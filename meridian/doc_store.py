@@ -83,6 +83,8 @@ import json
 import os
 import re
 import shutil
+import tempfile
+import threading
 import uuid
 import hashlib
 import logging
@@ -1162,16 +1164,272 @@ def _find_paragraph_with_index(root: Any, para_id: str) -> tuple[Any, int] | Non
     return None
 
 
-def _save_docx_xml(raw: bytes, root: Any, dest: str) -> None:
+class DocxWriteVerificationError(OSError):
+    """dccc2311 -- fail-closed rejection of a staged DOCX write transaction.
+
+    Raised by :func:`_write_docx_transaction` when the disposable staged
+    artifact fails structural verification BEFORE it is ever promoted over
+    the live file -- the destination is guaranteed byte-for-byte untouched
+    whenever this is raised. Subclasses ``OSError`` so it is caught by any
+    existing broad ``except OSError`` / ``except Exception`` guard around a
+    docx write (e.g. ``insert_equation``'s ``except Exception as exc:`` when
+    opening/writing the source .docx) without requiring call-site changes,
+    while still being distinguishable via ``isinstance()`` by tests/callers
+    that want the specific fail-closed-verification failure mode rather than
+    a generic disk/permission error.
+    """
+
+    def __init__(self, message: str, *, manifest: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.manifest = manifest or {}
+
+
+_DOCX_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+# dccc2311 -- single serialized canonical-merge point per destination path,
+# mirroring extensions/meridian-docs/meridian_docs/docs_intel.py's
+# _docx_promotion_lock (an independent copy, not a shared import -- see the
+# module-docstring note above on WRITE-side duplication with docs_intel:
+# this core package intentionally never imports the standalone
+# stdlib-only extension, and vice versa). Keyed on the destination's
+# normalized absolute path so two threads racing to promote a staged draft
+# into the SAME .docx can never interleave their promotion; distinct
+# destinations never block each other.
+_DOCX_PROMOTION_LOCKS: dict[str, threading.Lock] = {}
+_DOCX_PROMOTION_LOCKS_GUARD = threading.Lock()
+
+
+def _docx_promotion_lock(dest: str) -> threading.Lock:
+    """Return the process-wide promotion lock for ``dest``'s canonical path."""
+    key = os.path.normcase(os.path.abspath(dest))
+    with _DOCX_PROMOTION_LOCKS_GUARD:
+        lock = _DOCX_PROMOTION_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _DOCX_PROMOTION_LOCKS[key] = lock
+        return lock
+
+
+def _docx_media_count(raw: bytes) -> int:
+    """Count ``word/media/*`` parts in a (pre- or post-write) .docx ZIP."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        return sum(1 for name in zf.namelist() if name.startswith("word/media/"))
+
+
+def _docx_style_count(raw: bytes) -> int:
+    """Count ``<w:style>`` elements in ``word/styles.xml`` (0 when absent)."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        if "word/styles.xml" not in zf.namelist():
+            return 0
+        data = zf.read("word/styles.xml")
+    try:
+        root = _LET.fromstring(data)
+    except _LET.XMLSyntaxError:
+        return 0
+    return sum(1 for _ in root.iter(f"{{{_DOCX_W_NS}}}style"))
+
+
+_DOCX_HEADER_FOOTER_RE = re.compile(r"^word/(?:header|footer)\d+\.xml$")
+
+
+def _docx_equation_count(raw: bytes) -> int:
+    """Count ``<m:oMath>`` elements across ``word/document.xml`` plus any
+    ``word/header<N>.xml`` / ``word/footer<N>.xml`` parts present."""
+    total = 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        names = [
+            name for name in zf.namelist()
+            if name == _DOCX_DOCUMENT_PART or _DOCX_HEADER_FOOTER_RE.match(name)
+        ]
+        for name in names:
+            try:
+                part_root = _LET.fromstring(zf.read(name))
+            except _LET.XMLSyntaxError:
+                continue
+            total += sum(1 for _ in part_root.iter(f"{{{_OMML_NS}}}oMath"))
+    return total
+
+
+def _docx_relationship_count(raw: bytes) -> int:
+    """Count ``<Relationship>`` elements across every ``*.rels`` part."""
+    total = 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        for name in zf.namelist():
+            if not name.endswith(".rels"):
+                continue
+            try:
+                rels_root = _LET.fromstring(zf.read(name))
+            except _LET.XMLSyntaxError:
+                continue
+            total += sum(1 for _ in rels_root.iter(f"{{{_DOCX_PKG_REL_NS}}}Relationship"))
+    return total
+
+
+def _docx_structural_manifest(raw: bytes) -> dict[str, int]:
+    """Structural fingerprint used to gate a write transaction (dccc2311).
+
+    Counts the four structural families a write transaction must never
+    silently lose: embedded media (images), paragraph styles, equations, and
+    OOXML package relationships. Computed identically on the PRE-write bytes
+    and the STAGED post-write bytes so a caller can compare before ever
+    promoting a staged artifact into the live file.
+    """
+    return {
+        "media_count": _docx_media_count(raw),
+        "style_count": _docx_style_count(raw),
+        "equation_count": _docx_equation_count(raw),
+        "relationship_count": _docx_relationship_count(raw),
+    }
+
+
+def _docx_manifest_hash(changed_parts: dict[str, bytes]) -> str:
+    """Deterministic SHA-256 over the parts a write transaction actually changed.
+
+    Pure function of ``changed_parts`` (sorted by name first, so caller
+    iteration order never affects the result) -- the same input always
+    yields the same hash, and it identifies the transaction's actual DELTA
+    rather than conflating it with everything else in the archive that
+    stayed the same.
+    """
+    h = hashlib.sha256()
+    for name in sorted(changed_parts):
+        name_bytes = name.encode("utf-8")
+        h.update(len(name_bytes).to_bytes(4, "big"))
+        h.update(name_bytes)
+        data = changed_parts[name]
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()
+
+
+def _write_docx_transaction(
+    payload: bytes,
+    dest: str,
+    *,
+    pre_manifest: dict[str, int],
+    protected_keys: tuple[str, ...],
+    changed_parts: dict[str, bytes],
+) -> dict[str, Any]:
+    """Stage / verify / (serialized) promote a DOCX write transaction (dccc2311).
+
+    1. STAGE -- ``payload`` (the complete, already-repackaged ZIP) is flushed
+       to a disposable temp file in ``dest``'s own directory. It is NEVER
+       written to ``dest`` directly -- ``dest`` is untouched unless and until
+       verification (step 2) passes.
+    2. VERIFY -- the staged file is re-opened FRESH FROM DISK (never the
+       in-memory ``payload`` object, which would just re-validate the build
+       step's own intent) and its structural manifest
+       (:func:`_docx_structural_manifest`) is compared against
+       ``pre_manifest`` for every key in ``protected_keys``. Any mismatch --
+       or a staged artifact that isn't even a valid .docx -- is a
+       fail-closed verification failure: :class:`DocxWriteVerificationError`
+       is raised, the staged file is discarded, and ``dest`` is left
+       byte-for-byte untouched.
+    3. PROMOTE -- the ONLY point at which the live file changes is inside
+       :func:`_docx_promotion_lock`'s single serialized canonical-merge
+       point for ``dest``: an ``os.replace`` (atomic on the same filesystem)
+       swaps the verified staged artifact over ``dest``. Two concurrent
+       writers targeting the same ``dest`` can never interleave their
+       promotions. A pre-existing ``dest`` is backed up to ``dest + ".bak"``
+       immediately before promotion (best-effort, non-fatal on failure --
+       a doc write must not fail because backup housekeeping did).
+
+    Returns ``{"manifest_hash", "pre_counts", "post_counts"}``.
+    """
+    parent = os.path.dirname(os.path.abspath(dest)) or "."
+    os.makedirs(parent, exist_ok=True)
+    manifest_hash = _docx_manifest_hash(changed_parts)
+    post_counts: dict[str, int] | None = None
+
+    staged_path: str | None = None
+    try:
+        fd, staged_path = tempfile.mkstemp(
+            prefix=".meridian-docx-stage-", suffix=".tmp", dir=parent
+        )
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        with open(staged_path, "rb") as fh:
+            staged_bytes = fh.read()
+        try:
+            post_counts = _docx_structural_manifest(staged_bytes)
+        except (zipfile.BadZipFile, KeyError) as exc:
+            raise DocxWriteVerificationError(
+                f"post-write verification failed: the staged artifact for {dest} "
+                f"is not a valid .docx after being flushed to disk: {exc} -- "
+                f"discarding it, {dest} is untouched",
+                manifest={"pre_counts": pre_manifest, "post_counts": None},
+            ) from exc
+
+        mismatches = {
+            key: {"expected": pre_manifest.get(key), "actual": post_counts.get(key)}
+            for key in protected_keys
+            if post_counts.get(key) != pre_manifest.get(key)
+        }
+        if mismatches:
+            raise DocxWriteVerificationError(
+                "post-write verification failed: the staged .docx does not "
+                "preserve structural elements this write must never lose "
+                f"({dest}) -- discarding the staged artifact instead of "
+                f"promoting a corrupted write; {dest} is untouched",
+                manifest={
+                    "pre_counts": pre_manifest,
+                    "post_counts": post_counts,
+                    "count_mismatches": mismatches,
+                },
+            )
+
+        with _docx_promotion_lock(dest):
+            if os.path.exists(dest):
+                backup_path = dest + ".bak"
+                try:
+                    shutil.copy2(dest, backup_path)
+                except OSError as exc:
+                    _log.warning(
+                        "could not write backup %r before overwriting %r: %s",
+                        backup_path, dest, exc,
+                    )
+            os.replace(staged_path, dest)
+            staged_path = None
+    finally:
+        if staged_path:
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+
+    return {
+        "manifest_hash": manifest_hash,
+        "pre_counts": pre_manifest,
+        "post_counts": post_counts,
+    }
+
+
+def _save_docx_xml(raw: bytes, root: Any, dest: str) -> dict[str, Any]:
     """Rewrite ``word/document.xml`` with ``root`` into a copy of the .docx at ``dest``.
 
     Every OTHER zip entry from ``raw`` is copied through unchanged (byte-for-byte,
     preserving compression), so styles / relationships / media / content-types are
-    untouched -- only the document part is replaced with the mutated tree. Writing
-    to a fresh ``BytesIO`` first and flushing to ``dest`` at the end keeps the
-    write atomic-ish (a mid-write crash can't half-truncate the original when
-    ``dest`` differs, and even for an in-place overwrite the new bytes are fully
-    materialised before the file is opened for writing).
+    untouched -- only the document part is replaced with the mutated tree.
+
+    Hardened (dccc2311) to route through :func:`_write_docx_transaction`'s
+    disposable-worker-artifact pipeline: the new archive is staged to a temp
+    file (never written to ``dest`` directly), re-read fresh from disk, and
+    its media/style/relationship counts are gated to be UNCHANGED against
+    the pre-write counts -- this function only ever rewrites
+    ``word/document.xml``, so those three families can never legitimately
+    move here; a mismatch means the staged artifact is corrupt (e.g. a
+    truncated/interrupted flush), not that an intentional edit happened.
+    Equation count is intentionally NOT gated -- editing
+    ``word/document.xml`` (insert_equation, update_paragraph, ...) is the
+    entire point of this function's callers and is expected to change it.
+    Verification failure leaves ``dest`` byte-for-byte untouched (fail
+    closed) and raises :class:`DocxWriteVerificationError`. The live file is
+    only ever mutated inside the single serialized promotion point for
+    ``dest`` (:func:`_docx_promotion_lock`), so concurrent writers targeting
+    the same document can never race their promotion.
 
     c034fa24 -- when ``dest`` already exists (the common in-place-overwrite case
     every docx-mutating tool routes through: update_paragraph, link_figure_caption,
@@ -1181,6 +1439,11 @@ def _save_docx_xml(raw: bytes, root: Any, dest: str) -> None:
     without indefinitely growing disk usage on a document edited many times.
     Best-effort: a failure to write the backup is logged but never blocks the
     actual save -- a doc write must not fail because backup housekeeping did.
+
+    Returns the write-transaction manifest, ``{"manifest_hash", "pre_counts",
+    "post_counts"}`` (dccc2311) -- callers that don't need it (most existing
+    call sites, including every test that pre-dates this change) simply
+    ignore the return value, exactly as they did when this returned ``None``.
     """
     new_document = _LET.tostring(
         root, xml_declaration=True, encoding="UTF-8", standalone=True
@@ -1195,14 +1458,14 @@ def _save_docx_xml(raw: bytes, root: Any, dest: str) -> None:
                     data = new_document
                 # Preserve each entry's original compression type.
                 dst.writestr(info, data)
-    if os.path.exists(dest):
-        backup_path = dest + ".bak"
-        try:
-            shutil.copy2(dest, backup_path)
-        except OSError as exc:
-            _log.warning("could not write backup %r before overwriting %r: %s", backup_path, dest, exc)
-    with open(dest, "wb") as fh:
-        fh.write(out.getvalue())
+
+    return _write_docx_transaction(
+        out.getvalue(),
+        dest,
+        pre_manifest=_docx_structural_manifest(raw),
+        protected_keys=("media_count", "style_count", "relationship_count"),
+        changed_parts={_DOCX_DOCUMENT_PART: new_document},
+    )
 
 
 def _insert_omath_at_position(
@@ -2595,7 +2858,7 @@ class DocStructureStore:
             return {"error": f"resolved OMML is not valid XML: {exc}"}
         _insert_omath_at_position(paragraph, omath_el, pos)
         try:
-            _save_docx_xml(raw, root, docx_path)
+            transaction = _save_docx_xml(raw, root, docx_path)
         except Exception as exc:  # noqa: BLE001 — write failure (perms/disk)
             return {"error": f"could not write back to source .docx: {exc}"}
 
@@ -2608,6 +2871,9 @@ class DocStructureStore:
             "position": pos,
             "omml": _LET.tostring(omath_el, encoding="unicode"),
             "resync": resync,
+            # dccc2311 — deterministic identifier of exactly what this write
+            # transaction changed (see _docx_manifest_hash).
+            "manifest_hash": transaction.get("manifest_hash"),
         }
         if stale_warning is not None:
             result["stale_warning"] = stale_warning
@@ -3515,7 +3781,7 @@ class DocStructureStore:
 
         # Canonical _save_docx_xml serializes ``root`` and rewrites only the
         # document part into a copy of the original ZIP (``raw``) at ``dest``.
-        _save_docx_xml(raw, root, source_path)
+        transaction = _save_docx_xml(raw, root, source_path)
 
         resynced = await self._resync_element_text(doc_row["id"], para_id, new_text)
         result = {
@@ -3524,6 +3790,9 @@ class DocStructureStore:
             "new_text": new_text,
             "elements_resynced": resynced,
             "source_path": source_path,
+            # dccc2311 — deterministic identifier of exactly what this write
+            # transaction changed (see _docx_manifest_hash).
+            "manifest_hash": transaction.get("manifest_hash"),
         }
         if stale_warning is not None:
             result["stale_warning"] = stale_warning

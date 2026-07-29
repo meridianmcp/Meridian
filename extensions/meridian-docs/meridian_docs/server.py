@@ -367,6 +367,7 @@ def insert_caption(
     position: str = "after",
     section_heading: str | None = None,
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real Word Caption paragraph into a .docx file.
 
@@ -377,6 +378,9 @@ def insert_caption(
 
     Both Figure and Table captions use the same Word Caption-style + SEQ
     mechanism — the ``kind`` parameter selects which counter to use.
+
+    4efc63fd — style_policy["caption_centered"] (default False) controls
+    whether the new caption gets w:jc w:val="center".
 
     Args:
       docx_path:       Absolute path to the .docx file (mutated in place).
@@ -389,6 +393,8 @@ def insert_caption(
                        Stored in the sidecar index section column.
       index_db_path:   If supplied, sidecar is invalidated after write so the
                        next read auto-reindexes (keeps metadata in sync).
+      style_policy:    Optional style policy overrides (see
+                       resolve_style_policy / audit_equation_style).
 
     Returns:
       {status, kind, seq_number, label_text, section_heading, docx_path}
@@ -402,6 +408,7 @@ def insert_caption(
         position=position,
         section_heading=section_heading,
         index_db_path=index_db_path,
+        style_policy=style_policy,
     )
 
 
@@ -720,6 +727,7 @@ def insert_equation(
     payload: str,
     position: str = "after",
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Insert an equation into a .docx file.
 
@@ -732,12 +740,19 @@ def insert_equation(
       "after"  — new display-mode paragraph immediately after the anchor.
       "append" — append the <m:oMath> inline to the anchor paragraph itself.
 
+    4efc63fd — style_policy (see resolve_style_policy) controls the new
+    display paragraph's alignment (equation_alignment, default "center") and
+    left indentation (body_indent_twips, default 0). Not consulted for
+    position="append".
+
     Args:
       docx_path:       Absolute path to the .docx file (mutated in place).
       anchor_para_id:  w14:paraId or p{N}/tbl{N} to anchor the insertion.
       payload:         Raw OMML XML or LaTeX expression.
       position:        "before", "after" (default), or "append".
       index_db_path:   If supplied, sidecar is invalidated after write.
+      style_policy:    Optional style policy overrides (see
+                       resolve_style_policy / audit_equation_style).
 
     Returns:
       {status, position, para_id, omml, docx_path}
@@ -749,6 +764,7 @@ def insert_equation(
         payload=payload,
         position=position,
         index_db_path=index_db_path,
+        style_policy=style_policy,
     )
 
 
@@ -830,6 +846,44 @@ def remove_equation(
         docx_path=docx_path,
         equation_para_id=equation_para_id,
         index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def audit_equation_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """4efc63fd — Audit every equation in a .docx for alignment, trailing
+    punctuation, and numbering consistency; returns structured findings, not
+    free text.
+
+    Three finding types:
+      misaligned_equation                — a display equation's paragraph
+        alignment doesn't match style_policy["equation_alignment"] (default
+        "center"). Inline and table-numbered equations are excluded.
+      missing_trailing_punctuation /
+      incorrect_trailing_punctuation     — a display equation has no (or the
+        wrong) trailing punctuation immediately after the <m:oMath> — the
+        same spot append_text_run_after_math writes to. Skipped entirely
+        when style_policy["equation_punctuation_required"] is False.
+      duplicate_equation_number /
+      equation_number_gap                — table-numbered equations (the
+        "(1)"/"(2a)" pattern) checked for exact duplicate numbers and gaps in
+        the leading-integer sequence.
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides (see
+                     resolve_style_policy).
+
+    Returns:
+      {docx_path, equation_count, findings, finding_count, findings_by_type,
+      policy} or {error: <message>}.
+    """
+    return docs_intel.audit_equation_style(
+        docx_path=docx_path,
+        style_policy=style_policy,
     )
 
 
@@ -1115,11 +1169,19 @@ def insert_highlighted_note(
     mode: str = "inline",
     author: str = "Meridian",
     initials: str = "M",
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Insert an internal note inline or as a native Word comment.
 
     mode="inline" preserves the highlighted Meridian note paragraph.
     mode="comment" creates a real Word comment visible in Word's review pane.
+
+    4efc63fd — for mode="inline", style_policy["note_style"] (default
+    "MeridianInternalNote") and style_policy["note_highlight_color"] (default
+    "yellow") control the OOXML paragraph style / highlight color. Not
+    consulted for mode="comment". Distinct from the `style` parameter above,
+    which selects the note's category (only "internal_note" is supported),
+    not its rendering.
     """
     return docs_intel.insert_highlighted_note(
         docx_path=docx_path,
@@ -1131,6 +1193,7 @@ def insert_highlighted_note(
         mode=mode,
         author=author,
         initials=initials,
+        style_policy=style_policy,
     )
 
 

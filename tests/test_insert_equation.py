@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import zipfile
 
 import pytest
@@ -223,6 +224,95 @@ def test_insert_equation_latex_append_writes_file_and_resyncs(tmp_path):
             eqs = await store.get_equations(doc_row["id"])
             assert len(eqs) == 2
             assert res["resync"]["inserted"]  # resync reported inserts
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# dccc2311 — hardened DOCX transaction manifests + fail-closed verification,
+# exercised through the real insert_equation write path (_save_docx_xml).
+# ---------------------------------------------------------------------------
+
+def test_insert_equation_manifest_hash_present_and_deterministic(tmp_path):
+    """insert_equation surfaces a deterministic manifest_hash identifying
+    exactly what the write transaction changed: the SAME edit applied to two
+    structurally-identical fresh documents produces the IDENTICAL hash, and
+    a different edit produces a different one."""
+    async def _run():
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        store_a = await _open_store(dir_a)
+        store_b = await _open_store(dir_b)
+        try:
+            docx_a = await _seed_document(store_a, dir_a, name="same.docx")
+            docx_b = await _seed_document(store_b, dir_b, name="same.docx")
+
+            res_a = await store_a.insert_equation(
+                "proj-1", docx_a, "0000B003", "a^2 + b^2 = c^2", position="append",
+            )
+            res_b = await store_b.insert_equation(
+                "proj-1", docx_b, "0000B003", "a^2 + b^2 = c^2", position="append",
+            )
+            assert "error" not in res_a and "error" not in res_b
+            assert isinstance(res_a["manifest_hash"], str)
+            assert len(res_a["manifest_hash"]) == 64
+            # Identical starting document + identical edit -> identical hash.
+            assert res_a["manifest_hash"] == res_b["manifest_hash"]
+
+            # A DIFFERENT equation produces a DIFFERENT hash.
+            res_c = await store_a.insert_equation(
+                "proj-1", docx_a, "0000B001", "x = y", position="after",
+            )
+            assert "error" not in res_c
+            assert res_c["manifest_hash"] != res_a["manifest_hash"]
+        finally:
+            await store_a.close()
+            await store_b.close()
+
+    asyncio.run(_run())
+
+
+def test_insert_equation_verification_failure_leaves_file_untouched_and_errors(tmp_path):
+    """dccc2311 — a fail-closed post-write verification failure surfaces as
+    a normal {"error": ...} result (insert_equation's broad except Exception
+    catches DocxWriteVerificationError, an OSError subclass) and the source
+    .docx is left completely untouched -- no corrupted/partial write."""
+    async def _run():
+        store = await _open_store(tmp_path)
+        try:
+            docx_path = await _seed_document(store, tmp_path)
+            before = _read_document_xml(docx_path)
+
+            real_manifest = doc_store._docx_structural_manifest
+            calls = {"n": 0}
+
+            def fake_manifest(raw):
+                calls["n"] += 1
+                result = real_manifest(raw)
+                # Corrupt only the SECOND call (the staged post-write
+                # re-read) so the transaction's own protected-count
+                # comparison genuinely mismatches.
+                if calls["n"] == 2:
+                    result["style_count"] += 1
+                return result
+
+            doc_store._docx_structural_manifest = fake_manifest
+            try:
+                res = await store.insert_equation(
+                    "proj-1", docx_path, "0000B003", "x^2 + y^2", position="append",
+                )
+            finally:
+                doc_store._docx_structural_manifest = real_manifest
+
+            assert "error" in res
+            assert "could not write back to source .docx" in res["error"]
+            # File is byte-for-byte unchanged -- fail-closed, never promoted.
+            assert _read_document_xml(docx_path) == before
+            assert not os.path.exists(docx_path + ".bak")
         finally:
             await store.close()
 

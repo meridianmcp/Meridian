@@ -45,6 +45,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import threading
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -1451,11 +1452,156 @@ def _load_docx_xml_stdlib(path: str) -> tuple[bytes, ET.Element]:
     return raw, root
 
 
+class DocxWriteVerificationError(OSError):
+    """dccc2311 — fail-closed rejection of a staged DOCX write transaction.
+
+    Raised by :func:`_atomic_write_docx_bytes` when the disposable staged
+    artifact fails structural verification (see ``_docx_structural_manifest``)
+    BEFORE it is ever promoted over the live file — ``dest`` is guaranteed
+    byte-for-byte untouched whenever this is raised.
+
+    Subclasses ``OSError`` (not a bare ``Exception``) so it is caught, without
+    any call-site change, by every one of this module's ~25 existing
+    ``except OSError as exc: return {"error": ...}`` guards around
+    ``_save_docx_xml_stdlib`` / ``_save_docx_with_new_parts_stdlib`` — while
+    still being distinguishable via ``isinstance()`` by tests/callers that
+    want the specific fail-closed-verification failure mode rather than a
+    generic disk/permission error.
+    """
+
+    def __init__(self, message: str, *, manifest: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.manifest = manifest or {}
+
+
+# dccc2311 — single serialized canonical-merge point per destination path.
+# Every write that goes through _atomic_write_docx_bytes only ever mutates
+# the live file inside this lock, keyed on the destination's normalized
+# absolute path — two threads racing to promote a staged draft into the SAME
+# .docx can never interleave their promotion (one full stage -> verify ->
+# promote cycle always completes before the next begins for that path).
+# Writers targeting DIFFERENT destinations never block each other, and the
+# lock table only ever grows by distinct live destination paths (bounded by
+# the number of documents actually being written to, not by request count).
+_DOCX_PROMOTION_LOCKS: dict[str, threading.Lock] = {}
+_DOCX_PROMOTION_LOCKS_GUARD = threading.Lock()
+
+
+def _docx_promotion_lock(dest: str) -> threading.Lock:
+    """Return the process-wide promotion lock for ``dest``'s canonical path."""
+    key = os.path.normcase(os.path.abspath(dest))
+    with _DOCX_PROMOTION_LOCKS_GUARD:
+        lock = _DOCX_PROMOTION_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _DOCX_PROMOTION_LOCKS[key] = lock
+        return lock
+
+
+def _docx_style_count(raw: bytes) -> int:
+    """Count ``<w:style>`` elements in ``word/styles.xml`` (0 when absent)."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        if "word/styles.xml" not in zf.namelist():
+            return 0
+        data = zf.read("word/styles.xml")
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return 0
+    return sum(1 for _ in root.iter(_q(_W, "style")))
+
+
+_HEADER_FOOTER_PART_RE = re.compile(r"^word/(?:header|footer)\d+\.xml$")
+
+
+def _docx_equation_count(raw: bytes) -> int:
+    """Count ``<m:oMath>`` elements across ``word/document.xml`` plus any
+    ``word/header<N>.xml`` / ``word/footer<N>.xml`` parts present."""
+    total = 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        names = [
+            name for name in zf.namelist()
+            if name == "word/document.xml" or _HEADER_FOOTER_PART_RE.match(name)
+        ]
+        for name in names:
+            try:
+                part_root = ET.fromstring(zf.read(name))
+            except ET.ParseError:
+                continue
+            total += sum(1 for _ in part_root.iter(_q(_M, "oMath")))
+    return total
+
+
+def _docx_relationship_count(raw: bytes) -> int:
+    """Count ``<Relationship>`` elements across every ``*.rels`` part."""
+    total = 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        for name in zf.namelist():
+            if not name.endswith(".rels"):
+                continue
+            try:
+                rels_root = ET.fromstring(zf.read(name))
+            except ET.ParseError:
+                continue
+            total += sum(1 for _ in rels_root.iter(_q(_PKG_REL_NS, "Relationship")))
+    return total
+
+
+def _docx_structural_manifest(raw: bytes) -> dict[str, int]:
+    """Structural fingerprint used to gate a write transaction (dccc2311).
+
+    Counts the four structural families a DOCX write transaction must never
+    silently lose: embedded media (images), paragraph styles, equations, and
+    OOXML package relationships. Computed identically on the PRE-write bytes
+    and the STAGED post-write bytes so a caller can compare before ever
+    promoting a staged artifact into the live file.
+    """
+    return {
+        "media_count": _docx_media_count(raw),
+        "style_count": _docx_style_count(raw),
+        "equation_count": _docx_equation_count(raw),
+        "relationship_count": _docx_relationship_count(raw),
+    }
+
+
+def _docx_manifest_hash(changed_parts: dict[str, bytes]) -> str:
+    """Deterministic SHA-256 over the parts a write transaction actually changed.
+
+    Hashing only the CHANGED parts (never the whole repackaged archive) means
+    the hash identifies the transaction's actual delta: two transactions that
+    produce the exact same logical edit hash IDENTICALLY regardless of
+    unrelated ZIP member ordering, and two transactions that touch different
+    content hash differently even when everything else in the document is
+    byte-identical. Part names are sorted first, so caller iteration order
+    never affects the result — pure function of ``changed_parts``, so the
+    same input always yields the same hash.
+    """
+    h = hashlib.sha256()
+    for name in sorted(changed_parts):
+        name_bytes = name.encode("utf-8")
+        h.update(len(name_bytes).to_bytes(4, "big"))
+        h.update(name_bytes)
+        data = changed_parts[name]
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()
+
+
 def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> None:
     """Write ``root`` back into ``dest`` as ``word/document.xml``.
 
     All other ZIP members from ``raw`` are preserved byte-for-byte.
     Writes to a BytesIO buffer first, then flushes to disk.
+
+    Hardened (dccc2311) to route through :func:`_atomic_write_docx_bytes`'s
+    stage -> verify -> promote transaction: media/style/relationship counts
+    are gated to be UNCHANGED (this function only ever rewrites
+    ``word/document.xml`` — every other part is copied through byte-for-byte,
+    so those three families can never legitimately move here; a mismatch
+    means the staged artifact is corrupt, not that an intentional edit
+    happened). Equation count is intentionally NOT gated — editing
+    ``word/document.xml`` is the entire point of most callers
+    (insert_equation_local et al.) and is expected to change it.
 
     Backs up the existing file to ``dest + ".bak"`` when it already exists
     (best-effort, non-fatal on failure — same pattern as meridian/doc_store.py).
@@ -1475,40 +1621,123 @@ def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> None:
                     data = new_document_bytes
                 dst.writestr(info, data)
 
-    _atomic_write_docx_bytes(out.getvalue(), dest)
+    _atomic_write_docx_bytes(
+        out.getvalue(),
+        dest,
+        pre_manifest=_docx_structural_manifest(raw),
+        protected_keys=("media_count", "style_count", "relationship_count"),
+        changed_parts={"word/document.xml": new_document_bytes},
+    )
 
 
-def _atomic_write_docx_bytes(payload: bytes, dest: str) -> None:
-    """Persist a DOCX with backup + same-directory atomic replacement.
+def _atomic_write_docx_bytes(
+    payload: bytes,
+    dest: str,
+    *,
+    pre_manifest: dict[str, int] | None = None,
+    protected_keys: tuple[str, ...] = (),
+    changed_parts: dict[str, bytes] | None = None,
+) -> dict[str, Any]:
+    """Persist a DOCX as a disposable-worker-artifact transaction (dccc2311).
 
-    A mutation is not considered written until the complete ZIP has been
-    flushed and atomically replaced. A failed temp write leaves the original
-    document in place and removes the temporary artifact.
+    1. STAGE — ``payload`` (the complete, already-repackaged ZIP) is flushed
+       to a disposable temp file in ``dest``'s own directory. It is NEVER
+       written to ``dest`` directly — ``dest`` is not touched at all unless
+       and until verification (step 2) passes.
+    2. VERIFY — when ``pre_manifest`` is supplied, the staged file is
+       re-opened FRESH FROM DISK (never the in-memory ``payload`` object,
+       which would just re-validate the build step's own intent) and its
+       structural manifest (:func:`_docx_structural_manifest`) is compared
+       against ``pre_manifest`` for every key in ``protected_keys``. Any
+       mismatch — or a staged artifact that isn't even a valid .docx — is a
+       fail-closed verification failure: :class:`DocxWriteVerificationError`
+       is raised, the staged file is discarded, and ``dest`` is left
+       byte-for-byte untouched (never a partially-written or corrupted file).
+    3. PROMOTE — the ONLY point at which the live file changes is inside
+       :func:`_docx_promotion_lock`'s single serialized canonical-merge
+       point for this destination — an ``os.replace`` (atomic on the same
+       filesystem) swaps the verified staged artifact over ``dest``. Two
+       concurrent writers targeting the same ``dest`` can never interleave
+       their promotions.
+
+    A pre-existing ``dest`` is backed up to ``dest + ".bak"`` immediately
+    before promotion (best-effort, non-fatal on failure).
+
+    Returns ``{"manifest_hash", "pre_counts", "post_counts"}`` — the
+    manifest hash is always computed (from ``changed_parts`` when given, else
+    ``None``); ``pre_counts``/``post_counts`` are ``None`` when
+    ``pre_manifest`` was not supplied (legacy callers that run their OWN
+    separate range-hash verification, like move_section/copy_section/
+    relocate_table via :func:`_verify_docx_write`, keep working exactly as
+    before — this is purely additive).
     """
     parent = os.path.dirname(os.path.abspath(dest)) or "."
     os.makedirs(parent, exist_ok=True)
-    temp_path: str | None = None
-    if os.path.exists(dest):
-        try:
-            shutil.copy2(dest, dest + ".bak")
-        except OSError:
-            pass
+    manifest_hash = _docx_manifest_hash(changed_parts) if changed_parts else None
+    post_counts: dict[str, int] | None = None
+
+    staged_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="wb", prefix=".meridian-docx-", suffix=".tmp", dir=parent, delete=False
+            mode="wb", prefix=".meridian-docx-stage-", suffix=".tmp", dir=parent, delete=False
         ) as fh:
-            temp_path = fh.name
+            staged_path = fh.name
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(temp_path, dest)
-        temp_path = None
-    finally:
-        if temp_path:
+
+        if pre_manifest is not None:
+            with open(staged_path, "rb") as fh:
+                staged_bytes = fh.read()
             try:
-                os.unlink(temp_path)
+                post_counts = _docx_structural_manifest(staged_bytes)
+            except (zipfile.BadZipFile, KeyError) as exc:
+                raise DocxWriteVerificationError(
+                    "post-write verification failed: the staged artifact for "
+                    f"{dest} is not a valid .docx after being flushed to disk: "
+                    f"{exc} — discarding it, {dest} is untouched",
+                    manifest={"pre_counts": pre_manifest, "post_counts": None},
+                ) from exc
+
+            mismatches = {
+                key: {"expected": pre_manifest.get(key), "actual": post_counts.get(key)}
+                for key in protected_keys
+                if post_counts.get(key) != pre_manifest.get(key)
+            }
+            if mismatches:
+                raise DocxWriteVerificationError(
+                    "post-write verification failed: the staged .docx does "
+                    "not preserve structural elements this write must never "
+                    f"lose ({dest}) — discarding the staged artifact instead "
+                    f"of promoting a corrupted write; {dest} is untouched",
+                    manifest={
+                        "pre_counts": pre_manifest,
+                        "post_counts": post_counts,
+                        "count_mismatches": mismatches,
+                    },
+                )
+
+        # --- PROMOTE: the single serialized canonical-merge point ----------
+        with _docx_promotion_lock(dest):
+            if os.path.exists(dest):
+                try:
+                    shutil.copy2(dest, dest + ".bak")
+                except OSError:
+                    pass
+            os.replace(staged_path, dest)
+            staged_path = None
+    finally:
+        if staged_path:
+            try:
+                os.unlink(staged_path)
             except OSError:
                 pass
+
+    return {
+        "manifest_hash": manifest_hash,
+        "pre_counts": pre_manifest,
+        "post_counts": post_counts,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1861,13 +2090,17 @@ def _build_caption_paragraph(
     label_text: str,
     seq_cached: str = "1",
     ref_bookmark: str | None = None,
+    centered: bool = False,
 ) -> ET.Element:
     """Build a ``<w:p>`` element for a Word caption using the Caption style.
 
     Produces::
 
         <w:p>
-          <w:pPr><w:pStyle w:val="Caption"/></w:pPr>
+          <w:pPr>
+            <w:pStyle w:val="Caption"/>
+            <w:jc w:val="center"/>     <!-- only when centered=True -->
+          </w:pPr>
           <w:bookmarkStart w:id="0" w:name="_Ref123456789"/>
           <w:r><w:t xml:space="preserve">Figure </w:t></w:r>
           <w:fldSimple w:instr="SEQ Figure \\* ARABIC">
@@ -1889,6 +2122,10 @@ def _build_caption_paragraph(
     inserted elsewhere (see :func:`insert_cross_reference`) resolves to just
     ``"Figure 3"`` and stays correct across reordering/renumbering on Word's
     next field refresh, instead of hand-typed prose text going stale.
+
+    4efc63fd — ``centered`` (from ``style_policy["caption_centered"]`` via
+    :func:`resolve_style_policy`) adds ``w:jc w:val="center"`` to the
+    paragraph; default ``False`` preserves this function's original output.
     """
     if kind not in ("Figure", "Table"):
         raise ValueError(f"caption kind must be 'Figure' or 'Table', got {kind!r}")
@@ -1901,6 +2138,8 @@ def _build_caption_paragraph(
     pPr = ET.SubElement(p, _q(_W, "pPr"))
     pStyle = ET.SubElement(pPr, _q(_W, "pStyle"))
     pStyle.set(_q(_W, "val"), _CAPTION_STYLE)
+    if centered:
+        ET.SubElement(pPr, _q(_W, "jc"), {_q(_W, "val"): "center"})
 
     if ref_bookmark:
         bm_start = ET.SubElement(p, _q(_W, "bookmarkStart"))
@@ -2478,6 +2717,7 @@ def insert_caption(
     position: str = "after",
     section_heading: str | None = None,
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real Word Caption paragraph into a .docx file.
 
@@ -2488,6 +2728,10 @@ def insert_caption(
     The SEQ number is auto-incremented: it equals the count of existing SEQ
     captions of the same kind in the document plus one.  Word will recompute
     the final numbering on the next field refresh (F9).
+
+    4efc63fd — ``style_policy["caption_centered"]`` (default ``False``, via
+    :func:`resolve_style_policy`) controls whether the new caption paragraph
+    gets ``w:jc w:val="center"``.
 
     Args:
         docx_path:       Absolute path to the .docx file (mutated in place).
@@ -2505,6 +2749,8 @@ def insert_caption(
                          belongs to.  Stored in the sidecar ``section`` column.
         index_db_path:   If supplied, the sidecar SQLite index is invalidated
                          after the write so the next read auto-reindexes.
+        style_policy:    Optional overrides merged via
+                         :func:`resolve_style_policy`.
 
     Returns:
         ``{status, kind, seq_number, label_text, section_heading, ref_bookmark,
@@ -2535,6 +2781,11 @@ def insert_caption(
         return {"error": "label_text must be a non-empty string"}
 
     try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
         raw, root = _load_docx_xml_stdlib(docx_path)
     except FileNotFoundError as exc:
         return {"error": str(exc)}
@@ -2555,6 +2806,7 @@ def insert_caption(
         label_text=label_text.strip(),
         seq_cached=str(seq_number),
         ref_bookmark=ref_bookmark,
+        centered=policy["caption_centered"],
     )
 
     insert_at = child_idx if position == "before" else child_idx + 1
@@ -4135,21 +4387,399 @@ def get_local_equations(index_db_path: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Configurable document style policy (4efc63fd)
+# ---------------------------------------------------------------------------
+#
+# A single dict-shaped "style policy" that write-back functions consult
+# instead of hardcoding style choices (caption centering, equation body
+# indentation/alignment, internal-note style name + highlight color), and
+# that audit_equation_style below uses as its "expected" baseline. Plain
+# dicts -- not a dataclass -- to match this module's existing convention of
+# returning/consuming JSON-shaped dicts everywhere (MCP tool boundary).
+#
+# _style_policy_defaults() is a function (not a module-level dict literal)
+# specifically so it can reference _INTERNAL_NOTE_STYLE_DEFAULT /
+# _INTERNAL_NOTE_HIGHLIGHT_COLOR, which are defined later in this file --
+# names inside a function body resolve at CALL time, long after the whole
+# module has finished importing, so the forward reference is safe.
+
+_VALID_EQUATION_ALIGNMENTS = {"left", "center", "right", "both"}
+
+# The fixed set of values OOXML's <w:highlight w:val="..."/> accepts.
+_VALID_HIGHLIGHT_COLORS = {
+    "black", "blue", "cyan", "darkBlue", "darkCyan", "darkGray", "darkGreen",
+    "darkMagenta", "darkRed", "darkYellow", "green", "lightGray", "magenta",
+    "none", "red", "white", "yellow",
+}
+
+
+def _style_policy_defaults() -> dict[str, Any]:
+    """Built-in defaults -- reproduce today's pre-4efc63fd behavior except
+    where called out below.
+
+    ``equation_alignment`` defaults to ``"center"`` (the conventional
+    display-equation layout, matching :func:`insert_image`'s already-centered
+    figures) rather than "leave unset" -- this is a deliberate, documented
+    behavior addition for newly inserted display equations, not a bug: no
+    existing test asserts an inserted equation paragraph has no ``pPr``, and
+    keeping the audit's "expected" alignment and the writer's actual output
+    in sync (one policy, two consumers) is the whole point of this feature.
+    """
+    return {
+        "caption_centered": False,
+        "body_indent_twips": 0,
+        "equation_alignment": "center",
+        "equation_punctuation_required": True,
+        "equation_punctuation_chars": ".,;:",
+        "note_style": _INTERNAL_NOTE_STYLE_DEFAULT,
+        "note_highlight_color": _INTERNAL_NOTE_HIGHLIGHT_COLOR,
+    }
+
+
+def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    """4efc63fd -- merge caller-supplied overrides onto the default document
+    style policy, validating every key/value so a malformed policy raises
+    ``ValueError`` immediately (callers turn that into ``{"error": ...}``
+    *before* touching any file) instead of producing malformed OOXML or
+    silently doing nothing.
+
+    Recognised keys (all optional -- any subset may be overridden):
+
+      caption_centered (bool):     whether :func:`insert_caption` adds
+                                    ``w:jc w:val="center"`` to new captions.
+      body_indent_twips (int>=0):  left-indent (in twips, 1/20 pt) applied to
+                                    a newly inserted DISPLAY equation
+                                    paragraph's ``pPr`` by
+                                    :func:`insert_equation_local`.
+      equation_alignment (str):    one of "left"/"center"/"right"/"both" --
+                                    both the alignment :func:`insert_equation_local`
+                                    writes into new display-equation paragraphs
+                                    AND the alignment :func:`audit_equation_style`
+                                    treats as "correct".
+      equation_punctuation_required (bool): whether
+                                    :func:`audit_equation_style` checks
+                                    trailing punctuation at all.
+      equation_punctuation_chars (str): the accepted trailing-punctuation
+                                    characters (checked by
+                                    :func:`audit_equation_style`).
+      note_style (str):            OOXML paragraph style name
+                                    :func:`insert_highlighted_note` (inline
+                                    mode) writes for new notes.
+      note_highlight_color (str):  ``<w:highlight>`` value (must be a valid
+                                    OOXML highlight color) for new notes.
+
+    Raises:
+      ValueError: an unknown key, or a value of the wrong type/out of range.
+    """
+    defaults = _style_policy_defaults()
+    if not overrides:
+        return defaults
+
+    unknown = sorted(set(overrides) - set(defaults))
+    if unknown:
+        raise ValueError(f"unknown style policy key(s): {unknown}")
+
+    policy = dict(defaults)
+    policy.update(overrides)
+
+    if not isinstance(policy["caption_centered"], bool):
+        raise ValueError("style policy 'caption_centered' must be a bool")
+
+    indent = policy["body_indent_twips"]
+    if not isinstance(indent, int) or isinstance(indent, bool) or indent < 0:
+        raise ValueError("style policy 'body_indent_twips' must be a non-negative int")
+
+    if policy["equation_alignment"] not in _VALID_EQUATION_ALIGNMENTS:
+        raise ValueError(
+            "style policy 'equation_alignment' must be one of "
+            f"{sorted(_VALID_EQUATION_ALIGNMENTS)}"
+        )
+
+    if not isinstance(policy["equation_punctuation_required"], bool):
+        raise ValueError("style policy 'equation_punctuation_required' must be a bool")
+
+    punct_chars = policy["equation_punctuation_chars"]
+    if not isinstance(punct_chars, str) or not punct_chars:
+        raise ValueError("style policy 'equation_punctuation_chars' must be a non-empty string")
+
+    note_style = policy["note_style"]
+    if not isinstance(note_style, str) or not note_style.strip():
+        raise ValueError("style policy 'note_style' must be a non-empty string")
+
+    if policy["note_highlight_color"] not in _VALID_HIGHLIGHT_COLORS:
+        raise ValueError(
+            "style policy 'note_highlight_color' must be one of "
+            f"{sorted(_VALID_HIGHLIGHT_COLORS)}"
+        )
+
+    return policy
+
+
+def _paragraph_alignment(para_elem: ET.Element) -> str | None:
+    """Return the explicit ``w:jc`` value on ``para_elem``'s ``pPr``, or
+    ``None`` when no alignment is explicitly set (Word's own default renders
+    that as left-aligned)."""
+    pPr = para_elem.find(_q(_W, "pPr"))
+    if pPr is None:
+        return None
+    jc = pPr.find(_q(_W, "jc"))
+    if jc is None:
+        return None
+    return jc.get(_q(_W, "val"))
+
+
+def _trailing_text_after_omath(para_elem: ET.Element, omath_el: ET.Element) -> str:
+    """Concatenate the text of every element following ``omath_el`` within its
+    immediate parent inside ``para_elem``.
+
+    Mirrors :func:`append_text_run_after_math`'s insertion point exactly --
+    this is how :func:`audit_equation_style` reads back whatever a prior
+    ``append_text_run_after_math`` call wrote (or detects that nothing was
+    ever appended).
+    """
+    parent = next(
+        (candidate for candidate in para_elem.iter() if omath_el in list(candidate)),
+        None,
+    )
+    if parent is None:
+        return ""
+    siblings = list(parent)
+    idx = siblings.index(omath_el)
+    w_t = _q(_W, "t")
+    return "".join(
+        "".join(t.text or "" for t in sib.iter(w_t)) for sib in siblings[idx + 1:]
+    )
+
+
+_EQ_LEADING_INT_RE = re.compile(r"^\(\s*(\d+)")
+
+
+def _leading_equation_number(number_text: str | None) -> int | None:
+    """Extract the leading integer from an equation number like ``"(2a)"`` ->
+    ``2``, or ``None`` for a non-numeric label like ``"(A.1)"``/``"(eq3)"``
+    that has no well-defined "next integer" for gap detection."""
+    if not number_text:
+        return None
+    m = _EQ_LEADING_INT_RE.match(number_text)
+    return int(m.group(1)) if m else None
+
+
+def audit_equation_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """4efc63fd -- audit every equation in a .docx and report STRUCTURED
+    findings (never free-text) covering alignment, trailing punctuation, and
+    numbering consistency, so a caller can programmatically triage a document
+    before submission instead of eyeballing it.
+
+    Three finding categories:
+
+    1. ``misaligned_equation`` -- scoped to STANDALONE equations that occupy
+       their own paragraph (a "display" equation: the paragraph's only
+       content besides ``pPr`` is the ``<m:oMath>``/``<m:oMathPara>`` --
+       exactly what :func:`insert_equation_local`'s ``before``/``after``
+       positions produce). Its paragraph-level ``w:jc`` (missing == "left")
+       is compared against ``style_policy["equation_alignment"]``. Inline
+       equations mixed into running prose, and table-numbered equations
+       (whose 2-column layout has its own alignment conventions), are
+       intentionally excluded -- neither has one well-defined "expected"
+       paragraph alignment.
+
+    2. ``missing_trailing_punctuation`` / ``incorrect_trailing_punctuation``
+       -- for the same display-equation paragraphs (skipped entirely when
+       ``style_policy["equation_punctuation_required"]`` is False), the text
+       of any run(s) immediately following the ``<m:oMath>`` -- the exact
+       spot :func:`append_text_run_after_math` writes to -- is checked
+       against ``style_policy["equation_punctuation_chars"]``. No trailing
+       text at all -> "missing"; trailing text whose last non-whitespace
+       character isn't an accepted character -> "incorrect".
+
+    3. ``duplicate_equation_number`` / ``equation_number_gap`` -- across every
+       ``table-numbered`` equation (the ``"(1)"``/``"(2a)"`` pattern
+       :func:`parse_docx_equations_local` already detects), numbers are
+       compared whitespace-normalized for exact duplicates, and each number's
+       LEADING integer (``"2a"`` -> ``2``) is checked for a contiguous
+       1..max sequence. Non-numeric labels (``"(A.1)"``, ``"(eq3)"``) still
+       participate in duplicate detection but are excluded from gap
+       detection (no well-defined "next integer").
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style policy
+                     via :func:`resolve_style_policy`.
+
+    Returns:
+      ``{docx_path, equation_count, findings, finding_count,
+      findings_by_type, policy}`` or ``{"error": <message>}`` when the file
+      cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    equations = parse_docx_equations_local(docx_path)
+    findings: list[dict[str, Any]] = []
+
+    m_omath_tag = _qm("oMath")
+    m_omath_para_tag = _qm("oMathPara")
+
+    for eq in equations:
+        if eq["pattern"] != "standalone":
+            continue
+        located = _find_para_by_id(root, eq["para_id"])
+        if located is None:
+            continue  # unresolvable id (e.g. a table-embedded standalone) -- skip
+        _body, para_elem, _idx = located
+
+        # Resolve the paragraph's direct-child oMath(s) (unwrapping a single
+        # oMathPara if that's how it's wrapped). A paragraph containing more
+        # than one equation is ambiguous -- which one does trailing text
+        # belong to? -- so it's skipped entirely, mirroring
+        # append_text_run_after_math's own "math_index required" guard
+        # against the same ambiguity rather than guessing.
+        direct_omaths = para_elem.findall(m_omath_tag)
+        top_level_el = None
+        if direct_omaths:
+            top_level_el = direct_omaths[0] if len(direct_omaths) == 1 else None
+        else:
+            omath_para_el = para_elem.find(m_omath_para_tag)
+            if omath_para_el is not None:
+                direct_omaths = omath_para_el.findall(m_omath_tag)
+                if len(direct_omaths) == 1:
+                    top_level_el = omath_para_el
+        if len(direct_omaths) != 1 or top_level_el is None:
+            continue
+        omath_el = direct_omaths[0]
+
+        # "Display equation" = nothing but pPr precedes the equation in the
+        # paragraph. Content AFTER the equation -- e.g. a trailing
+        # punctuation run written by append_text_run_after_math -- is
+        # expected and does NOT disqualify it (that's exactly what the
+        # punctuation check below reads back). Content BEFORE the equation
+        # (prose mixed with the equation, as in an inline
+        # "Einstein: E=mc^2" sentence) DOES disqualify it -- there is no
+        # single sensible alignment/punctuation expectation for a sentence
+        # that merely contains an equation.
+        siblings = list(para_elem)
+        top_idx = siblings.index(top_level_el)
+        preceding = [c for c in siblings[:top_idx] if c.tag != _q(_W, "pPr")]
+        if preceding:
+            continue  # inline equation mixed with prose -- no alignment/punctuation check
+
+        actual_alignment = _paragraph_alignment(para_elem) or "left"
+        expected_alignment = policy["equation_alignment"]
+        if actual_alignment != expected_alignment:
+            findings.append({
+                "type": "misaligned_equation",
+                "para_id": eq["para_id"],
+                "ordinal": eq["ordinal"],
+                "expected_alignment": expected_alignment,
+                "actual_alignment": actual_alignment,
+            })
+
+        if policy["equation_punctuation_required"]:
+            trailing = _trailing_text_after_omath(para_elem, omath_el)
+            stripped = trailing.rstrip()
+            if not stripped:
+                findings.append({
+                    "type": "missing_trailing_punctuation",
+                    "para_id": eq["para_id"],
+                    "ordinal": eq["ordinal"],
+                    "expected_punctuation_chars": policy["equation_punctuation_chars"],
+                })
+            elif stripped[-1] not in policy["equation_punctuation_chars"]:
+                findings.append({
+                    "type": "incorrect_trailing_punctuation",
+                    "para_id": eq["para_id"],
+                    "ordinal": eq["ordinal"],
+                    "actual_trailing_text": trailing,
+                    "actual_char": stripped[-1],
+                    "expected_punctuation_chars": policy["equation_punctuation_chars"],
+                })
+
+    numbered = [eq for eq in equations if eq["pattern"] == "table-numbered" and eq["number"]]
+
+    grouped_by_norm: dict[str, list[dict[str, Any]]] = {}
+    for eq in numbered:
+        norm = re.sub(r"\s+", "", eq["number"])
+        grouped_by_norm.setdefault(norm, []).append(eq)
+    for group in grouped_by_norm.values():
+        if len(group) > 1:
+            findings.append({
+                "type": "duplicate_equation_number",
+                "number": group[0]["number"],
+                "para_ids": [g["para_id"] for g in group],
+                "ordinals": [g["ordinal"] for g in group],
+            })
+
+    leading_ints = sorted({
+        v for v in (_leading_equation_number(eq["number"]) for eq in numbered)
+        if v is not None
+    })
+    if leading_ints:
+        expected_range = set(range(1, leading_ints[-1] + 1))
+        for missing in sorted(expected_range - set(leading_ints)):
+            findings.append({"type": "equation_number_gap", "missing_number": missing})
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "equation_count": len(equations),
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+# ---------------------------------------------------------------------------
 # WRITE: insert / edit / remove equation
 # ---------------------------------------------------------------------------
 
-def _build_omath_paragraph(omml_raw: str) -> ET.Element:
+def _build_omath_paragraph(
+    omml_raw: str,
+    alignment: str | None = None,
+    indent_twips: int = 0,
+) -> ET.Element:
     """Wrap a raw OMML string in a new <w:p> for display-mode insertion.
 
     Produces::
 
         <w:p>
+          <w:pPr>
+            <w:jc w:val="..."/>        <!-- only when alignment is given -->
+            <w:ind w:left="..."/>      <!-- only when indent_twips > 0 -->
+          </w:pPr>
           <m:oMath>...</m:oMath>
         </w:p>
+
+    ``alignment``/``indent_twips`` (4efc63fd) come from a resolved style
+    policy (see :func:`resolve_style_policy`) so the paragraph's ``pPr`` is
+    omitted entirely when neither is set -- matching this function's
+    original (pre-4efc63fd) output exactly.
 
     The oMath element is parsed from ``omml_raw`` and appended as a child.
     """
     p = ET.Element(_q(_W, "p"))
+    if alignment or indent_twips:
+        pPr = ET.SubElement(p, _q(_W, "pPr"))
+        if alignment:
+            ET.SubElement(pPr, _q(_W, "jc"), {_q(_W, "val"): alignment})
+        if indent_twips:
+            ET.SubElement(pPr, _q(_W, "ind"), {_q(_W, "left"): str(indent_twips)})
     omath_el = ET.fromstring(omml_raw)
     p.append(omath_el)
     return p
@@ -4161,6 +4791,7 @@ def insert_equation_local(
     payload: str,
     position: str = "after",
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Insert an equation into a .docx file.
 
@@ -4177,6 +4808,12 @@ def insert_equation_local(
     the ``<m:oMath>`` element is appended as a direct child of the anchor
     ``<w:p>`` (inline equation style).
 
+    4efc63fd — ``style_policy`` (resolved via :func:`resolve_style_policy`)
+    supplies the new display paragraph's alignment (``equation_alignment``,
+    default ``"center"``) and left indentation (``body_indent_twips``,
+    default 0 / no indent). Not consulted for ``position="append"`` (inline
+    equations have no paragraph of their own to style).
+
     Args:
         docx_path:       Absolute path to the .docx file (mutated in place).
         anchor_para_id:  ``w14:paraId`` or ``p{N}`` / ``tbl{N}`` of the
@@ -4186,6 +4823,9 @@ def insert_equation_local(
         position:        ``"before"``, ``"after"``, or ``"append"`` (default
                          ``"after"``).
         index_db_path:   If supplied, sidecar is invalidated after write.
+        style_policy:    Optional overrides merged via
+                         :func:`resolve_style_policy`; see that function's
+                         docstring for keys.
 
     Returns:
         ``{status, position, para_id, omml, docx_path}``
@@ -4195,6 +4835,11 @@ def insert_equation_local(
         return {"error": f"position must be 'before', 'after', or 'append', got {position!r}"}
     if not payload or not str(payload).strip():
         return {"error": "payload must be a non-empty string (OMML XML or LaTeX)"}
+
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     # Resolve OMML before touching the file — fail fast on bad input.
     try:
@@ -4223,7 +4868,11 @@ def insert_equation_local(
         anchor_elem.append(omath_el)
     else:
         # Display: insert a new <w:p> wrapping the equation.
-        new_p = _build_omath_paragraph(omml)
+        new_p = _build_omath_paragraph(
+            omml,
+            alignment=policy["equation_alignment"],
+            indent_twips=policy["body_indent_twips"],
+        )
         insert_at = child_idx if position == "before" else child_idx + 1
         body.insert(insert_at, new_p)
 
@@ -5768,7 +6417,12 @@ def _next_note_bookmark_name(root: ET.Element) -> str:
     return f"{_INTERNAL_NOTE_BOOKMARK_PREFIX}{max_seen + 1}"
 
 
-def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.Element:
+def _build_internal_note_paragraph(
+    text: str,
+    note_id: str,
+    style: str,
+    highlight_color: str = _INTERNAL_NOTE_HIGHLIGHT_COLOR,
+) -> ET.Element:
     """Build a ``<w:p>`` for a highlighted internal-author-note paragraph.
 
     Produces a paragraph styled ``style`` (falls back to Normal rendering in
@@ -5776,6 +6430,10 @@ def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.El
     ``w:highlight`` is what guarantees visible distinctiveness regardless),
     wrapped in a ``_MNote<digits>`` bookmark so :func:`list_internal_notes`
     and future tooling can locate it precisely instead of re-matching on text.
+
+    4efc63fd -- ``highlight_color`` (from
+    ``style_policy["note_highlight_color"]`` via :func:`resolve_style_policy`)
+    defaults to the original hardcoded ``"yellow"``.
     """
     p = ET.Element(_q(_W, "p"))
     pPr = ET.SubElement(p, _q(_W, "pPr"))
@@ -5789,7 +6447,7 @@ def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.El
     r = ET.SubElement(p, _q(_W, "r"))
     rPr = ET.SubElement(r, _q(_W, "rPr"))
     highlight = ET.SubElement(rPr, _q(_W, "highlight"))
-    highlight.set(_q(_W, "val"), _INTERNAL_NOTE_HIGHLIGHT_COLOR)
+    highlight.set(_q(_W, "val"), highlight_color)
     t = ET.SubElement(r, _q(_W, "t"))
     t.set(_q(_XML_NS, "space"), "preserve")
     t.text = text
@@ -6528,6 +7186,7 @@ def insert_highlighted_note(
     mode: str = "inline",
     author: str = "Meridian",
     initials: str = "M",
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Insert an internal note inline or as a native Word comment.
 
@@ -6535,6 +7194,16 @@ def insert_highlighted_note(
     mode="comment" writes Word's comments.xml part, relationship, content-type
     override, range markers, and comment reference so Microsoft Word displays
     the note in its normal review pane.
+
+    4efc63fd — ``style_policy`` (resolved via :func:`resolve_style_policy`)
+    supplies the OOXML paragraph style name (``note_style``, default
+    ``"MeridianInternalNote"``) and highlight color (``note_highlight_color``,
+    default ``"yellow"``) for ``mode="inline"`` notes. Not consulted for
+    ``mode="comment"`` (Word comments have no paragraph style/highlight of
+    their own — they live in a separate comments.xml part).  Distinct from
+    the existing ``style`` parameter above, which selects the note's
+    *category* (currently only ``"internal_note"`` is supported), not its
+    OOXML rendering.
     """
     if not text or not str(text).strip():
         return {"error": "text must be a non-empty string"}
@@ -6549,6 +7218,11 @@ def insert_highlighted_note(
         }
     if mode not in ("inline", "comment"):
         return {"error": f"mode must be 'inline' or 'comment', got {mode!r}"}
+
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     if mode == "comment":
         result = insert_word_comment(
@@ -6582,7 +7256,7 @@ def insert_highlighted_note(
 
     note_id = _next_note_bookmark_name(root)
     note_p = _build_internal_note_paragraph(
-        text.strip(), note_id, _INTERNAL_NOTE_STYLE_DEFAULT
+        text.strip(), note_id, policy["note_style"], policy["note_highlight_color"]
     )
 
     insert_at = child_idx if position == "before" else child_idx + 1
@@ -6605,7 +7279,7 @@ def insert_highlighted_note(
         "text": text.strip(),
         "anchor_para_id": anchor_para_id,
         "position": position,
-        "style": _INTERNAL_NOTE_STYLE_DEFAULT,
+        "style": policy["note_style"],
         "docx_path": docx_path,
     }
 
@@ -8290,6 +8964,16 @@ def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes]
     that are not already present in the original archive AND overwrites parts
     that are. Every other original ZIP member is preserved byte-for-byte.
 
+    Hardened (dccc2311) to route through :func:`_atomic_write_docx_bytes`'s
+    stage -> verify -> promote transaction, gating media/style counts to be
+    UNCHANGED. Unlike :func:`_save_docx_xml_stdlib`, relationship and
+    equation counts are deliberately NOT gated here: every current caller of
+    this multi-part writer (insert_word_comment, highlight_document_matches,
+    set_page_header/footer) legitimately adds relationships and/or new
+    content-type overrides as part of a correct write, so a relationship-count
+    delta is expected, not a corruption signal. Media and styles are never
+    legitimately touched by any of them, so those two stay hard invariants.
+
     Backs up the existing file to ``dest + ".bak"`` when it already exists
     (best-effort, non-fatal on failure -- same pattern as
     :func:`_save_docx_xml_stdlib`).
@@ -8311,7 +8995,13 @@ def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes]
                 if part_name not in written:
                     dst.writestr(part_name, data)
 
-    _atomic_write_docx_bytes(out.getvalue(), dest)
+    _atomic_write_docx_bytes(
+        out.getvalue(),
+        dest,
+        pre_manifest=_docx_structural_manifest(raw),
+        protected_keys=("media_count", "style_count"),
+        changed_parts=dict(updated_parts),
+    )
 
 
 def _insert_before_closing_tag(xml_bytes: bytes, root_tag_name: str, new_element_xml: str) -> bytes:
