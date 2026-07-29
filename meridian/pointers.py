@@ -1083,3 +1083,354 @@ def assemble_pointer_entries_from_annotated_items(
             entry["pointers"] = records
         entries.append(entry)
     return sorted(entries, key=lambda e: e["item_id"])
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed artifact readiness verification (3196ba0e — b730 follow-up)
+# ---------------------------------------------------------------------------
+#
+# ``validate_pointer``'s target_kind check (300a063d, above) answers a narrow
+# WRITE-time question: "does an explicit target_kind='existing' point at
+# something that exists RIGHT NOW?" It is opt-in and never touches
+# meridian-outputs — a symlink/directory mixup, an archival/stale copy, or a
+# planned_new target that was declared but never actually produced all pass
+# it silently (planned_new is exempt from the check entirely, by design).
+#
+# :func:`verify_target_readiness` / :func:`verify_pointer_readiness` answer
+# the FAIL-CLOSED, COMPLETION-time question instead: "is this target
+# genuinely ready to stand behind a sprint item being marked done?" Per
+# ``target_kind``:
+#
+#   * ``"existing"`` — the uri must resolve to a real FILE (not a directory)
+#     on disk; that is the one hard gate (``ready=False`` on ``"missing"`` /
+#     ``"is_directory"``). Beyond it, when a ``figure_resolver`` is
+#     available the target is resolved THROUGH meridian-outputs — reusing
+#     ``outputs_indexer.resolve_output`` / ``resolve_figure_output`` (the
+#     SAME two-stage canonical-vs-archival classification
+#     ``classify_canonical_archival`` already computes; never re-derived
+#     here) — and classified as ``"canonical"``, ``"archival"`` (stale),
+#     ``"unresolved"``, or ``"ambiguous"`` (multiple same-basename
+#     candidates — the meridian-outputs extension's relocation-tolerant
+#     basename-fallback tier, see ``provenance.resolve_figure_output``).
+#     That classification is recorded EVIDENCE, not a second gate — it never
+#     flips ``ready`` back to False on its own, mirroring
+#     ``OutputsFtsIndex.search``'s own policy that archival rows are
+#     DEPRIORITIZED, never hard-excluded.
+#
+#   * ``"planned_new"`` — a much harder bar, straight from the sprint spec:
+#     "planned_new must NOT be allowed to satisfy readiness merely by naming
+#     a future path." A planned_new target is only ``ready`` when (1) the
+#     file now actually EXISTS (the plan was executed, not merely declared)
+#     AND (2) a provenance record for it is on file, via an injected
+#     ``provenance_getter`` that reuses
+#     ``extensions/meridian-outputs``'s ``record_provenance`` /
+#     ``get_provenance`` ledger — never re-implemented here. Either missing
+#     piece fails closed (``"not_created"`` / ``"provenance_missing"``).
+#
+# meridian-outputs lives in a SEPARATE package (``extensions/meridian-
+# outputs``) that is not installed into core's own env and is not
+# importable from here (see pixi.toml's 52cbe5d8 note and
+# ``tunnel_plugins.py``) — a hosted tenant's outputs tree may not even be on
+# this machine, reachable only over the tunnel. Both seams are therefore
+# guarded, injectable, ASYNC callables, matching :func:`resolve_pointer`'s
+# own symbol_resolver/node_resolver/citation_resolver seam shape exactly:
+#
+#   * ``figure_resolver`` DOES have a real core-local default — a lazy-
+#     imported async wrapper around ``outputs_indexer.resolve_figure_output``
+#     (plain, synchronous, no tunnel needed for an outputs tree that IS on
+#     this machine, e.g. self-hosted). A caller with a richer resolver (the
+#     meridian-outputs extension's own ``provenance.resolve_figure_output``,
+#     with its basename-fallback/``match_type``/``candidate_count`` fields,
+#     or a tunnel-backed MCP call for a hosted tenant) injects it instead.
+#   * ``provenance_getter`` has NO core-local default — the provenance
+#     ledger lives ONLY in the extension — and stays ``None`` unless a
+#     caller (the MCP handler layer, once wired) injects one.
+#
+# An unavailable seam (``None``) or one that raises is ALWAYS surfaced as an
+# EXPLICIT degraded/unavailable status (``"unresolved"`` / ``"degraded"`` for
+# existing targets; ``"provenance_unavailable"`` / ``"provenance_check_failed"``
+# for planned_new, both ``ready=False``) — NEVER silently treated as
+# ``"canonical"`` / ``"ready"``. That is the whole point of a fail-closed
+# gate: an unreachable check must never be indistinguishable from a passed
+# one.
+# ---------------------------------------------------------------------------
+
+FigureResolver = Callable[[str, str], Awaitable[dict[str, Any] | None]]
+ProvenanceGetter = Callable[[str, str], Awaitable[dict[str, Any] | None]]
+
+
+def _default_figure_resolver() -> FigureResolver:
+    """Lazy-imported default seam: core's own local, synchronous
+    ``outputs_indexer.resolve_figure_output`` (exact-path match against the
+    ``outputs_index`` — no tunnel needed for an outputs tree reachable on
+    this machine). Wrapped as ``async`` purely to match the injectable
+    seam's shape (mirrors ``resolve_pointer``'s own lazy-import wrappers).
+    """
+    from . import outputs_indexer as _oi  # noqa: PLC0415
+
+    async def _resolver(outputs_dir: str, file_path: str) -> dict[str, Any] | None:
+        return _oi.resolve_figure_output(outputs_dir, file_path)
+
+    return _resolver
+
+
+async def verify_target_readiness(
+    target: dict[str, Any],
+    *,
+    outputs_dir: str | None = None,
+    path_exists: Callable[[str], bool] | None = None,
+    is_dir: Callable[[str], bool] | None = None,
+    figure_resolver: FigureResolver | None = None,
+    provenance_getter: ProvenanceGetter | None = None,
+) -> dict[str, Any]:
+    """Fail-closed, completion-time readiness check for ONE pointer target.
+
+    Distinct from (and complementary to) :func:`validate_pointer`'s opt-in,
+    write-time ``target_kind='existing'`` filesystem check — see the module
+    section docstring above for the full rationale.
+
+    ``target`` is one normalized ``{uri, target_kind, ...}`` target dict
+    (e.g. one entry of a :func:`validate_pointer`-normalized pointer's
+    ``targets`` list). A missing/invalid ``target_kind`` defaults to
+    ``"existing"`` (matches :func:`validate_pointer`'s own default). A
+    non-local ``uri`` (a URL, or a ``zotero:``/``doc:``/``finding:``
+    reference — see :func:`_looks_like_local_path`) is out of scope for this
+    filesystem-oriented check and is reported ``ready=True, status="skipped"``
+    — those schemes have their own existence semantics, already checked by
+    :func:`resolve_pointer`.
+
+    ``path_exists`` / ``is_dir`` are injectable filesystem checkers
+    (default :func:`os.path.exists` / :func:`os.path.isdir`), the same
+    pattern :func:`validate_pointer` already uses. ``figure_resolver`` /
+    ``provenance_getter`` are the meridian-outputs seams described above.
+
+    Returns a dict always carrying ``{uri, target_kind, ready, status,
+    reason}`` plus, when available, ``resolved`` (the meridian-outputs hit)
+    or ``provenance`` (the provenance ledger record). ``status`` values:
+
+    * ``"skipped"`` — non-local uri, not applicable (``ready=True``).
+    * ``"missing_uri"`` — the target carries no uri at all (``ready=False``).
+    * ``"missing"`` — ``existing``: no file at ``uri`` (``ready=False``).
+    * ``"is_directory"`` — the uri names a directory, not a file
+      (``ready=False``, either kind).
+    * ``"canonical"`` — ``existing``: verified on disk AND meridian-outputs
+      resolves it to a non-archival, unambiguous output (``ready=True``).
+    * ``"archival"`` — ``existing``: verified on disk but meridian-outputs
+      flags the resolved output archival/stale (``ready=True`` — recorded
+      evidence, not a second gate; see rationale above).
+    * ``"ambiguous"`` — ``existing``: verified on disk but meridian-outputs'
+      basename-fallback tier found multiple same-named candidates
+      (``ready=True``).
+    * ``"unresolved"`` — ``existing``: verified on disk, but meridian-outputs
+      is unavailable (``figure_resolver`` is ``None``) or has no matching
+      record (``ready=True`` — file presence alone is the hard gate).
+    * ``"degraded"`` — ``existing``: verified on disk, but the injected
+      ``figure_resolver`` raised (``ready=True`` — same reasoning: disk
+      presence is the hard gate, the enrichment step merely failed).
+    * ``"not_created"`` — ``planned_new``: the planned path does not exist
+      yet — naming a future path never satisfies readiness (``ready=False``).
+    * ``"provenance_unavailable"`` — ``planned_new``: the file was created
+      but no ``provenance_getter`` is wired to confirm registration
+      (``ready=False`` — fail closed, never assume success).
+    * ``"provenance_check_failed"`` — ``planned_new``: the file was created
+      but the injected ``provenance_getter`` raised (``ready=False``).
+    * ``"provenance_missing"`` — ``planned_new``: the file was created but no
+      provenance record is on file for it (``ready=False``).
+    * ``"ready"`` — ``planned_new``: created AND provenance-registered
+      (``ready=True``).
+
+    Never raises: every resolver/checker call is guarded; a failure degrades
+    to an explicit unavailable/degraded status, never to a silent pass.
+    """
+    uri = ""
+    kind: Any = None
+    if isinstance(target, dict):
+        raw_uri = target.get("uri")
+        uri = raw_uri.strip() if isinstance(raw_uri, str) else ""
+        kind = target.get("target_kind")
+    if kind not in _TARGET_KINDS:
+        kind = _DEFAULT_TARGET_KIND
+    base: dict[str, Any] = {"uri": uri, "target_kind": kind}
+
+    if not uri:
+        return {**base, "ready": False, "status": "missing_uri",
+                "reason": "target has no uri to verify"}
+
+    if not _looks_like_local_path(uri):
+        return {
+            **base, "ready": True, "status": "skipped",
+            "reason": (
+                "not a local filesystem path — readiness verification only "
+                "applies to local artifacts; other uri schemes "
+                "(zotero:/doc:/finding:/URLs) have their own existence "
+                "semantics, checked by resolve_pointer instead"
+            ),
+        }
+
+    exists_checker = path_exists or os.path.exists
+    dir_checker = is_dir or os.path.isdir
+    try:
+        exists = bool(exists_checker(uri))
+    except OSError:
+        exists = False
+
+    if kind == "planned_new":
+        if not exists:
+            return {
+                **base, "ready": False, "status": "not_created",
+                "reason": (
+                    f"planned_new target {uri!r} has not been created yet — "
+                    "naming a future path does not satisfy readiness; create "
+                    "the file, then record its provenance"
+                ),
+            }
+        try:
+            is_directory = bool(dir_checker(uri))
+        except OSError:
+            is_directory = False
+        if is_directory:
+            return {**base, "ready": False, "status": "is_directory",
+                    "reason": f"{uri!r} is a directory, not a file"}
+        if provenance_getter is None:
+            return {
+                **base, "ready": False, "status": "provenance_unavailable",
+                "reason": (
+                    "no provenance checker is wired (meridian-outputs is "
+                    "unavailable) — cannot confirm record_provenance was "
+                    "ever called for this path; degrading explicitly rather "
+                    "than assuming success"
+                ),
+            }
+        try:
+            record = await provenance_getter(outputs_dir or "", uri)
+        except Exception as exc:  # noqa: BLE001 — degrade, never fake success
+            _log.debug(
+                "verify_target_readiness: provenance_getter failed for %r",
+                uri, exc_info=True,
+            )
+            return {**base, "ready": False, "status": "provenance_check_failed",
+                    "reason": f"provenance lookup raised: {exc}"}
+        if not record:
+            return {
+                **base, "ready": False, "status": "provenance_missing",
+                "reason": (
+                    f"{uri!r} exists but has no provenance record on file — "
+                    "call record_provenance after creating a planned_new "
+                    "output before it can satisfy readiness"
+                ),
+            }
+        return {**base, "ready": True, "status": "ready", "provenance": record}
+
+    # kind == "existing"
+    if not exists:
+        return {**base, "ready": False, "status": "missing",
+                "reason": f"no file exists at {uri!r}"}
+    try:
+        is_directory = bool(dir_checker(uri))
+    except OSError:
+        is_directory = False
+    if is_directory:
+        return {**base, "ready": False, "status": "is_directory",
+                "reason": f"{uri!r} is a directory, not a file"}
+
+    if figure_resolver is None:
+        return {
+            **base, "ready": True, "status": "unresolved",
+            "reason": (
+                "meridian-outputs is unavailable — existence verified on "
+                "disk, but canonical/archival status could not be determined"
+            ),
+        }
+    try:
+        resolved = await figure_resolver(outputs_dir or "", uri)
+    except Exception as exc:  # noqa: BLE001 — degrade, never fake success
+        _log.debug(
+            "verify_target_readiness: figure_resolver failed for %r",
+            uri, exc_info=True,
+        )
+        return {**base, "ready": True, "status": "degraded",
+                "reason": f"meridian-outputs resolve failed: {exc}"}
+    if not resolved:
+        return {
+            **base, "ready": True, "status": "unresolved",
+            "reason": (
+                "existence verified on disk, but not found in the "
+                "meridian-outputs index"
+            ),
+        }
+    if resolved.get("is_archival"):
+        return {
+            **base, "ready": True, "status": "archival",
+            "reason": "resolved output is flagged archival/stale by meridian-outputs",
+            "resolved": resolved,
+        }
+    if resolved.get("match_type") == "basename" and int(resolved.get("candidate_count") or 0) > 1:
+        return {
+            **base, "ready": True, "status": "ambiguous",
+            "reason": (
+                f"{resolved.get('candidate_count')} same-basename candidates "
+                "found in the meridian-outputs index — treat as a best "
+                "guess, not a certain match"
+            ),
+            "resolved": resolved,
+        }
+    return {**base, "ready": True, "status": "canonical", "resolved": resolved}
+
+
+async def verify_pointer_readiness(
+    pointer: dict[str, Any],
+    *,
+    outputs_dir: str | None = None,
+    path_exists: Callable[[str], bool] | None = None,
+    is_dir: Callable[[str], bool] | None = None,
+    figure_resolver: FigureResolver | None = None,
+    provenance_getter: ProvenanceGetter | None = None,
+) -> dict[str, Any]:
+    """Fail-closed readiness verdict for EVERY target of a pointer.
+
+    The pointer-level counterpart of :func:`verify_target_readiness`, this is
+    the intended completion-time gate: run it over each of a sprint item's
+    durable pointers (``db.get_sprint_item_pointers``) before letting
+    ``complete_sprint_item`` pass, per the capability-manifest-style design
+    contract in AGENTS.md ("Capability manifests & fallback contracts") —
+    the primitive is built and fully tested here; wiring it into the
+    ``complete_sprint_item`` DB gate itself is a follow-up, not part of this
+    change (mirrors how 649e095f's capability manifest shipped ahead of its
+    own enforcement wiring).
+
+    Returns ``{source_type, label?, ready, targets: [<target-verdict>, ...]}``
+    where ``ready`` is ``True`` iff the pointer has at least one target AND
+    every target's own ``ready`` is ``True`` (an empty/malformed
+    ``targets`` list is never vacuously ready). Never raises — a malformed
+    (non-dict) target entry yields a ``ready=False`` "malformed_target"
+    verdict for that slot rather than crashing the whole pass, matching
+    :func:`resolve_pointer`'s own belt-and-suspenders guarding.
+    """
+    targets_raw = pointer.get("targets") if isinstance(pointer, dict) else None
+    targets = targets_raw if isinstance(targets_raw, list) else []
+
+    results: list[dict[str, Any]] = []
+    for raw_target in targets:
+        if not isinstance(raw_target, dict):
+            results.append({
+                "ready": False, "status": "malformed_target",
+                "reason": "target is not an object",
+            })
+            continue
+        results.append(await verify_target_readiness(
+            raw_target,
+            outputs_dir=outputs_dir,
+            path_exists=path_exists,
+            is_dir=is_dir,
+            figure_resolver=figure_resolver,
+            provenance_getter=provenance_getter,
+        ))
+
+    out: dict[str, Any] = {
+        "source_type": pointer.get("source_type") if isinstance(pointer, dict) else None,
+        "ready": bool(results) and all(r.get("ready") for r in results),
+        "targets": results,
+    }
+    if isinstance(pointer, dict) and pointer.get("label") is not None:
+        out["label"] = pointer.get("label")
+    return out

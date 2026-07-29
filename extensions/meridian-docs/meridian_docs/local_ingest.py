@@ -539,7 +539,9 @@ def ingest_local_document_structure_sidecar(
 
     Returns:
       ``{index_db, source, heading_count, figure_count, table_count,
-      local_path, blocks_parsed}``.
+      local_path, blocks_parsed, complete, source_sha256}``.  ``complete``
+      and ``source_sha256`` (e9b2cd2b) are passed through from
+      :func:`docs_intel.index_docx_structure`'s freshness metadata.
 
     Raises:
       FileNotFoundError:        if ``path`` does not exist.
@@ -599,6 +601,11 @@ def ingest_local_document_structure_sidecar(
         "heading_count": summary.get("heading_count", 0),
         "figure_count": summary.get("figure_count", 0),
         "table_count": summary.get("table_count", 0),
+        # e9b2cd2b — pass through the completeness marker + SHA-256 source
+        # fingerprint index_docx_structure just stamped, so a caller of this
+        # wrapper has the same freshness signal without a second sidecar hit.
+        "complete": summary.get("complete", True),
+        "source_sha256": summary.get("source_sha256"),
     }
 
 
@@ -660,7 +667,7 @@ def ingest_local_document_structure(
 
     Returns:
       Local path:  ``{index_db, source, heading_count, figure_count,
-                      table_count, local_path}``.
+                      table_count, local_path, complete, source_sha256}``.
       Hosted path: ``{document_id, source, doc_type, element_count,
                       local_path, blocks_forwarded}``.
 

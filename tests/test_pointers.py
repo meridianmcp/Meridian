@@ -1100,3 +1100,360 @@ async def test_resolve_text_quote_anchors_docx_paragraph_and_flags_drift(tmp_pat
     assert miss["resolved"] is True
     assert miss["found"] is False
     assert miss["drift"] is True
+
+
+# ---------------------------------------------------------------------------
+# 3196ba0e — fail-closed artifact readiness verification (b730 follow-up)
+#
+# verify_target_readiness / verify_pointer_readiness answer the COMPLETION-
+# time question "is this target genuinely ready?" — distinct from
+# validate_pointer's opt-in, WRITE-time target_kind='existing' check above.
+# meridian-outputs (figure_resolver / provenance_getter) is a separate
+# package not importable from core, so these tests stub those seams exactly
+# like _stub_symbol_resolver / _stub_node_resolver / _stub_citation_resolver
+# do for resolve_pointer's own seams.
+# ---------------------------------------------------------------------------
+
+from meridian.pointers import verify_target_readiness, verify_pointer_readiness
+
+
+@pytest.mark.asyncio
+async def test_readiness_missing_uri_reported_explicitly():
+    out = await verify_target_readiness({"target_kind": "existing"})
+    assert out["ready"] is False
+    assert out["status"] == "missing_uri"
+
+
+@pytest.mark.asyncio
+async def test_readiness_non_local_uri_skipped_not_faked_ready():
+    """A zotero:/doc:/finding:/URL uri is out of scope for a filesystem
+    readiness check — reported ready (skipped), never silently checked."""
+    out = await verify_target_readiness({"uri": "zotero:ABCD1234", "target_kind": "existing"})
+    assert out["ready"] is True
+    assert out["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_readiness_target_kind_omitted_defaults_to_existing(tmp_path):
+    missing = tmp_path / "nope.py"
+    out = await verify_target_readiness({"uri": str(missing)})
+    assert out["target_kind"] == "existing"
+    assert out["ready"] is False
+    assert out["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_readiness_injectable_path_and_dir_checkers():
+    """path_exists / is_dir are injectable seams, same pattern validate_pointer
+    already uses for path_exists — tests never need to touch a real filesystem."""
+    calls = []
+
+    def _exists(uri):
+        calls.append(("exists", uri))
+        return True
+
+    def _isdir(uri):
+        calls.append(("isdir", uri))
+        return False
+
+    out = await verify_target_readiness(
+        {"uri": "fake/path.csv", "target_kind": "existing"},
+        path_exists=_exists, is_dir=_isdir,
+    )
+    assert out["ready"] is True
+    assert ("exists", "fake/path.csv") in calls
+    assert ("isdir", "fake/path.csv") in calls
+
+
+# -- existing: file present / missing / is-a-directory -----------------------
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_file_present_no_resolver(tmp_path):
+    """existing + file present + no figure_resolver -> ready, but explicitly
+    'unresolved' (meridian-outputs unavailable) — never faked as canonical."""
+    real = tmp_path / "results.csv"
+    real.write_text("a,b\n1,2\n")
+    out = await verify_target_readiness({"uri": str(real), "target_kind": "existing"})
+    assert out["ready"] is True
+    assert out["status"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_missing_file(tmp_path):
+    missing = tmp_path / "nope.csv"
+    out = await verify_target_readiness({"uri": str(missing), "target_kind": "existing"})
+    assert out["ready"] is False
+    assert out["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_path_is_a_directory(tmp_path):
+    out = await verify_target_readiness({"uri": str(tmp_path), "target_kind": "existing"})
+    assert out["ready"] is False
+    assert out["status"] == "is_directory"
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_path_is_a_directory_before_provenance(tmp_path):
+    """A planned_new target naming an existing DIRECTORY is rejected before
+    provenance is even consulted."""
+    async def _prov(_outputs_dir, _path):
+        raise AssertionError("provenance_getter must not be called for a directory")
+
+    out = await verify_target_readiness(
+        {"uri": str(tmp_path), "target_kind": "planned_new"}, provenance_getter=_prov,
+    )
+    assert out["ready"] is False
+    assert out["status"] == "is_directory"
+
+
+# -- planned_new: creation + provenance registration --------------------------
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_not_created_yet(tmp_path):
+    """Naming a future path is never enough on its own (the sprint spec's
+    core requirement for this item)."""
+    future = tmp_path / "not_written_yet.png"
+    out = await verify_target_readiness({"uri": str(future), "target_kind": "planned_new"})
+    assert out["ready"] is False
+    assert out["status"] == "not_created"
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_before_record_provenance(tmp_path):
+    """File was created, but record_provenance was never called for it — an
+    in-memory ledger stub mirrors extensions/meridian-outputs' annotate.py
+    record_provenance/get_provenance contract (path -> record dict | None)."""
+    made = tmp_path / "figure_1.png"
+    made.write_bytes(b"\x89PNG\r\n")
+    ledger: dict = {}
+
+    async def _get_provenance(_outputs_dir, path):
+        return ledger.get(path)
+
+    out = await verify_target_readiness(
+        {"uri": str(made), "target_kind": "planned_new"}, provenance_getter=_get_provenance,
+    )
+    assert out["ready"] is False
+    assert out["status"] == "provenance_missing"
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_after_record_provenance(tmp_path):
+    """Once a provenance record exists for the same path, the SAME target
+    flips to ready — mirroring record_provenance's real upsert-then-
+    get_provenance round trip."""
+    made = tmp_path / "figure_1.png"
+    made.write_bytes(b"\x89PNG\r\n")
+    ledger: dict = {}
+
+    async def _get_provenance(_outputs_dir, path):
+        return ledger.get(path)
+
+    before = await verify_target_readiness(
+        {"uri": str(made), "target_kind": "planned_new"}, provenance_getter=_get_provenance,
+    )
+    assert before["ready"] is False
+
+    # Simulate record_provenance(outputs_dir, made, ...) having been called.
+    ledger[str(made)] = {
+        "path": str(made), "generating_script": "plot_results.py", "recorded_at": 1234.0,
+    }
+
+    after = await verify_target_readiness(
+        {"uri": str(made), "target_kind": "planned_new"}, provenance_getter=_get_provenance,
+    )
+    assert after["ready"] is True
+    assert after["status"] == "ready"
+    assert after["provenance"]["generating_script"] == "plot_results.py"
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_provenance_getter_unavailable(tmp_path):
+    """No provenance_getter wired at all (meridian-outputs unavailable) must
+    degrade explicitly to ready=False — never silently pass."""
+    made = tmp_path / "table_2.csv"
+    made.write_text("x,y\n1,2\n")
+    out = await verify_target_readiness({"uri": str(made), "target_kind": "planned_new"})
+    assert out["ready"] is False
+    assert out["status"] == "provenance_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_provenance_getter_raises_degrades(tmp_path):
+    """A provenance_getter that raises (tool present but unreachable) must
+    never be silently converted into success."""
+    made = tmp_path / "table_3.csv"
+    made.write_text("x,y\n1,2\n")
+
+    async def _boom(_outputs_dir, _path):
+        raise RuntimeError("meridian-outputs tunnel down")
+
+    out = await verify_target_readiness(
+        {"uri": str(made), "target_kind": "planned_new"}, provenance_getter=_boom,
+    )
+    assert out["ready"] is False
+    assert out["status"] == "provenance_check_failed"
+    assert "tunnel down" in out["reason"]
+
+
+# -- existing: canonical vs archival vs ambiguous resolution ------------------
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_canonical_vs_archival_resolution(tmp_path):
+    """canonical (non-archival) vs archival/stale classification is recorded,
+    but BOTH stay ready=True — archival is deprioritized evidence, not a
+    second gate (mirrors OutputsFtsIndex.search's own never-hard-exclude
+    policy for archival rows)."""
+    canon = tmp_path / "run.csv"
+    canon.write_text("a,b\n1,2\n")
+    stale = tmp_path / "run_old.csv"
+    stale.write_text("a,b\n1,2\n")
+
+    async def _resolver_canonical(_outputs_dir, file_path):
+        return {"path": file_path, "is_archival": False, "canonical_path": None}
+
+    async def _resolver_archival(_outputs_dir, file_path):
+        return {"path": file_path, "is_archival": True, "canonical_path": str(canon)}
+
+    canon_out = await verify_target_readiness(
+        {"uri": str(canon), "target_kind": "existing"}, figure_resolver=_resolver_canonical,
+    )
+    assert canon_out["ready"] is True
+    assert canon_out["status"] == "canonical"
+
+    stale_out = await verify_target_readiness(
+        {"uri": str(stale), "target_kind": "existing"}, figure_resolver=_resolver_archival,
+    )
+    assert stale_out["ready"] is True
+    assert stale_out["status"] == "archival"
+    assert stale_out["resolved"]["canonical_path"] == str(canon)
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_ambiguous_basename_resolution(tmp_path):
+    """Multiple same-basename candidates (the meridian-outputs extension's
+    relocation-tolerant basename-fallback tier) are surfaced as ambiguous,
+    not silently collapsed to canonical."""
+    figure = tmp_path / "plot.png"
+    figure.write_bytes(b"\x89PNG\r\n")
+
+    async def _resolver_ambiguous(_outputs_dir, file_path):
+        return {"path": file_path, "is_archival": False,
+                "match_type": "basename", "candidate_count": 3}
+
+    out = await verify_target_readiness(
+        {"uri": str(figure), "target_kind": "existing"}, figure_resolver=_resolver_ambiguous,
+    )
+    assert out["ready"] is True
+    assert out["status"] == "ambiguous"
+    assert out["resolved"]["candidate_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_meridian_outputs_unavailable_no_resolver(tmp_path):
+    """No figure_resolver at all — the tool genuinely unavailable. File
+    presence still satisfies readiness, but status must say 'unresolved',
+    never 'canonical' (never fake success for an unreachable check)."""
+    real = tmp_path / "output.npy"
+    real.write_bytes(b"\x93NUMPY")
+    out = await verify_target_readiness({"uri": str(real), "target_kind": "existing"})
+    assert out["ready"] is True
+    assert out["status"] == "unresolved"
+    assert "unavailable" in out["reason"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_meridian_outputs_resolver_raises_degrades(tmp_path):
+    """A figure_resolver that raises (tool present but unreachable) degrades
+    explicitly rather than silently reporting canonical."""
+    real = tmp_path / "output.json"
+    real.write_text("{}")
+
+    async def _boom(_outputs_dir, _path):
+        raise RuntimeError("outputs tunnel timeout")
+
+    out = await verify_target_readiness(
+        {"uri": str(real), "target_kind": "existing"}, figure_resolver=_boom,
+    )
+    assert out["ready"] is True
+    assert out["status"] == "degraded"
+    assert "timeout" in out["reason"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_default_figure_resolver_wraps_outputs_indexer(tmp_path):
+    """The core-local default figure_resolver (used when a caller wants real
+    resolution without injecting a stub) really does reuse
+    outputs_indexer.resolve_figure_output rather than duplicating resolution
+    policy — proven end-to-end against a real (tiny) outputs tree."""
+    outputs_dir = tmp_path / "outputs"
+    outputs_dir.mkdir()
+    csv_path = outputs_dir / "metrics.csv"
+    csv_path.write_text("epoch,loss\n1,0.5\n")
+
+    resolver = pointers_module._default_figure_resolver()
+    out = await verify_target_readiness(
+        {"uri": str(csv_path), "target_kind": "existing"},
+        outputs_dir=str(outputs_dir), figure_resolver=resolver,
+    )
+    assert out["ready"] is True
+    assert out["status"] == "canonical"
+    assert out["resolved"]["path"] == str(csv_path)
+
+
+# -- pointer-level wrapper -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_readiness_pointer_level_requires_every_target_ready(tmp_path):
+    good = tmp_path / "good.csv"
+    good.write_text("a\n1\n")
+    missing = tmp_path / "missing.csv"
+
+    ptr = {
+        "source_type": "experiment",
+        "label": "run artifacts",
+        "targets": [
+            {"uri": str(good), "target_kind": "existing"},
+            {"uri": str(missing), "target_kind": "existing"},
+        ],
+    }
+    out = await verify_pointer_readiness(ptr)
+    assert out["ready"] is False
+    assert out["label"] == "run artifacts"
+    assert out["targets"][0]["ready"] is True
+    assert out["targets"][1]["ready"] is False
+    assert out["targets"][1]["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_readiness_pointer_level_all_ready_when_every_target_passes(tmp_path):
+    a = tmp_path / "a.csv"
+    a.write_text("x\n")
+    b = tmp_path / "b.png"
+    b.write_bytes(b"\x89PNG")
+    ptr = {"source_type": "experiment", "targets": [
+        {"uri": str(a), "target_kind": "existing"},
+        {"uri": str(b), "target_kind": "existing"},
+    ]}
+    out = await verify_pointer_readiness(ptr)
+    assert out["ready"] is True
+    assert all(t["ready"] for t in out["targets"])
+
+
+@pytest.mark.asyncio
+async def test_readiness_pointer_level_empty_targets_never_vacuously_ready():
+    out = await verify_pointer_readiness({"source_type": "experiment", "targets": []})
+    assert out["ready"] is False
+    assert out["targets"] == []
+
+
+@pytest.mark.asyncio
+async def test_readiness_pointer_level_malformed_target_never_raises():
+    out = await verify_pointer_readiness({"source_type": "x", "targets": ["not-a-dict"]})
+    assert out["ready"] is False
+    assert out["targets"][0]["status"] == "malformed_target"

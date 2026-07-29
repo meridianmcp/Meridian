@@ -19,6 +19,12 @@ blocks to the hosted ``ingest_document_structure`` MCP tool, which stores them
 into the doc-structure store.  This makes find_similar_figure / index_figure /
 index_table / index_equation work correctly on locally-stored .docx files from
 hosted Meridian — the gap that fdbd4296 alone could NOT close.
+
+93cd9798 — also exposes :func:`check_render_capability`, a thin wrapper over
+:mod:`render_gate` that detects whether this environment can actually render
+a .docx for visual QA (LibreOffice headless / Word COM), returning one of
+exactly three states (rendered / unavailable-with-reason / failed) so a
+caller never mistakes "we could not check" for "we verified this renders".
 """
 from __future__ import annotations
 
@@ -28,6 +34,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import docs_intel
 from . import local_ingest
+from . import render_gate
 
 mcp = FastMCP("meridian-docs")
 
@@ -67,20 +74,38 @@ def index_document_structure(path: str, index_db_path: str) -> dict[str, Any]:
     detected by SEQ Figure field codes; tables by raw <w:tbl> blocks plus optional
     SEQ Table captions.
 
-    Returns {index_db, heading_count, figure_count, table_count}.
+    Returns {index_db, heading_count, figure_count, table_count, complete,
+    source_sha256}.
+
+    e9b2cd2b — complete is always True on a successful return (a failed/
+    interrupted run raises instead); source_sha256 is the SHA-256 fingerprint
+    of the source .docx bytes that were just indexed, so a caller can compare
+    it against a later re-fingerprint to detect drift out-of-band.
     """
     return docs_intel.index_docx_structure(path, index_db_path)
 
 
 @mcp.tool()
-def get_structure_elements(index_db_path: str) -> dict[str, Any]:
+def get_structure_elements(
+    index_db_path: str, allow_stale: bool = False
+) -> dict[str, Any]:
     """c39ae092 — retrieve all locally-stored structural elements from the sidecar.
 
     Returns {headings, figures, tables} lists from the docx_headings,
     docx_figures, docx_tables tables populated by index_document_structure.
     Returns empty lists for any table not yet populated.
+
+    e9b2cd2b — FAILS CLOSED by default: raises if the structural index is
+    stale (source .docx content changed since the last successful
+    index_document_structure run) or incomplete (that run never finished),
+    instead of returning partial/outdated counts as if they were
+    authoritative. Pass allow_stale=True to read the best-effort data anyway
+    — the result then includes a "freshness" key explaining why it wasn't
+    trusted.
     """
-    return docs_intel.get_local_structure_elements(index_db_path)
+    return docs_intel.get_local_structure_elements(
+        index_db_path, allow_stale=allow_stale
+    )
 
 
 @mcp.tool()
@@ -131,6 +156,37 @@ def highlight_document(
 def read_document_snapshot(docx_path: str) -> dict[str, Any]:
     """Read the last saved DOCX snapshot without writing or requiring a close."""
     return docs_intel.read_document_snapshot(docx_path)
+
+
+@mcp.tool()
+def check_render_capability(docx_path: str) -> dict[str, Any]:
+    """93cd9798 -- lightweight render-capability detection for visual QA.
+
+    This is capability DETECTION, not a rendering engine (mirrors the .pdf
+    boundary in ``ingest_local_document``, which also declines to embed a
+    rendering pipeline). Returns a dict with a ``status`` key that is exactly
+    one of three states:
+
+      - "rendered"                -- a real render backend (LibreOffice
+                                      headless, or Word COM on Windows) was
+                                      available and actually produced visual
+                                      output for this document. This is the
+                                      ONLY status that means "verified visual
+                                      QA" -- treat every other status as NOT
+                                      verified.
+      - "unavailable-with-reason" -- no render backend is installed/reachable
+                                      in this environment. ``reason`` names
+                                      every backend checked and why, never a
+                                      generic message. Says nothing about the
+                                      document itself.
+      - "failed"                  -- a backend was available but the render
+                                      attempt for this document errored.
+                                      ``reason`` carries the underlying error.
+                                      Never silently reported as "rendered".
+
+    See ``render_gate.check_render_capability`` for the full contract.
+    """
+    return render_gate.check_render_capability(docx_path)
 
 
 @mcp.tool()
