@@ -1108,3 +1108,399 @@ async def test_sprint_item_resource_claim_gate_rolls_back_earlier_resource_in_sa
     assert any(
         c["symbol_name"] == "foo" and c["session_id"] == holder["id"] for c in live_symbols
     )
+
+
+# ---------------------------------------------------------------------------
+# 22cad9b8 — atomic batch claim: claim_parallel_batch reserves an ENTIRE
+# parallel-safe batch (every item's status AND every declared resource)
+# atomically, before workers launch. Closes the gap between
+# get_parallelizable_groups computing a safe batch and each worker
+# individually calling claim_sprint_item afterward.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_disjoint_resources_all_succeed(db):
+    """The core happy path: a batch of items with pairwise-disjoint declared
+    resources all claim atomically, each item lands in_progress, and an
+    immutable 'claimed' manifest is persisted."""
+    p = await db_module.create_project(db, "batch-happy")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "b", touches_resources=["file:b.py"], prospect_bypass=True,
+    )
+    result = await db_module.claim_parallel_batch(
+        db, pid, sess["id"], [a["id"], b["id"]],
+    )
+    assert result["ok"] is True
+    assert set(result["claimed_item_ids"]) == {a["id"], b["id"]}
+    assert result["resources"] == ["file:a.py", "file:b.py"]
+    assert result["manifest"]["status"] == "claimed"
+
+    reread_a = await db_module.get_sprint_item(db, a["id"])
+    reread_b = await db_module.get_sprint_item(db, b["id"])
+    assert reread_a["status"] == "in_progress"
+    assert reread_b["status"] == "in_progress"
+    assert reread_a["actor"] == sess["id"]
+    assert reread_b["actor"] == sess["id"]
+
+    # Both file locks were really acquired under the claiming session.
+    fa = await db_module.get_file_claims(db, "a.py")
+    fb = await db_module.get_file_claims(db, "b.py")
+    assert fa["file_lock"]["session_id"] == sess["id"]
+    assert fb["file_lock"]["session_id"] == sess["id"]
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_distinct_item_sessions(db):
+    """item_sessions pre-assigns each item to the DISTINCT worker session that
+    will actually execute it — resources end up held under the session doing
+    the work, no hand-off needed once workers launch."""
+    p = await db_module.create_project(db, "batch-distinct-sessions")
+    pid = p["id"]
+    orchestrator = await db_module.register_session(db, pid, "orchestrator")
+    w1 = await db_module.register_session(db, pid, "worker-1")
+    w2 = await db_module.register_session(db, pid, "worker-2")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "b", touches_resources=["file:b.py"], prospect_bypass=True,
+    )
+    result = await db_module.claim_parallel_batch(
+        db, pid, orchestrator["id"], [a["id"], b["id"]],
+        item_sessions={a["id"]: w1["id"], b["id"]: w2["id"]},
+    )
+    assert result["ok"] is True
+    reread_a = await db_module.get_sprint_item(db, a["id"])
+    reread_b = await db_module.get_sprint_item(db, b["id"])
+    assert reread_a["actor"] == w1["id"]
+    assert reread_b["actor"] == w2["id"]
+    fa = await db_module.get_file_claims(db, "a.py")
+    fb = await db_module.get_file_claims(db, "b.py")
+    assert fa["file_lock"]["session_id"] == w1["id"]
+    assert fb["file_lock"]["session_id"] == w2["id"]
+    # The manifest itself still records the orchestrating session.
+    assert result["manifest"]["session_id"] == orchestrator["id"]
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_external_conflict_rolls_back_everything(db):
+    """If item B's resource is already held by ANOTHER live session, the
+    WHOLE batch fails cleanly: item A's already-claimed status/resource
+    (acquired earlier in this same call) must be rolled back too — no
+    partial-claim state left behind."""
+    p = await db_module.create_project(db, "batch-external-conflict")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    stranger = await db_module.register_session(db, pid, "stranger")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "b", touches_resources=["file:b.py"], prospect_bypass=True,
+    )
+    # A stranger session already holds file:b.py before the batch is attempted.
+    pre = await db_module.claim_file(db, "b.py", stranger["id"])
+    assert pre["claimed"] is True
+
+    result = await db_module.claim_parallel_batch(
+        db, pid, sess["id"], [a["id"], b["id"]],
+    )
+    assert result["ok"] is False
+    assert result["error"] == "BATCH_RESOURCE_CONFLICT"
+    assert result["item_id"] == b["id"]
+    assert result["holder_session_id"] == stranger["id"]
+
+    # Item a's claim (which succeeded before b's resource conflicted) was
+    # fully rolled back: status reverted to pending, no orphaned file lock.
+    reread_a = await db_module.get_sprint_item(db, a["id"])
+    assert reread_a["status"] == "pending"
+    assert reread_a["claimed_at"] is None
+    fa = await db_module.get_file_claims(db, "a.py")
+    assert fa["file_lock"] is None
+
+    # Item b was never claimed at all.
+    reread_b = await db_module.get_sprint_item(db, b["id"])
+    assert reread_b["status"] == "pending"
+
+    # The stranger's pre-existing lock on b.py is untouched.
+    fb = await db_module.get_file_claims(db, "b.py")
+    assert fb["file_lock"]["session_id"] == stranger["id"]
+
+    # The manifest recorded the failure — durable audit trail.
+    manifest = await db_module.get_batch_claim_manifest(
+        db, pid, db_module.compute_batch_key([a["id"], b["id"]]),
+    )
+    assert manifest["status"] == "failed"
+    assert manifest["failure_detail"]["error"] == "BATCH_RESOURCE_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_undeclared_resource_blocks_multi_item_batch(db):
+    """22cad9b8/de730a25 — an item with NO declared touches_resources can
+    never be PROVEN parallel-safe. Including it in a multi-item batch must be
+    refused outright (never silently treated as conflict-free), even though
+    its OTHER batch-mate has a perfectly valid declaration."""
+    p = await db_module.create_project(db, "batch-undeclared")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    u = await db_module.add_sprint_item(db, pid, "v1", "undeclared")  # no resources
+
+    result = await db_module.claim_parallel_batch(db, pid, sess["id"], [a["id"], u["id"]])
+    assert result["ok"] is False
+    assert result["error"] == "UNDECLARED_RESOURCE_IN_BATCH"
+    assert u["id"] in result["undeclared_item_ids"]
+
+    # Neither item was touched.
+    assert (await db_module.get_sprint_item(db, a["id"]))["status"] == "pending"
+    assert (await db_module.get_sprint_item(db, u["id"]))["status"] == "pending"
+    assert (await db_module.get_file_claims(db, "a.py"))["file_lock"] is None
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_undeclared_singleton_allowed(db):
+    """An undeclared item is fine as a batch OF ONE — nothing else in the
+    batch exists for it to conflict with, so the singleton exception applies
+    (mirrors get_parallelizable_groups' own undeclared-gets-its-own-group
+    behavior)."""
+    p = await db_module.create_project(db, "batch-undeclared-singleton")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    u = await db_module.add_sprint_item(db, pid, "v1", "solo undeclared")
+    result = await db_module.claim_parallel_batch(db, pid, sess["id"], [u["id"]])
+    assert result["ok"] is True
+    assert result["claimed_item_ids"] == [u["id"]]
+    assert (await db_module.get_sprint_item(db, u["id"]))["status"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_composition_conflict_rejected(db):
+    """22cad9b8 — if the requested batch is NOT actually internally
+    conflict-free (a stale/hand-assembled batch), the whole request is
+    refused up front with a structured error naming the conflicting pair —
+    no manifest is persisted, nothing is claimed."""
+    p = await db_module.create_project(db, "batch-composition-conflict")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    c = await db_module.add_sprint_item(
+        db, pid, "v1", "c", touches_resources=["file:a.py"], prospect_bypass=True,
+        force=True,  # same-file declaration as 'a' -- title would also dup-guard
+    )
+    result = await db_module.claim_parallel_batch(db, pid, sess["id"], [a["id"], c["id"]])
+    assert result["ok"] is False
+    assert result["error"] == "BATCH_COMPOSITION_CONFLICT"
+    assert len(result["conflicting_pairs"]) == 1
+    pair = result["conflicting_pairs"][0]
+    assert {pair["item_a"], pair["item_b"]} == {a["id"], c["id"]}
+
+    assert (await db_module.get_sprint_item(db, a["id"]))["status"] == "pending"
+    assert (await db_module.get_sprint_item(db, c["id"]))["status"] == "pending"
+    # No manifest was ever persisted for this doomed-from-the-start batch.
+    manifest = await db_module.get_batch_claim_manifest(
+        db, pid, db_module.compute_batch_key([a["id"], c["id"]]),
+    )
+    assert manifest is None
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_symbol_level_disjoint_succeeds(db):
+    """22cad9b8/18c488b6 — two items claiming genuinely DISJOINT symbols in
+    the SAME file must both succeed atomically as part of one batch: the
+    atomic-batch mechanism must NOT regress fine-grained symbol-level
+    claiming into a coarser whole-file-only lock."""
+    p = await db_module.create_project(db, "batch-symbol-disjoint")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    item_foo = await db_module.add_sprint_item(
+        db, pid, "v1", "touch foo", touches_resources=["symbol:pkg/mod.py::foo"],
+        prospect_bypass=True,
+    )
+    item_bar = await db_module.add_sprint_item(
+        db, pid, "v1", "touch bar", touches_resources=["symbol:pkg/mod.py::bar"],
+        prospect_bypass=True, force=True,
+    )
+    result = await db_module.claim_parallel_batch(
+        db, pid, sess["id"], [item_foo["id"], item_bar["id"]],
+        resource_contents={"pkg/mod.py": _FOO_BAR_SRC},
+    )
+    assert result["ok"] is True
+    assert set(result["claimed_item_ids"]) == {item_foo["id"], item_bar["id"]}
+
+    live_symbols = await db_module.get_symbol_claims(db, "pkg/mod.py")
+    names = {s["symbol_name"] for s in live_symbols}
+    assert names == {"foo", "bar"}
+    # Neither claim escalated to a whole-file lock.
+    assert (await db_module.get_file_claims(db, "pkg/mod.py"))["file_lock"] is None
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_file_vs_symbol_conflict_rejected(db):
+    """22cad9b8/63b030a6 — a whole-file declaration and a symbol declaration
+    on that same file conflict under the file⊃symbol hierarchy, so a batch
+    combining them is rejected as an internal composition conflict."""
+    p = await db_module.create_project(db, "batch-file-symbol-conflict")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    whole = await db_module.add_sprint_item(
+        db, pid, "v1", "whole file", touches_resources=["file:pkg/mod.py"],
+        prospect_bypass=True,
+    )
+    one_symbol = await db_module.add_sprint_item(
+        db, pid, "v1", "one symbol", touches_resources=["symbol:pkg/mod.py::foo"],
+        prospect_bypass=True, force=True,
+    )
+    result = await db_module.claim_parallel_batch(
+        db, pid, sess["id"], [whole["id"], one_symbol["id"]],
+    )
+    assert result["ok"] is False
+    assert result["error"] == "BATCH_COMPOSITION_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_persists_immutable_manifest(db):
+    """Acceptance #1 — a successful batch claim leaves a durable, auditable
+    manifest recording exactly which items and which resources were in the
+    batch."""
+    p = await db_module.create_project(db, "batch-manifest-audit")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "b", touches_resources=["symbol:b.py::foo"], prospect_bypass=True,
+    )
+    result = await db_module.claim_parallel_batch(
+        db, pid, sess["id"], [a["id"], b["id"]],
+        resource_contents={"b.py": _FOO_BAR_SRC},
+    )
+    assert result["ok"] is True
+    batch_key = db_module.compute_batch_key([a["id"], b["id"]])
+    manifest = await db_module.get_batch_claim_manifest(db, pid, batch_key)
+    assert manifest is not None
+    assert manifest["status"] == "claimed"
+    assert manifest["session_id"] == sess["id"]
+    assert set(manifest["item_ids"]) == {a["id"], b["id"]}
+    assert set(manifest["resources"]) == {"file:a.py", "symbol:b.py::foo"}
+    assert manifest["item_resource_map"][a["id"]] == ["file:a.py"]
+    assert manifest["item_resource_map"][b["id"]] == ["symbol:b.py::foo"]
+    assert manifest["superseded_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_manifest_immutable_without_force(db):
+    """Mirrors eb2e44f8's immutability contract: re-attempting the EXACT same
+    item set while an active manifest already exists is refused unless
+    force_manifest=True — never a silent overwrite."""
+    p = await db_module.create_project(db, "batch-manifest-immutable")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    first = await db_module.claim_parallel_batch(db, pid, sess["id"], [a["id"]])
+    assert first["ok"] is True
+
+    # Directly exercise the low-level immutability guard (persist_batch_claim_manifest)
+    # the same way worktree_manifest.persist_worktree_manifest is tested: a second
+    # persist for the SAME (project_id, batch_key) without force=True raises.
+    with pytest.raises(ValueError):
+        await db_module.persist_batch_claim_manifest(
+            db, pid, sess["id"], [a["id"]], {a["id"]: ["file:a.py"]}, ["file:a.py"],
+        )
+
+    # force=True explicitly supersedes instead of silently overwriting.
+    superseded = await db_module.persist_batch_claim_manifest(
+        db, pid, sess["id"], [a["id"]], {a["id"]: ["file:a.py"]}, ["file:a.py"],
+        force=True, reason="test supersede",
+    )
+    assert superseded["status"] == "pending"
+    history = await db_module.get_batch_claim_manifest_history(
+        db, pid, db_module.compute_batch_key([a["id"]]),
+    )
+    assert len(history) == 2
+    superseded_row = next(h for h in history if h["id"] != superseded["id"])
+    assert superseded_row["superseded_at"] is not None
+    assert superseded_row["superseded_reason"] == "test supersede"
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_item_not_found(db):
+    p = await db_module.create_project(db, "batch-item-not-found")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    result = await db_module.claim_parallel_batch(db, pid, sess["id"], ["nonexistent-id"])
+    assert result["ok"] is False
+    assert result["error"] == "ITEM_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_requires_session_id_and_item_ids(db):
+    p = await db_module.create_project(db, "batch-bad-args")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    with pytest.raises(ValueError):
+        await db_module.claim_parallel_batch(db, pid, "", ["x"])
+    with pytest.raises(ValueError):
+        await db_module.claim_parallel_batch(db, pid, sess["id"], [])
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_via_mcp_handler(db):
+    """The MCP tool wrapper (claim_parallel_batch) routes through
+    _dispatch_mcp_tool exactly like claim_sprint_item does."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "batch-mcp-handler")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "b", touches_resources=["file:b.py"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_parallel_batch",
+        {"project_id": pid, "session_id": sess["id"], "item_ids": [a["id"], b["id"]]},
+        db, "/tmp",
+    )
+    assert result["ok"] is True
+    assert set(result["claimed_item_ids"]) == {a["id"], b["id"]}
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_end_to_end_from_parallelizable_groups(db):
+    """Integration: a batch computed by get_parallelizable_groups is fed
+    straight into claim_parallel_batch and claims cleanly end-to-end."""
+    p = await db_module.create_project(db, "batch-e2e-groups")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    await db_module.add_sprint_item(
+        db, pid, "v1", "b", touches_resources=["file:b.py"], prospect_bypass=True,
+    )
+    groups = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert groups["group_count"] == 1
+    batch_item_ids = [it["id"] for it in groups["groups"][0]]
+
+    result = await db_module.claim_parallel_batch(db, pid, sess["id"], batch_item_ids)
+    assert result["ok"] is True
+    assert set(result["claimed_item_ids"]) == set(batch_item_ids)
+
+    # The batch no longer shows up as eligible (both items are in_progress now).
+    groups_after = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert groups_after["eligible_count"] == 0

@@ -2638,6 +2638,42 @@ async def _migrate_pg_wave_base_manifests(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_batch_claims(conn: PostgresConnection) -> None:
+    """22cad9b8 — immutable sprint_batch_claims: atomic parallel-batch claim
+    manifests, mirroring wave_base_manifests' immutability pattern.
+
+    Creates sprint_batch_claims on existing Postgres DBs. Not present in the
+    base CREATE_TABLES_CORE literal — this guarded migration is the only
+    creation path on Postgres, matching _migrate_pg_wave_base_manifests.
+
+    The partial unique index (``WHERE superseded_at IS NULL``) is the
+    schema-level half of the immutability contract described in
+    db.batch_claim's module docstring: only one ACTIVE manifest may exist
+    per (project_id, batch_key) at a time.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS sprint_batch_claims ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    session_id TEXT NOT NULL,"
+        "    batch_key TEXT NOT NULL,"
+        "    item_ids TEXT NOT NULL,"
+        "    item_resource_map TEXT NOT NULL,"
+        "    resources TEXT NOT NULL,"
+        "    status TEXT NOT NULL DEFAULT 'pending',"
+        "    failure_detail TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    resolved_at TEXT,"
+        "    superseded_at TEXT,"
+        "    superseded_reason TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_sprint_batch_claims_project "
+        "ON sprint_batch_claims(project_id);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sprint_batch_claims_active "
+        "ON sprint_batch_claims(project_id, batch_key) WHERE superseded_at IS NULL;"
+    )
+
+
 async def _migrate_pg_sprint_version_descriptions(conn: PostgresConnection) -> None:
     """f9188526 — sprint_version_descriptions: per-version-bucket summary text.
 
@@ -3930,4 +3966,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_docx_merge_manifests,
     _migrate_pg_proposal_evidence_links,
     _migrate_pg_wave_base_manifests,
+    _migrate_pg_sprint_batch_claims,
 )
