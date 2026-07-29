@@ -14,6 +14,7 @@ of N" instead of silently implying only 3 pending items exist.
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -464,3 +465,106 @@ async def test_goal_mode_scope_equals_requested_pending_items_exactly(db, tmp_pa
         if tok.strip().rstrip(".")
     }
     assert emitted_ids == ids_v1
+
+
+# ---------------------------------------------------------------------------
+# 70c10ca3 (b730 follow-up) — _build_artifact_pointer_findings_clause: the
+# batch /goal's own ``<artifact_pointer_findings>`` XML surface for 88f82c15's
+# warn/strict artifact-pointer verdict enriched with 3196ba0e's readiness
+# verification, so a MULTI-item /goal run sees the warning inline too — not
+# only when a caller separately requests a single-item build_item_briefing.
+# ---------------------------------------------------------------------------
+
+
+def test_build_artifact_pointer_findings_clause_empty_for_no_data():
+    assert handoff_module._build_artifact_pointer_findings_clause([]) == ""
+    # No warning active for this item -> still empty.
+    assert handoff_module._build_artifact_pointer_findings_clause(
+        [{"id": "x", "artifact_pointer_finding": None}]
+    ) == ""
+
+
+def test_build_artifact_pointer_findings_clause_embeds_canonical_json():
+    from meridian import pointers as pointers_module
+
+    items = [{
+        "id": "item-1",
+        "artifact_pointer_finding": {
+            "item_id": "item-1",
+            "warning_code": "insufficient_pointer_bare_docx",
+            "pointer_status": "weak",
+            "ready": False,
+            "affected_pointer_ids": ["ptr-1"],
+            "target_readiness": [{"pointer_id": "ptr-1", "ready": False, "targets": []}],
+        },
+    }]
+    out = handoff_module._build_artifact_pointer_findings_clause(items)
+    assert out.startswith("\n<artifact_pointer_findings>")
+    assert out.endswith("</artifact_pointer_findings>")
+    body = out[len("\n<artifact_pointer_findings>"):-len("</artifact_pointer_findings>")]
+    embedded = json.loads(body)
+    assert embedded == pointers_module.assemble_artifact_pointer_findings_from_annotated_items(items)
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_renders_artifact_pointer_findings_clause(db, tmp_path):
+    p = await db_module.create_project(db, "goal-mode-artifact-findings")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    assert "<artifact_pointer_findings>" in content
+    start = content.index("<artifact_pointer_findings>") + len("<artifact_pointer_findings>")
+    end = content.index("</artifact_pointer_findings>")
+    findings = json.loads(content[start:end])
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding["item_id"] == item["id"]
+    assert finding["warning_code"] == "insufficient_pointer_bare_docx"
+    assert finding["pointer_status"] == "weak"
+    assert finding["ready"] is False
+    assert finding["affected_pointer_ids"] == [str(stored["id"])]
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_omits_artifact_pointer_findings_when_no_warning(db, tmp_path):
+    p = await db_module.create_project(db, "goal-mode-artifact-findings-none")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Renumber figure captions")
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    assert "<artifact_pointer_findings>" not in content
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_artifact_pointer_findings_deterministic(db, tmp_path):
+    """Repeated calls against IDENTICAL DB state must render byte-identical
+    <artifact_pointer_findings> content — apart from the single-use goal_token
+    (the only field allowed to differ)."""
+    p = await db_module.create_project(db, "goal-mode-artifact-findings-determinism")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+
+    _, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    _, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    assert _strip_goal_token(content_a) == _strip_goal_token(content_b)

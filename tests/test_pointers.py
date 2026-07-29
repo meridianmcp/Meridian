@@ -1686,3 +1686,262 @@ def test_off_mode_with_insufficient_pointer_also_suppresses():
     result = evaluate_artifact_pointer_policy(item)
     assert result["warning_code"] is None
     assert result["ready"] is True
+
+
+# ---------------------------------------------------------------------------
+# 70c10ca3 (b730 follow-up) — build_artifact_pointer_finding /
+# assemble_artifact_pointer_findings_from_annotated_items: combine 88f82c15's
+# warn/strict policy verdict with 3196ba0e's fail-closed readiness
+# verification into ONE canonical, machine-readable finding.
+# ---------------------------------------------------------------------------
+
+from meridian.pointers import build_artifact_pointer_finding  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_none_when_no_active_warning():
+    """A genuinely non-sensitive item produces no finding at all — mirrors
+    evaluate_artifact_pointer_policy's own restraint."""
+    item = {"id": "art-1", "title": "Renumber figure captions"}
+    out = await build_artifact_pointer_finding(item)
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_missing_pointer_status():
+    """No candidate pointer at all -> pointer_status 'missing', and an empty
+    target_readiness (there is no durable row to verify)."""
+    item = _figure_item(artifact_policy=_WARN_POLICY)
+    out = await build_artifact_pointer_finding(item)
+    assert out is not None
+    assert out["warning_code"] == "missing_pointer"
+    assert out["pointer_status"] == "missing"
+    assert out["affected_pointer_ids"] == []
+    assert out["target_readiness"] == []
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_weak_pointer_status_and_readiness(tmp_path):
+    """A bare .docx durable pointer -> pointer_status 'weak', and its
+    readiness IS verified (via the default core-local figure_resolver) for
+    the implicated pointer id."""
+    docx = tmp_path / "report.docx"
+    docx.write_bytes(b"PK\x03\x04")  # a real file on disk
+    item = _figure_item(
+        artifact_policy=_STRICT_POLICY,
+        pointer_records=[{
+            "id": "ptr-1",
+            "source_type": "docs",
+            "targets": [{"uri": str(docx), "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+        }],
+    )
+    stored_pointers = [{"id": "ptr-1", "targets": [{"uri": str(docx), "target_kind": "existing"}]}]
+    out = await build_artifact_pointer_finding(item, stored_pointers=stored_pointers)
+    assert out is not None
+    assert out["warning_code"] == "insufficient_pointer_bare_docx"
+    assert out["pointer_status"] == "weak"
+    assert out["affected_pointer_ids"] == ["ptr-1"]
+    assert len(out["target_readiness"]) == 1
+    entry = out["target_readiness"][0]
+    assert entry["pointer_id"] == "ptr-1"
+    # entry is the FULL verify_pointer_readiness result for this pointer
+    # (pointer-level ready + a per-target verdict list), plus pointer_id.
+    assert entry["ready"] is True
+    assert len(entry["targets"]) == 1
+    target_verdict = entry["targets"][0]
+    # The DEFAULT figure_resolver was genuinely consulted (not merely
+    # "figure_resolver is None -> unavailable") — proven by the distinct
+    # "not found in the meridian-outputs index" reason text only that branch
+    # produces (see verify_target_readiness).
+    assert target_verdict["status"] == "unresolved"
+    assert "meridian-outputs index" in target_verdict["reason"]
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_target_readiness_missing_when_file_absent(tmp_path):
+    absent = tmp_path / "does_not_exist.docx"
+    item = _figure_item(
+        artifact_policy=_STRICT_POLICY,
+        pointer_records=[{
+            "id": "ptr-missing",
+            "source_type": "docs",
+            "targets": [{"uri": str(absent), "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+        }],
+    )
+    stored_pointers = [{"id": "ptr-missing", "targets": [{"uri": str(absent), "target_kind": "existing"}]}]
+    out = await build_artifact_pointer_finding(item, stored_pointers=stored_pointers)
+    entry = out["target_readiness"][0]
+    assert entry["ready"] is False
+    assert entry["targets"][0]["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_consumes_injected_figure_resolver(tmp_path):
+    """canonical / archival / ambiguous all propagate through target_readiness
+    when a caller injects a stub figure_resolver — proving readiness data,
+    not just file-presence, is genuinely consumed end to end."""
+    stale = tmp_path / "run_old.docx"
+    stale.write_bytes(b"PK\x03\x04")
+    item = _figure_item(
+        artifact_policy=_STRICT_POLICY,
+        pointer_records=[{
+            "id": "ptr-archival",
+            "source_type": "docs",
+            "targets": [{"uri": str(stale), "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+        }],
+    )
+    stored_pointers = [{"id": "ptr-archival", "targets": [{"uri": str(stale), "target_kind": "existing"}]}]
+
+    async def _archival_resolver(_outputs_dir, file_path):
+        return {"path": file_path, "is_archival": True, "canonical_path": "run.docx"}
+
+    out = await build_artifact_pointer_finding(
+        item, stored_pointers=stored_pointers, figure_resolver=_archival_resolver,
+    )
+    entry = out["target_readiness"][0]
+    assert entry["ready"] is True
+    target_verdict = entry["targets"][0]
+    assert target_verdict["status"] == "archival"
+    assert target_verdict["resolved"]["canonical_path"] == "run.docx"
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_reuses_supplied_policy_result_verbatim():
+    """policy_result, when given, is used AS-IS — no independent
+    recomputation from `item` (proven by an item that would otherwise
+    classify as non-sensitive/None)."""
+    canned_policy = {
+        "item_id": "hand-crafted",
+        "classification": {"classification": "table", "is_artifact_sensitive": True},
+        "policy": {"artifact_pointer_check": "warn"},
+        "warning_code": "insufficient_pointer_directory",
+        "required_remediation": "point at the file, not the directory",
+        "affected_pointer_ids": [],
+        "ready": True,
+    }
+    out = await build_artifact_pointer_finding({}, policy_result=canned_policy)
+    assert out["item_id"] == "hand-crafted"
+    assert out["warning_code"] == "insufficient_pointer_directory"
+    assert out["pointer_status"] == "weak"
+    assert out["target_readiness"] == []
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_multiple_affected_ids_sorted(tmp_path):
+    a = tmp_path / "a.docx"
+    a.write_bytes(b"PK")
+    b = tmp_path / "b.docx"
+    b.write_bytes(b"PK")
+    canned_policy = {
+        "item_id": "multi",
+        "classification": {}, "policy": {},
+        "warning_code": "insufficient_pointer_bare_docx",
+        "required_remediation": "x",
+        "affected_pointer_ids": ["ptr-b", "ptr-a"],
+        "ready": True,
+    }
+    stored_pointers = [
+        {"id": "ptr-b", "targets": [{"uri": str(b), "target_kind": "existing"}]},
+        {"id": "ptr-a", "targets": [{"uri": str(a), "target_kind": "existing"}]},
+    ]
+    out = await build_artifact_pointer_finding(
+        {}, policy_result=canned_policy, stored_pointers=stored_pointers,
+    )
+    assert [t["pointer_id"] for t in out["target_readiness"]] == ["ptr-a", "ptr-b"]
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_readiness_failure_degrades_not_raises(monkeypatch):
+    canned_policy = {
+        "item_id": "boom-item",
+        "classification": {}, "policy": {},
+        "warning_code": "insufficient_pointer_bare_docx",
+        "required_remediation": "x",
+        "affected_pointer_ids": ["ptr-boom"],
+        "ready": True,
+    }
+    stored_pointers = [{"id": "ptr-boom", "targets": [{"uri": "x.docx", "target_kind": "existing"}]}]
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("readiness check exploded")
+
+    monkeypatch.setattr(pointers_module, "verify_pointer_readiness", _boom)
+    out = await build_artifact_pointer_finding(
+        {}, policy_result=canned_policy, stored_pointers=stored_pointers,
+    )
+    assert out is not None
+    entry = out["target_readiness"][0]
+    assert entry["pointer_id"] == "ptr-boom"
+    assert entry["ready"] is False
+    assert entry["status"] == "verification_error"
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_missing_affected_pointer_id_skipped():
+    """An affected_pointer_ids entry with no matching stored_pointers row is
+    silently skipped (never crashes, never fabricates a verdict) — even when
+    OTHER stored_pointers rows exist (proves it's an id-match miss, not just
+    an empty stored_pointers short-circuit)."""
+    canned_policy = {
+        "item_id": "orphan",
+        "classification": {}, "policy": {},
+        "warning_code": "insufficient_pointer_directory",
+        "required_remediation": "x",
+        "affected_pointer_ids": ["ptr-does-not-exist"],
+        "ready": True,
+    }
+    out = await build_artifact_pointer_finding(
+        {}, policy_result=canned_policy,
+        stored_pointers=[{"id": "ptr-unrelated", "targets": [{"uri": "x.docx", "target_kind": "existing"}]}],
+    )
+    assert out["target_readiness"] == []
+
+
+def test_build_artifact_pointer_finding_never_raises_on_evaluate_blowup(monkeypatch):
+    """A raising evaluate_artifact_pointer_policy (no policy_result supplied)
+    degrades to None, never crashes this mandatory annotation path."""
+    def _boom(_item):
+        raise RuntimeError("classification exploded")
+
+    monkeypatch.setattr(pointers_module, "evaluate_artifact_pointer_policy", _boom)
+    import asyncio as _asyncio
+    out = _asyncio.run(build_artifact_pointer_finding({"id": "x"}))
+    assert out is None
+
+
+# ---------------------------------------------------------------------------
+# assemble_artifact_pointer_findings_from_annotated_items — pure assembly
+# ---------------------------------------------------------------------------
+
+from meridian.pointers import (  # noqa: E402
+    assemble_artifact_pointer_findings_from_annotated_items,
+)
+
+
+def test_assemble_artifact_pointer_findings_empty_when_none_active():
+    items = [{"id": "a", "title": "no problem here"}]
+    assert assemble_artifact_pointer_findings_from_annotated_items(items) == []
+
+
+def test_assemble_artifact_pointer_findings_skips_items_with_none_finding():
+    items = [{"id": "a", "artifact_pointer_finding": None}]
+    assert assemble_artifact_pointer_findings_from_annotated_items(items) == []
+
+
+def test_assemble_artifact_pointer_findings_sorted_by_item_id():
+    items = [
+        {"id": "zzz", "artifact_pointer_finding": {"item_id": "zzz", "warning_code": "missing_pointer"}},
+        {"id": "aaa", "artifact_pointer_finding": {"item_id": "aaa", "warning_code": "missing_pointer"}},
+    ]
+    out = assemble_artifact_pointer_findings_from_annotated_items(items)
+    assert [e["item_id"] for e in out] == ["aaa", "zzz"]
+
+
+def test_assemble_artifact_pointer_findings_ignores_malformed_entries():
+    items = [
+        "not-a-dict",
+        {"artifact_pointer_finding": {"item_id": "no-id"}},  # missing top-level id
+        {"id": "ok", "artifact_pointer_finding": {"item_id": "ok", "warning_code": "missing_pointer"}},
+    ]
+    out = assemble_artifact_pointer_findings_from_annotated_items(items)
+    assert [e["item_id"] for e in out] == ["ok"]

@@ -583,6 +583,79 @@ async def test_annotate_resolved_pointers_not_sensitive_item_no_policy_warning(d
 
 
 # ---------------------------------------------------------------------------
+# 70c10ca3 (b730 follow-up) — artifact_pointer_finding wiring:
+# _annotate_resolved_pointers ALSO attaches the SAME policy verdict enriched
+# with 3196ba0e's fail-closed readiness verification (canonical/archival/
+# unresolved/ambiguous/missing/...) for every implicated pointer, so the
+# JSON/capability_contract projection (and generate_handoff's response
+# metadata) carries the identical finding the human XML clause already did
+# — not just prose.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_attaches_artifact_pointer_finding_none_when_no_warning(db):
+    p = await db_module.create_project(db, "artifact-finding-safe")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Renumber figure captions")
+    items = [{"id": item["id"], "title": item["title"]}]
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], items)
+    # An item with no active warning contributes no finding at all — mirrors
+    # artifact_pointer_policy's own "nothing to say" restraint.
+    assert out[0]["artifact_pointer_finding"] is None
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_attaches_artifact_pointer_finding_for_weak_pointer(db):
+    p = await db_module.create_project(db, "artifact-finding-weak")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{
+            "uri": "outputs/report.docx",
+            "selector": {"type": "range", "start_line": 1, "end_line": 1},
+        }],
+    )
+    items = [{"id": item["id"], "title": item["title"], "artifact_policy": item["artifact_policy"]}]
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], items)
+    finding = out[0]["artifact_pointer_finding"]
+    assert finding is not None
+    # The SAME canonical fields artifact_pointer_policy already carried...
+    assert finding["warning_code"] == "insufficient_pointer_bare_docx"
+    assert finding["ready"] is False
+    assert finding["affected_pointer_ids"] == [str(stored["id"])]
+    # ...PLUS the new pointer_status + readiness verification this item adds.
+    assert finding["pointer_status"] == "weak"
+    assert len(finding["target_readiness"]) == 1
+    tr = finding["target_readiness"][0]
+    assert tr["pointer_id"] == str(stored["id"])
+    # "outputs/report.docx" is a relative path that does not exist on disk
+    # from the test working directory — the fail-closed readiness check
+    # must report it as genuinely missing, never silently ready.
+    assert tr["ready"] is False
+    assert tr["targets"][0]["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_artifact_pointer_finding_missing_pointer_status(db):
+    """Zero candidate pointers at all -> pointer_status 'missing' and an
+    empty target_readiness (there's no durable row to verify)."""
+    p = await db_module.create_project(db, "artifact-finding-missing")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Insert a new ablation chart figure into the results",
+        artifact_policy={"artifact_pointer_check": "warn"},
+    )
+    items = [{"id": item["id"], "title": item["title"], "artifact_policy": item["artifact_policy"]}]
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], items)
+    finding = out[0]["artifact_pointer_finding"]
+    assert finding["warning_code"] == "missing_pointer"
+    assert finding["pointer_status"] == "missing"
+    assert finding["target_readiness"] == []
+
+
+# ---------------------------------------------------------------------------
 # _build_artifact_policy_blocking_warnings — pure, no DB needed
 # ---------------------------------------------------------------------------
 

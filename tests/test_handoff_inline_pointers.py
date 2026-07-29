@@ -336,3 +336,60 @@ async def test_resolved_pointer_text_matches_executor_contract_structured_target
     )
     assert expected_location in content
     assert expected_location == "meridian/db/migrations.py:100-120"
+
+
+# ---------------------------------------------------------------------------
+# 70c10ca3 (b730 follow-up) — artifact_pointer_finding rides the SAME
+# _annotate_resolved_pointers pass as resolved_pointers/pointer_records: it
+# must coexist with the legacy fields, never crowd them out, and the batch
+# /goal's <artifact_pointer_findings> clause must render in EVERY mode that
+# shares _build_quick_start_goal (full/delta too, not only goal-only mode).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_sets_artifact_pointer_finding_alongside_legacy_fields(db):
+    """A single resolve pass sets resolved_pointers, pointer_records,
+    artifact_pointer_policy, AND artifact_pointer_finding together — one
+    canonical finding feeding every downstream representation, never a
+    second independent resolve pass."""
+    p = await db_module.create_project(db, "inline-plus-artifact-finding")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "warn"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+        label="report site",
+    )
+    items = [{"id": item["id"], "title": item["title"], "artifact_policy": item["artifact_policy"]}]
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], items)
+    it = out[0]
+    assert it["resolved_pointers"]
+    assert it["pointer_records"]
+    assert it["artifact_pointer_policy"]["warning_code"] == "insufficient_pointer_bare_docx"
+    assert it["artifact_pointer_finding"]["warning_code"] == "insufficient_pointer_bare_docx"
+    assert it["artifact_pointer_finding"]["pointer_status"] == "weak"
+
+
+@pytest.mark.asyncio
+async def test_full_mode_renders_artifact_pointer_findings_clause_too(db, tmp_path):
+    """_build_quick_start_goal is shared by full/delta and goal-only mode —
+    the new clause must appear in full mode's embedded /goal block too, not
+    only in mode='goal'."""
+    p = await db_module.create_project(db, "inline-full-mode-artifact-findings")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
+    )
+    assert "<artifact_pointer_findings>" in content

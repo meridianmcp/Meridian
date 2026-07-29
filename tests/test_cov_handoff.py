@@ -2521,6 +2521,137 @@ async def test_sprint_item_pointers_xml_clause_matches_capability_contract_json(
     assert any(e["item_id"] == item["id"] for e in from_xml)
 
 
+async def test_artifact_pointer_findings_xml_clause_matches_capability_contract_json(db, tmp_path):
+    """70c10ca3 (b730 follow-up) — the batch /goal's <artifact_pointer_findings>
+    clause and capability_contract's item_artifact_pointer_findings section
+    must carry IDENTICAL data for the SAME request, proven through the REAL
+    MCP generate_handoff dispatch (mirrors the tool_requirements/
+    sprint_item_pointers parity tests immediately above)."""
+    p = await db_module.create_project(db, "parity-artifact-findings")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    from_xml = json.loads(_extract_xml_tag_body(result["content"], "artifact_pointer_findings"))
+    assert from_xml == result["capability_contract"]["item_artifact_pointer_findings"]
+    assert len(from_xml) == 1
+    finding = from_xml[0]
+    assert finding["item_id"] == item["id"]
+    assert finding["warning_code"] == "insufficient_pointer_bare_docx"
+    assert finding["pointer_status"] == "weak"
+    assert finding["ready"] is False
+    assert finding["affected_pointer_ids"] == [str(stored["id"])]
+    # The readiness verification (3196ba0e) genuinely ran: a relative
+    # "outputs/report.docx" path does not exist from the test cwd.
+    assert finding["target_readiness"][0]["ready"] is False
+    assert finding["target_readiness"][0]["targets"][0]["status"] == "missing"
+
+
+async def test_artifact_pointer_findings_absent_when_no_active_warning(db, tmp_path):
+    p = await db_module.create_project(db, "parity-artifact-findings-none")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Renumber figure captions")
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert "<artifact_pointer_findings>" not in result["content"]
+    assert result["capability_contract"]["item_artifact_pointer_findings"] == []
+
+
+async def test_build_capability_contract_item_artifact_pointer_findings_empty_project(db):
+    p = await db_module.create_project(db, "artifact-findings-empty-contract")
+    contract = await cc.build_capability_contract(db, p["id"])
+    assert contract["item_artifact_pointer_findings"] == []
+
+
+async def test_extract_artifact_pointer_findings_self_fetch_matches_pre_annotated(db):
+    """Whether the caller pre-annotates items (via _annotate_resolved_pointers)
+    or passes raw items and lets extract_artifact_pointer_findings self-fetch
+    + resolve + verify readiness, the two paths must produce identical typed
+    output for the same underlying data."""
+    p = await db_module.create_project(db, "artifact-findings-self-fetch")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "warn"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+
+    raw_items = [dict(item)]
+    self_fetched = await cc.extract_artifact_pointer_findings(db, p["id"], raw_items)
+
+    annotated_items = [dict(item)]
+    await handoff_module._annotate_resolved_pointers(db, p["id"], annotated_items)
+    pre_annotated = await cc.extract_artifact_pointer_findings(db, p["id"], annotated_items)
+
+    assert self_fetched == pre_annotated
+    assert self_fetched[0]["item_id"] == item["id"]
+    assert self_fetched[0]["warning_code"] == "insufficient_pointer_bare_docx"
+
+
+async def test_build_capability_contract_accepts_explicit_items_override_for_artifact_findings(db):
+    p = await db_module.create_project(db, "artifact-findings-explicit-items")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "warn"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    items = [dict(item)]
+    contract = await cc.build_capability_contract(db, p["id"], items=items)
+    expected = await cc.extract_artifact_pointer_findings(db, p["id"], items)
+    assert contract["item_artifact_pointer_findings"] == expected
+
+
+async def test_generate_handoff_artifact_pointer_findings_deterministic_across_repeated_mcp_calls(
+    db, tmp_path
+):
+    """Same byte-stability guarantee the sibling capability_contract test
+    above proves, specific to the new item_artifact_pointer_findings section
+    and its <artifact_pointer_findings> XML twin."""
+    p = await db_module.create_project(db, "determinism-artifact-findings")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    result_a = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    result_b = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert (
+        result_a["capability_contract"]["item_artifact_pointer_findings"]
+        == result_b["capability_contract"]["item_artifact_pointer_findings"]
+    )
+    from_xml_a = json.loads(_extract_xml_tag_body(result_a["content"], "artifact_pointer_findings"))
+    from_xml_b = json.loads(_extract_xml_tag_body(result_b["content"], "artifact_pointer_findings"))
+    assert from_xml_a == from_xml_b
+    assert _strip_goal_token(result_a["content"]) == _strip_goal_token(result_b["content"])
+
+
 # ---------------------------------------------------------------------------
 # (4) Requested-vs-emitted scope fidelity — every pending item for the
 # requested version is visible SOMEWHERE (claimable batch or a structured
