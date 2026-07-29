@@ -4940,10 +4940,41 @@ async def _handle_tunnel_tools(
                 "hosted": True,
             }
 
+        # 525d86bb — persist a durable lifecycle record BEFORE dispatch, then
+        # consume it with the REAL result of the ONE synchronous wait below —
+        # never from any other code path. See db.verification_runs for the
+        # full contract (no detached monitor can complete a run; ambiguous
+        # evidence — e.g. status='ok' with no real exit_code — is rejected).
+        run_record = await db_module.create_verification_run(
+            db,
+            project_id,
+            test_cmd,
+            cwd=repo_path or None,
+            worktree=(exec_cfg.get("worktree") or "").strip() or None,
+            actor=tenant_id,
+        )
+
         result = await _tunnel_mod.send_run_cmd_control(
             tenant_id,
             cmd=test_cmd,
             cwd=repo_path or None,
+        )
+
+        # Consume the persisted record with the real, synchronous outcome —
+        # this call is the ONLY place a verification run is ever marked
+        # complete, and it only ever runs immediately after awaiting the
+        # genuine send_run_cmd_control result above (criterion: no detached
+        # monitor can report completion).
+        completed_run = await db_module.complete_verification_run(
+            db,
+            run_record["id"],
+            status=result.get("status") or "error",
+            exit_code=result.get("exit_code"),
+            passed=result.get("passed"),
+            failed=result.get("failed"),
+            stdout_tail=result.get("stdout_tail") or "",
+            stderr_tail=result.get("stderr_tail") or "",
+            message=result.get("message"),
         )
 
         # Enrich the result with project context so the caller has everything.
@@ -4951,6 +4982,7 @@ async def _handle_tunnel_tools(
         result["test_cmd"] = test_cmd
         if repo_path:
             result["cwd"] = repo_path
+        result["verification_run_id"] = completed_run["id"]
         return result
 
     return _MISS
