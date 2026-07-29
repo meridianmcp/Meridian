@@ -949,14 +949,16 @@ def test_generate_handoff_warns_on_long_goal(tmp_path):
         _run(db.close())
 
 
-def test_generate_handoff_content_is_single_fenced_block(tmp_path):
-    """5234877f — generate_handoff content is delivered pre-wrapped in exactly one
-    4-backtick code fence (replacing the 642b1818 strip approach).  The outer fence
-    uses 4 backticks so any nested ``` fences inside the handoff body (e.g. the
-    start_session code block in the Jinja2 template) are rendered as content, not
-    as fence terminators.  Callers must output the field verbatim — no extra headers
-    or blockquotes."""
+def test_generate_handoff_content_is_raw_unwrapped(tmp_path):
+    """a5e8aa74 — generate_handoff content is delivered EXACTLY as rendered, with
+    NO Markdown code fence, header, or blockquote added around it. This replaces
+    the 5234877f four-backtick fence: that wrapping meant a receiving session
+    could never forward the content field verbatim as a paste-ready /goal block
+    without first stripping the fence itself, defeating the whole point of a
+    'display verbatim' contract. Callers must output the field exactly as-is."""
     import meridian.db as db_module
+    from meridian import handoff as handoff_module
+
     db = _make_db()
     try:
         proj = _run(db_module.create_project(db, "fence-proj"))
@@ -968,22 +970,24 @@ def test_generate_handoff_content_is_single_fenced_block(tmp_path):
         out = _run(mh._dispatch_mcp_tool(
             "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
         content = out["content"]
-        # Must start and end with a 4-backtick fence (exactly one outer wrapper).
-        assert content.startswith("````\n"), (
-            f"content must start with 4-backtick fence, got: {content[:30]!r}")
-        assert content.endswith("\n````"), (
-            f"content must end with 4-backtick fence, got: {content[-30:]!r}")
-        # The inner body (everything between the outer fences) must not start with ````
-        inner = content[5:-5]  # strip leading "````\n" (5 chars) and trailing "\n````" (5 chars)
-        assert not inner.startswith("````"), "no nested 4-backtick fences in the body"
+        # No outer 4-backtick wrapper of any kind.
+        assert not content.startswith("````"), (
+            f"content must not be fenced, got: {content[:30]!r}")
+        assert not content.endswith("````"), (
+            f"content must not be fenced, got: {content[-30:]!r}")
+        # The shared helper is a pure identity function — the field is exactly
+        # what it returns for the same input, proving there is no ad-hoc wrap
+        # left in the handler dispatch path.
+        assert content == handoff_module.format_handoff_mcp_content(content)
     finally:
         _run(db.close())
 
 
-def test_generate_handoff_content_fence_preserves_inner_triple_backticks(tmp_path):
-    """5234877f — inner ``` fences from the handoff body (e.g. the start_session
-    code block rendered by the Jinja2 template) are preserved verbatim inside the
-    outer 4-backtick fence — they are NOT stripped."""
+def test_generate_handoff_content_preserves_inner_triple_backticks(tmp_path):
+    """a5e8aa74 — inner ``` fences from the handoff body (e.g. the start_session
+    code block rendered by the Jinja2 template) are preserved verbatim and are
+    the ONLY fences in the returned content — there is no outer wrapper added
+    around them anymore (see the raw-unwrapped test above)."""
     import meridian.db as db_module
     db = _make_db()
     try:
@@ -992,16 +996,88 @@ def test_generate_handoff_content_fence_preserves_inner_triple_backticks(tmp_pat
         out = _run(mh._dispatch_mcp_tool(
             "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
         content = out["content"]
-        # The outer 4-backtick wrapper is present.
-        assert content.startswith("````\n")
-        assert content.endswith("\n````")
-        # The inner body contains the template's ``` start_session code block.
-        inner = content[5:-5]
+        assert not content.startswith("````")
+        assert not content.endswith("````")
         # The Jinja2 handoff template renders a ```\nstart_session(...)\n``` block
         # under "## Start a New Session". That inner fence must survive intact.
-        assert "```" in inner, (
-            "inner handoff body must contain the start_session ``` code block; "
+        assert "```" in content, (
+            "handoff body must contain the start_session ``` code block; "
             "if the template changed, update this test accordingly"
+        )
+    finally:
+        _run(db.close())
+
+
+def test_generate_handoff_content_parity_across_transports(monkeypatch, tmp_path):
+    """a5e8aa74 — transport-parity: the ``content`` field returned by
+    ``generate_handoff`` must be the same raw text whether it is reached
+    through the HTTP/MCP handler dispatch (meridian/mcp/handler.py,
+    ``_dispatch_mcp_tool``) or the stdio transport
+    (meridian/mcp/stdio_handler.py, ``call_tool``). Both used to wrap the
+    content in their own independent four-backtick fence (5234877f); now both
+    call the single shared ``handoff.format_handoff_mcp_content`` helper, so
+    this test proves the two transports cannot drift out of sync again.
+
+    mode='delta' is used on both sides because it deterministically disables
+    the AI-summary network seam regardless of transport (handler.py defaults
+    skip_ai_summary=True already; the stdio tool schema has no such argument
+    at all, so delta is the one denominator both transports share without a
+    network dependency or a fake summarizer fixture). The embedded
+    "_Generated at <ts> (delta mode)_" timestamp legitimately differs by a
+    few seconds between the two calls, so it is normalized out before the
+    byte-identical comparison.
+    """
+    import re
+
+    import mcp.types as mcp_types
+    import meridian.db as db_module
+    import meridian.server as server_module
+
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "transport-parity-proj"))
+        _run(db_module.set_goal(db, proj["id"], "", sprint="parity check"))
+
+        handler_out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff",
+            {"project_id": proj["id"], "mode": "delta"},
+            db, str(tmp_path),
+        ))
+        handler_content = handler_out["content"]
+
+        server = _stdio_server(monkeypatch, db)
+        call_handler = server.request_handlers[mcp_types.CallToolRequest]
+        called = _run(call_handler(
+            mcp_types.CallToolRequest(
+                params=mcp_types.CallToolRequestParams(
+                    name="generate_handoff",
+                    arguments={"project_id": proj["id"], "mode": "delta"},
+                )
+            )
+        ))
+        stdio_result = json.loads(called.root.content[0].text)
+        stdio_content = stdio_result["content"]
+
+        # Neither transport may add a fence, header, or blockquote wrapper.
+        for _c in (handler_content, stdio_content):
+            assert not _c.startswith("````"), f"content must not be fenced: {_c[:30]!r}"
+            assert not _c.endswith("````"), f"content must not be fenced: {_c[-30:]!r}"
+
+        # Byte-identical modulo the embedded generation timestamp and the
+        # single-use <goal_token> (dd07ece0) — both legitimately differ between
+        # two independent generate_handoff calls, fenced or not.
+        def _normalize(text: str) -> str:
+            text = re.sub(r"_Generated at [^_]*_", "_Generated at <ts>_", text)
+            text = re.sub(
+                r"<goal_token>[^<]*</goal_token>",
+                "<goal_token><tok></goal_token>",
+                text,
+            )
+            return text
+
+        assert _normalize(handler_content) == _normalize(stdio_content), (
+            "generate_handoff content diverged between the handler.py and "
+            "stdio_handler.py transports"
         )
     finally:
         _run(db.close())

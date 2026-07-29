@@ -2865,16 +2865,16 @@ async def _handle_task_tools(
                 )
         except Exception:  # noqa: BLE001
             _goal_warn = None
-        # 5234877f — wrap content in exactly ONE plain 4-backtick code fence so it
-        # renders as a single copy-pasteable block in any MCP client regardless of
-        # how the caller's markdown renderer handles surrounding context.  Four
-        # backticks (not three) avoids collision with nested ``` fences that appear
-        # inside the handoff body (e.g. the start_session code block in the Jinja2
-        # template).  This replaces the 642b1818 strip approach, which destroyed
-        # formatting and was still unreliable because callers kept adding their own
-        # blockquote/header wrappers around the plain text — the fence makes the
-        # block unambiguously self-delimiting at the wire level.
-        _plain_content = f"````\n{content}\n````"
+        # a5e8aa74 — return content EXACTLY as generate_handoff rendered it, via
+        # the one shared helper every transport calls (meridian/mcp/stdio_handler.py
+        # and meridian/routes/handoff.py use the same function). This replaces the
+        # 5234877f four-backtick fence: that wrapping meant the field was never the
+        # raw, copy-pasteable /goal text the trust protocol (see AGENTS.md's
+        # handoff-delivery section) depends on — a receiving session had to strip
+        # the fence itself before the block was usable, and the two independent
+        # transport-side wrap sites could drift out of sync with each other. See
+        # format_handoff_mcp_content's docstring for the full contract.
+        _plain_content = handoff_module_local.format_handoff_mcp_content(content)
         # 5abf3e12 — surface the stored per-session goal-compliance metric
         # (generate_handoff computed & persisted it) so the caller / dashboard
         # sees whether this session's /goal item list was fully completed.

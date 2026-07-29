@@ -468,11 +468,14 @@ def build_mcp_server():
                     "block: project_id, start_session command, last 5 done, "
                     "top 3 pending IDs, and a /goal string. "
                     "mode='planner' gives strategic context for claude.ai. "
-                    "DISPLAY THE RETURNED content FIELD VERBATIM to the user "
-                    "(5234877f) - the server delivers content pre-wrapped in a "
-                    "single 4-backtick code fence so it renders as one "
-                    "copy-pasteable block. Do NOT add extra headers, blockquotes, "
-                    "or fences around it - just output the field value as-is."
+                    "FORWARD THE RETURNED content FIELD VERBATIM to the user "
+                    "(a5e8aa74) - the server delivers content as the EXACT raw "
+                    "handoff text, with NO Markdown code fence, header, or "
+                    "blockquote added around it (earlier versions wrapped it in a "
+                    "4-backtick fence under 5234877f; removed because it broke "
+                    "copy-paste fidelity). Output the field value as-is, as the "
+                    "sole plain-text bubble - do NOT add your own fence, header, "
+                    "blockquote, or any other wrapping on the calling side either."
                 ),
                 inputSchema={
                     "type": "object",
@@ -2210,10 +2213,17 @@ def build_mcp_server():
                         db, arguments["project_id"], state["data_dir"]
                     )
                     mode = "full"
-                # 5234877f — wrap content in one 4-backtick fence (same as the
-                # HTTP/handler.py path) so the field is paste-ready as a single
-                # copy-pasteable block regardless of how the caller renders it.
-                result = {"path": path, "content": f"````\n{content}\n````", "mode": mode}
+                # a5e8aa74 — return content EXACTLY as generate_handoff rendered
+                # it, via the shared helper meridian/mcp/handler.py and
+                # meridian/routes/handoff.py also use, so all transports emit a
+                # byte-identical, unwrapped contract. This replaces the 5234877f
+                # four-backtick fence: the fence broke verbatim forwarding of the
+                # /goal block (see format_handoff_mcp_content's docstring).
+                result = {
+                    "path": path,
+                    "content": handoff_module.format_handoff_mcp_content(content),
+                    "mode": mode,
+                }
             elif name == "get_context_block":
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.
                 result = await _dispatch_mcp_tool(
