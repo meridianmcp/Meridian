@@ -2601,6 +2601,43 @@ async def _migrate_pg_proposal_evidence_links(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_wave_base_manifests(conn: PostgresConnection) -> None:
+    """eb2e44f8 — immutable wave_base_manifests + active_worktrees.pid.
+
+    Creates wave_base_manifests on existing Postgres DBs and adds the
+    ``pid`` column to ``active_worktrees``. Mirrors
+    db.worktree_manifest._migrate_wave_base_manifests. Not present in the
+    base CREATE_TABLES_CORE literal — this guarded migration is the only
+    creation path on Postgres, matching _migrate_pg_docx_merge_manifests.
+
+    The partial unique index (``WHERE superseded_at IS NULL``) is the
+    schema-level half of the immutability contract described in
+    db.worktree_manifest's module docstring: Postgres supports partial
+    indexes with identical syntax to SQLite, so this is a straight mirror,
+    not a workaround.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS wave_base_manifests ("
+        "    id TEXT PRIMARY KEY,"
+        "    worktree_id TEXT NOT NULL REFERENCES active_worktrees(id),"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    session_id TEXT NOT NULL,"
+        "    item_id TEXT,"
+        "    repo_identity TEXT NOT NULL,"
+        "    base_branch TEXT NOT NULL,"
+        "    base_sha TEXT NOT NULL,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    superseded_at TEXT,"
+        "    superseded_reason TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_base_manifests_worktree "
+        "ON wave_base_manifests(worktree_id);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_wave_base_manifests_active "
+        "ON wave_base_manifests(worktree_id) WHERE superseded_at IS NULL;"
+        "ALTER TABLE active_worktrees ADD COLUMN IF NOT EXISTS pid INTEGER"
+    )
+
+
 async def _migrate_pg_sprint_version_descriptions(conn: PostgresConnection) -> None:
     """f9188526 — sprint_version_descriptions: per-version-bucket summary text.
 
@@ -3892,4 +3929,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_artifact_declaration,
     _migrate_pg_docx_merge_manifests,
     _migrate_pg_proposal_evidence_links,
+    _migrate_pg_wave_base_manifests,
 )

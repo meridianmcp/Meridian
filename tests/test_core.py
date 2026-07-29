@@ -7740,10 +7740,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_artifact_declaration",
         "_migrate_pg_docx_merge_manifests",
         "_migrate_pg_proposal_evidence_links",
+        "_migrate_pg_wave_base_manifests",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 135
+    assert len(allnames) == len(set(allnames)) == 136
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -14691,6 +14692,12 @@ async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
     assert "git worktree add" in result["worktree_setup_cmd"]
     assert "git worktree remove" in result["worktree_cleanup_cmd"]
     assert "git merge" in result["worktree_merge_cmd"]
+    # eb2e44f8 — the claim response also names the base branch the worktree
+    # is expected to be created from, matching worktree_merge_cmd's target,
+    # so an executor can pass it straight to POST /worktrees' base_branch
+    # (together with the base SHA it observes) to persist an immutable base
+    # manifest for later merge-time validation.
+    assert result["worktree_base_branch"] == "dev"
 
 
 @pytest.mark.asyncio

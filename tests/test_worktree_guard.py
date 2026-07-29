@@ -316,3 +316,472 @@ def test_settings_wires_edit_write_matcher():
     assert "worktree_guard" in cmds, (
         "the Edit|Write matcher must run worktree_guard"
     )
+
+
+# ===========================================================================
+# eb2e44f8 -- immutable wave base manifests + merge-time / cleanup-time
+# validation guard. Unlike the bash-hook tests above (a3984d96, which guard
+# EDIT tool calls against a claimed worktree), this section guards the
+# server-side worktree lifecycle itself: the base manifest persisted per
+# worktree, the pre-merge/completion validation checked against it, and the
+# path/PID liveness gate that runs before a worktree directory is ever
+# deleted from disk. Placed in this same file because it is, at heart, the
+# same category of protection -- "don't let a worktree operation act on the
+# wrong target" -- just enforced in Python against real state instead of in
+# bash against a JSON tool-call payload.
+# ===========================================================================
+
+from meridian import db as db_module
+from meridian import worktree_cleanup as _wt_cleanup_mod
+from meridian import worktree_merge_guard as _merge_guard_mod
+
+
+def _run_git_cmd(args: list, cwd: str) -> None:
+    subprocess.run(
+        ["git"] + args, cwd=cwd, capture_output=True, text=True, check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+        },
+    )
+
+
+def _git_commit(repo_dir: str, filename: str, content: str) -> str:
+    with open(os.path.join(repo_dir, filename), "w", encoding="utf-8") as f:
+        f.write(content)
+    _run_git_cmd(["add", "-A"], repo_dir)
+    _run_git_cmd(["commit", "-m", f"add {filename}"], repo_dir)
+    out = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir,
+        capture_output=True, text=True, check=True,
+    )
+    return out.stdout.strip()
+
+
+def _init_git_repo(repo_dir: str) -> None:
+    _run_git_cmd(["init"], repo_dir)
+
+
+# ---------------------------------------------------------------------------
+# 1. Immutable manifest persistence (db.worktree_manifest)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persist_worktree_manifest_stores_all_fields(db):
+    p = await db_module.create_project(db, "wt-manifest-basic")
+    session = await db_module.register_session(db, p["id"], "wt-manifest-sess")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "manifest item", prospect_bypass=True)
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/manifest1", ".claude/worktrees/manifest1",
+        item_id=item["id"],
+    )
+
+    manifest = await db_module.persist_worktree_manifest(
+        db, wt["id"], p["id"], session["id"], item["id"],
+        "meridian-repo", "dev", "a" * 40,
+    )
+    assert manifest["worktree_id"] == wt["id"]
+    assert manifest["repo_identity"] == "meridian-repo"
+    assert manifest["base_branch"] == "dev"
+    assert manifest["base_sha"] == "a" * 40
+    assert manifest["item_id"] == item["id"]
+    assert manifest["superseded_at"] is None
+
+    fetched = await db_module.get_worktree_manifest(db, wt["id"])
+    assert fetched["id"] == manifest["id"]
+
+
+@pytest.mark.asyncio
+async def test_persist_worktree_manifest_is_immutable_without_force(db):
+    """A second persist for the SAME worktree_id must be rejected, not
+    silently overwrite the first -- the core acceptance criterion."""
+    p = await db_module.create_project(db, "wt-manifest-immutable")
+    session = await db_module.register_session(db, p["id"], "wt-manifest-immutable-sess")
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/immutable1", ".claude/worktrees/immutable1",
+    )
+    await db_module.persist_worktree_manifest(
+        db, wt["id"], p["id"], session["id"], None, "repo-a", "dev", "a" * 40,
+    )
+
+    with pytest.raises(ValueError):
+        await db_module.persist_worktree_manifest(
+            db, wt["id"], p["id"], session["id"], None, "repo-b", "dev", "b" * 40,
+        )
+
+    # The original manifest must be untouched.
+    still_active = await db_module.get_worktree_manifest(db, wt["id"])
+    assert still_active["repo_identity"] == "repo-a"
+    assert still_active["base_sha"] == "a" * 40
+
+
+@pytest.mark.asyncio
+async def test_persist_worktree_manifest_force_supersedes_with_audit_trail(db):
+    """force=True performs an explicit, AUDITED replacement -- the old row
+    is marked superseded (with a reason), never deleted."""
+    p = await db_module.create_project(db, "wt-manifest-supersede")
+    session = await db_module.register_session(db, p["id"], "wt-manifest-supersede-sess")
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/supersede1", ".claude/worktrees/supersede1",
+    )
+    first = await db_module.persist_worktree_manifest(
+        db, wt["id"], p["id"], session["id"], None, "repo-a", "dev", "a" * 40,
+    )
+    second = await db_module.persist_worktree_manifest(
+        db, wt["id"], p["id"], session["id"], None, "repo-a", "dev", "c" * 40,
+        force=True, reason="worktree was reset to a new base",
+    )
+    assert second["id"] != first["id"]
+    assert second["base_sha"] == "c" * 40
+
+    active = await db_module.get_worktree_manifest(db, wt["id"])
+    assert active["id"] == second["id"]
+
+    history = await db_module.get_worktree_manifest_history(db, wt["id"])
+    assert len(history) == 2
+    by_id = {row["id"]: row for row in history}
+    assert by_id[first["id"]]["superseded_at"] is not None
+    assert by_id[first["id"]]["superseded_reason"] == "worktree was reset to a new base"
+    assert by_id[second["id"]]["superseded_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# 2 + 3. validate_worktree_merge -- pre-merge/completion validation gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_validate_worktree_merge_ok_when_clean_and_ancestor(db, tmp_path):
+    repo = tmp_path / "repo-ok"
+    repo.mkdir()
+    _init_git_repo(str(repo))
+    sha1 = _git_commit(str(repo), "a.txt", "one")
+    sha2 = _git_commit(str(repo), "b.txt", "two")
+
+    p = await db_module.create_project(db, "wt-merge-ok")
+    session = await db_module.register_session(db, p["id"], "wt-merge-ok-sess")
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/ok1", ".",
+    )
+    await db_module.persist_worktree_manifest(
+        db, wt["id"], p["id"], session["id"], None, "repo", "dev", sha1,
+    )
+
+    result = await _merge_guard_mod.validate_worktree_merge(db, repo, wt["id"])
+    assert result["ok"] is True, result["errors"]
+    assert result["head_sha"] == sha2
+    assert result["errors"] == []
+
+
+@pytest.mark.asyncio
+async def test_validate_worktree_merge_rejects_dirty_worktree(db, tmp_path):
+    repo = tmp_path / "repo-dirty"
+    repo.mkdir()
+    _init_git_repo(str(repo))
+    sha1 = _git_commit(str(repo), "a.txt", "one")
+    # Uncommitted change -- never committed.
+    (repo / "uncommitted.txt").write_text("wip", encoding="utf-8")
+
+    p = await db_module.create_project(db, "wt-merge-dirty")
+    session = await db_module.register_session(db, p["id"], "wt-merge-dirty-sess")
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/dirty1", ".",
+    )
+    await db_module.persist_worktree_manifest(
+        db, wt["id"], p["id"], session["id"], None, "repo", "dev", sha1,
+    )
+
+    result = await _merge_guard_mod.validate_worktree_merge(db, repo, wt["id"])
+    assert result["ok"] is False
+    codes = {e["code"] for e in result["errors"]}
+    assert "DIRTY_WORKTREE" in codes
+
+
+@pytest.mark.asyncio
+async def test_validate_worktree_merge_rejects_head_mismatch_after_divergence(db, tmp_path):
+    """base_sha recorded at manifest time must be an ancestor of current
+    HEAD. A reset that abandons the recorded base (simulating a rebase or
+    hard reset) must be rejected."""
+    repo = tmp_path / "repo-diverged"
+    repo.mkdir()
+    _init_git_repo(str(repo))
+    sha1 = _git_commit(str(repo), "a.txt", "one")
+    _git_commit(str(repo), "b.txt", "two")
+    sha3 = _git_commit(str(repo), "c.txt", "three")  # this was HEAD when the manifest was written
+
+    # Simulate a hard reset that abandons sha3's line of history entirely.
+    _run_git_cmd(["reset", "--hard", sha1], str(repo))
+    sha4 = _git_commit(str(repo), "d.txt", "four")  # new, unrelated-to-sha3 HEAD
+
+    p = await db_module.create_project(db, "wt-merge-diverged")
+    session = await db_module.register_session(db, p["id"], "wt-merge-diverged-sess")
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/diverged1", ".",
+    )
+    await db_module.persist_worktree_manifest(
+        db, wt["id"], p["id"], session["id"], None, "repo", "dev", sha3,
+    )
+
+    result = await _merge_guard_mod.validate_worktree_merge(db, repo, wt["id"])
+    assert result["ok"] is False
+    assert result["head_sha"] == sha4
+    codes = {e["code"] for e in result["errors"]}
+    assert "HEAD_MISMATCH" in codes
+
+
+@pytest.mark.asyncio
+async def test_validate_worktree_merge_rejects_stale_manifest(db, tmp_path):
+    repo = tmp_path / "repo-stale"
+    repo.mkdir()
+    _init_git_repo(str(repo))
+    sha1 = _git_commit(str(repo), "a.txt", "one")
+
+    p = await db_module.create_project(db, "wt-merge-stale")
+    session = await db_module.register_session(db, p["id"], "wt-merge-stale-sess")
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/stale1", ".",
+    )
+    await db_module.persist_worktree_manifest(
+        db, wt["id"], p["id"], session["id"], None, "repo", "dev", sha1,
+    )
+    # Back-date the manifest well past the staleness threshold.
+    await db.execute(
+        "UPDATE wave_base_manifests SET created_at = datetime('now', '-48 hours') "
+        "WHERE worktree_id = ?",
+        (wt["id"],),
+    )
+    await db.commit()
+
+    result = await _merge_guard_mod.validate_worktree_merge(
+        db, repo, wt["id"], stale_after_hours=24.0,
+    )
+    assert result["ok"] is False
+    codes = {e["code"] for e in result["errors"]}
+    assert "STALE_MANIFEST" in codes
+
+
+@pytest.mark.asyncio
+async def test_validate_worktree_merge_no_manifest_is_rejected(db, tmp_path):
+    repo = tmp_path / "repo-nomanifest"
+    repo.mkdir()
+    _init_git_repo(str(repo))
+    _git_commit(str(repo), "a.txt", "one")
+
+    p = await db_module.create_project(db, "wt-merge-nomanifest")
+    session = await db_module.register_session(db, p["id"], "wt-merge-nomanifest-sess")
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/nomanifest1", ".",
+    )
+
+    result = await _merge_guard_mod.validate_worktree_merge(db, repo, wt["id"])
+    assert result["ok"] is False
+    assert result["errors"][0]["code"] == "NO_MANIFEST"
+
+
+@pytest.mark.asyncio
+async def test_validate_worktree_merge_unknown_worktree_id_is_rejected(db, tmp_path):
+    result = await _merge_guard_mod.validate_worktree_merge(
+        db, tmp_path, "no-such-worktree-id",
+    )
+    assert result["ok"] is False
+    assert result["errors"][0]["code"] == "WORKTREE_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_validate_worktree_merge_hosted_skips_git_checks_but_checks_manifest(db, tmp_path):
+    """repo_root=None (hosted / no local FS access) must still catch a
+    missing or stale manifest -- only the git-level checks are skipped."""
+    p = await db_module.create_project(db, "wt-merge-hosted")
+    session = await db_module.register_session(db, p["id"], "wt-merge-hosted-sess")
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/hosted1", ".",
+    )
+    await db_module.persist_worktree_manifest(
+        db, wt["id"], p["id"], session["id"], None, "repo", "dev", "a" * 40,
+    )
+
+    result = await _merge_guard_mod.validate_worktree_merge(db, None, wt["id"])
+    assert result["ok"] is True
+    assert result["head_sha"] is None
+
+
+# ---------------------------------------------------------------------------
+# 4. Cleanup guard -- validate path/PID before real disk removal
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_guard_rejects_missing_row():
+    result = _wt_cleanup_mod.validate_worktree_cleanup_target(
+        None, expected_worktree_id="wt-does-not-exist",
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "NOT_FOUND"
+
+
+def test_cleanup_guard_rejects_id_mismatch():
+    row = {"id": "wt-real", "path": ".claude/worktrees/real", "pid": None}
+    result = _wt_cleanup_mod.validate_worktree_cleanup_target(
+        row, expected_worktree_id="wt-other",
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "ID_MISMATCH"
+
+
+def test_cleanup_guard_rejects_path_mismatch():
+    row = {"id": "wt-real", "path": ".claude/worktrees/real", "pid": None}
+    result = _wt_cleanup_mod.validate_worktree_cleanup_target(
+        row, expected_worktree_id="wt-real", expected_path=".claude/worktrees/WRONG",
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "PATH_MISMATCH"
+
+
+def test_cleanup_guard_allows_when_no_pid_recorded():
+    row = {"id": "wt-real", "path": ".claude/worktrees/real", "pid": None}
+    result = _wt_cleanup_mod.validate_worktree_cleanup_target(
+        row, expected_worktree_id="wt-real",
+    )
+    assert result["ok"] is True
+
+
+def test_cleanup_guard_rejects_when_pid_still_alive():
+    """A live PID (the current test process itself) must block cleanup."""
+    row = {"id": "wt-real", "path": ".claude/worktrees/real", "pid": os.getpid()}
+    result = _wt_cleanup_mod.validate_worktree_cleanup_target(
+        row, expected_worktree_id="wt-real",
+    )
+    assert result["ok"] is False
+    assert result["reason"] == "PROCESS_STILL_LIVE"
+    assert result["detail"] and str(os.getpid()) in result["detail"]
+
+
+def test_cleanup_guard_allows_when_pid_is_dead(monkeypatch):
+    """A recorded PID that's no longer running must NOT block cleanup."""
+    def _dead(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(_wt_cleanup_mod.os, "kill", _dead)
+    row = {"id": "wt-real", "path": ".claude/worktrees/real", "pid": 999999}
+    result = _wt_cleanup_mod.validate_worktree_cleanup_target(
+        row, expected_worktree_id="wt-real",
+    )
+    assert result["ok"] is True
+
+
+def test_remove_worktree_on_disk_guarded_skips_disk_mutation_when_pid_alive(monkeypatch, tmp_path):
+    """The guarded wrapper must never even ATTEMPT a disk removal when the
+    guard rejects it -- confirms the destructive call is truly gated, not
+    just logged around."""
+    called = []
+    monkeypatch.setattr(
+        _wt_cleanup_mod, "remove_worktree_on_disk",
+        lambda *a, **k: called.append((a, k)) or {"attempted": True, "removed": True, "detail": "x"},
+    )
+    row = {"id": "wt-live", "path": "some/path", "pid": os.getpid()}
+    outcome = _wt_cleanup_mod.remove_worktree_on_disk_guarded(
+        tmp_path, row, expected_worktree_id="wt-live",
+    )
+    assert outcome["attempted"] is False
+    assert outcome["removed"] is False
+    assert outcome["guard_ok"] is False
+    assert outcome["reason"] == "PROCESS_STILL_LIVE"
+    assert called == []  # the real disk-mutating function was never invoked
+
+
+def test_remove_worktree_on_disk_guarded_proceeds_when_guard_passes(monkeypatch, tmp_path):
+    called = []
+    monkeypatch.setattr(
+        _wt_cleanup_mod, "remove_worktree_on_disk",
+        lambda *a, **k: called.append((a, k)) or {"attempted": True, "removed": True, "detail": "x"},
+    )
+    row = {"id": "wt-idle", "path": "some/path", "pid": None}
+    outcome = _wt_cleanup_mod.remove_worktree_on_disk_guarded(
+        tmp_path, row, expected_worktree_id="wt-idle",
+    )
+    assert outcome["removed"] is True
+    assert outcome["guard_ok"] is True
+    assert len(called) == 1
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: complete_sprint_item hard-rejects at merge time
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_rejects_when_worktree_fails_merge_validation(db, tmp_path, monkeypatch):
+    """The wired gate (acceptance points 2+3): when a worktree has a
+    persisted base manifest and it fails validation (here: dirty tree),
+    complete_sprint_item must hard-reject with a structured error and leave
+    the item NOT done -- not just fire the pre-existing advisory HITL."""
+    import meridian.server as srv
+
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+
+    repo = tmp_path / "repo-e2e-dirty"
+    repo.mkdir()
+    _init_git_repo(str(repo))
+    sha1 = _git_commit(str(repo), "a.txt", "one")
+    (repo / "uncommitted.txt").write_text("wip", encoding="utf-8")
+    monkeypatch.setattr(srv, "_REPO_ROOT", repo)
+
+    p = await db_module.create_project(db, "wt-e2e-dirty")
+    session = await db_module.register_session(db, p["id"], "wt-e2e-dirty-sess")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "e2e dirty item", prospect_bypass=True,
+    )
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/e2edirty1", ".", item_id=item["id"],
+    )
+    await db_module.persist_worktree_manifest(
+        db, wt["id"], p["id"], session["id"], item["id"], "repo", "dev", sha1,
+    )
+
+    result = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"], "session_id": session["id"]},
+        db, "/tmp",
+    )
+
+    assert result.get("error") == "WORKTREE_MERGE_BLOCKED"
+    assert result["worktree_id"] == wt["id"]
+    codes = {e["code"] for e in result["validation"]["errors"]}
+    assert "DIRTY_WORKTREE" in codes
+
+    reloaded = await db_module.get_sprint_item(db, item["id"])
+    assert reloaded["status"] != "done"
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_proceeds_when_no_manifest_exists(db, tmp_path, monkeypatch):
+    """Backward compatibility: a worktree that never opted into a base
+    manifest (the common case for every worktree registered before this
+    sprint item) must NOT be retroactively blocked -- completion proceeds
+    exactly like before (advisory HITL only)."""
+    import meridian.server as srv
+
+    monkeypatch.delenv("MERIDIAN_HOSTED", raising=False)
+    monkeypatch.setattr(srv, "_REPO_ROOT", tmp_path)
+
+    p = await db_module.create_project(db, "wt-e2e-nomanifest")
+    session = await db_module.register_session(db, p["id"], "wt-e2e-nomanifest-sess")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "e2e no-manifest item", prospect_bypass=True,
+    )
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+    await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/e2enomanifest1", ".claude/worktrees/e2enomanifest1",
+        item_id=item["id"],
+    )
+
+    result = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"], "session_id": session["id"]},
+        db, "/tmp",
+    )
+
+    assert result.get("error") is None
+    assert result["status"] == "done"
