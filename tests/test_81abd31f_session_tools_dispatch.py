@@ -723,6 +723,69 @@ async def test_checkpoint_in_progress_warning(db, project, session, monkeypatch)
     assert "action_required" in result
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_handler_direct_scopes_to_session_version(
+    db, project, monkeypatch
+):
+    """660314c1 — handle_checkpoint must scope pending_ids/next_goal to the
+    calling session's own sprint_version, not the whole (cross-version) board.
+
+    Regression: handle_checkpoint used to call
+    get_sprint_items(db, project_id, status="pending") with no version
+    argument at all, so a session scoped to one version bucket could see
+    another version's item ids leak into pending_ids/next_goal. This test
+    creates two version buckets and asserts the out-of-scope bucket's item
+    never appears in either field for a session scoped to the in-scope one.
+    """
+    pid = project["id"]
+    # Session explicitly scoped to v0.2.6 (mirrors how start_session persists
+    # sprint_version on the session row).
+    scoped_session = await db_module.register_session(
+        db, pid, "version-scoped-session", sprint_version="v0.2.6",
+    )
+    sid = scoped_session["id"]
+
+    in_scope = await db_module.add_sprint_item(db, pid, "v0.2.6", "in scope item")
+    out_of_scope = await db_module.add_sprint_item(
+        db, pid, "v0.2.5", "other version item"
+    )
+
+    monkeypatch.setattr(
+        "meridian.server._finalize_session_md",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "meridian.db.auto_capture_session",
+        AsyncMock(return_value=None),
+    )
+
+    async def _fake_generate_handoff(*args, **kw):
+        return (None, "version-scoped summary", None)
+
+    monkeypatch.setattr(
+        "meridian.handoff.generate_handoff",
+        _fake_generate_handoff,
+    )
+
+    async def _fake_commits(project_dict, tenant):
+        return []
+
+    def _fake_identity(tenant):
+        return None
+
+    result = await st_mod.handle_checkpoint(
+        {"session_id": sid, "project_id": pid},
+        db, _DATA_DIR, None, None,
+        fetch_recent_commits=_fake_commits,
+        resolve_caller_identity=_fake_identity,
+    )
+    assert result["pending_count"] == 1
+    assert in_scope["id"][:8] in result["pending_ids"]
+    assert out_of_scope["id"][:8] not in result["pending_ids"]
+    assert in_scope["id"] in result["next_goal"]
+    assert out_of_scope["id"] not in result["next_goal"]
+
+
 # ---------------------------------------------------------------------------
 # Dispatch-table completeness: all 13 known tool names must NOT return _MISS
 # ---------------------------------------------------------------------------

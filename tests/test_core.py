@@ -8640,6 +8640,59 @@ async def test_checkpoint_writes_session_summary(db, tmp_path):
     assert summary_val, "checkpoint() must write non-empty session_summary"
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_scopes_pending_ids_to_session_version(db, tmp_path):
+    """660314c1 — checkpoint()'s pending_ids/next_goal must be scoped to the
+    calling session's own sprint_version bucket. Before the fix,
+    handle_checkpoint called get_sprint_items(..., status="pending") with NO
+    version filter, so a session scoped to one version (e.g. v0.2.6) got a
+    checkpoint whose pending_ids/next_goal leaked items from a completely
+    different version (e.g. v0.2.5) — a cross-version board-drift bug."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "ckpt-version-scope-test")
+    pid = p["id"]
+    in_scope = await db_module.add_sprint_item(db, pid, "v0.2.6", "in scope item")
+    out_of_scope = await db_module.add_sprint_item(
+        db, pid, "v0.2.5", "other version item"
+    )
+    s = await db_module.register_session(
+        db, pid, "ckpt-scoped-session", sprint_version="v0.2.6",
+    )
+    result = await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": pid}, db, str(tmp_path)
+    )
+    assert result["pending_count"] == 1, (
+        f"expected only the v0.2.6 item, got pending_count={result['pending_count']}"
+    )
+    assert in_scope["id"][:8] in result["pending_ids"]
+    assert out_of_scope["id"][:8] not in result["pending_ids"], (
+        "other-version item id leaked into checkpoint pending_ids"
+    )
+    assert in_scope["id"] in result["next_goal"]
+    assert out_of_scope["id"] not in result["next_goal"], (
+        "other-version item id leaked into checkpoint next_goal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_unscoped_session_sees_all_versions(db, tmp_path):
+    """A session with no stored sprint_version (never version-scoped) keeps
+    the original unscoped checkpoint behaviour — every version's pending
+    items are still visible. Back-compat guard for the 660314c1 fix."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "ckpt-unscoped-test")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v0.2.6", "item a")
+    await db_module.add_sprint_item(db, pid, "v0.2.5", "item b")
+    s = await db_module.register_session(db, pid, "ckpt-unscoped-session")
+    result = await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": pid}, db, str(tmp_path)
+    )
+    assert result["pending_count"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Goal history filter — AUTO BLOCKS-only versions collapsed
 # ---------------------------------------------------------------------------
