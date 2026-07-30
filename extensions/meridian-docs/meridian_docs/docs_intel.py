@@ -1483,17 +1483,38 @@ class DocxWriteVerificationError(OSError):
 # Writers targeting DIFFERENT destinations never block each other, and the
 # lock table only ever grows by distinct live destination paths (bounded by
 # the number of documents actually being written to, not by request count).
-_DOCX_PROMOTION_LOCKS: dict[str, threading.Lock] = {}
+#
+# 5988a5bb — widened from ``threading.Lock`` to ``threading.RLock``. Callers
+# with their own caller-specific post-write check (move_section /
+# copy_section / relocate_figure / relocate_table / merge_draft_into_canonical)
+# now hold this SAME lock across their entire stage+promote ->
+# verify -> conditional-restore sequence, not just the promote step —
+# ``_atomic_write_docx_bytes`` still acquires it internally for its own
+# stage+promote step, so a caller holding it at the top needs reentrant
+# acquisition from the SAME thread to avoid deadlocking itself. This closes
+# the SAME-PROCESS race window between promotion and a subsequent
+# verify/restore completely. It does NOT — and structurally cannot, since a
+# lock (reentrant or not) is process-local — protect against a DIFFERENT
+# process promoting to the same ``dest`` in that window; the cross-process
+# case is instead covered by the compare-and-swap fingerprint check in
+# ``_safe_restore_after_verification_failure`` (comparing ``dest``'s CURRENT
+# on-disk bytes against what THIS writer itself promoted before deciding
+# whether a verification-failure restore is safe).
+_DOCX_PROMOTION_LOCKS: dict[str, threading.RLock] = {}
 _DOCX_PROMOTION_LOCKS_GUARD = threading.Lock()
 
 
-def _docx_promotion_lock(dest: str) -> threading.Lock:
-    """Return the process-wide promotion lock for ``dest``'s canonical path."""
+def _docx_promotion_lock(dest: str) -> threading.RLock:
+    """Return the process-wide, reentrant promotion lock for ``dest``'s
+    canonical path (5988a5bb — reentrant so a caller can hold it across a
+    stage+promote -> verify -> conditional-restore sequence while
+    ``_atomic_write_docx_bytes`` also reentrantly acquires it internally for
+    its own stage+promote step; see the module-level comment above)."""
     key = os.path.normcase(os.path.abspath(dest))
     with _DOCX_PROMOTION_LOCKS_GUARD:
         lock = _DOCX_PROMOTION_LOCKS.get(key)
         if lock is None:
-            lock = threading.Lock()
+            lock = threading.RLock()
             _DOCX_PROMOTION_LOCKS[key] = lock
         return lock
 
@@ -1587,7 +1608,7 @@ def _docx_manifest_hash(changed_parts: dict[str, bytes]) -> str:
     return h.hexdigest()
 
 
-def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> None:
+def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> dict[str, Any]:
     """Write ``root`` back into ``dest`` as ``word/document.xml``.
 
     All other ZIP members from ``raw`` are preserved byte-for-byte.
@@ -1605,6 +1626,11 @@ def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> None:
 
     Backs up the existing file to ``dest + ".bak"`` when it already exists
     (best-effort, non-fatal on failure — same pattern as meridian/doc_store.py).
+
+    Returns :func:`_atomic_write_docx_bytes`'s transaction dict, ``{
+    "manifest_hash", "pre_counts", "post_counts", "promoted_sha256"}``
+    (5988a5bb) — callers that don't need it (most existing call sites, which
+    predate this change) simply ignore the return value.
     """
     new_xml = ET.tostring(root, encoding="unicode")
     new_document_bytes = (
@@ -1621,7 +1647,7 @@ def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> None:
                     data = new_document_bytes
                 dst.writestr(info, data)
 
-    _atomic_write_docx_bytes(
+    return _atomic_write_docx_bytes(
         out.getvalue(),
         dest,
         pre_manifest=_docx_structural_manifest(raw),
@@ -1663,18 +1689,28 @@ def _atomic_write_docx_bytes(
     A pre-existing ``dest`` is backed up to ``dest + ".bak"`` immediately
     before promotion (best-effort, non-fatal on failure).
 
-    Returns ``{"manifest_hash", "pre_counts", "post_counts"}`` — the
-    manifest hash is always computed (from ``changed_parts`` when given, else
-    ``None``); ``pre_counts``/``post_counts`` are ``None`` when
+    Returns ``{"manifest_hash", "pre_counts", "post_counts", "promoted_sha256"}``
+    — the manifest hash is always computed (from ``changed_parts`` when
+    given, else ``None``); ``pre_counts``/``post_counts`` are ``None`` when
     ``pre_manifest`` was not supplied (legacy callers that run their OWN
     separate range-hash verification, like move_section/copy_section/
     relocate_table via :func:`_verify_docx_write`, keep working exactly as
-    before — this is purely additive).
+    before — this is purely additive). ``promoted_sha256`` (5988a5bb) is a
+    full-body SHA-256 over the EXACT bytes this call promoted (the staged
+    artifact, re-read fresh from disk after flush — never the in-memory
+    ``payload`` object), always computed regardless of ``pre_manifest``. It
+    is the "what did THIS writer actually put on disk" fingerprint a
+    caller-specific post-write check uses to tell apart "verification
+    failed but nobody has touched dest since I promoted" (safe to restore my
+    own pre-image) from "a different writer's promotion has already landed
+    since mine" (restoring would destroy that writer's completed work — see
+    :func:`_safe_restore_after_verification_failure`).
     """
     parent = os.path.dirname(os.path.abspath(dest)) or "."
     os.makedirs(parent, exist_ok=True)
     manifest_hash = _docx_manifest_hash(changed_parts) if changed_parts else None
     post_counts: dict[str, int] | None = None
+    promoted_sha256: str | None = None
 
     staged_path: str | None = None
     try:
@@ -1686,9 +1722,11 @@ def _atomic_write_docx_bytes(
             fh.flush()
             os.fsync(fh.fileno())
 
+        with open(staged_path, "rb") as fh:
+            staged_bytes = fh.read()
+        promoted_sha256 = hashlib.sha256(staged_bytes).hexdigest()
+
         if pre_manifest is not None:
-            with open(staged_path, "rb") as fh:
-                staged_bytes = fh.read()
             try:
                 post_counts = _docx_structural_manifest(staged_bytes)
             except (zipfile.BadZipFile, KeyError) as exc:
@@ -1737,6 +1775,7 @@ def _atomic_write_docx_bytes(
         "manifest_hash": manifest_hash,
         "pre_counts": pre_manifest,
         "post_counts": post_counts,
+        "promoted_sha256": promoted_sha256,
     }
 
 
@@ -1841,15 +1880,120 @@ def _restore_docx_backup(dest: str) -> bool:
     succeeded; a missing/failed backup is reported (not raised) so the
     caller can surface it in the error payload rather than mask the
     original verification failure.
+
+    5988a5bb (finding 2) -- routed through the SAME stage-to-temp-in-
+    ``dest``'s-own-directory + fsync + ``os.replace`` pattern every other
+    write in this module uses, instead of writing straight into ``dest`` via
+    ``shutil.copy2``. An interrupted restore (disk full, AV lock, permission
+    revoked mid-copy) now leaves ``dest`` and the disposable temp file
+    untouched -- ``os.replace`` is atomic on the same filesystem, so ``dest``
+    is either the OLD content (interrupted before replace) or the FULLY
+    restored backup content (replace completed); it can never be left
+    truncated or partially overwritten as a direct in-place copy risked.
     """
     backup = dest + ".bak"
     if not os.path.exists(backup):
         return False
+    parent = os.path.dirname(os.path.abspath(dest)) or "."
+    staged_path: str | None = None
     try:
-        shutil.copy2(backup, dest)
+        fd, staged_path = tempfile.mkstemp(
+            prefix=".meridian-docx-restore-", suffix=".tmp", dir=parent
+        )
+        with open(backup, "rb") as src, os.fdopen(fd, "wb") as fh:
+            shutil.copyfileobj(src, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(staged_path, dest)
+        staged_path = None
         return True
     except OSError:
         return False
+    finally:
+        if staged_path:
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+
+
+def _docx_file_sha256(path: str) -> str | None:
+    """SHA-256 over ``path``'s raw bytes, read fresh from disk.
+
+    5988a5bb -- the compare-and-swap fingerprint used to tell "dest still
+    holds exactly what THIS writer promoted" apart from "a different writer
+    has already promoted something newer" (see
+    :func:`_safe_restore_after_verification_failure`). Returns ``None``
+    (rather than raising) when ``path`` cannot be read -- a missing/
+    unreadable file is itself informative to the caller (it can never match
+    a real ``promoted_sha256``), not a reason to blow up a post-write
+    verification-failure handler that is already in an error path.
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _safe_restore_after_verification_failure(
+    write_dest: str,
+    promoted_sha256: str | None,
+) -> tuple[bool, bool, bool]:
+    """Compare-and-swap-safe gate in front of :func:`_restore_docx_backup` (5988a5bb).
+
+    Only called once a caller-specific post-write check (e.g.
+    :func:`_verify_docx_write`) has already found a mismatch on
+    ``write_dest``. A bare, unconditional restore is unsafe: if a DIFFERENT
+    writer (a different process, or a different concurrent claim on a
+    non-overlapping region of the SAME file -- see
+    :func:`claim_docx_region`'s module docs) promoted its own write to
+    ``write_dest`` in the window between THIS writer's own promotion and
+    THIS writer's verify, the mismatch this writer is reacting to is a false
+    positive caused by that other writer's legitimate, already-promoted
+    work -- blindly restoring from THIS writer's own ``.bak`` would silently
+    destroy it.
+
+    Re-reads ``write_dest``'s CURRENT on-disk bytes (fresh from disk) and
+    compares their SHA-256 against ``promoted_sha256`` --
+    :func:`_atomic_write_docx_bytes`'s own fingerprint of exactly what THIS
+    writer promoted (returned as ``transaction["promoted_sha256"]``).
+    ``promoted_sha256`` can itself be ``None`` -- not only from a genuinely
+    concurrent writer, but also when the caller's own write helper didn't
+    return transaction info at all (e.g. a stubbed/broken lower-level write
+    path in a test, or a future caller that hasn't been updated) -- that
+    case is reported distinctly below rather than misdiagnosed as a
+    confirmed concurrent write.
+
+    Returns ``(safe_to_restore, restored, concurrent_write_detected)``:
+
+    * ``(True, restored, False)`` -- ``write_dest`` still held exactly what
+      this writer promoted (nobody has touched it since); a restore was
+      attempted and ``restored`` reports whether it succeeded.
+    * ``(False, False, True)`` -- POSITIVE evidence of a different writer:
+      both fingerprints were available and did not match. Restore was
+      deliberately NOT attempted, and ``write_dest`` is left exactly as
+      that other writer left it.
+    * ``(False, False, False)`` -- restore eligibility could not be
+      determined at all (``promoted_sha256`` or ``write_dest`` itself was
+      unavailable) -- NOT positive evidence of a concurrent write, just
+      insufficient information to safely restore. Restore is still NOT
+      attempted (the same fail-closed default), but callers should not
+      report this as a confirmed cross-writer clobber.
+    """
+    current_sha256 = _docx_file_sha256(write_dest) if os.path.isfile(write_dest) else None
+    safe_to_restore = (
+        promoted_sha256 is not None
+        and current_sha256 is not None
+        and current_sha256 == promoted_sha256
+    )
+    if not safe_to_restore:
+        concurrent_write_detected = promoted_sha256 is not None and current_sha256 is not None
+        return False, False, concurrent_write_detected
+    return True, _restore_docx_backup(write_dest), False
 
 
 def _verify_docx_write(
@@ -2903,25 +3047,69 @@ def insert_figure_block(
     body.insert(insert_at, paragraph)
     body.insert(insert_at + 1, caption_p)
 
-    try:
-        _save_docx_with_image(
-            raw, root, image_bytes, image_name, relationship_id,
-            image_type[1], docx_path
-        )
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    # 5988a5bb -- hold docx_path's promotion lock across stage+promote
+    # (_save_docx_with_image, which is not itself lock-aware, so this
+    # caller must bracket it explicitly) THROUGH the post-write verify and
+    # any conditional restore below, closing the same-process window
+    # between promotion and verify/restore entirely (see
+    # _docx_promotion_lock's module-level comment). promoted_sha256 is
+    # computed locally right after the write (rather than returned from
+    # _save_docx_with_image, which has other callers -- insert_image /
+    # insert_caption -- this fix does not touch) since it is simply
+    # docx_path's own fresh-from-disk fingerprint immediately after THIS
+    # writer's own promotion.
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_image(
+                raw, root, image_bytes, image_name, relationship_id,
+                image_type[1], docx_path
+            )
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
 
-    verify_error = _verify_figure_block_write(
-        docx_path,
-        image_para_id=image_para_id,
-        expected_seq_number=seq_number,
-        expected_label_text=label_text_clean,
-    )
-    if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(docx_path)
-        verify_error["image_para_id"] = image_para_id
-        verify_error["docx_path"] = docx_path
-        return verify_error
+        promoted_sha256 = _docx_file_sha256(docx_path)
+
+        verify_error = _verify_figure_block_write(
+            docx_path,
+            image_para_id=image_para_id,
+            expected_seq_number=seq_number,
+            expected_label_text=label_text_clean,
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to docx_path
+            # since our own promotion, in which case this verification
+            # "failure" is a false positive and restoring from our own
+            # backup would destroy that writer's completed, already-
+            # promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["image_para_id"] = image_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
 
     _invalidate_sidecar_mtime(index_db_path)
     if index_db_path and os.path.exists(index_db_path):
@@ -8238,39 +8426,78 @@ def merge_draft_into_canonical(
                 ),
             }
 
-    try:
-        _atomic_write_docx_bytes(
-            draft_bytes,
-            canonical_path,
-            pre_manifest=pre_manifest,
-            protected_keys=("media_count", "style_count", "relationship_count"),
-        )
-    except DocxWriteVerificationError as exc:
-        return {
-            "merged": False,
-            "error": (
-                "merge rejected: the draft does not preserve structural "
-                f"elements the canonical file must never lose: {exc}"
-            ),
-        }
-    except OSError as exc:
-        return {
-            "merged": False,
-            "error": f"could not write {canonical_path}: {exc}",
-        }
+    # 5988a5bb -- hold canonical_path's promotion lock across stage+promote
+    # (_atomic_write_docx_bytes, which reentrantly acquires it internally)
+    # THROUGH the post-write verify and any conditional restore below,
+    # closing the same-process window between promotion and verify/restore
+    # entirely (see _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(canonical_path):
+        try:
+            transaction = _atomic_write_docx_bytes(
+                draft_bytes,
+                canonical_path,
+                pre_manifest=pre_manifest,
+                protected_keys=("media_count", "style_count", "relationship_count"),
+            )
+        except DocxWriteVerificationError as exc:
+            return {
+                "merged": False,
+                "error": (
+                    "merge rejected: the draft does not preserve structural "
+                    f"elements the canonical file must never lose: {exc}"
+                ),
+            }
+        except OSError as exc:
+            return {
+                "merged": False,
+                "error": f"could not write {canonical_path}: {exc}",
+            }
 
-    verify_error = _verify_docx_write(
-        canonical_path,
-        expected_counts=draft_counts,
-        expected_hash=expected_hash,
-        expected_range=(0, len(draft_children)),
-    )
-    if verify_error is not None:
-        verify_error["merged"] = False
-        verify_error["file_restored"] = _restore_docx_backup(canonical_path)
-        verify_error["canonical_path"] = canonical_path
-        verify_error["draft_path"] = draft_path
-        return verify_error
+        verify_error = _verify_docx_write(
+            canonical_path,
+            expected_counts=draft_counts,
+            expected_hash=expected_hash,
+            expected_range=(0, len(draft_children)),
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore. A different (concurrent)
+            # writer may have already promoted something newer to
+            # canonical_path since our own promotion, in which case this
+            # verification "failure" is a false positive and restoring from
+            # our own backup would destroy that writer's completed,
+            # already-promoted work -- check first.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    canonical_path,
+                    transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            verify_error["merged"] = False
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {canonical_path} was left untouched, exactly as "
+                        "that other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {canonical_path} was left untouched "
+                        "rather than risk it -- investigate manually."
+                    )
+            verify_error["canonical_path"] = canonical_path
+            verify_error["draft_path"] = draft_path
+            return verify_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
@@ -8575,30 +8802,67 @@ def move_section(
     for offset, el in enumerate(moved_elements):
         body.insert(insert_at + offset, el)
 
-    try:
-        _save_docx_xml_stdlib(raw, root, dest)
-    except OSError as exc:
-        return {"error": f"could not write {dest}: {exc}"}
+    # 5988a5bb -- hold dest's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write verify and any conditional restore below,
+    # closing the same-process window between promotion and verify/restore
+    # entirely (see _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(dest):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, dest)
+        except OSError as exc:
+            return {"error": f"could not write {dest}: {exc}"}
 
-    # 9907df44 -- mandatory post-write verification: re-read dest FRESH
-    # FROM DISK and confirm the on-disk document actually reflects this move
-    # before trusting/reporting the write as a success. A stale/buggy write
-    # path (or one that silently no-ops) is caught here instead of producing
-    # a false "moved" success -- same abort discipline as the pre-write
-    # reference/bookmark-split checks above (real error, no misleading
-    # status), except the file has already been written, so best-effort
-    # restore it to the pre-write backup first.
-    verify_error = _verify_docx_write(
-        dest,
-        expected_counts=baseline_counts,
-        expected_hash=expected_hash,
-        expected_range=(insert_at, insert_at + len(moved_elements)),
-    )
-    if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(dest)
-        verify_error["section_id"] = section_id
-        verify_error["moved_block_count"] = len(moved_elements)
-        return verify_error
+        # 9907df44 -- mandatory post-write verification: re-read dest FRESH
+        # FROM DISK and confirm the on-disk document actually reflects this move
+        # before trusting/reporting the write as a success. A stale/buggy write
+        # path (or one that silently no-ops) is caught here instead of producing
+        # a false "moved" success -- same abort discipline as the pre-write
+        # reference/bookmark-split checks above (real error, no misleading
+        # status), except the file has already been written, so best-effort
+        # restore it to the pre-write backup first.
+        verify_error = _verify_docx_write(
+            dest,
+            expected_counts=baseline_counts,
+            expected_hash=expected_hash,
+            expected_range=(insert_at, insert_at + len(moved_elements)),
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to dest since
+            # our own promotion, in which case this verification "failure"
+            # is a false positive and restoring from our own backup would
+            # destroy that writer's completed, already-promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            verify_error["section_id"] = section_id
+            verify_error["moved_block_count"] = len(moved_elements)
+            return verify_error
 
     # fe989980 -- in draft mode, docx_path (the canonical/source file) was
     # never touched, so its sidecar index is still accurate: skip invalidating it.
@@ -8967,32 +9231,69 @@ def copy_section(
             expected_counts["paragraph_count"] += 1
         trimmed = True
 
-    try:
-        _save_docx_xml_stdlib(raw, root, dest)
-    except OSError as exc:
-        return {"error": f"could not write {dest}: {exc}"}
+    # 5988a5bb -- hold dest's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write verify and any conditional restore below,
+    # closing the same-process window between promotion and verify/restore
+    # entirely (see _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(dest):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, dest)
+        except OSError as exc:
+            return {"error": f"could not write {dest}: {exc}"}
 
-    # 9907df44 -- mandatory post-write verification: re-read dest FRESH
-    # FROM DISK and confirm the copy actually landed before trusting/
-    # reporting success. The copy is located by its own fresh
-    # new_heading_para_id rather than a fixed body index, since a subsequent
-    # trim of the original section can itself shift indices -- searching by
-    # paraId sidesteps needing to re-derive that arithmetic here too. Same
-    # abort discipline as the pre-write checks above (real error, no
-    # misleading status), except the file has already been written, so
-    # best-effort restore it to the pre-write backup first.
-    verify_error = _verify_docx_write(
-        dest,
-        expected_counts=expected_counts,
-        expected_hash=expected_hash if new_heading_para_id is not None else None,
-        locate_by_paraid=new_heading_para_id,
-        expected_len=len(copied_elements),
-    )
-    if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(dest)
-        verify_error["section_id"] = section_id
-        verify_error["copied_block_count"] = len(copied_elements)
-        return verify_error
+        # 9907df44 -- mandatory post-write verification: re-read dest FRESH
+        # FROM DISK and confirm the copy actually landed before trusting/
+        # reporting success. The copy is located by its own fresh
+        # new_heading_para_id rather than a fixed body index, since a subsequent
+        # trim of the original section can itself shift indices -- searching by
+        # paraId sidesteps needing to re-derive that arithmetic here too. Same
+        # abort discipline as the pre-write checks above (real error, no
+        # misleading status), except the file has already been written, so
+        # best-effort restore it to the pre-write backup first.
+        verify_error = _verify_docx_write(
+            dest,
+            expected_counts=expected_counts,
+            expected_hash=expected_hash if new_heading_para_id is not None else None,
+            locate_by_paraid=new_heading_para_id,
+            expected_len=len(copied_elements),
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to dest since
+            # our own promotion, in which case this verification "failure"
+            # is a false positive and restoring from our own backup would
+            # destroy that writer's completed, already-promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            verify_error["section_id"] = section_id
+            verify_error["copied_block_count"] = len(copied_elements)
+            return verify_error
 
     # fe989980 -- in draft mode, docx_path was never touched; its sidecar
     # index is still accurate, so skip invalidating it.
@@ -9225,22 +9526,59 @@ def relocate_figure(
     for offset, element in enumerate(moved_elements):
         body.insert(insert_at + offset, element)
 
-    try:
-        _save_docx_xml_stdlib(raw, root, dest)
-    except OSError as exc:
-        return {"error": f"could not write {dest}: {exc}"}
+    # 5988a5bb -- hold dest's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write verify and any conditional restore below,
+    # closing the same-process window between promotion and verify/restore
+    # entirely (see _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(dest):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, dest)
+        except OSError as exc:
+            return {"error": f"could not write {dest}: {exc}"}
 
-    verify_error = _verify_docx_write(
-        dest,
-        expected_counts=baseline_counts,
-        expected_hash=expected_hash,
-        expected_range=(insert_at, insert_at + removed_count),
-    )
-    if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(dest)
-        verify_error["figure_index"] = figure_index
-        verify_error["moved_block_count"] = removed_count
-        return verify_error
+        verify_error = _verify_docx_write(
+            dest,
+            expected_counts=baseline_counts,
+            expected_hash=expected_hash,
+            expected_range=(insert_at, insert_at + removed_count),
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to dest since
+            # our own promotion, in which case this verification "failure"
+            # is a false positive and restoring from our own backup would
+            # destroy that writer's completed, already-promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            verify_error["figure_index"] = figure_index
+            verify_error["moved_block_count"] = removed_count
+            return verify_error
 
     # fe989980 -- in draft mode, docx_path was never touched; its sidecar
     # index is still accurate, so skip invalidating it.
@@ -9506,27 +9844,64 @@ def relocate_table(
 
     body.insert(insert_at, target_el)
 
-    try:
-        _save_docx_xml_stdlib(raw, root, dest)
-    except OSError as exc:
-        return {"error": f"could not write {dest}: {exc}"}
+    # 5988a5bb -- hold dest's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write verify and any conditional restore below,
+    # closing the same-process window between promotion and verify/restore
+    # entirely (see _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(dest):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, dest)
+        except OSError as exc:
+            return {"error": f"could not write {dest}: {exc}"}
 
-    # 9907df44 -- mandatory post-write verification: re-read dest FRESH
-    # FROM DISK and confirm the table actually landed at insert_at before
-    # trusting/reporting the move as a success. Same abort discipline as the
-    # pre-write bookmark-split check above (real error, no misleading
-    # status), except the file has already been written, so best-effort
-    # restore it to the pre-write backup first.
-    verify_error = _verify_docx_write(
-        dest,
-        expected_counts=baseline_counts,
-        expected_hash=expected_hash,
-        expected_range=(insert_at, insert_at + 1),
-    )
-    if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(dest)
-        verify_error["table_index"] = table_index
-        return verify_error
+        # 9907df44 -- mandatory post-write verification: re-read dest FRESH
+        # FROM DISK and confirm the table actually landed at insert_at before
+        # trusting/reporting the move as a success. Same abort discipline as the
+        # pre-write bookmark-split check above (real error, no misleading
+        # status), except the file has already been written, so best-effort
+        # restore it to the pre-write backup first.
+        verify_error = _verify_docx_write(
+            dest,
+            expected_counts=baseline_counts,
+            expected_hash=expected_hash,
+            expected_range=(insert_at, insert_at + 1),
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to dest since
+            # our own promotion, in which case this verification "failure"
+            # is a false positive and restoring from our own backup would
+            # destroy that writer's completed, already-promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            verify_error["table_index"] = table_index
+            return verify_error
 
     # fe989980 -- in draft mode, docx_path was never touched; its sidecar
     # index is still accurate, so skip invalidating it.
