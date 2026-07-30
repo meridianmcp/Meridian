@@ -1282,6 +1282,8 @@ def move_section(
     destination_position: str = "after",
     index_db_path: str | None = None,
     allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
 ) -> dict[str, Any]:
     """6ff24136 — Move an existing section (heading + its content) to a new
     location in the document.
@@ -1329,13 +1331,33 @@ def move_section(
                                      proceed even when the move would split a
                                      bookmark's start/end across the move
                                      boundary (see safety check 2 above).
+      draft_output_path:            fe989980 — wave-scoped opt-in: when given
+                                     together with wave_run_id, the move is
+                                     written to this ISOLATED path instead of
+                                     docx_path (which is only ever read, never
+                                     mutated). Must differ from docx_path.
+                                     Omitted (the default), this call is
+                                     byte-identical to the direct-write
+                                     behavior that predates fe989980. Pair
+                                     with merge_docx_draft to promote an
+                                     accepted draft into the canonical file
+                                     once the Meridian MCP connection's
+                                     docx_merge manifest gate (open_merge_
+                                     manifest / declare_merge_anchors /
+                                     claim_merge_owner / check_merge_stale_or_
+                                     overlap) has cleared.
+      wave_run_id:                  fe989980 — required together with
+                                     draft_output_path; opaque wave
+                                     identifier threaded into the return
+                                     payload for cross-referencing against
+                                     the matching docx_merge manifest.
 
     Returns:
       {status, section_id, heading_text, moved_block_count,
       destination_anchor_para_id, destination_position, renumber_sequences,
-      find_references_to, docx_path} or {error: <message>} (file NOT
-      mutated on error; a blocked bookmark-split also returns
-      {split_bookmarks: [...]}).
+      find_references_to, docx_path, wave_run_id, is_draft} or
+      {error: <message>} (file NOT mutated on error; a blocked
+      bookmark-split also returns {split_bookmarks: [...]}).
     """
     return docs_intel.move_section(
         docx_path=docx_path,
@@ -1344,6 +1366,8 @@ def move_section(
         destination_position=destination_position,
         index_db_path=index_db_path,
         allow_bookmark_split=allow_bookmark_split,
+        draft_output_path=draft_output_path,
+        wave_run_id=wave_run_id,
     )
 
 
@@ -1355,6 +1379,8 @@ def copy_section(
     destination_position: str = "after",
     index_db_path: str | None = None,
     trim_original_to: str | None = None,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
 ) -> dict[str, Any]:
     """8213050a — Duplicate an existing section (heading + its content) to a
     new location, leaving the original untouched (unless trim_original_to is
@@ -1393,13 +1419,21 @@ def copy_section(
                                      e.g. a "moved to <destination>" pointer).
                                      None (default) leaves the original fully
                                      untouched.
+      draft_output_path:            fe989980 — same wave-scoped opt-in as
+                                     move_section: when given with
+                                     wave_run_id, the copy is written to this
+                                     ISOLATED path instead of docx_path.
+                                     Omitted (the default), byte-identical to
+                                     pre-fe989980 behavior.
+      wave_run_id:                  fe989980 — required together with
+                                     draft_output_path; see move_section.
 
     Returns:
       {status, section_id, heading_text, new_heading_para_id,
       copied_block_count, para_id_map, bookmark_map,
       destination_anchor_para_id, destination_position, renumber_sequences,
-      find_references_to, trimmed_original, docx_path} or
-      {error: <message>} (file NOT mutated on error).
+      find_references_to, trimmed_original, docx_path, wave_run_id,
+      is_draft} or {error: <message>} (file NOT mutated on error).
     """
     return docs_intel.copy_section(
         docx_path=docx_path,
@@ -1408,6 +1442,8 @@ def copy_section(
         destination_position=destination_position,
         index_db_path=index_db_path,
         trim_original_to=trim_original_to,
+        draft_output_path=draft_output_path,
+        wave_run_id=wave_run_id,
     )
 
 
@@ -1419,6 +1455,8 @@ def relocate_figure(
     destination_position: str = "after",
     index_db_path: str | None = None,
     allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Move an image paragraph together with its immediately following Figure caption.
 
@@ -1428,6 +1466,12 @@ def relocate_figure(
     bookmark-splitting moves before writing, verifies the saved document,
     invalidates the local structure sidecar, and renumbers Figure SEQ/REF
     caches after a successful reorder.
+
+    fe989980 — draft_output_path + wave_run_id (both or neither): when given,
+    writes to the ISOLATED draft_output_path instead of docx_path, which is
+    only ever read. Omitted (the default), byte-identical to pre-fe989980
+    behavior. Pair with merge_docx_draft to promote an accepted draft into
+    the canonical file.
     """
     return docs_intel.relocate_figure(
         docx_path=docx_path,
@@ -1436,6 +1480,8 @@ def relocate_figure(
         destination_position=destination_position,
         index_db_path=index_db_path,
         allow_bookmark_split=allow_bookmark_split,
+        draft_output_path=draft_output_path,
+        wave_run_id=wave_run_id,
     )
 
 @mcp.tool()
@@ -1446,6 +1492,8 @@ def relocate_table(
     destination_position: str = "after",
     index_db_path: str | None = None,
     allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
 ) -> dict[str, Any]:
     """c031622b — Move an existing bare <w:tbl> (no owning heading) to a new
     location in the document, atomically.
@@ -1490,12 +1538,21 @@ def relocate_table(
                                      proceed even when the move would split a
                                      bookmark's start/end across the move
                                      boundary.
+      draft_output_path:            fe989980 — same wave-scoped opt-in as
+                                     move_section: when given with
+                                     wave_run_id, the relocate is written to
+                                     this ISOLATED path instead of docx_path.
+                                     Omitted (the default), byte-identical to
+                                     pre-fe989980 behavior.
+      wave_run_id:                  fe989980 — required together with
+                                     draft_output_path; see move_section.
 
     Returns:
       {status, table_index, new_table_index, row_count, col_count,
-      destination_anchor_para_id, destination_position, docx_path} or
-      {error: <message>} (file NOT mutated on error; a blocked bookmark-split
-      also returns {split_bookmarks: [...]}).
+      destination_anchor_para_id, destination_position, docx_path,
+      wave_run_id, is_draft} or {error: <message>} (file NOT mutated on
+      error; a blocked bookmark-split also returns
+      {split_bookmarks: [...]}).
     """
     return docs_intel.relocate_table(
         docx_path=docx_path,
@@ -1504,6 +1561,50 @@ def relocate_table(
         destination_position=destination_position,
         index_db_path=index_db_path,
         allow_bookmark_split=allow_bookmark_split,
+        draft_output_path=draft_output_path,
+        wave_run_id=wave_run_id,
+    )
+
+
+@mcp.tool()
+def merge_docx_draft(
+    canonical_path: str,
+    draft_path: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """fe989980 — promote an isolated wave-scoped draft into canonical_path.
+
+    The file-level counterpart to the Meridian core package's
+    meridian.db.docx_merge coordination layer (open_merge_manifest /
+    declare_merge_anchors / claim_merge_owner / check_merge_stale_or_overlap
+    / record_merge_result / finalize_merge_manifest — a SEPARATE MCP
+    connection, since this stdlib-only extension has no database access of
+    its own). Call this ONLY after that DB-side gate has cleared for the
+    caller — this tool performs no ownership/overlap/staleness checks
+    itself; it only performs the physical promotion, verification, and
+    restore-on-failure.
+
+    draft_path must be a complete .docx previously produced by move_section /
+    copy_section / relocate_table / relocate_figure called with
+    draft_output_path (or any other isolated draft artifact). The draft's
+    whole-document bytes are staged, checked against canonical_path's
+    current media/style/relationship counts, and only then promoted (an
+    existing canonical_path is backed up to canonical_path + ".bak" first).
+    After promotion, canonical_path is re-read fresh from disk and compared
+    against the draft's own structural counts + content hash; on any
+    mismatch canonical_path is best-effort restored from that backup and
+    this returns an error, never a false success.
+
+    Returns {merged: True, status: "merged", canonical_path, draft_path,
+    paragraph_count, heading_count, table_count, image_count} on success, or
+    {merged: False, error: <message>, ...} on failure — with
+    file_restored: <bool> present only when a post-promotion verification
+    failure triggered a restore.
+    """
+    return docs_intel.merge_draft_into_canonical(
+        canonical_path=canonical_path,
+        draft_path=draft_path,
+        index_db_path=index_db_path,
     )
 
 
