@@ -7767,6 +7767,221 @@ def _bookmarks_split_by_range(
     return split_names
 
 
+# ---------------------------------------------------------------------------
+# fe989980 -- wave-scoped merge manifests: the file-level promotion step.
+#
+# meridian.db.docx_merge (in the hosted/self-hosted Meridian core package)
+# owns the DURABLE, cross-session coordination for a wave of parallel DOCX
+# edits: open_merge_manifest / declare_merge_anchors / claim_merge_owner /
+# check_merge_stale_or_overlap / record_merge_result / finalize_merge_manifest.
+# That module resolves WHO may merge and WHETHER a draft is still valid
+# (ownership, declared-anchor overlap, staleness against the canonical
+# file's current revision) -- but it never touches a real .docx: this
+# extension is stdlib-only and deliberately has NO dependency on the
+# meridian core package or its database (see server.py's module docstring
+# -- "Thin MCP stdio server exposing the docs_intel DOCX parser as tools",
+# run locally via ``uvx meridian-docs``, no DB connectivity at all).
+#
+# merge_draft_into_canonical is the file-level counterpart those DB
+# primitives call out to once their gate is clear: a wave's serialized
+# merge owner promotes their already-accepted draft (a COMPLETE, isolated
+# .docx produced by move_section/copy_section/relocate_table/relocate_figure
+# below, called with draft_output_path -- never the canonical file itself)
+# over the canonical file. It reuses the exact stage -> verify -> promote
+# transaction (_atomic_write_docx_bytes) every direct write in this module
+# already goes through, so a structurally corrupt draft can never reach
+# canonical_path, plus the SAME post-write re-read-from-disk verification +
+# backup/restore discipline (_verify_docx_write / _restore_docx_backup,
+# 9907df44) move_section et al. use for their own in-place writes -- applied
+# here to a whole-document promotion instead of an in-place range edit.
+# ---------------------------------------------------------------------------
+
+def merge_draft_into_canonical(
+    canonical_path: str,
+    draft_path: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """fe989980 -- promote an isolated wave-scoped draft into ``canonical_path``.
+
+    Called by a wave's serialized merge owner AFTER the DB-side gate
+    (``meridian.db.docx_merge.check_merge_stale_or_overlap``, over the
+    separate Meridian MCP connection) has already cleared -- this function
+    performs no ownership/overlap/staleness checks of its own; that
+    coordination is durable, cross-session state this stdlib-only, DB-free
+    extension cannot see.
+
+    Promotion:
+      1. ``draft_path`` is read and parsed; a draft that does not exist or
+         is not a valid .docx is rejected with ``canonical_path`` untouched.
+      2. The draft's whole-document bytes are staged, structurally verified
+         against ``canonical_path``'s CURRENT media/style/relationship
+         counts (:func:`_atomic_write_docx_bytes`'s existing ``pre_manifest``
+         gate -- the same invariant every direct write in this module
+         preserves), and only then promoted -- an existing ``canonical_path``
+         is backed up to ``canonical_path + ".bak"`` immediately before the
+         swap. A structural-invariant violation here means the STAGED draft
+         is corrupt: raised as an error, ``canonical_path`` is guaranteed
+         byte-for-byte untouched (promotion never runs).
+      3. Post-promotion, ``canonical_path`` is re-read FRESH FROM DISK and
+         its structural counts + a whole-body content hash are compared
+         against the draft's OWN (pre-promotion) counts/hash -- the same
+         :func:`_verify_docx_write` discipline move_section/copy_section/
+         relocate_table/relocate_figure apply to their in-place writes,
+         applied here to confirm the promotion itself actually landed
+         (catches a silent no-op promotion or a concurrent external write).
+         On mismatch, ``canonical_path`` is best-effort restored from the
+         backup :func:`_atomic_write_docx_bytes` just wrote and this returns
+         an ERROR -- never a false success.
+
+    Returns ``{"merged": True, "status": "merged", "canonical_path",
+    "draft_path", "paragraph_count", "heading_count", "table_count",
+    "image_count"}`` on success.
+
+    Returns ``{"merged": False, "error": <message>, ...}`` on failure --
+    with ``"file_restored": <bool>`` present only for the post-promotion
+    verification-failure case (step 3); every other failure mode leaves
+    ``canonical_path`` untouched by construction, so there is nothing to
+    restore.
+    """
+    if not draft_path or not os.path.exists(draft_path):
+        return {
+            "merged": False,
+            "error": f"draft_path {draft_path!r} does not exist",
+        }
+
+    try:
+        with open(draft_path, "rb") as fh:
+            draft_bytes = fh.read()
+    except OSError as exc:
+        return {
+            "merged": False,
+            "error": f"could not read draft_path {draft_path!r}: {exc}",
+        }
+
+    try:
+        draft_raw, draft_root = _load_docx_xml_stdlib(draft_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "merged": False,
+            "error": f"draft_path {draft_path!r} is not a valid .docx: {exc}",
+        }
+
+    draft_body = draft_root.find(_q(_W, "body"))
+    if draft_body is None:
+        return {
+            "merged": False,
+            "error": f"draft_path {draft_path!r} has no <w:body> element",
+        }
+
+    draft_children = list(draft_body)
+    draft_counts = _structural_counts([draft_body])
+    draft_counts["image_count"] = _docx_media_count(draft_raw)
+    expected_hash = _hash_elements(draft_children)
+
+    pre_manifest: dict[str, int] | None = None
+    if os.path.exists(canonical_path):
+        try:
+            with open(canonical_path, "rb") as fh:
+                canonical_raw = fh.read()
+            pre_manifest = _docx_structural_manifest(canonical_raw)
+        except (OSError, zipfile.BadZipFile, KeyError) as exc:
+            return {
+                "merged": False,
+                "error": (
+                    f"could not read existing canonical_path {canonical_path!r} "
+                    f"before merging: {exc}"
+                ),
+            }
+
+    try:
+        _atomic_write_docx_bytes(
+            draft_bytes,
+            canonical_path,
+            pre_manifest=pre_manifest,
+            protected_keys=("media_count", "style_count", "relationship_count"),
+        )
+    except DocxWriteVerificationError as exc:
+        return {
+            "merged": False,
+            "error": (
+                "merge rejected: the draft does not preserve structural "
+                f"elements the canonical file must never lose: {exc}"
+            ),
+        }
+    except OSError as exc:
+        return {
+            "merged": False,
+            "error": f"could not write {canonical_path}: {exc}",
+        }
+
+    verify_error = _verify_docx_write(
+        canonical_path,
+        expected_counts=draft_counts,
+        expected_hash=expected_hash,
+        expected_range=(0, len(draft_children)),
+    )
+    if verify_error is not None:
+        verify_error["merged"] = False
+        verify_error["file_restored"] = _restore_docx_backup(canonical_path)
+        verify_error["canonical_path"] = canonical_path
+        verify_error["draft_path"] = draft_path
+        return verify_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "merged": True,
+        "status": "merged",
+        "canonical_path": canonical_path,
+        "draft_path": draft_path,
+        **draft_counts,
+    }
+
+
+def _resolve_draft_dest(
+    docx_path: str,
+    draft_output_path: str | None,
+    wave_run_id: str | None,
+) -> "dict[str, Any] | str":
+    """fe989980 -- shared opt-in draft-mode validation for the four
+    structural mutators (move_section / copy_section / relocate_table /
+    relocate_figure). Returns the resolved write destination (a plain
+    ``str``) on success, or an ``{"error": ...}`` dict for the caller to
+    return verbatim.
+
+    ``draft_output_path`` and ``wave_run_id`` must be supplied together or
+    not at all -- wave-scoped drafting needs both an isolated write target
+    AND the identifier that scopes its ``meridian.db.docx_merge`` manifest
+    (this extension has no DB access to validate ``wave_run_id`` against;
+    it is opaque here, threaded through only for the caller's own
+    cross-reference). Omitting both is the legacy path: the destination is
+    ``docx_path`` itself, byte-identical to pre-fe989980 behavior.
+    """
+    if bool(wave_run_id) != bool(draft_output_path):
+        return {
+            "error": (
+                "wave_run_id and draft_output_path must be provided "
+                "together -- wave-scoped drafting requires both an "
+                "isolated draft target and the wave identifier that scopes "
+                "its merge manifest"
+            )
+        }
+    if not draft_output_path:
+        return docx_path
+    dest = draft_output_path.strip()
+    if not dest:
+        return {"error": "draft_output_path must be a non-empty path"}
+    if os.path.normcase(os.path.abspath(dest)) == os.path.normcase(os.path.abspath(docx_path)):
+        return {
+            "error": (
+                "draft_output_path must differ from docx_path -- a "
+                "wave-scoped draft must be an isolated artifact, never the "
+                "canonical file itself"
+            )
+        }
+    return dest
+
+
 def move_section(
     docx_path: str,
     section_id: str,
@@ -7774,6 +7989,8 @@ def move_section(
     destination_position: str = "after",
     index_db_path: str | None = None,
     allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
 ) -> dict[str, Any]:
     """6ff24136 -- move an existing section (heading + its content) to a new
     location in the document.
@@ -7841,17 +8058,38 @@ def move_section(
                                       to proceed even when the move would
                                       split a bookmark's start/end across the
                                       move boundary (see e87b8338 above).
+        draft_output_path:            fe989980 -- when given (together with
+                                      ``wave_run_id``), the move is written to
+                                      this ISOLATED path instead of
+                                      ``docx_path`` -- ``docx_path`` is only
+                                      ever READ, never mutated. Must differ
+                                      from ``docx_path``. Omitted (the
+                                      default), this call is byte-identical
+                                      to the pre-fe989980 direct-write
+                                      behavior.
+        wave_run_id:                  fe989980 -- opaque wave identifier,
+                                      required together with
+                                      ``draft_output_path``; threaded straight
+                                      into the return payload so a caller can
+                                      cross-reference this write against the
+                                      matching ``meridian.db.docx_merge``
+                                      manifest. Never validated or persisted
+                                      by this stdlib-only, DB-free extension.
 
     Returns:
         ``{status, section_id, heading_text, moved_block_count,
         destination_anchor_para_id, destination_position,
-        renumber_sequences, find_references_to, docx_path}``.
+        renumber_sequences, find_references_to, docx_path, wave_run_id,
+        is_draft}``. ``docx_path`` in the result is the file actually
+        written -- ``draft_output_path`` when given, else the input
+        ``docx_path`` (unchanged legacy behavior).
 
         ``{"error": <message>}`` when ``section_id`` /
         ``destination_anchor_para_id`` can't be resolved, the destination
         falls inside the section being moved, the move would split a
-        bookmark (and ``allow_bookmark_split`` is not set), or the write
-        fails (file NOT mutated on error in every one of these cases).
+        bookmark (and ``allow_bookmark_split`` is not set), ``wave_run_id``/
+        ``draft_output_path`` are not both given or not both omitted, or the
+        write fails (file NOT mutated on error in every one of these cases).
 
         9907df44 -- after a successful write, mandatory post-write
         verification re-reads the file from disk and compares structural
@@ -7865,6 +8103,11 @@ def move_section(
         return {
             "error": f"destination_position must be 'before' or 'after', got {destination_position!r}"
         }
+
+    dest_error = _resolve_draft_dest(docx_path, draft_output_path, wave_run_id)
+    if isinstance(dest_error, dict):
+        return dest_error
+    dest = dest_error
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -7988,11 +8231,11 @@ def move_section(
         body.insert(insert_at + offset, el)
 
     try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
+        _save_docx_xml_stdlib(raw, root, dest)
     except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+        return {"error": f"could not write {dest}: {exc}"}
 
-    # 9907df44 -- mandatory post-write verification: re-read docx_path FRESH
+    # 9907df44 -- mandatory post-write verification: re-read dest FRESH
     # FROM DISK and confirm the on-disk document actually reflects this move
     # before trusting/reporting the write as a success. A stale/buggy write
     # path (or one that silently no-ops) is caught here instead of producing
@@ -8001,20 +8244,23 @@ def move_section(
     # status), except the file has already been written, so best-effort
     # restore it to the pre-write backup first.
     verify_error = _verify_docx_write(
-        docx_path,
+        dest,
         expected_counts=baseline_counts,
         expected_hash=expected_hash,
         expected_range=(insert_at, insert_at + len(moved_elements)),
     )
     if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(docx_path)
+        verify_error["file_restored"] = _restore_docx_backup(dest)
         verify_error["section_id"] = section_id
         verify_error["moved_block_count"] = len(moved_elements)
         return verify_error
 
-    _invalidate_sidecar_mtime(index_db_path)
+    # fe989980 -- in draft mode, docx_path (the canonical/source file) was
+    # never touched, so its sidecar index is still accurate: skip invalidating it.
+    if not draft_output_path:
+        _invalidate_sidecar_mtime(index_db_path)
 
-    renumber_result = renumber_sequences(docx_path, index_db_path=index_db_path)
+    renumber_result = renumber_sequences(dest, index_db_path=index_db_path)
 
     return {
         "status": "moved",
@@ -8025,7 +8271,9 @@ def move_section(
         "destination_position": destination_position,
         "renumber_sequences": renumber_result,
         "find_references_to": references_result,
-        "docx_path": docx_path,
+        "docx_path": dest,
+        "wave_run_id": wave_run_id,
+        "is_draft": bool(draft_output_path),
     }
 
 
@@ -8040,6 +8288,8 @@ def copy_section(
     destination_position: str = "after",
     index_db_path: str | None = None,
     trim_original_to: str | None = None,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
 ) -> dict[str, Any]:
     """8213050a -- duplicate an existing section (heading + its content) to a
     new location in the document, leaving the original untouched (unless
@@ -8128,13 +8378,26 @@ def copy_section(
                                       original section's body (heading kept).
                                       ``None`` (default) leaves the original
                                       fully untouched.
+        draft_output_path:            fe989980 -- same opt-in wave-scoped
+                                      draft mode as :func:`move_section`: when
+                                      given (with ``wave_run_id``), the copy
+                                      is written to this ISOLATED path instead
+                                      of ``docx_path``, which is only ever
+                                      read. Omitted (the default), behavior
+                                      is byte-identical to pre-fe989980.
+        wave_run_id:                  fe989980 -- required together with
+                                      ``draft_output_path``; see
+                                      :func:`move_section`.
 
     Returns:
         ``{status, section_id, heading_text, new_heading_para_id,
         copied_block_count, para_id_map, bookmark_map,
         destination_anchor_para_id, destination_position,
-        renumber_sequences, find_references_to, trimmed_original, docx_path}``
-        -- ``para_id_map`` / ``bookmark_map`` are ``{old: new}`` dicts for
+        renumber_sequences, find_references_to, trimmed_original, docx_path,
+        wave_run_id, is_draft}`` -- ``docx_path`` in the result is the file
+        actually written (``draft_output_path`` when given, else the input
+        ``docx_path``). ``para_id_map`` / ``bookmark_map`` are ``{old: new}``
+        dicts for
         every paraId/bookmark that existed in the original section and was
         renamed in the copy (originals lacking a native paraId aren't keyed
         in ``para_id_map``, but the copy still gets one -- see
@@ -8156,6 +8419,11 @@ def copy_section(
         return {
             "error": f"destination_position must be 'before' or 'after', got {destination_position!r}"
         }
+
+    dest_path_error = _resolve_draft_dest(docx_path, draft_output_path, wave_run_id)
+    if isinstance(dest_path_error, dict):
+        return dest_path_error
+    dest = dest_path_error
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -8355,11 +8623,11 @@ def copy_section(
         trimmed = True
 
     try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
+        _save_docx_xml_stdlib(raw, root, dest)
     except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+        return {"error": f"could not write {dest}: {exc}"}
 
-    # 9907df44 -- mandatory post-write verification: re-read docx_path FRESH
+    # 9907df44 -- mandatory post-write verification: re-read dest FRESH
     # FROM DISK and confirm the copy actually landed before trusting/
     # reporting success. The copy is located by its own fresh
     # new_heading_para_id rather than a fixed body index, since a subsequent
@@ -8369,21 +8637,24 @@ def copy_section(
     # misleading status), except the file has already been written, so
     # best-effort restore it to the pre-write backup first.
     verify_error = _verify_docx_write(
-        docx_path,
+        dest,
         expected_counts=expected_counts,
         expected_hash=expected_hash if new_heading_para_id is not None else None,
         locate_by_paraid=new_heading_para_id,
         expected_len=len(copied_elements),
     )
     if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(docx_path)
+        verify_error["file_restored"] = _restore_docx_backup(dest)
         verify_error["section_id"] = section_id
         verify_error["copied_block_count"] = len(copied_elements)
         return verify_error
 
-    _invalidate_sidecar_mtime(index_db_path)
+    # fe989980 -- in draft mode, docx_path was never touched; its sidecar
+    # index is still accurate, so skip invalidating it.
+    if not draft_output_path:
+        _invalidate_sidecar_mtime(index_db_path)
 
-    renumber_result = renumber_sequences(docx_path, index_db_path=index_db_path)
+    renumber_result = renumber_sequences(dest, index_db_path=index_db_path)
 
     return {
         "status": "copied",
@@ -8398,7 +8669,9 @@ def copy_section(
         "renumber_sequences": renumber_result,
         "find_references_to": references_result,
         "trimmed_original": trimmed,
-        "docx_path": docx_path,
+        "docx_path": dest,
+        "wave_run_id": wave_run_id,
+        "is_draft": bool(draft_output_path),
     }
 
 
@@ -8422,6 +8695,8 @@ def relocate_figure(
     destination_position: str = "after",
     index_db_path: str | None = None,
     allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
 ) -> dict[str, Any]:
     """Relocate one image paragraph together with its immediately following Figure caption.
 
@@ -8439,9 +8714,13 @@ def relocate_figure(
     SEQ caches and REF display text remain correct after the reorder.
 
     Returns {status, figure_index, moved_block_count, image_para_id,
-    caption_para_id, new_body_index, renumber_sequences, docx_path}, or an
-    {"error": ...} result with the source document untouched for validation and
-    pre-write safety failures.
+    caption_para_id, new_body_index, renumber_sequences, docx_path,
+    wave_run_id, is_draft}, or an {"error": ...} result with the source
+    document untouched for validation and pre-write safety failures.
+    ``docx_path`` in the result is the file actually written --
+    ``draft_output_path`` when given (fe989980; requires ``wave_run_id`` too
+    -- see :func:`move_section`), else the input ``docx_path`` (unchanged
+    legacy behavior).
     """
     if destination_position not in ("before", "after"):
         return {
@@ -8461,6 +8740,11 @@ def relocate_figure(
                 f"got {figure_index!r}"
             )
         }
+
+    dest_path_error = _resolve_draft_dest(docx_path, draft_output_path, wave_run_id)
+    if isinstance(dest_path_error, dict):
+        return dest_path_error
+    dest = dest_path_error
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -8597,25 +8881,28 @@ def relocate_figure(
         body.insert(insert_at + offset, element)
 
     try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
+        _save_docx_xml_stdlib(raw, root, dest)
     except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+        return {"error": f"could not write {dest}: {exc}"}
 
     verify_error = _verify_docx_write(
-        docx_path,
+        dest,
         expected_counts=baseline_counts,
         expected_hash=expected_hash,
         expected_range=(insert_at, insert_at + removed_count),
     )
     if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(docx_path)
+        verify_error["file_restored"] = _restore_docx_backup(dest)
         verify_error["figure_index"] = figure_index
         verify_error["moved_block_count"] = removed_count
         return verify_error
 
-    _invalidate_sidecar_mtime(index_db_path)
+    # fe989980 -- in draft mode, docx_path was never touched; its sidecar
+    # index is still accurate, so skip invalidating it.
+    if not draft_output_path:
+        _invalidate_sidecar_mtime(index_db_path)
     renumber_result = renumber_sequences(
-        docx_path, index_db_path=index_db_path
+        dest, index_db_path=index_db_path
     )
 
     image_para_id = body_list[source_idx].get(w14_para_id)
@@ -8630,7 +8917,9 @@ def relocate_figure(
         "destination_anchor_para_id": destination_anchor_para_id,
         "destination_position": destination_position,
         "renumber_sequences": renumber_result,
-        "docx_path": docx_path,
+        "docx_path": dest,
+        "wave_run_id": wave_run_id,
+        "is_draft": bool(draft_output_path),
     }
 
 def relocate_table(
@@ -8640,6 +8929,8 @@ def relocate_table(
     destination_position: str = "after",
     index_db_path: str | None = None,
     allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
 ) -> dict[str, Any]:
     """c031622b -- move an existing bare ``<w:tbl>`` (no owning heading) to a
     new location in the document, atomically.
@@ -8709,10 +9000,23 @@ def relocate_table(
                                       to proceed even when the move would
                                       split a bookmark's start/end across the
                                       move boundary (see e87b8338 above).
+        draft_output_path:            fe989980 -- same opt-in wave-scoped
+                                      draft mode as :func:`move_section`: when
+                                      given (with ``wave_run_id``), the move
+                                      is written to this ISOLATED path instead
+                                      of ``docx_path``, which is only ever
+                                      read. Omitted (the default), behavior
+                                      is byte-identical to pre-fe989980.
+        wave_run_id:                  fe989980 -- required together with
+                                      ``draft_output_path``; see
+                                      :func:`move_section`.
 
     Returns:
         ``{status, table_index, new_table_index, row_count, col_count,
-        destination_anchor_para_id, destination_position, docx_path}``.
+        destination_anchor_para_id, destination_position, docx_path,
+        wave_run_id, is_draft}``. ``docx_path`` in the result is the file
+        actually written (``draft_output_path`` when given, else the input
+        ``docx_path``).
 
         ``{"error": <message>}`` when ``table_index`` is out of range or does
         not identify a ``<w:tbl>``, ``destination_anchor_para_id`` can't be
@@ -8732,6 +9036,11 @@ def relocate_table(
         return {
             "error": f"destination_position must be 'before' or 'after', got {destination_position!r}"
         }
+
+    dest_path_error = _resolve_draft_dest(docx_path, draft_output_path, wave_run_id)
+    if isinstance(dest_path_error, dict):
+        return dest_path_error
+    dest = dest_path_error
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -8853,28 +9162,31 @@ def relocate_table(
     body.insert(insert_at, target_el)
 
     try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
+        _save_docx_xml_stdlib(raw, root, dest)
     except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+        return {"error": f"could not write {dest}: {exc}"}
 
-    # 9907df44 -- mandatory post-write verification: re-read docx_path FRESH
+    # 9907df44 -- mandatory post-write verification: re-read dest FRESH
     # FROM DISK and confirm the table actually landed at insert_at before
     # trusting/reporting the move as a success. Same abort discipline as the
     # pre-write bookmark-split check above (real error, no misleading
     # status), except the file has already been written, so best-effort
     # restore it to the pre-write backup first.
     verify_error = _verify_docx_write(
-        docx_path,
+        dest,
         expected_counts=baseline_counts,
         expected_hash=expected_hash,
         expected_range=(insert_at, insert_at + 1),
     )
     if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(docx_path)
+        verify_error["file_restored"] = _restore_docx_backup(dest)
         verify_error["table_index"] = table_index
         return verify_error
 
-    _invalidate_sidecar_mtime(index_db_path)
+    # fe989980 -- in draft mode, docx_path was never touched; its sidecar
+    # index is still accurate, so skip invalidating it.
+    if not draft_output_path:
+        _invalidate_sidecar_mtime(index_db_path)
 
     return {
         "status": "moved",
@@ -8884,7 +9196,9 @@ def relocate_table(
         "col_count": table_meta["col_count"],
         "destination_anchor_para_id": destination_anchor_para_id,
         "destination_position": destination_position,
-        "docx_path": docx_path,
+        "docx_path": dest,
+        "wave_run_id": wave_run_id,
+        "is_draft": bool(draft_output_path),
     }
 
 
