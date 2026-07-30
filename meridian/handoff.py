@@ -37,6 +37,7 @@ from . import artifact_declaration as artifact_declaration_module
 from . import capability_contract as capability_contract_module
 from . import db as db_module
 from . import docx_integrity_gate as docx_integrity_gate_module
+from . import executor_contract as executor_contract_module
 from . import tool_requirements as tool_requirements_module
 from .db.sprint_items import (
     _is_deferred,
@@ -1722,6 +1723,12 @@ def _build_quick_start_goal(
         # category: same hard, unconditional treatment, for items with no
         # item-level pin of their own.
         + _build_workspace_tool_priority_clause(pending_sprint_items, tool_priority_map)
+        # de4d4293 — compact per-item routing hint for the CLAIMABLE batch
+        # ONLY (pending_sprint_items — already narrowed by the manual/
+        # backburner/unprospected/wave-gate exclusions above), deliberately
+        # bounded unlike the full-inventory clauses below. See
+        # _build_executor_routing_clause's own docstring for why.
+        + _build_executor_routing_clause(pending_sprint_items)
         # 76dde31f (665 follow-up) — typed per-item tool_requirements contract:
         # the FULL pending inventory (see _all_pending_for_tool_requirements
         # above), not the narrower claimable-now batch the two clauses above
@@ -1809,6 +1816,61 @@ def _build_required_tool_clause(items: list[dict[str, Any]]) -> str:
         "a hard requirement, not a suggestion: " + "; ".join(pins)
     )
     return f"\n<required_tool>{_xml_escape(body)}</required_tool>"
+
+
+def _build_executor_routing_clause(items: list[dict[str, Any]]) -> str:
+    """de4d4293 — build a COMPACT ``<executor_routing>`` XML clause: one
+    short line per item naming the tool an executor should reach for FIRST.
+
+    This is the fix for the "confirmed handoff gap" this item shipped to
+    close: starter (and every other) mode's paste-ready /goal text used to
+    carry item ids and generic executor rules but NOTHING about which tool
+    routes THIS item. Sourced from
+    ``executor_contract.build_routing_summary`` — explicit
+    ``tool_requirements``/``required_tool`` when the item declares one, else
+    a best-effort default-category lookup (see
+    ``executor_contract.infer_default_routing_category`` for the built-in
+    orchestration/code-investigation/handoff/tunnel-verification/DOCX
+    lookup table) — the SAME canonical extraction
+    ``capability_contract.build_capability_contract``'s
+    ``item_routing_summary`` field reads, so the /goal text and the
+    structured JSON never independently drift for overlapping items.
+
+    Deliberately bounded and deliberately NOT the full per-item
+    ``executor_contract`` (allowed/forbidden tools, steps, gates, completion
+    checks — that stays in the structured
+    ``capability_contract.item_executor_contracts`` JSON field only).
+    ``items`` here is expected to be the FINAL claimable batch — the same
+    list already named in ``<sprint_items>`` — deliberately narrower than
+    the full pending-inventory scope ``_build_tool_requirements_clause``
+    below uses: inlining a full per-item contract for every item in the
+    entire backlog into this prose is exactly the unbounded-size mistake
+    23e20656 already made once (95KB+ on a 37-69 item board — see
+    ``capability_contract.build_capability_contract``'s own docstring for
+    the incident). One compact line per claimable item keeps this clause a
+    few KB even for a 40+ item scope.
+
+    The embedded ``hash`` attribute is
+    ``executor_contract.routing_summary_hash`` of the SAME entries this
+    clause renders — a caller can recompute
+    ``build_routing_summary(claimable_items)`` independently and confirm the
+    hash matches, proving this compact prose block was not hand-edited
+    after generation without needing the full structured contract inline.
+
+    Returns ``""`` when no item in ``items`` has a resolvable hint (explicit
+    or inferred), so an ordinary /goal with nothing to route never grows a
+    line of noise.
+    """
+    summary = executor_contract_module.build_routing_summary(items)
+    if not summary:
+        return ""
+    _hash = executor_contract_module.routing_summary_hash(summary)
+    body = "; ".join(
+        f"{h['item_id']}: {h['server_or_namespace']}: {h['name']} "
+        f"({h['required_or_preferred']}/{h['source']})"
+        for h in summary
+    )
+    return f'\n<executor_routing hash="{_xml_escape(_hash)}">{_xml_escape(body)}</executor_routing>'
 
 
 def _build_tool_requirements_clause(items: list[dict[str, Any]]) -> str:
