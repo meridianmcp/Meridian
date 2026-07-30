@@ -1945,3 +1945,542 @@ def test_assemble_artifact_pointer_findings_ignores_malformed_entries():
     ]
     out = assemble_artifact_pointer_findings_from_annotated_items(items)
     assert [e["item_id"] for e in out] == ["ok"]
+
+
+# ---------------------------------------------------------------------------
+# eb8b6894 — distinguish pointer PRESENCE from successful TARGET RESOLUTION.
+#
+# Confirmed bug: a checkpoint/handoff projection could show a durable pointer
+# row EXISTS and mark provenance "satisfied" even when resolve_pointer
+# reports every target unresolved. These tests exercise the three new
+# explicit signals (structural_valid / target_resolved / provenance_verified),
+# the live-vs-fallback resolution_source distinction, the item-level rollup
+# (pointers.aggregate_pointer_evidence), and the opt-in STRICT gate
+# (db.is_item_claim_prospected(strict=True, target_resolved=...)) that makes
+# an unresolved-but-present pointer fail a strict caller instead of quietly
+# passing.
+# ---------------------------------------------------------------------------
+
+from meridian.pointers import (  # noqa: E402
+    check_structural_validity,
+    build_typed_pointer_record,
+    aggregate_pointer_evidence,
+    verify_pointer_readiness,
+    default_figure_resolver,
+    compute_pointer_readiness_for_record,
+)
+from meridian import handoff as handoff_module  # noqa: E402
+
+
+def test_check_structural_validity_pure_pass_and_fail():
+    ok = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2},
+         "target_kind": "existing"},
+    ]}
+    valid, err = check_structural_validity(ok)
+    assert valid is True and err is None
+
+    bad = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "bogus"}},
+    ]}
+    valid, err = check_structural_validity(bad)
+    assert valid is False
+    assert "bogus" in err
+
+
+def test_check_structural_validity_never_touches_real_filesystem():
+    """A STORED pointer (row_to_pointer shape) always carries an EXPLICIT
+    target_kind on every target — re-validating it with the REAL filesystem
+    checker would retroactively disk-check every implicit-'existing' pointer
+    ever written (see the module docstring). check_structural_validity must
+    stay pure: a target_kind='existing' pointer at a path that does NOT
+    exist on disk must still be reported structurally valid."""
+    stored = {
+        "source_type": "code",
+        "targets": [{
+            "uri": "definitely/does/not/exist/on/this/machine.py",
+            "selector": {"type": "range", "start_line": 1, "end_line": 2},
+            "target_kind": "existing",
+        }],
+    }
+    valid, err = check_structural_validity(stored)
+    assert valid is True and err is None
+
+
+def test_build_typed_pointer_record_target_resolved_true_for_fully_resolved_pointer():
+    stored = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2},
+         "target_kind": "existing"},
+    ]}
+    resolved = {"source_type": "code", "targets": [
+        {"resolved": True, "selector_type": "range", "uri": "a.py",
+         "range": {"start_line": 1, "end_line": 2}},
+    ]}
+    rec = build_typed_pointer_record(stored, resolved)
+    assert rec["structural_valid"] is True
+    assert "structural_error" not in rec
+    assert rec["target_resolved"] is True
+    assert "target_resolved_reason" not in rec
+    # range has no live/fallback resolution concept.
+    assert rec["resolution_source"] == "not_applicable"
+    # No readiness was supplied — tri-state None, never coerced to False.
+    assert rec["provenance_verified"] is None
+    assert rec["provenance_reason"]
+
+
+def test_build_typed_pointer_record_target_resolved_false_carries_reason():
+    """The core bug scenario: a durable pointer row (structurally valid) whose
+    target the resolver could NOT find — target_resolved must be False with
+    an explicit reason, distinct from structural_valid (still True: the
+    pointer itself is well-formed)."""
+    stored = {"source_type": "code", "targets": [
+        {"uri": "file:x.py", "selector": {"type": "symbol", "qualified_name": "x.missing"},
+         "target_kind": "existing"},
+    ]}
+    resolved = {"source_type": "code", "targets": [
+        {"resolved": False, "selector_type": "symbol", "uri": "file:x.py",
+         "qualified_name": "x.missing", "reason": "no matching symbol in graph snapshot"},
+    ]}
+    rec = build_typed_pointer_record(stored, resolved)
+    assert rec["structural_valid"] is True
+    assert rec["target_resolved"] is False
+    assert "unresolved" in rec["target_resolved_reason"]
+    assert "no matching symbol in graph snapshot" in rec["target_resolved_reason"]
+
+
+def test_build_typed_pointer_record_target_resolved_false_with_no_resolve_pass_at_all():
+    """resolved=None (never resolved) must also read as NOT resolved — never
+    vacuously True just because nothing failed."""
+    stored = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}},
+    ]}
+    rec = build_typed_pointer_record(stored, None)
+    assert rec["target_resolved"] is False
+    assert "not been resolved" in rec["target_resolved_reason"]
+
+
+def test_build_typed_pointer_record_resolution_source_from_symbol_match():
+    stored = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "symbol", "qualified_name": "a.b"},
+         "target_kind": "existing"},
+    ]}
+    resolved_live = {"source_type": "code", "targets": [
+        {"resolved": True, "selector_type": "symbol", "uri": "a.py",
+         "qualified_name": "a.b", "resolution_source": "live_graph"},
+    ]}
+    assert build_typed_pointer_record(stored, resolved_live)["resolution_source"] == "live_graph"
+
+    resolved_stale = {"source_type": "code", "targets": [
+        {"resolved": True, "selector_type": "symbol", "uri": "a.py",
+         "qualified_name": "a.b", "resolution_source": "stale_snapshot"},
+    ]}
+    assert build_typed_pointer_record(stored, resolved_stale)["resolution_source"] == "stale_snapshot"
+
+
+def test_build_typed_pointer_record_resolution_source_mixed_across_targets():
+    stored = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "symbol", "qualified_name": "a.b"}},
+        {"uri": "b.py", "selector": {"type": "symbol", "qualified_name": "c.d"}},
+    ]}
+    resolved = {"source_type": "code", "targets": [
+        {"resolved": True, "selector_type": "symbol", "uri": "a.py",
+         "qualified_name": "a.b", "resolution_source": "live_graph"},
+        {"resolved": True, "selector_type": "symbol", "uri": "b.py",
+         "qualified_name": "c.d", "resolution_source": "stale_snapshot"},
+    ]}
+    rec = build_typed_pointer_record(stored, resolved)
+    assert rec["resolution_source"] == "mixed"
+
+
+def test_build_typed_pointer_record_provenance_verified_none_without_readiness():
+    stored = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 1},
+         "target_kind": "existing"},
+    ]}
+    rec = build_typed_pointer_record(stored, None, readiness=None)
+    assert rec["provenance_verified"] is None
+    assert "not computed" in rec["provenance_reason"]
+
+
+@pytest.mark.asyncio
+async def test_build_typed_pointer_record_provenance_verified_reflects_readiness(tmp_path):
+    """Wires an ACTUAL verify_pointer_readiness result in: a range selector
+    always resolves (target_resolved True) regardless of whether the file
+    exists — provenance_verified is the SEPARATE signal that catches that,
+    proving all three fields answer genuinely different questions."""
+    missing = str(tmp_path / "does_not_exist.py")
+    stored = {"source_type": "code", "targets": [
+        {"uri": missing, "selector": {"type": "range", "start_line": 1, "end_line": 1},
+         "target_kind": "existing"},
+    ]}
+    resolved = {"source_type": "code", "targets": [
+        {"resolved": True, "selector_type": "range", "uri": missing,
+         "range": {"start_line": 1, "end_line": 1}},
+    ]}
+    readiness = await verify_pointer_readiness(stored)
+    rec = build_typed_pointer_record(stored, resolved, readiness=readiness)
+    # target_resolved is True (range resolves unconditionally)...
+    assert rec["target_resolved"] is True
+    # ...but provenance_verified correctly catches the missing file.
+    assert rec["provenance_verified"] is False
+    assert rec["provenance_reason"]
+
+    real_file = tmp_path / "real.py"
+    real_file.write_text("x = 1\n")
+    stored_real = {"source_type": "code", "targets": [
+        {"uri": str(real_file), "selector": {"type": "range", "start_line": 1, "end_line": 1},
+         "target_kind": "existing"},
+    ]}
+    readiness_real = await verify_pointer_readiness(stored_real)
+    rec_real = build_typed_pointer_record(stored_real, resolved, readiness=readiness_real)
+    assert rec_real["provenance_verified"] is True
+    assert "provenance_reason" not in rec_real
+
+
+@pytest.mark.asyncio
+async def test_compute_pointer_readiness_for_record_never_raises_on_malformed_pointer():
+    # No 'targets' key at all — verify_pointer_readiness degrades gracefully.
+    out = await compute_pointer_readiness_for_record({"source_type": "code"})
+    assert isinstance(out, dict)
+    assert out["ready"] is False
+
+
+def test_default_figure_resolver_returns_callable():
+    resolver = default_figure_resolver()
+    assert callable(resolver)
+
+
+# ---------------------------------------------------------------------------
+# aggregate_pointer_evidence — item-level rollup
+# ---------------------------------------------------------------------------
+
+def test_aggregate_pointer_evidence_empty_list_is_not_vacuously_true():
+    out = aggregate_pointer_evidence([])
+    assert out == {
+        "structural_valid": None,
+        "target_resolved": False,
+        "provenance_verified": None,
+        "resolution_source": "not_applicable",
+    }
+
+
+def test_aggregate_pointer_evidence_all_pass():
+    records = [
+        {"structural_valid": True, "target_resolved": True,
+         "provenance_verified": True, "resolution_source": "live_graph"},
+        {"structural_valid": True, "target_resolved": True,
+         "provenance_verified": None, "resolution_source": "not_applicable"},
+    ]
+    out = aggregate_pointer_evidence(records)
+    assert out["structural_valid"] is True
+    assert out["target_resolved"] is True
+    assert out["provenance_verified"] is True  # no False anywhere, >=1 True
+    assert out["resolution_source"] == "live_graph"
+
+
+def test_aggregate_pointer_evidence_one_unresolved_fails_the_whole_item():
+    records = [
+        {"structural_valid": True, "target_resolved": True,
+         "provenance_verified": True, "resolution_source": "live_graph"},
+        {"structural_valid": True, "target_resolved": False,
+         "provenance_verified": None, "resolution_source": "stale_snapshot"},
+    ]
+    out = aggregate_pointer_evidence(records)
+    assert out["target_resolved"] is False  # NOT vacuously True
+    assert out["resolution_source"] == "mixed"
+
+
+def test_aggregate_pointer_evidence_provenance_false_dominates():
+    records = [
+        {"structural_valid": True, "target_resolved": True,
+         "provenance_verified": None, "resolution_source": "not_applicable"},
+        {"structural_valid": True, "target_resolved": True,
+         "provenance_verified": False, "resolution_source": "not_applicable"},
+    ]
+    out = aggregate_pointer_evidence(records)
+    assert out["provenance_verified"] is False
+
+
+# ---------------------------------------------------------------------------
+# db.is_item_claim_prospected — opt-in STRICT gate (target_resolved-aware)
+# ---------------------------------------------------------------------------
+
+def test_is_item_claim_prospected_default_unaffected_by_new_kwargs():
+    """Every pre-existing call site (no strict/target_resolved kwargs) sees
+    byte-for-byte identical results — the presence-only check is untouched."""
+    item = {"touches_resources": ["file:x.py"]}
+    assert db_module.is_item_claim_prospected(item, has_pointer_evidence=True) is True
+    assert db_module.is_item_claim_prospected(item, has_pointer_evidence=False) is False
+
+
+def test_is_item_claim_prospected_strict_false_target_resolved_is_ignored():
+    """strict=False (the default) never consults target_resolved, even if a
+    caller happens to pass it — mirrors the OFF-by-default opt-in contract."""
+    item = {"touches_resources": ["file:x.py"]}
+    assert db_module.is_item_claim_prospected(
+        item, has_pointer_evidence=True, strict=False, target_resolved=False,
+    ) is True
+
+
+def test_is_item_claim_prospected_strict_true_blocks_unresolved_row():
+    """THE fix: a row exists (has_pointer_evidence=True) but did NOT resolve
+    (target_resolved=False) — under strict=True this must now FAIL the gate,
+    not pass just because a row exists."""
+    item = {"touches_resources": ["file:x.py"]}
+    assert db_module.is_item_claim_prospected(
+        item, has_pointer_evidence=True, strict=True, target_resolved=False,
+    ) is False
+
+
+def test_is_item_claim_prospected_strict_true_passes_when_resolved():
+    item = {"touches_resources": ["file:x.py"]}
+    assert db_module.is_item_claim_prospected(
+        item, has_pointer_evidence=True, strict=True, target_resolved=True,
+    ) is True
+
+
+def test_is_item_claim_prospected_strict_true_target_resolved_none_falls_back():
+    """A caller that opts into strict=True but has no resolution-aware signal
+    (target_resolved=None — e.g. never annotated) is NOT punished: it falls
+    back to the presence-only result, exactly like strict=False."""
+    item = {"touches_resources": ["file:x.py"]}
+    assert db_module.is_item_claim_prospected(
+        item, has_pointer_evidence=True, strict=True, target_resolved=None,
+    ) is True
+
+
+def test_is_item_claim_prospected_strict_true_bypass_and_no_resources_still_win():
+    """prospect_bypass and 'never a real prospecting candidate' still short-
+    circuit True even under strict=True — strict only tightens the
+    has_pointer_evidence branch, nothing else."""
+    bypassed = {"touches_resources": ["file:x.py"], "prospect_bypass": True}
+    assert db_module.is_item_claim_prospected(
+        bypassed, has_pointer_evidence=False, strict=True, target_resolved=False,
+    ) is True
+    no_resources = {}
+    assert db_module.is_item_claim_prospected(
+        no_resources, has_pointer_evidence=False, strict=True, target_resolved=False,
+    ) is True
+
+
+# ---------------------------------------------------------------------------
+# handoff._annotate_resolved_pointers — the end-to-end bug-fix demonstration
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_distinguishes_presence_from_resolution(db):
+    """THE confirmed bug, reproduced and fixed: a durable pointer row exists
+    (pointer_provenance.satisfied stays True — presence-only, unchanged
+    behavior) while the resolver could not find the target at all (default
+    resolver, empty codebase_graph_entities snapshot in this test db) — the
+    new pointer_resolution_status field must show target_resolved=False and
+    strict_satisfied=False, making the mismatch explicit instead of hidden."""
+    p = await db_module.create_project(db, "eb8b6894-presence-vs-resolution")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the thing",
+        touches_resources=["file:meridian/nonexistent_module.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "file:meridian/nonexistent_module.py",
+          "selector": {"type": "symbol", "qualified_name": "totally.unindexed.symbol"}}],
+    )
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], [item])
+    it = out[0]
+
+    # Presence-only field: unchanged, still (incorrectly, by itself) "satisfied".
+    assert it["pointer_provenance"]["satisfied"] is True
+
+    # The new, resolution-aware companion tells the real story.
+    status = it["pointer_resolution_status"]
+    assert status["structural_valid"] is True
+    assert status["target_resolved"] is False
+    assert status["strict_satisfied"] is False
+
+    # And the per-pointer record backing that rollup carries the same signal.
+    rec = it["pointer_records"][0]
+    assert rec["structural_valid"] is True
+    assert rec["target_resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_resolution_status_present_even_with_zero_pointers(db):
+    p = await db_module.create_project(db, "eb8b6894-zero-pointers")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Needs prospecting",
+        touches_resources=["file:meridian/some_module.py"],
+    )
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], [item])
+    it = out[0]
+    assert it["pointer_resolution_status"]["target_resolved"] is False
+    assert it["pointer_resolution_status"]["strict_satisfied"] is False
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_fully_resolved_range_pointer_is_strict_satisfied(db):
+    """A range pointer at a REAL, existing file resolves AND is strict_satisfied
+    — the strict gate must not punish genuinely-good evidence."""
+    p = await db_module.create_project(db, "eb8b6894-resolved-range")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the migration guard",
+        touches_resources=["file:meridian/db/migrations.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "meridian/db/migrations.py",
+          "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+    )
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], [item])
+    it = out[0]
+    status = it["pointer_resolution_status"]
+    assert status["target_resolved"] is True
+    assert status["strict_satisfied"] is True
+
+
+# ---------------------------------------------------------------------------
+# eb8b6894 — resolution_source: default resolver tags the cached snapshot
+# path explicitly (never presumed "live").
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_default_symbol_resolver_tags_stale_snapshot(db):
+    p = await db_module.create_project(db, "eb8b6894-stale-snapshot-tag")
+    await db_module.upsert_graph_entities(db, p["id"], [
+        {"qualified_name": "auth.login_user", "file": "auth.py"},
+    ])
+    resolved = await resolve_pointer(
+        db,
+        {"source_type": "code", "targets": [
+            {"uri": "auth.py", "selector": {"type": "symbol",
+                                             "qualified_name": "auth.login_user"}},
+        ]},
+        project_id=p["id"],
+    )
+    target = resolved["targets"][0]
+    assert target["resolved"] is True
+    assert target["resolution_source"] == "stale_snapshot"
+
+
+@pytest.mark.asyncio
+async def test_symbol_resolver_stub_without_resolution_source_reports_unknown():
+    """A caller-injected symbol_resolver that doesn't self-report a source
+    (e.g. a bare test stub) must never be PRESUMED live."""
+    async def _stub(_db, _pid, _q, _lim):
+        return [{"qualified_name": "a.b", "file": "a.py"}]
+
+    resolved = await resolve_pointer(
+        None,
+        {"source_type": "code", "targets": [
+            {"uri": "a.py", "selector": {"type": "symbol", "qualified_name": "a.b"}},
+        ]},
+        project_id="p",
+        symbol_resolver=_stub,
+    )
+    assert resolved["targets"][0]["resolution_source"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_build_symbol_resolver_tags_live_graph_vs_stale_snapshot(monkeypatch):
+    """prospect.build_symbol_resolver — the SAME live-vs-fallback distinction
+    test_mcp_resolve_pointers_reaches_live_graph_via_tenant already proves
+    exists at the resolution level, now surfaced explicitly as
+    resolution_source rather than left implicit."""
+    from meridian import prospect as prospect_module
+    from meridian.routes import tunnel as tunnel_module
+
+    async def _fake_call_tunnel(tid, name, args, **kw):
+        if name == "codebase__search_graph":
+            return {"content": [{"type": "text", "text":
+                '{"results": [{"qualified_name": "meridian.server.mcp_tools_doc", '
+                '"file": "meridian/server.py"}]}'}]}
+        raise AssertionError(f"unexpected tunnel tool: {name}")
+
+    monkeypatch.setattr(tunnel_module, "call_tunnel_tool", _fake_call_tunnel)
+    monkeypatch.setattr(tunnel_module, "has_active_tunnel", lambda tid: True)
+
+    resolver = prospect_module.build_symbol_resolver(tenant={"id": "tenant-live"})
+    hits = await resolver(None, "proj", "meridian.server.mcp_tools_doc", 5)
+    assert hits
+    assert hits[0]["resolution_source"] == "live_graph"
+
+
+@pytest.mark.asyncio
+async def test_build_symbol_resolver_snapshot_fallback_tags_stale_snapshot(db, monkeypatch):
+    """No active tunnel at all -> falls all the way through to the cached
+    codebase_graph_entities snapshot; that fallback must be tagged too."""
+    from meridian import prospect as prospect_module
+    from meridian.routes import tunnel as tunnel_module
+
+    monkeypatch.setattr(tunnel_module, "has_active_tunnel", lambda tid: False)
+    p = await db_module.create_project(db, "eb8b6894-resolver-fallback")
+    await db_module.upsert_graph_entities(db, p["id"], [
+        {"qualified_name": "billing.charge_customer", "file": "billing.py"},
+    ])
+    resolver = prospect_module.build_symbol_resolver(tenant={"id": "tenant-none"})
+    hits = await resolver(db, p["id"], "billing.charge_customer", 5)
+    assert hits
+    assert hits[0]["resolution_source"] == "stale_snapshot"
+
+
+# ---------------------------------------------------------------------------
+# eb8b6894 — strict_pointer_evidence opt-in: excludes an item whose durable
+# pointer never resolved from the claimable /goal batch, WITHOUT affecting
+# the default (non-strict) caller at all.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_generate_handoff_strict_pointer_evidence_excludes_unresolved_item(db, tmp_path):
+    p = await db_module.create_project(db, "eb8b6894-strict-gate-goal")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the thing",
+        touches_resources=["file:meridian/nonexistent_module.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "file:meridian/nonexistent_module.py",
+          "selector": {"type": "symbol", "qualified_name": "totally.unindexed.symbol"}}],
+    )
+
+    # Default (non-strict): presence alone satisfies the gate — item is
+    # claimable, exactly as before this sprint item existed.
+    _, default_content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+    )
+    assert item["id"] in default_content
+    assert "<excluded_unprospected" not in default_content
+
+    # strict_pointer_evidence=True: the SAME item is now excluded, because
+    # its durable pointer never actually resolved.
+    _, strict_content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+        strict_pointer_evidence=True,
+    )
+    assert "<excluded_unprospected" in strict_content
+    assert item["id"] in strict_content  # named in the exclusion tag itself
+
+
+def test_build_quick_start_goal_default_ignores_pointer_resolution_status():
+    """Direct unit-level proof that omitting strict_pointer_evidence (every
+    pre-existing caller) is unaffected by an item's pointer_resolution_status
+    even when that status says target_resolved=False."""
+    items = [{
+        "id": "item-1", "title": "do the thing",
+        "touches_resources": ["file:x.py"],
+        "pointer_resolution_status": {"target_resolved": False, "strict_satisfied": False},
+    }]
+    out = handoff_module._build_quick_start_goal(items, pointer_evidence_ids={"item-1"})
+    assert "<excluded_unprospected" not in out
+    assert "item-1" in out
+
+
+def test_build_quick_start_goal_strict_pointer_evidence_excludes_when_unresolved():
+    items = [{
+        "id": "item-1", "title": "do the thing",
+        "touches_resources": ["file:x.py"],
+        "pointer_resolution_status": {"target_resolved": False, "strict_satisfied": False},
+    }]
+    out = handoff_module._build_quick_start_goal(
+        items, pointer_evidence_ids={"item-1"}, strict_pointer_evidence=True,
+    )
+    assert "<excluded_unprospected" in out
+    assert "item-1" in out

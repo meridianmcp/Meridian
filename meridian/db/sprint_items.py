@@ -3393,7 +3393,13 @@ def _item_declares_resources(item: dict[str, Any]) -> bool:
     return bool(raw) and raw not in ("[]", "null")
 
 
-def is_item_claim_prospected(item: dict[str, Any], *, has_pointer_evidence: bool) -> bool:
+def is_item_claim_prospected(
+    item: dict[str, Any],
+    *,
+    has_pointer_evidence: bool,
+    strict: bool = False,
+    target_resolved: "bool | None" = None,
+) -> bool:
     """d5849a67 — SINGLE SOURCE OF TRUTH for "would ``claim_sprint_item``'s
     UNPROSPECTED gate let this item through?"
 
@@ -3421,12 +3427,34 @@ def is_item_claim_prospected(item: dict[str, Any], *, has_pointer_evidence: bool
       persisted to ``sprint_item_pointers``, so an item showing
       ``prospect_status='prospected'`` can still have zero durable rows and
       would still be refused by ``claim_sprint_item``.
+
+    ``strict`` / ``target_resolved`` (eb8b6894) — OPT-IN, OFF by default
+    (mirrors ``generate_handoff``'s own ``strict_evidence``/8a883f60 opt-in
+    shape). ``has_pointer_evidence`` alone answers "does a row exist" —
+    PRESENCE, not RESOLUTION (see ``get_pointer_evidence_item_ids``'s own
+    docstring: it is presence-only BY DESIGN). When a caller has ALSO
+    resolved the item's pointers (e.g. ``handoff._annotate_resolved_pointers``
+    via ``pointers.aggregate_pointer_evidence``) and passes both
+    ``strict=True`` and the resulting ``target_resolved`` bool, a pointer
+    that is structurally present but explicitly did NOT resolve
+    (``target_resolved is False``) now FAILS this gate too — "a row exists"
+    can no longer, by itself, satisfy a strict caller. ``target_resolved is
+    None`` (the caller didn't compute a resolution-aware signal — every
+    existing call site, and every call that leaves ``strict`` at its
+    default) is treated exactly like ``strict=False``: nothing tightens,
+    zero behaviour change from before these kwargs existed. A caller that
+    never passes ``strict``/``target_resolved`` — i.e. every pre-existing
+    call site — sees byte-for-byte identical results.
     """
     if bool(item.get("prospect_bypass")):
         return True
     if not _item_declares_resources(item):
         return True
-    return bool(has_pointer_evidence)
+    if not bool(has_pointer_evidence):
+        return False
+    if strict and target_resolved is False:
+        return False
+    return True
 
 
 async def get_pointer_evidence_item_ids(
@@ -3443,6 +3471,24 @@ async def get_pointer_evidence_item_ids(
     fail open" (``is_item_claim_prospected`` is called with
     ``has_pointer_evidence=True`` in that case), mirroring
     ``claim_sprint_item``'s own try/except fail-open behaviour.
+
+    eb8b6894 — this function is, and stays, PRESENCE-ONLY BY DESIGN: a plain
+    SQL existence check (a durable row is in ``sprint_item_pointers``), no
+    :func:`meridian.pointers.resolve_pointer` call, no live-graph/tunnel
+    reach — that would require awaiting an async resolve per item from a
+    low-level DB helper with no tenant/symbol-resolver context available
+    here. It is intentionally NOT extended to answer "did the target
+    actually resolve" — that is a SEPARATE, RESOLUTION-aware signal, computed
+    one layer up where the resolve machinery already runs:
+    ``handoff._annotate_resolved_pointers`` resolves every stored pointer via
+    :func:`meridian.pointers.resolve_pointer` and rolls the per-pointer
+    result up via :func:`meridian.pointers.aggregate_pointer_evidence` into
+    each item's ``pointer_resolution_status["target_resolved"]`` — the
+    companion check a caller passes to ``is_item_claim_prospected(strict=True,
+    target_resolved=...)`` to close exactly the presence-vs-resolution gap
+    this function's own docstring calls out. This remains the ONE
+    presence-only source; it is deliberately paired with, not silently
+    conflated with, that resolution-aware companion.
     """
     ids = [i for i in (item_ids or []) if i]
     if not ids:
