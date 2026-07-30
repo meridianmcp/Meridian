@@ -67,6 +67,8 @@ get_commit(sha="a1b2c3d")
 - **Per-account** — the connection belongs to your Meridian account, not to a single project. All your projects share the same GitHub connection.
 - **Revokable any time** — click **Disconnect** in Settings or revoke the PAT on GitHub to immediately remove access.
 
+See [Data Handling](data-handling.md) for how this fits into Meridian's broader data storage and deletion policies.
+
 ## Troubleshooting
 
 | Error | Fix |

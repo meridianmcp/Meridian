@@ -50,6 +50,7 @@ nav:
   - Team Self-Hosting: team-self-hosting.md
   - Configuration: configuration.md
   - Safety Limits: safety-limits.md
+  - Data Handling: data-handling.md
   - API Reference: api-reference.md
   - FAQ: faq.md
 
