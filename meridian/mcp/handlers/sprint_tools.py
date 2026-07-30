@@ -1342,6 +1342,59 @@ async def handle_complete_sprint_item(
                     ),
                 }
 
+    # a8c0f3b7 — CODE-INTEL PROSPECTING RECEIPT gate. Opt-in via the PROJECT's
+    # capability manifest, not a per-call flag: a no-op (zero behavior change)
+    # unless the project has declared the "code_intel_prospecting" capability
+    # via set_capability_manifest — mirrors the megasprint's own capability-
+    # manifest contract ("old projects are not broken by this feature
+    # existing"). When declared, this turns claim_sprint_item's existing
+    # best-effort code_context.hint nudge ("prospect before editing") into
+    # something auditable: complete_sprint_item now verifies a durable,
+    # server-written receipt (meridian.code_intel_receipt) exists proving a
+    # real search_graph/find_symbol/prospect_symbol call happened since this
+    # item was claimed — not something that trusts the calling agent's
+    # self-report. Fails CLOSED only for availability_policy="required"
+    # (mirrors verify_strict_completion_evidence's fail-closed contract);
+    # "optional"/"degraded_ok" degrade with a warning instead of blocking.
+    _code_intel_check: dict[str, Any] | None = None
+    _code_intel_override: dict[str, Any] | None = None
+    if _pre_item is not None and _pre_item.get("project_id") == args["project_id"]:
+        from meridian.code_intel_receipt import (  # noqa: PLC0415
+            verify_code_intel_prospecting,
+            record_prospect_receipt_override,
+        )
+        _code_intel_check = await verify_code_intel_prospecting(
+            db, tenant, args["project_id"], _pre_item,
+            session_id=_complete_session_id or None,
+        )
+        if _code_intel_check.get("applicable") and not _code_intel_check.get("ok"):
+            _ci_override_requested = bool(args.get("override_code_intel_receipt"))
+            _ci_override_reason = (args.get("override_reason") or "").strip()
+            if _ci_override_requested and _ci_override_reason:
+                # Same auditable-override contract as strict evidence / merge
+                # approval above: BOTH the explicit flag AND a non-empty
+                # reason are required in the SAME call, or it is refused.
+                _code_intel_override = await record_prospect_receipt_override(
+                    db, args["project_id"], args["item_id"],
+                    actor=_complete_actor,
+                    reason=_ci_override_reason,
+                    check=_code_intel_check,
+                    tenant_id=(tenant or {}).get("id"),
+                )
+            else:
+                return {
+                    "error": _code_intel_check.get("code") or "CODE_INTEL_RECEIPT_BLOCKED",
+                    "item_id": args["item_id"],
+                    "capability": _code_intel_check.get("capability"),
+                    "message": _code_intel_check.get("message") or (
+                        "Refusing to complete: code-intel prospecting-receipt "
+                        "verification failed. Pass "
+                        "override_code_intel_receipt=true with a non-empty "
+                        "override_reason to explicitly acknowledge and "
+                        "complete anyway (audited)."
+                    ),
+                }
+
     # 5823db0b — quality gate + actor attribution. Pass evidence notes and
     # the completing actor; surface the required_notes gate as a clean error.
     try:
@@ -1407,6 +1460,20 @@ async def handle_complete_sprint_item(
         # evidence verification failed and was explicitly, auditedly overridden.
         item = dict(item)
         item["strict_evidence_override"] = _strict_evidence_override
+    if _code_intel_check and _code_intel_check.get("applicable"):
+        # a8c0f3b7 — surface the prospecting-receipt verdict on the response
+        # whenever the gate actually applied: a degraded/warned pass (policy
+        # optional/degraded_ok, or code-intel genuinely unavailable) is never
+        # silently indistinguishable from a real receipt, and an audited
+        # override is always visible on the completed item, same as strict
+        # evidence above.
+        item = dict(item)
+        if _code_intel_check.get("degraded"):
+            item["code_intel_receipt_warning"] = _code_intel_check.get("warning")
+        elif _code_intel_check.get("receipt"):
+            item["code_intel_receipt"] = _code_intel_check.get("receipt")
+        if _code_intel_override:
+            item["code_intel_receipt_override"] = _code_intel_override
     # fdaa5b55 — item has a linked GitHub issue: auto-close (meridian_auto)
     # or post a proposed-closure comment + non-blocking HITL (manual/unset).
     # Never lets a GitHub failure undo the completion that already succeeded
