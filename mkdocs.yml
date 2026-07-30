@@ -10,6 +10,7 @@ edit_uri: edit/main/docs/
 exclude_docs: |
   fly-scaling.md
   backup-runbook.md
+  mcp-directory-listing.md
 
 theme:
   name: material
