@@ -327,6 +327,96 @@ def insert_image(
     )
 
 @mcp.tool()
+def insert_figure_block(
+    docx_path: str,
+    image_path: str,
+    label_text: str,
+    anchor_para_id: str | None = None,
+    position: str = "after",
+    width_inches: float | None = None,
+    height_inches: float | None = None,
+    section_heading: str | None = None,
+    index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """19be1551 — atomically insert a centered image paragraph AND its
+    adjacent real SEQ Figure caption in ONE document-load-mutate-save
+    transaction.
+
+    Unlike calling insert_image then insert_caption as two separate write
+    transactions, both paragraphs are built against a single in-memory
+    document tree and reach disk via exactly one zip rewrite — there is no
+    window in which a failure leaves an orphan image with no caption, or an
+    inconsistent caption index.
+
+    The image paragraph is always centered (w:jc val="center", equivalent to
+    Ctrl+E), regardless of any alignment the anchor paragraph carries. The
+    caption paragraph is always inserted immediately after the image
+    paragraph — that ordering is not configurable, mirroring insert_caption's
+    own rule that a Figure caption can never precede its image. anchor_para_id
+    / position control where the IMAGE paragraph (and therefore the whole
+    block) lands relative to an existing direct body paragraph, exactly like
+    insert_image; None appends the block before the document's trailing
+    sectPr.
+
+    The caption's SEQ number is the count of existing SEQ Figure captions in
+    the document plus one (same semantics as insert_caption), and it gets a
+    fresh _Ref<digits> cross-reference bookmark. style_policy["caption_centered"]
+    (default False, via resolve_style_policy) controls whether the caption
+    itself also gets w:jc val="center".
+
+    After the single save, the file is re-read fresh from disk and verified:
+    the image paragraph must be present and centered, the caption must
+    immediately follow with nothing in between, and its SEQ number/label text
+    must match what was written. On a verification failure, the pre-write
+    backup is restored and an error is returned instead of a false success.
+
+    Supported image formats, dimension inference, and the six-inch default
+    width all match insert_image.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      image_path:      Absolute path to a local PNG/JPEG/GIF/BMP/TIFF image.
+      label_text:      Caption label text (e.g. "Loss curve for run 42").
+                       Rendered text will be e.g. "Figure 1. Loss curve...".
+      anchor_para_id:  w14:paraId or p{N} of the direct body paragraph to
+                       anchor the block on. None appends before the trailing
+                       sectPr.
+      position:        "before" or "after" (default) — placement of the
+                       IMAGE paragraph relative to anchor_para_id.
+      width_inches:    Optional explicit width; inferred from the image
+                       header when omitted (six-inch default width).
+      height_inches:   Optional explicit height; inferred from the image
+                       header when omitted (preserves aspect ratio).
+      section_heading: Optional section heading for organizational
+                       association. Stored in the sidecar index.
+      index_db_path:   If supplied, the sidecar index is invalidated and the
+                       new caption is upserted so the next read reflects the
+                       new figure/caption without a stale cache.
+      style_policy:    Optional style policy overrides (see
+                       resolve_style_policy).
+
+    Returns:
+      {status, image_para_id, image_name, kind, seq_number, label_text,
+      section_heading, ref_bookmark, docx_path}
+      or {error: <message>} on failure (file NOT left mutated on validation
+      failure; restored from backup on a post-write verification failure).
+    """
+    return docs_intel.insert_figure_block(
+        docx_path=docx_path,
+        image_path=image_path,
+        label_text=label_text,
+        anchor_para_id=anchor_para_id,
+        position=position,
+        width_inches=width_inches,
+        height_inches=height_inches,
+        section_heading=section_heading,
+        index_db_path=index_db_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
 def find_image_paragraph(
     docx_path: str,
     figure_index: int | None = None,

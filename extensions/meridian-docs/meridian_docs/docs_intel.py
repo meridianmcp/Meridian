@@ -2603,6 +2603,351 @@ def insert_image(
         "docx_path": docx_path,
     }
 
+
+def _verify_figure_block_write(
+    docx_path: str,
+    *,
+    image_para_id: str,
+    expected_seq_number: int,
+    expected_label_text: str,
+) -> dict[str, Any] | None:
+    """19be1551 — post-write verification for :func:`insert_figure_block`.
+
+    Re-reads ``docx_path`` FRESH FROM DISK (never the in-memory tree that was
+    just serialized -- that would only re-validate this function's own
+    intent, not the actual write) and confirms, in order: the image
+    paragraph is present and centered (``w:jc w:val="center"``); the very
+    next body element is a paragraph (no other paragraph -- and in
+    particular no OTHER image -- landed between them); that paragraph
+    carries a ``SEQ Figure`` field whose cached number matches
+    ``expected_seq_number``; and its rendered text contains
+    ``expected_label_text``. Returns ``None`` when every check passes, or an
+    ``{"error": ...}`` dict on the first mismatch -- mirroring
+    :func:`_verify_docx_write`'s "real error instead of a false success
+    payload" discipline (9907df44) for the one case that helper does not
+    already cover (a newly inserted pair with no prior on-disk baseline to
+    diff against).
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    body_list = list(body2)
+    w14_para_id = _q(_W14, "paraId")
+    image_idx = next(
+        (i for i, el in enumerate(body_list) if el.get(w14_para_id) == image_para_id),
+        None,
+    )
+    if image_idx is None:
+        return {
+            "error": (
+                f"post-write verification failed: image paragraph "
+                f"{image_para_id!r} not found anywhere in {docx_path} after "
+                "the write"
+            )
+        }
+
+    image_para = body_list[image_idx]
+    if image_para.find(f".//{_q(_W, 'drawing')}") is None:
+        return {
+            "error": (
+                "post-write verification failed: paragraph "
+                f"{image_para_id!r} no longer contains a <w:drawing> image "
+                "after the write"
+            )
+        }
+    if _paragraph_alignment(image_para) != "center":
+        return {
+            "error": (
+                "post-write verification failed: image paragraph "
+                f"{image_para_id!r} is not centered (w:jc=\"center\") after "
+                "the write"
+            )
+        }
+
+    if image_idx + 1 >= len(body_list):
+        return {
+            "error": (
+                "post-write verification failed: no paragraph immediately "
+                f"follows the image paragraph {image_para_id!r} after the "
+                "write -- the caption is missing"
+            )
+        }
+    caption_para = body_list[image_idx + 1]
+    if caption_para.tag != _q(_W, "p"):
+        return {
+            "error": (
+                "post-write verification failed: the element immediately "
+                f"following image paragraph {image_para_id!r} is not a "
+                "paragraph"
+            )
+        }
+
+    fld = caption_para.find(_q(_W, "fldSimple"))
+    instr = fld.get(_q(_W, "instr")) if fld is not None else None
+    if fld is None or "SEQ Figure" not in (instr or ""):
+        return {
+            "error": (
+                "post-write verification failed: the paragraph immediately "
+                f"following image paragraph {image_para_id!r} does not "
+                "contain a SEQ Figure field"
+            )
+        }
+    seq_text_el = fld.find(f".//{_q(_W, 't')}")
+    seq_text = seq_text_el.text if seq_text_el is not None else None
+    if seq_text != str(expected_seq_number):
+        return {
+            "error": (
+                "post-write verification failed: caption SEQ number "
+                f"mismatch (expected {expected_seq_number!r}, got "
+                f"{seq_text!r})"
+            )
+        }
+
+    caption_text = "".join(t.text or "" for t in caption_para.iter(_q(_W, "t")))
+    if expected_label_text not in caption_text:
+        return {
+            "error": (
+                "post-write verification failed: caption label text "
+                f"mismatch (expected to contain {expected_label_text!r}, "
+                f"got {caption_text!r})"
+            )
+        }
+    return None
+
+
+def insert_figure_block(
+    docx_path: str,
+    image_path: str,
+    label_text: str,
+    anchor_para_id: str | None = None,
+    position: str = "after",
+    width_inches: float | None = None,
+    height_inches: float | None = None,
+    section_heading: str | None = None,
+    index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """19be1551 — atomically insert a centered image paragraph AND its
+    adjacent real SEQ Figure caption in a SINGLE document-load-mutate-save
+    transaction.
+
+    This is deliberately NOT the same as calling :func:`insert_image` then
+    :func:`insert_caption` back to back: that composition already "works"
+    today but performs two separate zip rewrites, so a failure between them
+    can leave an orphan image with no caption, or a caption whose SEQ number
+    raced against a concurrent writer. Here both paragraphs are built
+    against ONE shared in-memory document tree and reach disk via exactly
+    one call to :func:`_save_docx_with_image` -- there is no window in which
+    only one half of the pair exists on disk.
+
+    Anchor resolution is identical to :func:`insert_image`: ``anchor_para_id``
+    must name a direct body paragraph, and ``position`` ("before"/"after",
+    default "after") places the IMAGE paragraph relative to it; ``None``
+    appends the block before the document's trailing ``sectPr``. The caption
+    paragraph is always inserted immediately after the image paragraph --
+    that placement is not itself configurable, mirroring
+    :func:`insert_caption`'s own rule that a Figure caption can never precede
+    its image.
+
+    The caption is built exactly like :func:`insert_caption` with
+    ``kind="Figure"``: ``seq_number`` is the count of existing SEQ Figure
+    captions in the document plus one, and ``ref_bookmark`` is a fresh
+    ``_Ref<digits>`` cross-reference bookmark -- both computed against the
+    document tree BEFORE either new paragraph is inserted, exactly like
+    :func:`insert_caption` does, which is safe here specifically because
+    atomicity removes the race a second writer's caption could otherwise
+    land in between. ``style_policy["caption_centered"]`` (via
+    :func:`resolve_style_policy`) controls whether the caption itself also
+    gets ``w:jc w:val="center"``; the image paragraph is always centered
+    regardless of style_policy or of any alignment the anchor paragraph
+    happens to carry -- the new paragraph's own ``w:jc`` is authoritative and
+    never inherits a neighbor's alignment.
+
+    After the single save, the file is re-read FRESH FROM DISK and verified
+    (see :func:`_verify_figure_block_write`): the image paragraph must be
+    present and centered, the caption must immediately follow with nothing
+    in between, and its SEQ number/label text must match what was written.
+    On a verification failure the pre-write backup :func:`_save_docx_with_image`
+    left at ``docx_path + ".bak"`` is restored via :func:`_restore_docx_backup`
+    -- the same backup-then-restore mechanism this module's other post-write
+    verification failures already use (9907df44) -- and an error is returned
+    instead of a false success payload.
+
+    Supported image formats, dimension inference, and the six-inch default
+    width all match :func:`insert_image`.
+
+    Returns ``{status, image_para_id, image_name, kind, seq_number,
+    label_text, section_heading, ref_bookmark, docx_path}``, or
+    ``{"error": message}`` without mutating the document on validation
+    failure or verification failure that could not be cleanly restored.
+    """
+    if not isinstance(docx_path, str) or not docx_path:
+        return {"error": "docx_path must be a non-empty string"}
+    if not isinstance(image_path, str) or not image_path:
+        return {"error": "image_path must be a non-empty string"}
+    if position not in ("before", "after"):
+        return {"error": "position must be before or after"}
+    if not label_text or not str(label_text).strip():
+        return {"error": "label_text must be a non-empty string"}
+    suffix = os.path.splitext(image_path)[1].lower()
+    image_type = _IMAGE_TYPES.get(suffix)
+    if image_type is None:
+        return {"error": f"unsupported image format: {suffix or 'missing extension'}"}
+    if width_inches is not None and width_inches <= 0:
+        return {"error": "width_inches must be greater than zero"}
+    if height_inches is not None and height_inches <= 0:
+        return {"error": "height_inches must be greater than zero"}
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    try:
+        with open(image_path, "rb") as handle:
+            image_bytes = handle.read()
+    except OSError as exc:
+        return {"error": f"could not read image {image_path}: {exc}"}
+    if not image_bytes:
+        return {"error": f"image file is empty: {image_path}"}
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+        width_emu, height_emu = _image_size_emu(
+            image_bytes, suffix, width_inches, height_inches
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"document has no body: {docx_path}"}
+    children = list(body)
+    if anchor_para_id is None:
+        insert_at = next(
+            (idx for idx, child in enumerate(children) if child.tag == _q(_W, "sectPr")),
+            len(children),
+        )
+    else:
+        located = _find_para_by_id(root, anchor_para_id)
+        if located is None:
+            return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+        _located_body, anchor, anchor_idx = located
+        if _located_body is not body or children[anchor_idx] is not anchor:
+            return {
+                "error": (
+                    "anchor_para_id must identify a direct body paragraph; "
+                    "table-cell paragraphs cannot anchor image insertion"
+                )
+            }
+        insert_at = anchor_idx + (1 if position == "after" else 0)
+
+    entries: dict[str, bytes] = {}
+    with zipfile.ZipFile(io.BytesIO(raw)) as source:
+        for info in source.infolist():
+            entries[info.filename] = source.read(info.filename)
+    rels_xml = entries.get("word/_rels/document.xml.rels")
+    rels_root = (
+        ET.fromstring(rels_xml)
+        if rels_xml
+        else ET.Element(_q(_PACKAGE_REL_NS, "Relationships"))
+    )
+    relationship_id = _next_relationship_id(rels_root)
+    image_name = _next_media_name(entries, f".{image_type[0]}")
+    taken = _existing_para_ids(root)
+    image_para_id = _new_para_id(taken)
+    doc_pr_id = len(root.findall(f".//{_q(_WP, 'docPr')}")) + 1
+
+    # Caption metadata (seq_number, ref_bookmark) is computed against the
+    # ORIGINAL root, before either new paragraph is inserted -- identical
+    # timing to insert_caption's own computation. Safe here specifically
+    # because both paragraphs land in the same save transaction: there is no
+    # window for a second writer's caption to land in between and shift the
+    # count out from under us.
+    seq_number = _count_seq_captions(root, "Figure") + 1
+    ref_bookmark = _next_ref_bookmark_name(root)
+    label_text_clean = label_text.strip()
+
+    paragraph = ET.Element(_q(_W, "p"))
+    paragraph.set(_q(_W14, "paraId"), image_para_id)
+    ppr = ET.SubElement(paragraph, _q(_W, "pPr"))
+    ET.SubElement(ppr, _q(_W, "jc"), {_q(_W, "val"): "center"})
+    run = ET.SubElement(paragraph, _q(_W, "r"))
+    run.append(
+        _build_image_drawing(
+            relationship_id, width_emu, height_emu, doc_pr_id, image_name
+        )
+    )
+
+    caption_p = _build_caption_paragraph(
+        kind="Figure",
+        label_text=label_text_clean,
+        seq_cached=str(seq_number),
+        ref_bookmark=ref_bookmark,
+        centered=policy["caption_centered"],
+    )
+
+    body.insert(insert_at, paragraph)
+    body.insert(insert_at + 1, caption_p)
+
+    try:
+        _save_docx_with_image(
+            raw, root, image_bytes, image_name, relationship_id,
+            image_type[1], docx_path
+        )
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    verify_error = _verify_figure_block_write(
+        docx_path,
+        image_para_id=image_para_id,
+        expected_seq_number=seq_number,
+        expected_label_text=label_text_clean,
+    )
+    if verify_error is not None:
+        verify_error["file_restored"] = _restore_docx_backup(docx_path)
+        verify_error["image_para_id"] = image_para_id
+        verify_error["docx_path"] = docx_path
+        return verify_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+    if index_db_path and os.path.exists(index_db_path):
+        _upsert_sidecar_caption(
+            index_db_path=index_db_path,
+            kind="Figure",
+            para_id=None,  # newly inserted caption para has no w14:paraId yet
+            seq_number=str(seq_number),
+            caption_text=f"Figure {seq_number}. {label_text_clean}",
+            section_heading=section_heading,
+            ref_bookmark=ref_bookmark,
+        )
+
+    return {
+        "status": "inserted",
+        "image_para_id": image_para_id,
+        "image_name": image_name,
+        "kind": "Figure",
+        "seq_number": seq_number,
+        "label_text": label_text_clean,
+        "section_heading": section_heading,
+        "ref_bookmark": ref_bookmark,
+        "docx_path": docx_path,
+    }
+
+
 def find_image_paragraph(
     docx_path: str,
     figure_index: int | None = None,
