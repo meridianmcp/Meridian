@@ -2830,6 +2830,11 @@ async def _handle_task_tools(
         # response, never a change to `content` itself. See
         # handoff.generate_handoff's own docstring for the full contract.
         _strict_evidence = bool(args.get("strict_evidence"))
+        # eb8b6894 — separate opt-in gate: whether the claimable batch's
+        # UNPROSPECTED exclusion requires durable pointers to have actually
+        # RESOLVED, not merely be present. Off by default; see
+        # handoff.generate_handoff's own strict_pointer_evidence docstring.
+        _strict_pointer_evidence = bool(args.get("strict_pointer_evidence"))
         _evidence_status: dict[str, Any] = {}
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
@@ -2847,6 +2852,7 @@ async def _handle_task_tools(
                     version=_requested_version,
                     strict_evidence=_strict_evidence,
                     evidence_status=_evidence_status,
+                    strict_pointer_evidence=_strict_pointer_evidence,
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -2998,6 +3004,10 @@ async def _handle_task_tools(
             # 8a883f60 — echoes the strict_evidence flag this call actually
             # used, so a caller never has to re-derive it from args.
             "strict_evidence": _strict_evidence,
+            # eb8b6894 — echoes the strict_pointer_evidence flag this call
+            # actually used (separate from strict_evidence above — see
+            # handoff.generate_handoff's docstring).
+            "strict_pointer_evidence": _strict_pointer_evidence,
             # 6cdc5df3 — one entry per proposal id with linked evidence in this
             # project (see meridian.db.proposal_links.get_proposal_evidence).
             "proposal_evidence": _proposal_evidence,

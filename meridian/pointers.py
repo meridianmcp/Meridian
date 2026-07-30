@@ -548,7 +548,7 @@ async def _resolve_symbol(
             best = m
             break
     best = best or matches[0]
-    return {
+    out: dict[str, Any] = {
         "resolved": True,
         "selector_type": "symbol",
         "uri": uri,
@@ -556,6 +556,22 @@ async def _resolve_symbol(
         "file": (best.get("file") if isinstance(best, dict) else None),
         "match": best,
     }
+    # eb8b6894 — surface WHICH resolution path produced this match: "live"
+    # tunnel-connected graph search (build_symbol_resolver's prospect_symbol_impl
+    # rung) vs. a fallback (local semantic search, or the cached-snapshot
+    # search_graph_entities table — production-empty, see
+    # test_mcp_resolve_pointers_reaches_live_graph_via_tenant). Reuses the
+    # EXISTING distinction (prospect_symbol_impl's own "rung" field / the
+    # snapshot-fallback tag applied above and in build_symbol_resolver) rather
+    # than reinventing one. Always set (never omitted) so a symbol match is
+    # never mistaken for a selector type this concept doesn't apply to;
+    # "unknown" is the honest default when the symbol_resolver in use doesn't
+    # self-report (a bare caller-supplied test stub, for instance) — NEVER
+    # presumed to be "live_graph".
+    out["resolution_source"] = (
+        (best.get("resolution_source") if isinstance(best, dict) else None) or "unknown"
+    )
+    return out
 
 
 async def _resolve_node_id(
@@ -732,7 +748,20 @@ async def resolve_pointer(
         from .db import search_graph_entities as _sg  # noqa: PLC0415
 
         async def symbol_resolver(_db: Any, _pid: str, _q: str, _lim: int):  # type: ignore[misc]
-            return await _sg(_db, _pid, _q, _lim)
+            # eb8b6894 — this default resolver ONLY ever queries the cached
+            # codebase_graph_entities snapshot (no production writers — see
+            # prospect.build_symbol_resolver's docstring), never the live
+            # tunnel-connected graph. Tag every hit explicitly so a caller
+            # (e.g. handoff._annotate_resolved_pointers, which never injects
+            # a tenant-aware symbol_resolver) can tell "resolved" apart from
+            # "resolved against a possibly-stale cached snapshot" instead of
+            # the two looking identical.
+            _hits = await _sg(_db, _pid, _q, _lim)
+            return [
+                {**h, "resolution_source": h.get("resolution_source") or "stale_snapshot"}
+                if isinstance(h, dict) else h
+                for h in (_hits or [])
+            ]
 
     if citation_resolver is None:
         # e9d72d17 — pick the reference-manager backend by name (arg / env / default)
@@ -917,8 +946,225 @@ def _extract_archival_metadata(resolved_target: dict[str, Any]) -> "dict[str, An
     return out or None
 
 
+# ---------------------------------------------------------------------------
+# eb8b6894 — distinguish pointer PRESENCE ("a durable row exists") from
+# successful TARGET RESOLUTION ("resolve_pointer actually found it") in
+# readiness/handoff projections.
+#
+# Confirmed bug this fixes: a checkpoint/handoff projection could show a
+# durable ``sprint_item_pointers`` row and mark provenance "satisfied" purely
+# because the row existed (``get_pointer_evidence_item_ids`` /
+# ``is_item_claim_prospected`` are PRESENCE-ONLY by design — see
+# ``db.sprint_items.get_pointer_evidence_item_ids``'s own docstring) even when
+# :func:`resolve_pointer` reported every target unresolved in the SAME
+# annotation pass (``handoff._annotate_resolved_pointers`` already resolves
+# every stored pointer — it just never surfaced the result at the
+# provenance-decision layer). The three functions below give every pointer
+# THREE separate, explicit signals instead of one conflated one:
+#
+# * :func:`check_structural_validity` — ``validate_pointer`` passed: the
+#   pointer is well-formed (shape/schema only, no resolution attempted).
+# * ``target_resolved`` (computed inline in :func:`build_typed_pointer_record`
+#   from the already-resolved ``resolved`` argument) — :func:`resolve_pointer`
+#   actually found/resolved EVERY target, not merely "a row exists".
+# * ``provenance_verified`` (also computed inline, from an OPTIONAL
+#   pre-computed :func:`verify_pointer_readiness` result) — a provenance
+#   record backs this target, WHERE APPLICABLE (reuses 3196ba0e's readiness
+#   primitives verbatim; ``None`` when not applicable, e.g. a non-local uri).
+#
+# All three are purely ADDITIVE fields on the existing typed record / item
+# provenance dicts — no existing field's value or type changes, so a
+# non-strict caller sees zero functional regression (see
+# ``db.sprint_items.is_item_claim_prospected``'s new ``strict``/
+# ``target_resolved`` kwargs, both opt-in and default-False/None).
+# ---------------------------------------------------------------------------
+
+
+def check_structural_validity(pointer: dict[str, Any]) -> "tuple[bool, str | None]":
+    """Pure shape/schema check for an ALREADY-STORED pointer — no resolution,
+    no filesystem I/O.
+
+    Re-runs :func:`validate_pointer` with ``path_exists`` stubbed to always
+    return ``True``. This is deliberate, not a shortcut: a pointer fetched
+    from ``sprint_item_pointers`` (``row_to_pointer``) always carries an
+    EXPLICIT ``target_kind`` on every target (normalization at write time
+    fills it in even when the caller omitted it — see
+    :func:`_validate_target`'s own docstring). Re-validating that already-
+    normalized shape with the REAL filesystem checker would silently turn
+    every implicit-``"existing"`` pointer written before 300a063d into an
+    explicit, retroactive disk check — exactly the "opt-in, never
+    retroactive" contract :func:`validate_pointer`'s module docstring
+    promises NOT to do. Stubbing ``path_exists`` keeps this check to pure
+    shape/schema correctness, matching the module docstring's own framing
+    of ``validate_pointer`` as "structural validation... no resolution".
+
+    Returns ``(True, None)`` when valid, ``(False, <message>)`` otherwise.
+    Never raises.
+    """
+    try:
+        validate_pointer(pointer, path_exists=lambda _uri: True)
+        return True, None
+    except PointerValidationError as exc:
+        return False, str(exc)
+    except Exception as exc:  # noqa: BLE001 — never let this break annotation
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _summarize_target_resolution(
+    resolved_targets: "list[dict[str, Any]]",
+) -> "tuple[bool, str | None]":
+    """Aggregate :func:`resolve_pointer` per-target ``resolved`` flags for
+    ONE pointer into a single bool: ``True`` iff there is at least one
+    target AND every one of them resolved (mirrors
+    :func:`verify_pointer_readiness`'s own "all targets must pass" policy —
+    an empty/all-missing resolve pass is never vacuously "resolved").
+    """
+    if not resolved_targets:
+        return False, "pointer has not been resolved (no resolve_pointer output supplied)"
+    unresolved = [
+        t for t in resolved_targets if not (isinstance(t, dict) and t.get("resolved"))
+    ]
+    if unresolved:
+        reasons = sorted({
+            str(t.get("reason")) for t in unresolved
+            if isinstance(t, dict) and t.get("reason")
+        })
+        detail = "; ".join(reasons) if reasons else "target did not resolve"
+        return False, f"{len(unresolved)}/{len(resolved_targets)} target(s) unresolved — {detail}"
+    return True, None
+
+
+def _summarize_resolution_source(resolved_targets: "list[dict[str, Any]]") -> str:
+    """Aggregate each resolved target's ``resolution_source`` (set by
+    :func:`_resolve_symbol` — "live_graph" / "local_fallback" /
+    "stale_snapshot" / "unknown") into one value for the whole pointer:
+
+    * ``"not_applicable"`` — no target reports a resolution_source at all
+      (every target is a selector type this concept doesn't apply to, e.g.
+      ``range``/``zotero_key``/``node_id``/``text_quote``/``finding_id``).
+    * ``"mixed"`` — more than one distinct source across this pointer's targets.
+    * the single shared value otherwise (e.g. ``"live_graph"``).
+    """
+    sources = {
+        t.get("resolution_source") for t in resolved_targets
+        if isinstance(t, dict) and t.get("resolution_source")
+    }
+    if not sources:
+        return "not_applicable"
+    if len(sources) > 1:
+        return "mixed"
+    return next(iter(sources))
+
+
+def _summarize_provenance_verified(
+    readiness: "dict[str, Any] | None",
+) -> "tuple[bool | None, str | None]":
+    """Aggregate an OPTIONAL, pre-computed :func:`verify_pointer_readiness`
+    result for ONE pointer into a tri-state ``(verified, reason)``:
+
+    * ``(None, reason)`` — not computed (``readiness`` is ``None`` — the
+      caller didn't run the I/O-backed check) or not applicable (every
+      target is a non-local uri — see :func:`verify_target_readiness`'s own
+      ``"skipped"`` status).
+    * ``(False, reason)`` — computed, applicable, and at least one target's
+      ``ready`` came back ``False`` (missing file, undischarged
+      planned_new provenance, etc).
+    * ``(True, None)`` — computed, applicable, every target ready.
+
+    Deliberately tri-state (never coerces "not computed" to ``False``): a
+    caller that never ran the readiness check must not have that silence
+    misread as "verification failed".
+    """
+    if not isinstance(readiness, dict):
+        return None, "readiness not computed for this pointer"
+    results = readiness.get("targets")
+    if not isinstance(results, list) or not results:
+        return None, "readiness not computed for this pointer"
+    applicable = [
+        r for r in results if isinstance(r, dict) and r.get("status") != "skipped"
+    ]
+    if not applicable:
+        return None, "no local filesystem targets to verify"
+    not_ready = [r for r in applicable if not r.get("ready")]
+    if not_ready:
+        reasons = sorted({str(r.get("reason")) for r in not_ready if r.get("reason")})
+        detail = "; ".join(reasons) if reasons else "one or more targets not provenance-verified"
+        return False, detail
+    return True, None
+
+
+def aggregate_pointer_evidence(
+    typed_records: "list[dict[str, Any]]",
+) -> "dict[str, Any]":
+    """Item-level rollup of the PER-POINTER ``structural_valid`` /
+    ``target_resolved`` / ``provenance_verified`` / ``resolution_source``
+    fields :func:`build_typed_pointer_record` attaches to each entry of
+    ``typed_records`` (one item's full ``pointer_records`` list — see
+    ``handoff._annotate_resolved_pointers``).
+
+    Pure, synchronous rollup — mirrors :func:`verify_pointer_readiness`'s own
+    "ready iff non-empty AND every entry passes" aggregation:
+
+    * ``structural_valid`` — ``None`` when ``typed_records`` is empty (no
+      pointer to check — not "valid", not "invalid"); else ``True`` iff
+      EVERY pointer's own ``structural_valid`` is ``True``.
+    * ``target_resolved`` — ``False`` when empty (nothing has been
+      resolved); else ``True`` iff EVERY pointer's own ``target_resolved``
+      is ``True``. Deliberately never vacuously ``True`` on an empty list —
+      this is the field the eb8b6894 STRICT pointer gate consults (see
+      ``db.sprint_items.is_item_claim_prospected``'s ``strict`` kwarg): a
+      row that exists but never actually resolved must not read as
+      resolved just because nothing failed.
+    * ``provenance_verified`` — tri-state: ``False`` if any pointer's own
+      value is explicitly ``False``; else ``None`` if every pointer's own
+      value is ``None`` (nothing applicable/computed); else ``True``.
+    * ``resolution_source`` — ``"not_applicable"`` when empty or no pointer
+      reports one; the single shared value when every reporting pointer
+      agrees; ``"mixed"`` otherwise.
+
+    Never raises: a malformed (non-dict) entry in ``typed_records`` is
+    skipped rather than breaking the rollup.
+    """
+    records = [r for r in typed_records if isinstance(r, dict)]
+    if not records:
+        return {
+            "structural_valid": None,
+            "target_resolved": False,
+            "provenance_verified": None,
+            "resolution_source": "not_applicable",
+        }
+    structural = [bool(r.get("structural_valid")) for r in records]
+    resolved = [bool(r.get("target_resolved")) for r in records]
+    prov_values = [r.get("provenance_verified") for r in records]
+    prov_verified: "bool | None"
+    if any(v is False for v in prov_values):
+        prov_verified = False
+    else:
+        _non_none = [v for v in prov_values if v is not None]
+        prov_verified = True if _non_none else None
+    sources = {
+        r.get("resolution_source") for r in records
+        if r.get("resolution_source") not in (None, "not_applicable")
+    }
+    if not sources:
+        resolution_source = "not_applicable"
+    elif len(sources) > 1:
+        resolution_source = "mixed"
+    else:
+        resolution_source = next(iter(sources))
+    return {
+        "structural_valid": all(structural),
+        "target_resolved": all(resolved),
+        "provenance_verified": prov_verified,
+        "resolution_source": resolution_source,
+    }
+
+
 def build_typed_pointer_record(
-    pointer: dict[str, Any], resolved: "dict[str, Any] | None" = None
+    pointer: dict[str, Any],
+    resolved: "dict[str, Any] | None" = None,
+    *,
+    readiness: "dict[str, Any] | None" = None,
 ) -> "dict[str, Any] | None":
     """Build ONE typed, machine-readable pointer record.
 
@@ -934,6 +1180,26 @@ def build_typed_pointer_record(
     its compact sibling. ``resolved`` may be omitted (or ``None``): every
     target is then treated as unresolved with no reason, which is still a
     fully valid, explicit typed record.
+
+    ``readiness`` (eb8b6894) — an OPTIONAL, pre-computed
+    :func:`verify_pointer_readiness` result for this SAME pointer (the
+    caller runs the I/O-backed check itself, e.g. via
+    :func:`compute_pointer_readiness_for_record`, and passes the result in —
+    this function stays pure/synchronous). When omitted, ``provenance_verified``
+    on the returned record is ``None`` ("not computed"), never coerced to
+    ``False``.
+
+    eb8b6894 — beyond the per-TARGET fields above, the returned record also
+    carries four POINTER-level fields distinguishing "a durable row exists"
+    from "the target actually resolves to something real":
+    ``structural_valid`` (:func:`check_structural_validity` — shape/schema
+    only), ``target_resolved`` (:func:`_summarize_target_resolution` — every
+    target actually resolved via ``resolve_pointer``, not just present),
+    ``resolution_source`` (:func:`_summarize_resolution_source` — "live_graph"
+    vs. a fallback/cache, when the selector type reports it), and
+    ``provenance_verified`` (:func:`_summarize_provenance_verified` — tri-state,
+    ``None`` when not computed/not applicable). These are purely ADDITIVE
+    keys; no existing key's value or type changes.
 
     Never raises: a malformed stored target is skipped rather than blowing
     up the whole record — this must be safe to call from a mandatory
@@ -1000,6 +1266,22 @@ def build_typed_pointer_record(
         record["id"] = pointer["id"]
     if pointer.get("label"):
         record["label"] = pointer["label"]
+
+    # eb8b6894 — pointer-level presence-vs-resolution distinction (see the
+    # module section docstring above check_structural_validity).
+    _struct_valid, _struct_error = check_structural_validity(pointer)
+    record["structural_valid"] = _struct_valid
+    if not _struct_valid:
+        record["structural_error"] = _struct_error
+    _target_resolved, _target_resolved_reason = _summarize_target_resolution(resolved_targets)
+    record["target_resolved"] = _target_resolved
+    if not _target_resolved:
+        record["target_resolved_reason"] = _target_resolved_reason
+    record["resolution_source"] = _summarize_resolution_source(resolved_targets)
+    _prov_verified, _prov_reason = _summarize_provenance_verified(readiness)
+    record["provenance_verified"] = _prov_verified
+    if _prov_verified is not True:
+        record["provenance_reason"] = _prov_reason
     return record
 
 
@@ -1021,6 +1303,15 @@ async def build_item_pointer_records(
     Guarded per-pointer: a resolve failure degrades that ONE pointer to an
     unresolved typed record (via ``build_typed_pointer_record(ptr, None)``)
     rather than dropping the item's other evidence; NEVER raises.
+
+    eb8b6894 — ALSO runs :func:`compute_pointer_readiness_for_record` per
+    pointer (best-effort, core-local default figure_resolver, no
+    provenance_getter — see that function's docstring) and threads the
+    result into :func:`build_typed_pointer_record`'s ``readiness`` kwarg, so
+    every typed record's ``provenance_verified`` field is populated here the
+    SAME way ``handoff._annotate_resolved_pointers`` populates it — the two
+    call sites that build a pointer's typed record can never independently
+    drift on what "provenance_verified" means.
     """
     records: list[dict[str, Any]] = []
     for ptr in stored_pointers:
@@ -1033,8 +1324,9 @@ async def build_item_pointer_records(
             )
         except Exception:  # noqa: BLE001 — resolve_pointer never raises, but be safe
             resolved = None
+        readiness = await compute_pointer_readiness_for_record(ptr)
         try:
-            record = build_typed_pointer_record(ptr, resolved)
+            record = build_typed_pointer_record(ptr, resolved, readiness=readiness)
         except Exception:  # noqa: BLE001 — a malformed pointer must not break the batch
             record = None
         if record:
@@ -1052,11 +1344,21 @@ def assemble_pointer_entries_from_annotated_items(
     :func:`build_item_pointer_records` powers).
 
     Each entry is ``{item_id, provenance: {required, bypassed, satisfied}?,
+    resolution_status: {structural_valid, target_resolved,
+    provenance_verified, resolution_source, strict_satisfied}?,
     pointers: [<typed pointer record>, ...]?}``, sorted by ``item_id`` for
     deterministic byte-for-byte output. An item contributes an entry only
     when it has >=1 typed pointer record OR its provenance state is
     ``required`` — an ordinary item with neither is silently skipped, so
     this never adds noise for the common case.
+
+    ``resolution_status`` (eb8b6894) — the item's ``pointer_resolution_status``
+    field, when present (set by ``handoff._annotate_resolved_pointers``
+    alongside ``pointer_provenance``/``pointer_records`` in the SAME resolve
+    pass — see :func:`aggregate_pointer_evidence`). Purely additive: an item
+    with no such field (e.g. annotated by a caller predating eb8b6894)
+    simply omits the key, byte-for-byte identical to before this field
+    existed.
 
     Shared by ``handoff._build_pointer_records_clause`` (the /goal block's
     ``<sprint_item_pointers>`` XML clause) and
@@ -1074,11 +1376,14 @@ def assemble_pointer_entries_from_annotated_items(
             continue
         records = it.get("pointer_records") or []
         provenance = it.get("pointer_provenance")
+        resolution_status = it.get("pointer_resolution_status")
         if not records and not (isinstance(provenance, dict) and provenance.get("required")):
             continue
         entry: dict[str, Any] = {"item_id": iid}
         if provenance:
             entry["provenance"] = provenance
+        if resolution_status:
+            entry["resolution_status"] = resolution_status
         if records:
             entry["pointers"] = records
         entries.append(entry)
@@ -1434,6 +1739,49 @@ async def verify_pointer_readiness(
     if isinstance(pointer, dict) and pointer.get("label") is not None:
         out["label"] = pointer.get("label")
     return out
+
+
+def default_figure_resolver() -> FigureResolver:
+    """Public accessor for the core-local default :data:`FigureResolver`
+    (see :func:`_default_figure_resolver`) so callers OUTSIDE this module
+    (e.g. ``handoff._annotate_resolved_pointers``'s per-pointer
+    ``provenance_verified`` check, eb8b6894) can reuse the exact same
+    default without reaching into a private name. Identical behaviour to
+    ``_default_figure_resolver()`` — this is purely a public alias.
+    """
+    return _default_figure_resolver()
+
+
+async def compute_pointer_readiness_for_record(
+    pointer: dict[str, Any],
+) -> "dict[str, Any] | None":
+    """Best-effort :func:`verify_pointer_readiness` call for ONE stored
+    pointer, using the core-local default figure_resolver
+    (:func:`default_figure_resolver`) and no ``provenance_getter``
+    (meridian-outputs' provenance ledger is extension-only — see the
+    3196ba0e module section docstring above; a ``planned_new`` target will
+    therefore consistently report ``provenance_unavailable`` here unless a
+    richer caller injects its own ledger, which correctly fails CLOSED
+    rather than assuming success).
+
+    eb8b6894 — the ONE shared readiness-for-a-record step both
+    :func:`build_item_pointer_records` (capability_contract's self-fetch
+    path) and ``handoff._annotate_resolved_pointers`` (its own inline
+    resolve loop) call, so ``provenance_verified`` can never independently
+    drift between the XML /goal clause and the JSON capability contract.
+
+    Guarded: returns ``None`` on any failure (never raises) — a caller
+    passes that straight through to :func:`build_typed_pointer_record`,
+    which already treats ``readiness=None`` as "not computed" rather than
+    "verification failed".
+    """
+    try:
+        return await verify_pointer_readiness(
+            pointer, figure_resolver=default_figure_resolver(),
+        )
+    except Exception:  # noqa: BLE001 — best-effort, never breaks a mandatory pass
+        _log.debug("compute_pointer_readiness_for_record failed", exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------

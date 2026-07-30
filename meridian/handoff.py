@@ -1078,6 +1078,7 @@ def _build_quick_start_goal(
     include_pointer_lines: bool = False,
     completion_criteria_override: str | None = None,
     execution_policy: dict[str, Any] | None = None,
+    strict_pointer_evidence: bool = False,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -1136,6 +1137,22 @@ def _build_quick_start_goal(
     query failed" and is treated as fail-open (nothing is excluded on that
     basis) rather than "confirmed no evidence" (which would risk mass-excluding
     every resource-declaring item on a transient DB hiccup).
+
+    ``strict_pointer_evidence`` (eb8b6894) — OPT-IN, OFF by default (mirrors
+    ``generate_handoff``'s own ``strict_evidence``/8a883f60 opt-in shape).
+    When False (every existing caller), the UNPROSPECTED exclusion below is
+    PRESENCE-only, byte-for-byte identical to before this flag existed: a
+    durable pointer row is enough to satisfy the gate regardless of whether
+    it ever actually resolved. When True, a pending item whose
+    ``pointer_resolution_status`` (set by ``_annotate_resolved_pointers`` —
+    both call sites that build a /goal run that annotation pass first) shows
+    a durable row that did NOT resolve (``target_resolved is False``) is ALSO
+    excluded — "a row exists" can no longer, by itself, satisfy a strict
+    caller's claimable batch. An item never annotated with
+    ``pointer_resolution_status`` (e.g. the starter/compact mode, which never
+    resolves pointers at all) is unaffected either way — there is no
+    resolution-aware signal to tighten against, so it falls back to the same
+    presence-only check.
 
     ``include_pointer_lines`` (682005f4) — when True, append each remaining
     item's resolved pointer(s) (``item["resolved_pointers"]``, set by
@@ -1254,7 +1271,18 @@ def _build_quick_start_goal(
             True if pointer_evidence_ids is None
             else _it.get("id") in pointer_evidence_ids
         )
-        if is_item_claim_prospected(_it, has_pointer_evidence=_has_evidence):
+        # eb8b6894 — when the caller opted into strict_pointer_evidence, pull
+        # the resolution-aware signal _annotate_resolved_pointers already
+        # computed for this item (None when never annotated, e.g. starter
+        # mode — falls back to the presence-only check exactly as before).
+        _target_resolved = (
+            (_it.get("pointer_resolution_status") or {}).get("target_resolved")
+            if strict_pointer_evidence else None
+        )
+        if is_item_claim_prospected(
+            _it, has_pointer_evidence=_has_evidence,
+            strict=strict_pointer_evidence, target_resolved=_target_resolved,
+        ):
             _included_sprint_items.append(_it)
         else:
             _excluded_unprospected.append(_it)
@@ -3059,6 +3087,19 @@ async def _annotate_resolved_pointers(
       (even one with zero stored pointers — that IS the "required but not
       yet satisfied" case), unlike ``resolved_pointers``/``pointer_records``
       which need >=1 stored row to produce anything.
+    * ``pointer_resolution_status`` (eb8b6894) — item-level rollup of the
+      PER-POINTER ``structural_valid``/``target_resolved``/
+      ``provenance_verified``/``resolution_source`` fields each
+      ``pointer_records`` entry now carries (see
+      ``pointers.aggregate_pointer_evidence``), plus ``strict_satisfied`` —
+      whether ``is_item_claim_prospected``'s STRICT gate would accept this
+      item using RESOLUTION-aware evidence rather than bare row-presence
+      (``pointer_provenance["satisfied"]`` stays presence-only and
+      byte-for-byte unchanged; this is the new, additive, resolution-aware
+      sibling). Computed unconditionally, same as ``pointer_provenance``.
+      This is the field ``_build_quick_start_goal``'s
+      ``strict_pointer_evidence`` opt-in consults so a durable-but-unresolved
+      pointer can no longer silently satisfy a strict claimability gate.
     * ``artifact_pointer_policy`` (88f82c15, b730 follow-up) — the
       ``pointers.evaluate_artifact_pointer_policy`` warn/strict verdict for
       this item: classification, effective policy, an active warning code +
@@ -3084,9 +3125,9 @@ async def _annotate_resolved_pointers(
       warning is never hidden in prose-only text.
 
     Fully guarded: a per-item failure degrades to no ``resolved_pointers``/
-    ``pointer_records``/``pointer_provenance``/``artifact_pointer_policy``/
-    ``artifact_pointer_finding`` for that item; the pass NEVER raises so the
-    mandatory handoff can't break.
+    ``pointer_records``/``pointer_provenance``/``pointer_resolution_status``/
+    ``artifact_pointer_policy``/``artifact_pointer_finding`` for that item;
+    the pass NEVER raises so the mandatory handoff can't break.
 
     ``stats`` (8a883f60) — optional output dict. When given, incremented in
     place with ``items_checked``, ``items_fetch_failed`` (the
@@ -3131,9 +3172,9 @@ async def _annotate_resolved_pointers(
             }
         except Exception:  # noqa: BLE001 — provenance annotation is best-effort
             pass
+        typed_records: list[dict[str, Any]] = []
         if stored:
             rendered: list[dict[str, Any]] = []
-            typed_records: list[dict[str, Any]] = []
             for ptr in stored:
                 try:
                     resolved = await pointers_module.resolve_pointer(
@@ -3151,8 +3192,17 @@ async def _annotate_resolved_pointers(
                 formatted = _format_resolved_pointer(resolved)
                 if formatted:
                     rendered.append(formatted)
+                # eb8b6894 — best-effort completion-time readiness check per
+                # pointer (the SAME shared primitive
+                # pointers.build_item_pointer_records uses for
+                # capability_contract's JSON path), so provenance_verified is
+                # populated identically wherever a typed record is built —
+                # never re-derived independently by each caller.
+                _readiness = await pointers_module.compute_pointer_readiness_for_record(ptr)
                 try:
-                    typed = pointers_module.build_typed_pointer_record(ptr, resolved)
+                    typed = pointers_module.build_typed_pointer_record(
+                        ptr, resolved, readiness=_readiness,
+                    )
                 except Exception:  # noqa: BLE001 — one bad pointer must not drop the rest
                     typed = None
                 if typed:
@@ -3161,6 +3211,26 @@ async def _annotate_resolved_pointers(
                 item["resolved_pointers"] = rendered
             if typed_records:
                 item["pointer_records"] = typed_records
+        # eb8b6894 — item-level rollup of the PER-POINTER structural_valid/
+        # target_resolved/provenance_verified/resolution_source fields (see
+        # pointers.aggregate_pointer_evidence), PLUS strict_satisfied: whether
+        # is_item_claim_prospected's STRICT gate would let this item through
+        # using RESOLUTION-aware evidence instead of bare row-presence — the
+        # signal _build_quick_start_goal consults when a caller opts into
+        # strict_pointer_evidence=True. Computed unconditionally (even for
+        # zero stored pointers), mirroring pointer_provenance above; purely
+        # additive and best-effort — never breaks the mandatory handoff.
+        try:
+            _resolution_status = pointers_module.aggregate_pointer_evidence(typed_records)
+            _resolution_status["strict_satisfied"] = is_item_claim_prospected(
+                item, has_pointer_evidence=bool(stored), strict=True,
+                target_resolved=(
+                    _resolution_status["target_resolved"] if stored else None
+                ),
+            )
+            item["pointer_resolution_status"] = _resolution_status
+        except Exception:  # noqa: BLE001 — resolution-status rollup is best-effort
+            pass
         # 88f82c15 (b730 follow-up) — warn/strict artifact-pointer policy
         # verdict, computed AFTER pointer_records above so it sees this same
         # pass's durable pointer evidence. Best-effort: never breaks the
@@ -4928,6 +4998,7 @@ async def generate_handoff(
     version: str | None = None,
     strict_evidence: bool = False,
     evidence_status: dict[str, Any] | None = None,
+    strict_pointer_evidence: bool = False,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -5002,6 +5073,25 @@ async def generate_handoff(
     typed ``errors`` list. A caller that never opts in is completely
     unaffected — same content, same persistence, same exceptions as before
     this parameter existed.
+
+    ``strict_pointer_evidence`` (eb8b6894) — optional, OFF by default,
+    mirrors ``strict_evidence``'s own opt-in shape but governs a DIFFERENT,
+    finer-grained gate: whether the claimable/goal batch and its
+    ``<excluded_unprospected>`` exclusion list require durable pointer
+    TARGETS to have actually resolved (not merely have a row present) — see
+    ``_build_quick_start_goal``'s own docstring and
+    ``pointers.aggregate_pointer_evidence``. Threaded through to every
+    executable mode (full/delta/starter/goal) exactly like ``version``
+    above. Unlike ``strict_evidence``, this never raises
+    :class:`HandoffEvidenceRequired` — a structurally-valid-but-unresolved
+    item is simply EXCLUDED from the claimable batch (the same "excluded,
+    not blocking" mechanism the existing UNPROSPECTED gate already uses),
+    never a hard refusal of the whole handoff call. A caller that never
+    opts in (the default, every pre-existing call site) sees zero
+    functional change: the claimable batch and ``pointer_provenance`` field
+    are computed exactly as before this parameter existed; only the new,
+    purely additive ``pointer_resolution_status`` field appears on every
+    item either way.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -5033,6 +5123,7 @@ async def generate_handoff(
             version=_effective_version,
             strict_evidence=strict_evidence,
             evidence_status=evidence_status,
+            strict_pointer_evidence=strict_pointer_evidence,
         )
         return _st_path, _st_content, False
     if mode == "goal":
@@ -5050,6 +5141,7 @@ async def generate_handoff(
             version=_effective_version,
             strict_evidence=strict_evidence,
             evidence_status=evidence_status,
+            strict_pointer_evidence=strict_pointer_evidence,
         )
         return _g_path, _g_content, False
     if mode not in {"full", "delta"}:
@@ -5475,6 +5567,9 @@ async def generate_handoff(
         execution_policy=_execution_policy_from_settings(
             proj_settings, _effective_execution_mode
         ),
+        # eb8b6894 — opt-in STRICT pointer gate: excludes an item whose
+        # durable pointer row exists but never actually resolved.
+        strict_pointer_evidence=strict_pointer_evidence,
     )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
@@ -6011,6 +6106,7 @@ async def _generate_starter_handoff(
     version: str | None = None,
     strict_evidence: bool = False,
     evidence_status: dict[str, Any] | None = None,
+    strict_pointer_evidence: bool = False,
 ) -> tuple[str, str]:
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
@@ -6034,6 +6130,12 @@ async def _generate_starter_handoff(
     ``graph_search_availability``, and ``freshness_requery`` are always
     reported ``skipped`` here — only ``wave_gate_exclusion`` reflects a real
     check in this mode.
+
+    ``strict_pointer_evidence`` (eb8b6894) — threaded straight through too,
+    but has no resolution-aware signal to act on here: starter/compact never
+    runs ``_annotate_resolved_pointers``, so no pending item carries
+    ``pointer_resolution_status`` and ``_build_quick_start_goal`` falls back
+    to its ordinary presence-only check regardless of this flag.
     """
     project_id = project["id"]
     sprint_items_all = await db_module.get_sprint_items(
@@ -6136,6 +6238,7 @@ async def _generate_starter_handoff(
         # 75ac1c8e — canonical execution policy (bounds planning, forces the
         # first required action).
         execution_policy=_execution_policy_from_settings(settings, _s_execution_mode),
+        strict_pointer_evidence=strict_pointer_evidence,
     )
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the
@@ -6178,6 +6281,7 @@ async def _generate_goal_only_handoff(
     version: str | None = None,
     strict_evidence: bool = False,
     evidence_status: dict[str, Any] | None = None,
+    strict_pointer_evidence: bool = False,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
 
@@ -6404,6 +6508,7 @@ async def _generate_goal_only_handoff(
         # 75ac1c8e — canonical execution policy (bounds planning, forces the
         # first required action).
         execution_policy=_execution_policy_from_settings(proj_settings, _g_execution_mode),
+        strict_pointer_evidence=strict_pointer_evidence,
     )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.

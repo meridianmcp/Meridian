@@ -435,3 +435,87 @@ async def test_full_mode_artifact_pointer_findings_clause_well_formed_with_speci
     assert "<v2>.docx" not in clause  # raw metacharacters never appear unescaped
     root = ET.fromstring(clause)  # raises ParseError if not well-formed
     assert root.tag == "artifact_pointer_findings"
+
+
+# ---------------------------------------------------------------------------
+# eb8b6894 — XML / JSON / plain-text parity for the presence-vs-resolution
+# fields (structural_valid / target_resolved / provenance_verified /
+# resolution_source / strict_satisfied), mirroring 70c10ca3's own
+# artifact-pointer-findings XML/JSON parity pattern above and 8a883f60's
+# determinism work: the SAME status/reason must appear byte-identically in
+# every projection, never independently re-derived per representation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pointer_resolution_status_xml_json_plaintext_parity(db, tmp_path):
+    from meridian import capability_contract as cc
+
+    p = await db_module.create_project(db, "eb8b6894-resolution-status-parity")
+    resolved_item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the migration guard",
+        touches_resources=["file:meridian/db/migrations.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], resolved_item["id"], "code",
+        [{"uri": "meridian/db/migrations.py",
+          "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+        label="guard site",
+    )
+    unresolved_item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the other thing",
+        touches_resources=["file:meridian/nonexistent_module.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], unresolved_item["id"], "code",
+        [{"uri": "file:meridian/nonexistent_module.py",
+          "selector": {"type": "symbol", "qualified_name": "totally.unindexed.symbol"}}],
+    )
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+    )
+
+    # --- XML: the typed <sprint_item_pointers> clause -----------------
+    assert "<sprint_item_pointers>" in content
+    start = content.index("<sprint_item_pointers>") + len("<sprint_item_pointers>")
+    end = content.index("</sprint_item_pointers>")
+    import json as _json
+    xml_entries = _json.loads(content[start:end])
+    by_id = {e["item_id"]: e for e in xml_entries}
+
+    resolved_status = by_id[resolved_item["id"]]["resolution_status"]
+    assert resolved_status["target_resolved"] is True
+    assert resolved_status["strict_satisfied"] is True
+
+    unresolved_status = by_id[unresolved_item["id"]]["resolution_status"]
+    assert unresolved_status["target_resolved"] is False
+    assert unresolved_status["strict_satisfied"] is False
+    # Presence-only provenance still says "satisfied" — the exact bug this
+    # item fixes: the two fields must coexist, never silently merged.
+    assert by_id[unresolved_item["id"]]["provenance"]["satisfied"] is True
+
+    # --- JSON: capability_contract's item_sprint_item_pointers ---------
+    contract = await cc.build_capability_contract(db, p["id"])
+    assert contract["item_sprint_item_pointers"] == xml_entries
+
+    # --- plain text: the compact goal-line for the unresolved pointer --
+    # _build_goal_pointer_lines (mode='goal' -> include_pointer_lines=True)
+    # renders each item as "<id> (<title>): <target>; ..." — search for that
+    # specific marker (not a bare id substring, which also appears earlier
+    # in the <sprint_item_pointers> JSON clause and the plain item listing)
+    # to land on the actual pointer line.
+    unresolved_marker = f"{unresolved_item['id']} ("
+    assert unresolved_marker in content
+    line_start = content.index(unresolved_marker)
+    line_end = content.index("\n", line_start)
+    unresolved_line = content[line_start:line_end]
+    assert "unresolved" in unresolved_line
+
+    resolved_marker = f"{resolved_item['id']} ("
+    assert resolved_marker in content
+    resolved_line_start = content.index(resolved_marker)
+    resolved_line_end = content.index("\n", resolved_line_start)
+    resolved_line = content[resolved_line_start:resolved_line_end]
+    assert "unresolved" not in resolved_line
+    assert "migrations.py" in resolved_line

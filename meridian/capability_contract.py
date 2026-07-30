@@ -151,6 +151,15 @@ async def extract_sprint_item_pointers(
     ``<sprint_item_pointers>`` XML clause, so the two never independently
     diverge for the same request.
 
+    eb8b6894 — each entry also carries ``resolution_status`` (when
+    available): the item-level ``structural_valid``/``target_resolved``/
+    ``provenance_verified``/``resolution_source``/``strict_satisfied``
+    rollup from :func:`pointers.aggregate_pointer_evidence`, computed
+    identically on both paths below so a durable-but-unresolved pointer
+    can never look "satisfied" in this JSON contract while
+    ``pointer_records``' own per-pointer ``target_resolved`` says
+    otherwise.
+
     Two paths, depending on whether ``items`` already carry the
     ``pointer_records``/``pointer_provenance`` annotation
     ``handoff._annotate_resolved_pointers`` sets (the SAME resolve pass a
@@ -188,6 +197,12 @@ async def extract_sprint_item_pointers(
         if "pointer_records" in it or "pointer_provenance" in it:
             records = it.get("pointer_records") or []
             provenance = it.get("pointer_provenance")
+            # eb8b6894 — reuse the SAME resolution_status
+            # handoff._annotate_resolved_pointers already computed in this
+            # pass (pointers.aggregate_pointer_evidence) rather than
+            # re-deriving it, so the JSON contract can never disagree with
+            # the /goal XML clause for the same annotated items.
+            resolution_status = it.get("pointer_resolution_status")
         else:
             try:
                 stored = await db_module.get_sprint_item_pointers(db, item_id)
@@ -214,11 +229,28 @@ async def extract_sprint_item_pointers(
                     )
                 except Exception:  # noqa: BLE001 — resolve failure -> no records for this item
                     records = []
+            # eb8b6894 — the self-fetch path's OWN companion to
+            # pointer_resolution_status, computed via the SAME shared
+            # aggregator handoff._annotate_resolved_pointers uses, plus the
+            # SAME strict_satisfied signal (resolution-aware, not
+            # presence-only) — see is_item_claim_prospected(strict=True).
+            try:
+                resolution_status = _pointers.aggregate_pointer_evidence(records)
+                resolution_status["strict_satisfied"] = db_module.is_item_claim_prospected(
+                    it, has_pointer_evidence=bool(stored), strict=True,
+                    target_resolved=(
+                        resolution_status["target_resolved"] if stored else None
+                    ),
+                )
+            except Exception:  # noqa: BLE001 — resolution-status derivation is best-effort
+                resolution_status = None
         if not records and not (isinstance(provenance, dict) and provenance.get("required")):
             continue
         entry: dict[str, Any] = {"item_id": item_id}
         if provenance:
             entry["provenance"] = provenance
+        if resolution_status:
+            entry["resolution_status"] = resolution_status
         if records:
             entry["pointers"] = records
         entries.append(entry)
