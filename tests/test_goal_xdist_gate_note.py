@@ -49,11 +49,40 @@ def test_xdist_gate_note_mentions_stash_steps():
 
 
 def test_xdist_gate_note_mentions_serial_fallback():
-    """The guidance must recommend re-running without -n 3 as the fallback."""
+    """The guidance must recommend re-running without the configured
+    parallelism flag as the fallback (6cfdabd7 -- this no longer hardcodes
+    "-n 3": the fallback command is derived from the EFFECTIVE test_cmd)."""
     goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
-    # Both forms of the recommendation should be present
-    assert "WITHOUT -n 3" in goal or "without -n 3" in goal
+    assert "WITHOUT the configured parallelism flag" in goal
     assert "timeout=60" in goal
+
+
+def test_xdist_gate_note_no_stale_default_parallelism_flag():
+    """6cfdabd7 regression guard: the default (no executor_config.test_cmd
+    configured) /goal must NOT assert a hardcoded "-n 3" anywhere -- that
+    was the exact staleness bug (pixi.toml's own `test` task moved to
+    "-n auto" long before the /goal text was updated to match)."""
+    goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
+    assert "-n 3" not in goal
+
+
+def test_xdist_gate_note_uses_configured_test_cmd():
+    """When a project has a configured test_cmd (e.g. via set_executor_config),
+    the gate note's first mention AND the "rerun without parallelism" fallback
+    must both reflect that EXACT command, not a hardcoded default."""
+    goal = h._build_quick_start_goal(
+        [{**_ITEM, "title": "FEAT: implementation"}],
+        test_cmd="pixi run test -n auto",
+    )
+    assert "`pixi run test -n auto`" in goal
+    assert "-n 3" not in goal
+    # The "rerun without parallelism" fallback strips the -n flag from the
+    # ACTUAL configured command rather than asserting a second,
+    # independently hardcoded command.
+    assert "WITHOUT the configured parallelism flag (`pixi run test`)" in goal
+    # The machine-readable companion tag agrees with the prose.
+    assert 'test_cmd="pixi run test -n auto"' in goal
+    assert 'parallelism="-n auto"' in goal
 
 
 def test_xdist_gate_note_is_closed_tag():

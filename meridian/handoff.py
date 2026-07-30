@@ -57,6 +57,14 @@ _env = Environment(
     keep_trailing_newline=True,
 )
 _DEFAULT_GOAL_TEST_FLOOR = 2150
+# 6cfdabd7 — fallback test invocation when a project has no executor_config.
+# test_cmd set. Deliberately NOT hardcoding a `-n <value>` parallelism flag
+# here: baking in a fixed flag is exactly the staleness bug this constant
+# exists to prevent (the prior /goal text hardcoded "-n 3" long after
+# pixi.toml's own `test` task moved to "-n auto"). Leaving the bare command
+# lets the project's own task definition own the parallelism policy, so this
+# fallback can never drift out of sync with it again.
+_DEFAULT_GOAL_TEST_CMD = "pixi run test"
 _STRATEGIC_NOTE_TAGS = {"planning", "strategy", "competitive", "acquisition"}
 _SESSION_HANDOFF_STATE: dict[str, str] = {}
 
@@ -736,6 +744,92 @@ def _max_turns_from_settings(proj_settings: dict[str, Any] | None) -> int:
         return _DEFAULT_GOAL_MAX_TURNS
 
 
+def _test_cmd_from_settings(proj_settings: dict[str, Any] | None) -> str:
+    """Extract executor_config.test_cmd (6cfdabd7). Sibling of
+    _max_turns_from_settings — same two-input read pattern, same fail-safe
+    convention: a missing/non-dict executor_config or a blank test_cmd
+    returns _DEFAULT_GOAL_TEST_CMD rather than raising or returning empty."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    if not isinstance(cfg, dict):
+        return _DEFAULT_GOAL_TEST_CMD
+    raw = cfg.get("test_cmd")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return _DEFAULT_GOAL_TEST_CMD
+
+
+def _branch_from_settings(proj_settings: dict[str, Any] | None) -> str | None:
+    """Extract executor_config.branch (6cfdabd7). Returns None when unset so
+    callers render an explicit, clearly-labeled fallback instead of guessing
+    a branch name."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    if not isinstance(cfg, dict):
+        return None
+    raw = cfg.get("branch")
+    return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+
+# 6cfdabd7 — matches a pytest-xdist worker-count flag in either `-n VALUE` or
+# `--numprocesses VALUE`/`--numprocesses=VALUE` form, so the parallelism
+# policy displayed in a /goal is read off whatever the project's actual
+# test_cmd says rather than a second hardcoded assumption.
+_PARALLELISM_FLAG_RE = re.compile(r"(?:-n|--numprocesses)(?:[= ]+)(\S+)")
+
+
+def _parallelism_policy_from_test_cmd(test_cmd: str) -> str:
+    """Read the effective pytest-xdist parallelism policy off an already-
+    resolved test_cmd, e.g. '-n auto' out of 'pixi run test -n auto' (6cfdabd7).
+
+    Returns a clearly-labeled fallback when the command carries no explicit
+    -n/--numprocesses flag, rather than asserting a parallelism value the
+    configured command doesn't actually specify — this is the exact anti-
+    staleness property the old hardcoded "-n 3" text lacked.
+    """
+    match = _PARALLELISM_FLAG_RE.search(test_cmd or "")
+    if match:
+        return f"-n {match.group(1)}"
+    return "not declared in test_cmd (task's own default applies)"
+
+
+def _strip_parallelism_flag(test_cmd: str) -> str:
+    """Return ``test_cmd`` with any -n/--numprocesses flag removed, for the
+    "rerun without parallelism" triage step in the xdist test_gate_note
+    (6cfdabd7). Falls back to appending ' -p no:xdist' when the command
+    carries no removable flag, so the triage command shown is always derived
+    from the ACTUAL effective test_cmd instead of a second hardcoded
+    fallback invocation.
+    """
+    base = (test_cmd or _DEFAULT_GOAL_TEST_CMD).strip()
+    stripped = re.sub(r"\s{2,}", " ", _PARALLELISM_FLAG_RE.sub("", base)).strip()
+    if stripped and stripped != base:
+        return stripped
+    return f"{base} -p no:xdist"
+
+
+def _build_test_gate_config_clause(
+    *, test_cmd: str, branch: str | None, version: str | None,
+) -> str:
+    """6cfdabd7 — render the resolved test_cmd/parallelism/branch/version as
+    one machine-readable ``<test_gate_config>`` tag, sourced from the
+    project's actual executor_config (``_test_cmd_from_settings`` /
+    ``_branch_from_settings``) rather than a hardcoded string. Every handoff
+    mode (full/delta/starter/goal) renders this from the SAME underlying
+    config via the shared ``_build_quick_start_goal`` call, so the four
+    modes can never disagree on these values. ``branch``/``version`` fall
+    back to a clearly-labeled 'unset'/'unscoped' rather than silently
+    omitting the attribute or guessing a value.
+    """
+    _attr_escape = {chr(34): "&quot;"}
+    _parallelism = _parallelism_policy_from_test_cmd(test_cmd)
+    _branch = _xml_escape(branch, _attr_escape) if branch else "unset"
+    _version = _xml_escape(str(version), _attr_escape) if version else "unscoped"
+    return (
+        f'\n<test_gate_config test_cmd="{_xml_escape(test_cmd, _attr_escape)}" '
+        f'parallelism="{_xml_escape(_parallelism, _attr_escape)}" '
+        f'branch="{_branch}" version="{_version}" />'
+    )
+
+
 def _completion_mode_from_settings(proj_settings: dict[str, Any] | None) -> str:
     """9f57374b — executor_config.completion_mode ('strict'|'lenient', default
     'strict'). 'strict' keeps the anti-stop failure framing on the /goal."""
@@ -1062,6 +1156,8 @@ def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
     test_floor: int = _DEFAULT_GOAL_TEST_FLOOR,
+    test_cmd: str = _DEFAULT_GOAL_TEST_CMD,
+    branch: str | None = None,
     version: str | None = None,
     execution_mode: str = "autonomous",
     max_turns: int = _DEFAULT_GOAL_MAX_TURNS,
@@ -1172,12 +1268,34 @@ def _build_quick_start_goal(
     ``execution_mode`` param alone via ``build_execution_policy({},
     execution_mode=execution_mode)``, so the tag is always present and no
     caller can silently omit it.
+
+    ``test_cmd`` (6cfdabd7) — the project's EFFECTIVE test invocation,
+    sourced by the caller from ``executor_config.test_cmd`` via
+    ``_test_cmd_from_settings`` (default ``_DEFAULT_GOAL_TEST_CMD``, the bare
+    "pixi run test" — deliberately no hardcoded ``-n`` flag, see that
+    constant's comment). Replaces what used to be a literal hardcoded
+    "pixi run test -n 3" string in both the completion criteria and the
+    xdist ``<test_gate_note>`` triage guidance — those now interpolate this
+    value, and the derived parallelism policy (``_parallelism_policy_from_
+    test_cmd``) is additionally rendered on a dedicated ``<test_gate_config>``
+    tag together with ``branch``/``version`` so every handoff mode reports
+    the SAME effective values for the SAME underlying config.
+
+    ``branch`` (6cfdabd7) — the project's ``executor_config.branch``, sourced
+    by the caller via ``_branch_from_settings``. ``None`` renders as an
+    explicit ``branch="unset"`` on ``<test_gate_config>`` rather than being
+    omitted or guessed.
     """
     _completion_override = (
         completion_criteria_override.strip()
         if isinstance(completion_criteria_override, str)
         and completion_criteria_override.strip()
         else None
+    )
+    _effective_test_cmd = (
+        test_cmd.strip()
+        if isinstance(test_cmd, str) and test_cmd.strip()
+        else _DEFAULT_GOAL_TEST_CMD
     )
     _policy = (
         execution_policy
@@ -1532,7 +1650,7 @@ def _build_quick_start_goal(
     else:
         _completion_text = (
             "Done when all listed sprint items are marked complete via "
-            "complete_sprint_item(), pixi run test passes "
+            f"complete_sprint_item(), {_effective_test_cmd} passes "
             f"{test_floor}+ (run the full suite ONCE at the very end of the "
             "entire megasprint as the single deploy gate -- not per item; "
             "per-item verification uses targeted tests for that item only), "
@@ -1566,8 +1684,16 @@ def _build_quick_start_goal(
         + (
             ""
             if _completion_override is not None or _stype == "general"
-            else "\n<test_gate_note>" + _xml_escape(
-            "If `pixi run test -n 3` produces an INTERNALERROR "
+            # 6cfdabd7 — <test_gate_config> is the machine-readable source of
+            # truth for the effective test_cmd/parallelism/branch/version;
+            # the <test_gate_note> prose below interpolates the SAME
+            # _effective_test_cmd rather than a second, independently
+            # hardcoded command string.
+            else _build_test_gate_config_clause(
+                test_cmd=_effective_test_cmd, branch=branch, version=version,
+            )
+            + "\n<test_gate_note>" + _xml_escape(
+            f"If `{_effective_test_cmd}` produces an INTERNALERROR "
             "or worker crash (a line starting with 'INTERNALERROR>' rather than a "
             "normal 'FAILED tests/...' line), this is very likely a parallel-execution "
             "flake, not a regression in your code. Before concluding your change broke "
@@ -1575,8 +1701,9 @@ def _build_quick_start_goal(
             "crashed test in isolation (`pixi run python -m pytest <path>::<test> -q "
             "--timeout=60 -p no:xdist`), (3) if it passes standalone, your change is "
             "very likely fine — restore your changes (`git stash pop`) and re-run the "
-            "full suite WITHOUT -n 3 (`pixi run python -m pytest tests/ -q "
-            "--timeout=60`) for a clean, honest count before deciding pass/fail."
+            "full suite WITHOUT the configured parallelism flag (`"
+            f"{_strip_parallelism_flag(_effective_test_cmd)}`) "
+            "for a clean, honest count before deciding pass/fail."
             ) + "</test_gate_note>"
         )
         + f"{_not_done_until}\n"
@@ -5538,6 +5665,12 @@ async def generate_handoff(
         pending_sprint_items,
         execution_mode=_effective_execution_mode,
         max_turns=_max_turns_from_settings(proj_settings),
+        # 6cfdabd7 — render the EFFECTIVE test_cmd/branch (executor_config,
+        # not a hardcoded string) so the completion criteria and
+        # <test_gate_config>/<test_gate_note> agree with what this project
+        # actually has configured via set_executor_config.
+        test_cmd=_test_cmd_from_settings(proj_settings),
+        branch=_branch_from_settings(proj_settings),
         hitl_auto_answer_mode=_hitl_aa_mode,
         completion_mode=_completion_mode_from_settings(proj_settings),
         goal_group_style=_goal_group_style_from_settings(proj_settings),
@@ -6225,6 +6358,13 @@ async def _generate_starter_handoff(
         pending,
         execution_mode=_s_execution_mode,
         max_turns=_max_turns_from_settings(settings),
+        # 6cfdabd7 — same EFFECTIVE test_cmd/branch/version rendering as the
+        # full/delta and goal-only call sites, sourced from this project's
+        # actual executor_config so starter/compact never disagrees with the
+        # other three handoff modes.
+        test_cmd=_test_cmd_from_settings(settings),
+        branch=_branch_from_settings(settings),
+        version=version,
         hitl_auto_answer_mode=_s_hitl_mode,
         completion_mode=_completion_mode_from_settings(settings),
         goal_group_style=_goal_group_style_from_settings(settings),
@@ -6490,6 +6630,11 @@ async def _generate_goal_only_handoff(
         pending_sprint_items,
         execution_mode=_g_execution_mode,
         max_turns=_max_turns_from_settings(proj_settings),
+        # 6cfdabd7 — same EFFECTIVE test_cmd/branch rendering as the
+        # full/delta and starter call sites (version is already threaded
+        # below via the pre-existing belt-and-suspenders param).
+        test_cmd=_test_cmd_from_settings(proj_settings),
+        branch=_branch_from_settings(proj_settings),
         hitl_auto_answer_mode=_hitl_mode,
         completion_mode=_completion_mode_from_settings(proj_settings),
         goal_group_style=_goal_group_style_from_settings(proj_settings),
