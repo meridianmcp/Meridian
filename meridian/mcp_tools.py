@@ -1144,7 +1144,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "root_dir": {"type": "string", "description": "Absolute path to the source tree root — used for the search_code_semantic fallback. If omitted, the semantic leg is skipped."},
          "limit": {"type": "integer", "description": "Max results per rung (default 5)."},
          "stale_graph": {"type": "boolean", "description": "Set true to SKIP the graph rung and go straight to Serena (e.g. you already know the graph is stale from a _graph_staleness warning)."},
-         "kind": {"type": "string", "description": "Optional symbol kind filter passed to search_code_semantic fallback (function/class/method/etc)."}},
+         "kind": {"type": "string", "description": "Optional symbol kind filter passed to search_code_semantic fallback (function/class/method/etc)."},
+         "session_id": {"type": "string", "description": "a8c0f3b7 — optional Meridian session id. Purely for attribution: when supplied, the durable code-intel prospecting receipt this call records (meridian.code_intel_receipt) is attributed to this session, strengthening complete_sprint_item's prospecting-receipt gate. Never required and never affects the prospect result itself."}},
          "required": ["symbol"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
@@ -1735,7 +1736,18 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "EVIDENCE_INVALID/EVIDENCE_STALE/WRONG_WORKTREE/UNCLAIMED_EDIT) unless evidence is "
         "present, verifiable, fresh, from the right worktree, and every modified file was "
         "claimed. Default (no strict_evidence, no require_strict_evidence) behavior is exactly "
-        "the pre-existing advisory-only evidence checks — nothing changes unless you opt in.",
+        "the pre-existing advisory-only evidence checks — nothing changes unless you opt in. "
+        "a8c0f3b7 — CODE-INTEL PROSPECTING RECEIPT gate: opt in at the PROJECT level via "
+        "set_capability_manifest(capabilities=[{id:'code_intel_prospecting', ...}]) — no "
+        "per-call flag needed, and a no-op for projects that never declared it. When declared, "
+        "completion of an item that has touches_resources and no prospect_bypass is refused "
+        "(CODE_INTEL_RECEIPT_MISSING) unless a durable receipt shows a real search_graph/"
+        "find_symbol/prospect_symbol call happened since the item was claimed (see "
+        "meridian.code_intel_receipt) — or refused (CODE_INTEL_UNAVAILABLE) when the capability "
+        "is availability_policy='required' and code-intel itself is unavailable. Pass "
+        "override_code_intel_receipt=true with a non-empty override_reason to acknowledge and "
+        "complete anyway (audited). 'optional'/'degraded_ok' policies never block — they degrade "
+        "with a code_intel_receipt_warning on the returned item instead.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
@@ -1749,7 +1761,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit override, never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
          "strict_evidence": {"type": "boolean", "description": "5fe3502e — opt in to the STRICT, fail-closed evidence gate for THIS call only (see meridian.sprint_evidence_guard). Omit/false preserves the exact pre-existing advisory-only behavior. Equivalent, persistent alternative: update_sprint_item(require_strict_evidence=true)."},
          "override_strict_evidence": {"type": "boolean", "description": "5fe3502e — explicit, audited override of a STRICT_EVIDENCE_BLOCKED rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Never inferred; omit/false for normal strict behavior."},
-         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside override_strict_evidence=true: why the strict-evidence rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."}},
+         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside override_strict_evidence=true (or a8c0f3b7's override_code_intel_receipt=true): why the rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."},
+         "override_code_intel_receipt": {"type": "boolean", "description": "a8c0f3b7 — explicit, audited override of a CODE_INTEL_RECEIPT_MISSING / CODE_INTEL_UNAVAILABLE rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Only relevant for a project that declared the 'code_intel_prospecting' capability."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
         "Read-only: Cross-reference pending sprint items against recent git commits and "

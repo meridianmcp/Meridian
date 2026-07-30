@@ -1314,6 +1314,32 @@ async def _handle_mcp_request(
                             req_id, -32002, _tunnel_mod.CROSS_INSTANCE_MISS_MESSAGE,
                         )
                     if tunnel_result is not None:
+                        # a8c0f3b7 -- durable, structural prospecting receipt for
+                        # a TUNNEL-FORWARDED code-intel call (search_graph,
+                        # find_symbol, ...). This is THE single chokepoint every
+                        # tool call over this MCP connection passes through,
+                        # tunneled or native -- a bare Read/grep/git-show/
+                        # Get-Content bypass, or a sub-agent that never routes a
+                        # code-intel call through this connection, simply never
+                        # reaches this line, so no receipt is ever fabricated for
+                        # that work. Best-effort: never let a logging failure
+                        # break an already-successful tool call. See
+                        # meridian/code_intel_receipt.py.
+                        try:
+                            from .. import code_intel_receipt as _cir  # noqa: PLC0415
+                            if _cir.is_code_intel_receipt_tool(name):
+                                _receipt_pid = _cir.resolve_receipt_project_id(args)
+                                if _receipt_pid:
+                                    await _cir.record_prospect_receipt(
+                                        db,
+                                        tenant_id=tenant.get("id") if tenant else None,
+                                        project_id=_receipt_pid,
+                                        session_id=args.get("session_id"),
+                                        tool_name=name,
+                                        query=_cir.extract_query_hint(args),
+                                    )
+                        except Exception:  # noqa: BLE001
+                            pass
                         # Pass the tunneled server's result through verbatim — it
                         # already carries the MCP `content` envelope.
                         return _server._jsonrpc_ok(req_id, tunnel_result)
@@ -5304,7 +5330,7 @@ async def _handle_code_index_tools(
         kind = str(kind).strip() if kind else None
         stale_graph = bool(args.get("stale_graph", False))
         from .. import prospect as _prospect  # noqa: PLC0415
-        return await _prospect.prospect_symbol_impl(
+        result = await _prospect.prospect_symbol_impl(
             symbol=symbol,
             project_id=project_id,
             root_dir=root_dir,
@@ -5314,6 +5340,28 @@ async def _handle_code_index_tools(
             tenant=tenant,
             data_dir=data_dir,
         )
+        # a8c0f3b7 -- durable, structural prospecting receipt. prospect_symbol
+        # is the promoted single entry point for code-intel prospecting
+        # (agent_defaults.py v12) and, unlike the tools it wraps, is ALWAYS
+        # dispatched natively by THIS server -- so writing the receipt here
+        # can never be spoofed by a caller's self-report. Best-effort: a
+        # receipt-write failure must never break the prospect call that
+        # already succeeded above. See meridian/code_intel_receipt.py.
+        try:
+            from .. import code_intel_receipt as _cir  # noqa: PLC0415
+            _receipt_pid = _cir.resolve_receipt_project_id(args)
+            if _receipt_pid:
+                await _cir.record_prospect_receipt(
+                    db,
+                    tenant_id=(tenant or {}).get("id"),
+                    project_id=_receipt_pid,
+                    session_id=args.get("session_id"),
+                    tool_name="prospect_symbol",
+                    query=symbol,
+                )
+        except Exception:  # noqa: BLE001 -- receipt logging must never break the call
+            pass
+        return result
     if name == "search_code_semantic":
         from .. import code_index as _code_index  # noqa: PLC0415
         from .. import hardening as _hardening  # noqa: PLC0415
