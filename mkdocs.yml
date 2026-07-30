@@ -10,6 +10,7 @@ edit_uri: edit/main/docs/
 exclude_docs: |
   fly-scaling.md
   backup-runbook.md
+  mcp-directory-listing.md
 
 theme:
   name: material
@@ -50,6 +51,7 @@ nav:
   - Team Self-Hosting: team-self-hosting.md
   - Configuration: configuration.md
   - Safety Limits: safety-limits.md
+  - Data Handling: data-handling.md
   - API Reference: api-reference.md
   - FAQ: faq.md
 

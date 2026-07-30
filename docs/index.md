@@ -112,6 +112,8 @@ flowchart LR
 
 Zero local install — sign in at [usemeridian.us](https://usemeridian.us), copy your API token, add to MCP config.
 
+Curious exactly where your project data lives in each mode, and how to delete it? → [Data Handling](data-handling.md)
+
 ## Dashboard
 
 The Meridian dashboard runs at `localhost:7878` (self-hosted) or `usemeridian.us/dashboard` (hosted). All project data, session activity, and configuration lives here.

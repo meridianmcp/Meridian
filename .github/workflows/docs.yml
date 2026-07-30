@@ -31,7 +31,11 @@ jobs:
           python-version: '3.12'
 
       - name: Install MkDocs Material
-        run: pip install mkdocs-material
+        # Pinned to a compatible range for build determinism (fd8cc749). mkdocs-material
+        # itself constrains its mkdocs/pymdown-extensions dependencies, so this one pin
+        # keeps the whole toolchain reproducible. Bump the upper bound deliberately after
+        # reviewing the Material for MkDocs changelog for breaking changes.
+        run: pip install "mkdocs-material>=9.7,<10"
 
       - name: Build and deploy docs
         env:
@@ -41,3 +45,46 @@ jobs:
           printf "https://x-access-token:%s@github.com\n" "$DOCS_TOKEN" > ~/.git-credentials
           echo "docs.usemeridian.us" > docs/CNAME
           mkdocs gh-deploy --force --clean --verbose --remote-name https://github.com/meridianmcp/meridian-docs.git
+
+      - name: Verify deployment (HTTPS smoke check)
+        # Runs after the push above. Deliberately does NOT reference $DOCS_TOKEN or
+        # ~/.git-credentials — this step only issues plain, unauthenticated HTTPS GETs
+        # against the public site, so there is no credential material in scope to leak
+        # into these logs. Fails the job (non-zero exit) on any check failure so a
+        # broken deploy is loud in CI instead of silently reporting green.
+        run: |
+          set -euo pipefail
+
+          check_url() {
+            local url="$1"
+            local expect_marker="${2:-}"
+            local attempt max_attempts=10 delay=6
+            for attempt in $(seq 1 "$max_attempts"); do
+              echo "GET $url (attempt $attempt/$max_attempts)"
+              http_code=$(curl -sS -o /tmp/smoke_body.html -w '%{http_code}' --max-time 15 "$url" || echo "000")
+
+              if [ "$http_code" = "200" ]; then
+                if [ -z "$expect_marker" ] || grep -qF "$expect_marker" /tmp/smoke_body.html; then
+                  echo "OK: $url -> 200${expect_marker:+ (marker '$expect_marker' found)}"
+                  return 0
+                fi
+                echo "  got 200 but marker '$expect_marker' not found yet"
+              else
+                echo "  got HTTP $http_code"
+              fi
+
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                sleep "$delay"
+              fi
+            done
+
+            echo "::error::Smoke check failed for $url after $max_attempts attempts"
+            return 1
+          }
+
+          # Home page: must resolve and carry the site's identity (site_name in mkdocs.yml).
+          check_url "https://docs.usemeridian.us/" "Meridian"
+
+          # Representative nav page: must resolve, confirming more than just the CNAME
+          # root is serving correctly.
+          check_url "https://docs.usemeridian.us/quickstart/" ""
