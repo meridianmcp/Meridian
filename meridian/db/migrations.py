@@ -3292,6 +3292,8 @@ async def _migrate_wave_gate_results(db: aiosqlite.Connection) -> None:
       id                 — UUID primary key
       project_id         — owning project
       wave_label         — the wave whose gate was passed (e.g. 'wave-1')
+      version            — (ed8e4524) sprint-version bucket this gate belongs
+                            to; NULL = unscoped/legacy (pre-ed8e4524 meaning)
       gate_passed        — always 1 (rejected gates never write a row)
       exit_code          — exit_code from the run_verification result (0 = pass)
       passed_count       — number of tests that passed (from run_verification)
@@ -3302,6 +3304,17 @@ async def _migrate_wave_gate_results(db: aiosqlite.Connection) -> None:
       completed_at       — wall-clock UTC timestamp
 
     Idempotent via CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+    ed8e4524 — the ``version`` column is added via ``_migrate_add_column_if_
+    missing`` for a table that already existed before this fix (the fresh
+    CREATE TABLE branch above already includes it for a brand-new table); the
+    UNIQUE constraint on a table created before ed8e4524 is NOT retroactively
+    widened to include version (SQLite cannot ALTER a table constraint
+    without a full rebuild) — a pre-existing table can therefore have at most
+    one gate result per (project_id, wave_label) until a manual follow-up
+    migration rebuilds it, same residual limitation noted in
+    pg_adapter._migrate_pg_wave_gate_results. Every FRESH table (every test,
+    and any project whose wave_gate_results didn't exist before this
+    deploy) gets the fully correct per-version constraint from the start.
     Mirrored in pg_adapter._migrate_pg_wave_gate_results.
     """
     await db.execute(
@@ -3309,6 +3322,7 @@ async def _migrate_wave_gate_results(db: aiosqlite.Connection) -> None:
         "    id TEXT PRIMARY KEY,"
         "    project_id TEXT NOT NULL,"
         "    wave_label TEXT NOT NULL,"
+        "    version TEXT,"
         "    gate_passed INTEGER NOT NULL DEFAULT 1,"
         "    exit_code INTEGER,"
         "    passed_count INTEGER,"
@@ -3317,12 +3331,17 @@ async def _migrate_wave_gate_results(db: aiosqlite.Connection) -> None:
         "    evidence_snapshot TEXT,"
         "    actor TEXT,"
         "    completed_at TEXT NOT NULL DEFAULT (datetime('now')),"
-        "    UNIQUE(project_id, wave_label)"
+        "    UNIQUE(project_id, wave_label, version)"
         ")"
     )
+    await _migrate_add_column_if_missing(db, "wave_gate_results", "version", "TEXT")
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_wave_gate_results_project "
         "ON wave_gate_results(project_id, wave_label)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wave_gate_results_project_version "
+        "ON wave_gate_results(project_id, wave_label, version)"
     )
     await db.commit()
 
@@ -3339,16 +3358,24 @@ async def _migrate_wave_gate_configs(db: aiosqlite.Connection) -> None:
       project_id   — owning project
       wave_start   — first wave covered by this gate (documentation only)
       wave_end     — boundary wave; the enforcement key (e.g. 'wave-3')
+      version      — (ed8e4524) sprint-version bucket this gate belongs to;
+                     NULL = unscoped/legacy (pre-ed8e4524 meaning) — applies
+                     to every item regardless of its own version.
       actions      — JSON array of {"type": ..., ...params} action dicts
       actor        — session/actor that configured the gate
       created_at / updated_at — wall-clock UTC timestamps
 
-    One pipeline per (project_id, wave_end) — UNIQUE constraint. Reconfiguring
-    an un-passed boundary is an upsert (see db.sprint_items.configure_wave_gate);
-    once wave_gate_results has a row for wave_end the config is immutable.
+    One pipeline per (project_id, wave_end, version) — UNIQUE constraint.
+    Reconfiguring an un-passed boundary (for the SAME version) is an upsert
+    (see db.sprint_items.configure_wave_gate); once wave_gate_results has a
+    matching row for wave_end (and version) the config is immutable.
 
     Idempotent via CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
-    Mirrored in pg_adapter._migrate_pg_wave_gate_configs.
+    ed8e4524 — same residual-constraint note as _migrate_wave_gate_results
+    above applies here: ``version`` is added additively via
+    ``_migrate_add_column_if_missing`` for a table that predates this fix,
+    but its UNIQUE constraint is not retroactively widened without a full
+    table rebuild. Mirrored in pg_adapter._migrate_pg_wave_gate_configs.
     """
     await db.execute(
         "CREATE TABLE IF NOT EXISTS wave_gate_configs ("
@@ -3356,16 +3383,22 @@ async def _migrate_wave_gate_configs(db: aiosqlite.Connection) -> None:
         "    project_id TEXT NOT NULL,"
         "    wave_start TEXT NOT NULL,"
         "    wave_end TEXT NOT NULL,"
+        "    version TEXT,"
         "    actions TEXT NOT NULL,"
         "    actor TEXT,"
         "    created_at TEXT NOT NULL DEFAULT (datetime('now')),"
         "    updated_at TEXT NOT NULL DEFAULT (datetime('now')),"
-        "    UNIQUE(project_id, wave_end)"
+        "    UNIQUE(project_id, wave_end, version)"
         ")"
     )
+    await _migrate_add_column_if_missing(db, "wave_gate_configs", "version", "TEXT")
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_wave_gate_configs_project "
         "ON wave_gate_configs(project_id, wave_end)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wave_gate_configs_project_version "
+        "ON wave_gate_configs(project_id, wave_end, version)"
     )
     await db.commit()
 

@@ -283,6 +283,17 @@ async def test_complete_wave_gate_dispatch_works(db):
     assert isinstance(result, dict)
     assert "error" in result
 
+    # ed8e4524 — an explicit version arg dispatches through and is echoed
+    # back on the result, confirming the MCP layer threads it to the DB layer.
+    versioned = await srv._dispatch_mcp_tool(
+        "complete_wave_gate",
+        {"project_id": pid, "wave_label": "wave-1",
+         "verification_payload": _GOOD_PAYLOAD, "version": "v-dispatch"},
+        db, "/tmp",
+    )
+    assert versioned.get("gate_completed") is True
+    assert versioned.get("version") == "v-dispatch"
+
 
 # ---------------------------------------------------------------------------
 # 11. project_name resolves to project_id
@@ -299,6 +310,8 @@ async def test_complete_wave_gate_project_name_resolution(db):
     )
     assert result.get("gate_completed") is True
     assert result.get("wave_label") == "wave-1"
+    # ed8e4524 — no version passed -> stays unscoped (legacy behavior).
+    assert result.get("version") is None
 
 
 # ---------------------------------------------------------------------------
@@ -331,3 +344,115 @@ async def test_db_complete_wave_gate_succeeds(db):
     assert result["wave_label"] == "wave-1"
     assert result["next_wave_label"] == "wave-2"
     assert result["gate_id"]
+    # ed8e4524 — an unscoped call (no version passed) stays unscoped: the
+    # legacy/project-wide behavior for a project with one sprint version.
+    assert result["version"] is None
+
+
+# ---------------------------------------------------------------------------
+# 13. ed8e4524 — sprint-version scoping regression tests.
+#
+# Confirmed defect: complete_wave_gate's next-wave query (and
+# configure_wave_gate's immutability/upsert checks, and claim_sprint_item's
+# structural wave-gate block via _get_blocking_wave_gate) were scoped by
+# project_id + wave label ONLY. Two different sprint versions that happen to
+# reuse the same wave label (e.g. both have a 'wave-2') could leak or
+# satisfy each other's gate. These tests prove: (a) two REAL, DIFFERENT
+# versions never cross-contaminate gate configuration, completion, next-wave
+# readiness, or claim-unblocking; (b) a project that never explicitly
+# version-scopes its wave-gate calls (the common/legacy case — including one
+# whose items still carry an ordinary version string like 'v1') keeps
+# behaving exactly as it did before this fix.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_two_versions_same_wave_label_do_not_cross_contaminate(db):
+    pid = (await db_module.create_project(db, name="two-version-wave-gate"))["id"]
+
+    # Configure an INDEPENDENT 'wave-1' gate boundary for each version.
+    cfg_a = await db_module.configure_wave_gate(
+        db, pid, "wave-1", [{"type": "run_verification"}], version="vA",
+    )
+    cfg_b = await db_module.configure_wave_gate(
+        db, pid, "wave-1", [{"type": "run_verification"}], version="vB",
+    )
+    assert cfg_a["gate_config_id"] != cfg_b["gate_config_id"]
+    assert cfg_a["version"] == "vA"
+    assert cfg_b["version"] == "vB"
+
+    # Each version gets its own wave-2 item.
+    item_a = await db_module.add_sprint_item(db, pid, "vA", "vA wave-2 item")
+    item_b = await db_module.add_sprint_item(
+        db, pid, "vB", "vB wave-2 item", force=True,
+    )
+    await db_module.patch_sprint_item(db, pid, item_a["id"], wave="wave-2")
+    await db_module.patch_sprint_item(db, pid, item_b["id"], wave="wave-2")
+
+    # CLAIM-UNBLOCKING: both start out blocked by their OWN unpassed gate.
+    blocked_a = await db_module.claim_sprint_item(db, pid, item_a["id"])
+    assert blocked_a.get("blocked") is True
+    assert blocked_a.get("error") == "WAVE_GATE_PENDING"
+    blocked_b = await db_module.claim_sprint_item(db, pid, item_b["id"])
+    assert blocked_b.get("blocked") is True
+    assert blocked_b.get("error") == "WAVE_GATE_PENDING"
+
+    # GATE COMPLETION + next-wave READINESS: complete version A's gate only.
+    result_a = await db_module.complete_wave_gate(
+        db, pid, "wave-1", _GOOD_PAYLOAD, version="vA",
+    )
+    assert result_a["gate_completed"] is True
+    assert result_a["version"] == "vA"
+    # Only vA's item is reported ready — vB's item must NOT leak in.
+    assert result_a["next_wave_item_ids"] == [item_a["id"]]
+    assert item_b["id"] not in result_a["next_wave_item_ids"]
+
+    # CLAIM-UNBLOCKING: vA's item is now claimable...
+    claimed_a = await db_module.claim_sprint_item(db, pid, item_a["id"])
+    assert claimed_a.get("status") == "in_progress"
+    # ...but vB's item is STILL blocked — vA's completion must not leak
+    # across versions and wrongly unblock it.
+    still_blocked_b = await db_module.claim_sprint_item(db, pid, item_b["id"])
+    assert still_blocked_b.get("blocked") is True
+    assert still_blocked_b.get("error") == "WAVE_GATE_PENDING"
+
+    # GATE COMPLETION: version B can still independently complete ITS OWN
+    # wave-1 gate — it must not have been silently "used up" by version A's
+    # completion of the same wave_label (the exact bug: a shared
+    # UNIQUE(project_id, wave_label) row would have rejected this as a dup).
+    result_b = await db_module.complete_wave_gate(
+        db, pid, "wave-1", _GOOD_PAYLOAD, version="vB",
+    )
+    assert result_b["gate_completed"] is True
+    assert result_b["version"] == "vB"
+    assert result_b["next_wave_item_ids"] == [item_b["id"]]
+
+    claimed_b = await db_module.claim_sprint_item(db, pid, item_b["id"])
+    assert claimed_b.get("status") == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_unversioned_legacy_wave_gate_still_project_wide(db):
+    """A project that never explicitly version-scopes its wave-gate calls —
+    still the common/legacy case per AGENTS.md — must behave EXACTLY as
+    before ed8e4524: one project-wide gate per wave label, blocking/
+    unblocking every item in that wave regardless of the item's own version
+    field (items commonly carry an ordinary version string like 'v1' even
+    when the project isn't using multi-version scoping)."""
+    pid = (await db_module.create_project(db, name="legacy-unversioned-wave-gate"))["id"]
+    await db_module.configure_wave_gate(
+        db, pid, "wave-1", [{"type": "run_verification"}],
+    )
+    item = await db_module.add_sprint_item(db, pid, "v1", "legacy wave-2 item")
+    await db_module.patch_sprint_item(db, pid, item["id"], wave="wave-2")
+
+    blocked = await db_module.claim_sprint_item(db, pid, item["id"])
+    assert blocked.get("blocked") is True
+    assert blocked.get("error") == "WAVE_GATE_PENDING"
+
+    result = await db_module.complete_wave_gate(db, pid, "wave-1", _GOOD_PAYLOAD)
+    assert result["gate_completed"] is True
+    assert result["version"] is None
+    assert result["next_wave_item_ids"] == [item["id"]]
+
+    claimed = await db_module.claim_sprint_item(db, pid, item["id"])
+    assert claimed.get("status") == "in_progress"

@@ -333,6 +333,7 @@ async def _resolve_dependency_state(
 async def _resolve_wave_gate_state(
     db: Any, project_id: str, item_wave: "str | None",
     *, wave_gate_configs: "list[dict[str, Any]] | None" = None,
+    version: "str | None" = None,
 ) -> tuple["dict[str, Any] | None", "dict[str, Any] | None"]:
     """Returns ``(gate_blocking, gate_after)``.
 
@@ -350,9 +351,18 @@ async def _resolve_wave_gate_state(
     from ``gate_blocking`` (strictly-before vs. exactly-at), so it is
     computed separately rather than trying to squeeze both out of
     ``_get_blocking_wave_gate``, which only ever answers the "before" question.
+
+    ``version`` (ed8e4524, pass the item's own ``item.get("version")``) keeps
+    this in lockstep with ``claim_sprint_item``'s wave-gate scoping: a
+    version-scoped config (``configure_wave_gate(..., version=...)``) only
+    counts as this item's ``gate_after`` when its stored version matches;
+    an unscoped (NULL) config remains project-wide and matches regardless of
+    the item's own version, exactly the pre-ed8e4524 behavior.
     """
     try:
-        gate_blocking = await db_module._get_blocking_wave_gate(db, project_id, item_wave)
+        gate_blocking = await db_module._get_blocking_wave_gate(
+            db, project_id, item_wave, version=version,
+        )
     except Exception:  # noqa: BLE001 — wave-gate state is best-effort
         gate_blocking = None
 
@@ -367,6 +377,9 @@ async def _resolve_wave_gate_state(
         item_prefix, item_num = db_module._split_wave_label(item_wave)
         if item_num is not None:
             for cfg in configs or []:
+                cfg_version = cfg.get("version")
+                if cfg_version is not None and cfg_version != version:
+                    continue  # version-scoped config that isn't THIS item's version
                 cfg_prefix, cfg_num = db_module._split_wave_label(cfg.get("wave_end"))
                 if cfg_num is not None and cfg_prefix == item_prefix and cfg_num == item_num:
                     gate_after = cfg
@@ -609,6 +622,7 @@ async def build_executor_contract(
     dependency = await _resolve_dependency_state(db, item)
     gate_blocking, gate_after = await _resolve_wave_gate_state(
         db, project_id, item.get("wave"), wave_gate_configs=wave_gate_configs,
+        version=item.get("version"),
     )
     completion_checks = await _resolve_completion_checks(db, project_id, item)
 
