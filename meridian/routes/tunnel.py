@@ -3505,8 +3505,29 @@ async def check_docs_write_conflict(
     Deliberately delegates to :func:`meridian.db.locks.check_docx_region_write_
     conflict` (Model B) rather than duplicating :func:`check_word_write_conflict`'s
     plainer whole-file-only check above — this is the SAME gate ``update_paragraph``
-    already enforces, so a scoped element claim behaves identically whether the
-    write reaches the .docx via the native MCP path or this tunneled relay path.
+    already enforces, so once ``session_id`` is actually present (see below), a
+    scoped element claim is evaluated identically whether the write reaches the
+    .docx via the native MCP path or this tunneled relay path.
+
+    How ``session_id`` reaches this function (273df573 fix): the caller
+    (:func:`call_tunnel_tool` below) passes through whatever ``session_id`` it
+    was given, which ``meridian/mcp/handler.py`` extracts from the incoming
+    ``tools/call`` arguments via ``args.get("session_id")`` — the SAME
+    extraction ``check_word_write_conflict`` relies on, and nothing in this
+    module does anything different for the docs slot. The part that had to
+    change was upstream of tunnel.py entirely: each of the 27 mutating
+    ``@mcp.tool()`` wrappers in ``extensions/meridian-docs/meridian_docs/
+    server.py`` now declares an optional ``session_id`` parameter in its own
+    signature, so it appears in that tool's advertised MCP ``inputSchema`` and
+    a compliant client actually has a field to populate. Before that, no
+    wrapper declared the parameter, so ``args.get("session_id")`` was always
+    empty for a real meridian-docs call even though this extraction code was
+    already correct — a scoped claim held by the CALLING session itself could
+    not be recognized as the caller's own, and every no-anchor-argument tool
+    (relocate_figure, relocate_table, highlight_document, merge_docx_draft,
+    retrofit_plaintext_captions, the bibliography tools, renumber_sequences)
+    was blocked by any scoped claim on the file from anyone, including its own
+    owner.
 
     Fail-open by design — a missing db, an unidentifiable target, or a claim-
     lookup error degrades to None (no block). This guard SURFACES a conflict; it
