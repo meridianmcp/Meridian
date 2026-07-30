@@ -2908,8 +2908,13 @@ async def _annotate_code_pointers(
                     item["prospect_status"] = "prospected"
                 else:
                     item["prospect_status"] = "no_valid_match"
-        except Exception:  # noqa: BLE001 — enrichment is best-effort, never fatal
+        except Exception as _prospect_exc:  # noqa: BLE001 — enrichment is best-effort, never fatal
             item["prospect_status"] = "error"
+            # 8a883f60 — record the exact cause alongside the status so a
+            # caller building an evidence_status entry never has to fall
+            # back to a generic "something went wrong" (see
+            # _code_pointer_enrichment_error_outcome). Purely additive.
+            item["prospect_error"] = f"{type(_prospect_exc).__name__}: {_prospect_exc}"
             continue
     return pending_items
 
@@ -3019,6 +3024,7 @@ async def _annotate_resolved_pointers(
     pending_items: list[dict[str, Any]],
     *,
     node_resolver: Callable[[str], Any] | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """36fea6ca — attach each pending item's DURABLE, resolved pointers as a
     ``resolved_pointers`` list for inline rendering in the handoff markdown.
@@ -3081,15 +3087,33 @@ async def _annotate_resolved_pointers(
     ``pointer_records``/``pointer_provenance``/``artifact_pointer_policy``/
     ``artifact_pointer_finding`` for that item; the pass NEVER raises so the
     mandatory handoff can't break.
+
+    ``stats`` (8a883f60) — optional output dict. When given, incremented in
+    place with ``items_checked``, ``items_fetch_failed`` (the
+    ``get_sprint_item_pointers`` per-item try/except below actually fired),
+    and ``pointers_resolve_failed`` (a ``resolve_pointer`` call for one
+    stored pointer raised). This function's per-item guards mean it NEVER
+    raises even when every single item's fetch/resolve fails — silently
+    "completing successfully" while doing nothing useful for any item. This
+    counter is what lets a caller (``generate_handoff``'s
+    ``evidence_status``) tell that apart from a genuine, fully-successful
+    pass, instead of reporting "verified" either way. Pure addition: ``None``
+    (the default) means zero behavior change from before this parameter
+    existed.
     """
     from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
     for item in pending_items:
         iid = item.get("id")
         if not iid:
             continue
+        if stats is not None:
+            stats["items_checked"] = stats.get("items_checked", 0) + 1
         try:
             stored = await db_module.get_sprint_item_pointers(db, iid)
-        except Exception:  # noqa: BLE001 — pre-migration DB / fetch failure
+        except Exception as _fetch_exc:  # noqa: BLE001 — pre-migration DB / fetch failure
+            if stats is not None:
+                stats["items_fetch_failed"] = stats.get("items_fetch_failed", 0) + 1
+                stats["last_fetch_error"] = f"{type(_fetch_exc).__name__}: {_fetch_exc}"
             continue
         # 665 follow-up — provenance state is meaningful even with zero
         # durable pointers, so it's computed unconditionally per item, unlike
@@ -3115,7 +3139,14 @@ async def _annotate_resolved_pointers(
                     resolved = await pointers_module.resolve_pointer(
                         db, ptr, project_id=project_id, node_resolver=node_resolver
                     )
-                except Exception:  # noqa: BLE001 — resolve_pointer never raises, but be safe
+                except Exception as _resolve_exc:  # noqa: BLE001 — resolve_pointer never raises, but be safe
+                    if stats is not None:
+                        stats["pointers_resolve_failed"] = (
+                            stats.get("pointers_resolve_failed", 0) + 1
+                        )
+                        stats["last_resolve_error"] = (
+                            f"{type(_resolve_exc).__name__}: {_resolve_exc}"
+                        )
                     continue
                 formatted = _format_resolved_pointer(resolved)
                 if formatted:
@@ -4665,6 +4696,221 @@ async def build_docx_integrity_gate_for_handoff(
         return None
 
 
+# ---------------------------------------------------------------------------
+# 8a883f60 — explicit, machine-readable outcome for every best-effort step
+# generate_handoff runs: code-pointer enrichment, resolved-pointer annotation,
+# freshness re-query, wave-gate exclusion, graph-search availability.
+#
+# Before this, every one of those steps was "catch Exception, degrade
+# silently, keep going" — the ONLY visible trace was an occasional free-text
+# skip-reason string (``code_pointer_skip_reason``) baked into the rendered
+# template, with no equivalent for the other four steps at all. A /goal could
+# therefore look complete and paste-ready while one or more of these had
+# silently failed, with no machine-readable signal a caller could act on.
+#
+# ``_capability_outcome`` builds ONE typed entry; ``generate_handoff`` (and
+# its ``goal``/``starter`` mode helpers) populate a ``dict[str, entry]``
+# keyed by the ``_CAP_*`` ids below as they go, using the EXACT SAME
+# try/except boundaries that already existed (this is additive instrumentation
+# of existing guards, not new guards) — no existing skip-reason value, log
+# line, or rendered content changes as a result.
+#
+# ``strict_evidence`` (mirrors 5fe3502e's ``sprint_evidence_guard`` opt-in
+# shape and naming EXACTLY — see that module's docstring — rather than
+# inventing a fourth different opt-in convention alongside it and
+# e7548587's tri-state ``require_merge_approval``) is OFF by default: a
+# caller that never passes it sees zero behavior change beyond the new,
+# purely additive ``evidence_status`` output. When a caller opts in and at
+# least one capability is ``failed``/``degraded`` (``skipped`` is not a
+# problem — see below), :func:`_finalize_capability_status` raises
+# :class:`HandoffEvidenceRequired` BEFORE any rendering/persistence happens
+# for that call — fail CLOSED, mirroring ``verify_strict_completion_evidence``'s
+# own contract of never letting a caller who asked for strict evidence walk
+# away with a plausible-looking-but-incomplete result.
+# ---------------------------------------------------------------------------
+
+_CAP_CODE_POINTER_ENRICHMENT = "code_pointer_enrichment"
+_CAP_RESOLVED_POINTER_ANNOTATION = "resolved_pointer_annotation"
+_CAP_FRESHNESS_REQUERY = "freshness_requery"
+_CAP_WAVE_GATE_EXCLUSION = "wave_gate_exclusion"
+_CAP_GRAPH_SEARCH_AVAILABILITY = "graph_search_availability"
+
+# The full, stable set of capability ids every ``evidence_status`` dict
+# carries, regardless of mode — a mode that structurally never runs a given
+# step (e.g. 'starter' never resolves code pointers) still reports it
+# explicitly as ``skipped`` with a reason, rather than simply omitting the
+# key, so a caller can rely on all five keys always being present.
+_ALL_CAPABILITY_IDS = (
+    _CAP_CODE_POINTER_ENRICHMENT,
+    _CAP_RESOLVED_POINTER_ANNOTATION,
+    _CAP_FRESHNESS_REQUERY,
+    _CAP_WAVE_GATE_EXCLUSION,
+    _CAP_GRAPH_SEARCH_AVAILABILITY,
+)
+
+_CAPABILITY_STATUSES = frozenset({"verified", "skipped", "failed", "degraded"})
+
+
+def _capability_outcome(
+    status: str, reason: str, *, fallback: str | None = None,
+) -> dict[str, Any]:
+    """Build one typed ``evidence_status`` entry.
+
+    ``status`` is one of verified/skipped/failed/degraded (acceptance point
+    1). ``reason`` must be the EXACT, specific cause — never a generic
+    "something went wrong" (acceptance point 2) — every call site below
+    passes the real exception type+message or the real structural reason.
+    ``fallback`` documents the approved degrade path actually used, when one
+    exists (e.g. "pending items rendered without code_pointers"); ``None``
+    when nothing was substituted (e.g. a genuine ``failed``/``skipped`` with
+    no fallback, or a clean ``verified``).
+    """
+    assert status in _CAPABILITY_STATUSES, f"invalid capability status: {status!r}"
+    return {"status": status, "reason": reason, "fallback": fallback}
+
+
+def _code_pointer_enrichment_error_outcome(
+    pending_items: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """8a883f60 — a genuine PER-ITEM search failure inside
+    ``_annotate_code_pointers`` never propagates to its caller: that
+    function's own per-item try/except catches it, sets
+    ``item["prospect_status"] = "error"``, and moves on to the next item —
+    by design ("this must NEVER raise", see its docstring). That means the
+    caller's own outer try/except around the ``_annotate_code_pointers``
+    call can only ever observe a totally different, unrelated crash — it
+    would otherwise report "verified" even when every eligible item's
+    prospector call raised. This inspects the per-item ``prospect_status``
+    values ``_annotate_code_pointers`` already sets to recover that signal.
+
+    Returns ``None`` when no item errored (the caller keeps its own
+    verified/degraded-by-cap outcome); an explicit failed/degraded entry
+    otherwise — ``failed`` when EVERY attempted item errored, ``degraded``
+    when only some did.
+    """
+    errored = [it for it in pending_items if it.get("prospect_status") == "error"]
+    if not errored:
+        return None
+    attempted = [
+        it for it in pending_items
+        if it.get("prospect_status") in ("error", "prospected", "no_valid_match", "no_match")
+    ]
+    status = "failed" if len(errored) >= len(attempted) else "degraded"
+    _last_error = next(
+        (it.get("prospect_error") for it in reversed(errored) if it.get("prospect_error")),
+        "unknown error",
+    )
+    return _capability_outcome(
+        status,
+        f"{len(errored)} of {len(attempted)} prospected pending item(s) raised "
+        f"during their own code-pointer search call — {_last_error}",
+        fallback="those item(s) rendered without code_pointers",
+    )
+
+
+def _resolved_pointer_annotation_error_outcome(
+    stats: dict[str, Any],
+) -> dict[str, Any] | None:
+    """8a883f60 — the twin of :func:`_code_pointer_enrichment_error_outcome`
+    for ``_annotate_resolved_pointers``: that function's own per-item/per-
+    pointer try/excepts mean a genuine ``get_sprint_item_pointers``/
+    ``resolve_pointer`` failure never propagates out — it would otherwise
+    silently "complete successfully" while doing nothing useful for any
+    item. Inspects the ``stats`` dict that function optionally populates
+    (``items_checked``/``items_fetch_failed``/``pointers_resolve_failed``/
+    ``last_fetch_error``/``last_resolve_error``).
+
+    Returns ``None`` when nothing failed (caller keeps its own verified/
+    degraded-by-settings-fetch outcome); an explicit failed/degraded entry
+    otherwise — ``failed`` only when every checked item's fetch failed.
+    """
+    checked = stats.get("items_checked", 0)
+    fetch_failed = stats.get("items_fetch_failed", 0)
+    resolve_failed = stats.get("pointers_resolve_failed", 0)
+    if not fetch_failed and not resolve_failed:
+        return None
+    if fetch_failed and checked and fetch_failed >= checked:
+        return _capability_outcome(
+            "failed",
+            f"sprint_item_pointers fetch raised for all {checked} checked "
+            f"pending item(s) — {stats.get('last_fetch_error', 'unknown error')}",
+            fallback="those item(s) rendered without resolved_pointers/pointer_records",
+        )
+    parts = []
+    if fetch_failed:
+        parts.append(
+            f"{fetch_failed}/{checked} item(s) failed the sprint_item_pointers "
+            f"fetch ({stats.get('last_fetch_error', 'unknown error')})"
+        )
+    if resolve_failed:
+        parts.append(
+            f"{resolve_failed} stored pointer(s) failed resolve_pointer "
+            f"({stats.get('last_resolve_error', 'unknown error')})"
+        )
+    return _capability_outcome(
+        "degraded", "; ".join(parts),
+        fallback="affected item(s)/pointer(s) rendered without resolved_pointers/pointer_records",
+    )
+
+
+class HandoffEvidenceRequired(ValueError):
+    """Raised by generate_handoff (and its goal/starter helpers) when
+    ``strict_evidence=True`` and at least one best-effort capability in
+    ``evidence_status`` is ``failed`` or ``degraded`` rather than
+    ``verified``/``skipped`` (acceptance point 3).
+
+    Mirrors ``sprint_evidence_guard``'s fail-closed, opt-in-only contract:
+    never engages for a caller that didn't pass ``strict_evidence=True`` (or,
+    for goal/starter, have it threaded through from generate_handoff), and
+    when it does engage, NOTHING is rendered, written to disk, or persisted
+    for this call — the handoff is refused outright rather than emitting a
+    plausible-looking-but-incomplete goal. ``skipped`` capabilities never
+    trigger this: a mode that structurally doesn't run a step (e.g.
+    'starter' never resolving code pointers) is not itself a failure.
+    """
+
+    def __init__(self, evidence_status: dict[str, Any], errors: list[dict[str, Any]]):
+        self.evidence_status = evidence_status
+        self.errors = errors
+        codes = ", ".join(e["code"] for e in errors)
+        super().__init__(
+            f"generate_handoff refused (strict_evidence=True): {codes}"
+        )
+
+
+def _finalize_capability_status(
+    capability_status: dict[str, Any],
+    evidence_status: "dict[str, Any] | None",
+    *,
+    strict_evidence: bool,
+) -> None:
+    """Surface ``capability_status`` via the caller-supplied ``evidence_status``
+    output dict (when given — pure addition, see the module-level comment
+    above), then enforce strict mode.
+
+    Must be called AFTER every one of the five capabilities has been recorded
+    but BEFORE any rendering/persistence for this handoff call — see
+    :class:`HandoffEvidenceRequired`'s fail-closed contract.
+    """
+    if evidence_status is not None:
+        evidence_status.clear()
+        evidence_status.update(capability_status)
+    if not strict_evidence:
+        return
+    errors = [
+        {
+            "code": f"{cap_id.upper()}_{info.get('status', 'unknown').upper()}",
+            "capability": cap_id,
+            "status": info.get("status"),
+            "reason": info.get("reason"),
+        }
+        for cap_id, info in capability_status.items()
+        if isinstance(info, dict) and info.get("status") in ("failed", "degraded")
+    ]
+    if errors:
+        raise HandoffEvidenceRequired(dict(capability_status), errors)
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4680,6 +4926,8 @@ async def generate_handoff(
     identity: str | None = None,
     force_include_ids: list[str] | None = None,
     version: str | None = None,
+    strict_evidence: bool = False,
+    evidence_status: dict[str, Any] | None = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -4730,6 +4978,30 @@ async def generate_handoff(
     (``mcp/handler.py``) additionally returns a machine-readable
     ``scope: {requested_version, effective_version, session_id}`` so a caller
     never has to infer what scope a handoff actually resolved to.
+
+    ``evidence_status`` (8a883f60) — optional output dict. When given (any
+    dict, typically ``{}``), it is populated in place with the explicit,
+    per-capability outcome of every best-effort step this call ran: code-
+    pointer enrichment, resolved-pointer annotation, freshness re-query,
+    wave-gate exclusion, and graph-search availability — one of
+    verified/skipped/failed/degraded each, with the exact reason and, when
+    one was used, the approved fallback (see ``_capability_outcome``). Pure
+    ADDITION: a caller that passes ``None`` (the default) sees zero
+    functional change to the returned ``(path, content, amended)`` or to
+    ``content`` itself. Applies uniformly across full/delta/starter/goal —
+    every mode reports all five keys, marking any step that mode
+    structurally never runs (e.g. 'starter' never resolves code pointers) as
+    ``skipped`` rather than omitting it.
+
+    ``strict_evidence`` (8a883f60) — optional, OFF by default, mirrors
+    ``sprint_evidence_guard``'s opt-in/fail-closed shape exactly (see the
+    module-level comment above ``_capability_outcome``). When True and any
+    capability above is ``failed``/``degraded``, raises
+    :class:`HandoffEvidenceRequired` BEFORE anything is rendered or
+    persisted for this call, carrying the full ``evidence_status`` plus a
+    typed ``errors`` list. A caller that never opts in is completely
+    unaffected — same content, same persistence, same exceptions as before
+    this parameter existed.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -4759,6 +5031,8 @@ async def generate_handoff(
             identity=identity,
             completion_criteria_override=_project_completion_criteria_override,
             version=_effective_version,
+            strict_evidence=strict_evidence,
+            evidence_status=evidence_status,
         )
         return _st_path, _st_content, False
     if mode == "goal":
@@ -4774,6 +5048,8 @@ async def generate_handoff(
             force_include_ids=force_include_ids,
             completion_criteria_override=_project_completion_criteria_override,
             version=_effective_version,
+            strict_evidence=strict_evidence,
+            evidence_status=evidence_status,
         )
         return _g_path, _g_content, False
     if mode not in {"full", "delta"}:
@@ -4889,9 +5165,20 @@ async def generate_handoff(
     # handoff instead of silently omitting pointers — a zero-pointer handoff was
     # otherwise indistinguishable from "enrichment never attempted". Fully guarded.
     code_pointer_skip_reason: str | None = None
+    # 8a883f60 — explicit per-capability outcome dict; see the module comment
+    # above _capability_outcome. Populated using the EXACT SAME try/except
+    # boundaries as the pre-existing best-effort logic below — additive
+    # instrumentation only, no existing skip-reason value changes.
+    _capability_status: dict[str, Any] = {}
     if _code_pointers_enabled(proj_settings):
         searcher = graph_searcher or _resolve_graph_searcher(project_id)
         if searcher is not None:
+            _capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+                "verified",
+                "graph searcher available ("
+                + ("explicit graph_searcher argument" if graph_searcher is not None
+                   else "resolved via active tunnel connector") + ")",
+            )
             try:
                 pending_sprint_items = await _annotate_code_pointers(
                     pending_sprint_items, searcher
@@ -4908,31 +5195,105 @@ async def generate_handoff(
                         f"items — {_capped} further pending item(s) not prospected "
                         f"this pass"
                     )
-            except Exception:  # noqa: BLE001 — enrichment is best-effort
+                # 8a883f60 — _annotate_code_pointers NEVER raises for a per-item
+                # search failure (it catches it, sets prospect_status="error",
+                # and continues) — recover that signal explicitly rather than
+                # reporting "verified" just because this outer call didn't raise.
+                _cp_err = _code_pointer_enrichment_error_outcome(pending_sprint_items)
+                if _cp_err is not None:
+                    if _capped:
+                        _cp_err = dict(_cp_err)
+                        _cp_err["reason"] += (
+                            f"; additionally capped at {_MAX_ENRICHED_ITEMS} items"
+                        )
+                    _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _cp_err
+                elif _capped:
+                    _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                        "degraded", code_pointer_skip_reason,
+                        fallback=(
+                            f"first {_MAX_ENRICHED_ITEMS} pending items prospected; "
+                            "remainder left unprospected this pass"
+                        ),
+                    )
+                else:
+                    _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                        "verified",
+                        "code-pointer enrichment completed for every eligible pending item",
+                    )
+            except Exception as _cp_exc:  # noqa: BLE001 — enrichment is best-effort
                 code_pointer_skip_reason = (
                     "code-pointer enrichment skipped — graph searcher errored"
+                )
+                _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                    "failed",
+                    f"graph searcher raised {type(_cp_exc).__name__}: {_cp_exc}",
+                    fallback="pending items rendered without code_pointers",
                 )
         else:
             code_pointer_skip_reason = (
                 "code-pointer enrichment skipped — no live tunnel/graph searcher"
             )
+            _capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+                "degraded",
+                "no live tunnel/graph searcher registered for this project",
+                fallback="pending items rendered without code_pointers",
+            )
+            _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                "degraded", code_pointer_skip_reason,
+                fallback="pending items rendered without code_pointers",
+            )
+    else:
+        _capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+            "skipped", "code-pointer enrichment disabled via project settings",
+        )
+        _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+            "skipped", "code-pointer enrichment disabled via project settings",
+        )
     # 36fea6ca — inline each pending item's DURABLE resolved pointers in the
     # handoff markdown (default on via workspace_settings.handoff_inline_pointers)
     # so a resuming session sees exact locations without a separate
     # resolve_sprint_item_pointers call. Fully guarded: a missing settings column,
     # pre-migration pointers table, or resolve failure degrades to no inline
     # pointers and never breaks the mandatory handoff.
+    _inline_ws_fetch_failed = False
     try:
         _inline_ws = await db_module.get_workspace_settings(db)
     except Exception:  # noqa: BLE001 — column/row may be absent on older DBs
         _inline_ws = {}
+        _inline_ws_fetch_failed = True
     if (_inline_ws or {}).get("handoff_inline_pointers", True):
+        _rp_stats: dict[str, int] = {}
         try:
             pending_sprint_items = await _annotate_resolved_pointers(
-                db, project_id, pending_sprint_items
+                db, project_id, pending_sprint_items, stats=_rp_stats,
             )
-        except Exception:  # noqa: BLE001 — inline pointers are best-effort
-            pass
+            # 8a883f60 — _annotate_resolved_pointers NEVER raises for a
+            # per-item fetch/resolve failure either — recover that signal
+            # from _rp_stats rather than reporting "verified" just because
+            # this outer call didn't raise.
+            _rp_err = _resolved_pointer_annotation_error_outcome(_rp_stats)
+            if _rp_err is not None:
+                _capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _rp_err
+            elif _inline_ws_fetch_failed:
+                _capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+                    "degraded",
+                    "workspace settings fetch failed; defaulted handoff_inline_pointers=on",
+                    fallback="proceeded with the default (inline pointers enabled)",
+                )
+            else:
+                _capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+                    "verified", "durable resolved-pointer annotation completed",
+                )
+        except Exception as _rp_exc:  # noqa: BLE001 — inline pointers are best-effort
+            _capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+                "failed",
+                f"resolved-pointer annotation raised {type(_rp_exc).__name__}: {_rp_exc}",
+                fallback="pending items rendered without resolved_pointers/pointer_records",
+            )
+    else:
+        _capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+            "skipped", "handoff_inline_pointers disabled in workspace settings",
+        )
     # 81396666 — annotate each pending item with a suggested_model hint when the
     # per-project model_tier_hints_enabled toggle is on. Fully guarded: failure
     # degrades to no hint and never breaks the mandatory handoff.
@@ -4981,8 +5342,18 @@ async def generate_handoff(
     _wave_gate_pending = None
     try:
         _wave_gate_pending = await db_module.get_wave_gate_configs(db, project_id)
-    except Exception:  # noqa: BLE001
+        _capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "verified",
+            f"wave-gate config fetch succeeded ({len(_wave_gate_pending or [])} "
+            "configured gate(s))",
+        )
+    except Exception as _wg_exc:  # noqa: BLE001
         _wave_gate_pending = None
+        _capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "failed",
+            f"get_wave_gate_configs raised {type(_wg_exc).__name__}: {_wg_exc}",
+            fallback="no wave-gate exclusion applied this pass",
+        )
     # dd19b6a4 — re-query sprint items + sessions immediately before finalizing
     # the pending list. Everything above this point (the session-summary
     # asyncio.gather fan-out, code-pointer/graph-searcher enrichment, resolved-
@@ -5002,6 +5373,9 @@ async def generate_handoff(
     # filters/refreshes status, it does not re-run the enrichment pipeline.
     # Best-effort: any failure degrades to the original (slightly stale)
     # snapshot rather than breaking the mandatory handoff.
+    _freshness_status = "verified"
+    _freshness_reason = "sprint-item + session freshness re-query completed"
+    _freshness_fallback: str | None = None
     try:
         _fresh_sprint_items = await db_module.get_sprint_items(
             db, project_id, include_human=False, include_deferred=False,
@@ -5024,15 +5398,39 @@ async def generate_handoff(
         in_progress_items = [
             it for it in _fresh_sprint_items if it.get("status") == "in_progress"
         ]
-    except Exception:  # noqa: BLE001 — cross-check is best-effort
-        pass
+    except Exception as _fr_exc:  # noqa: BLE001 — cross-check is best-effort
+        _freshness_status = "failed"
+        _freshness_reason = (
+            f"sprint-item freshness re-query raised {type(_fr_exc).__name__}: {_fr_exc}"
+        )
+        _freshness_fallback = (
+            "used the pre-enrichment snapshot; an item claimed/completed "
+            "elsewhere mid-generation may still appear pending"
+        )
     try:
         sessions = await db_module.get_sessions(db, project_id, active_only=False)
         session_names = {s["id"]: s["name"] for s in sessions}
         for t in tasks:
             session_names.setdefault(t["session_id"], "(unknown-session)")
-    except Exception:  # noqa: BLE001 — cross-check is best-effort
-        pass
+    except Exception as _sr_exc:  # noqa: BLE001 — cross-check is best-effort
+        if _freshness_status == "verified":
+            _freshness_status = "degraded"
+            _freshness_reason = (
+                f"session freshness re-query raised {type(_sr_exc).__name__}: {_sr_exc}"
+            )
+            _freshness_fallback = "sessions/session_names reflect the earlier snapshot"
+    _capability_status[_CAP_FRESHNESS_REQUERY] = _capability_outcome(
+        _freshness_status, _freshness_reason, fallback=_freshness_fallback,
+    )
+    # 8a883f60 — every best-effort capability above is now recorded; surface
+    # it via the caller-supplied evidence_status output dict and, when
+    # strict_evidence=True, fail CLOSED before anything below this point is
+    # built/rendered/persisted (pointer_evidence_ids, quick_start_goal, the
+    # goal_token mint, the rendered template, the on-disk file, or any DB
+    # write — see _finalize_capability_status / HandoffEvidenceRequired).
+    _finalize_capability_status(
+        _capability_status, evidence_status, strict_evidence=strict_evidence,
+    )
     # d5849a67 — batch-resolve durable pointer evidence for the pending batch so
     # the excluded_unprospected list below uses the SAME evidence signal
     # claim_sprint_item checks per-item (sprint_item_pointers rows), not the
@@ -5611,6 +6009,8 @@ async def _generate_starter_handoff(
     *,
     completion_criteria_override: str | None = None,
     version: str | None = None,
+    strict_evidence: bool = False,
+    evidence_status: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
@@ -5626,6 +6026,14 @@ async def _generate_starter_handoff(
     the pre-existing behavior (every version, unscoped) — see generate_handoff's
     own docstring for the regression this closes when the caller resolves a
     session's own scope and passes it through here.
+
+    ``strict_evidence``/``evidence_status`` (8a883f60) — threaded straight
+    through from ``generate_handoff``; see its docstring. Starter/compact
+    never resolves code pointers at all (structural, not a failure), so
+    ``code_pointer_enrichment``, ``resolved_pointer_annotation``,
+    ``graph_search_availability``, and ``freshness_requery`` are always
+    reported ``skipped`` here — only ``wave_gate_exclusion`` reflects a real
+    check in this mode.
     """
     project_id = project["id"]
     sprint_items_all = await db_module.get_sprint_items(
@@ -5667,10 +6075,37 @@ async def _generate_starter_handoff(
     # 74a8f420 — see the twin comment in generate_handoff: exclude items gated
     # behind a configured-but-unpassed wave gate boundary. Guarded, fail-open.
     _s_wave_gate_pending = None
+    _s_capability_status: dict[str, Any] = {
+        _CAP_CODE_POINTER_ENRICHMENT: _capability_outcome(
+            "skipped", "starter/compact mode does not run code-pointer enrichment",
+        ),
+        _CAP_RESOLVED_POINTER_ANNOTATION: _capability_outcome(
+            "skipped", "starter/compact mode does not resolve durable pointers",
+        ),
+        _CAP_GRAPH_SEARCH_AVAILABILITY: _capability_outcome(
+            "skipped", "starter/compact mode does not attempt code-pointer enrichment",
+        ),
+        _CAP_FRESHNESS_REQUERY: _capability_outcome(
+            "skipped", "freshness re-query only runs for full/delta modes",
+        ),
+    }
     try:
         _s_wave_gate_pending = await db_module.get_wave_gate_configs(db, project["id"])
-    except Exception:  # noqa: BLE001
+        _s_capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "verified",
+            f"wave-gate config fetch succeeded ({len(_s_wave_gate_pending or [])} "
+            "configured gate(s))",
+        )
+    except Exception as _s_wg_exc:  # noqa: BLE001
         _s_wave_gate_pending = None
+        _s_capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "failed",
+            f"get_wave_gate_configs raised {type(_s_wg_exc).__name__}: {_s_wg_exc}",
+            fallback="no wave-gate exclusion applied this pass",
+        )
+    _finalize_capability_status(
+        _s_capability_status, evidence_status, strict_evidence=strict_evidence,
+    )
     # d5849a67 — see the twin comment in generate_handoff: batch-resolve durable
     # pointer evidence so the starter handoff's excluded_unprospected list also
     # agrees with claim_sprint_item's own gate. Guarded, fail-open.
@@ -5741,8 +6176,17 @@ async def _generate_goal_only_handoff(
     force_include_ids: list[str] | None = None,
     completion_criteria_override: str | None = None,
     version: str | None = None,
+    strict_evidence: bool = False,
+    evidence_status: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
+
+    ``strict_evidence``/``evidence_status`` (8a883f60) — threaded straight
+    through from ``generate_handoff``; see its docstring.
+    ``freshness_requery`` is always reported ``skipped`` here (this mode,
+    like starter/compact, never re-queries pending items right before
+    rendering — only full/delta do); the other four capabilities reflect
+    real checks, exactly as in full/delta.
 
     ``version`` (b8f89491) — optional effective sprint-version scope, resolved
     by the caller (``generate_handoff``) from an explicit ``version`` argument
@@ -5814,26 +6258,92 @@ async def _generate_goal_only_handoff(
         _ws_settings = await db_module.get_workspace_settings(db)
     except Exception:  # noqa: BLE001 — column/row may be absent on older DBs
         _ws_settings = None
+    # 8a883f60 — explicit per-capability outcome dict; see the module comment
+    # above _capability_outcome. Same try/except boundaries as the
+    # pre-existing best-effort logic — additive instrumentation only.
+    _g_capability_status: dict[str, Any] = {
+        _CAP_FRESHNESS_REQUERY: _capability_outcome(
+            "skipped", "freshness re-query only runs for full/delta modes",
+        ),
+    }
     if _code_pointers_enabled(proj_settings):
         searcher = graph_searcher or _resolve_graph_searcher(project_id)
         if searcher is not None:
+            _g_capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+                "verified",
+                "graph searcher available ("
+                + ("explicit graph_searcher argument" if graph_searcher is not None
+                   else "resolved via active tunnel connector") + ")",
+            )
             try:
                 pending_sprint_items = await _annotate_code_pointers(
                     pending_sprint_items, searcher
                 )
-            except Exception:  # noqa: BLE001 — enrichment is best-effort
-                pass
+                # 8a883f60 — see the twin comment in generate_handoff:
+                # _annotate_code_pointers never raises for a per-item search
+                # failure, so recover that signal from prospect_status.
+                _g_cp_err = _code_pointer_enrichment_error_outcome(pending_sprint_items)
+                if _g_cp_err is not None:
+                    _g_capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _g_cp_err
+                else:
+                    _g_capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                        "verified",
+                        "code-pointer enrichment completed for every eligible pending item",
+                    )
+            except Exception as _g_cp_exc:  # noqa: BLE001 — enrichment is best-effort
+                _g_capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                    "failed",
+                    f"graph searcher raised {type(_g_cp_exc).__name__}: {_g_cp_exc}",
+                    fallback="pending items rendered without code_pointers",
+                )
+        else:
+            _g_capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+                "degraded",
+                "no live tunnel/graph searcher registered for this project",
+                fallback="pending items rendered without code_pointers",
+            )
+            _g_capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                "degraded",
+                "code-pointer enrichment skipped — no live tunnel/graph searcher",
+                fallback="pending items rendered without code_pointers",
+            )
+    else:
+        _g_capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+            "skipped", "code-pointer enrichment disabled via project settings",
+        )
+        _g_capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+            "skipped", "code-pointer enrichment disabled via project settings",
+        )
     # 36fea6ca — same durable-pointer resolution generate_handoff's full/delta
     # branch uses (gated by workspace_settings.handoff_inline_pointers, default
     # on). Unlike full/delta, this mode's ONLY rendering surface for the
     # result is the /goal block itself (see include_pointer_lines below).
     if (_ws_settings or {}).get("handoff_inline_pointers", True):
+        _g_rp_stats: dict[str, int] = {}
         try:
             pending_sprint_items = await _annotate_resolved_pointers(
-                db, project_id, pending_sprint_items
+                db, project_id, pending_sprint_items, stats=_g_rp_stats,
             )
-        except Exception:  # noqa: BLE001 — inline pointers are best-effort
-            pass
+            # 8a883f60 — see the twin comment in generate_handoff:
+            # _annotate_resolved_pointers never raises for a per-item fetch/
+            # resolve failure, so recover that signal from _g_rp_stats.
+            _g_rp_err = _resolved_pointer_annotation_error_outcome(_g_rp_stats)
+            if _g_rp_err is not None:
+                _g_capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _g_rp_err
+            else:
+                _g_capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+                    "verified", "durable resolved-pointer annotation completed",
+                )
+        except Exception as _g_rp_exc:  # noqa: BLE001 — inline pointers are best-effort
+            _g_capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+                "failed",
+                f"resolved-pointer annotation raised {type(_g_rp_exc).__name__}: {_g_rp_exc}",
+                fallback="pending items rendered without resolved_pointers/pointer_records",
+            )
+    else:
+        _g_capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+            "skipped", "handoff_inline_pointers disabled in workspace settings",
+        )
 
     _hitl_mode = 0
     try:
@@ -5848,8 +6358,21 @@ async def _generate_goal_only_handoff(
     _wave_gate_pending = None
     try:
         _wave_gate_pending = await db_module.get_wave_gate_configs(db, project_id)
-    except Exception:  # noqa: BLE001
+        _g_capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "verified",
+            f"wave-gate config fetch succeeded ({len(_wave_gate_pending or [])} "
+            "configured gate(s))",
+        )
+    except Exception as _g_wg_exc:  # noqa: BLE001
         _wave_gate_pending = None
+        _g_capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "failed",
+            f"get_wave_gate_configs raised {type(_g_wg_exc).__name__}: {_g_wg_exc}",
+            fallback="no wave-gate exclusion applied this pass",
+        )
+    _finalize_capability_status(
+        _g_capability_status, evidence_status, strict_evidence=strict_evidence,
+    )
     _pointer_evidence_ids = None
     try:
         _pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(

@@ -342,14 +342,25 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "permitted_parallel_wave=... claim_before_edit=...> tag (75ac1c8e) right after "
         "<executor_directive> — the SAME canonical policy start_session's execution_policy "
         "field returns, so a receiver can identify the required first action from the tag "
-        "attributes without interpreting prose.",
+        "attributes without interpreting prose. "
+        "Also returns handoff_evidence_status (8a883f60) on every mode: an explicit "
+        "{code_pointer_enrichment, resolved_pointer_annotation, freshness_requery, "
+        "wave_gate_exclusion, graph_search_availability} object — each a "
+        "{status: verified|skipped|failed|degraded, reason, fallback} entry for that "
+        "best-effort step, so a silently-degraded handoff is never indistinguishable "
+        "from a fully-verified one. Pass strict_evidence=true to fail CLOSED instead: "
+        "if any capability comes back failed/degraded, nothing is rendered or persisted "
+        "and the call returns {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, "
+        "evidence_errors, message} — default (strict_evidence omitted/false) behavior is "
+        "completely unchanged.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"]},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."},
          "version": {"type": "string", "description": "(b8f89491) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this handoff to — applies to every mode (full/delta/starter/compact/goal), not just starter. Wins over the calling session's own stored sprint_version. Omit to fall back to session_id's scope, or to the whole project's cross-version backlog when neither is set."},
          "force_include_ids": {"type": "array", "items": {"type": "string"}, "description": "(45f519a0) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming."},
-         "skip_ai_summary": {"type": "boolean", "description": "65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time."}},
+         "skip_ai_summary": {"type": "boolean", "description": "65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time."},
+         "strict_evidence": {"type": "boolean", "description": "(8a883f60) Opt-in, off by default — mirrors complete_sprint_item's strict_evidence shape exactly. When true, a failed/degraded pointer-enrichment/freshness/wave-gate/graph-search capability makes this call refuse to render or persist a handoff at all, returning {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, evidence_errors, message} instead. Leave false/omitted for today's graceful-degrade behavior (handoff_evidence_status is still returned either way)."}},
          "required": []}},
     {"name": "load_handoff", "description":
         "Read-only: Return the latest stored handoff for a project as an MCP tool "

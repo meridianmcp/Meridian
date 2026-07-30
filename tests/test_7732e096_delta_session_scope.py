@@ -282,3 +282,106 @@ async def test_full_mode_session_span_footer_still_project_wide(db, tmp_path):
         "mode='full' session-span footer unexpectedly got scoped away from "
         "project-wide activity"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8a883f60 — the dd19b6a4 freshness re-query (this file's own subject: full/
+# delta re-check pending items + sessions right before finalizing the /goal,
+# so a claim that lands mid-generation isn't handed out stale) now reports an
+# explicit evidence_status outcome instead of degrading silently on failure.
+# ---------------------------------------------------------------------------
+
+
+def _fail_after_n_calls(original, n):
+    """Return an async wrapper around `original` that behaves normally for
+    the first `n` calls, then raises on every call after that — used to make
+    ONLY generate_handoff's dd19b6a4 re-query (its SECOND get_sprint_items
+    call) fail, while leaving the function's first, unguarded
+    `sprint_items_all = await db_module.get_sprint_items(...)` call
+    untouched (that one isn't wrapped in a try/except at all, so failing it
+    would crash the whole handoff rather than exercising the freshness gate)."""
+    calls = {"n": 0}
+
+    async def _wrapped(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] > n:
+            raise RuntimeError("sprint_items table temporarily unavailable")
+        return await original(*args, **kwargs)
+
+    return _wrapped
+
+
+@pytest.mark.asyncio
+async def test_delta_freshness_requery_verified_in_happy_path(db, tmp_path):
+    """No injected failure -> freshness_requery reports verified with an
+    explicit reason, on the exact mode (delta) this file's dd19b6a4 fix
+    targets."""
+    p = await db_module.create_project(db, "evidence-freshness-happy")
+    s = await db_module.register_session(db, p["id"], "sess-freshness-happy")
+    await db_module.add_sprint_item(db, p["id"], "v1", "some pending item")
+
+    evidence_status: dict = {}
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
+        session_id=s["id"], evidence_status=evidence_status,
+    )
+    assert content
+    assert evidence_status["freshness_requery"]["status"] == "verified"
+
+
+@pytest.mark.asyncio
+async def test_delta_freshness_requery_failure_reported_not_silently_degraded(
+    db, tmp_path, monkeypatch,
+):
+    """A failure in the SECOND get_sprint_items call (the actual dd19b6a4
+    re-query, not the function's initial fetch) must surface as an explicit
+    failed evidence_status entry — previously this was a bare
+    `except Exception: pass`, indistinguishable from success."""
+    p = await db_module.create_project(db, "evidence-freshness-blowup")
+    s = await db_module.register_session(db, p["id"], "sess-freshness-blowup")
+    await db_module.add_sprint_item(db, p["id"], "v1", "some pending item")
+
+    original = db_module.get_sprint_items
+    monkeypatch.setattr(
+        db_module, "get_sprint_items", _fail_after_n_calls(original, 1),
+    )
+
+    evidence_status: dict = {}
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
+        session_id=s["id"], evidence_status=evidence_status,
+    )
+    # The mandatory handoff still rendered (degrade, don't break) ...
+    assert content
+    # ... but the freshness re-query failure is now explicit and specific.
+    fr = evidence_status["freshness_requery"]
+    assert fr["status"] == "failed"
+    assert "sprint_items table temporarily unavailable" in fr["reason"]
+    assert fr["fallback"]
+
+
+@pytest.mark.asyncio
+async def test_delta_freshness_requery_strict_evidence_blocks_on_failure(
+    db, tmp_path, monkeypatch,
+):
+    """Same broken re-query, but with strict_evidence=True: fail CLOSED —
+    nothing rendered/written/persisted for this call — rather than handing
+    back the same plausible-looking delta the non-strict test above got."""
+    p = await db_module.create_project(db, "evidence-freshness-strict")
+    s = await db_module.register_session(db, p["id"], "sess-freshness-strict")
+    await db_module.add_sprint_item(db, p["id"], "v1", "some pending item")
+
+    original = db_module.get_sprint_items
+    monkeypatch.setattr(
+        db_module, "get_sprint_items", _fail_after_n_calls(original, 1),
+    )
+
+    out_dir = tmp_path / "strict-freshness"
+    out_dir.mkdir()
+    with pytest.raises(handoff_module.HandoffEvidenceRequired) as excinfo:
+        await handoff_module.generate_handoff(
+            db, p["id"], str(out_dir), skip_ai_summary=True, mode="delta",
+            session_id=s["id"], strict_evidence=True,
+        )
+    assert any(e["capability"] == "freshness_requery" for e in excinfo.value.errors)
+    assert list(out_dir.iterdir()) == []
