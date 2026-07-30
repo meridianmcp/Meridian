@@ -2230,7 +2230,13 @@ async def claim_sprint_item(
     # wave_gate_configs table not yet migrated) lets the claim proceed so a
     # structural defect never permanently wedges the board.
     try:
-        _blocking_gate = await _get_blocking_wave_gate(db, project_id, item.get("wave"))
+        # ed8e4524 — pass the item's own sprint-version bucket so a
+        # version-scoped gate config only blocks/unblocks items in that SAME
+        # version; an unscoped (project-wide) config still applies to every
+        # item regardless of its version, exactly as before this fix.
+        _blocking_gate = await _get_blocking_wave_gate(
+            db, project_id, item.get("wave"), version=item.get("version")
+        )
     except Exception:  # noqa: BLE001 — gate must never wedge the board
         _blocking_gate = None
     if _blocking_gate is not None:
@@ -4784,11 +4790,21 @@ async def analyze_sprint(
 # next-wave items, and a future add to claim_sprint_item can query this table.
 # ---------------------------------------------------------------------------
 
+# ed8e4524 — `version` (nullable) scopes a gate result to ONE sprint-version
+# bucket; NULL is the legacy/project-wide bucket (unchanged pre-fix meaning).
+# The UNIQUE constraint includes version so two DIFFERENT versions can each
+# complete their OWN gate for a wave_label they happen to share. This DDL is
+# the fallback safety net for a table created before the formal migration
+# runs (see meridian.db.migrations._migrate_wave_gate_results /
+# pg_adapter._migrate_pg_wave_gate_results, which are what actually create
+# this table at init_db time and are kept in sync with this text) — it is a
+# no-op on an already-existing table either way.
 _WAVE_GATE_RESULTS_TABLE_DDL = (
     "CREATE TABLE IF NOT EXISTS wave_gate_results ("
     "    id TEXT PRIMARY KEY,"
     "    project_id TEXT NOT NULL,"
     "    wave_label TEXT NOT NULL,"         # e.g. 'wave-1'
+    "    version TEXT,"                     # NULL = unscoped/legacy bucket
     "    gate_passed INTEGER NOT NULL DEFAULT 1,"  # always 1 (rejected gates never write)
     "    exit_code INTEGER,"
     "    passed_count INTEGER,"
@@ -4797,7 +4813,7 @@ _WAVE_GATE_RESULTS_TABLE_DDL = (
     "    evidence_snapshot TEXT,"           # JSON of the full payload
     "    actor TEXT,"
     "    completed_at TEXT NOT NULL DEFAULT (datetime('now')),"
-    "    UNIQUE(project_id, wave_label)"    # one gate result per project+wave
+    "    UNIQUE(project_id, wave_label, version)"  # one gate result per project+wave+version
     ")"
 )
 
@@ -4813,6 +4829,7 @@ async def complete_wave_gate(
     wave_label: str,
     verification_payload: dict[str, Any],
     actor: str | None = None,
+    version: str | None = None,
 ) -> dict[str, Any]:
     """d2430713 — record a verified wave gate completion and report next-wave readiness.
 
@@ -4826,11 +4843,23 @@ async def complete_wave_gate(
     only the genuine output of run_verification — which runs the REAL test suite on
     the caller's machine — is accepted.
 
+    ``version`` (ed8e4524) scopes this gate completion to ONE sprint-version
+    bucket, closing the cross-version leak where two different sprint versions
+    that happen to reuse the SAME ``wave_label`` (e.g. both have a 'wave-2')
+    could satisfy or unblock each other's gate. ``None`` (default) is the
+    LEGACY/unscoped behavior — exactly the pre-fix, project-wide check —
+    so a project with only one sprint version in play is unaffected. When
+    given, the duplicate-gate check AND the next-wave-items query are both
+    restricted to items/results stamped with this SAME version (mirroring
+    ``handoff._resolve_session_sprint_version`` / 660314c1's checkpoint fix,
+    which resolves an analogous scope for a session's pending items).
+
     On success a row is written to ``wave_gate_results`` and the function returns::
 
         {
             "gate_completed": True,
             "wave_label": "wave-1",
+            "version": "v0.2.6",              # the resolved scope, or None
             "next_wave_label": "wave-2",      # None if no next wave exists
             "next_wave_item_count": <int>,    # how many pending/todo items in next wave
             "next_wave_item_ids": [...],
@@ -4838,8 +4867,14 @@ async def complete_wave_gate(
         }
 
     Raises ValueError on evidence failure (bad payload) or if the gate for this
-    wave has already been completed.
+    wave (and version, when given) has already been completed.
     """
+    # ed8e4524 — normalize "" / whitespace-only to None, same convention as
+    # start_wave_run's version handling, so a legacy sprint_items.version of ""
+    # (the NOT-NULL column's empty-bucket default) lines up with an unscoped
+    # (NULL) wave_gate_results/configs row instead of silently mismatching it.
+    version = (version or "").strip() or None
+
     # ── 1. Validate evidence ────────────────────────────────────────────────────
     if not isinstance(verification_payload, dict):
         raise ValueError(
@@ -4890,17 +4925,28 @@ async def complete_wave_gate(
 
     # ── 2. Check for duplicate gate completion ────────────────────────────────────
     await _ensure_wave_gate_results_table(db)
+    # ed8e4524 — scope the duplicate check to `version` when given (a DIFFERENT
+    # version's completed row for the same wave_label must NOT be reported as
+    # "already completed" here — that was the exact cross-version block bug).
+    # version=None keeps the original unscoped match (any row for this
+    # project+wave_label, regardless of stored version, counts as a dup).
+    _dup_clauses = ["project_id = ?", "wave_label = ?"]
+    _dup_params: list[Any] = [project_id, wave_label]
+    if version is not None:
+        _dup_clauses.append("version = ?")
+        _dup_params.append(version)
     async with db.execute(
-        "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
-        (project_id, wave_label),
+        f"SELECT id FROM wave_gate_results WHERE {' AND '.join(_dup_clauses)}",
+        _dup_params,
     ) as _dup_cur:
         _dup_row = await _dup_cur.fetchone()
     if _dup_row is not None:
         existing_id = _dup_row[0] if not isinstance(_dup_row, dict) else _dup_row["id"]
+        _version_note = f" (version {version!r})" if version else ""
         raise ValueError(
-            f"Wave gate for {wave_label!r} on project {project_id!r} has already been "
-            f"completed (gate_id={existing_id!r}). Each wave gate may only be completed "
-            f"once."
+            f"Wave gate for {wave_label!r} on project {project_id!r}{_version_note} "
+            f"has already been completed (gate_id={existing_id!r}). Each wave gate "
+            f"may only be completed once."
         )
 
     # ── 3. Determine the next wave label ─────────────────────────────────────────
@@ -4911,12 +4957,23 @@ async def complete_wave_gate(
         next_wave_label = f"{_parts[0]}-{int(_parts[1]) + 1}"
 
     # ── 4. Find next-wave items (informational) ───────────────────────────────────
+    # ed8e4524 — THE confirmed defect: this query used to filter only on
+    # project_id + wave, so two sprint versions sharing the same wave label
+    # (e.g. both have a 'wave-2') would leak each other's items into
+    # next_wave_item_ids. version=None preserves the exact prior unscoped
+    # query (matches sprint_items.get_sprint_items's own `if version is not
+    # None` convention for "no filter means every version").
     next_wave_item_ids: list[str] = []
     if next_wave_label is not None:
+        _nw_clauses = ["project_id = ?", "wave = ?", "status IN ('pending', 'todo')"]
+        _nw_params: list[Any] = [project_id, next_wave_label]
+        if version is not None:
+            _nw_clauses.append("version = ?")
+            _nw_params.append(version)
         async with db.execute(
-            "SELECT id FROM sprint_items WHERE project_id = ? AND wave = ? "
-            "AND status IN ('pending', 'todo') ORDER BY added_at",
-            (project_id, next_wave_label),
+            f"SELECT id FROM sprint_items WHERE {' AND '.join(_nw_clauses)} "
+            f"ORDER BY added_at",
+            _nw_params,
         ) as _nw_cur:
             _nw_rows = await _nw_cur.fetchall()
         next_wave_item_ids = [
@@ -4928,13 +4985,14 @@ async def complete_wave_gate(
     evidence_snapshot = json.dumps(verification_payload)
     await db.execute(
         "INSERT INTO wave_gate_results "
-        "(id, project_id, wave_label, gate_passed, exit_code, passed_count, "
+        "(id, project_id, wave_label, version, gate_passed, exit_code, passed_count, "
         " failed_count, verification_status, evidence_snapshot, actor) "
-        "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
         (
             gate_id,
             project_id,
             wave_label,
+            version,
             v_exit,
             v_passed,
             v_failed if v_failed is not None else 0,
@@ -4948,6 +5006,7 @@ async def complete_wave_gate(
     return {
         "gate_completed": True,
         "wave_label": wave_label,
+        "version": version,
         "next_wave_label": next_wave_label,
         "next_wave_item_count": len(next_wave_item_ids),
         "next_wave_item_ids": next_wave_item_ids,
@@ -4984,17 +5043,23 @@ _VALID_WAVE_GATE_ACTIONS = frozenset({
     "push_dev", "push_main", "deploy", "wait", "run_verification",
 })
 
+# ed8e4524 — `version` (nullable) scopes a gate config to ONE sprint-version
+# bucket, same convention as wave_gate_results.version above. This DDL is the
+# fallback safety net (see the note above _WAVE_GATE_RESULTS_TABLE_DDL — kept
+# in sync with meridian.db.migrations._migrate_wave_gate_configs /
+# pg_adapter._migrate_pg_wave_gate_configs, the actual creation path).
 _WAVE_GATE_CONFIGS_TABLE_DDL = (
     "CREATE TABLE IF NOT EXISTS wave_gate_configs ("
     "    id TEXT PRIMARY KEY,"
     "    project_id TEXT NOT NULL,"
     "    wave_start TEXT NOT NULL,"     # first wave covered by this gate (documentation)
     "    wave_end TEXT NOT NULL,"       # boundary wave — enforcement key
+    "    version TEXT,"                 # NULL = unscoped/legacy bucket
     "    actions TEXT NOT NULL,"        # JSON array of {"type": ..., ...params}
     "    actor TEXT,"
     "    created_at TEXT NOT NULL DEFAULT (datetime('now')),"
     "    updated_at TEXT NOT NULL DEFAULT (datetime('now')),"
-    "    UNIQUE(project_id, wave_end)"  # one pipeline per boundary wave
+    "    UNIQUE(project_id, wave_end, version)"  # one pipeline per boundary wave+version
     ")"
 )
 
@@ -5027,6 +5092,7 @@ async def configure_wave_gate(
     actions: list[dict[str, Any]],
     wave_start: str | None = None,
     actor: str | None = None,
+    version: str | None = None,
 ) -> dict[str, Any]:
     """74a8f420 — configure (or on-the-fly reconfigure) a wave gate's action pipeline.
 
@@ -5042,14 +5108,29 @@ async def configure_wave_gate(
     run_verification (extra keys — e.g. {"type": "wait", "seconds": 30} — are
     preserved verbatim for the executor to read).
 
+    ``version`` (ed8e4524) scopes this gate CONFIG to ONE sprint-version
+    bucket — the same class of fix as ``complete_wave_gate``'s ``version``
+    param (see its docstring). ``None`` (default) is the legacy/unscoped
+    behavior: matches ANY existing config/result row for this ``wave_end``,
+    exactly the pre-fix project-wide semantics. When given, both the
+    immutability check (has this version's gate already passed?) and the
+    upsert lookup (does this version already have a config for this
+    wave_end?) are restricted to that SAME version, so version B can
+    configure and later complete its own ``wave_end`` boundary independently
+    of version A reusing the same label.
+
     Re-configuring an already-configured (but not yet passed) ``wave_end`` is
     an upsert — this is the "on-the-fly-configurable" half of the spec: a
     planner can revise the pipeline for a wave boundary right up until an
-    executor actually completes it. Once wave_gate_results has a row for
-    wave_end the config is immutable (raises ValueError) — rewriting a passed
-    gate's pipeline after the fact would silently invalidate evidence that
-    claim_sprint_item already relied on to unblock items.
+    executor actually completes it. Once wave_gate_results has a matching row
+    for wave_end (and version, when given) the config is immutable (raises
+    ValueError) — rewriting a passed gate's pipeline after the fact would
+    silently invalidate evidence that claim_sprint_item already relied on to
+    unblock items.
     """
+    # ed8e4524 — same "" -> None normalization as complete_wave_gate; see that
+    # function's docstring for why.
+    version = (version or "").strip() or None
     wave_end = str(wave_end or "").strip()
     if not wave_end:
         raise ValueError("configure_wave_gate requires a non-empty wave_end")
@@ -5078,23 +5159,40 @@ async def configure_wave_gate(
     await _ensure_wave_gate_configs_table(db)
     await _ensure_wave_gate_results_table(db)
 
-    # A passed gate's config is immutable — see docstring.
+    # A passed gate's config is immutable — see docstring. Scoped to `version`
+    # when given (ed8e4524): version=None matches ANY existing result row for
+    # this wave_end (unscoped, exactly the pre-fix behavior); an explicit
+    # version only matches a result row completed under that SAME version.
+    _passed_clauses = ["project_id = ?", "wave_label = ?"]
+    _passed_params: list[Any] = [project_id, wave_end]
+    if version is not None:
+        _passed_clauses.append("version = ?")
+        _passed_params.append(version)
     async with db.execute(
-        "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
-        (project_id, wave_end),
+        f"SELECT id FROM wave_gate_results WHERE {' AND '.join(_passed_clauses)}",
+        _passed_params,
     ) as _res_cur:
         _already_passed = await _res_cur.fetchone()
     if _already_passed is not None:
+        _version_note = f" (version {version!r})" if version else ""
         raise ValueError(
-            f"Wave gate for {wave_end!r} on project {project_id!r} has already "
-            "completed — its pipeline is immutable. Configure a NEW wave_end "
-            "boundary instead of reconfiguring a passed gate."
+            f"Wave gate for {wave_end!r} on project {project_id!r}{_version_note} "
+            "has already completed — its pipeline is immutable. Configure a NEW "
+            "wave_end boundary instead of reconfiguring a passed gate."
         )
 
     _actions_json = json.dumps(_normalized)
+    # ed8e4524 — same version scoping for the upsert lookup: a config row
+    # belonging to a DIFFERENT version (or the unscoped legacy bucket) must
+    # never be silently overwritten by this call.
+    _cfg_clauses = ["project_id = ?", "wave_end = ?"]
+    _cfg_params: list[Any] = [project_id, wave_end]
+    if version is not None:
+        _cfg_clauses.append("version = ?")
+        _cfg_params.append(version)
     async with db.execute(
-        "SELECT id FROM wave_gate_configs WHERE project_id = ? AND wave_end = ?",
-        (project_id, wave_end),
+        f"SELECT id FROM wave_gate_configs WHERE {' AND '.join(_cfg_clauses)}",
+        _cfg_params,
     ) as _cfg_cur:
         _existing = await _cfg_cur.fetchone()
     if _existing is not None:
@@ -5108,9 +5206,9 @@ async def configure_wave_gate(
         _config_id = _new_id()
         await db.execute(
             "INSERT INTO wave_gate_configs "
-            "(id, project_id, wave_start, wave_end, actions, actor) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (_config_id, project_id, wave_start, wave_end, _actions_json, actor),
+            "(id, project_id, wave_start, wave_end, version, actions, actor) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_config_id, project_id, wave_start, wave_end, version, _actions_json, actor),
         )
     await db.commit()
 
@@ -5120,22 +5218,39 @@ async def configure_wave_gate(
         "project_id": project_id,
         "wave_start": wave_start,
         "wave_end": wave_end,
+        "version": version,
         "actions": _normalized,
     }
 
 
 async def get_wave_gate_configs(
-    db: aiosqlite.Connection, project_id: str,
+    db: aiosqlite.Connection, project_id: str, version: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read-only: list every configured wave gate for a project (oldest first),
     each annotated with ``gate_passed`` (whether wave_gate_results already has
     a matching row) so callers don't need a second query to know what's still
-    pending."""
+    pending.
+
+    ``version`` (ed8e4524) optionally restricts the listing to gates
+    EXPLICITLY configured under that exact sprint-version bucket. ``None``
+    (default) returns every configured gate regardless of its stored version
+    — the unchanged, original behavior every existing caller
+    (capability_contract.build_capability_contract, executor_contract,
+    handoff._build_quick_start_goal and friends) relies on, since none of
+    them pass this parameter.
+    """
     await _ensure_wave_gate_configs_table(db)
     await _ensure_wave_gate_results_table(db)
+    version = (version or "").strip() or None
+    _clauses = ["project_id = ?"]
+    _params: list[Any] = [project_id]
+    if version is not None:
+        _clauses.append("version = ?")
+        _params.append(version)
     async with db.execute(
-        "SELECT * FROM wave_gate_configs WHERE project_id = ? ORDER BY created_at",
-        (project_id,),
+        f"SELECT * FROM wave_gate_configs WHERE {' AND '.join(_clauses)} "
+        f"ORDER BY created_at",
+        _params,
     ) as _cur:
         _rows = await _cur.fetchall()
     out: list[dict[str, Any]] = []
@@ -5145,9 +5260,20 @@ async def get_wave_gate_configs(
             _cfg["actions"] = json.loads(_cfg.get("actions") or "[]")
         except (TypeError, ValueError):
             _cfg["actions"] = []
+        # ed8e4524 — the passed-check is scoped to THIS row's own stored
+        # version (not the listing filter above): an unscoped (NULL) config
+        # matches ANY results row for the wave_label (project-wide, exactly
+        # the pre-fix behavior); a version-scoped config only matches a
+        # results row completed under that SAME version.
+        _row_version = _cfg.get("version")
+        _res_clauses = ["project_id = ?", "wave_label = ?"]
+        _res_params: list[Any] = [project_id, _cfg.get("wave_end")]
+        if _row_version is not None:
+            _res_clauses.append("version = ?")
+            _res_params.append(_row_version)
         async with db.execute(
-            "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
-            (project_id, _cfg.get("wave_end")),
+            f"SELECT id FROM wave_gate_results WHERE {' AND '.join(_res_clauses)}",
+            _res_params,
         ) as _res_cur:
             _cfg["gate_passed"] = (await _res_cur.fetchone()) is not None
         out.append(_cfg)
@@ -5156,20 +5282,37 @@ async def get_wave_gate_configs(
 
 async def _get_blocking_wave_gate(
     db: aiosqlite.Connection, project_id: str, item_wave: str | None,
+    version: str | None = None,
 ) -> dict[str, Any] | None:
     """Return the lowest-boundary configured-but-unpassed wave gate that
     structurally blocks claiming an item in ``item_wave``, or None if nothing
-    blocks it (no wave on the item, no configs, an unparseable wave label, or
-    every configured boundary at-or-below this wave has already passed).
+    blocks it (no wave on the item, no configs, an unparseable wave label,
+    every configured boundary at-or-below this wave has already passed, or
+    every boundary-scoped config belongs to a DIFFERENT sprint version).
 
     This is the function claim_sprint_item calls to turn wave gates from
     advisory /goal prose into a real, structural claim-time block.
+
+    ``version`` (ed8e4524, pass the CLAIMED ITEM's own ``item.get("version")``)
+    is the item's sprint-version bucket. A gate config with an EXPLICIT
+    stored version only applies to — and can only be satisfied by evidence
+    from — items/completions in that SAME version, closing the cross-version
+    leak where completing version A's 'wave-1' gate could unblock version B's
+    'wave-2' items just because they share the label. A config with NO stored
+    version (the default when configure_wave_gate/complete_wave_gate are
+    called without ``version`` — still the common, single-sprint-version
+    case) remains PROJECT-WIDE and applies unconditionally regardless of the
+    item's own version, exactly like before this fix — this is what keeps a
+    project that never explicitly version-scopes its wave-gate calls
+    (including one whose items still carry an ordinary version string like
+    'v1') working unchanged.
     """
     _item_prefix, _item_num = _split_wave_label(item_wave)
     if _item_num is None:
         return None
     await _ensure_wave_gate_configs_table(db)
     await _ensure_wave_gate_results_table(db)
+    version = (version or "").strip() or None
     async with db.execute(
         "SELECT * FROM wave_gate_configs WHERE project_id = ?",
         (project_id,),
@@ -5179,16 +5322,24 @@ async def _get_blocking_wave_gate(
     _blocking_num: int | None = None
     for _row in _configs:
         _cfg = _row_to_dict(_row) or {}
+        _cfg_version = _cfg.get("version")
+        if _cfg_version is not None and _cfg_version != version:
+            continue  # a version-scoped config that isn't THIS item's version
         _cfg_prefix, _cfg_num = _split_wave_label(_cfg.get("wave_end"))
         if _cfg_num is None or _cfg_prefix != _item_prefix or _cfg_num >= _item_num:
             continue  # not a boundary strictly before this item's wave
+        _res_clauses = ["project_id = ?", "wave_label = ?"]
+        _res_params: list[Any] = [project_id, _cfg.get("wave_end")]
+        if _cfg_version is not None:
+            _res_clauses.append("version = ?")
+            _res_params.append(_cfg_version)
         async with db.execute(
-            "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
-            (project_id, _cfg.get("wave_end")),
+            f"SELECT id FROM wave_gate_results WHERE {' AND '.join(_res_clauses)}",
+            _res_params,
         ) as _res_cur:
             _passed = await _res_cur.fetchone()
         if _passed is not None:
-            continue  # this boundary's gate already passed
+            continue  # this boundary's gate already passed (for this version)
         if _blocking_num is None or _cfg_num < _blocking_num:
             try:
                 _cfg["actions"] = json.loads(_cfg.get("actions") or "[]")

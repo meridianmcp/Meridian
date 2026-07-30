@@ -3314,12 +3314,19 @@ async def _migrate_pg_wave_gate_results(conn: PostgresConnection) -> None:
 
     Mirrors db._migrate_wave_gate_results. Idempotent via CREATE TABLE IF NOT
     EXISTS + CREATE INDEX IF NOT EXISTS.
+
+    ed8e4524 — added nullable ``version`` (sprint-version scope; NULL =
+    unscoped/legacy) via ``ADD COLUMN IF NOT EXISTS`` for a table that
+    predates this fix. Same residual-constraint note as the SQLite mirror
+    (db.migrations._migrate_wave_gate_results): the UNIQUE constraint on an
+    already-existing table is not retroactively widened to include version.
     """
     await conn.executescript(
         "CREATE TABLE IF NOT EXISTS wave_gate_results ("
         "    id TEXT PRIMARY KEY,"
         "    project_id TEXT NOT NULL,"
         "    wave_label TEXT NOT NULL,"
+        "    version TEXT,"
         "    gate_passed INTEGER NOT NULL DEFAULT 1,"
         "    exit_code INTEGER,"
         "    passed_count INTEGER,"
@@ -3328,10 +3335,13 @@ async def _migrate_pg_wave_gate_results(conn: PostgresConnection) -> None:
         "    evidence_snapshot TEXT,"
         "    actor TEXT,"
         "    completed_at TEXT NOT NULL DEFAULT (now()::text),"
-        "    UNIQUE(project_id, wave_label)"
+        "    UNIQUE(project_id, wave_label, version)"
         ");"
+        "ALTER TABLE wave_gate_results ADD COLUMN IF NOT EXISTS version TEXT;"
         "CREATE INDEX IF NOT EXISTS idx_wave_gate_results_project "
-        "ON wave_gate_results(project_id, wave_label)"
+        "ON wave_gate_results(project_id, wave_label);"
+        "CREATE INDEX IF NOT EXISTS idx_wave_gate_results_project_version "
+        "ON wave_gate_results(project_id, wave_label, version)"
     )
 
 
@@ -3344,6 +3354,13 @@ async def _migrate_pg_wave_gate_configs(conn: PostgresConnection) -> None:
 
     Mirrors db.migrations._migrate_wave_gate_configs. Idempotent via CREATE
     TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+
+    ed8e4524 — added nullable ``version`` (sprint-version scope; NULL =
+    unscoped/legacy, applies to every item regardless of its own version) via
+    ``ADD COLUMN IF NOT EXISTS`` for a table that predates this fix. Same
+    residual-constraint note as the SQLite mirror
+    (db.migrations._migrate_wave_gate_configs): the UNIQUE constraint on an
+    already-existing table is not retroactively widened to include version.
     """
     await conn.executescript(
         "CREATE TABLE IF NOT EXISTS wave_gate_configs ("
@@ -3351,14 +3368,18 @@ async def _migrate_pg_wave_gate_configs(conn: PostgresConnection) -> None:
         "    project_id TEXT NOT NULL,"
         "    wave_start TEXT NOT NULL,"
         "    wave_end TEXT NOT NULL,"
+        "    version TEXT,"
         "    actions TEXT NOT NULL,"
         "    actor TEXT,"
         "    created_at TEXT NOT NULL DEFAULT (now()::text),"
         "    updated_at TEXT NOT NULL DEFAULT (now()::text),"
-        "    UNIQUE(project_id, wave_end)"
+        "    UNIQUE(project_id, wave_end, version)"
         ");"
+        "ALTER TABLE wave_gate_configs ADD COLUMN IF NOT EXISTS version TEXT;"
         "CREATE INDEX IF NOT EXISTS idx_wave_gate_configs_project "
-        "ON wave_gate_configs(project_id, wave_end)"
+        "ON wave_gate_configs(project_id, wave_end);"
+        "CREATE INDEX IF NOT EXISTS idx_wave_gate_configs_project_version "
+        "ON wave_gate_configs(project_id, wave_end, version)"
     )
 
 

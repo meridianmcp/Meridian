@@ -1801,9 +1801,26 @@ async def handle_complete_wave_gate(
 
     actor = str(args.get("actor") or "").strip() or None
 
+    # ed8e4524 — scope this gate to the active sprint-version bucket, the SAME
+    # class of fix 660314c1 applied to checkpoint's pending/next_goal: an
+    # explicit version wins; otherwise fall back to resolving the CALLING
+    # session's own stored sprint_version via the identical helper
+    # (handoff._resolve_session_sprint_version) rather than inventing a new
+    # resolution mechanism. Neither given -> version stays None, which
+    # preserves the exact pre-fix, project-wide behavior for a project with
+    # only one sprint version in play.
+    version = str(args.get("version") or "").strip() or None
+    session_id = str(args.get("session_id") or "").strip() or None
+    if version is None and session_id:
+        from meridian import handoff as handoff_module_local  # noqa: PLC0415
+        version = await handoff_module_local._resolve_session_sprint_version(
+            db, session_id
+        )
+
     try:
         result = await db_module.complete_wave_gate(
-            db, project_id, wave_label, verification_payload, actor=actor
+            db, project_id, wave_label, verification_payload, actor=actor,
+            version=version,
         )
     except ValueError as exc:
         return {"error": str(exc)}
@@ -2116,9 +2133,23 @@ async def handle_configure_wave_gate(
     wave_start = str(args.get("wave_start") or "").strip() or None
     actor = str(args.get("actor") or "").strip() or None
 
+    # ed8e4524 — same version-scope resolution as handle_complete_wave_gate
+    # (above) and 660314c1's checkpoint fix: explicit version wins, else
+    # resolve from session_id via handoff._resolve_session_sprint_version,
+    # else stay unscoped (legacy/project-wide) — see that handler for the
+    # full rationale.
+    version = str(args.get("version") or "").strip() or None
+    session_id = str(args.get("session_id") or "").strip() or None
+    if version is None and session_id:
+        from meridian import handoff as handoff_module_local  # noqa: PLC0415
+        version = await handoff_module_local._resolve_session_sprint_version(
+            db, session_id
+        )
+
     try:
         result = await db_module.configure_wave_gate(
             db, project_id, wave_end, actions, wave_start=wave_start, actor=actor,
+            version=version,
         )
     except ValueError as exc:
         return {"error": str(exc)}

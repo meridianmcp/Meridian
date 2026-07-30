@@ -1862,13 +1862,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "{gate_completed, wave_label, next_wave_label, next_wave_item_count, "
         "next_wave_item_ids, gate_id}. Each wave gate may only be completed once "
         "(duplicate calls return an error). Security note: this is a deploy-adjacent "
-        "gate — only actual run_verification output satisfies it.",
+        "gate — only actual run_verification output satisfies it. ed8e4524 — SCOPED "
+        "TO SPRINT VERSION: pass version (or session_id to auto-resolve the calling "
+        "session's scope) so two different sprint versions that happen to share the "
+        "SAME wave_label (e.g. both have a 'wave-2') never satisfy or unblock each "
+        "other's gate — omit both to keep the exact prior project-wide behavior for "
+        "a single-version project.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "wave_label": {"type": "string", "description": "The wave whose gate is being completed, e.g. 'wave-1'. Must match the wave field on sprint_items that were just executed."},
          "verification_payload": {"type": "object", "description": "The FULL dict returned by run_verification. Must have status='ok' and exit_code=0. Any other value (non-zero exit, error, not_configured, not_connected) is rejected. Do NOT fabricate or self-report — the server validates the payload."},
-         "actor": {"type": "string", "description": "Optional session_id or actor name to record who completed the gate."}},
+         "actor": {"type": "string", "description": "Optional session_id or actor name to record who completed the gate."},
+         "version": {"type": "string", "description": "ed8e4524 — Optional sprint-version bucket this gate belongs to (e.g. 'v0.2.6'). Wins over session_id's resolved scope. Omit (and omit session_id) for the legacy project-wide gate behavior."},
+         "session_id": {"type": "string", "description": "ed8e4524 — Optional: resolve the version scope from this session's own sprint_version (same helper handoff._resolve_session_sprint_version uses for checkpoint) when version is not given explicitly."}},
          "required": ["wave_label", "verification_payload"]}},
     {"name": "start_wave_run", "description":
         "2a654cb0 — DURABLE WAVE STATE: open a wave run before dispatching a parallel "
@@ -1957,14 +1964,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "checkpoint. Re-configuring an un-passed wave_end is an upsert — the pipeline can be "
         "revised right up until an executor completes it; once passed the config is immutable "
         "(returns {\"error\": ...}). Returns {configured, gate_config_id, project_id, "
-        "wave_start, wave_end, actions} on success.",
+        "wave_start, wave_end, actions} on success. ed8e4524 — SCOPED TO SPRINT VERSION: "
+        "pass version (or session_id to auto-resolve the calling session's scope) so two "
+        "different sprint versions that happen to share the SAME wave_end label never "
+        "reconfigure or immutably block each other's gate — omit both to keep the exact "
+        "prior project-wide behavior for a single-version project.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "wave_end": {"type": "string", "description": "The boundary wave, e.g. 'wave-3'. Any item in a later wave (same 'prefix-N' family) is structurally blocked from claim_sprint_item until this gate completes."},
          "wave_start": {"type": "string", "description": "Optional: first wave covered by this gate (documentation only, defaults to wave_end) — e.g. wave_start='wave-1' with wave_end='wave-3' covers waves 1-3 under one checkpoint."},
          "actions": {"type": "array", "description": "Non-empty ordered list of {\"type\": push_dev|push_main|deploy|wait|run_verification, ...params} action dicts — the deterministic pipeline that must run before the next wave unlocks.", "items": {"type": "object"}},
-         "actor": {"type": "string", "description": "Optional session_id or actor name to record who configured the gate."}},
+         "actor": {"type": "string", "description": "Optional session_id or actor name to record who configured the gate."},
+         "version": {"type": "string", "description": "ed8e4524 — Optional sprint-version bucket this gate belongs to (e.g. 'v0.2.6'). Wins over session_id's resolved scope. Omit (and omit session_id) for the legacy project-wide gate behavior."},
+         "session_id": {"type": "string", "description": "ed8e4524 — Optional: resolve the version scope from this session's own sprint_version (same helper handoff._resolve_session_sprint_version uses for checkpoint) when version is not given explicitly."}},
          "required": ["wave_end", "actions"]}},
     {"name": "analyze_sprint", "description":
         "PLANNING: Read-only synthesis of the current sprint into one structured brief — "
