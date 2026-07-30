@@ -625,6 +625,162 @@ def test_build_execution_policy_clause_renders_attributes_and_escapes():
     assert _build_execution_policy_clause({}) == ""
 
 
+# ---------------------------------------------------------------------------
+# 6cfdabd7 — render the configured test command and parallelism policy in
+# handoffs. set_executor_config's test_cmd used to be silently ignored by
+# /goal rendering: the completion criteria and xdist test_gate_note both
+# hardcoded "pixi run test -n 3" regardless of what a project actually had
+# configured (or pixi.toml's own default, which had already moved to
+# "-n auto"). These tests cover the new settings-reading helpers directly.
+# ---------------------------------------------------------------------------
+
+
+def test_test_cmd_from_settings():
+    """Sibling of _max_turns_from_settings: same read pattern/fail-safe default."""
+    f = handoff_module._test_cmd_from_settings
+    assert f(None) == "pixi run test"
+    assert f({"executor_config": {}}) == "pixi run test"
+    assert f({"executor_config": {"test_cmd": "pixi run test -n auto"}}) == \
+        "pixi run test -n auto"
+    # Whitespace is trimmed.
+    assert f({"executor_config": {"test_cmd": "  pixi run test-pg  "}}) == \
+        "pixi run test-pg"
+    # Blank/non-string/non-dict all degrade to the default, never raise.
+    assert f({"executor_config": {"test_cmd": "   "}}) == "pixi run test"
+    assert f({"executor_config": {"test_cmd": 42}}) == "pixi run test"
+    assert f({"executor_config": "notadict"}) == "pixi run test"
+
+
+def test_branch_from_settings():
+    f = handoff_module._branch_from_settings
+    assert f(None) is None
+    assert f({"executor_config": {}}) is None
+    assert f({"executor_config": {"branch": "dev"}}) == "dev"
+    assert f({"executor_config": {"branch": "  main  "}}) == "main"
+    assert f({"executor_config": {"branch": "   "}}) is None
+    assert f({"executor_config": "notadict"}) is None
+
+
+def test_parallelism_policy_from_test_cmd():
+    f = handoff_module._parallelism_policy_from_test_cmd
+    assert f("pixi run test -n auto") == "-n auto"
+    assert f("pixi run test -n 8") == "-n 8"
+    assert f("pytest tests/ --numprocesses=4") == "-n 4"
+    assert f("pytest tests/ --numprocesses 4") == "-n 4"
+    # No -n/--numprocesses flag -> clearly-labeled fallback, never a guess.
+    assert f("pixi run test") == "not declared in test_cmd (task's own default applies)"
+    assert f("") == "not declared in test_cmd (task's own default applies)"
+
+
+def test_strip_parallelism_flag():
+    f = handoff_module._strip_parallelism_flag
+    # A flag present -> removed cleanly.
+    assert f("pixi run test -n auto") == "pixi run test"
+    assert f("pixi run test -n 8 -q") == "pixi run test -q"
+    # No flag present -> explicit no:xdist appended rather than a silent no-op,
+    # so the rendered triage command always actually disables parallelism.
+    assert f("pixi run test") == "pixi run test -p no:xdist"
+    assert f("") == "pixi run test -p no:xdist"
+
+
+def test_build_test_gate_config_clause_renders_effective_values():
+    from meridian.handoff import _build_test_gate_config_clause
+
+    clause = _build_test_gate_config_clause(
+        test_cmd="pixi run test -n auto", branch="dev", version="v0.3.1",
+    )
+    assert clause.startswith("\n<test_gate_config ")
+    assert 'test_cmd="pixi run test -n auto"' in clause
+    assert 'parallelism="-n auto"' in clause
+    assert 'branch="dev"' in clause
+    assert 'version="v0.3.1"' in clause
+    assert clause.endswith(" />")
+
+    # Unset branch/version render a clearly-labeled fallback, not omission.
+    unset = _build_test_gate_config_clause(test_cmd="pixi run test", branch=None, version=None)
+    assert 'branch="unset"' in unset
+    assert 'version="unscoped"' in unset
+
+
+def test_build_quick_start_goal_renders_effective_test_cmd_not_hardcoded():
+    """The bug this item fixes: a configured test_cmd must flow into BOTH the
+    completion criteria prose and the test_gate_note/test_gate_config -- not
+    a hardcoded 'pixi run test -n 3'."""
+    goal = handoff_module._build_quick_start_goal(
+        # ``version`` (below) scopes the claimable batch to items whose own
+        # ``version`` field matches -- give the item the matching value so it
+        # survives that filter and the completion/test_gate_note text is
+        # actually rendered (see _build_quick_start_goal's version handling).
+        [{"id": "c1", "title": "FEAT: real work", "version": "v0.4.0"}],
+        test_floor=100,
+        test_cmd="pixi run test -n auto",
+        branch="dev",
+        version="v0.4.0",
+    )
+    assert "-n 3" not in goal
+    assert "pixi run test -n auto passes 100+" in goal
+    assert 'test_cmd="pixi run test -n auto"' in goal
+    assert 'parallelism="-n auto"' in goal
+    assert 'branch="dev"' in goal
+    assert 'version="v0.4.0"' in goal
+
+
+def test_build_quick_start_goal_default_test_cmd_has_no_stale_flag():
+    """No executor_config configured -> the fallback is the bare project test
+    task with no independently-hardcoded -n value (that hardcoded value going
+    stale is the exact bug 6cfdabd7 fixes)."""
+    goal = handoff_module._build_quick_start_goal(
+        [{"id": "c1", "title": "FEAT: real work"}],
+    )
+    assert "-n 3" not in goal
+    assert "pixi run test passes" in goal
+    assert 'test_cmd="pixi run test"' in goal
+    assert 'parallelism="not declared in test_cmd' in goal
+    assert 'branch="unset"' in goal
+    assert 'version="unscoped"' in goal
+
+
+@pytest.mark.asyncio
+async def test_handoff_modes_render_same_effective_test_cmd_parallelism_branch_version(
+    db, tmp_path,
+):
+    """6cfdabd7 acceptance: full/delta/starter/goal all render the SAME
+    effective test_cmd/parallelism/branch/version for the SAME underlying
+    executor_config -- proving the four modes can never disagree, because
+    they all resolve settings via the SAME _test_cmd_from_settings/
+    _branch_from_settings helpers into the SAME shared _build_quick_start_goal
+    call."""
+    p = await db_module.create_project(db, "test-cmd-parity")
+    await db_module.set_executor_config(
+        db, p["id"],
+        {"test_cmd": "pixi run test -n auto", "branch": "dev", "test_min": 42},
+    )
+    s = await db_module.register_session(db, p["id"], "sess-parity")
+    await db_module.add_sprint_item(db, p["id"], "v1", "FEAT: parity check", force=True)
+
+    expected_snippets = [
+        'test_cmd="pixi run test -n auto"',
+        'parallelism="-n auto"',
+        'branch="dev"',
+        # No explicit version scope was requested for any mode below, so all
+        # four must agree on the SAME unscoped fallback label too.
+        'version="unscoped"',
+    ]
+
+    for mode in ("full", "delta", "starter", "goal"):
+        _, content, _ = await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+            session_id=s["id"],
+        )
+        for snippet in expected_snippets:
+            assert snippet in content, (
+                f"mode={mode!r} missing {snippet!r} -- handoff modes disagree "
+                "on the effective test_cmd/parallelism/branch"
+            )
+        # No mode should ever surface the old hardcoded, now-stale value.
+        assert "-n 3" not in content, f"mode={mode!r} leaked stale '-n 3' text"
+
+
 def test_build_quick_start_goal_execution_policy_default_immediate():
     """75ac1c8e — the default executor handoff (no execution_policy passed,
     execution_mode defaults to 'autonomous') always carries the immediate-mode

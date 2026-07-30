@@ -385,3 +385,63 @@ async def test_delta_freshness_requery_strict_evidence_blocks_on_failure(
         )
     assert any(e["capability"] == "freshness_requery" for e in excinfo.value.errors)
     assert list(out_dir.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# 6cfdabd7 — delta mode must render the project's EFFECTIVE test_cmd/
+# parallelism policy (sourced from executor_config), not a hardcoded
+# "pixi run test -n 3" string -- the exact staleness bug this item fixes.
+# Placed here (not just test_cov_handoff.py) because delta is the one mode
+# this file already exercises end-to-end with a real session/db, and the
+# fix must hold for delta specifically, not just the full/starter/goal
+# paths already covered elsewhere.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delta_mode_renders_configured_test_cmd_not_stale_default(db, tmp_path):
+    """A project with an explicit set_executor_config(test_cmd=...) must see
+    THAT exact command (and its derived parallelism) in a delta handoff --
+    never the old hardcoded "-n 3" fallback."""
+    p = await db_module.create_project(db, "delta-test-cmd-scope")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    await db_module.set_executor_config(
+        db, p["id"], {"test_cmd": "pixi run test -n auto", "branch": "release"},
+    )
+    s = await db_module.register_session(db, p["id"], "sess-testcmd")
+    await db_module.add_sprint_item(db, p["id"], "v1", "FEAT: needs the test gate", force=True)
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
+        session_id=s["id"],
+    )
+    assert "pixi run test -n auto passes" in content
+    assert 'test_cmd="pixi run test -n auto"' in content
+    assert 'parallelism="-n auto"' in content
+    assert 'branch="release"' in content
+    assert "-n 3" not in content
+
+
+@pytest.mark.asyncio
+async def test_delta_mode_default_test_cmd_matches_full_mode_default(db, tmp_path):
+    """With NO executor_config configured, delta and full must agree on the
+    exact same fallback test_cmd/parallelism text -- proving the two render
+    paths share the same underlying settings resolution rather than each
+    carrying its own (possibly diverging) hardcoded string."""
+    p = await db_module.create_project(db, "delta-full-default-parity")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    s = await db_module.register_session(db, p["id"], "sess-default-parity")
+    await db_module.add_sprint_item(db, p["id"], "v1", "FEAT: default gate", force=True)
+
+    _, delta_content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
+        session_id=s["id"],
+    )
+    _, full_content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
+        session_id=s["id"],
+    )
+    for content in (delta_content, full_content):
+        assert "-n 3" not in content
+        assert 'test_cmd="pixi run test"' in content
+        assert 'branch="unset"' in content
