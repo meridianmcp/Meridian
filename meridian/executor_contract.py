@@ -97,6 +97,180 @@ def executor_contract_hash(contract: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Default routing lookup (de4d4293) -- a COMPACT, deterministic per-item
+# tool-routing HINT for the common case a "confirmed handoff gap" describes:
+# a sprint item with no explicit ``tool_requirements``/``required_tool`` pin
+# at all. Distinct from -- and deliberately much lighter than -- the full
+# :func:`build_executor_contract`: this answers ONLY "which tool should an
+# executor reach for FIRST," never executability/dependency/gate/completion-
+# check state. Explicit ``tool_requirements`` ALWAYS wins when present (see
+# :func:`build_routing_hint`) -- this table is purely a fallback.
+#
+# This is intentionally NOT a second, parallel per-item CONTRACT mechanism:
+# it reuses the exact same canonical read
+# (:func:`meridian.tool_requirements.effective_tool_requirements`)
+# :func:`build_executor_contract` itself uses for ``allowed_tools``/
+# ``forbidden_tools``, and never computes executability, dependencies, gates,
+# or completion checks -- those stay the sole responsibility of the full
+# contract. See ``handoff._build_executor_routing_clause`` for the bounded
+# (CLAIMABLE-batch-only) /goal text projection of this data, and
+# ``capability_contract.build_capability_contract``'s ``item_routing_summary``
+# for the structured JSON twin -- both read this SAME extraction so neither
+# can independently drift from the other.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_ROUTING_CATEGORIES: tuple[dict[str, Any], ...] = (
+    {
+        "category": "orchestration",
+        "keywords": frozenset({
+            "claim sprint", "sprint item", "parallelize", "parallel group",
+            "wave gate", "orchestrat", "claim_file", "claim_resource",
+            "claim_symbol",
+        }),
+        "server_or_namespace": "meridian",
+        "name": "claim_sprint_item",
+        "purpose": "orchestration/claims — claim, batch, or gate sprint work",
+        "fallback": ["meridian: get_parallelizable_groups"],
+    },
+    {
+        "category": "code_investigation",
+        "keywords": frozenset({
+            "investigate", "trace", "understand", "locate", "inspect",
+            "audit", "explore", "find the", "search the code", "root cause",
+        }),
+        "server_or_namespace": "Serena",
+        "name": "find_symbol",
+        "purpose": "code investigation — locate and read the relevant symbol(s)",
+        "fallback": ["codebase-memory: search_graph"],
+    },
+    {
+        "category": "handoff",
+        "keywords": frozenset({
+            "handoff", "generate_handoff", "mode parity", "/goal", "goal block",
+        }),
+        "server_or_namespace": "meridian",
+        "name": "generate_handoff",
+        "purpose": "handoff work — render/verify a generate_handoff mode",
+        "fallback": [],
+    },
+    {
+        "category": "tunnel_verification",
+        "keywords": frozenset({
+            "tunnel", "verification", "verify the", "run_verification",
+            "deploy gate", "smoke test",
+        }),
+        "server_or_namespace": "meridian",
+        "name": "run_verification",
+        "purpose": "tunnel verification — run the configured verification command",
+        "fallback": ["meridian: run_cmd"],
+    },
+    {
+        "category": "docx",
+        "keywords": frozenset({
+            "docx", "word document", ".docx", "region claim", "meridian-docs",
+        }),
+        "server_or_namespace": "meridian-docs",
+        "name": "claim_docx_region",
+        "purpose": "DOCX work — claim a document region before writing",
+        "fallback": ["meridian-outputs: record_provenance"],
+    },
+)
+
+
+def infer_default_routing_category(item: dict[str, Any]) -> "dict[str, Any] | None":
+    """Best-effort, deterministic keyword match against
+    :data:`_DEFAULT_ROUTING_CATEGORIES`, in table order (first match wins --
+    an item whose text matches two categories' keywords always resolves to
+    the SAME one across calls, never ambiguous). Searches the item's title +
+    notes, lowercased. Returns a ``tool_requirements``-shaped dict
+    (``required_or_preferred`` is always ``"preferred"`` -- an INFERRED
+    default is never a hard block the way an explicit pin can be) or
+    ``None`` when nothing matches. Pure, synchronous, no DB -- safe to call
+    from a text renderer with no async plumbing.
+    """
+    haystack = " ".join([
+        str(item.get("title") or ""), str(item.get("notes") or ""),
+    ]).lower()
+    if not haystack.strip():
+        return None
+    for cat in _DEFAULT_ROUTING_CATEGORIES:
+        if any(kw in haystack for kw in cat["keywords"]):
+            return {
+                "name": cat["name"],
+                "server_or_namespace": cat["server_or_namespace"],
+                "required_or_preferred": "preferred",
+                "purpose": cat["purpose"],
+                "call_template": None,
+                "fallback": list(cat["fallback"]),
+                "availability_check": None,
+                "verification": None,
+                "routing_category": cat["category"],
+            }
+    return None
+
+
+def build_routing_hint(item: dict[str, Any]) -> "dict[str, Any] | None":
+    """One compact routing hint for ``item``: explicit ``tool_requirements``/
+    ``required_tool`` (via
+    :func:`meridian.tool_requirements.effective_tool_requirements` -- the
+    SAME canonical read :func:`build_executor_contract` itself uses for
+    ``allowed_tools``) when present, else
+    :func:`infer_default_routing_category`'s best-effort default. Returns
+    ``None`` when the item has no id, or neither source resolves anything --
+    never fabricates a hint out of nothing.
+    """
+    item_id = item.get("id")
+    if not item_id:
+        return None
+    requirements = _tool_requirements.effective_tool_requirements(item)
+    if requirements:
+        primary = next(
+            (r for r in requirements if r.get("required_or_preferred") == "required"),
+            requirements[0],
+        )
+        source = "explicit"
+    else:
+        primary = infer_default_routing_category(item)
+        if primary is None:
+            return None
+        source = "inferred"
+    return {
+        "item_id": item_id,
+        "server_or_namespace": primary.get("server_or_namespace"),
+        "name": primary.get("name"),
+        "required_or_preferred": primary.get("required_or_preferred"),
+        "purpose": primary.get("purpose"),
+        "source": source,
+    }
+
+
+def build_routing_summary(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deterministic (sorted by ``item_id``), compact per-item routing
+    summary for ``items`` -- the canonical source BOTH the /goal text's
+    ``<executor_routing>`` clause (``handoff._build_executor_routing_clause``)
+    and the structured ``capability_contract.item_routing_summary`` field
+    read, so the two never independently drift. Only items with a
+    resolvable hint (explicit or inferred) are included -- an item with
+    nothing to say contributes nothing, mirroring the sibling ``extract_*``
+    helpers' own "nothing to report" restraint. Non-dict entries are
+    skipped rather than raising.
+    """
+    hints = [
+        h for h in (build_routing_hint(it) for it in items if isinstance(it, dict))
+        if h is not None
+    ]
+    return sorted(hints, key=lambda h: h["item_id"])
+
+
+def routing_summary_hash(summary: list[dict[str, Any]]) -> str:
+    """Stable sha256 over ``summary``'s canonical JSON -- lets a TEXT
+    projection and a structured JSON projection of the SAME summary prove
+    byte-for-byte parity without either having to embed the other's full
+    body."""
+    return hashlib.sha256(_canonical_json(summary).encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # Tool availability -- bridges tool_requirements' "Server: name" convention
 # onto capability_availability's "plugin__tool" classifier, reusing (never
 # reimplementing) evaluate_capability_availability's fallback-rescue logic.

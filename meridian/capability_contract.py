@@ -555,6 +555,9 @@ async def _resolve_pending_items_for_contract(
     return [it for it in items if it.get("status") in ("todo", "pending")]
 
 
+_DEFAULT_MAX_EXECUTOR_CONTRACTS = 25
+
+
 async def build_capability_contract(
     db: Any,
     project_id: str,
@@ -564,6 +567,7 @@ async def build_capability_contract(
     availability_checker: "AvailabilityChecker | None" = None,
     version: "str | None" = None,
     items: "list[dict[str, Any]] | None" = None,
+    max_executor_contracts: int = _DEFAULT_MAX_EXECUTOR_CONTRACTS,
 ) -> dict[str, Any]:
     """Build the effective capability contract for ``project_id``.
 
@@ -598,6 +602,23 @@ async def build_capability_contract(
     readiness verification, matching
     ``handoff._build_artifact_pointer_findings_clause``'s
     ``<artifact_pointer_findings>`` XML clause for the same request.
+
+    ``max_executor_contracts`` (de4d4293) — CAPS how many full per-item
+    ``item_executor_contracts`` entries this call embeds, applied AFTER a
+    deterministic ``item_id`` sort so the same underlying board always caps
+    to the same subset. This is the direct fix for a real, already-shipped
+    size regression (23e20656): embedding one FULL executor_contract per
+    PENDING item with no bound at all inflated a real project's
+    ``generate_handoff`` JSON response by 95KB+ on a 37-69 item board,
+    repeatedly breaking the calling MCP client's own max-tool-output-size
+    limit. When the candidate list exceeds the cap, ``item_executor_contracts``
+    holds only the first ``max_executor_contracts`` (by ``item_id``) and a
+    sibling ``item_executor_contracts_truncated`` dict records
+    ``{"truncated": True, "total_candidates": N, "included": cap}`` — never
+    a SILENT drop. A board at or under the cap gets
+    ``{"truncated": False, ...}`` and, functionally, the exact same output
+    as before this parameter existed (default matches the shipped-bug's
+    effective board sizes at the low end, chosen deliberately conservative).
 
     Never raises: ``get_project_capability_manifest`` returns an empty
     profile for any project with no persisted manifest (649e095f's own
@@ -658,7 +679,26 @@ async def build_capability_contract(
     # project-scoped queries. Fully guarded per item — one item's failure
     # degrades to that item simply being absent from the list, never breaks
     # the mandatory contract.
+    #
+    # de4d4293 — BOUNDED: candidates are sorted by item_id and capped to
+    # ``max_executor_contracts`` BEFORE any per-item contract is built (never
+    # after), so a huge board never pays the async build cost for entries it
+    # will discard anyway. This directly fixes a real, already-shipped size
+    # regression — see build_capability_contract's own docstring for the
+    # incident this cap exists to prevent. Never silent: when the candidate
+    # count exceeds the cap, item_executor_contracts_truncated records the
+    # full picture rather than letting the list simply come up short.
     item_executor_contracts: list[dict[str, Any]] = []
+    _executor_contract_candidates = sorted(
+        (
+            _it for _it in _pending_items_for_tool_reqs
+            if isinstance(_it, dict) and _it.get("id")
+        ),
+        key=lambda _it: _it["id"],
+    )
+    _ec_total_candidates = len(_executor_contract_candidates)
+    _ec_cap = max(0, int(max_executor_contracts or 0))
+    _executor_contract_candidates = _executor_contract_candidates[:_ec_cap]
     try:
         from . import executor_contract as _executor_contract  # noqa: PLC0415
 
@@ -670,9 +710,7 @@ async def build_capability_contract(
             _project_row = await db_module.get_project(db, project_id)
         except Exception:  # noqa: BLE001
             _project_row = None
-        for _it in _pending_items_for_tool_reqs:
-            if not isinstance(_it, dict) or not _it.get("id"):
-                continue
+        for _it in _executor_contract_candidates:
             try:
                 _ec = await _executor_contract.build_executor_contract(
                     db, project_id, _it, version=version,
@@ -693,6 +731,36 @@ async def build_capability_contract(
         item_executor_contracts.sort(key=lambda c: c.get("item_id") or "")
     except Exception:  # noqa: BLE001 — executor_contract is best-effort enrichment
         item_executor_contracts = []
+    item_executor_contracts_truncated = {
+        "truncated": _ec_total_candidates > _ec_cap,
+        "total_candidates": _ec_total_candidates,
+        "included": len(item_executor_contracts),
+    }
+
+    # de4d4293 — compact per-item routing summary + parity hash: the SAME
+    # canonical extraction (executor_contract.build_routing_summary) the
+    # /goal text's <executor_routing> clause reads
+    # (handoff._build_executor_routing_clause), computed here over the SAME
+    # _pending_items_for_tool_reqs list as the sibling item_tool_requirements/
+    # item_sprint_item_pointers/item_artifact_pointer_findings sections above
+    # (the full version-scoped pending inventory — NOT the narrower
+    # claimable-batch scope the /goal text's own <executor_routing> clause
+    # deliberately uses; see that clause's docstring for why the text stays
+    # narrower). This is cheap and bounded by construction — no DB, no
+    # per-item async work, one short entry per item — never the size risk
+    # item_executor_contracts above needed an explicit cap for.
+    try:
+        from . import executor_contract as _executor_contract_routing  # noqa: PLC0415
+
+        item_routing_summary = _executor_contract_routing.build_routing_summary(
+            _pending_items_for_tool_reqs
+        )
+        item_routing_summary_hash = _executor_contract_routing.routing_summary_hash(
+            item_routing_summary
+        )
+    except Exception:  # noqa: BLE001 — routing summary is best-effort enrichment
+        item_routing_summary = []
+        item_routing_summary_hash = None
 
     effective_capabilities, effective_source = _resolve_effective_capabilities(
         db, project_id, requested_capabilities, resolver=effective_resolver,
@@ -763,6 +831,9 @@ async def build_capability_contract(
         "item_sprint_item_pointers": item_sprint_item_pointers,
         "item_artifact_pointer_findings": item_artifact_pointer_findings,
         "item_executor_contracts": item_executor_contracts,
+        "item_executor_contracts_truncated": item_executor_contracts_truncated,
+        "item_routing_summary": item_routing_summary,
+        "item_routing_summary_hash": item_routing_summary_hash,
         "board_stale": bool(board_stale),
         "executable": executable,
         "executable_reasons": executable_reasons,
