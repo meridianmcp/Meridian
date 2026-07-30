@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import re
+from pathlib import Path
 
 import pytest
 
@@ -2884,3 +2885,285 @@ async def test_fresh_session_goal_block_self_sufficient_no_manual_reconstruction
         and any(r.get("name") == "find_symbol" for r in e.get("requirements", []))
         for e in tool_reqs
     )
+
+
+# ---------------------------------------------------------------------------
+# 8a883f60 — explicit, machine-readable evidence_status for generate_handoff's
+# best-effort steps (code-pointer enrichment, resolved-pointer annotation,
+# freshness re-query, wave-gate exclusion, graph-search availability), plus
+# the opt-in strict_evidence fail-closed gate. See meridian/handoff.py's
+# _capability_outcome / HandoffEvidenceRequired / _finalize_capability_status
+# for the implementation this section exercises.
+# ---------------------------------------------------------------------------
+
+_ALL_EVIDENCE_CAPS = {
+    "code_pointer_enrichment", "resolved_pointer_annotation",
+    "freshness_requery", "wave_gate_exclusion", "graph_search_availability",
+}
+
+
+@pytest.mark.parametrize("mode", ["full", "delta", "starter", "goal"])
+async def test_generate_handoff_evidence_status_always_reports_all_five_capabilities(
+    db, tmp_path, mode,
+):
+    """Acceptance point 1: every best-effort step gets an EXPLICIT outcome —
+    never a silently-missing key — on every executable mode, not just goal."""
+    p = await db_module.create_project(db, f"evidence-shape-{mode}")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+    evidence_status: dict = {}
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+        evidence_status=evidence_status,
+    )
+    assert set(evidence_status) == _ALL_EVIDENCE_CAPS
+    for cap_id, entry in evidence_status.items():
+        assert entry["status"] in {"verified", "skipped", "failed", "degraded"}, cap_id
+        # Acceptance point 2: exact reason, never blank/generic.
+        assert isinstance(entry["reason"], str) and entry["reason"].strip()
+        assert "fallback" in entry
+
+
+async def test_generate_handoff_evidence_status_starter_marks_pointer_steps_skipped(
+    db, tmp_path,
+):
+    """starter/compact structurally never resolves code pointers at all
+    (pre-existing behavior, unchanged) — that must read as an explicit
+    'skipped', not simply be absent from evidence_status."""
+    p = await db_module.create_project(db, "evidence-starter-skips")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+    evidence_status: dict = {}
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="starter",
+        evidence_status=evidence_status,
+    )
+    for cap_id in (
+        "code_pointer_enrichment", "resolved_pointer_annotation",
+        "graph_search_availability", "freshness_requery",
+    ):
+        assert evidence_status[cap_id]["status"] == "skipped", cap_id
+    # wave-gate exclusion IS a real check in starter mode.
+    assert evidence_status["wave_gate_exclusion"]["status"] == "verified"
+
+
+async def test_generate_handoff_evidence_status_is_pure_addition_content_unchanged(
+    db, tmp_path,
+):
+    """Acceptance point 5: passing evidence_status (default callers never do)
+    must not change `content` at all — pure addition, byte-identical modulo
+    the single-use goal_token (same 9c6cac08-style comparison the rest of
+    this file already uses for mode='goal')."""
+    p = await db_module.create_project(db, "evidence-pure-addition")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    _, content_without, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    _, content_with, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+        evidence_status={},
+    )
+    assert _strip_goal_token(content_without) == _strip_goal_token(content_with)
+
+
+@pytest.mark.parametrize("mode", ["full", "delta", "starter", "goal"])
+async def test_generate_handoff_evidence_status_deterministic_repeated_calls(
+    db, tmp_path, mode,
+):
+    """Acceptance point 4 — same 'call twice, diff' pattern 9c6cac08
+    established (see test_generate_handoff_goal_mode_deterministic_modulo_token
+    above), applied to evidence_status for each of the four modes. Unlike
+    `content` (which carries a fresh goal_token/timestamp each call),
+    evidence_status carries no wall-clock/nonce field at all, so it must be
+    EXACTLY equal across two calls against identical DB state — no stripping
+    needed."""
+    p = await db_module.create_project(db, f"evidence-determinism-{mode}")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+    status_a: dict = {}
+    status_b: dict = {}
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+        evidence_status=status_a,
+    )
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+        evidence_status=status_b,
+    )
+    assert status_a == status_b
+
+
+async def test_generate_handoff_evidence_status_survives_code_pointer_search_error(
+    db, tmp_path,
+):
+    """_annotate_code_pointers NEVER raises for a per-item search failure (it
+    catches it, sets prospect_status='error', and continues) — the outer
+    try/except around that call therefore can't see it on its own. This
+    proves generate_handoff recovers that signal instead of reporting
+    'verified' just because the outer call didn't raise (see
+    _code_pointer_enrichment_error_outcome)."""
+    p = await db_module.create_project(db, "evidence-searcher-blowup")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Fix OAuth redirect bug")
+
+    def _boom_searcher(_query):
+        raise RuntimeError("search index unavailable")
+
+    evidence_status: dict = {}
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
+        graph_searcher=_boom_searcher, evidence_status=evidence_status,
+    )
+    cpe = evidence_status["code_pointer_enrichment"]
+    assert cpe["status"] in {"failed", "degraded"}
+    assert "search index unavailable" in cpe["reason"]
+    assert cpe["fallback"]
+    # And the mandatory handoff still rendered — this is best-effort, not fatal.
+    assert content
+
+
+async def test_generate_handoff_evidence_status_wave_gate_fetch_failure(
+    db, tmp_path, monkeypatch,
+):
+    """A wave-gate config fetch failure (e.g. pre-migration DB) is reported
+    as an explicit failed capability with the real exception text, not
+    silently folded into 'verified' just because generate_handoff itself
+    kept going."""
+    p = await db_module.create_project(db, "evidence-wave-gate-blowup")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("wave_gate_configs table missing")
+
+    monkeypatch.setattr(db_module, "get_wave_gate_configs", _boom)
+
+    evidence_status: dict = {}
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
+        evidence_status=evidence_status,
+    )
+    wge = evidence_status["wave_gate_exclusion"]
+    assert wge["status"] == "failed"
+    assert "wave_gate_configs table missing" in wge["reason"]
+    assert wge["fallback"]
+    assert content  # still a valid mandatory handoff — degrade, don't break
+
+
+# ---------------------------------------------------------------------------
+# strict_evidence — opt-in, fail-closed (acceptance point 3). Mirrors
+# sprint_evidence_guard's strict_evidence/require_strict_evidence contract:
+# never engages unless a caller explicitly asks, and when it does, nothing
+# is rendered/persisted for that call.
+# ---------------------------------------------------------------------------
+
+
+async def test_generate_handoff_strict_evidence_off_by_default_same_as_before(
+    db, tmp_path, monkeypatch,
+):
+    """The exact same broken state (wave-gate fetch raising) that trips
+    strict_evidence below must NOT change behavior at all when
+    strict_evidence is omitted — today's graceful-degrade default."""
+    p = await db_module.create_project(db, "evidence-default-unaffected")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("wave_gate_configs table missing")
+
+    monkeypatch.setattr(db_module, "get_wave_gate_configs", _boom)
+
+    path, content, amended = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
+    )
+    assert content  # rendered normally; no exception, no behavior change
+    assert Path(path).exists()
+
+
+async def test_generate_handoff_strict_evidence_raises_and_writes_nothing(
+    db, tmp_path, monkeypatch,
+):
+    """strict_evidence=True on a failed capability raises
+    HandoffEvidenceRequired BEFORE anything is rendered/written/persisted —
+    fail CLOSED, not a plausible-looking-but-incomplete goal."""
+    p = await db_module.create_project(db, "evidence-strict-blocks")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("wave_gate_configs table missing")
+
+    monkeypatch.setattr(db_module, "get_wave_gate_configs", _boom)
+
+    out_dir = tmp_path / "strict-out"
+    out_dir.mkdir()
+    with pytest.raises(handoff_module.HandoffEvidenceRequired) as excinfo:
+        await handoff_module.generate_handoff(
+            db, p["id"], str(out_dir), skip_ai_summary=True, mode="full",
+            strict_evidence=True,
+        )
+    errors = excinfo.value.errors
+    assert any(e["capability"] == "wave_gate_exclusion" for e in errors)
+    assert any(e["status"] == "failed" for e in errors)
+    assert excinfo.value.evidence_status["wave_gate_exclusion"]["status"] == "failed"
+    # Nothing was written for this refused call.
+    assert list(out_dir.iterdir()) == []
+    # And the pending_goal channel (5efe254b) was never touched either — a
+    # refused handoff must not leak a stale-but-plausible /goal into it.
+    pending = await db_module.get_pending_goal(db, p["id"])
+    assert pending is None
+
+
+async def test_generate_handoff_strict_evidence_passes_when_nothing_failed(
+    db, tmp_path,
+):
+    """strict_evidence=True must NOT block a genuinely clean run — only a
+    failed/degraded capability triggers the refusal, never 'skipped' ones."""
+    p = await db_module.create_project(db, "evidence-strict-clean")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    path, content, amended = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="starter",
+        strict_evidence=True,
+    )
+    assert content
+    assert Path(path).exists()
+
+
+async def test_generate_handoff_mcp_dispatch_returns_handoff_evidence_status(db, tmp_path):
+    """The real MCP dispatch (mcp/handler.py) — what actually ships to a
+    caller — surfaces handoff_evidence_status on every call, plus the
+    strict_evidence flag it echoed back, as pure additions alongside the
+    pre-existing capability_contract field."""
+    p = await db_module.create_project(db, "evidence-mcp-dispatch")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert set(result["handoff_evidence_status"]) == _ALL_EVIDENCE_CAPS
+    assert result["strict_evidence"] is False
+    assert result["content"]  # unaffected — still the bare /goal block
+    assert result["capability_contract"] is not None or result["capability_contract"] is None
+
+
+async def test_generate_handoff_mcp_dispatch_strict_evidence_blocked_response(
+    db, tmp_path, monkeypatch,
+):
+    """strict_evidence=true over the real MCP dispatch returns a structured
+    refusal (mirrors complete_sprint_item's STRICT_EVIDENCE_BLOCKED shape)
+    instead of raising an unhandled exception up through the transport."""
+    p = await db_module.create_project(db, "evidence-mcp-strict-blocked")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("wave_gate_configs table missing")
+
+    monkeypatch.setattr(db_module, "get_wave_gate_configs", _boom)
+
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "full", "strict_evidence": True},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert result["error"] == "HANDOFF_EVIDENCE_BLOCKED"
+    assert result["project_id"] == p["id"]
+    assert any(
+        e["capability"] == "wave_gate_exclusion" for e in result["evidence_errors"]
+    )
+    assert "wave_gate_exclusion" in result["evidence_status"]
+    assert "strict_evidence=true" not in result["message"] or "strict_evidence" in result["message"]

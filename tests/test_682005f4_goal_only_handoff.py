@@ -203,11 +203,32 @@ async def test_generate_handoff_goal_mode_uses_code_pointer_searcher(db, tmp_pat
             }
         ]
 
+    # 8a883f60 — evidence_status is a pure-addition output param: passing it
+    # must not change anything about `content` (still asserted below), and a
+    # caller that doesn't pass it (every OTHER test in this file) must see
+    # zero behavior change either.
+    evidence_status: dict = {}
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
-        graph_searcher=searcher,
+        graph_searcher=searcher, evidence_status=evidence_status,
     )
     assert captured and "oauth" in captured[0]
+
+    # All five capabilities are always reported, even in goal mode.
+    assert set(evidence_status) == {
+        "code_pointer_enrichment", "resolved_pointer_annotation",
+        "freshness_requery", "wave_gate_exclusion", "graph_search_availability",
+    }
+    # A real, successful searcher call -> verified, not silently "maybe ok".
+    assert evidence_status["code_pointer_enrichment"]["status"] == "verified"
+    assert evidence_status["graph_search_availability"]["status"] == "verified"
+    assert evidence_status["wave_gate_exclusion"]["status"] == "verified"
+    # goal mode structurally never re-queries freshness (only full/delta do)
+    # -- reported explicitly as skipped, not simply absent.
+    assert evidence_status["freshness_requery"]["status"] == "skipped"
+    for entry in evidence_status.values():
+        assert entry["status"] in {"verified", "skipped", "failed", "degraded"}
+        assert entry["reason"]  # exact reason always present, never blank
 
 
 @pytest.mark.asyncio
@@ -231,11 +252,35 @@ async def test_generate_handoff_goal_mode_survives_pointer_resolve_blowup(
 
     monkeypatch.setattr(db_module, "get_sprint_item_pointers", _boom)
 
+    # 8a883f60 — default (non-strict) call: content behavior is UNCHANGED
+    # (both assertions below are the pre-existing ones, untouched), but the
+    # blowup is now visible as an explicit failed capability with the EXACT
+    # underlying reason instead of being indistinguishable from success.
+    evidence_status: dict = {}
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+        evidence_status=evidence_status,
     )
     assert "resilient item" not in content  # title isn't rendered raw in goal mode...
     assert item["id"] in content  # ...but the id still is, and nothing crashed.
+
+    rpa = evidence_status["resolved_pointer_annotation"]
+    assert rpa["status"] == "failed"
+    assert "pointer fetch exploded" in rpa["reason"]  # exact cause, not generic
+    assert rpa["fallback"]  # an approved fallback is documented
+
+    # strict_evidence=True on the SAME broken state must fail CLOSED instead
+    # of silently emitting the plausible-looking-but-incomplete goal above:
+    # nothing is written for this call.
+    with pytest.raises(handoff_module.HandoffEvidenceRequired) as excinfo:
+        await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+            strict_evidence=True,
+        )
+    assert any(
+        e["capability"] == "resolved_pointer_annotation" for e in excinfo.value.errors
+    )
+    assert excinfo.value.evidence_status["resolved_pointer_annotation"]["status"] == "failed"
 
 
 # ---------------------------------------------------------------------------

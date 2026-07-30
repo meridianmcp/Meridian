@@ -2822,6 +2822,15 @@ async def _handle_task_tools(
         if isinstance(_raw_fii, list):
             _force_include_ids = [str(x) for x in _raw_fii if x]
         _handoff_degraded = False
+        # 8a883f60 — opt-in, fail-closed strict evidence for this handoff's
+        # best-effort steps (mirrors complete_sprint_item's strict_evidence
+        # shape exactly — same name, same off-by-default contract). The
+        # out-param dict below is ALWAYS passed so evidence_status is emitted
+        # on every call regardless of strict_evidence — a pure ADDITION to the
+        # response, never a change to `content` itself. See
+        # handoff.generate_handoff's own docstring for the full contract.
+        _strict_evidence = bool(args.get("strict_evidence"))
+        _evidence_status: dict[str, Any] = {}
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -2836,6 +2845,8 @@ async def _handle_task_tools(
                     force_include_ids=_force_include_ids,
                     skip_ai_summary=_skip_ai,
                     version=_requested_version,
+                    strict_evidence=_strict_evidence,
+                    evidence_status=_evidence_status,
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -2843,6 +2854,27 @@ async def _handle_task_tools(
                 # backstop for DB-heavy projects.
                 timeout=180.0,
             )
+        except handoff_module_local.HandoffEvidenceRequired as exc:
+            # 8a883f60 — strict_evidence=True and at least one best-effort
+            # capability was failed/degraded: fail CLOSED. Nothing was
+            # rendered/written/persisted for this call (see
+            # generate_handoff's docstring) — surface a structured refusal
+            # instead of a plausible-looking-but-incomplete goal, mirroring
+            # complete_sprint_item's STRICT_EVIDENCE_BLOCKED response shape.
+            return {
+                "error": "HANDOFF_EVIDENCE_BLOCKED",
+                "project_id": args["project_id"],
+                "evidence_status": exc.evidence_status,
+                "evidence_errors": exc.errors,
+                "message": (
+                    "Refusing to generate handoff: strict evidence verification "
+                    "failed (" + ", ".join(e["code"] for e in exc.errors) + "). "
+                    "This handoff was NOT rendered or persisted. Resolve the "
+                    "underlying capability failure(s) and retry, or call "
+                    "generate_handoff without strict_evidence=true to get "
+                    "today's graceful-degrade behavior."
+                ),
+            }
         except asyncio.TimeoutError:
             path, content = await handoff_module_local._generate_handoff_l0(
                 db, args["project_id"], data_dir
@@ -2954,6 +2986,18 @@ async def _handle_task_tools(
             "goal_length_warning": _goal_warn,
             "goal_compliance": _goal_compliance,
             "capability_contract": _capability_contract,
+            # 8a883f60 — explicit per-capability outcome (verified/skipped/
+            # failed/degraded, with exact reason + fallback used) for every
+            # best-effort step this call ran: code-pointer enrichment,
+            # resolved-pointer annotation, freshness re-query, wave-gate
+            # exclusion, graph-search availability. Pure ADDITION — emitted
+            # on every call regardless of strict_evidence; {} only when the
+            # 180s timeout fired before generate_handoff reached its own
+            # finalize step (see the l0_fallback/degraded handling above).
+            "handoff_evidence_status": _evidence_status,
+            # 8a883f60 — echoes the strict_evidence flag this call actually
+            # used, so a caller never has to re-derive it from args.
+            "strict_evidence": _strict_evidence,
             # 6cdc5df3 — one entry per proposal id with linked evidence in this
             # project (see meridian.db.proposal_links.get_proposal_evidence).
             "proposal_evidence": _proposal_evidence,
