@@ -759,7 +759,26 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "f7ee1ba7 — pass session_id to enable scoped-region claim enforcement: "
         "if another session has claimed the target para_id (or holds a whole-file "
         "lock), the write is REJECTED with error='docx_region_conflict'. Use "
-        "claim_docx_region to acquire your region before writing.",
+        "claim_docx_region to acquire your region before writing. "
+        "5988a5bb — mandatory post-write verification now re-reads the file "
+        "from disk and confirms the target paragraph's text actually landed "
+        "before this ever reports success; on a rare verification failure the "
+        "write is best-effort restored from backup and an error is returned "
+        "instead. Response also now includes pre_counts/post_counts (the "
+        "media/style/equation/relationship structural manifest from before "
+        "and after the write). Three further OPT-IN parameters (each omitted "
+        "by default, byte-identical behavior when omitted): "
+        "expected_content_hash — a fail-closed precondition: if the source "
+        "file's current on-disk content hash doesn't match, the write is "
+        "REJECTED before anything is touched (get the current hash from a "
+        "prior get_document_structure/get_structure staleness check). "
+        "draft_output_path + wave_run_id (both-or-neither, with session_id "
+        "also required) — writes to an ISOLATED draft path instead of the "
+        "canonical file, claiming the paragraph as this wave's anchor via the "
+        "real docx-merge manifest so a conflicting concurrent draft on the "
+        "same paragraph is rejected; response carries draft_path/wave_run_id/ "
+        "is_draft instead of elements_resynced (the canonical index is not "
+        "touched until a merge).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
@@ -768,7 +787,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "new_text": {"type": "string", "description": "New paragraph text as a single unformatted run. Provide this OR runs, not both."},
          "runs": {"type": "array", "description": "List of runs — each a plain string or a {text, bold?, italic?, underline?} object. Provide this OR new_text, not both.",
                   "items": {"type": ["string", "object"]}},
-         "session_id": {"type": "string", "description": "f7ee1ba7 — calling session id. When provided, scoped-region claim enforcement activates: the write is rejected if another session claims the target para_id or holds a whole-file lock. Without session_id the guard is skipped (legacy/unclaimed writes pass through)."}},
+         "session_id": {"type": "string", "description": "f7ee1ba7 — calling session id. When provided, scoped-region claim enforcement activates: the write is rejected if another session claims the target para_id or holds a whole-file lock. Without session_id the guard is skipped (legacy/unclaimed writes pass through). 5988a5bb — also required (together with draft_output_path/wave_run_id) to use wave-scoped draft mode."},
+         "expected_content_hash": {"type": "string", "description": "5988a5bb — opt-in fail-closed precondition: the write is rejected BEFORE touching the file if this doesn't match the source's CURRENT on-disk content hash. Omit for the pre-5988a5bb advisory-only staleness warning instead."},
+         "draft_output_path": {"type": "string", "description": "5988a5bb — opt-in wave-scoped draft mode: write to this isolated path instead of the canonical `doc`. Must be given together with wave_run_id and session_id; must differ from `doc`."},
+         "wave_run_id": {"type": "string", "description": "5988a5bb — the wave identifier scoping this draft's meridian.db.docx_merge manifest. Must be given together with draft_output_path and session_id."}},
          "required": ["doc", "para_id"]}},
     {"name": "find_symbol_usages", "description":
         "9605edb0 — READ-ONLY cross-reference tracking: given a document and "
