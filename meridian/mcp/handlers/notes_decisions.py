@@ -855,9 +855,20 @@ async def handle_update_paragraph(
     docx-region claims and REJECT the write when another session owns the
     target element (or holds a whole-file lock). Fail-open: a claim-lookup
     error degrades to allow so a missing db never wedges a legitimate write.
+
+    5988a5bb — threads three new OPT-IN parameters straight through to
+    ``store.update_paragraph`` (see that method's docstring for the fail-
+    closed/draft-mode semantics); none of them change behavior when omitted:
+    ``expected_content_hash`` (fail-closed staleness precondition),
+    ``draft_output_path`` + ``wave_run_id`` (wave-scoped isolated-draft
+    write, both-or-neither). The scoped-region claim-check layering above
+    is otherwise unchanged.
     """
     validate_input_size(args.get("doc"), "doc", 2_000)
     validate_input_size(args.get("para_id"), "para_id", 500)
+    validate_input_size(args.get("expected_content_hash"), "expected_content_hash", 200)
+    validate_input_size(args.get("draft_output_path"), "draft_output_path", 4_000)
+    validate_input_size(args.get("wave_run_id"), "wave_run_id", 200)
     if not args.get("project_id"):
         return {"error": "project_id is required"}
     doc_source = args.get("doc")
@@ -900,6 +911,10 @@ async def handle_update_paragraph(
     try:
         result = await store.update_paragraph(
             args["project_id"], doc_source, para_id, new_text_or_runs,
+            expected_content_hash=args.get("expected_content_hash") or None,
+            draft_output_path=args.get("draft_output_path") or None,
+            wave_run_id=args.get("wave_run_id") or None,
+            session_id=_up_session_id,
         )
     except ValueError as exc:
         return {"error": str(exc)}
