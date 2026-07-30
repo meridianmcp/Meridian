@@ -1223,11 +1223,56 @@ class DocxPostWriteVerificationError(OSError):
     finds the promoted file doesn't actually contain the intended edit -- a
     silent no-op or wrong-target write that the structural manifest alone
     would never catch. A best-effort restore from ``dest + ".bak"`` is
-    attempted before this is raised, but (unlike the pre-promotion case)
-    "untouched" cannot be guaranteed here, only "restored on a best-effort
-    basis" -- check ``.manifest.get("restored")`` for whether it succeeded.
-    Subclasses ``OSError`` for the same broad-except compatibility as
-    :class:`DocxWriteVerificationError`.
+    attempted before this is raised -- but ONLY when it is safe to do so
+    (see :func:`_safe_restore_after_verification_failure`: a compare-and-swap
+    check confirming no OTHER writer has promoted something newer to
+    ``dest`` since this writer's own promotion). "Untouched" cannot be
+    guaranteed here the way it is for :class:`DocxWriteVerificationError`
+    (this fires AFTER promotion), only "restored on a best-effort basis when
+    safe" -- check ``.manifest.get("restored")`` for whether it was
+    attempted and succeeded. When it was NOT safe to restore (a genuine
+    concurrent write landed), :class:`DocxConcurrentWriteConflictError` is
+    raised instead of this class -- the two are deliberately distinguishable
+    via ``isinstance()`` so a caller/operator can tell "my own write simply
+    didn't verify" apart from "someone else's write landed after mine and I
+    backed off rather than clobber it." Subclasses ``OSError`` for the same
+    broad-except compatibility as :class:`DocxWriteVerificationError`.
+    """
+
+    def __init__(self, message: str, *, manifest: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.manifest = manifest or {}
+
+
+class DocxConcurrentWriteConflictError(OSError):
+    """5988a5bb (finding 1) -- a post-write verification failure that could NOT
+    be safely auto-corrected because a DIFFERENT writer's promotion landed on
+    the same destination after this writer's own promotion.
+
+    Raised by ``update_paragraph`` / ``merge_paragraph_draft`` instead of
+    :class:`DocxPostWriteVerificationError` when
+    :func:`_safe_restore_after_verification_failure` finds that the
+    destination's CURRENT on-disk bytes no longer match what THIS writer
+    itself promoted (via ``_write_docx_transaction``'s ``promoted_sha256``
+    fingerprint). In that situation the original verification failure this
+    writer observed is very likely a FALSE POSITIVE caused by the other
+    writer's legitimate, already-promoted edit landing in between this
+    writer's own promotion and its own verify -- restoring from this
+    writer's ``.bak`` would silently destroy that other, completed write.
+
+    This error is deliberately raised WITHOUT touching the destination any
+    further: it is left exactly as the other writer left it. Distinguishable
+    via ``isinstance()`` from :class:`DocxPostWriteVerificationError` (a
+    same-writer verification failure that WAS safe to restore) so a caller
+    can tell the two apart rather than treat every post-write failure
+    identically. Subclasses ``OSError`` for the same broad-except
+    compatibility as the other docx write-transaction errors in this module.
+
+    Note this only catches a CROSS-PROCESS race (or same-process code that
+    bypasses :func:`_docx_promotion_lock`) -- a same-process, same-thread-
+    reentrant race is already closed entirely by that lock now spanning the
+    full stage+promote -> verify -> conditional-restore sequence (see its
+    module-level comment).
     """
 
     def __init__(self, message: str, *, manifest: dict[str, Any] | None = None):
@@ -1246,17 +1291,43 @@ _DOCX_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships
 # normalized absolute path so two threads racing to promote a staged draft
 # into the SAME .docx can never interleave their promotion; distinct
 # destinations never block each other.
-_DOCX_PROMOTION_LOCKS: dict[str, threading.Lock] = {}
+#
+# 5988a5bb -- widened from ``threading.Lock`` to ``threading.RLock``. Callers
+# with a caller-specific post-write check (``update_paragraph`` /
+# ``merge_paragraph_draft``) now hold this SAME lock across their entire
+# stage+promote -> verify -> conditional-restore sequence, not just the
+# promote step -- ``_write_docx_transaction`` still acquires it internally
+# for its own stage+promote step, so a caller holding it at the top needs
+# reentrant acquisition from the SAME thread to avoid deadlocking itself.
+# This closes the SAME-PROCESS race window between promotion and a
+# subsequent verify/restore completely: two concurrent async tasks/threads
+# within THIS process can never interleave one writer's promotion with
+# another writer's verify-then-restore. It does NOT -- and structurally
+# cannot, since a lock (reentrant or not) is process-local -- protect
+# against a DIFFERENT process promoting to the same ``dest`` in that window.
+# That is the realistic threat model here: this codebase runs one process
+# per client session in the self-hosted deployment model (AGENTS.md), so
+# two legitimate writers racing the same file are almost always two
+# processes, not two threads in one. The cross-process case is instead
+# covered by the compare-and-swap fingerprint check in ``update_paragraph``
+# / ``merge_paragraph_draft`` (comparing ``dest``'s CURRENT on-disk bytes
+# against what THIS writer itself promoted before deciding whether a
+# verification-failure restore is safe) -- see 5988a5bb finding notes.
+_DOCX_PROMOTION_LOCKS: dict[str, threading.RLock] = {}
 _DOCX_PROMOTION_LOCKS_GUARD = threading.Lock()
 
 
-def _docx_promotion_lock(dest: str) -> threading.Lock:
-    """Return the process-wide promotion lock for ``dest``'s canonical path."""
+def _docx_promotion_lock(dest: str) -> threading.RLock:
+    """Return the process-wide, reentrant promotion lock for ``dest``'s
+    canonical path (5988a5bb -- reentrant so a caller can hold it across a
+    stage+promote -> verify -> conditional-restore sequence while
+    ``_write_docx_transaction`` also reentrantly acquires it internally for
+    its own stage+promote step; see the module-level comment above)."""
     key = os.path.normcase(os.path.abspath(dest))
     with _DOCX_PROMOTION_LOCKS_GUARD:
         lock = _DOCX_PROMOTION_LOCKS.get(key)
         if lock is None:
-            lock = threading.Lock()
+            lock = threading.RLock()
             _DOCX_PROMOTION_LOCKS[key] = lock
         return lock
 
@@ -1385,12 +1456,23 @@ def _write_docx_transaction(
        immediately before promotion (best-effort, non-fatal on failure --
        a doc write must not fail because backup housekeeping did).
 
-    Returns ``{"manifest_hash", "pre_counts", "post_counts"}``.
+    Returns ``{"manifest_hash", "pre_counts", "post_counts", "promoted_sha256"}``.
+    ``promoted_sha256`` (5988a5bb) is a full-body SHA-256 over the EXACT
+    bytes this call promoted (the staged artifact, re-read fresh from disk
+    after flush -- never the in-memory ``payload`` object), independent of
+    ``manifest_hash`` (which only hashes ``changed_parts``, i.e. the
+    transaction's intended delta). It is the "what did THIS writer actually
+    put on disk" fingerprint a caller-specific post-write check uses to tell
+    apart "verification failed but nobody has touched dest since I promoted"
+    (safe to restore my own pre-image) from "a different writer's promotion
+    has already landed since mine" (restoring would destroy that writer's
+    completed work -- see ``update_paragraph`` / ``merge_paragraph_draft``).
     """
     parent = os.path.dirname(os.path.abspath(dest)) or "."
     os.makedirs(parent, exist_ok=True)
     manifest_hash = _docx_manifest_hash(changed_parts)
     post_counts: dict[str, int] | None = None
+    promoted_sha256: str | None = None
 
     staged_path: str | None = None
     try:
@@ -1404,6 +1486,7 @@ def _write_docx_transaction(
 
         with open(staged_path, "rb") as fh:
             staged_bytes = fh.read()
+        promoted_sha256 = hashlib.sha256(staged_bytes).hexdigest()
         try:
             post_counts = _docx_structural_manifest(staged_bytes)
         except (zipfile.BadZipFile, KeyError) as exc:
@@ -1455,6 +1538,7 @@ def _write_docx_transaction(
         "manifest_hash": manifest_hash,
         "pre_counts": pre_manifest,
         "post_counts": post_counts,
+        "promoted_sha256": promoted_sha256,
     }
 
 
@@ -1492,9 +1576,10 @@ def _save_docx_xml(raw: bytes, root: Any, dest: str) -> dict[str, Any]:
     actual save -- a doc write must not fail because backup housekeeping did.
 
     Returns the write-transaction manifest, ``{"manifest_hash", "pre_counts",
-    "post_counts"}`` (dccc2311) -- callers that don't need it (most existing
-    call sites, including every test that pre-dates this change) simply
-    ignore the return value, exactly as they did when this returned ``None``.
+    "post_counts", "promoted_sha256"}`` (dccc2311; ``promoted_sha256`` added
+    5988a5bb) -- callers that don't need it (most existing call sites,
+    including every test that pre-dates this change) simply ignore the
+    return value, exactly as they did when this returned ``None``.
     """
     new_document = _LET.tostring(
         root, xml_declaration=True, encoding="UTF-8", standalone=True
@@ -1534,15 +1619,106 @@ def _restore_docx_backup(dest: str) -> bool:
     succeeded; a missing or unreadable backup is reported (not raised) so the
     caller can surface it in the error it raises rather than mask the
     original verification failure.
+
+    5988a5bb (finding 2) -- routed through the SAME stage-to-temp-in-
+    ``dest``'s-own-directory + fsync + ``os.replace`` pattern every other
+    write in this module uses, instead of writing straight into ``dest`` via
+    ``shutil.copy2``. An interrupted restore (disk full, AV lock, permission
+    revoked mid-copy) now leaves ``dest`` and the disposable temp file
+    untouched -- ``os.replace`` is atomic on the same filesystem, so ``dest``
+    is either the OLD content (interrupted before replace) or the FULLY
+    restored backup content (replace completed); it can never be left
+    truncated or partially overwritten as a direct in-place copy risked.
     """
     backup = dest + ".bak"
     if not os.path.exists(backup):
         return False
+    parent = os.path.dirname(os.path.abspath(dest)) or "."
+    staged_path: str | None = None
     try:
-        shutil.copy2(backup, dest)
+        fd, staged_path = tempfile.mkstemp(
+            prefix=".meridian-docx-restore-", suffix=".tmp", dir=parent
+        )
+        with open(backup, "rb") as src, os.fdopen(fd, "wb") as fh:
+            shutil.copyfileobj(src, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(staged_path, dest)
+        staged_path = None
         return True
     except OSError:
         return False
+    finally:
+        if staged_path:
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+
+
+def _docx_file_sha256(path: str) -> str | None:
+    """SHA-256 over ``path``'s raw bytes, read fresh from disk.
+
+    5988a5bb -- the compare-and-swap fingerprint used to tell "dest still
+    holds exactly what THIS writer promoted" apart from "a different writer
+    has already promoted something newer" (see
+    :func:`_safe_restore_after_verification_failure`). Returns ``None``
+    (rather than raising) when ``path`` cannot be read -- a missing/
+    unreadable file is itself informative to the caller (it can never match
+    a real ``promoted_sha256``), not a reason to blow up a post-write
+    verification-failure handler that is already in an error path.
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _safe_restore_after_verification_failure(
+    write_dest: str,
+    promoted_sha256: str | None,
+) -> tuple[bool, bool]:
+    """Compare-and-swap-safe gate in front of :func:`_restore_docx_backup` (5988a5bb, finding 1).
+
+    Only called once a caller-specific post-write check (e.g.
+    :func:`_verify_paragraph_write`) has already found a mismatch on
+    ``write_dest``. A bare, unconditional restore is unsafe: if a
+    DIFFERENT writer (a different process -- see the threat-model note on
+    :func:`_docx_promotion_lock`) promoted its own write to ``write_dest``
+    in the window between THIS writer's own promotion and THIS writer's
+    verify, the mismatch this writer is reacting to is a false positive
+    caused by that other writer's legitimate, already-promoted work --
+    blindly restoring from THIS writer's own ``.bak`` would silently
+    destroy it.
+
+    Re-reads ``write_dest``'s CURRENT on-disk bytes (fresh from disk) and
+    compares their SHA-256 against ``promoted_sha256`` --
+    ``_write_docx_transaction``'s own fingerprint of exactly what THIS
+    writer promoted (returned as ``transaction["promoted_sha256"]``).
+
+    Returns ``(safe_to_restore, restored)``:
+
+    * ``(True, restored)`` -- ``write_dest`` still held exactly what this
+      writer promoted (nobody has touched it since); a restore was
+      attempted and ``restored`` reports whether it succeeded.
+    * ``(False, False)`` -- ``write_dest``'s current bytes do NOT match what
+      this writer promoted (a newer write from elsewhere is on disk);
+      restore was deliberately NOT attempted, and ``write_dest`` is left
+      exactly as that other writer left it.
+    """
+    current_sha256 = _docx_file_sha256(write_dest) if os.path.isfile(write_dest) else None
+    safe_to_restore = (
+        promoted_sha256 is not None
+        and current_sha256 is not None
+        and current_sha256 == promoted_sha256
+    )
+    if not safe_to_restore:
+        return False, False
+    return True, _restore_docx_backup(write_dest)
 
 
 def _verify_paragraph_write(source_path: str, para_id: str, expected_text: str) -> str | None:
@@ -3939,9 +4115,18 @@ class DocStructureStore:
         structural manifest gate only proves the archive as a whole wasn't
         corrupted — it has no idea what THIS write was supposed to do, so a
         silent no-op or wrong-paragraph write would otherwise sail through
-        undetected. On a verification failure, the written file is
-        best-effort restored from its ``.bak`` backup and
-        :class:`DocxPostWriteVerificationError` is raised — never a false
+        undetected. The write's own promotion lock is held across this
+        verify step and any resulting restore (not just the promotion
+        itself, 5988a5bb finding 1), and a verification failure is restored
+        from its ``.bak`` backup ONLY when a compare-and-swap check confirms
+        no OTHER writer has promoted something newer to the same destination
+        in the meantime — see :func:`_safe_restore_after_verification_failure`.
+        When that check passes, :class:`DocxPostWriteVerificationError` is
+        raised after the (successful or best-effort) restore; when it does
+        NOT pass (a genuine concurrent write landed),
+        :class:`DocxConcurrentWriteConflictError` is raised instead WITHOUT
+        touching the file further, since restoring would destroy the other
+        writer's completed work. Neither ever fabricates a silent no-op
         success.
 
         Returns ``{document_id, para_id, new_text, elements_resynced,
@@ -3952,8 +4137,10 @@ class DocStructureStore:
         ``expected_content_hash``, a rejected draft claim, or a ``para_id``
         not present in the document; raises
         :class:`DocxPostWriteVerificationError` when the promoted write
-        cannot be confirmed on disk — never fabricates a silent no-op
-        success.
+        cannot be confirmed on disk and it was safe to restore, or
+        :class:`DocxConcurrentWriteConflictError` when it could not be
+        safely auto-corrected because a different writer's promotion landed
+        after this one's — never fabricates a silent no-op success.
         """
         src = source.strip() if isinstance(source, str) else ""
         if not src:
@@ -4063,28 +4250,60 @@ class DocStructureStore:
                 )
             write_dest = draft_dest
 
-        # Canonical _save_docx_xml serializes ``root`` and rewrites only the
-        # document part into a copy of the original ZIP (``raw``) at ``write_dest``.
-        transaction = _save_docx_xml(raw, root, write_dest)
+        # 5988a5bb (finding 1) — hold the SAME dest's promotion lock across
+        # stage+promote (_save_docx_xml, which reentrantly acquires it
+        # internally) THROUGH the post-write verify and any conditional
+        # restore below. This closes the SAME-PROCESS window between
+        # promotion and verify/restore completely; see _docx_promotion_lock's
+        # module-level comment for why it cannot (and does not need to)
+        # close the cross-process window by itself — that's what the
+        # compare-and-swap check just below is for.
+        with _docx_promotion_lock(write_dest):
+            # Canonical _save_docx_xml serializes ``root`` and rewrites only
+            # the document part into a copy of the original ZIP (``raw``) at
+            # ``write_dest``.
+            transaction = _save_docx_xml(raw, root, write_dest)
 
-        # 5988a5bb, part A — mandatory post-write verification: re-reads
-        # write_dest FRESH FROM DISK and confirms the target paragraph's text
-        # actually landed. A structural-manifest pass alone (above) says
-        # nothing about whether THIS edit happened.
-        verification_error = _verify_paragraph_write(write_dest, para_id, new_text)
-        if verification_error is not None:
-            restored = _restore_docx_backup(write_dest)
-            raise DocxPostWriteVerificationError(
-                f"post-write verification failed for para_id={para_id!r} in "
-                f"{write_dest}: {verification_error}"
-                + (
-                    " — restored from backup, the file reflects its PRE-write state"
-                    if restored
-                    else " — WARNING: could not restore from backup (no .bak found "
-                    "or restore failed); the file may be left in an unverified state"
-                ),
-                manifest={**transaction, "restored": restored},
-            )
+            # 5988a5bb, part A — mandatory post-write verification: re-reads
+            # write_dest FRESH FROM DISK and confirms the target paragraph's
+            # text actually landed. A structural-manifest pass alone (above)
+            # says nothing about whether THIS edit happened.
+            verification_error = _verify_paragraph_write(write_dest, para_id, new_text)
+            if verification_error is not None:
+                # 5988a5bb (finding 1) — do NOT blindly restore. Check
+                # whether write_dest still holds exactly what THIS writer
+                # promoted before deciding a restore is safe: a different
+                # (cross-process) writer may have already promoted something
+                # newer to write_dest since our own promotion, in which case
+                # this verification "failure" is a false positive and
+                # restoring from OUR backup would destroy THEIR completed,
+                # already-promoted write.
+                safe_to_restore, restored = _safe_restore_after_verification_failure(
+                    write_dest, transaction.get("promoted_sha256"),
+                )
+                if not safe_to_restore:
+                    raise DocxConcurrentWriteConflictError(
+                        f"post-write verification failed for para_id={para_id!r} in "
+                        f"{write_dest}: {verification_error} — AND a different "
+                        "writer's promotion has landed on this file since ours, so "
+                        "this verification failure could not be safely "
+                        "auto-corrected: restoring from our own backup would "
+                        f"destroy that writer's already-promoted work. {write_dest} "
+                        "was left untouched, exactly as that other writer left it — "
+                        "investigate manually.",
+                        manifest={**transaction, "restored": False, "concurrent_write_detected": True},
+                    )
+                raise DocxPostWriteVerificationError(
+                    f"post-write verification failed for para_id={para_id!r} in "
+                    f"{write_dest}: {verification_error}"
+                    + (
+                        " — restored from backup, the file reflects its PRE-write state"
+                        if restored
+                        else " — WARNING: could not restore from backup (no .bak found "
+                        "or restore failed); the file may be left in an unverified state"
+                    ),
+                    manifest={**transaction, "restored": restored},
+                )
 
         result = {
             "document_id": doc_row["id"],
@@ -4149,12 +4368,20 @@ class DocStructureStore:
         ``source_path``'s OTHER parts that legitimately changed since the
         draft was opened are preserved, only ``document.xml`` is replaced by
         the draft's version) — the same stage → verify → promote transaction,
-        the same structural-manifest gate, the same ``.bak`` backup. Mandatory
-        post-write verification (:func:`_verify_paragraph_write`, part A)
-        then re-reads ``source_path`` FRESH FROM DISK and confirms
-        ``para_id``'s text now matches the draft's; a mismatch is best-effort
-        restored from ``source_path``'s own ``.bak`` and raises
-        :class:`DocxPostWriteVerificationError` — never a false success.
+        the same structural-manifest gate, the same ``.bak`` backup, held
+        under ``source_path``'s promotion lock end-to-end (stage+promote
+        through verify and any conditional restore, 5988a5bb finding 1).
+        Mandatory post-write verification (:func:`_verify_paragraph_write`,
+        part A) then re-reads ``source_path`` FRESH FROM DISK and confirms
+        ``para_id``'s text now matches the draft's; a mismatch is restored
+        from ``source_path``'s own ``.bak`` ONLY when a compare-and-swap
+        check (:func:`_safe_restore_after_verification_failure`) confirms no
+        other writer has promoted something newer to ``source_path`` since
+        this merge's own promotion — when it has,
+        :class:`DocxConcurrentWriteConflictError` is raised WITHOUT
+        restoring (restoring would destroy that other writer's completed
+        work) instead of :class:`DocxPostWriteVerificationError`. Neither
+        ever fabricates a false success.
 
         On success, calls ``record_merge_result`` (idempotent — merging the
         same anchor twice from the same session is a no-op; a genuine race
@@ -4235,22 +4462,42 @@ class DocStructureStore:
         except zipfile.BadZipFile as exc:
             raise ValueError(f"source is not a valid .docx (bad zip): {exc}") from exc
 
-        transaction = _save_docx_xml(dest_raw, draft_root, source_path)
+        # 5988a5bb (finding 1) — same widened-lock treatment as
+        # update_paragraph: hold source_path's promotion lock across
+        # stage+promote THROUGH verify and any conditional restore, and use
+        # the compare-and-swap check before ever restoring — see
+        # update_paragraph's identical comment for the full rationale.
+        with _docx_promotion_lock(source_path):
+            transaction = _save_docx_xml(dest_raw, draft_root, source_path)
 
-        verification_error = _verify_paragraph_write(source_path, para_id, draft_text)
-        if verification_error is not None:
-            restored = _restore_docx_backup(source_path)
-            raise DocxPostWriteVerificationError(
-                f"post-write verification failed merging para_id={para_id!r} "
-                f"from draft {draft_path!r} into {source_path}: {verification_error}"
-                + (
-                    " — restored from backup, the file reflects its PRE-merge state"
-                    if restored
-                    else " — WARNING: could not restore from backup (no .bak found "
-                    "or restore failed); the file may be left in an unverified state"
-                ),
-                manifest={**transaction, "restored": restored},
-            )
+            verification_error = _verify_paragraph_write(source_path, para_id, draft_text)
+            if verification_error is not None:
+                safe_to_restore, restored = _safe_restore_after_verification_failure(
+                    source_path, transaction.get("promoted_sha256"),
+                )
+                if not safe_to_restore:
+                    raise DocxConcurrentWriteConflictError(
+                        f"post-write verification failed merging para_id={para_id!r} "
+                        f"from draft {draft_path!r} into {source_path}: "
+                        f"{verification_error} — AND a different writer's promotion "
+                        "has landed on this file since ours, so this verification "
+                        "failure could not be safely auto-corrected: restoring from "
+                        "our own backup would destroy that writer's already-promoted "
+                        f"work. {source_path} was left untouched, exactly as that "
+                        "other writer left it — investigate manually.",
+                        manifest={**transaction, "restored": False, "concurrent_write_detected": True},
+                    )
+                raise DocxPostWriteVerificationError(
+                    f"post-write verification failed merging para_id={para_id!r} "
+                    f"from draft {draft_path!r} into {source_path}: {verification_error}"
+                    + (
+                        " — restored from backup, the file reflects its PRE-merge state"
+                        if restored
+                        else " — WARNING: could not restore from backup (no .bak found "
+                        "or restore failed); the file may be left in an unverified state"
+                    ),
+                    manifest={**transaction, "restored": restored},
+                )
 
         merge_result = await db_module.record_merge_result(
             self._db, wave_id, source_path, merge_session_id, para_id,

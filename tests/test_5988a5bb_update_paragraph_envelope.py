@@ -106,10 +106,14 @@ async def _mk_session(db, name: str) -> str:
 # ---------------------------------------------------------------------------
 
 def test_update_paragraph_detects_silent_no_op_and_restores_backup(tmp_path, monkeypatch):
-    """A write that promotes structurally but does not actually change the
-    target paragraph's text must surface as DocxPostWriteVerificationError,
-    never a false success, and the source file must be restored to its
-    pre-write state from the .bak backup _write_docx_transaction wrote."""
+    """Restore-WIRING contract test: given ANY reported verification
+    failure, update_paragraph must surface DocxPostWriteVerificationError
+    (never a false success) and restore the .bak backup. This test mocks
+    ``_verify_paragraph_write`` ITSELF to always fail, so it deliberately
+    does NOT exercise real mismatch detection -- see
+    ``test_update_paragraph_real_verification_detects_silent_no_op_and_restores_backup``
+    below (5988a5bb code-review finding 3) for a test that mocks lower in
+    the stack and lets the REAL detector catch a genuine mismatch."""
     async def _run():
         docx_path = _write_docx(str(tmp_path / "doc.docx"))
         store = await _open_store(tmp_path)
@@ -136,6 +140,171 @@ def test_update_paragraph_detects_silent_no_op_and_restores_backup(tmp_path, mon
             xml = _read_document_xml(docx_path).decode("utf-8")
             assert "this edit must be rejected" not in xml
             assert "The original body sentence." in xml
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_update_paragraph_real_verification_detects_silent_no_op_and_restores_backup(tmp_path, monkeypatch):
+    """5988a5bb code-review finding 3 -- exercises the REAL, unmocked
+    ``_verify_paragraph_write`` against a genuine on-disk mismatch, instead
+    of faking its return value. A broken detector (e.g. one that always
+    returns ``None``, disabling verification entirely) would make this test
+    fail where the faked-verify test above could not catch it.
+
+    Mocks ``_set_paragraph_runs`` -- LOWER in the stack than the detector --
+    to leave the target paragraph's runs UNCHANGED, simulating a
+    silent-no-op bug in the run-replacement step itself. The write
+    transaction (staging, structural-manifest gate, promotion) still
+    genuinely succeeds, since a no-op paragraph body doesn't move any
+    protected structural count. Only the REAL ``_verify_paragraph_write``,
+    re-reading the promoted file fresh from disk, catches that the intended
+    text never actually landed.
+    """
+    async def _run():
+        docx_path = _write_docx(str(tmp_path / "doc.docx"))
+        store = await _open_store(tmp_path)
+        try:
+            await store.reindex_document("proj-1", docx_path, source=docx_path)
+            original_bytes = open(docx_path, "rb").read()
+
+            monkeypatch.setattr(doc_store, "_set_paragraph_runs", lambda *a, **k: None)
+
+            with pytest.raises(doc_store.DocxPostWriteVerificationError) as excinfo:
+                await store.update_paragraph(
+                    "proj-1", docx_path, "AAAA0002", "this edit must be rejected",
+                )
+            assert "text mismatch" in str(excinfo.value)
+            assert "this edit must be rejected" in str(excinfo.value)
+            assert excinfo.value.manifest.get("restored") is True
+
+            # Genuinely restored -- byte-for-byte back to the pre-write file.
+            assert open(docx_path, "rb").read() == original_bytes
+            xml = _read_document_xml(docx_path).decode("utf-8")
+            assert "this edit must be rejected" not in xml
+            assert "The original body sentence." in xml
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_update_paragraph_draft_mode_real_verification_detects_silent_no_op_and_restores(tmp_path, monkeypatch):
+    """5988a5bb code-review finding 5 -- draft-mode variant of the real-
+    detection test above: ``draft_output_path``/``wave_run_id`` set, so
+    ``write_dest`` is the isolated DRAFT path, not ``source_path``. The
+    real, unmocked ``_verify_paragraph_write`` must catch the mismatch on
+    the DRAFT file and restore the draft's own ``.bak`` -- the canonical
+    file is never touched by draft-mode writes in the first place.
+
+    A restore needs a PRE-EXISTING ``.bak`` to restore from, which only
+    exists once ``write_dest`` itself already existed before the write
+    (``_write_docx_transaction`` only backs up an already-existing ``dest``)
+    -- so this does a first, genuinely correct draft write to establish that
+    baseline, then a SECOND draft write (same anchor, same session -- an
+    idempotent re-declare per ``declare_merge_anchors``) with the mocked
+    no-op run-replacement, so the second write's ``.bak`` holds the FIRST
+    write's genuinely-landed content.
+    """
+    async def _run():
+        docx_path = _write_docx(str(tmp_path / "canonical.docx"))
+        draft_path = str(tmp_path / "draft-session-a.docx")
+        store = await _open_store(tmp_path)
+        try:
+            await store.reindex_document("proj-1", docx_path, source=docx_path)
+            session_a = await _mk_session(store._db, "sess-a")
+            canonical_bytes = open(docx_path, "rb").read()
+
+            # Baseline: a genuinely correct first draft write.
+            await store.update_paragraph(
+                "proj-1", docx_path, "AAAA0002", "initial draft content",
+                draft_output_path=draft_path, wave_run_id="wave-1", session_id=session_a,
+            )
+            assert "initial draft content" in _read_document_xml(draft_path).decode()
+
+            monkeypatch.setattr(doc_store, "_set_paragraph_runs", lambda *a, **k: None)
+
+            with pytest.raises(doc_store.DocxPostWriteVerificationError) as excinfo:
+                await store.update_paragraph(
+                    "proj-1", docx_path, "AAAA0002", "drafted edit must be rejected",
+                    draft_output_path=draft_path, wave_run_id="wave-1", session_id=session_a,
+                )
+            assert "text mismatch" in str(excinfo.value)
+            assert excinfo.value.manifest.get("restored") is True
+
+            # The draft file itself was restored to the FIRST write's state...
+            assert os.path.exists(draft_path)
+            draft_xml = _read_document_xml(draft_path).decode("utf-8")
+            assert "drafted edit must be rejected" not in draft_xml
+            assert "initial draft content" in draft_xml
+            # ...and the canonical file was never touched at any point.
+            assert open(docx_path, "rb").read() == canonical_bytes
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_update_paragraph_verification_failure_with_concurrent_write_raises_conflict_and_leaves_file_untouched(
+    tmp_path, monkeypatch,
+):
+    """5988a5bb code-review finding 1 -- end-to-end validation of the
+    compare-and-swap-safe restore. Simulates the documented failure
+    scenario: this writer's OWN promotion genuinely succeeds, but by the
+    time its post-write verify runs, a DIFFERENT writer has already
+    promoted its own, unrelated payload to the same destination. The
+    original verification failure this writer observes is therefore a
+    false positive (caused by the other writer's legitimate write, not by
+    anything wrong with this writer's own promotion) -- restoring from
+    THIS writer's own backup would silently destroy the other writer's
+    completed work, so it must NOT happen.
+
+    Wraps (rather than replaces the return value of) the REAL
+    ``_verify_paragraph_write``: the wrapper's only job is to inject the
+    "concurrent writer" side effect (overwrite the file with an unrelated
+    payload) immediately before delegating to the genuine, unmocked
+    detector -- so the mismatch itself is still real, not fabricated.
+    """
+    async def _run():
+        docx_path = _write_docx(str(tmp_path / "doc.docx"))
+        store = await _open_store(tmp_path)
+        try:
+            await store.reindex_document("proj-1", docx_path, source=docx_path)
+
+            real_verify = doc_store._verify_paragraph_write
+
+            def _verify_with_injected_concurrent_write(path, para_id, expected_text):
+                # Simulate a DIFFERENT writer's promotion landing between
+                # OUR promotion (already complete by the time this runs)
+                # and OUR verify -- overwrite `path` with an independently
+                # promoted, unrelated payload before verification reads it.
+                _write_docx(
+                    path,
+                    _DOCUMENT_XML.replace(
+                        "The original body sentence.",
+                        "a concurrent writer's own payload, landed after ours",
+                    ),
+                )
+                return real_verify(path, para_id, expected_text)
+
+            monkeypatch.setattr(
+                doc_store, "_verify_paragraph_write", _verify_with_injected_concurrent_write,
+            )
+
+            with pytest.raises(doc_store.DocxConcurrentWriteConflictError) as excinfo:
+                await store.update_paragraph(
+                    "proj-1", docx_path, "AAAA0002", "our own genuinely correct edit",
+                )
+            assert "different writer" in str(excinfo.value) or "concurrent" in str(excinfo.value).lower()
+            assert excinfo.value.manifest.get("restored") is False
+            assert excinfo.value.manifest.get("concurrent_write_detected") is True
+
+            # The file was left EXACTLY as the "other writer" left it -- our
+            # own backup must NOT have been restored over it.
+            xml = _read_document_xml(docx_path).decode("utf-8")
+            assert "a concurrent writer's own payload, landed after ours" in xml
+            assert "our own genuinely correct edit" not in xml
         finally:
             await store.close()
 
@@ -445,6 +614,140 @@ def test_merge_paragraph_draft_promotes_draft_into_canonical(tmp_path):
                 "proj-1", docx_path, "AAAA0002", draft_path, "wave-1", session_a,
             )
             assert merge_result_2["merge_result"]["already_merged"] is True
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_merge_paragraph_draft_real_verification_failure_restores_when_safe(tmp_path, monkeypatch):
+    """5988a5bb code-review finding 4 -- merge_paragraph_draft's own verify/
+    restore path previously had ZERO failure-path coverage. Exercises the
+    REAL, unmocked ``_verify_paragraph_write`` against a genuine mismatch
+    (never a faked return value), using the same lower-in-the-stack
+    technique as finding 3's update_paragraph test, adapted to the merge
+    path: ``_paragraph_plain_text`` is the only function this flow calls to
+    derive BOTH "what text the draft says should land" (``draft_text``,
+    extracted BEFORE promotion) AND "what text actually IS on disk"
+    (re-extracted by the real ``_verify_paragraph_write`` AFTER promotion).
+    Making its FIRST call (the draft-side extraction) return a value that
+    can never match the genuinely-promoted content forces a REAL mismatch
+    on the SECOND call (post-promotion verification) without touching the
+    detector itself.
+
+    Nothing else touches ``source_path`` in this window, so this exercises
+    the "restore when safe" branch of the finding-1 compare-and-swap fix.
+    """
+    async def _run():
+        docx_path = _write_docx(str(tmp_path / "canonical.docx"))
+        draft_path = str(tmp_path / "draft-session-a.docx")
+        store = await _open_store(tmp_path)
+        try:
+            await store.reindex_document("proj-1", docx_path, source=docx_path)
+            session_a = await _mk_session(store._db, "sess-a")
+
+            await store.update_paragraph(
+                "proj-1", docx_path, "AAAA0002", "merged into canonical",
+                draft_output_path=draft_path, wave_run_id="wave-1", session_id=session_a,
+            )
+            owner = await db_module.claim_merge_owner(store._db, "wave-1", docx_path, session_a)
+            assert owner["claimed"] is True
+
+            original_bytes = open(docx_path, "rb").read()
+
+            real_plain_text = doc_store._paragraph_plain_text
+            call_count = {"n": 0}
+
+            def _fake_plain_text(p):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    # The draft-side extraction (BEFORE promotion) -- return
+                    # a value that will never match what actually lands on
+                    # disk, forcing the REAL post-promotion re-read (the
+                    # second and only other call) to genuinely mismatch.
+                    return "drifted-away-from-what-will-actually-land-on-disk"
+                return real_plain_text(p)
+
+            monkeypatch.setattr(doc_store, "_paragraph_plain_text", _fake_plain_text)
+
+            with pytest.raises(doc_store.DocxPostWriteVerificationError) as excinfo:
+                await store.merge_paragraph_draft(
+                    "proj-1", docx_path, "AAAA0002", draft_path, "wave-1", session_a,
+                )
+            assert "text mismatch" in str(excinfo.value)
+            assert excinfo.value.manifest.get("restored") is True
+
+            # Genuinely restored -- canonical file back to its pre-merge state.
+            assert open(docx_path, "rb").read() == original_bytes
+            assert "merged into canonical" not in _read_document_xml(docx_path).decode()
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_merge_paragraph_draft_verification_failure_with_concurrent_write_raises_conflict_and_leaves_canonical_untouched(
+    tmp_path, monkeypatch,
+):
+    """5988a5bb code-review finding 1 (+ finding 4) -- end-to-end validation
+    of the compare-and-swap-safe restore for merge_paragraph_draft's own
+    verify/restore path: the "leave it alone with a distinct error if a
+    newer write landed since" branch. Same technique as the
+    update_paragraph counterpart: wraps (never fakes the return value of)
+    the REAL ``_verify_paragraph_write`` to inject a "different writer
+    already promoted something newer" side effect immediately before
+    delegating to the genuine, unmocked detector -- so the resulting
+    mismatch is real, and the resulting ``DocxConcurrentWriteConflictError``
+    is a genuine consequence of the compare-and-swap fingerprint check
+    (``transaction["promoted_sha256"]`` no longer matching what's on disk),
+    not a fabricated branch.
+    """
+    async def _run():
+        docx_path = _write_docx(str(tmp_path / "canonical.docx"))
+        draft_path = str(tmp_path / "draft-session-a.docx")
+        store = await _open_store(tmp_path)
+        try:
+            await store.reindex_document("proj-1", docx_path, source=docx_path)
+            session_a = await _mk_session(store._db, "sess-a")
+
+            await store.update_paragraph(
+                "proj-1", docx_path, "AAAA0002", "merged into canonical",
+                draft_output_path=draft_path, wave_run_id="wave-1", session_id=session_a,
+            )
+            owner = await db_module.claim_merge_owner(store._db, "wave-1", docx_path, session_a)
+            assert owner["claimed"] is True
+
+            real_verify = doc_store._verify_paragraph_write
+
+            def _verify_with_injected_concurrent_write(path, para_id, expected_text):
+                # Simulate a DIFFERENT writer's promotion landing between
+                # OUR merge's promotion (already complete by the time this
+                # runs) and OUR verify.
+                _write_docx(
+                    path,
+                    _DOCUMENT_XML.replace(
+                        "The original body sentence.",
+                        "a concurrent writer's own payload, landed after our merge",
+                    ),
+                )
+                return real_verify(path, para_id, expected_text)
+
+            monkeypatch.setattr(
+                doc_store, "_verify_paragraph_write", _verify_with_injected_concurrent_write,
+            )
+
+            with pytest.raises(doc_store.DocxConcurrentWriteConflictError) as excinfo:
+                await store.merge_paragraph_draft(
+                    "proj-1", docx_path, "AAAA0002", draft_path, "wave-1", session_a,
+                )
+            assert excinfo.value.manifest.get("restored") is False
+            assert excinfo.value.manifest.get("concurrent_write_detected") is True
+
+            # Canonical was left EXACTLY as the "other writer" left it -- our
+            # own merge's backup must NOT have been restored over it.
+            xml = _read_document_xml(docx_path).decode("utf-8")
+            assert "a concurrent writer's own payload, landed after our merge" in xml
+            assert "merged into canonical" not in xml
         finally:
             await store.close()
 
