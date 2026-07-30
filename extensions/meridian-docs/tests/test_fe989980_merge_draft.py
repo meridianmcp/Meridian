@@ -418,7 +418,9 @@ def test_server_wrappers_expose_draft_params():
 
 def test_server_exposes_merge_docx_draft_tool():
     sig = inspect.signature(server.merge_docx_draft)
-    assert list(sig.parameters) == ["canonical_path", "draft_path", "index_db_path"]
+    assert list(sig.parameters) == [
+        "canonical_path", "draft_path", "index_db_path", "session_id",
+    ]
 
 
 def test_server_merge_docx_draft_delegates_to_docs_intel(tmp_path):

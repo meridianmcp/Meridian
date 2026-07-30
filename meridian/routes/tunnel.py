@@ -3404,6 +3404,152 @@ async def check_word_write_conflict(
     }
 
 
+# ---------------------------------------------------------------------------
+# 273df573 — scoped docx-region claim gate for the meridian-docs (docs) tunnel
+# slot. Reuses the SAME richer Model-B primitive
+# (meridian.db.locks.check_docx_region_write_conflict) that the native
+# update_paragraph MCP tool already enforces, rather than the plainer
+# whole-file-only check_word_write_conflict above: two sessions holding
+# non-overlapping SCOPED element claims on the same .docx may both proceed,
+# and only a whole-file lock or a same-element claim by another session
+# blocks. A tool with no natural paragraph-shaped anchor argument (e.g.
+# relocate_figure's integer figure_index) degrades to element_id=None —
+# whole-document-only checking, the "whole-document fallback" tier.
+# ---------------------------------------------------------------------------
+
+# Bare meridian-docs tool name -> (path_arg_name, anchor_arg_name_or_None).
+# Only MUTATING tools (ones that re-save the .docx zip container) appear here;
+# any name absent from this map is treated as read-only/non-mutating and is
+# never gated. anchor_arg_name is None when the tool has no argument that is
+# itself a real w14:paraId/p{N}-shaped element identifier — passing an
+# integer position (figure_index/table_index) or a non-paragraph key
+# (citation_key) into check_docx_region_write_conflict's element_id would
+# compare incompatible id spaces, so those correctly fall back to the
+# whole-document check instead. index_document / index_document_structure /
+# index_equations write only a local sidecar SQLite cache, never the .docx
+# itself, so they are intentionally excluded (not writers of the target file).
+_DOCS_WRITE_TOOLS: "dict[str, tuple[str, str | None]]" = {
+    "insert_image": ("docx_path", "anchor_para_id"),
+    "insert_figure_block": ("docx_path", "anchor_para_id"),
+    "insert_caption": ("docx_path", "anchor_para_id"),
+    "edit_caption": ("docx_path", "caption_para_id"),
+    "remove_caption": ("docx_path", "caption_para_id"),
+    "retrofit_plaintext_captions": ("docx_path", None),
+    "insert_cross_reference": ("docx_path", "anchor_para_id"),
+    "insert_citation": ("docx_path", "anchor_para_id"),
+    "edit_citation": ("docx_path", "anchor_para_id"),
+    "remove_citation": ("docx_path", "anchor_para_id"),
+    "insert_equation": ("docx_path", "anchor_para_id"),
+    "edit_equation": ("docx_path", "equation_para_id"),
+    "append_text_run_after_math": ("docx_path", "equation_para_id"),
+    "remove_equation": ("docx_path", "equation_para_id"),
+    "insert_bibliography_entry": ("docx_path", None),
+    "update_bibliography_entry": ("docx_path", None),
+    "remove_bibliography_entry": ("docx_path", None),
+    "sync_bibliography": ("docx_path", None),
+    "renumber_sequences": ("docx_path", None),
+    "insert_highlighted_note": ("docx_path", "anchor_para_id"),
+    "write_section": ("docx_path", "anchor_para_id"),
+    "move_section": ("docx_path", "section_id"),
+    "copy_section": ("docx_path", "section_id"),
+    "relocate_figure": ("docx_path", None),
+    "relocate_table": ("docx_path", None),
+    "highlight_document": ("docx_path", None),
+    "merge_docx_draft": ("canonical_path", None),
+}
+
+
+def _docs_write_target(
+    name: str, arguments: "dict | None"
+) -> "tuple[str, str | None] | None":
+    """Return ``(docx_path, element_id)`` for a MUTATING docs-slot tool, else None.
+
+    ``name`` is the BARE (prefix-stripped) meridian-docs tool name. Returns None
+    for a read-only tool, an unknown tool, or a writer whose path argument can't
+    be found in ``arguments`` (fail-open — we can't guard what we can't identify).
+    ``element_id`` is None whenever the tool has no natural paragraph-shaped
+    anchor argument (whole-document fallback) or that argument was omitted for
+    this call.
+    """
+    bare = name.split("__", 1)[1] if "__" in name else name
+    spec = _DOCS_WRITE_TOOLS.get(bare)
+    if spec is None or not isinstance(arguments, dict):
+        return None
+    path_key, anchor_key = spec
+    path_val = arguments.get(path_key)
+    if not isinstance(path_val, str) or not path_val.strip():
+        return None
+    element_id = None
+    if anchor_key is not None:
+        anchor_val = arguments.get(anchor_key)
+        if isinstance(anchor_val, str) and anchor_val.strip():
+            element_id = anchor_val.strip()
+    return path_val.strip(), element_id
+
+
+async def check_docs_write_conflict(
+    db: Any,
+    tenant_id: str,
+    name: str,
+    arguments: "dict | None",
+    session_id: "str | None" = None,
+) -> "dict | None":
+    """Consult scoped docx-region claims before relaying a MUTATING docs-slot tool.
+
+    Returns a conflict verdict dict (``{"blocked": True, "reason": ..., "holder":
+    ..., "message": ...}`` — the shape :func:`meridian.db.locks.
+    check_docx_region_write_conflict` returns) when another live session's
+    whole-file lock or scoped element claim conflicts with this write, else
+    ``None`` (clear — the relay may proceed).
+
+    Deliberately delegates to :func:`meridian.db.locks.check_docx_region_write_
+    conflict` (Model B) rather than duplicating :func:`check_word_write_conflict`'s
+    plainer whole-file-only check above — this is the SAME gate ``update_paragraph``
+    already enforces, so once ``session_id`` is actually present (see below), a
+    scoped element claim is evaluated identically whether the write reaches the
+    .docx via the native MCP path or this tunneled relay path.
+
+    How ``session_id`` reaches this function (273df573 fix): the caller
+    (:func:`call_tunnel_tool` below) passes through whatever ``session_id`` it
+    was given, which ``meridian/mcp/handler.py`` extracts from the incoming
+    ``tools/call`` arguments via ``args.get("session_id")`` — the SAME
+    extraction ``check_word_write_conflict`` relies on, and nothing in this
+    module does anything different for the docs slot. The part that had to
+    change was upstream of tunnel.py entirely: each of the 27 mutating
+    ``@mcp.tool()`` wrappers in ``extensions/meridian-docs/meridian_docs/
+    server.py`` now declares an optional ``session_id`` parameter in its own
+    signature, so it appears in that tool's advertised MCP ``inputSchema`` and
+    a compliant client actually has a field to populate. Before that, no
+    wrapper declared the parameter, so ``args.get("session_id")`` was always
+    empty for a real meridian-docs call even though this extraction code was
+    already correct — a scoped claim held by the CALLING session itself could
+    not be recognized as the caller's own, and every no-anchor-argument tool
+    (relocate_figure, relocate_table, highlight_document, merge_docx_draft,
+    retrofit_plaintext_captions, the bibliography tools, renumber_sequences)
+    was blocked by any scoped claim on the file from anyone, including its own
+    owner.
+
+    Fail-open by design — a missing db, an unidentifiable target, or a claim-
+    lookup error degrades to None (no block). This guard SURFACES a conflict; it
+    acquires no claim of its own — claim_docx_region is the real coordination
+    primitive.
+    """
+    target = _docs_write_target(name, arguments)
+    if not target or db is None:
+        return None
+    docx_path, element_id = target
+    try:
+        return await db_module.check_docx_region_write_conflict(
+            db, session_id, docx_path, element_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — never wedge a write on a lookup error
+        _log.debug(
+            "docs write-guard: check_docx_region_write_conflict(%s) failed: %s",
+            docx_path, exc,
+        )
+        return None
+
+
 # 7ef712a8 — code-intel graph tools identify a project by the *local repo-path
 # slug* (e.g. "C-Users-13144-Documents-Meridian-repository"), NOT the Meridian
 # planning-project name (e.g. "meridian-build"). A session naturally passes the
@@ -3891,6 +4037,13 @@ async def call_tunnel_tool(
     error. Fail-open — no db / unidentifiable target / lookup error passes through
     unchanged.
 
+    273df573 — same protection for a MUTATING meridian-docs (docs) slot tool, via
+    :func:`check_docs_write_conflict`, but using the richer scoped element-or-
+    whole-file Model B gate (:func:`meridian.db.locks.check_docx_region_write_
+    conflict`) so non-overlapping element claims on the same file don't false-
+    block each other. Read-only docs tools are never gated. Fail-open, same as
+    the word-slot guard.
+
     2ce5bc76 — when ``index_repository`` succeeds, its fingerprint is stored per
     (tenant, project_id) so future ``search_graph`` calls can detect a stale
     index and inject a ``_graph_staleness`` warning instead of silently returning
@@ -3964,6 +4117,17 @@ async def call_tunnel_tool(
     # refuse when another live session holds a conflicting write/symbol claim.
     if label == "word":
         conflict = await check_word_write_conflict(
+            db, tenant_id, name, arguments, session_id=session_id,
+        )
+        if conflict is not None:
+            raise RuntimeError(conflict["message"])
+    # 273df573 — scoped docx-region claim protection on the meridian-docs (docs)
+    # slot, mirroring the word-slot guard above but using the richer whole-file-
+    # or-scoped-element Model B check (check_docs_write_conflict / meridian.db.
+    # locks.check_docx_region_write_conflict) so non-overlapping element claims
+    # on the same file don't false-block each other.
+    if label == "docs":
+        conflict = await check_docs_write_conflict(
             db, tenant_id, name, arguments, session_id=session_id,
         )
         if conflict is not None:
