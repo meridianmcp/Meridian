@@ -2922,9 +2922,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "split_sprint_item":         "executor",
     "merge_sprint_items":        "executor",
     "add_subtask":               "executor",
-    "add_sprint_item_pointer":       "executor",
-    "get_sprint_item_pointers":      "executor",
-    "resolve_sprint_item_pointers":  "executor",
+    "add_sprint_item_pointer":       "both",
+    "get_sprint_item_pointers":      "both",
+    "resolve_sprint_item_pointers":  "both",
     "delete_sprint_item_pointer":    "executor",
     "claim_file":                "executor",
     "release_file":              "executor",
@@ -3468,7 +3468,7 @@ _EXECUTOR_DEFAULT_CATEGORIES: frozenset[str] = frozenset({
 })
 _PLANNER_DEFAULT_CATEGORIES: frozenset[str] = frozenset({
     "session", "project", "sprint-management", "decisions", "notes",
-    "workspace", "analysis", "research", "hitl", "plugin",
+    "workspace", "analysis", "research", "hitl", "plugin", "code-intel",
 })
 
 # Minimal stop-word set (mirrors handoff._extract_keywords) — inlined here to
