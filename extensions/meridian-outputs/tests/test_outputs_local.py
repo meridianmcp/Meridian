@@ -4506,6 +4506,95 @@ class TestProvenanceTriggeredRegistration:
         assert "error" not in result
         assert result["path"] == str(f)
 
+    def test_record_provenance_captures_content_hash(self, tmp_path: Path) -> None:
+        """bd5b8d79 -- record_provenance must snapshot a content hash (reusing
+        fingerprint.script_content_hash, not a new hash scheme) at record
+        time, so a later reader can detect drift."""
+        from meridian_outputs import annotate as AN
+        from meridian_outputs import fingerprint as FP
+
+        f = tmp_path / "output.csv"
+        f.write_text("a,b\n1,2\n", encoding="utf-8")
+
+        result = AN.record_provenance(str(tmp_path), str(f))
+        assert "error" not in result
+        assert result["content_hash"] == FP.script_content_hash(str(f))
+        assert result["content_hash"] is not None
+
+    def test_record_provenance_content_hash_none_when_path_missing(
+        self, tmp_path: Path,
+    ) -> None:
+        """A provenance record can legitimately be written for a path that
+        doesn't exist yet (see record_provenance's own docstring) -- the
+        hash snapshot must degrade to None, not raise."""
+        from meridian_outputs import annotate as AN
+
+        missing = tmp_path / "not_written_yet.csv"
+        result = AN.record_provenance(str(tmp_path), str(missing))
+        assert "error" not in result
+        assert result["content_hash"] is None
+
+
+# ---------------------------------------------------------------------------
+# Read-only helpers backing the composed provenance-status lookup (bd5b8d79)
+# ---------------------------------------------------------------------------
+
+class TestGetIndexedOutput:
+    def test_missing_outputs_dir(self) -> None:
+        assert OL.get_indexed_output("/definitely/nonexistent/dir", "/f.csv") is None
+
+    def test_empty_path(self, tmp_path: Path) -> None:
+        assert OL.get_indexed_output(str(tmp_path), "") is None
+
+    @duckdb_required
+    def test_never_indexed_path_returns_none(self, tmp_path: Path) -> None:
+        f = tmp_path / "never_touched.csv"
+        f.write_text("a,b\n1,2\n", encoding="utf-8")
+        assert OL.get_indexed_output(str(tmp_path), str(f)) is None
+
+    @duckdb_required
+    def test_indexed_path_returns_row_without_forcing_rebuild(
+        self, tmp_path: Path,
+    ) -> None:
+        """Unlike resolve_figure_output, get_indexed_output must never call
+        rebuild() itself -- it is a pure read of whatever the index has
+        already persisted. Registers the path explicitly via
+        register_priority_path (the same targeted, single-path indexing
+        record_provenance already uses) rather than relying on an ambient
+        walk this test never triggers."""
+        f = tmp_path / "registered.csv"
+        f.write_text("a,b\n1,2\n", encoding="utf-8")
+        OL.register_priority_path(str(tmp_path), str(f))
+
+        row = OL.get_indexed_output(str(tmp_path), str(f))
+        assert row is not None
+        assert row["path"] == str(f)
+        assert row["sha256"] is not None
+
+
+class TestGetPathAnnotations:
+    def test_missing_outputs_dir(self) -> None:
+        assert OL.get_path_annotations("/definitely/nonexistent/dir", "/f.csv") == []
+
+    def test_empty_path(self, tmp_path: Path) -> None:
+        assert OL.get_path_annotations(str(tmp_path), "") == []
+
+    @duckdb_required
+    def test_returns_directory_level_meridian_notes(self, tmp_path: Path) -> None:
+        sub = tmp_path / "run_1"
+        sub.mkdir()
+        (sub / OL.MERIDIAN_NOTES_FILENAME).write_text(
+            "PCA on, BFS off.", encoding="utf-8",
+        )
+        target = sub / "metric.csv"
+        target.write_text("a,b\n1,2\n", encoding="utf-8")
+
+        idx = OL._get_cached_index(str(tmp_path))
+        idx.rebuild()
+
+        notes = OL.get_path_annotations(str(tmp_path), str(target))
+        assert any(n["source"] == OL.MERIDIAN_NOTES_FILENAME for n in notes)
+
 
 # ---------------------------------------------------------------------------
 # Hierarchical subtree indexing (item 6af1518d, requirement 4)
