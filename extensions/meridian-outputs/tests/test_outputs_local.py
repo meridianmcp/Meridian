@@ -961,6 +961,352 @@ class TestCachedIndexPersistence:
 
 
 # ---------------------------------------------------------------------------
+# Durable walk/convergence state across a process restart (durability
+# follow-up to item 6af1518d): epoch/cursor/pending-backlog/expected-count/
+# last-error all used to live ONLY in the OutputsFtsIndex object's own
+# memory, so a process restart mid-walk either silently claimed convergence
+# it never verified (get_convergence_state read nothing but in-memory
+# defaults) or lost the confirmed-stale backlog outright.
+# ---------------------------------------------------------------------------
+
+class TestWalkStateDurability:
+    @duckdb_required
+    def test_persist_and_rehydrate_walk_state_roundtrip(self, tmp_path: Path) -> None:
+        """Direct field-level roundtrip through _persist_walk_state_locked /
+        _rehydrate_walk_state_from_disk, independent of a real walk -- proves
+        the durable store itself (outputs_index_meta) carries every field the
+        item requires: epoch, cursor/boundary, expected count, pending
+        queue, last error."""
+        db_path = str(tmp_path / "index.duckdb")
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            con = idx1._connect()
+            idx1._walk_epoch = 3
+            idx1._walk_pass_confirmed_complete = False
+            idx1._scan_boundary = str(tmp_path / "mid" / "file.csv")
+            idx1._expected_count = 42
+            idx1._last_walk_error = "could not list directory 'x': boom"
+            idx1._pending_stale = {
+                str(tmp_path / "a.csv"): (123.5, 10),
+                str(tmp_path / "b.csv"): (None, None),
+            }
+            idx1._persist_walk_state_locked(con)
+        finally:
+            idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx2._connect()
+            assert idx2._walk_epoch == 3
+            assert idx2._walk_pass_confirmed_complete is False
+            assert idx2._scan_boundary == str(tmp_path / "mid" / "file.csv")
+            assert idx2._expected_count == 42
+            assert idx2._last_walk_error == "could not list directory 'x': boom"
+            assert idx2._pending_stale == {
+                str(tmp_path / "a.csv"): (123.5, 10),
+                str(tmp_path / "b.csv"): (None, None),
+            }
+        finally:
+            idx2.close()
+
+    @duckdb_required
+    def test_fresh_never_touched_differs_from_restarted_interrupted(
+        self, tmp_path: Path,
+    ) -> None:
+        """The pre-existing contract (a genuinely brand-new index that has
+        never indexed anything reports converged=True -- see
+        TestConvergenceState::test_no_walk_in_progress_means_any_subtree_
+        converged) must NOT become indistinguishable from a restarted
+        process whose PRIOR incarnation persisted an interrupted walk, even
+        though both have _walk_state is None right now. Conflating the two
+        is exactly the "silently claim completion it hasn't verified" bug."""
+        never_touched_dir = tmp_path / "never_touched"
+        never_touched_dir.mkdir()
+        never_touched = OL.OutputsFtsIndex(str(never_touched_dir))
+        try:
+            assert never_touched.get_convergence_state().converged is True
+        finally:
+            never_touched.close()
+
+        restarted_dir = tmp_path / "restarted"
+        restarted_dir.mkdir()
+        db_path = str(tmp_path / "restarted.duckdb")
+        prior = OL.OutputsFtsIndex(str(restarted_dir), db_path=db_path)
+        try:
+            con = prior._connect()
+            prior._walk_pass_confirmed_complete = False
+            prior._persist_walk_state_locked(con)
+        finally:
+            prior.close()
+
+        resumed = OL.OutputsFtsIndex(str(restarted_dir), db_path=db_path)
+        try:
+            assert resumed._walk_state is None  # same as never_touched, right now
+            state = resumed.get_convergence_state()
+            assert state.converged is False
+            assert state.walk_complete is False
+        finally:
+            resumed.close()
+
+    @duckdb_required
+    def test_restart_resumes_interrupted_walk_without_rehashing(
+        self, tmp_path: Path,
+    ) -> None:
+        """End-to-end restart/resume: a walk interrupted partway through a
+        real multi-call rebuild() sequence (max_batch=1 forces one file
+        discovered per call) is picked back up by a FRESH OutputsFtsIndex
+        instance at the same on-disk db_path -- and finishes without ever
+        re-hashing a file the prior process already confirmed (not
+        "restart from scratch"), without ever reporting a row count that
+        regresses across the restart, and without ever claiming convergence
+        before the walk has genuinely finished (not "silently unsafe")."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(6):
+            (outputs_dir / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        hash_calls: list[str] = []
+
+        def counting_hasher(path: str) -> str | None:
+            hash_calls.append(path)
+            return OL._xxh3_file(path)
+
+        idx1 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path, max_batch=1,
+            hasher=counting_hasher,
+        )
+        try:
+            for _ in range(3):
+                idx1.rebuild()
+            assert idx1._walk_state is not None, (
+                "walk must still be mid-pass with only 3 calls at max_batch=1"
+            )
+            idx1_row_count = len(idx1._row_cache)
+            assert 1 <= idx1_row_count < 6
+        finally:
+            idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path, max_batch=1,
+            hasher=counting_hasher,
+        )
+        try:
+            # Safety property: BEFORE this fresh instance ever calls
+            # rebuild() itself, it must not silently claim the tree is
+            # fully converged.
+            pre_rebuild_state = idx2.get_convergence_state()
+            assert pre_rebuild_state.converged is False
+            assert pre_rebuild_state.walk_complete is False
+            assert pre_rebuild_state.indexed_count == idx1_row_count
+
+            seen_counts: list[int] = []
+            for _ in range(24):
+                idx2.rebuild()
+                seen_counts.append(len(idx2._row_cache))
+                if idx2.get_convergence_state().converged:
+                    break
+
+            final_state = idx2.get_convergence_state()
+            assert final_state.converged is True
+            assert final_state.walk_complete is True
+            assert final_state.pending_count == 0
+            assert len(idx2._row_cache) == 6
+            # Resuming never regresses the visible row count.
+            assert seen_counts == sorted(seen_counts)
+        finally:
+            idx2.close()
+
+        # The whole point: no file was EVER hashed more than once across
+        # BOTH incarnations combined -- the resumed process rehydrated the
+        # files idx1 already confirmed from disk instead of re-walking/
+        # re-hashing them from scratch (the size-based archival-dedup
+        # prefilter can legitimately skip hashing a handful of files
+        # entirely -- e.g. one still genuinely unique in size when it's
+        # analysed -- so this asserts "never duplicated", not "every file
+        # hashed exactly once").
+        assert len(hash_calls) == len(set(hash_calls)), (
+            f"a file was re-hashed after the simulated restart: {hash_calls!r}"
+        )
+
+    @duckdb_required
+    def test_restart_distinguishes_zero_hit_in_progress_from_failed_walk(
+        self, tmp_path: Path,
+    ) -> None:
+        """A walk interrupted with nothing indexed YET (in-progress, no
+        error) must remain distinguishable, after a restart, from one that
+        hit a real filesystem error -- neither is a confirmed miss, but only
+        one carries an actionable last_error."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        (outputs_dir / "only.csv").write_text("col\n1", encoding="utf-8")
+        db_path_a = str(tmp_path / "in_progress.duckdb")
+        db_path_b = str(tmp_path / "failed.duckdb")
+
+        idx_a = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path_a)
+        try:
+            con = idx_a._connect()
+            idx_a._walk_pass_confirmed_complete = False
+            idx_a._persist_walk_state_locked(con)
+        finally:
+            idx_a.close()
+
+        idx_b = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path_b)
+        try:
+            con = idx_b._connect()
+            idx_b._walk_pass_confirmed_complete = False
+            idx_b._record_walk_error(
+                str(outputs_dir / "bad_dir"), OSError("simulated permission denied"),
+            )
+            idx_b._persist_walk_state_locked(con)
+        finally:
+            idx_b.close()
+
+        resumed_a = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path_a)
+        resumed_b = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path_b)
+        try:
+            state_a = resumed_a.get_convergence_state()
+            state_b = resumed_b.get_convergence_state()
+
+            assert state_a.converged is False
+            assert state_a.last_error is None
+            assert state_a.indexed_count == 0
+
+            assert state_b.converged is False
+            assert state_b.last_error is not None
+            assert "bad_dir" in state_b.last_error
+        finally:
+            resumed_a.close()
+            resumed_b.close()
+
+    @duckdb_required
+    def test_subtree_index_has_independently_persisted_walk_state(
+        self, tmp_path: Path,
+    ) -> None:
+        """get_subtree_index() indexes live in a SEPARATE on-disk DB from
+        the root's own -- a root's persisted backlog must never leak into,
+        or get read back as, an independent subtree index's own state after
+        a restart of both."""
+        root_dir = tmp_path / "root"
+        sub_dir = root_dir / "sub"
+        sub_dir.mkdir(parents=True)
+        (root_dir / "top.csv").write_text("col\n1", encoding="utf-8")
+        (sub_dir / "inner.csv").write_text("col\n2", encoding="utf-8")
+
+        root_idx = OL._get_cached_index(str(root_dir))
+        root_idx.rebuild()
+        # Simulate a crash right after Phase 0/1 flagged top.csv stale but
+        # before Phase 2 confirmed the write -- the backlog that must
+        # survive the restart, scoped to the ROOT db only.
+        root_idx._pending_stale[str(root_dir / "top.csv")] = (1.0, 1)
+        root_idx._persist_walk_state_locked(root_idx._connect())
+        root_db_path = root_idx._db_path
+
+        sub_idx = OL.get_subtree_index(str(root_dir), str(sub_dir))
+        sub_idx.rebuild()
+        sub_db_path = sub_idx._db_path
+        assert root_db_path != sub_db_path
+
+        root_idx.close()
+        sub_idx.close()
+
+        resumed_root = OL.OutputsFtsIndex(str(root_dir), db_path=root_db_path)
+        resumed_sub = OL.OutputsFtsIndex(str(sub_dir), db_path=sub_db_path)
+        try:
+            root_state = resumed_root.get_convergence_state()
+            sub_state = resumed_sub.get_convergence_state()
+
+            assert root_state.converged is False
+            assert root_state.pending_count == 1
+
+            assert sub_state.converged is True
+            assert sub_state.pending_count == 0
+        finally:
+            resumed_root.close()
+            resumed_sub.close()
+
+    @duckdb_required
+    def test_subtree_scoped_convergence_after_restart_does_not_conflate_with_root(
+        self, tmp_path: Path,
+    ) -> None:
+        """get_convergence_state(subtree=...) on the SAME root instance must
+        scope a rehydrated (persisted-then-restored) pending backlog to the
+        requested subtree, not report the whole root's incompleteness for a
+        subtree that has nothing outstanding, nor hide a subtree's own
+        outstanding backlog behind an otherwise-quiet root."""
+        outputs_dir = tmp_path / "outputs"
+        done_dir = outputs_dir / "done"
+        pending_dir = outputs_dir / "pending"
+        done_dir.mkdir(parents=True)
+        pending_dir.mkdir(parents=True)
+        (done_dir / "d.csv").write_text("col\n1", encoding="utf-8")
+        (pending_dir / "p.csv").write_text("col\n2", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        try:
+            con = idx1._connect()
+            idx1._walk_pass_confirmed_complete = False
+            # "done" sorts before "pending" -- the boundary sitting inside
+            # pending/ proves the walk has fully passed done/'s block.
+            idx1._scan_boundary = str(pending_dir / "p.csv")
+            idx1._pending_stale = {str(pending_dir / "p.csv"): (1.0, 1)}
+            idx1._persist_walk_state_locked(con)
+        finally:
+            idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        try:
+            done_state = idx2.get_convergence_state(subtree=str(done_dir))
+            pending_state = idx2.get_convergence_state(subtree=str(pending_dir))
+            root_state = idx2.get_convergence_state()
+
+            assert done_state.converged is True
+            assert done_state.pending_count == 0
+
+            assert pending_state.converged is False
+            assert pending_state.pending_count == 1
+
+            assert root_state.converged is False
+            assert root_state.pending_count == 1
+        finally:
+            idx2.close()
+
+    @duckdb_required
+    def test_restart_after_full_convergence_still_reports_converged(
+        self, tmp_path: Path,
+    ) -> None:
+        """Happy path across a restart: a tree that fully converged before
+        the process exited must still report fully converged -- with the
+        SAME expected/indexed counts -- to a fresh instance that has not
+        (yet) called rebuild() itself."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        (outputs_dir / "a.csv").write_text("col\n1", encoding="utf-8")
+        (outputs_dir / "b.csv").write_text("col\n2", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        try:
+            idx1.rebuild()
+            assert idx1.get_convergence_state().converged is True
+        finally:
+            idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        try:
+            state = idx2.get_convergence_state()
+            assert state.converged is True
+            assert state.walk_complete is True
+            assert state.pending_count == 0
+            assert state.indexed_count == 2
+            assert state.expected_count == 2
+            assert state.last_error is None
+        finally:
+            idx2.close()
+
+
+# ---------------------------------------------------------------------------
 # Determinism: same inputs -> same results (requirement 3)
 # ---------------------------------------------------------------------------
 

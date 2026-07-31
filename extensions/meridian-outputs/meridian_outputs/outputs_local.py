@@ -1692,6 +1692,38 @@ class OutputsFtsIndex:
         # not) for this instance, so get_subtree_index() only ever tries the
         # ancestor-seeding lookup once per subtree index, not on every call.
         self._seeded_from_ancestor = False
+        # ------------------------------------------------------------------
+        # Durable walk/convergence state (item durability follow-up to
+        # 6af1518d) -- everything above this point (_walk_state,
+        # _pending_stale, _scan_boundary, _expected_count, _last_walk_error)
+        # only ever lived in this Python object's memory: a process restart
+        # mid-walk lost the backlog and scan progress outright, AND
+        # get_convergence_state() -- which reads none of this from disk --
+        # would report a freshly-restarted, never-yet-rebuilt instance as
+        # `converged=True` (walk_state is None, pending_stale is empty)
+        # even though the previous process's walk never finished a pass.
+        # That is exactly the "silently claim completion it hasn't
+        # verified" failure this fixes. _walk_pass_confirmed_complete is
+        # the durable proxy for "_walk_state is not None": kept in
+        # lockstep with the walk_complete local computed in rebuild()'s
+        # Phase 0 every call, persisted to outputs_index_meta at the end
+        # of rebuild() (see _persist_walk_state_locked), and rehydrated in
+        # _connect() (see _rehydrate_walk_state_from_disk) so a fresh
+        # instance -- even one that answers get_convergence_state() before
+        # ever calling rebuild() itself -- reflects the last CONFIRMED
+        # on-disk state rather than an optimistic empty default. Defaults
+        # to True (matches the pre-existing "nothing recorded yet" ==
+        # "nothing to report as incomplete" contract for a genuinely
+        # brand-new index -- see TestConvergenceState::
+        # test_no_walk_in_progress_means_any_subtree_converged).
+        self._walk_pass_confirmed_complete = True
+        # Monotonic counter, incremented each time rebuild() starts a BRAND
+        # NEW walk pass (self._walk_state was None). Purely a durable
+        # audit/diagnostic trail -- distinguishes "this pending_stale/
+        # scan_boundary belongs to the walk pass that was running when the
+        # process died" from an arbitrarily older one; nothing in the
+        # convergence-state contract branches on its value.
+        self._walk_epoch = 0
 
     def _connect(self) -> Any:
         if self._con is None:
@@ -1757,6 +1789,22 @@ class OutputsFtsIndex:
                         "OutputsFtsIndex._connect: cache rehydration failed",
                         exc_info=True,
                     )
+            # Durability follow-up to 6af1518d -- restore walk epoch/
+            # cursor/pending-backlog/expected-count/last-error from any
+            # prior process's persisted state (see
+            # _persist_walk_state_locked). Deliberately NOT gated on
+            # needs_full_rehash: this metadata (stat-signature backlog,
+            # scan boundary, error string) is independent of the hash
+            # algorithm the row content was fingerprinted with, so a
+            # pending hash-algo upgrade has no bearing on whether it's
+            # safe to restore.
+            try:
+                self._rehydrate_walk_state_from_disk()
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._connect: walk-state rehydration failed",
+                    exc_info=True,
+                )
         return self._con
 
     def _rehydrate_cache_from_disk(self) -> None:
@@ -1831,6 +1879,137 @@ class OutputsFtsIndex:
             _log.debug(
                 "OutputsFtsIndex._rehydrate_cache_from_disk: resumed %d "
                 "cached rows from disk", len(fetched),
+            )
+
+    # Keys this instance owns inside the shared, generic ``outputs_index_meta``
+    # key/value table (see _ensure_schema's docstring: "kept generic so
+    # future schema-version markers don't need a new table each time" --
+    # this reuses that existing local DB connection/schema rather than
+    # inventing a second on-disk store for walk/convergence state).
+    _WALK_STATE_META_KEYS = (
+        "walk_epoch",
+        "walk_pass_complete",
+        "walk_scan_boundary",
+        "walk_expected_count",
+        "walk_last_error",
+        "walk_pending_stale_json",
+    )
+
+    def _persist_walk_state_locked(self, con: Any) -> None:
+        """Durably record walk epoch/cursor(scan boundary)/pending backlog/
+        expected count/last error into ``outputs_index_meta`` so a process
+        restart can rehydrate them (:meth:`_rehydrate_walk_state_from_disk`)
+        instead of silently reporting false convergence or losing
+        confirmed-stale files that were never actually persisted.
+
+        Must be called with ``self._write_lock`` already held (mirrors
+        :meth:`_add_annotation_locked`'s naming convention) -- called from
+        the tail of :meth:`rebuild`, after Phase 2's own write (successful
+        or not; a write failure is exactly the case where the caller most
+        needs the retry backlog to survive a restart). Best-effort: a
+        persistence failure here must never break rebuild()'s own contract,
+        so callers wrap this in their own try/except.
+        """
+        self._ensure_schema(con)
+        pending_json = json.dumps(
+            {p: list(sig) for p, sig in self._pending_stale.items()}
+        )
+        values: dict[str, str | None] = {
+            "walk_epoch": str(self._walk_epoch),
+            "walk_pass_complete": "1" if self._walk_pass_confirmed_complete else "0",
+            "walk_scan_boundary": self._scan_boundary,
+            "walk_expected_count": (
+                str(self._expected_count) if self._expected_count is not None
+                else None
+            ),
+            "walk_last_error": self._last_walk_error,
+            "walk_pending_stale_json": pending_json,
+        }
+        placeholders = ",".join("?" for _ in self._WALK_STATE_META_KEYS)
+        con.execute(
+            f"DELETE FROM outputs_index_meta WHERE key IN ({placeholders})",
+            list(self._WALK_STATE_META_KEYS),
+        )
+        for key, value in values.items():
+            con.execute(
+                "INSERT INTO outputs_index_meta (key, value) VALUES (?, ?)",
+                [key, value],
+            )
+
+    def _rehydrate_walk_state_from_disk(self) -> None:
+        """Restore walk epoch/cursor(scan boundary)/pending backlog/expected
+        count/last error from a prior process's persisted state (see
+        :meth:`_persist_walk_state_locked`), so a freshly-constructed
+        instance -- even one whose very first call is a read-only
+        :meth:`get_convergence_state` -- reflects the last CONFIRMED on-disk
+        state rather than the optimistic "nothing recorded, must be fine"
+        default every field otherwise starts from.
+
+        No-op (fields keep their constructor defaults) when
+        ``outputs_index_meta`` doesn't exist yet, holds none of these keys
+        (a brand-new DB, or one written before this durability fix shipped),
+        or can't be read -- same degrade-gracefully contract as
+        :meth:`_rehydrate_cache_from_disk`.
+        """
+        con = self._con
+        if con is None:
+            return
+        try:
+            placeholders = ",".join("?" for _ in self._WALK_STATE_META_KEYS)
+            rows = con.execute(
+                "SELECT key, value FROM outputs_index_meta "
+                f"WHERE key IN ({placeholders})",
+                list(self._WALK_STATE_META_KEYS),
+            ).fetchall()
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "OutputsFtsIndex._rehydrate_walk_state_from_disk: read "
+                "failed", exc_info=True,
+            )
+            return
+        if not rows:
+            return
+        values = {key: value for key, value in rows}
+        epoch_raw = values.get("walk_epoch")
+        if epoch_raw is not None:
+            try:
+                self._walk_epoch = int(epoch_raw)
+            except (TypeError, ValueError):
+                _log.debug(
+                    "OutputsFtsIndex._rehydrate_walk_state_from_disk: "
+                    "invalid walk_epoch %r", epoch_raw,
+                )
+        complete_raw = values.get("walk_pass_complete")
+        if complete_raw is not None:
+            self._walk_pass_confirmed_complete = complete_raw == "1"
+        self._scan_boundary = values.get("walk_scan_boundary")
+        self._last_walk_error = values.get("walk_last_error")
+        expected_raw = values.get("walk_expected_count")
+        if expected_raw is not None:
+            try:
+                self._expected_count = int(expected_raw)
+            except (TypeError, ValueError):
+                self._expected_count = None
+        else:
+            self._expected_count = None
+        pending_json = values.get("walk_pending_stale_json")
+        if pending_json:
+            try:
+                raw = json.loads(pending_json)
+                self._pending_stale = {
+                    p: (sig[0], sig[1]) for p, sig in raw.items()
+                }
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._rehydrate_walk_state_from_disk: "
+                    "failed to parse pending_stale_json", exc_info=True,
+                )
+        if rows:
+            _log.debug(
+                "OutputsFtsIndex._rehydrate_walk_state_from_disk: resumed "
+                "walk state (epoch=%d, pass_complete=%s, pending=%d) from "
+                "disk", self._walk_epoch, self._walk_pass_confirmed_complete,
+                len(self._pending_stale),
             )
 
     def _read_hash_algo_version(self, con: Any) -> int:
@@ -2343,6 +2522,12 @@ class OutputsFtsIndex:
         batch_limit = self._adaptive_batch_limit()
         if os.path.isdir(self.outputs_dir):
             if self._walk_state is None:
+                # A brand-new pass is starting (either the very first one,
+                # or the one after a prior pass completed) -- bump the
+                # durable epoch counter (see _persist_walk_state_locked)
+                # BEFORE any paths are drained, so even a crash during this
+                # very first drain() records the correct epoch on restart.
+                self._walk_epoch += 1
                 self._walk_state = _ResumableFileWalk(
                     self.outputs_dir, exclude_patterns=self._exclude_patterns,
                     max_batch=batch_limit, on_error=self._record_walk_error,
@@ -2366,6 +2551,14 @@ class OutputsFtsIndex:
             self._walk_accumulated = []
             self._pending_stale = {}
             walk_complete = True
+
+        # Durable proxy for "_walk_state is not None" -- see the field's
+        # docstring in __init__. Kept in lockstep with walk_complete on
+        # every call (in-memory here; persisted at the tail of this method)
+        # so get_convergence_state() reports the correct walk_complete/
+        # converged answer even for a freshly-restarted process that polls
+        # it before ever calling rebuild() itself.
+        self._walk_pass_confirmed_complete = walk_complete
 
         if walk_complete:
             # A full pass just finished (or outputs_dir doesn't exist) -- this
@@ -2855,6 +3048,23 @@ class OutputsFtsIndex:
                         "OutputsFtsIndex.rebuild: failed to persist "
                         "hash_algo_version", exc_info=True,
                     )
+            # Durability follow-up to 6af1518d -- persist THIS call's final
+            # walk epoch/cursor/pending-backlog/expected-count/last-error,
+            # regardless of whether Phase 2's row write above succeeded.
+            # Unconditional (not gated on `changed`) because a walk pass can
+            # legitimately complete -- or a pending-stale backlog can
+            # legitimately shrink/grow -- with zero row-level changes this
+            # call (e.g. a full pass over an already-converged tree).
+            # Best-effort: a persistence failure here must never break
+            # rebuild()'s own return contract.
+            try:
+                walk_state_con = self._connect()
+                self._persist_walk_state_locked(walk_state_con)
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex.rebuild: failed to persist walk state",
+                    exc_info=True,
+                )
             self.last_rebuild_metrics["write_seconds"] = round(
                 time.monotonic() - write_started, 6,
             )
@@ -3173,9 +3383,35 @@ class OutputsFtsIndex:
         from "this subtree is genuinely empty". See
         :func:`_subtree_scanned_past` for the scan-boundary heuristic this
         uses, and its documented limits.
+
+        Durability follow-up to 6af1518d: connects (best-effort) before
+        reading state, so a process that restarted mid-walk and calls this
+        method FIRST -- before ever calling :meth:`rebuild` itself -- still
+        answers from the last CONFIRMED on-disk state (see
+        :meth:`_rehydrate_walk_state_from_disk`) instead of the empty,
+        optimistic-looking defaults a brand-new, never-connected instance
+        would otherwise report. Still read-only and safe to poll: once
+        connected (a one-time cost per instance), this is a pure in-memory
+        read, and never triggers a filesystem walk or any indexing.
         """
         with self._read_lock:
-            walk_in_progress = self._walk_state is not None
+            try:
+                self._connect()
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex.get_convergence_state: connect failed "
+                    "(duckdb unavailable or db unreadable) -- reporting "
+                    "in-memory state only", exc_info=True,
+                )
+            # _walk_pass_confirmed_complete is the durable proxy for
+            # "_walk_state is not None" -- see its docstring in __init__.
+            # Checking BOTH covers the in-process case (a live walk this
+            # same process started) and the cross-restart case (a prior
+            # process's walk that never finished, rehydrated above).
+            walk_in_progress = (
+                self._walk_state is not None
+                or not self._walk_pass_confirmed_complete
+            )
             last_error = self.last_db_write_error or self._last_walk_error
             if subtree is None:
                 pending = len(self._pending_stale)
