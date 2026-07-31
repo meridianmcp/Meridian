@@ -4398,6 +4398,58 @@ def resolve_figure_output(
     return index.resolve_output(file_path)
 
 
+def get_indexed_output(outputs_dir: str, file_path: str) -> dict[str, Any] | None:
+    """Read-only membership check: has ``file_path`` ever been discovered and
+    indexed under ``outputs_dir`` -- WITHOUT triggering a rebuild (unlike
+    :func:`resolve_figure_output`, which forces one first). Item bd5b8d79
+    (per-file provenance authority) -- this is what lets a caller distinguish
+    "this path is part of the outputs tree but has no exact provenance
+    record" (a real, if unregistered, output) from "this path was never
+    discovered by the walker at all".
+
+    Delegates straight to :meth:`OutputsFtsIndex.resolve_output` (an exact-
+    path SQL lookup against the persistent ``outputs_index`` table) on the
+    SAME cached index instance every other tool in this module uses -- a row
+    written by a prior process is visible here even before THIS process's
+    own walk has rehydrated ``_row_cache``/``_manifest``, because the query
+    runs directly against the on-disk DuckDB file (see ``_connect``).
+
+    Returns:
+      The resolved row (same shape as ``resolve_output``/
+      ``resolve_figure_output``: path, generating_script, is_archival,
+      canonical_path, sha256, kind, size, mtime, csv_columns, json_keys), or
+      ``None`` if ``file_path`` has never been indexed under ``outputs_dir``
+      (or ``outputs_dir``/``file_path`` are missing/invalid).
+    """
+    if not file_path or not str(file_path).strip():
+        return None
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        return None
+    index = _get_cached_index(outputs_dir)
+    return index.resolve_output(file_path)
+
+
+def get_path_annotations(outputs_dir: str, path: str) -> list[dict[str, Any]]:
+    """Read-only wrapper: annotations for ``path`` AND its ancestor
+    directories (e.g. a directory-level ``MERIDIAN_NOTES.md`` note), read
+    from the SAME cached index :func:`annotate_outputs`/``search_outputs``
+    already use.
+
+    Delegates straight to :meth:`OutputsFtsIndex.get_annotations_for_path`.
+    Exposed at module level (item bd5b8d79) so a caller composing a richer
+    per-path answer (``provenance_status.get_provenance_status``) can read
+    directory-level fallback coverage without reaching into the class's
+    instance directly. Never triggers a rebuild -- purely reads whatever
+    annotations are already persisted.
+    """
+    if not path or not str(path).strip():
+        return []
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        return []
+    index = _get_cached_index(outputs_dir)
+    return index.get_annotations_for_path(path)
+
+
 # ---------------------------------------------------------------------------
 # Disposable log search: Tier 0 ripgrep scan + Tier 1 opportunistic sniffing
 # ---------------------------------------------------------------------------
