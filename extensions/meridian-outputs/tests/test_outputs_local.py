@@ -1305,6 +1305,206 @@ class TestWalkStateDurability:
         finally:
             idx2.close()
 
+    @duckdb_required
+    def test_rebuild_called_first_forced_write_failure_survives_backlog(
+        self, tmp_path: Path,
+    ) -> None:
+        """<code-review fix, sprint 6b5ecdc5> regression test for Finding 2.
+
+        Mirrors the REAL production call order -- search_outputs() calls
+        index.rebuild() DIRECTLY, with no preceding get_convergence_state()/
+        _connect() call -- which every pre-existing TestWalkStateDurability
+        test above pre-empts by connecting first. That ordering matters
+        because this instance's first _connect() call (which triggers
+        _rehydrate_walk_state_from_disk) doesn't fire until MID-Phase-2 of
+        THIS rebuild() call, i.e. AFTER Phase 0/1 of the SAME call has
+        already added a newly-discovered file to self._pending_stale.
+
+        Setup: a prior incarnation fully converges on one file and persists
+        a clean, empty backlog (a realistic "everything was fine before the
+        restart" prior state) -- then a NEW file appears before the restart.
+        A fresh instance calls rebuild() directly as its first operation,
+        with a forced write failure. The newly-discovered file's stale
+        entry must survive in the retry backlog: rehydration merging with
+        (not overwriting) this call's own in-flight discovery is what makes
+        that possible -- a hard overwrite would replace the in-flight
+        backlog with the prior (empty) persisted one, silently dropping the
+        file the write failure should have queued for retry.
+        """
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        (outputs_dir / "first.csv").write_text("col\nvalue=1\n", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        # Prior incarnation: fully converges, persists a CLEAN (empty
+        # backlog, pass-confirmed-complete) walk state.
+        prior = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        try:
+            prior.rebuild()
+            assert prior.get_convergence_state().converged is True
+        finally:
+            prior.close()
+
+        # A new file appears after the "restart" -- this is what THIS
+        # call's own Phase 0/1 must discover and queue BEFORE its own
+        # first _connect() call (triggering rehydration) ever fires.
+        (outputs_dir / "second.csv").write_text("col\nvalue=2\n", encoding="utf-8")
+        second_path = str(outputs_dir / "second.csv")
+
+        resumed = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        try:
+            def _boom(self, con):  # noqa: ANN001 -- matches _ensure_schema's signature
+                raise RuntimeError("simulated write failure on first post-restart call")
+
+            with patch.object(OL.OutputsFtsIndex, "_ensure_schema", _boom):
+                # Mirrors real production usage: rebuild() called directly,
+                # first -- never get_convergence_state()/_connect() first.
+                resumed.rebuild()
+
+            assert resumed.last_db_write_error is not None
+            assert second_path in resumed._pending_stale, (
+                "the newly-discovered file's write failed on the SAME "
+                "call that rehydration first fired -- it must survive in "
+                "the retry backlog, not be silently wiped by the "
+                "persisted (pre-restart, empty) backlog -- "
+                f"got {resumed._pending_stale!r}"
+            )
+
+            # A later, unpatched rebuild() call actually retries and
+            # persists it -- proving the survival above was real, not an
+            # artifact of the assertion running too early.
+            resumed.last_db_write_error = None
+            resumed.rebuild()
+            assert second_path not in resumed._pending_stale
+            hits = resumed.search("value=2")
+            assert any("second.csv" in h["path"] for h in hits), (
+                f"the file must be searchable once the retry actually "
+                f"succeeds -- got {hits}"
+            )
+        finally:
+            resumed.close()
+
+    @duckdb_required
+    def test_interrupted_persist_leaves_durable_state_never_a_partial_mix(
+        self, tmp_path: Path,
+    ) -> None:
+        """<code-review fix, sprint 6b5ecdc5> regression test for Finding 1.
+
+        Simulates a hard kill partway through _persist_walk_state_locked's
+        DELETE + 6 INSERTs (between the walk_epoch and walk_pass_complete
+        inserts, mirroring the reviewer's real subprocess-kill reproduction
+        via in-process failure injection -- a test double that forwards
+        every statement to a REAL DuckDB connection except it raises before
+        the 7th call reaches it). Confirms the durable outputs_index_meta
+        state after the interruption is EXACTLY the old, pre-call snapshot
+        -- never a hybrid of old and new keys -- proving the DELETE + 6
+        INSERTs land as one atomic unit."""
+        db_path = str(tmp_path / "index.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            con = idx._connect()
+
+            def _snapshot() -> dict[str, str | None]:
+                placeholders = ",".join("?" for _ in idx._WALK_STATE_META_KEYS)
+                rows = con.execute(
+                    "SELECT key, value FROM outputs_index_meta WHERE key "
+                    f"IN ({placeholders})",
+                    list(idx._WALK_STATE_META_KEYS),
+                ).fetchall()
+                return dict(rows)
+
+            # Baseline: a complete, successfully-committed persist -- the
+            # "old" durable state the interrupted persist must fall back to.
+            idx._walk_epoch = 1
+            idx._walk_pass_confirmed_complete = True
+            idx._scan_boundary = "old_boundary"
+            idx._expected_count = 10
+            idx._last_walk_error = None
+            idx._pending_stale = {}
+            idx._persist_walk_state_locked(con)
+            old_snapshot = _snapshot()
+            assert len(old_snapshot) == len(idx._WALK_STATE_META_KEYS), (
+                f"baseline persist did not land all 6 keys: {old_snapshot!r}"
+            )
+
+            # Mutate to a DIFFERENT new in-memory state...
+            idx._walk_epoch = 2
+            idx._walk_pass_confirmed_complete = False
+            idx._scan_boundary = "new_boundary"
+            idx._expected_count = 20
+            idx._last_walk_error = "could not list directory 'bad': boom"
+            idx._pending_stale = {str(tmp_path / "x.csv"): (1.0, 1)}
+
+            # ...and simulate a hard kill between the walk_epoch and
+            # walk_pass_complete INSERTs (the exact window the reviewer
+            # reproduced live). ROLLBACK/COMMIT always reach the real
+            # connection so the real DuckDB transaction genuinely gets
+            # discarded -- the same durable outcome DuckDB's own crash
+            # recovery provides when the process dies outright and no
+            # Python exception handler ever runs at all.
+            failing_con = _FailingAfterN(con, fail_after=6)
+            with pytest.raises(RuntimeError, match="simulated hard-kill"):
+                idx._persist_walk_state_locked(failing_con)
+
+            new_snapshot = _snapshot()
+            assert new_snapshot == old_snapshot, (
+                "an interrupted persist must leave the durable state "
+                "EXACTLY as it was before the call started -- never a mix "
+                f"of old and new keys. old={old_snapshot!r} "
+                f"new={new_snapshot!r}"
+            )
+            # Explicitly confirm it's not a HYBRID: no key leaked a NEW value.
+            leaked_new_values = {
+                "walk_epoch": "2",
+                "walk_pass_complete": "0",
+                "walk_scan_boundary": "new_boundary",
+                "walk_expected_count": "20",
+            }
+            for key, bad_value in leaked_new_values.items():
+                assert new_snapshot.get(key) != bad_value, (
+                    f"key {key!r} leaked a NEW value from the interrupted "
+                    f"persist -- durable state is a partial mix: "
+                    f"{new_snapshot!r}"
+                )
+
+            # The connection must be usable afterward (ROLLBACK genuinely
+            # closed out the transaction) -- a later persist succeeds
+            # cleanly and the durable state reflects it in full.
+            idx._persist_walk_state_locked(con)
+            final_snapshot = _snapshot()
+            assert final_snapshot["walk_epoch"] == "2"
+            assert final_snapshot["walk_pass_complete"] == "0"
+        finally:
+            idx.close()
+
+
+class _FailingAfterN:
+    """Test double for Finding 1's atomicity regression test: forwards
+    every ``execute()`` call to a REAL DuckDB connection, except it raises
+    before the ``(fail_after + 1)``-th non-ROLLBACK/COMMIT call reaches it
+    -- simulating a hard kill partway through a batch of statements while
+    still letting ``_persist_walk_state_locked``'s own except-block
+    ROLLBACK reach the real connection, so the real DuckDB transaction
+    genuinely gets discarded (the same durable outcome DuckDB's own crash
+    recovery provides for a true process kill, where no Python exception
+    handler runs at all)."""
+
+    def __init__(self, real_con: Any, fail_after: int) -> None:
+        self._real = real_con
+        self._count = 0
+        self._fail_after = fail_after
+
+    def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+        if sql.strip().upper() in ("ROLLBACK", "COMMIT"):
+            return self._real.execute(sql, *args, **kwargs)
+        self._count += 1
+        if self._count > self._fail_after:
+            raise RuntimeError("simulated hard-kill mid-persist")
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
 
 # ---------------------------------------------------------------------------
 # Determinism: same inputs -> same results (requirement 3)

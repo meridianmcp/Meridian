@@ -1909,6 +1909,30 @@ class OutputsFtsIndex:
         needs the retry backlog to survive a restart). Best-effort: a
         persistence failure here must never break rebuild()'s own contract,
         so callers wrap this in their own try/except.
+
+        <code-review fix, sprint 6b5ecdc5> -- the DELETE + 6 INSERTs below
+        are wrapped in ONE explicit DuckDB transaction (BEGIN/COMMIT, with
+        ROLLBACK on any failure) instead of running as 7 separate
+        auto-committed statements. Previously a hard kill (crash, OOM,
+        power loss) between any two of those statements left the DB
+        holding a MIX of old and new keys -- e.g. a freshly-written
+        ``walk_epoch`` alongside a stale ``walk_pass_complete``/
+        ``walk_pending_stale_json`` that the DELETE had already removed
+        but the matching INSERT never reached. On rehydration those
+        missing keys silently fell back to the optimistic constructor
+        defaults (``_walk_pass_confirmed_complete=True``,
+        ``_pending_stale={}``), reintroducing -- via a different
+        mechanism -- exactly the "silently claims completion it hasn't
+        verified" bug this whole feature exists to close. No other
+        multi-statement atomic pattern exists elsewhere in this file to
+        match (the other delete-then-insert helpers here,
+        e.g. :meth:`_write_hash_algo_version`, are single-key upserts,
+        not a multi-key batch), so this introduces DuckDB's standard
+        explicit-transaction SQL rather than inventing a new mechanism.
+        With this, any failure -- including the process dying mid-batch,
+        which never reaches COMMIT at all -- leaves the durable state
+        exactly as it was BEFORE this call started: either the complete
+        old set of keys, or (a genuinely first-ever persist) nothing.
         """
         self._ensure_schema(con)
         pending_json = json.dumps(
@@ -1926,15 +1950,29 @@ class OutputsFtsIndex:
             "walk_pending_stale_json": pending_json,
         }
         placeholders = ",".join("?" for _ in self._WALK_STATE_META_KEYS)
-        con.execute(
-            f"DELETE FROM outputs_index_meta WHERE key IN ({placeholders})",
-            list(self._WALK_STATE_META_KEYS),
-        )
-        for key, value in values.items():
+        con.execute("BEGIN TRANSACTION")
+        try:
             con.execute(
-                "INSERT INTO outputs_index_meta (key, value) VALUES (?, ?)",
-                [key, value],
+                f"DELETE FROM outputs_index_meta WHERE key IN ({placeholders})",
+                list(self._WALK_STATE_META_KEYS),
             )
+            for key, value in values.items():
+                con.execute(
+                    "INSERT INTO outputs_index_meta (key, value) VALUES (?, ?)",
+                    [key, value],
+                )
+        except BaseException:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._persist_walk_state_locked: rollback "
+                    "after a failed write also failed -- connection may be "
+                    "left in an unusable transaction state", exc_info=True,
+                )
+            raise
+        else:
+            con.execute("COMMIT")
 
     def _rehydrate_walk_state_from_disk(self) -> None:
         """Restore walk epoch/cursor(scan boundary)/pending backlog/expected
@@ -1950,6 +1988,62 @@ class OutputsFtsIndex:
         (a brand-new DB, or one written before this durability fix shipped),
         or can't be read -- same degrade-gracefully contract as
         :meth:`_rehydrate_cache_from_disk`.
+
+        <code-review fix, sprint 6b5ecdc5> -- MERGES with, rather than
+        overwrites, whatever this instance has already accumulated
+        in-memory. This method only ever fires on this instance's FIRST
+        :meth:`_connect` call -- but in the REAL production call order
+        (``search_outputs()`` -> ``rebuild()`` directly, with no
+        preceding ``get_convergence_state()``/``_connect()`` call), that
+        first :meth:`_connect` doesn't happen until MID-Phase-2 of the
+        first post-restart :meth:`rebuild` call -- i.e. AFTER Phase 0/1
+        of that SAME call already mutated ``self._pending_stale`` (newly
+        discovered stale paths) and unconditionally recomputed
+        ``self._walk_pass_confirmed_complete`` from THIS call's own,
+        just-observed walk state. A hard overwrite here used to silently
+        wipe those same-call discoveries and replace them with whatever
+        was persisted before the restart -- a file whose write failed on
+        THIS call would vanish from the retry backlog forever instead of
+        surviving for the next call (the false-convergence bug this
+        feature exists to close, reintroduced via clobbered rehydration
+        rather than missing persistence). Each field below is merged
+        according to which of the two sources (this call's own, possibly
+        absent, in-flight state vs. the persisted, possibly stale,
+        cross-restart state) is more trustworthy for that field:
+
+        * ``_pending_stale`` -- UNION. A persisted entry for a path this
+          call's own Phase 0/1 hasn't rediscovered yet must still survive
+          for retry; a path this call DID just re-stat is fresher and
+          wins over any stale persisted signature for the same path.
+        * ``_walk_pass_confirmed_complete`` -- logical AND (never widens
+          False -> True, only ever narrows True -> False). Phase 0
+          unconditionally recomputes this EVERY call, so by the time this
+          method can run mid-rebuild(), the in-memory value already IS
+          this call's own, fully current answer -- rehydration must never
+          let a stale, more optimistic persisted value override a fresh,
+          less optimistic one (that is precisely the danger case). When
+          Phase 0 hasn't run yet this instance (the constructor default,
+          True, is still in place), AND correctly reduces to "just adopt
+          the persisted value", reproducing the pre-merge behaviour those
+          call orders already depend on.
+        * ``_scan_boundary`` / ``_last_walk_error`` / ``_expected_count``
+          -- fill only if this call hasn't already produced a value
+          (still ``None``); a value Phase 0/1 already set this call is by
+          definition more current than anything persisted from before.
+        * ``_walk_epoch`` -- take the max of the two: a purely monotonic,
+          purely diagnostic counter (nothing in the convergence contract
+          branches on it), so "genuinely newer" is simply "numerically
+          larger".
+
+        ``rows`` being non-empty but missing SPECIFIC keys (as opposed to
+        holding none of them) means a prior process persisted SOME of the
+        6 keys but not all -- only possible from a DB written by a
+        pre-atomicity-fix version of this code (:meth:`_persist_walk_state_locked`
+        now makes the 6-key batch atomic, so this code can no longer
+        produce that shape itself going forward). A missing
+        ``walk_pass_complete`` key in that situation is treated as
+        persisted-False (conservative), not as "nothing to merge" --
+        see the ``partial_persist`` handling below.
         """
         con = self._con
         if con is None:
@@ -1970,47 +2064,88 @@ class OutputsFtsIndex:
         if not rows:
             return
         values = {key: value for key, value in rows}
+        # <code-review fix, sprint 6b5ecdc5> -- some, but not all, of the 6
+        # keys were found. With the atomic persist above this can only
+        # happen from a DB a pre-fix version of this code left in a
+        # partially-written state -- never from this version's own writes.
+        partial_persist = len(values) < len(self._WALK_STATE_META_KEYS)
+        if partial_persist:
+            _log.warning(
+                "OutputsFtsIndex._rehydrate_walk_state_from_disk: found "
+                "%d/%d walk-state keys in outputs_index_meta for %r -- "
+                "this looks like a persist from before the atomic-write "
+                "fix (or on-disk corruption) was interrupted partway "
+                "through. Treating the walk pass as UNCONFIRMED rather "
+                "than trusting the optimistic default.",
+                len(values), len(self._WALK_STATE_META_KEYS), self._db_path,
+            )
+        # walk_epoch -- purely diagnostic monotonic counter; "genuinely
+        # newer" reduces to "numerically larger" (see docstring).
         epoch_raw = values.get("walk_epoch")
         if epoch_raw is not None:
             try:
-                self._walk_epoch = int(epoch_raw)
+                self._walk_epoch = max(self._walk_epoch, int(epoch_raw))
             except (TypeError, ValueError):
                 _log.debug(
                     "OutputsFtsIndex._rehydrate_walk_state_from_disk: "
                     "invalid walk_epoch %r", epoch_raw,
                 )
+        # walk_pass_confirmed_complete -- logical AND merge (see
+        # docstring): never lets a persisted value turn a call-computed
+        # False into True; correctly adopts the persisted value outright
+        # when this call hasn't computed anything yet (in-memory still at
+        # the constructor's True default).
         complete_raw = values.get("walk_pass_complete")
         if complete_raw is not None:
-            self._walk_pass_confirmed_complete = complete_raw == "1"
-        self._scan_boundary = values.get("walk_scan_boundary")
-        self._last_walk_error = values.get("walk_last_error")
-        expected_raw = values.get("walk_expected_count")
-        if expected_raw is not None:
-            try:
-                self._expected_count = int(expected_raw)
-            except (TypeError, ValueError):
-                self._expected_count = None
+            persisted_complete = complete_raw == "1"
         else:
-            self._expected_count = None
+            # Missing specifically because rows is non-empty (something
+            # WAS persisted) yet this particular key wasn't -- see
+            # partial_persist above. Treat conservatively as "persisted
+            # state says NOT confirmed complete" rather than "nothing to
+            # merge", so this can only ever narrow towards False, same as
+            # every other partial-persist case.
+            persisted_complete = False
+        self._walk_pass_confirmed_complete = (
+            self._walk_pass_confirmed_complete and persisted_complete
+        )
+        # scan_boundary / last_walk_error / expected_count -- fill only if
+        # this call hasn't already produced a value (see docstring).
+        if self._scan_boundary is None:
+            self._scan_boundary = values.get("walk_scan_boundary")
+        if self._last_walk_error is None:
+            self._last_walk_error = values.get("walk_last_error")
+        if self._expected_count is None:
+            expected_raw = values.get("walk_expected_count")
+            if expected_raw is not None:
+                try:
+                    self._expected_count = int(expected_raw)
+                except (TypeError, ValueError):
+                    self._expected_count = None
+        # pending_stale -- UNION (see docstring): persisted entries fill in
+        # paths this call's own walk hasn't rediscovered yet; this call's
+        # own (fresher) entries win for any path present in both.
         pending_json = values.get("walk_pending_stale_json")
         if pending_json:
             try:
                 raw = json.loads(pending_json)
-                self._pending_stale = {
+                persisted_pending: dict[str, tuple[float | None, int | None]] = {
                     p: (sig[0], sig[1]) for p, sig in raw.items()
                 }
+                merged_pending = dict(persisted_pending)
+                merged_pending.update(self._pending_stale)
+                self._pending_stale = merged_pending
             except Exception:  # noqa: BLE001
                 _log.debug(
                     "OutputsFtsIndex._rehydrate_walk_state_from_disk: "
                     "failed to parse pending_stale_json", exc_info=True,
                 )
-        if rows:
-            _log.debug(
-                "OutputsFtsIndex._rehydrate_walk_state_from_disk: resumed "
-                "walk state (epoch=%d, pass_complete=%s, pending=%d) from "
-                "disk", self._walk_epoch, self._walk_pass_confirmed_complete,
-                len(self._pending_stale),
-            )
+        _log.debug(
+            "OutputsFtsIndex._rehydrate_walk_state_from_disk: merged walk "
+            "state (epoch=%d, pass_complete=%s, pending=%d) from disk",
+            self._walk_epoch, self._walk_pass_confirmed_complete,
+            len(self._pending_stale),
+        )
 
     def _read_hash_algo_version(self, con: Any) -> int:
         """Return the ``hash_algo_version`` stored in ``outputs_index_meta``,
