@@ -1144,6 +1144,74 @@ def _load_docx_xml(source: str | bytes | bytearray) -> tuple[bytes, Any]:
     return raw, root
 
 
+class AmbiguousParagraphIdError(ValueError):
+    """827b6bdc -- fail-closed rejection of a para_id that resolves to MORE
+    than one ``<w:p>`` element.
+
+    Raised by :func:`_find_paragraph_by_id` / :func:`_find_paragraph_with_index`
+    instead of silently returning their first match. Word's ``w14:paraId`` is
+    SUPPOSED to be unique per paragraph, but nothing enforces that on read --
+    a malformed / hand-edited / merged .docx can carry the same native id on
+    two distinct paragraphs (the reference case: two paragraphs both carrying
+    ``w14:paraId="6BDC5378"``). First-match-wins addressing on a WRITE path
+    (``DocStructureStore.update_paragraph`` and everything else that resolves
+    a para_id through these two functions) would silently edit whichever
+    paragraph happened to be encountered first during the tree walk -- which
+    may not be the one the caller meant -- with no error and no warning. That
+    is a strictly worse failure mode than refusing outright, so this fails
+    closed instead. Subclasses ``ValueError`` because every existing
+    para_id-resolution failure in this module (unknown id, missing/invalid
+    para_id argument) already raises ``ValueError`` -- an ambiguous id is
+    just another way a para_id fails to resolve to a single answer, so
+    existing ``except ValueError`` callers keep working without changes;
+    ``isinstance(exc, AmbiguousParagraphIdError)`` distinguishes this specific
+    cause when a caller wants to.
+    """
+
+    def __init__(self, message: str, *, para_id: str, matches: list[dict[str, Any]]):
+        super().__init__(message)
+        self.para_id = para_id
+        self.matches = matches
+
+
+def _resolve_paragraph_matches(root: Any, para_id: str) -> list[tuple[int, Any]]:
+    """Shared match logic for :func:`_find_paragraph_by_id` /
+    :func:`_find_paragraph_with_index` (827b6bdc): every ``<w:p>`` in *root*
+    whose native ``w14:paraId`` (or, absent one, the synthesized ``p{idx}``
+    positional fallback) equals ``para_id``, as ``[(idx, element), ...]`` in
+    document order. Normally a single match; more than one means ``para_id``
+    is ambiguous in this document. Never raises -- callers decide what an
+    empty / multi-element result means.
+    """
+    target = para_id.strip()
+    w_p = f"{{{_DOCX_W_NS}}}p"
+    w14_para_id = f"{{{_DOCX_W14_NS}}}paraId"
+    matches: list[tuple[int, Any]] = []
+    for idx, p in enumerate(root.iter(w_p)):
+        real_id = p.get(w14_para_id)
+        synthetic_id = f"p{idx}"
+        if real_id == target or (real_id is None and synthetic_id == target) or synthetic_id == target:
+            matches.append((idx, p))
+    return matches
+
+
+def _raise_ambiguous_paragraph_id(para_id: str, matches: list[tuple[int, Any]]) -> None:
+    indices = [idx for idx, _ in matches]
+    raise AmbiguousParagraphIdError(
+        f"para_id={para_id!r} matches {len(matches)} paragraphs in document "
+        f"order (indices {indices}) -- refusing to guess which one is the "
+        "target; the source .docx likely has a duplicated native w14:paraId "
+        "(a malformed/hand-edited/merged document). Use "
+        "repair_duplicate_para_ids to resolve the collision before "
+        "addressing this id again.",
+        para_id=para_id,
+        matches=[
+            {"index": idx, "text": _paragraph_plain_text(p)[:200]}
+            for idx, p in matches
+        ],
+    )
+
+
 def _find_paragraph_by_id(root: Any, para_id: str) -> Any | None:
     """Return the ``<w:p>`` element whose id == ``para_id``, or ``None``.
 
@@ -1154,18 +1222,21 @@ def _find_paragraph_by_id(root: Any, para_id: str) -> Any | None:
     here. The synthesized index counts every ``<w:p>`` in document order. Returns
     the bare paragraph element (or ``None``); callers needing the body-order index
     use :func:`_find_paragraph_with_index`.
+
+    827b6bdc -- raises :class:`AmbiguousParagraphIdError` when ``para_id``
+    matches MORE than one ``<w:p>`` element (a duplicated native
+    ``w14:paraId`` in the source document) instead of silently returning
+    whichever one the tree walk reached first -- see that class's docstring
+    for why first-match-wins is unsafe here.
     """
     if not isinstance(para_id, str) or not para_id.strip():
         return None
-    target = para_id.strip()
-    w_p = f"{{{_DOCX_W_NS}}}p"
-    w14_para_id = f"{{{_DOCX_W14_NS}}}paraId"
-    for idx, p in enumerate(root.iter(w_p)):
-        real_id = p.get(w14_para_id)
-        synthetic_id = f"p{idx}"
-        if real_id == target or (real_id is None and synthetic_id == target) or synthetic_id == target:
-            return p
-    return None
+    matches = _resolve_paragraph_matches(root, para_id.strip())
+    if not matches:
+        return None
+    if len(matches) > 1:
+        _raise_ambiguous_paragraph_id(para_id.strip(), matches)
+    return matches[0][1]
 
 
 def _find_paragraph_with_index(root: Any, para_id: str) -> tuple[Any, int] | None:
@@ -1174,19 +1245,18 @@ def _find_paragraph_with_index(root: Any, para_id: str) -> tuple[Any, int] | Non
     Returns ``(element, idx)`` where ``idx`` is the paragraph's zero-based
     position among every ``<w:p>`` in document order (matching the ``p{index}``
     synthesized-id convention), or ``None`` when nothing matches. Shares the exact
-    match rule with :func:`_find_paragraph_by_id`.
+    match rule -- and, per 827b6bdc, the same :class:`AmbiguousParagraphIdError`
+    fail-closed behavior on a duplicated id -- with :func:`_find_paragraph_by_id`.
     """
     if not isinstance(para_id, str) or not para_id.strip():
         return None
-    target = para_id.strip()
-    w_p = f"{{{_DOCX_W_NS}}}p"
-    w14_para_id = f"{{{_DOCX_W14_NS}}}paraId"
-    for idx, p in enumerate(root.iter(w_p)):
-        real_id = p.get(w14_para_id)
-        synthetic_id = f"p{idx}"
-        if real_id == target or (real_id is None and synthetic_id == target) or synthetic_id == target:
-            return p, idx
-    return None
+    matches = _resolve_paragraph_matches(root, para_id.strip())
+    if not matches:
+        return None
+    if len(matches) > 1:
+        _raise_ambiguous_paragraph_id(para_id.strip(), matches)
+    idx, p = matches[0]
+    return p, idx
 
 
 class DocxWriteVerificationError(OSError):
@@ -1741,12 +1811,25 @@ def _verify_paragraph_write(source_path: str, para_id: str, expected_text: str) 
     failure. Never raises itself and never touches the file -- the caller
     decides what to do with a failure, including whether/how to restore a
     backup.
+
+    827b6bdc -- if ``para_id`` is now AMBIGUOUS on re-read (only reachable via
+    a genuine concurrent writer: our own pre-write resolution already proved
+    it unique, and this write never touches w14:paraId), that is reported as
+    a mismatch string here too rather than letting
+    :class:`AmbiguousParagraphIdError` escape -- this keeps the "never raises
+    itself" contract intact, and routes the failure through the SAME already-
+    hardened compare-and-swap safe-restore-or-conflict handling the caller
+    already applies to every other verification failure, instead of adding a
+    second, untested raise-based failure path alongside it.
     """
     try:
         _, root2 = _load_docx_xml(source_path)
     except (OSError, zipfile.BadZipFile, KeyError, _LET.XMLSyntaxError) as exc:
         return f"could not re-read {source_path} after writing it: {exc}"
-    p2 = _find_paragraph_by_id(root2, para_id)
+    try:
+        p2 = _find_paragraph_by_id(root2, para_id)
+    except AmbiguousParagraphIdError as exc:
+        return f"paragraph {para_id!r} became ambiguous in {source_path} after writing it: {exc}"
     if p2 is None:
         return f"paragraph {para_id!r} not found in {source_path} after writing it"
     actual_text = _paragraph_plain_text(p2)
@@ -1756,6 +1839,112 @@ def _verify_paragraph_write(source_path: str, para_id: str, expected_text: str) 
             f"expected {expected_text!r}, found {actual_text!r} on disk"
         )
     return None
+
+
+def _mint_para_id(taken: set[str]) -> str:
+    """Mint a fresh ``w14:paraId`` (Word's own 8-hex-char uppercase format),
+    reserving it in *taken* immediately so repeated calls within the same
+    repair batch never collide with each other, not just with ids already on
+    disk (827b6bdc). Independently implemented rather than imported: mirrors
+    extensions/meridian-docs/meridian_docs/docs_intel.py's ``_new_para_id``
+    (same convention) but this module has no dependency on that standalone
+    package, and that package correspondingly has none on this one.
+    """
+    while True:
+        candidate = uuid.uuid4().hex[:8].upper()
+        if candidate not in taken:
+            taken.add(candidate)
+            return candidate
+
+
+def repair_duplicate_para_ids(
+    source: str | bytes | bytearray,
+    dest_path: str | None = None,
+) -> dict[str, Any]:
+    """827b6bdc -- explicit, opt-in repair for a .docx whose native
+    ``w14:paraId`` values are duplicated across more than one paragraph (the
+    reference regression: two paragraphs both carrying
+    ``w14:paraId="6BDC5378"``).
+
+    Read-side callers -- :func:`docparse.docs_intel.document_content_tree`,
+    :func:`meridian_docs.index_docx_structure` via its vendored copy, and
+    this module's own :func:`_find_paragraph_by_id` /
+    :func:`_find_paragraph_with_index` -- detect a duplicate and either
+    report it (read paths) or fail closed (write paths). None of them ever
+    call this function: renumbering an existing document's ids is a
+    deliberate, separately-invoked mutation, never a side effect of reading
+    or addressing it.
+
+    For every native id shared by 2+ paragraphs, the FIRST occurrence (in
+    document order) keeps its id unchanged; every subsequent occurrence is
+    assigned a fresh id via :func:`_mint_para_id` that collides with nothing
+    already in the document (native or freshly minted earlier in this same
+    call).
+
+    ``dest_path`` is REQUIRED to actually write anything. Omitted (the
+    default): this is a pure, read-only MAPPING -- no bytes are written
+    anywhere and ``source`` (a path or raw bytes) is never touched, whether
+    or not duplicates were found. Given: the repaired document is written to
+    ``dest_path`` via :func:`_save_docx_xml` (the same hardened
+    disposable-staged-artifact + fail-closed structural-manifest pipeline
+    every other write in this module routes through) -- NEVER implicitly
+    back onto a path-based ``source``; a caller that wants to replace the
+    original in place must pass that same path as ``dest_path``
+    deliberately. Nothing is written when there is nothing to fix, even if
+    ``dest_path`` was given.
+
+    Returns ``{duplicates_found, remapped, applied, dest_path}`` --
+    ``duplicates_found`` is the count of DISTINCT ids that were duplicated;
+    ``remapped`` is ``[{old_para_id, new_para_id, index, text}]`` (one entry
+    per RENUMBERED occurrence, i.e. every occurrence after the first of each
+    duplicated id) in document order; ``applied`` is whether a write actually
+    happened. Raises whatever :func:`_load_docx_xml` / :func:`_save_docx_xml`
+    raise on a malformed/unreadable/unwritable document -- this function
+    performs no post-write re-verification beyond what
+    :func:`_save_docx_xml` already guarantees structurally, since (unlike
+    ``update_paragraph``) there is no single expected paragraph TEXT to
+    re-confirm here.
+    """
+    raw, root = _load_docx_xml(source)
+    w_p = f"{{{_DOCX_W_NS}}}p"
+    w14_para_id = f"{{{_DOCX_W14_NS}}}paraId"
+    occurrences_by_id: dict[str, list[tuple[int, Any]]] = {}
+    for idx, p in enumerate(root.iter(w_p)):
+        real_id = p.get(w14_para_id)
+        if not real_id:
+            continue
+        occurrences_by_id.setdefault(real_id, []).append((idx, p))
+
+    taken = set(occurrences_by_id.keys())
+    remapped: list[dict[str, Any]] = []
+    duplicates_found = 0
+    for old_id, occurrences in occurrences_by_id.items():
+        if len(occurrences) < 2:
+            continue
+        duplicates_found += 1
+        # The first occurrence keeps old_id; every later one is renumbered.
+        for idx, p in occurrences[1:]:
+            new_id = _mint_para_id(taken)
+            p.set(w14_para_id, new_id)
+            remapped.append({
+                "old_para_id": old_id,
+                "new_para_id": new_id,
+                "index": idx,
+                "text": _paragraph_plain_text(p)[:200],
+            })
+    remapped.sort(key=lambda r: r["index"])
+
+    applied = False
+    if remapped and dest_path:
+        _save_docx_xml(raw, root, dest_path)
+        applied = True
+
+    return {
+        "duplicates_found": duplicates_found,
+        "remapped": remapped,
+        "applied": applied,
+        "dest_path": dest_path if applied else None,
+    }
 
 
 def _resolve_docx_draft_dest(
@@ -3194,7 +3383,13 @@ class DocStructureStore:
             raw, root = _load_docx_xml(docx_path)
         except Exception as exc:  # noqa: BLE001 — malformed/locked file
             return {"error": f"could not open source .docx: {exc}"}
-        paragraph = _find_paragraph_by_id(root, para_id)
+        try:
+            paragraph = _find_paragraph_by_id(root, para_id)
+        except AmbiguousParagraphIdError as exc:
+            # 827b6bdc — fail closed the same as a not-found id: this call
+            # site's established contract is an {"error": ...} dict, never a
+            # raise, and nothing has been mutated yet either way.
+            return {"error": str(exc)}
         if paragraph is None:
             return {"error": f"no paragraph with id {para_id!r} in {docx_path!r}"}
         try:
@@ -4136,6 +4331,10 @@ class DocStructureStore:
         unknown document, an unresolvable/missing source path, a stale
         ``expected_content_hash``, a rejected draft claim, or a ``para_id``
         not present in the document; raises
+        :class:`AmbiguousParagraphIdError` (827b6bdc, a ``ValueError``
+        subclass) when ``para_id`` matches MORE than one paragraph — a
+        duplicated native ``w14:paraId`` in the source .docx — instead of
+        silently writing whichever match the resolver reached first; raises
         :class:`DocxPostWriteVerificationError` when the promoted write
         cannot be confirmed on disk and it was safe to restore, or
         :class:`DocxConcurrentWriteConflictError` when it could not be
@@ -4393,7 +4592,9 @@ class DocStructureStore:
 
         Returns ``{document_id, para_id, new_text, elements_resynced,
         source_path, draft_path, manifest_hash, pre_counts, post_counts,
-        merge_result}``.
+        merge_result}``. Raises :class:`AmbiguousParagraphIdError` (827b6bdc,
+        a ``ValueError`` subclass) when ``para_id`` matches more than one
+        paragraph in the draft — see :func:`_find_paragraph_by_id`.
         """
         src = source.strip() if isinstance(source, str) else ""
         if not src:

@@ -951,8 +951,15 @@ def index_docx_structure(
     are stored with their cell data serialised as JSON.
 
     Returns a summary ``{index_db, heading_count, figure_count, table_count,
-    complete, source_sha256}``.  Idempotent: all three structural tables are
-    fully replaced on each run.
+    complete, source_sha256, duplicate_para_ids}``.  Idempotent: all three
+    structural tables are fully replaced on each run.
+
+    827b6bdc — ``duplicate_para_ids`` is document_content_tree's own
+    native-``w14:paraId``-collision report, passed through unchanged (READ-ONLY:
+    this indexer never renumbers/mutates the source to resolve a collision it
+    finds — see ``meridian.doc_store.repair_duplicate_para_ids`` for the
+    explicit, separately-invoked repair path). Empty list on the overwhelmingly
+    common case of a document with no duplicated native ids.
 
     e9b2cd2b — freshness metadata: a SHA-256 fingerprint of the source .docx
     bytes and an explicit "complete boundary" marker are stamped into
@@ -1146,6 +1153,11 @@ def index_docx_structure(
         "table_count": len(tables_out),
         "complete": True,
         "source_sha256": source_sha256,
+        # 827b6bdc — surfaces document_content_tree's own duplicate native
+        # w14:paraId report (see _vendored_content_tree.document_content_tree)
+        # so a caller of this read-only indexer learns about an ambiguous
+        # source document without indexing having silently "fixed" it.
+        "duplicate_para_ids": tree.get("duplicate_para_ids", []),
     }
 
 

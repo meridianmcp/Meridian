@@ -835,6 +835,44 @@ def _build_synth_id_map(body: ET.Element) -> dict[int, str]:
     return result
 
 
+def _find_duplicate_native_para_ids(body: ET.Element) -> list[dict[str, Any]]:
+    """Detect native ``w14:paraId`` values shared by more than one direct
+    ``<w:p>`` child of *body* (827b6bdc — a malformed / hand-edited / merged
+    .docx: Word's own invariant is that ``w14:paraId`` is unique per
+    paragraph, but nothing upstream of this function ever verified that; the
+    reference regression is a document with two distinct paragraphs both
+    carrying ``w14:paraId="6BDC5378"``).
+
+    Returns one entry per duplicated id, in first-occurrence document order:
+    ``{"para_id", "occurrence_count", "occurrences": [{"index", "text"}, ...]}``.
+    ``index`` is the body-order position — the SAME index
+    :func:`document_content_tree` assigns each block, so a caller can jump
+    straight from a duplicate report to the offending blocks — and ``text``
+    is a short (200-char) snippet of that paragraph's own text, so a
+    duplicate can actually be located and told apart, not just flagged.
+    Paragraphs with no native id (see :func:`_build_synth_id_map` for how
+    those are synthesized instead) are never part of this report. Empty list
+    when every native id in the document is unique.
+    """
+    p_tag = _q(_W, "p")
+    w14_paraId = _q(_W14, "paraId")
+    seen: dict[str, list[dict[str, Any]]] = {}
+    for index, child in enumerate(body):
+        if child.tag != p_tag:
+            continue
+        native_id = child.get(w14_paraId)
+        if not native_id:
+            continue
+        seen.setdefault(native_id, []).append(
+            {"index": index, "text": _paragraph_text(child)[:200]}
+        )
+    return [
+        {"para_id": pid, "occurrence_count": len(occurrences), "occurrences": occurrences}
+        for pid, occurrences in seen.items()
+        if len(occurrences) > 1
+    ]
+
+
 def _paragraph_node(p: ET.Element, index: int, synth_id: str | None = None) -> dict[str, Any]:
     """Build a content-tree node for one ``<w:p>`` (heading or body paragraph).
 
@@ -904,11 +942,25 @@ def document_content_tree(source: str | bytes | bytearray) -> dict[str, Any]:
             paragraph_count, table_count, heading_count, field_count,
             blocks: [ ...flat, document-ordered nodes... ],
             tree:   [ ...roots, each with nested "children"... ],
+            duplicate_para_ids: [ ...see below... ],
         }
 
     ``blocks`` is the flat sequential stream (paragraphs, headings, tables);
     ``tree`` is the same nodes nested by heading level. Purely additive — this is
     a sibling of ``document_outline``, which is untouched.
+
+    827b6bdc — ``duplicate_para_ids`` (:func:`_find_duplicate_native_para_ids`)
+    reports every native ``w14:paraId`` shared by 2+ paragraphs (a malformed /
+    hand-edited / merged document — Word's own uniqueness invariant is never
+    actually enforced upstream of this parser). This is READ-ONLY reporting:
+    when duplicates exist, the affected ``blocks``/``tree`` nodes still carry
+    whatever ``para_id`` the document literally has (first-match ambiguity is
+    surfaced here, not silently resolved) — this function never renumbers or
+    otherwise mutates the source to "fix" it; see ``meridian.doc_store``'s
+    ``repair_duplicate_para_ids`` for the explicit, separately-invoked repair
+    path. Empty list on a document with no duplicated native ids (the
+    overwhelmingly common case) — existing callers that never look at this key
+    are unaffected.
     """
     if isinstance(source, (bytes, bytearray)):
         zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
@@ -930,11 +982,13 @@ def document_content_tree(source: str | bytes | bytearray) -> dict[str, Any]:
             "field_count": 0,
             "blocks": [],
             "tree": [],
+            "duplicate_para_ids": [],
         }
 
     p_tag = _q(_W, "p")
     tbl_tag = _q(_W, "tbl")
     synth_map = _build_synth_id_map(body)
+    duplicate_para_ids = _find_duplicate_native_para_ids(body)
     # Walk direct body children in stored order so paragraphs and tables keep
     # their real interleaving.
     for index, child in enumerate(list(body)):
@@ -973,6 +1027,7 @@ def document_content_tree(source: str | bytes | bytearray) -> dict[str, Any]:
         "field_count": field_count,
         "blocks": blocks,
         "tree": tree,
+        "duplicate_para_ids": duplicate_para_ids,
     }
 
 
