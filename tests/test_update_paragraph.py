@@ -846,3 +846,238 @@ def test_mcp_update_paragraph_unknown_doc_returns_error(tmp_path, monkeypatch):
             await doc_store.close_all_doc_stores()
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# 827b6bdc — duplicated native w14:paraId: fail-closed writes + explicit
+# repair. Word's own invariant is that w14:paraId is unique per paragraph,
+# but nothing enforced that on read; first-match-wins addressing on a WRITE
+# path would silently edit whichever duplicate the tree walk reached first.
+# ---------------------------------------------------------------------------
+
+_DUPLICATE_DOCUMENT_XML = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="AAAA0001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="6BDC5378">
+      <w:r><w:t>First paragraph, original owner of 6BDC5378.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="AAAA0002">
+      <w:r><w:t>An unrelated, uniquely-identified paragraph in between.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="6BDC5378">
+      <w:r><w:t>Second, unrelated paragraph that WRONGLY shares 6BDC5378.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+
+def test_find_paragraph_by_id_raises_on_duplicate_native_para_id(tmp_path):
+    """827b6bdc regression: the reference case this item names -- two
+    distinct paragraphs both carrying w14:paraId="6BDC5378" (e.g. a real
+    hand-edited/merged .docx). _find_paragraph_by_id must fail closed
+    instead of silently returning the first match."""
+    docx = _write_docx(str(tmp_path / "dup.docx"), _DUPLICATE_DOCUMENT_XML)
+    _raw, root = doc_store._load_docx_xml(docx)
+
+    with pytest.raises(doc_store.AmbiguousParagraphIdError) as exc_info:
+        doc_store._find_paragraph_by_id(root, "6BDC5378")
+
+    exc = exc_info.value
+    assert "6BDC5378" in str(exc)
+    assert exc.para_id == "6BDC5378"
+    assert len(exc.matches) == 2
+    # Enough location info to actually find the problem: body-order index
+    # (1 and 3, since the duplicated id is the 2nd and 4th <w:p>) plus a text
+    # snippet distinguishing the two, not just "duplicate found".
+    assert [m["index"] for m in exc.matches] == [1, 3]
+    assert "First paragraph" in exc.matches[0]["text"]
+    assert "Second, unrelated paragraph" in exc.matches[1]["text"]
+
+    # A non-duplicated id in the SAME document still resolves normally --
+    # only the actually-ambiguous id fails closed.
+    unique = doc_store._find_paragraph_by_id(root, "AAAA0002")
+    assert unique is not None
+    assert doc_store._paragraph_plain_text(unique) == (
+        "An unrelated, uniquely-identified paragraph in between."
+    )
+    assert doc_store._find_paragraph_by_id(root, "NOPE") is None
+
+
+def test_find_paragraph_with_index_raises_on_duplicate_native_para_id(tmp_path):
+    """Same fail-closed contract for the (element, idx) accessor."""
+    docx = _write_docx(str(tmp_path / "dup.docx"), _DUPLICATE_DOCUMENT_XML)
+    _raw, root = doc_store._load_docx_xml(docx)
+
+    with pytest.raises(doc_store.AmbiguousParagraphIdError):
+        doc_store._find_paragraph_with_index(root, "6BDC5378")
+
+    found = doc_store._find_paragraph_with_index(root, "AAAA0002")
+    assert found is not None and found[1] == 2
+
+
+def test_update_paragraph_rejects_write_to_duplicated_para_id(tmp_path):
+    """The ambiguous-address-rejection regression: a WRITE attempt against a
+    duplicated para_id must be REJECTED -- never silently land on whichever
+    of the two matching paragraphs the resolver reached first."""
+    async def _run():
+        docx_path = _write_docx(str(tmp_path / "dup.docx"), _DUPLICATE_DOCUMENT_XML)
+        store = await _open_store(tmp_path)
+        try:
+            await store.reindex_document("proj-1", docx_path, source=docx_path)
+
+            raised = False
+            try:
+                await store.update_paragraph(
+                    "proj-1", docx_path, "6BDC5378", "This must never land.",
+                )
+            except doc_store.AmbiguousParagraphIdError as exc:
+                raised = True
+                assert "6BDC5378" in str(exc)
+            assert raised, "expected AmbiguousParagraphIdError, write was not rejected"
+
+            # Neither of the two candidate paragraphs was touched -- the
+            # file is byte-for-byte the original text on both sides of the
+            # ambiguity, not just "one of them happened to survive".
+            new_xml = _read_document_xml(docx_path).decode("utf-8")
+            assert "First paragraph, original owner of 6BDC5378." in new_xml
+            assert "Second, unrelated paragraph that WRONGLY shares 6BDC5378." in new_xml
+            assert "This must never land." not in new_xml
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_insert_equation_rejects_ambiguous_para_id_without_mutating(tmp_path):
+    """insert_equation's own {"error": ...} contract is preserved for the
+    ambiguous case (never raises out of this call, never mutates)."""
+    async def _run():
+        docx_path = _write_docx(str(tmp_path / "dup.docx"), _DUPLICATE_DOCUMENT_XML)
+        store = await _open_store(tmp_path)
+        try:
+            await store.reindex_document("proj-1", docx_path, source=docx_path)
+            before = _read_document_xml(docx_path)
+
+            result = await store.insert_equation(
+                "proj-1", docx_path, "6BDC5378",
+                "<m:oMath xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\">"
+                "<m:r><m:t>x</m:t></m:r></m:oMath>",
+            )
+            assert "error" in result
+            assert "6BDC5378" in result["error"]
+            assert _read_document_xml(docx_path) == before
+        finally:
+            await store.close()
+
+    asyncio.run(_run())
+
+
+def test_mcp_update_paragraph_rejects_ambiguous_para_id(tmp_path, monkeypatch):
+    """Through the real MCP dispatch path: AmbiguousParagraphIdError is a
+    ValueError subclass, so the existing `except ValueError` in
+    handle_update_paragraph surfaces it as a plain {"error": ...} with zero
+    handler changes required."""
+    async def _run():
+        from meridian import server as mh
+
+        sidecar = _seed_store_via_env(tmp_path, monkeypatch)
+        docx_path = _write_docx(str(tmp_path / "dup.docx"), _DUPLICATE_DOCUMENT_XML)
+        db = await db_module.init_db(":memory:")
+        try:
+            proj = await db_module.create_project(db, "dup-proj")
+            pid = proj["id"]
+            seed = await doc_store.open_doc_store_for(
+                plan=None, hosted=False, data_dir=str(tmp_path),
+                tenant_pg_url=None, override_url=sidecar,
+            )
+            await seed.reindex_document(pid, docx_path, source=docx_path)
+
+            res = await mh._dispatch_mcp_tool(
+                "update_paragraph",
+                {"project_id": pid, "doc": docx_path, "para_id": "6BDC5378",
+                 "new_text": "must not land"},
+                db, str(tmp_path),
+            )
+            assert "error" in res
+            assert "6BDC5378" in res["error"]
+            new_xml = _read_document_xml(docx_path).decode("utf-8")
+            assert "must not land" not in new_xml
+        finally:
+            await db.close()
+            await doc_store.close_all_doc_stores()
+
+    asyncio.run(_run())
+
+
+def test_repair_duplicate_para_ids_mapping_only_does_not_touch_source(tmp_path):
+    """Omitting dest_path is a pure, read-only MAPPING -- no bytes written
+    anywhere, source untouched, regardless of whether duplicates exist."""
+    docx_path = _write_docx(str(tmp_path / "dup.docx"), _DUPLICATE_DOCUMENT_XML)
+    before = _read_document_xml(docx_path)
+
+    result = doc_store.repair_duplicate_para_ids(docx_path)
+
+    assert result["duplicates_found"] == 1
+    assert result["applied"] is False
+    assert result["dest_path"] is None
+    assert len(result["remapped"]) == 1
+    remap = result["remapped"][0]
+    assert remap["old_para_id"] == "6BDC5378"
+    assert remap["new_para_id"] != "6BDC5378"
+    assert remap["index"] == 3
+    assert "Second, unrelated paragraph" in remap["text"]
+    # Nothing was written -- source .docx is byte-for-byte unchanged.
+    assert _read_document_xml(docx_path) == before
+    assert not os.path.exists(docx_path + ".bak")
+
+
+def test_repair_duplicate_para_ids_applies_and_resolves_the_ambiguity(tmp_path):
+    """Given dest_path: the repaired copy is written there (never back onto
+    source implicitly), and afterward BOTH the original id (now unique --
+    first occurrence only) and the freshly minted id resolve unambiguously."""
+    docx_path = _write_docx(str(tmp_path / "dup.docx"), _DUPLICATE_DOCUMENT_XML)
+    before = _read_document_xml(docx_path)
+    dest_path = str(tmp_path / "dup_repaired.docx")
+
+    result = doc_store.repair_duplicate_para_ids(docx_path, dest_path=dest_path)
+
+    assert result["applied"] is True
+    assert result["dest_path"] == dest_path
+    new_id = result["remapped"][0]["new_para_id"]
+
+    # Source is untouched -- repair never implicitly overwrites it.
+    assert _read_document_xml(docx_path) == before
+
+    # The repaired copy now resolves BOTH ids unambiguously.
+    _raw, repaired_root = doc_store._load_docx_xml(dest_path)
+    first = doc_store._find_paragraph_by_id(repaired_root, "6BDC5378")
+    second = doc_store._find_paragraph_by_id(repaired_root, new_id)
+    assert first is not None and second is not None
+    assert doc_store._paragraph_plain_text(first) == (
+        "First paragraph, original owner of 6BDC5378."
+    )
+    assert doc_store._paragraph_plain_text(second) == (
+        "Second, unrelated paragraph that WRONGLY shares 6BDC5378."
+    )
+
+
+def test_repair_duplicate_para_ids_no_duplicates_is_a_noop(tmp_path):
+    """A document with no duplicated native ids reports zero duplicates and
+    writes nothing, even when dest_path is given."""
+    docx_path = _write_docx(str(tmp_path / "clean.docx"))
+    dest_path = str(tmp_path / "clean_out.docx")
+
+    result = doc_store.repair_duplicate_para_ids(docx_path, dest_path=dest_path)
+
+    assert result["duplicates_found"] == 0
+    assert result["remapped"] == []
+    assert result["applied"] is False
+    assert result["dest_path"] is None
+    assert not os.path.exists(dest_path)

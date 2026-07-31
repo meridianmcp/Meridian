@@ -13,6 +13,10 @@ Source of truth: packages/docparse/docparse/docs_intel.py (0d1b0809).
 If that function changes, this copy needs the same change -- there is no
 mechanism keeping them in sync automatically. Flagged as a known tradeoff,
 not a silent duplication.
+
+827b6bdc -- also vendors _find_duplicate_native_para_ids (native w14:paraId
+duplicate detection) for the same reason: document_content_tree here calls
+it, so it has to exist here too.
 """
 from __future__ import annotations
 
@@ -143,6 +147,29 @@ def _build_synth_id_map(body: ET.Element) -> dict[int, str]:
     return result
 
 
+def _find_duplicate_native_para_ids(body: ET.Element) -> list[dict[str, Any]]:
+    """Vendored copy of docparse.docs_intel._find_duplicate_native_para_ids
+    (827b6bdc). See the canonical source for the full docstring; this is the
+    vendored copy kept in sync manually."""
+    p_tag = _q(_W, "p")
+    w14_paraId = _q(_W14, "paraId")
+    seen: dict[str, list[dict[str, Any]]] = {}
+    for index, child in enumerate(body):
+        if child.tag != p_tag:
+            continue
+        native_id = child.get(w14_paraId)
+        if not native_id:
+            continue
+        seen.setdefault(native_id, []).append(
+            {"index": index, "text": _paragraph_text(child)[:200]}
+        )
+    return [
+        {"para_id": pid, "occurrence_count": len(occurrences), "occurrences": occurrences}
+        for pid, occurrences in seen.items()
+        if len(occurrences) > 1
+    ]
+
+
 def _paragraph_node(p: ET.Element, index: int, synth_id: str | None = None) -> dict[str, Any]:
     para_id = p.get(_q(_W14, "paraId")) or synth_id or f"p{index}"
     style = _paragraph_style(p)
@@ -206,11 +233,13 @@ def document_content_tree(source: str | bytes | bytearray) -> dict[str, Any]:
             "field_count": 0,
             "blocks": [],
             "tree": [],
+            "duplicate_para_ids": [],
         }
 
     p_tag = _q(_W, "p")
     tbl_tag = _q(_W, "tbl")
     synth_map = _build_synth_id_map(body)
+    duplicate_para_ids = _find_duplicate_native_para_ids(body)
     for index, child in enumerate(list(body)):
         if child.tag == p_tag:
             blocks.append(_paragraph_node(child, index, synth_map.get(id(child))))
@@ -242,4 +271,5 @@ def document_content_tree(source: str | bytes | bytearray) -> dict[str, Any]:
         "field_count": field_count,
         "blocks": blocks,
         "tree": tree,
+        "duplicate_para_ids": duplicate_para_ids,
     }
