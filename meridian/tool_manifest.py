@@ -13,6 +13,8 @@ re-fires the list_changed signal so a client that *does* honour it also re-lists
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
 
@@ -45,6 +47,8 @@ def build_tool_manifest(tools: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "count": len(entries),
         "tools": entries,
+        "revision": tool_manifest_revision(tools),
+        "revision_algorithm": "sha256(canonical-name-description-inputSchema-annotations)",
         "note": (
             "Full built-in Meridian tool set. If a tool you expected is missing "
             "from your client's tool list, it is almost certainly a stale client "
@@ -52,3 +56,31 @@ def build_tool_manifest(tools: list[dict[str, Any]]) -> dict[str, Any]:
             "here are authoritative. Re-issue tools/list or reconnect to surface it."
         ),
     }
+
+
+def tool_manifest_revision(tools: list[dict[str, Any]]) -> str:
+    """Return a stable revision for the exact schemas exposed by ``tools``.
+
+    Names alone are insufficient: a client can retain an old argument schema
+    while still showing the same tool names.  Keep the revision independent of
+    declaration order and exclude runtime-only fields so it remains stable
+    across equivalent server processes.
+    """
+    canonical: list[dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict) or not tool.get("name"):
+            continue
+        canonical.append({
+            "name": tool.get("name"),
+            "description": tool.get("description") or "",
+            "inputSchema": tool.get("inputSchema") or {},
+            "annotations": tool.get("annotations") or {},
+        })
+    canonical.sort(key=lambda item: str(item["name"]))
+    payload = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()

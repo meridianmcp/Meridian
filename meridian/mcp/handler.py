@@ -1134,10 +1134,15 @@ async def _handle_mcp_request(
     params = body.get("params") or {}
 
     if method == "initialize":
+        from ..tool_manifest import tool_manifest_revision  # noqa: PLC0415
+        server_info = dict(_server._MCP_SERVER_INFO)
+        server_info["toolManifestRevision"] = tool_manifest_revision(
+            _server._MCP_TOOLS_LIST,
+        )
         return _server._jsonrpc_ok(req_id, {
             "protocolVersion": _server._MCP_PROTOCOL_VERSION,
-            "serverInfo": _server._MCP_SERVER_INFO,
-            "capabilities": {"tools": {}, "prompts": {}},
+            "serverInfo": server_info,
+            "capabilities": {"tools": {"listChanged": True}, "prompts": {}},
         })
 
     if method in ("notifications/initialized", "ping"):
@@ -1238,9 +1243,19 @@ async def _handle_mcp_request(
                         ),
                         "detail": str(exc)[:200],
                     }
-        result: dict = {"tools": tools}
+        from ..tool_manifest import build_tool_manifest  # noqa: PLC0415
+        manifest = build_tool_manifest(tools)
+        result: dict = {
+            "tools": tools,
+            "_meta": {
+                "meridian/toolManifest": {
+                    "revision": manifest["revision"],
+                    "count": manifest["count"],
+                },
+            },
+        }
         if tunnel_health is not None:
-            result["_meta"] = {"meridian/tunnelHealth": tunnel_health}
+            result["_meta"]["meridian/tunnelHealth"] = tunnel_health
         return _server._jsonrpc_ok(req_id, result)
 
     if method == "prompts/list":

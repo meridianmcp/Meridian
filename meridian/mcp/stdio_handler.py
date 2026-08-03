@@ -15,6 +15,15 @@ from .. import enqueue as enqueue_module
 from .. import toml_config as toml_config_module
 
 
+def _create_stdio_initialization_options(server: Any) -> Any:
+    """Create stdio initialization options with deterministic tool invalidation."""
+    from mcp.server.lowlevel.server import NotificationOptions
+
+    return server.create_initialization_options(
+        notification_options=NotificationOptions(tools_changed=True),
+    )
+
+
 def build_mcp_server():
     """Construct the MCP server with all eight Meridian tools.
 
@@ -2608,7 +2617,12 @@ def build_mcp_server():
                 await server.run(
                     read_stream,
                     write_stream,
-                    server.create_initialization_options(),
+                    # Advertise the standard invalidation capability. Claude
+                    # Desktop and Cursor own their local tool caches; the
+                    # server must not guess or edit vendor-specific cache
+                    # paths. They can instead refresh from the canonical
+                    # tools/list response when this notification is emitted.
+                    _create_stdio_initialization_options(server),
                 )
         finally:
             keepalive.cancel()
