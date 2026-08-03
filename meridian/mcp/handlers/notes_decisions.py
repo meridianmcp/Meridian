@@ -1524,6 +1524,210 @@ async def handle_check_embedded_staleness(
 
 
 # ---------------------------------------------------------------------------
+# Section 9b2: Semantic figure/table/media provenance integrity audit (6b657a8b)
+# ---------------------------------------------------------------------------
+
+async def handle_audit_figure_table_provenance(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: audit_figure_table_provenance.
+
+    6b657a8b — a batch analogue of :func:`handle_check_embedded_staleness`:
+    where that tool checks ONE figure or table given explicit ids/paths, this
+    walks EVERY figure and table stored for a document and links each caption
+    to its embedded asset, its exact/fallback output match, SHA-256, and
+    generating script — so a caller gets one whole-document integrity report
+    instead of having to enumerate every figure/table id itself.
+
+    Per-figure resolution (uses the figure's stored ``file_path``):
+      - no ``file_path`` recorded at all -> ``status="orphan"``,
+        ``reason="no-embedded-asset"``.
+      - ``outputs_dir`` not given/not a directory -> ``status="unresolved"``,
+        ``reason="no-outputs-dir"`` (nothing to resolve against).
+      - :func:`meridian.outputs_indexer.resolve_output_with_fallback` finds
+        nothing -> ``status="orphan"``, ``reason="no-output-match"``.
+      - an EXACT match, or a basename match with exactly one candidate, is
+        AUTHORITATIVE: :func:`meridian.embedded_staleness.check_embedded_staleness`
+        then compares the resolved sha256 against the live file at
+        ``file_path`` right now -> ``status="mismatch"`` when drifted
+        (``stale=True``), else ``status="ok"``.
+      - a basename match with 2+ same-basename candidates is AMBIGUOUS
+        (non-authoritative — could be the wrong file) -> ``status="ambiguous"``.
+
+    Per-table resolution (``doc_tables`` stores no ``file_path``, so the same
+    exact/basename path resolution cannot apply): a generating-script hint is
+    extracted from the table's OWN caption text via
+    :func:`meridian.outputs_indexer.infer_generating_script_hint`, then traced
+    forward with :func:`meridian.outputs_indexer.find_outputs_by_source`:
+      - no hint in the caption, or ``outputs_dir`` absent -> ``status="orphan"``,
+        ``reason="no-source-hint"`` / ``"no-outputs-dir"``.
+      - hint found but it traces to zero outputs -> ``status="orphan"``,
+        ``reason="no-output-match"``.
+      - hint traces to exactly one output -> ``status="ok"``.
+      - hint traces to 2+ outputs -> ``status="ambiguous"`` (non-authoritative:
+        which run actually fed this table can't be determined from the
+        caption alone).
+
+    Args:
+      project_id  — required.
+      doc         — the stored document's source (same as ingest_document).
+      outputs_dir — the meridian-outputs directory to resolve against. Omitted
+                    (or hosted mode, where the outputs tree lives on the
+                    caller's machine) yields ``"unresolved"``/``"no-outputs-dir"``
+                    for every figure/table rather than a hard error — a
+                    document with no local outputs tree is still auditable
+                    for structure, just not for provenance.
+
+    Returns ``{project_id, doc, document_id, figures: [...], tables: [...],
+    summary: {figure_count, table_count, ok_count, ambiguous_count,
+    orphan_count, mismatch_count, unresolved_count}}``.
+    """
+    validate_input_size(args.get("doc"), "doc", 2_000)
+    validate_input_size(args.get("outputs_dir"), "outputs_dir", 4_000)
+
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    doc_source = (args.get("doc") or "").strip()
+    if not doc_source:
+        return {"error": "doc is required"}
+
+    from meridian.mcp.handler import _resolve_ingest_doc_store  # noqa: PLC0415
+    store = await _resolve_ingest_doc_store(db, data_dir, tenant)
+    if store is None:
+        return {"error": "document-structure store unavailable"}
+    try:
+        doc_row = await store.get_document(args["project_id"], doc_source)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve doc: {exc}"}
+    if doc_row is None:
+        return {
+            "error": (
+                f"no stored document for doc={doc_source!r} — ingest_document "
+                "it first"
+            ),
+        }
+
+    outputs_dir = str(args.get("outputs_dir") or "").strip()
+    if _hosted_mode():
+        # Hosted-mode guard (same as check_embedded_staleness/find_similar_figure):
+        # the outputs tree lives on the caller's machine, never the server's.
+        outputs_dir = ""
+    outputs_dir_usable = bool(outputs_dir) and os.path.isdir(outputs_dir)
+
+    from meridian import outputs_indexer as _oi  # noqa: PLC0415
+    from meridian.embedded_staleness import check_embedded_staleness  # noqa: PLC0415
+
+    counts = {
+        "ok_count": 0, "ambiguous_count": 0, "orphan_count": 0,
+        "mismatch_count": 0, "unresolved_count": 0,
+    }
+
+    figures_out: list[dict[str, Any]] = []
+    try:
+        figures = await store.get_figures(doc_row["id"])
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not fetch figures: {exc}"}
+    for fig in figures:
+        entry: dict[str, Any] = {
+            "id": fig.get("id"),
+            "caption": fig.get("caption"),
+            "file_path": fig.get("file_path"),
+        }
+        file_path = (fig.get("file_path") or "").strip() or None
+        if not file_path:
+            entry["status"] = "orphan"
+            entry["reason"] = "no-embedded-asset"
+        elif not outputs_dir_usable:
+            entry["status"] = "unresolved"
+            entry["reason"] = "no-outputs-dir"
+        else:
+            resolved = _oi.resolve_output_with_fallback(outputs_dir, file_path)
+            if resolved is None:
+                entry["status"] = "orphan"
+                entry["reason"] = "no-output-match"
+            else:
+                entry["match_type"] = resolved.get("match_type")
+                entry["generating_script"] = resolved.get("generating_script")
+                entry["sha256"] = resolved.get("sha256")
+                candidate_count = resolved.get("candidate_count", 1)
+                authoritative = resolved.get("match_type") == "exact" or (
+                    resolved.get("match_type") == "basename" and candidate_count <= 1
+                )
+                if not authoritative:
+                    entry["status"] = "ambiguous"
+                    entry["reason"] = "ambiguous-basename-match"
+                    entry["candidate_count"] = candidate_count
+                else:
+                    staleness = check_embedded_staleness(
+                        "figure", source_path=file_path, embed_sha256=resolved.get("sha256"),
+                    )
+                    entry["stale"] = staleness["stale"]
+                    if staleness["stale"] is True:
+                        entry["status"] = "mismatch"
+                        entry["reason"] = "content-changed"
+                    else:
+                        entry["status"] = "ok"
+                        entry["reason"] = staleness["reason"]
+        counts[f"{entry['status']}_count"] += 1
+        figures_out.append(entry)
+
+    tables_out: list[dict[str, Any]] = []
+    try:
+        tables = await store.get_tables(doc_row["id"])
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not fetch tables: {exc}"}
+    for tbl in tables:
+        entry = {
+            "id": tbl.get("id"),
+            "caption": tbl.get("caption"),
+        }
+        hint = _oi.infer_generating_script_hint(tbl.get("caption") or "")
+        if not hint:
+            entry["status"] = "orphan"
+            entry["reason"] = "no-source-hint"
+        elif not outputs_dir_usable:
+            entry["status"] = "unresolved"
+            entry["reason"] = "no-outputs-dir"
+            entry["generating_script"] = hint
+        else:
+            traced = _oi.find_outputs_by_source(outputs_dir, hint)
+            entry["generating_script"] = hint
+            total = traced.get("total", 0)
+            if total == 0:
+                entry["status"] = "orphan"
+                entry["reason"] = "no-output-match"
+            elif total > 1:
+                entry["status"] = "ambiguous"
+                entry["reason"] = "ambiguous-source-match"
+                entry["candidate_count"] = total
+            else:
+                entry["status"] = "ok"
+                entry["reason"] = "current"
+                matched = traced.get("outputs") or []
+                if matched:
+                    entry["sha256"] = matched[0].get("sha256")
+        counts[f"{entry['status']}_count"] += 1
+        tables_out.append(entry)
+
+    return {
+        "project_id": args["project_id"],
+        "doc": doc_source,
+        "document_id": doc_row["id"],
+        "figures": figures_out,
+        "tables": tables_out,
+        "summary": {
+            "figure_count": len(figures_out),
+            "table_count": len(tables_out),
+            **counts,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Section 9c: Flag-to-section drift check (8ca89e8f)
 # ---------------------------------------------------------------------------
 

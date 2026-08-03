@@ -95,6 +95,16 @@ async def generate_handoff_endpoint(
     _version = body.get("version")
     if isinstance(_version, str) and not _version.strip():
         _version = None
+    # 45f519a0/8a883f60/eb8b6894 — same gap as the stdio transport had: this
+    # REST body was only ever read for session_id/mode/version, silently
+    # dropping force_include_ids/strict_evidence/strict_pointer_evidence even
+    # though the MCP HTTP dispatch (handler.py) already threads all of these.
+    _force_include_ids: list[str] | None = None
+    _raw_fii = body.get("force_include_ids")
+    if isinstance(_raw_fii, list):
+        _force_include_ids = [str(x) for x in _raw_fii if x]
+    _strict_evidence = bool(body.get("strict_evidence"))
+    _strict_pointer_evidence = bool(body.get("strict_pointer_evidence"))
     skip_summary = not os.environ.get("ANTHROPIC_API_KEY")
     db = await _db(request)
     data_dir = _data_dir(request)
@@ -107,6 +117,9 @@ async def generate_handoff_endpoint(
                 mode=mode,
                 session_id=session_id if isinstance(session_id, str) else None,
                 version=_version if isinstance(_version, str) else None,
+                force_include_ids=_force_include_ids,
+                strict_evidence=_strict_evidence,
+                strict_pointer_evidence=_strict_pointer_evidence,
             ),
             timeout=90.0,
         )
@@ -117,6 +130,20 @@ async def generate_handoff_endpoint(
         # board/profile snapshot is known incomplete; a contract built
         # alongside it must not silently report executable=true.
         _board_stale = True
+    except handoff_module.HandoffEvidenceRequired as exc:
+        # 8a883f60 — strict_evidence=True and a best-effort capability was
+        # failed/degraded: fail CLOSED, mirroring the MCP HTTP dispatch's
+        # structured refusal instead of a generic 500.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "HANDOFF_EVIDENCE_BLOCKED",
+                "project_id": project_id,
+                "evidence_status": exc.evidence_status,
+                "evidence_errors": exc.errors,
+                "message": str(exc),
+            },
+        ) from exc
     # 98aaccf4 — machine-readable effective capability contract; best-effort,
     # never breaks the mandatory handoff.
     capability_contract = await handoff_module.build_effective_capability_contract(

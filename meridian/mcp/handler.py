@@ -3066,7 +3066,20 @@ async def _handle_task_tools(
         if not _token:
             return {"valid": False, "reason": "not_found"}
         _pid = args.get("project_id") or ""
-        return await handoff_module_local.verify_handoff_token(db, _token, _pid)
+        # efaa918a body-hash binding (2ee0000c) — presented_body is the FULL
+        # pasted block (token + SECURITY banner included, since that's what a
+        # caller actually has); strip those back out so the hash matches what
+        # was bound at mint time. Omitting presented_body leaves this exactly
+        # the prior token-only provenance check.
+        _presented_body = args.get("presented_body")
+        _body_for_check = (
+            handoff_module_local.strip_goal_token_banner(_presented_body)
+            if isinstance(_presented_body, str)
+            else None
+        )
+        return await handoff_module_local.verify_handoff_token(
+            db, _token, _pid, body=_body_for_check
+        )
     return _MISS
 
 
@@ -3320,6 +3333,7 @@ async def _handle_notes_decisions(
         handle_link_flag_to_section,
         handle_get_flag_drift,
         handle_check_embedded_staleness,
+        handle_audit_figure_table_provenance,
         handle_add_insight,
         handle_get_insights,
         handle_save_finding,
@@ -3342,7 +3356,7 @@ async def _handle_notes_decisions(
         handle_promote_proposal,
     )
 
-    # All 46 tools map directly to handler functions with the standard five
+    # All 47 tools map directly to handler functions with the standard five
     # parameters — no extra context needed beyond (args, db, data_dir, tenant,
     # _mcp_tenant_id).
     _standard_dispatch: dict[str, Any] = {
@@ -3375,6 +3389,7 @@ async def _handle_notes_decisions(
         "link_flag_to_section": handle_link_flag_to_section,
         "get_flag_drift": handle_get_flag_drift,
         "check_embedded_staleness": handle_check_embedded_staleness,
+        "audit_figure_table_provenance": handle_audit_figure_table_provenance,
         "add_insight": handle_add_insight,
         "get_insights": handle_get_insights,
         "save_finding": handle_save_finding,

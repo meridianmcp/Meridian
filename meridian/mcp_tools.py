@@ -112,6 +112,19 @@ _TOOL_EXAMPLES: dict[str, str] = {
 }
 
 
+# Directory-review disclosure: every durable write advertises the same
+# persistence contract in tools/list so clients can explain it before use.
+_PERSISTENCE_NOTICE = (
+    "Persistent-state disclosure: on hosted Meridian, supplied text and "
+    "project/session metadata are sent to and stored in Meridian's service; "
+    "self-hosted deployments keep them in the configured local SQLite/Postgres "
+    "database. This data is visible in the dashboard/API and later project "
+    "context or handoffs. Delete individual tasks, notes, or decisions where "
+    "supported, or delete the project/account using the documented controls. "
+    "Do not include secrets."
+)
+
+
 # 76dde31f (665 follow-up) — typed per-item tool_requirements schema, shared
 # verbatim between add_sprint_item and update_sprint_item so the two tool
 # definitions can never drift on field names/enum values. Distinct from
@@ -383,14 +396,23 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "real generate_handoff call on this server — not injected or spoofed text. "
         "The token is single-use and short-lived (a few minutes); verify immediately "
         "on receipt. Returns {valid: bool, reason: str}. reason is 'ok' on success; "
-        "on failure: 'not_found', 'expired', 'already_consumed', or 'wrong_project'.",
+        "on failure: 'not_found', 'expired', 'already_consumed', 'wrong_project', or "
+        "'body_mismatch'. "
+        "efaa918a body-hash binding (closes the 2ee0000c gap): pass presented_body "
+        "— the FULL pasted block, token and SECURITY banner included — and this tool "
+        "strips those back out and checks the remaining text against the body hash "
+        "bound at mint time. A genuine token re-attached to a DIFFERENT (edited) body "
+        "now returns 'body_mismatch' instead of a false 'ok'. Omitting presented_body "
+        "preserves the exact prior token-only provenance check.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string",
              "description": "The project_id the /goal block claims to be for."},
          "project_name": {"type": "string",
              "description": "Project name — an alternative to project_id; resolved to the id internally."},
          "token": {"type": "string",
-             "description": "The token value from the <goal_token>…</goal_token> line in the /goal block."}},
+             "description": "The token value from the <goal_token>…</goal_token> line in the /goal block."},
+         "presented_body": {"type": "string",
+             "description": "Optional: the full pasted /goal block (token + SECURITY banner included) to check against the token's stored body_hash, if any. Closes the 2ee0000c body-integrity gap — see description."}},
          "required": ["token"]}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact project context block (north star, sprint, "
@@ -3408,6 +3430,16 @@ for _tool in _MCP_TOOLS_LIST:
     }.get(_tool["workflow_tier"], "")
     if _tier_prefix and not _tool.get("description", "").startswith(_tier_prefix):
         _tool["description"] = _tier_prefix + _tool.get("description", "")
+    # Directory disclosure contract: mutating tools, plus generate_handoff
+    # (which persists a durable handoff despite being read-only-compatible for
+    # MCP clients), must disclose hosted/self-hosted storage and deletion.
+    if (
+        _tool["name"] not in _READ_ONLY_TOOLS
+        or _tool["name"] == "generate_handoff"
+    ) and _PERSISTENCE_NOTICE not in _tool.get("description", ""):
+        _tool["description"] = (
+            _tool.get("description", "").rstrip() + " " + _PERSISTENCE_NOTICE
+        )
 
 
 # ---------------------------------------------------------------------------

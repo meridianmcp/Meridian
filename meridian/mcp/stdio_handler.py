@@ -484,13 +484,48 @@ def build_mcp_server():
                         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
                         "mode": {
                             "type": "string",
-                            "enum": ["full", "delta", "planner", "starter"],
+                            "enum": ["full", "delta", "planner", "starter", "goal"],
                         },
                         "session_id": {
                             "type": "string",
                             "description": (
                                 "Optional session id for auto-delta on repeat "
                                 "calls in the same chat."
+                            ),
+                        },
+                        "version": {
+                            "type": "string",
+                            "description": (
+                                "(b8f89491) Optional explicit sprint-version bucket "
+                                "(e.g. 'v0.2.6') to scope this handoff to. Wins over "
+                                "the calling session's own stored sprint_version."
+                            ),
+                        },
+                        "force_include_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "(45f519a0) Optional list of sprint-item ids to "
+                                "force-include in the pending list for this call "
+                                "only, even when their deferred_until is in the "
+                                "future. deferred_until is NOT cleared."
+                            ),
+                        },
+                        "strict_evidence": {
+                            "type": "boolean",
+                            "description": (
+                                "(8a883f60) Opt-in fail-closed evidence check. When "
+                                "true, a failed/degraded best-effort capability "
+                                "makes this call refuse instead of degrading."
+                            ),
+                        },
+                        "strict_pointer_evidence": {
+                            "type": "boolean",
+                            "description": (
+                                "(eb8b6894) Opt-in: the claimable batch's "
+                                "UNPROSPECTED exclusion requires a pending item's "
+                                "pointer(s) to have actually RESOLVED, not merely "
+                                "be present."
                             ),
                         },
                     },
@@ -1183,6 +1218,41 @@ def build_mcp_server():
                         "embed_mtime": {"type": "number", "description": "Mtime recorded at embed time (Unix float). Used as fallback when no sha256 is available."},
                     },
                     "required": ["doc", "kind"],
+                },
+            ),
+            Tool(
+                name="audit_figure_table_provenance",
+                description=(
+                    "6b657a8b — batch analogue of check_embedded_staleness: "
+                    "walks EVERY figure and table stored for a document and "
+                    "links each caption to its embedded asset, its "
+                    "exact/fallback output match, SHA-256, and generating "
+                    "script, in one whole-document integrity report. Figures "
+                    "resolve via file_path + outputs_dir (exact match, then a "
+                    "relocation-tolerant basename fallback); a basename match "
+                    "with 2+ same-name candidates is reported as ambiguous "
+                    "(non-authoritative), never silently picked. Tables carry "
+                    "no file_path, so their generating script is inferred from "
+                    "the caption text itself and traced forward via "
+                    "find_outputs_by_source; zero or 2+ traced outputs are "
+                    "reported as orphan/ambiguous respectively, never guessed. "
+                    "Returns {figures, tables, summary} where each figure/table "
+                    "entry carries status in "
+                    "{ok, ambiguous, orphan, mismatch, unresolved} plus reason. "
+                    "outputs_dir omitted or hosted mode -> every entry reports "
+                    "unresolved/no-outputs-dir rather than erroring — a document "
+                    "with no local outputs tree is still auditable for "
+                    "structure, just not for provenance."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "outputs_dir": {"type": "string", "description": "The meridian-outputs directory to resolve figures/tables against. Omitted (or hosted mode) yields unresolved/no-outputs-dir entries rather than an error."},
+                    },
+                    "required": ["doc"],
                 },
             ),
             Tool(
@@ -2197,6 +2267,22 @@ def build_mcp_server():
                     arguments.get("mode"),
                     session_id,
                 )
+                # 45f519a0/b8f89491/8a883f60/eb8b6894 — mirror handler.py's HTTP
+                # MCP dispatch exactly, so the stdio transport stops silently
+                # dropping these args (the gap this comment fixes: previously
+                # only mode/session_id were ever read here).
+                _stdio_version = arguments.get("version")
+                if isinstance(_stdio_version, str) and not _stdio_version.strip():
+                    _stdio_version = None
+                _stdio_force_include_ids: list[str] | None = None
+                _raw_stdio_fii = arguments.get("force_include_ids")
+                if isinstance(_raw_stdio_fii, list):
+                    _stdio_force_include_ids = [str(x) for x in _raw_stdio_fii if x]
+                _stdio_strict_evidence = bool(arguments.get("strict_evidence"))
+                _stdio_strict_pointer_evidence = bool(
+                    arguments.get("strict_pointer_evidence")
+                )
+                _handoff_evidence_blocked = False
                 try:
                     path, content, _ = await asyncio.wait_for(
                         handoff_module.generate_handoff(
@@ -2205,6 +2291,10 @@ def build_mcp_server():
                             state["data_dir"],
                             mode=mode,
                             session_id=session_id,
+                            version=_stdio_version,
+                            force_include_ids=_stdio_force_include_ids,
+                            strict_evidence=_stdio_strict_evidence,
+                            strict_pointer_evidence=_stdio_strict_pointer_evidence,
                         ),
                         timeout=90.0,
                     )
@@ -2213,17 +2303,30 @@ def build_mcp_server():
                         db, arguments["project_id"], state["data_dir"]
                     )
                     mode = "full"
-                # a5e8aa74 — return content EXACTLY as generate_handoff rendered
-                # it, via the shared helper meridian/mcp/handler.py and
-                # meridian/routes/handoff.py also use, so all transports emit a
-                # byte-identical, unwrapped contract. This replaces the 5234877f
-                # four-backtick fence: the fence broke verbatim forwarding of the
-                # /goal block (see format_handoff_mcp_content's docstring).
-                result = {
-                    "path": path,
-                    "content": handoff_module.format_handoff_mcp_content(content),
-                    "mode": mode,
-                }
+                except handoff_module.HandoffEvidenceRequired as exc:
+                    # 8a883f60 — mirror handler.py's structured refusal: nothing
+                    # was rendered/persisted, so surface that instead of falling
+                    # through to the generic error string.
+                    result = {
+                        "error": "HANDOFF_EVIDENCE_BLOCKED",
+                        "project_id": arguments["project_id"],
+                        "evidence_status": exc.evidence_status,
+                        "evidence_errors": exc.errors,
+                        "message": str(exc),
+                    }
+                    _handoff_evidence_blocked = True
+                if not _handoff_evidence_blocked:
+                    # a5e8aa74 — return content EXACTLY as generate_handoff rendered
+                    # it, via the shared helper meridian/mcp/handler.py and
+                    # meridian/routes/handoff.py also use, so all transports emit a
+                    # byte-identical, unwrapped contract. This replaces the 5234877f
+                    # four-backtick fence: the fence broke verbatim forwarding of the
+                    # /goal block (see format_handoff_mcp_content's docstring).
+                    result = {
+                        "path": path,
+                        "content": handoff_module.format_handoff_mcp_content(content),
+                        "mode": mode,
+                    }
             elif name == "get_context_block":
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.
                 result = await _dispatch_mcp_tool(
@@ -2242,6 +2345,7 @@ def build_mcp_server():
                 "index_figure", "find_similar_figure",
                 "index_table", "find_similar_table",
                 "check_embedded_staleness",
+                "audit_figure_table_provenance",
                 "search_outputs",
                 "search_code_semantic",
                 "add_sprint_item",

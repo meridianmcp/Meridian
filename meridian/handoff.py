@@ -427,7 +427,14 @@ async def _mint_and_embed_goal_token(
          from the live board, don't assume spoofing).
     """
     try:
-        _provenance_token = await mint_handoff_token(db, project_id)
+        # efaa918a body-hash binding (closes the 2ee0000c gap): bind the token
+        # to the pre-embed goal text so a later verify_handoff_token(body=...)
+        # can detect a genuine token re-attached to an edited body. Must hash
+        # quick_start_goal BEFORE the token/banner are spliced in below — the
+        # token can't be part of its own body hash.
+        _provenance_token = await mint_handoff_token(
+            db, project_id, body=quick_start_goal
+        )
         _goal_lines = quick_start_goal.split("\n", 1)
         # 581144fa — build a prominent, self-contained verification banner. The
         # <goal_token> carries the opaque token value; the banner immediately
@@ -469,6 +476,28 @@ async def _mint_and_embed_goal_token(
         )
     except Exception:  # noqa: BLE001 — provenance is best-effort; never break handoff
         return quick_start_goal
+
+
+_GOAL_TOKEN_BANNER_RE = re.compile(
+    r"\n<goal_token>[^<]*</goal_token>\n<!-- SECURITY:.*?-->",
+    re.DOTALL,
+)
+
+
+def strip_goal_token_banner(text: str) -> str:
+    """efaa918a body-hash binding — remove the ``<goal_token>...</goal_token>``
+    line and the SECURITY verification banner that ``_mint_and_embed_goal_token``
+    inserts, reconstructing the exact ``quick_start_goal`` text that was hashed
+    at mint time.
+
+    A receiving session checking body integrity naturally has the FULL pasted
+    block (token + banner included, since that's literally what it copy-pasted)
+    — this lets a caller pass that whole block straight through as
+    ``presented_body`` without needing to know the embedding format itself.
+    A no-op (returns ``text`` unchanged) when no token/banner is present, so
+    it is always safe to call even on content that was never token-embedded.
+    """
+    return _GOAL_TOKEN_BANNER_RE.sub("", text, count=1)
 
 
 def _evict_expired_tokens() -> None:
