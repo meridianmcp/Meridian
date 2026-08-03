@@ -3333,6 +3333,7 @@ async def _handle_notes_decisions(
         handle_link_flag_to_section,
         handle_get_flag_drift,
         handle_check_embedded_staleness,
+        handle_audit_figure_table_provenance,
         handle_add_insight,
         handle_get_insights,
         handle_save_finding,
@@ -3355,7 +3356,7 @@ async def _handle_notes_decisions(
         handle_promote_proposal,
     )
 
-    # All 46 tools map directly to handler functions with the standard five
+    # All 47 tools map directly to handler functions with the standard five
     # parameters — no extra context needed beyond (args, db, data_dir, tenant,
     # _mcp_tenant_id).
     _standard_dispatch: dict[str, Any] = {
@@ -3388,6 +3389,7 @@ async def _handle_notes_decisions(
         "link_flag_to_section": handle_link_flag_to_section,
         "get_flag_drift": handle_get_flag_drift,
         "check_embedded_staleness": handle_check_embedded_staleness,
+        "audit_figure_table_provenance": handle_audit_figure_table_provenance,
         "add_insight": handle_add_insight,
         "get_insights": handle_get_insights,
         "save_finding": handle_save_finding,

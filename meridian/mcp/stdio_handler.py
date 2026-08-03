@@ -1221,6 +1221,41 @@ def build_mcp_server():
                 },
             ),
             Tool(
+                name="audit_figure_table_provenance",
+                description=(
+                    "6b657a8b — batch analogue of check_embedded_staleness: "
+                    "walks EVERY figure and table stored for a document and "
+                    "links each caption to its embedded asset, its "
+                    "exact/fallback output match, SHA-256, and generating "
+                    "script, in one whole-document integrity report. Figures "
+                    "resolve via file_path + outputs_dir (exact match, then a "
+                    "relocation-tolerant basename fallback); a basename match "
+                    "with 2+ same-name candidates is reported as ambiguous "
+                    "(non-authoritative), never silently picked. Tables carry "
+                    "no file_path, so their generating script is inferred from "
+                    "the caption text itself and traced forward via "
+                    "find_outputs_by_source; zero or 2+ traced outputs are "
+                    "reported as orphan/ambiguous respectively, never guessed. "
+                    "Returns {figures, tables, summary} where each figure/table "
+                    "entry carries status in "
+                    "{ok, ambiguous, orphan, mismatch, unresolved} plus reason. "
+                    "outputs_dir omitted or hosted mode -> every entry reports "
+                    "unresolved/no-outputs-dir rather than erroring — a document "
+                    "with no local outputs tree is still auditable for "
+                    "structure, just not for provenance."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string"},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "doc": {"type": "string", "description": "The stored document's source (the path/URL it was ingested/reindexed under)."},
+                        "outputs_dir": {"type": "string", "description": "The meridian-outputs directory to resolve figures/tables against. Omitted (or hosted mode) yields unresolved/no-outputs-dir entries rather than an error."},
+                    },
+                    "required": ["doc"],
+                },
+            ),
+            Tool(
                 name="ingest_document_structure",
                 description=(
                     "db42acce — persist pre-parsed structural data "
@@ -2310,6 +2345,7 @@ def build_mcp_server():
                 "index_figure", "find_similar_figure",
                 "index_table", "find_similar_table",
                 "check_embedded_staleness",
+                "audit_figure_table_provenance",
                 "search_outputs",
                 "search_code_semantic",
                 "add_sprint_item",
