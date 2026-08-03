@@ -27,6 +27,10 @@ def test_word_write_target_detects_mutating_tools():
     assert tun._word_write_target("create_document", {"file_path": "/docs/a.docx"}) == "/docs/a.docx"
     # Connector-prefixed name is accepted (prefix stripped before the lookup).
     assert tun._word_write_target("word__add_heading", {"path": "b.docx"}) == "b.docx"
+    # search_and_replace is an observed mutating tool in the live Word contract.
+    assert tun._word_write_target(
+        "search_and_replace", {"file_path": "replacements.docx"}
+    ) == "replacements.docx"
 
 
 def test_word_write_target_none_for_reads_and_unknowns():
@@ -168,3 +172,54 @@ async def test_call_tunnel_tool_relays_word_write_when_clear(db, monkeypatch):
         db=db, session_id="s1",
     )
     assert result == {"content": [{"type": "text", "text": "ok"}]}
+
+async def test_search_and_replace_requires_positive_structured_count(monkeypatch):
+    tenant = "tenant-search-replace"
+    monkeypatch.setitem(
+        tun._tunnel_tool_routes, tenant, {"word__search_and_replace": "word"}
+    )
+    monkeypatch.setitem(tun._tunnel_word_sockets, tenant, object())
+
+    async def _fake_jsonrpc(*_args, **_kwargs):
+        return {
+            "result": {
+                "structuredContent": {"result": "搜索替换完成: 替换了 2 处"},
+                "content": [{"type": "text", "text": "搜索替换完成: 替换了 2 处"}],
+            }
+        }
+
+    monkeypatch.setattr(tun, "_tunnel_jsonrpc", _fake_jsonrpc)
+    result = await tun.call_tunnel_tool(
+        tenant,
+        "word__search_and_replace",
+        {"search_text": "alpha", "replace_text": "omega"},
+    )
+    assert result["structuredContent"]["result"].endswith("替换了 2 处")
+
+
+@pytest.mark.parametrize(
+    "structured_result, expected",
+    [
+        ("搜索替换完成: 替换了 0 处", "positive replacement count"),
+        ("replacement completed", "no structured replacement count"),
+    ],
+)
+async def test_search_and_replace_rejects_ambiguous_result(
+    monkeypatch, structured_result, expected
+):
+    tenant = "tenant-search-replace-invalid"
+    monkeypatch.setitem(
+        tun._tunnel_tool_routes, tenant, {"word__search_and_replace": "word"}
+    )
+    monkeypatch.setitem(tun._tunnel_word_sockets, tenant, object())
+
+    async def _fake_jsonrpc(*_args, **_kwargs):
+        return {"result": {"structuredContent": {"result": structured_result}}}
+
+    monkeypatch.setattr(tun, "_tunnel_jsonrpc", _fake_jsonrpc)
+    with pytest.raises(RuntimeError, match=expected):
+        await tun.call_tunnel_tool(
+            tenant,
+            "word__search_and_replace",
+            {"search_text": "missing", "replace_text": "omega"},
+        )

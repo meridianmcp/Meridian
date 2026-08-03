@@ -6,12 +6,14 @@ module in this package -- NO hosted call is made by any tool here.  Most
 tools delegate straight to :mod:`meridian_outputs.outputs_local`; a handful
 (``search_outputs``, ``classify_outputs``, ``resolve_figure_output``,
 ``find_outputs_by_source``, ``tag_output``, ``check_staleness``,
-``find_stale_by_script``, ``script_content_hash``) delegate instead to the
-additive sibling modules built alongside it (:mod:`meridian_outputs.search`,
-:mod:`meridian_outputs.classify`, :mod:`meridian_outputs.provenance`,
-:mod:`meridian_outputs.fingerprint`) that each layer a drop-in-superset fix
-on top of ``outputs_local``'s public API without touching it directly (item
-a26ad8da wired these in; see each sibling module's docstring for the gap it
+``find_stale_by_script``, ``script_content_hash``, ``get_provenance_status``)
+delegate instead to the additive sibling modules built alongside it
+(:mod:`meridian_outputs.search`, :mod:`meridian_outputs.classify`,
+:mod:`meridian_outputs.provenance`, :mod:`meridian_outputs.fingerprint`,
+:mod:`meridian_outputs.provenance_status`) that each layer a drop-in-superset
+fix on top of ``outputs_local``'s public API without touching it directly
+(item a26ad8da wired the first batch of these in; item bd5b8d79 added
+``provenance_status``; see each sibling module's docstring for the gap it
 closes).
 
 This is the wave-1 stopgap for local outputs indexing.  The hosted-aware
@@ -32,7 +34,15 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from . import annotate, classify, fingerprint, outputs_local, provenance, search
+from . import (
+    annotate,
+    classify,
+    fingerprint,
+    outputs_local,
+    provenance,
+    provenance_status,
+    search,
+)
 
 mcp = FastMCP("meridian-outputs")
 
@@ -216,10 +226,14 @@ def record_provenance(
     Distinct from ``annotate_outputs`` (free-form human notes): this records
     the machine-oriented facts needed to reconstruct "what produced this
     file, with what parameters, when, and under which sprint-item/decision"
-    without reopening the output itself. Stored as an append-only JSONL
-    sidecar log at ``<outputs_dir>/.meridian-outputs-cache/provenance.jsonl``
-    -- fully local, no hosted call, no DB engine. Calling this again for the
-    same path supersedes the previous record (newest wins on read).
+    without reopening the output itself. Stored as a single JSON ledger
+    (upsert by normalized path) at
+    ``<outputs_dir>/.meridian-outputs-cache/provenance_ledger.json`` -- fully
+    local, no hosted call, no DB engine. Calling this again for the same
+    path OVERWRITES the previous record in place; this is NOT an
+    append-only log and no history is kept (corrected bd5b8d79 -- an earlier
+    version of this docstring incorrectly described an append-only JSONL
+    sidecar, which was never the actual implementation).
 
     Args:
       outputs_dir:        Absolute path to the outputs directory.
@@ -236,7 +250,13 @@ def record_provenance(
 
     Returns:
       The stored record as {path, generating_script, params, sprint_item_id,
-      decision_id, note, recorded_at, recorded_at_iso}, or {error: ...}.
+      decision_id, note, recorded_at, recorded_at_iso, content_hash}, or
+      {error: ...}. ``content_hash`` (bd5b8d79) is a best-effort SHA-256 of
+      ``path``'s on-disk bytes at record time (``None`` if unreadable) --
+      used by ``get_provenance_status`` to later detect relocation/drift.
+      This is a pure exact-record write; call ``get_provenance_status`` (not
+      this tool) for a richer answer that also covers "known but
+      unregistered" and directory-level fallback cases.
     """
     return annotate.record_provenance(
         outputs_dir,
@@ -251,10 +271,20 @@ def record_provenance(
 
 @mcp.tool()
 def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
-    """Look up the most recent reproducibility record for one output file.
+    """Exact-match lookup for one output file's reproducibility record.
 
     Queryable WITHOUT opening/parsing the output file itself -- reads only
-    the lightweight JSONL sidecar log written by ``record_provenance``.
+    the lightweight JSON ledger written by ``record_provenance`` (corrected
+    bd5b8d79 -- this was never a JSONL sidecar log; see ``record_provenance``
+    for the storage-shape correction).
+
+    A bare ``None`` here is AMBIGUOUS -- it does not distinguish "this path
+    is completely unknown to the outputs tree" from "this path is a real,
+    indexed output that just never had ``record_provenance`` called on it"
+    from "no exact record, but a directory-level MERIDIAN_NOTES.md note
+    covers it". Prefer ``get_provenance_status`` when that distinction
+    matters; use this tool only when a bare exact-or-nothing answer is
+    genuinely what's needed.
 
     Args:
       outputs_dir:  Absolute path to the outputs directory.
@@ -262,10 +292,52 @@ def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
 
     Returns:
       {path, generating_script, params, sprint_item_id, decision_id, note,
-      recorded_at, recorded_at_iso}, or None if nothing has been recorded for
-      this path under this outputs_dir.
+      recorded_at, recorded_at_iso, content_hash}, or None if nothing has
+      been recorded for this path under this outputs_dir.
     """
     return annotate.get_provenance(outputs_dir, path)
+
+
+@mcp.tool()
+def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
+    """Richer, authoritative per-file provenance answer (item bd5b8d79).
+
+    Composes ``get_provenance`` (exact machine-recorded provenance) with
+    ``outputs_local``'s index-membership and directory-level
+    ``MERIDIAN_NOTES.md`` annotation systems into ONE ranked answer, so a
+    bare ``None`` from ``get_provenance`` never has to be treated as "this
+    file is unknown" when it might just mean "known, but unregistered" or
+    "covered only by a directory-level note".
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      path:         The output file to look up.
+
+    Returns:
+      {error: ...} if outputs_dir/path are missing. Otherwise always
+      {path, provenance_type, record, directory_note, staleness} where
+      ``provenance_type`` is one of:
+
+        - "exact" -- ``record`` is the exact ``get_provenance`` record;
+          ``staleness`` reports {exists_on_disk, recorded_content_hash,
+          current_content_hash, stale, reason} -- a best-effort check
+          (reusing the SAME hasher ``fingerprint.py`` already computes
+          elsewhere, no new hash scheme) for whether the file has been
+          relocated, deleted, or changed since the record was made.
+        - "directory_fallback" -- no exact record, but ``directory_note`` is
+          a covering ``MERIDIAN_NOTES.md`` annotation. Explicitly weaker
+          than "exact" -- never the same shape, never silently upgraded.
+        - "unregistered" -- no exact record, no directory note, but this
+          exact path IS indexed/known to ``outputs_local`` (a real output
+          that simply never had ``record_provenance`` called on it).
+        - "unknown" -- this path has never been discovered by the outputs
+          walker at all.
+
+      ``record``/``directory_note``/``staleness`` are ``None`` whenever not
+      applicable to the returned ``provenance_type`` -- always branch on
+      ``provenance_type``, never infer status from field presence alone.
+    """
+    return provenance_status.get_provenance_status(outputs_dir, path)
 
 
 @mcp.tool()

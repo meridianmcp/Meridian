@@ -11,9 +11,12 @@ A ``range`` selector is used for the end-to-end cases because it is self-resolvi
 test is deterministic on both SQLite and Postgres.
 """
 
+import re
+
 import pytest
 
 from meridian import db as db_module
+from meridian import executor_contract as ec
 from meridian import handoff as handoff_module
 
 
@@ -246,3 +249,273 @@ async def test_generate_handoff_survives_pointer_resolve_blowup(db, tmp_path, mo
     )
     assert "resilient item" in content
     assert "Resolved pointers:" not in content
+
+
+# ---------------------------------------------------------------------------
+# 9c6cac08 (665 follow-up) — pointer rendering must be deterministic across
+# repeated calls, and the human-readable inline text must agree with the
+# structured executor_contract pointer target for the SAME pointer (text
+# and JSON projections of one underlying record, never independently
+# re-derived numbers that could drift apart).
+# ---------------------------------------------------------------------------
+
+_GOAL_TOKEN_RE = re.compile(r"<goal_token>[^<]*</goal_token>")
+# f9bacd5b (b730 follow-up, final gate) — full mode's MERIDIAN_CONTEXT header
+# (meridian/templates/handoff.md.j2) stamps a second-granularity
+# "Generated: <iso8601>" line from wall-clock time on EVERY call, same as the
+# goal_token nonce above. Two otherwise-identical generate_handoff() calls
+# landing in different wall-clock seconds is not guaranteed to be avoided —
+# under heavier parallel test load this flaked intermittently before this
+# line was normalized alongside the token.
+_GENERATED_AT_RE = re.compile(r"^Generated: .*$", re.MULTILINE)
+
+
+def _strip_goal_token(content: str) -> str:
+    content = _GOAL_TOKEN_RE.sub("<goal_token>STRIPPED</goal_token>", content)
+    content = _GENERATED_AT_RE.sub("Generated: STRIPPED", content)
+    return content
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_pointer_rendering_deterministic_across_repeated_calls(
+    db, tmp_path
+):
+    p = await db_module.create_project(db, "inline-determinism")
+    await db_module.set_goal(db, p["id"], "ship inline pointers")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix the migration guard")
+    await db_module.add_sprint_item_pointer(
+        db,
+        p["id"],
+        item["id"],
+        "code",
+        [
+            {
+                "uri": "file:meridian/db/migrations.py",
+                "selector": {"type": "range", "start_line": 100, "end_line": 120},
+            }
+        ],
+        label="guard site",
+    )
+
+    _, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    _, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+    assert _strip_goal_token(content_a) == _strip_goal_token(content_b)
+    for c in (content_a, content_b):
+        assert "meridian/db/migrations.py:100-120" in c
+
+
+@pytest.mark.asyncio
+async def test_resolved_pointer_text_matches_executor_contract_structured_target(
+    db, tmp_path
+):
+    """The plain-text 'Resolved pointers:' line generate_handoff renders and
+    the structured target executor_contract.build_executor_contract reports
+    for the SAME durable pointer must describe the identical file:line-range
+    location — no independent formatting that could silently disagree."""
+    p = await db_module.create_project(db, "inline-vs-structured")
+    await db_module.set_goal(db, p["id"], "ship inline pointers")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix the migration guard")
+    await db_module.add_sprint_item_pointer(
+        db,
+        p["id"],
+        item["id"],
+        "code",
+        [
+            {
+                "uri": "file:meridian/db/migrations.py",
+                "selector": {"type": "range", "start_line": 100, "end_line": 120},
+            }
+        ],
+        label="guard site",
+    )
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+
+    fresh = await db_module.get_sprint_item(db, item["id"])
+    contract = await ec.build_executor_contract(db, p["id"], fresh)
+    target = contract["pointers"]["pointers"][0]["targets"][0]
+    expected_location = (
+        f"{target['uri'].split(':', 1)[1]}:"
+        f"{target['selector']['start_line']}-{target['selector']['end_line']}"
+    )
+    assert expected_location in content
+    assert expected_location == "meridian/db/migrations.py:100-120"
+
+
+# ---------------------------------------------------------------------------
+# 70c10ca3 (b730 follow-up) — artifact_pointer_finding rides the SAME
+# _annotate_resolved_pointers pass as resolved_pointers/pointer_records: it
+# must coexist with the legacy fields, never crowd them out, and the batch
+# /goal's <artifact_pointer_findings> clause must render in EVERY mode that
+# shares _build_quick_start_goal (full/delta too, not only goal-only mode).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_sets_artifact_pointer_finding_alongside_legacy_fields(db):
+    """A single resolve pass sets resolved_pointers, pointer_records,
+    artifact_pointer_policy, AND artifact_pointer_finding together — one
+    canonical finding feeding every downstream representation, never a
+    second independent resolve pass."""
+    p = await db_module.create_project(db, "inline-plus-artifact-finding")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "warn"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+        label="report site",
+    )
+    items = [{"id": item["id"], "title": item["title"], "artifact_policy": item["artifact_policy"]}]
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], items)
+    it = out[0]
+    assert it["resolved_pointers"]
+    assert it["pointer_records"]
+    assert it["artifact_pointer_policy"]["warning_code"] == "insufficient_pointer_bare_docx"
+    assert it["artifact_pointer_finding"]["warning_code"] == "insufficient_pointer_bare_docx"
+    assert it["artifact_pointer_finding"]["pointer_status"] == "weak"
+
+
+@pytest.mark.asyncio
+async def test_full_mode_renders_artifact_pointer_findings_clause_too(db, tmp_path):
+    """_build_quick_start_goal is shared by full/delta and goal-only mode —
+    the new clause must appear in full mode's embedded /goal block too, not
+    only in mode='goal'."""
+    p = await db_module.create_project(db, "inline-full-mode-artifact-findings")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
+    )
+    assert "<artifact_pointer_findings>" in content
+
+
+@pytest.mark.asyncio
+async def test_full_mode_artifact_pointer_findings_clause_well_formed_with_special_chars(
+    db, tmp_path
+):
+    """f9bacd5b (b730 follow-up, final gate) — a pointer uri carrying raw XML
+    metacharacters (&, <, >, a literal quote) must still leave the FULL-mode
+    embedded <artifact_pointer_findings> clause well-formed, standalone XML —
+    the companion mode to test_full_mode_renders_artifact_pointer_findings_clause_too
+    above, which never exercised special characters in the pointer text."""
+    import xml.etree.ElementTree as ET
+
+    p = await db_module.create_project(db, "inline-full-mode-artifact-findings-xml")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    tricky_uri = 'outputs/tables/results & "final" <v2>.docx'
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": tricky_uri, "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
+    )
+    start = content.index("<artifact_pointer_findings>")
+    end = content.index("</artifact_pointer_findings>") + len("</artifact_pointer_findings>")
+    clause = content[start:end]
+    assert "<v2>.docx" not in clause  # raw metacharacters never appear unescaped
+    root = ET.fromstring(clause)  # raises ParseError if not well-formed
+    assert root.tag == "artifact_pointer_findings"
+
+
+# ---------------------------------------------------------------------------
+# eb8b6894 — XML / JSON / plain-text parity for the presence-vs-resolution
+# fields (structural_valid / target_resolved / provenance_verified /
+# resolution_source / strict_satisfied), mirroring 70c10ca3's own
+# artifact-pointer-findings XML/JSON parity pattern above and 8a883f60's
+# determinism work: the SAME status/reason must appear byte-identically in
+# every projection, never independently re-derived per representation.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pointer_resolution_status_xml_json_plaintext_parity(db, tmp_path):
+    from meridian import capability_contract as cc
+
+    p = await db_module.create_project(db, "eb8b6894-resolution-status-parity")
+    resolved_item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the migration guard",
+        touches_resources=["file:meridian/db/migrations.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], resolved_item["id"], "code",
+        [{"uri": "meridian/db/migrations.py",
+          "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+        label="guard site",
+    )
+    unresolved_item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the other thing",
+        touches_resources=["file:meridian/nonexistent_module.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], unresolved_item["id"], "code",
+        [{"uri": "file:meridian/nonexistent_module.py",
+          "selector": {"type": "symbol", "qualified_name": "totally.unindexed.symbol"}}],
+    )
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+    )
+
+    # --- XML: the typed <sprint_item_pointers> clause -----------------
+    assert "<sprint_item_pointers>" in content
+    start = content.index("<sprint_item_pointers>") + len("<sprint_item_pointers>")
+    end = content.index("</sprint_item_pointers>")
+    import json as _json
+    xml_entries = _json.loads(content[start:end])
+    by_id = {e["item_id"]: e for e in xml_entries}
+
+    resolved_status = by_id[resolved_item["id"]]["resolution_status"]
+    assert resolved_status["target_resolved"] is True
+    assert resolved_status["strict_satisfied"] is True
+
+    unresolved_status = by_id[unresolved_item["id"]]["resolution_status"]
+    assert unresolved_status["target_resolved"] is False
+    assert unresolved_status["strict_satisfied"] is False
+    # Presence-only provenance still says "satisfied" — the exact bug this
+    # item fixes: the two fields must coexist, never silently merged.
+    assert by_id[unresolved_item["id"]]["provenance"]["satisfied"] is True
+
+    # --- JSON: capability_contract's item_sprint_item_pointers ---------
+    contract = await cc.build_capability_contract(db, p["id"])
+    assert contract["item_sprint_item_pointers"] == xml_entries
+
+    # --- plain text: the compact goal-line for the unresolved pointer --
+    # _build_goal_pointer_lines (mode='goal' -> include_pointer_lines=True)
+    # renders each item as "<id> (<title>): <target>; ..." — search for that
+    # specific marker (not a bare id substring, which also appears earlier
+    # in the <sprint_item_pointers> JSON clause and the plain item listing)
+    # to land on the actual pointer line.
+    unresolved_marker = f"{unresolved_item['id']} ("
+    assert unresolved_marker in content
+    line_start = content.index(unresolved_marker)
+    line_end = content.index("\n", line_start)
+    unresolved_line = content[line_start:line_end]
+    assert "unresolved" in unresolved_line
+
+    resolved_marker = f"{resolved_item['id']} ("
+    assert resolved_marker in content
+    resolved_line_start = content.index(resolved_marker)
+    resolved_line_end = content.index("\n", resolved_line_start)
+    resolved_line = content[resolved_line_start:resolved_line_end]
+    assert "unresolved" not in resolved_line
+    assert "migrations.py" in resolved_line

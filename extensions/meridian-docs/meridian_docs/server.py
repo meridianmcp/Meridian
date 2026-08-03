@@ -19,6 +19,12 @@ blocks to the hosted ``ingest_document_structure`` MCP tool, which stores them
 into the doc-structure store.  This makes find_similar_figure / index_figure /
 index_table / index_equation work correctly on locally-stored .docx files from
 hosted Meridian — the gap that fdbd4296 alone could NOT close.
+
+93cd9798 — also exposes :func:`check_render_capability`, a thin wrapper over
+:mod:`render_gate` that detects whether this environment can actually render
+a .docx for visual QA (LibreOffice headless / Word COM), returning one of
+exactly three states (rendered / unavailable-with-reason / failed) so a
+caller never mistakes "we could not check" for "we verified this renders".
 """
 from __future__ import annotations
 
@@ -28,6 +34,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import docs_intel
 from . import local_ingest
+from . import render_gate
 
 mcp = FastMCP("meridian-docs")
 
@@ -67,20 +74,38 @@ def index_document_structure(path: str, index_db_path: str) -> dict[str, Any]:
     detected by SEQ Figure field codes; tables by raw <w:tbl> blocks plus optional
     SEQ Table captions.
 
-    Returns {index_db, heading_count, figure_count, table_count}.
+    Returns {index_db, heading_count, figure_count, table_count, complete,
+    source_sha256}.
+
+    e9b2cd2b — complete is always True on a successful return (a failed/
+    interrupted run raises instead); source_sha256 is the SHA-256 fingerprint
+    of the source .docx bytes that were just indexed, so a caller can compare
+    it against a later re-fingerprint to detect drift out-of-band.
     """
     return docs_intel.index_docx_structure(path, index_db_path)
 
 
 @mcp.tool()
-def get_structure_elements(index_db_path: str) -> dict[str, Any]:
+def get_structure_elements(
+    index_db_path: str, allow_stale: bool = False
+) -> dict[str, Any]:
     """c39ae092 — retrieve all locally-stored structural elements from the sidecar.
 
     Returns {headings, figures, tables} lists from the docx_headings,
     docx_figures, docx_tables tables populated by index_document_structure.
     Returns empty lists for any table not yet populated.
+
+    e9b2cd2b — FAILS CLOSED by default: raises if the structural index is
+    stale (source .docx content changed since the last successful
+    index_document_structure run) or incomplete (that run never finished),
+    instead of returning partial/outdated counts as if they were
+    authoritative. Pass allow_stale=True to read the best-effort data anyway
+    — the result then includes a "freshness" key explaining why it wasn't
+    trusted.
     """
-    return docs_intel.get_local_structure_elements(index_db_path)
+    return docs_intel.get_local_structure_elements(
+        index_db_path, allow_stale=allow_stale
+    )
 
 
 @mcp.tool()
@@ -117,8 +142,16 @@ def highlight_document(
     element_types: list[str] | None = None,
     color: str = "yellow",
     limit: int = 100,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
-    """Apply native Word highlighting to structural XML search matches."""
+    """Apply native Word highlighting to structural XML search matches.
+
+    session_id: 273df573 — identifies the calling Meridian session to the
+      tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+      meridian/routes/tunnel.py). Not forwarded to docs_intel; has no effect
+      when this tool is invoked outside Meridian's tunnel (e.g. standalone
+      `uvx meridian-docs`).
+    """
     return docs_intel.highlight_document_matches(
         docx_path=docx_path,
         query=query,
@@ -131,6 +164,37 @@ def highlight_document(
 def read_document_snapshot(docx_path: str) -> dict[str, Any]:
     """Read the last saved DOCX snapshot without writing or requiring a close."""
     return docs_intel.read_document_snapshot(docx_path)
+
+
+@mcp.tool()
+def check_render_capability(docx_path: str) -> dict[str, Any]:
+    """93cd9798 -- lightweight render-capability detection for visual QA.
+
+    This is capability DETECTION, not a rendering engine (mirrors the .pdf
+    boundary in ``ingest_local_document``, which also declines to embed a
+    rendering pipeline). Returns a dict with a ``status`` key that is exactly
+    one of three states:
+
+      - "rendered"                -- a real render backend (LibreOffice
+                                      headless, or Word COM on Windows) was
+                                      available and actually produced visual
+                                      output for this document. This is the
+                                      ONLY status that means "verified visual
+                                      QA" -- treat every other status as NOT
+                                      verified.
+      - "unavailable-with-reason" -- no render backend is installed/reachable
+                                      in this environment. ``reason`` names
+                                      every backend checked and why, never a
+                                      generic message. Says nothing about the
+                                      document itself.
+      - "failed"                  -- a backend was available but the render
+                                      attempt for this document errored.
+                                      ``reason`` carries the underlying error.
+                                      Never silently reported as "rendered".
+
+    See ``render_gate.check_render_capability`` for the full contract.
+    """
+    return render_gate.check_render_capability(docx_path)
 
 
 @mcp.tool()
@@ -254,11 +318,18 @@ def insert_image(
     width_inches: float | None = None,
     height_inches: float | None = None,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert a local image as a centered inline OOXML figure.
 
     The generated image paragraph is always centered with w:jc val="center",
     equivalent to pressing Ctrl+E in Word.
+
+    session_id: 273df573 — identifies the calling Meridian session to the
+      tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+      meridian/routes/tunnel.py). Not forwarded to docs_intel; has no effect
+      when this tool is invoked outside Meridian's tunnel (e.g. standalone
+      `uvx meridian-docs`).
     """
     return docs_intel.insert_image(
         docx_path=docx_path,
@@ -269,6 +340,103 @@ def insert_image(
         height_inches=height_inches,
         index_db_path=index_db_path,
     )
+
+@mcp.tool()
+def insert_figure_block(
+    docx_path: str,
+    image_path: str,
+    label_text: str,
+    anchor_para_id: str | None = None,
+    position: str = "after",
+    width_inches: float | None = None,
+    height_inches: float | None = None,
+    section_heading: str | None = None,
+    index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """19be1551 — atomically insert a centered image paragraph AND its
+    adjacent real SEQ Figure caption in ONE document-load-mutate-save
+    transaction.
+
+    Unlike calling insert_image then insert_caption as two separate write
+    transactions, both paragraphs are built against a single in-memory
+    document tree and reach disk via exactly one zip rewrite — there is no
+    window in which a failure leaves an orphan image with no caption, or an
+    inconsistent caption index.
+
+    The image paragraph is always centered (w:jc val="center", equivalent to
+    Ctrl+E), regardless of any alignment the anchor paragraph carries. The
+    caption paragraph is always inserted immediately after the image
+    paragraph — that ordering is not configurable, mirroring insert_caption's
+    own rule that a Figure caption can never precede its image. anchor_para_id
+    / position control where the IMAGE paragraph (and therefore the whole
+    block) lands relative to an existing direct body paragraph, exactly like
+    insert_image; None appends the block before the document's trailing
+    sectPr.
+
+    The caption's SEQ number is the count of existing SEQ Figure captions in
+    the document plus one (same semantics as insert_caption), and it gets a
+    fresh _Ref<digits> cross-reference bookmark. style_policy["caption_centered"]
+    (default False, via resolve_style_policy) controls whether the caption
+    itself also gets w:jc val="center".
+
+    After the single save, the file is re-read fresh from disk and verified:
+    the image paragraph must be present and centered, the caption must
+    immediately follow with nothing in between, and its SEQ number/label text
+    must match what was written. On a verification failure, the pre-write
+    backup is restored and an error is returned instead of a false success.
+
+    Supported image formats, dimension inference, and the six-inch default
+    width all match insert_image.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      image_path:      Absolute path to a local PNG/JPEG/GIF/BMP/TIFF image.
+      label_text:      Caption label text (e.g. "Loss curve for run 42").
+                       Rendered text will be e.g. "Figure 1. Loss curve...".
+      anchor_para_id:  w14:paraId or p{N} of the direct body paragraph to
+                       anchor the block on. None appends before the trailing
+                       sectPr.
+      position:        "before" or "after" (default) — placement of the
+                       IMAGE paragraph relative to anchor_para_id.
+      width_inches:    Optional explicit width; inferred from the image
+                       header when omitted (six-inch default width).
+      height_inches:   Optional explicit height; inferred from the image
+                       header when omitted (preserves aspect ratio).
+      section_heading: Optional section heading for organizational
+                       association. Stored in the sidecar index.
+      index_db_path:   If supplied, the sidecar index is invalidated and the
+                       new caption is upserted so the next read reflects the
+                       new figure/caption without a stale cache.
+      style_policy:    Optional style policy overrides (see
+                       resolve_style_policy).
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard
+                       (check_docs_write_conflict in meridian/routes/
+                       tunnel.py). Not forwarded to docs_intel; has no effect
+                       when this tool is invoked outside Meridian's tunnel
+                       (e.g. standalone `uvx meridian-docs`).
+
+    Returns:
+      {status, image_para_id, image_name, kind, seq_number, label_text,
+      section_heading, ref_bookmark, docx_path}
+      or {error: <message>} on failure (file NOT left mutated on validation
+      failure; restored from backup on a post-write verification failure).
+    """
+    return docs_intel.insert_figure_block(
+        docx_path=docx_path,
+        image_path=image_path,
+        label_text=label_text,
+        anchor_para_id=anchor_para_id,
+        position=position,
+        width_inches=width_inches,
+        height_inches=height_inches,
+        section_heading=section_heading,
+        index_db_path=index_db_path,
+        style_policy=style_policy,
+    )
+
 
 @mcp.tool()
 def find_image_paragraph(
@@ -311,6 +479,8 @@ def insert_caption(
     position: str = "after",
     section_heading: str | None = None,
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real Word Caption paragraph into a .docx file.
 
@@ -321,6 +491,9 @@ def insert_caption(
 
     Both Figure and Table captions use the same Word Caption-style + SEQ
     mechanism — the ``kind`` parameter selects which counter to use.
+
+    4efc63fd — style_policy["caption_centered"] (default False) controls
+    whether the new caption gets w:jc w:val="center".
 
     Args:
       docx_path:       Absolute path to the .docx file (mutated in place).
@@ -333,6 +506,14 @@ def insert_caption(
                        Stored in the sidecar index section column.
       index_db_path:   If supplied, sidecar is invalidated after write so the
                        next read auto-reindexes (keeps metadata in sync).
+      style_policy:    Optional style policy overrides (see
+                       resolve_style_policy / audit_equation_style).
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard
+                       (check_docs_write_conflict in meridian/routes/
+                       tunnel.py). Not forwarded to docs_intel; has no effect
+                       when this tool is invoked outside Meridian's tunnel
+                       (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, kind, seq_number, label_text, section_heading, docx_path}
@@ -346,6 +527,7 @@ def insert_caption(
         position=position,
         section_heading=section_heading,
         index_db_path=index_db_path,
+        style_policy=style_policy,
     )
 
 
@@ -355,6 +537,7 @@ def edit_caption(
     caption_para_id: str,
     new_label_text: str,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Edit the label text of an existing Word Caption paragraph.
 
@@ -368,6 +551,12 @@ def edit_caption(
       caption_para_id: w14:paraId or p{N} of the Caption paragraph.
       new_label_text:  Replacement label text.
       index_db_path:   If supplied, sidecar is invalidated after write.
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard
+                       (check_docs_write_conflict in meridian/routes/
+                       tunnel.py). Not forwarded to docs_intel; has no effect
+                       when this tool is invoked outside Meridian's tunnel
+                       (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, caption_para_id, new_label_text, docx_path}
@@ -386,6 +575,7 @@ def remove_caption(
     docx_path: str,
     caption_para_id: str,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Remove a Caption paragraph from a .docx file.
 
@@ -397,6 +587,12 @@ def remove_caption(
       docx_path:       Absolute path to the .docx file (mutated in place).
       caption_para_id: w14:paraId or p{N} of the Caption paragraph.
       index_db_path:   If supplied, sidecar is invalidated after write.
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard
+                       (check_docs_write_conflict in meridian/routes/
+                       tunnel.py). Not forwarded to docs_intel; has no effect
+                       when this tool is invoked outside Meridian's tunnel
+                       (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, caption_para_id, docx_path}
@@ -413,6 +609,7 @@ def remove_caption(
 def retrofit_plaintext_captions(
     docx_path: str,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """82b0b1a6 — Bulk-convert existing plain-text Figure/Table captions
     (hardcoded numbers, no SEQ field) into real Word SEQ fields.
@@ -441,6 +638,12 @@ def retrofit_plaintext_captions(
                        only if at least one plain-text caption is found).
       index_db_path:   If supplied, sidecar is invalidated after write (and
                        threaded into the renumber_sequences call).
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard
+                       (check_docs_write_conflict in meridian/routes/
+                       tunnel.py). Not forwarded to docs_intel; has no effect
+                       when this tool is invoked outside Meridian's tunnel
+                       (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, candidates_found, conversions, skipped, renumber_sequences,
@@ -460,6 +663,7 @@ def insert_cross_reference(
     target_caption_para_id: str | None = None,
     bookmark_name: str | None = None,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """1c59cb90 — Insert a live Word REF-field cross-reference into a .docx file.
 
@@ -493,6 +697,13 @@ def insert_cross_reference(
       bookmark_name:          Alternative to target_caption_para_id — an
                                existing _Ref<digits> bookmark name.
       index_db_path:          If supplied, sidecar is invalidated after write.
+      session_id:             273df573 — identifies the calling Meridian
+                               session to the tunnel-layer DOCX region-claim
+                               guard (check_docs_write_conflict in
+                               meridian/routes/tunnel.py). Not forwarded to
+                               docs_intel; has no effect when this tool is
+                               invoked outside Meridian's tunnel (e.g.
+                               standalone `uvx meridian-docs`).
 
     Returns:
       {status, anchor_para_id, bookmark_name, kind, seq_number, display_text,
@@ -515,6 +726,7 @@ def insert_citation(
     formatted_text: str,
     source: str = "zotero",
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real CSL_CITATION complex field into a .docx paragraph.
 
@@ -535,6 +747,12 @@ def insert_citation(
       formatted_text:  Rendered in-text marker (e.g. "(Smith et al., 2023)").
       source:          "zotero" (default) or "csl".
       index_db_path:   If supplied, sidecar is invalidated after write.
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard
+                       (check_docs_write_conflict in meridian/routes/
+                       tunnel.py). Not forwarded to docs_intel; has no effect
+                       when this tool is invoked outside Meridian's tunnel
+                       (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, anchor_para_id, citation_keys, formatted_text, source, docx_path}
@@ -558,6 +776,7 @@ def edit_citation(
     new_formatted_text: str | None = None,
     source: str = "zotero",
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Replace an existing CSL_CITATION field with updated keys/text.
 
@@ -575,6 +794,13 @@ def edit_citation(
       new_formatted_text: Replacement display text (None = keep existing).
       source:             "zotero" or "csl".
       index_db_path:      If supplied, sidecar is invalidated after write.
+      session_id:         273df573 — identifies the calling Meridian session
+                          to the tunnel-layer DOCX region-claim guard
+                          (check_docs_write_conflict in meridian/routes/
+                          tunnel.py). Not forwarded to docs_intel; has no
+                          effect when this tool is invoked outside
+                          Meridian's tunnel (e.g. standalone
+                          `uvx meridian-docs`).
 
     Returns:
       {status, anchor_para_id, citation_keys, formatted_text, source, docx_path}
@@ -595,6 +821,7 @@ def remove_citation(
     docx_path: str,
     anchor_para_id: str,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Remove the first CSL_CITATION complex field from a paragraph.
 
@@ -606,6 +833,12 @@ def remove_citation(
       docx_path:       Absolute path to the .docx file (mutated in place).
       anchor_para_id:  w14:paraId or p{N} of the paragraph to edit.
       index_db_path:   If supplied, sidecar is invalidated after write.
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard
+                       (check_docs_write_conflict in meridian/routes/
+                       tunnel.py). Not forwarded to docs_intel; has no effect
+                       when this tool is invoked outside Meridian's tunnel
+                       (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, anchor_para_id, docx_path}
@@ -664,6 +897,8 @@ def insert_equation(
     payload: str,
     position: str = "after",
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Insert an equation into a .docx file.
 
@@ -676,12 +911,25 @@ def insert_equation(
       "after"  — new display-mode paragraph immediately after the anchor.
       "append" — append the <m:oMath> inline to the anchor paragraph itself.
 
+    4efc63fd — style_policy (see resolve_style_policy) controls the new
+    display paragraph's alignment (equation_alignment, default "center") and
+    left indentation (body_indent_twips, default 0). Not consulted for
+    position="append".
+
     Args:
       docx_path:       Absolute path to the .docx file (mutated in place).
       anchor_para_id:  w14:paraId or p{N}/tbl{N} to anchor the insertion.
       payload:         Raw OMML XML or LaTeX expression.
       position:        "before", "after" (default), or "append".
       index_db_path:   If supplied, sidecar is invalidated after write.
+      style_policy:    Optional style policy overrides (see
+                       resolve_style_policy / audit_equation_style).
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard
+                       (check_docs_write_conflict in meridian/routes/
+                       tunnel.py). Not forwarded to docs_intel; has no effect
+                       when this tool is invoked outside Meridian's tunnel
+                       (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, position, para_id, omml, docx_path}
@@ -693,6 +941,7 @@ def insert_equation(
         payload=payload,
         position=position,
         index_db_path=index_db_path,
+        style_policy=style_policy,
     )
 
 
@@ -702,6 +951,7 @@ def edit_equation(
     equation_para_id: str,
     new_payload: str,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Replace the <m:oMath> in an existing equation paragraph.
 
@@ -714,6 +964,12 @@ def edit_equation(
       equation_para_id:  w14:paraId or p{N} of the equation paragraph.
       new_payload:       Replacement OMML XML or LaTeX expression.
       index_db_path:     If supplied, sidecar is invalidated after write.
+      session_id:        273df573 — identifies the calling Meridian session
+                         to the tunnel-layer DOCX region-claim guard
+                         (check_docs_write_conflict in meridian/routes/
+                         tunnel.py). Not forwarded to docs_intel; has no
+                         effect when this tool is invoked outside Meridian's
+                         tunnel (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, equation_para_id, omml, docx_path}
@@ -726,12 +982,41 @@ def edit_equation(
         index_db_path=index_db_path,
     )
 
+@mcp.tool()
+def append_text_run_after_math(
+    docx_path: str,
+    equation_para_id: str,
+    text: str,
+    math_index: int | None = None,
+    index_db_path: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Append a normal text run after an equation selected by stable paragraph id.
+
+    When a paragraph contains multiple equations, math_index is required so the
+    operation never guesses which equation should receive the text.
+
+    session_id: 273df573 — identifies the calling Meridian session to the
+      tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+      meridian/routes/tunnel.py). Not forwarded to docs_intel; has no effect
+      when this tool is invoked outside Meridian's tunnel (e.g. standalone
+      `uvx meridian-docs`).
+    """
+    return docs_intel.append_text_run_after_math(
+        docx_path=docx_path,
+        equation_para_id=equation_para_id,
+        text=text,
+        math_index=math_index,
+        index_db_path=index_db_path,
+    )
+
 
 @mcp.tool()
 def remove_equation(
     docx_path: str,
     equation_para_id: str,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Remove an equation from a .docx file.
 
@@ -744,6 +1029,12 @@ def remove_equation(
       docx_path:         Absolute path to the .docx file (mutated in place).
       equation_para_id:  w14:paraId or p{N} of the equation paragraph.
       index_db_path:     If supplied, sidecar is invalidated after write.
+      session_id:        273df573 — identifies the calling Meridian session
+                         to the tunnel-layer DOCX region-claim guard
+                         (check_docs_write_conflict in meridian/routes/
+                         tunnel.py). Not forwarded to docs_intel; has no
+                         effect when this tool is invoked outside Meridian's
+                         tunnel (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, equation_para_id, removed_whole_paragraph, docx_path}
@@ -753,6 +1044,44 @@ def remove_equation(
         docx_path=docx_path,
         equation_para_id=equation_para_id,
         index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
+def audit_equation_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """4efc63fd — Audit every equation in a .docx for alignment, trailing
+    punctuation, and numbering consistency; returns structured findings, not
+    free text.
+
+    Three finding types:
+      misaligned_equation                — a display equation's paragraph
+        alignment doesn't match style_policy["equation_alignment"] (default
+        "center"). Inline and table-numbered equations are excluded.
+      missing_trailing_punctuation /
+      incorrect_trailing_punctuation     — a display equation has no (or the
+        wrong) trailing punctuation immediately after the <m:oMath> — the
+        same spot append_text_run_after_math writes to. Skipped entirely
+        when style_policy["equation_punctuation_required"] is False.
+      duplicate_equation_number /
+      equation_number_gap                — table-numbered equations (the
+        "(1)"/"(2a)" pattern) checked for exact duplicate numbers and gaps in
+        the leading-integer sequence.
+
+    Args:
+      docx_path:     Absolute path to the .docx file (read-only).
+      style_policy:  Optional style policy overrides (see
+                     resolve_style_policy).
+
+    Returns:
+      {docx_path, equation_count, findings, finding_count, findings_by_type,
+      policy} or {error: <message>}.
+    """
+    return docs_intel.audit_equation_style(
+        docx_path=docx_path,
+        style_policy=style_policy,
     )
 
 
@@ -802,6 +1131,7 @@ def insert_bibliography_entry(
     citation_key: str,
     csl_item: dict,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict:
     """1258794a — Write a formatted APA bibliography entry into a .docx.
 
@@ -825,6 +1155,12 @@ def insert_bibliography_entry(
       csl_item:      CSL-JSON-shaped item dict (from Zotero local API /
                      zotero_client.resolve_citation_ref + item fetch).
       index_db_path: If supplied, sidecar is invalidated after write.
+      session_id:    273df573 — identifies the calling Meridian session to
+                     the tunnel-layer DOCX region-claim guard
+                     (check_docs_write_conflict in meridian/routes/
+                     tunnel.py). Not forwarded to docs_intel; has no effect
+                     when this tool is invoked outside Meridian's tunnel
+                     (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, citation_key, formatted_text, docx_path}
@@ -844,6 +1180,7 @@ def update_bibliography_entry(
     citation_key: str,
     csl_item: dict,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict:
     """1258794a — Refresh the formatted text of an existing bibliography entry.
 
@@ -859,6 +1196,12 @@ def update_bibliography_entry(
       citation_key:  The same key used when the entry was inserted.
       csl_item:      Updated CSL-JSON item dict.
       index_db_path: If supplied, sidecar is invalidated after write.
+      session_id:    273df573 — identifies the calling Meridian session to
+                     the tunnel-layer DOCX region-claim guard
+                     (check_docs_write_conflict in meridian/routes/
+                     tunnel.py). Not forwarded to docs_intel; has no effect
+                     when this tool is invoked outside Meridian's tunnel
+                     (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, citation_key, formatted_text, docx_path}
@@ -877,6 +1220,7 @@ def remove_bibliography_entry(
     docx_path: str,
     citation_key: str,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict:
     """1258794a — Remove a bibliography entry paragraph from a .docx.
 
@@ -888,6 +1232,12 @@ def remove_bibliography_entry(
       docx_path:     Absolute path to the .docx file (mutated in place).
       citation_key:  The citation key of the entry to remove.
       index_db_path: If supplied, sidecar is invalidated after write.
+      session_id:    273df573 — identifies the calling Meridian session to
+                     the tunnel-layer DOCX region-claim guard
+                     (check_docs_write_conflict in meridian/routes/
+                     tunnel.py). Not forwarded to docs_intel; has no effect
+                     when this tool is invoked outside Meridian's tunnel
+                     (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, citation_key, docx_path}
@@ -905,6 +1255,7 @@ def sync_bibliography(
     docx_path: str,
     csl_items: dict,
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict:
     """1258794a — Reconcile bibliography entries against in-document citations.
 
@@ -927,6 +1278,12 @@ def sync_bibliography(
       docx_path:   Absolute path to the .docx file (mutated in place).
       csl_items:   Dict mapping citation_key -> CSL-JSON item dict.
       index_db_path: If supplied, sidecar is invalidated after each write.
+      session_id:  273df573 — identifies the calling Meridian session to the
+                   tunnel-layer DOCX region-claim guard
+                   (check_docs_write_conflict in meridian/routes/
+                   tunnel.py). Not forwarded to docs_intel; has no effect
+                   when this tool is invoked outside Meridian's tunnel
+                   (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, inserted, updated, missing_data, stale_entries, docx_path}
@@ -1004,7 +1361,11 @@ def scan_stale_notes(docx_path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def renumber_sequences(docx_path: str, index_db_path: str | None = None) -> dict[str, Any]:
+def renumber_sequences(
+    docx_path: str,
+    index_db_path: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
     """595ccea1 — Re-scan SEQ Figure / SEQ Table fields and confirm/fix sequential numbering.
 
     Motivated directly by a real Figure 41/42 numbering collision found by
@@ -1019,6 +1380,12 @@ def renumber_sequences(docx_path: str, index_db_path: str | None = None) -> dict
       docx_path:      Absolute path to the .docx file (mutated in place only
                       if a correction is needed).
       index_db_path:  If supplied, sidecar is invalidated after a write.
+      session_id:     273df573 — identifies the calling Meridian session to
+                      the tunnel-layer DOCX region-claim guard
+                      (check_docs_write_conflict in meridian/routes/
+                      tunnel.py). Not forwarded to docs_intel; has no effect
+                      when this tool is invoked outside Meridian's tunnel
+                      (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, figure_count, table_count, collisions_found, corrections,
@@ -1038,11 +1405,26 @@ def insert_highlighted_note(
     mode: str = "inline",
     author: str = "Meridian",
     initials: str = "M",
+    style_policy: dict[str, Any] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert an internal note inline or as a native Word comment.
 
     mode="inline" preserves the highlighted Meridian note paragraph.
     mode="comment" creates a real Word comment visible in Word's review pane.
+
+    4efc63fd — for mode="inline", style_policy["note_style"] (default
+    "MeridianInternalNote") and style_policy["note_highlight_color"] (default
+    "yellow") control the OOXML paragraph style / highlight color. Not
+    consulted for mode="comment". Distinct from the `style` parameter above,
+    which selects the note's category (only "internal_note" is supported),
+    not its rendering.
+
+    session_id: 273df573 — identifies the calling Meridian session to the
+      tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+      meridian/routes/tunnel.py). Not forwarded to docs_intel; has no effect
+      when this tool is invoked outside Meridian's tunnel (e.g. standalone
+      `uvx meridian-docs`).
     """
     return docs_intel.insert_highlighted_note(
         docx_path=docx_path,
@@ -1054,6 +1436,7 @@ def insert_highlighted_note(
         mode=mode,
         author=author,
         initials=initials,
+        style_policy=style_policy,
     )
 
 
@@ -1087,6 +1470,7 @@ def write_section(
     anchor_para_id: str,
     position: str = "after",
     index_db_path: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """82d22824 — Create a whole new section (heading + body + figure/table
     references) as ONE atomic operation from a structured spec.
@@ -1118,6 +1502,12 @@ def write_section(
       anchor_para_id:  w14:paraId (or p{N}) of the paragraph/table to anchor on.
       position:        "before" or "after" (default) the anchor.
       index_db_path:   If supplied, sidecar is invalidated after the write.
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard
+                       (check_docs_write_conflict in meridian/routes/
+                       tunnel.py). Not forwarded to docs_intel; has no effect
+                       when this tool is invoked outside Meridian's tunnel
+                       (e.g. standalone `uvx meridian-docs`).
 
     Returns:
       {status, heading_para_id, heading_text, level, block_para_ids,
@@ -1142,6 +1532,9 @@ def move_section(
     destination_position: str = "after",
     index_db_path: str | None = None,
     allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """6ff24136 — Move an existing section (heading + its content) to a new
     location in the document.
@@ -1189,13 +1582,42 @@ def move_section(
                                      proceed even when the move would split a
                                      bookmark's start/end across the move
                                      boundary (see safety check 2 above).
+      draft_output_path:            fe989980 — wave-scoped opt-in: when given
+                                     together with wave_run_id, the move is
+                                     written to this ISOLATED path instead of
+                                     docx_path (which is only ever read, never
+                                     mutated). Must differ from docx_path.
+                                     Omitted (the default), this call is
+                                     byte-identical to the direct-write
+                                     behavior that predates fe989980. Pair
+                                     with merge_docx_draft to promote an
+                                     accepted draft into the canonical file
+                                     once the Meridian MCP connection's
+                                     docx_merge manifest gate (open_merge_
+                                     manifest / declare_merge_anchors /
+                                     claim_merge_owner / check_merge_stale_or_
+                                     overlap) has cleared.
+      wave_run_id:                  fe989980 — required together with
+                                     draft_output_path; opaque wave
+                                     identifier threaded into the return
+                                     payload for cross-referencing against
+                                     the matching docx_merge manifest.
+      session_id:                   273df573 — identifies the calling
+                                     Meridian session to the tunnel-layer
+                                     DOCX region-claim guard
+                                     (check_docs_write_conflict in
+                                     meridian/routes/tunnel.py). Not
+                                     forwarded to docs_intel; has no effect
+                                     when this tool is invoked outside
+                                     Meridian's tunnel (e.g. standalone
+                                     `uvx meridian-docs`).
 
     Returns:
       {status, section_id, heading_text, moved_block_count,
       destination_anchor_para_id, destination_position, renumber_sequences,
-      find_references_to, docx_path} or {error: <message>} (file NOT
-      mutated on error; a blocked bookmark-split also returns
-      {split_bookmarks: [...]}).
+      find_references_to, docx_path, wave_run_id, is_draft} or
+      {error: <message>} (file NOT mutated on error; a blocked
+      bookmark-split also returns {split_bookmarks: [...]}).
     """
     return docs_intel.move_section(
         docx_path=docx_path,
@@ -1204,6 +1626,8 @@ def move_section(
         destination_position=destination_position,
         index_db_path=index_db_path,
         allow_bookmark_split=allow_bookmark_split,
+        draft_output_path=draft_output_path,
+        wave_run_id=wave_run_id,
     )
 
 
@@ -1215,6 +1639,9 @@ def copy_section(
     destination_position: str = "after",
     index_db_path: str | None = None,
     trim_original_to: str | None = None,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """8213050a — Duplicate an existing section (heading + its content) to a
     new location, leaving the original untouched (unless trim_original_to is
@@ -1253,13 +1680,30 @@ def copy_section(
                                      e.g. a "moved to <destination>" pointer).
                                      None (default) leaves the original fully
                                      untouched.
+      draft_output_path:            fe989980 — same wave-scoped opt-in as
+                                     move_section: when given with
+                                     wave_run_id, the copy is written to this
+                                     ISOLATED path instead of docx_path.
+                                     Omitted (the default), byte-identical to
+                                     pre-fe989980 behavior.
+      wave_run_id:                  fe989980 — required together with
+                                     draft_output_path; see move_section.
+      session_id:                   273df573 — identifies the calling
+                                     Meridian session to the tunnel-layer
+                                     DOCX region-claim guard
+                                     (check_docs_write_conflict in
+                                     meridian/routes/tunnel.py). Not
+                                     forwarded to docs_intel; has no effect
+                                     when this tool is invoked outside
+                                     Meridian's tunnel (e.g. standalone
+                                     `uvx meridian-docs`).
 
     Returns:
       {status, section_id, heading_text, new_heading_para_id,
       copied_block_count, para_id_map, bookmark_map,
       destination_anchor_para_id, destination_position, renumber_sequences,
-      find_references_to, trimmed_original, docx_path} or
-      {error: <message>} (file NOT mutated on error).
+      find_references_to, trimmed_original, docx_path, wave_run_id,
+      is_draft} or {error: <message>} (file NOT mutated on error).
     """
     return docs_intel.copy_section(
         docx_path=docx_path,
@@ -1268,8 +1712,54 @@ def copy_section(
         destination_position=destination_position,
         index_db_path=index_db_path,
         trim_original_to=trim_original_to,
+        draft_output_path=draft_output_path,
+        wave_run_id=wave_run_id,
     )
 
+
+@mcp.tool()
+def relocate_figure(
+    docx_path: str,
+    figure_index: int,
+    destination_anchor_para_id: str,
+    destination_position: str = "after",
+    index_db_path: str | None = None,
+    allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Move an image paragraph together with its immediately following Figure caption.
+
+    figure_index is the 1-based order among direct-body image paragraphs. The
+    operation requires the next body child to be a SEQ Figure caption and
+    preserves the original OOXML elements and relationship IDs. It rejects
+    bookmark-splitting moves before writing, verifies the saved document,
+    invalidates the local structure sidecar, and renumbers Figure SEQ/REF
+    caches after a successful reorder.
+
+    fe989980 — draft_output_path + wave_run_id (both or neither): when given,
+    writes to the ISOLATED draft_output_path instead of docx_path, which is
+    only ever read. Omitted (the default), byte-identical to pre-fe989980
+    behavior. Pair with merge_docx_draft to promote an accepted draft into
+    the canonical file.
+
+    session_id: 273df573 — identifies the calling Meridian session to the
+      tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+      meridian/routes/tunnel.py). Not forwarded to docs_intel; has no effect
+      when this tool is invoked outside Meridian's tunnel (e.g. standalone
+      `uvx meridian-docs`).
+    """
+    return docs_intel.relocate_figure(
+        docx_path=docx_path,
+        figure_index=figure_index,
+        destination_anchor_para_id=destination_anchor_para_id,
+        destination_position=destination_position,
+        index_db_path=index_db_path,
+        allow_bookmark_split=allow_bookmark_split,
+        draft_output_path=draft_output_path,
+        wave_run_id=wave_run_id,
+    )
 
 @mcp.tool()
 def relocate_table(
@@ -1279,6 +1769,9 @@ def relocate_table(
     destination_position: str = "after",
     index_db_path: str | None = None,
     allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """c031622b — Move an existing bare <w:tbl> (no owning heading) to a new
     location in the document, atomically.
@@ -1323,12 +1816,30 @@ def relocate_table(
                                      proceed even when the move would split a
                                      bookmark's start/end across the move
                                      boundary.
+      draft_output_path:            fe989980 — same wave-scoped opt-in as
+                                     move_section: when given with
+                                     wave_run_id, the relocate is written to
+                                     this ISOLATED path instead of docx_path.
+                                     Omitted (the default), byte-identical to
+                                     pre-fe989980 behavior.
+      wave_run_id:                  fe989980 — required together with
+                                     draft_output_path; see move_section.
+      session_id:                   273df573 — identifies the calling
+                                     Meridian session to the tunnel-layer
+                                     DOCX region-claim guard
+                                     (check_docs_write_conflict in
+                                     meridian/routes/tunnel.py). Not
+                                     forwarded to docs_intel; has no effect
+                                     when this tool is invoked outside
+                                     Meridian's tunnel (e.g. standalone
+                                     `uvx meridian-docs`).
 
     Returns:
       {status, table_index, new_table_index, row_count, col_count,
-      destination_anchor_para_id, destination_position, docx_path} or
-      {error: <message>} (file NOT mutated on error; a blocked bookmark-split
-      also returns {split_bookmarks: [...]}).
+      destination_anchor_para_id, destination_position, docx_path,
+      wave_run_id, is_draft} or {error: <message>} (file NOT mutated on
+      error; a blocked bookmark-split also returns
+      {split_bookmarks: [...]}).
     """
     return docs_intel.relocate_table(
         docx_path=docx_path,
@@ -1337,6 +1848,58 @@ def relocate_table(
         destination_position=destination_position,
         index_db_path=index_db_path,
         allow_bookmark_split=allow_bookmark_split,
+        draft_output_path=draft_output_path,
+        wave_run_id=wave_run_id,
+    )
+
+
+@mcp.tool()
+def merge_docx_draft(
+    canonical_path: str,
+    draft_path: str,
+    index_db_path: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """fe989980 — promote an isolated wave-scoped draft into canonical_path.
+
+    The file-level counterpart to the Meridian core package's
+    meridian.db.docx_merge coordination layer (open_merge_manifest /
+    declare_merge_anchors / claim_merge_owner / check_merge_stale_or_overlap
+    / record_merge_result / finalize_merge_manifest — a SEPARATE MCP
+    connection, since this stdlib-only extension has no database access of
+    its own). Call this ONLY after that DB-side gate has cleared for the
+    caller — this tool performs no ownership/overlap/staleness checks
+    itself; it only performs the physical promotion, verification, and
+    restore-on-failure.
+
+    draft_path must be a complete .docx previously produced by move_section /
+    copy_section / relocate_table / relocate_figure called with
+    draft_output_path (or any other isolated draft artifact). The draft's
+    whole-document bytes are staged, checked against canonical_path's
+    current media/style/relationship counts, and only then promoted (an
+    existing canonical_path is backed up to canonical_path + ".bak" first).
+    After promotion, canonical_path is re-read fresh from disk and compared
+    against the draft's own structural counts + content hash; on any
+    mismatch canonical_path is best-effort restored from that backup and
+    this returns an error, never a false success.
+
+    session_id: 273df573 — identifies the calling Meridian session to the
+      tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+      meridian/routes/tunnel.py; the guarded path is canonical_path, since
+      that's the file this call mutates). Not forwarded to docs_intel; has
+      no effect when this tool is invoked outside Meridian's tunnel (e.g.
+      standalone `uvx meridian-docs`).
+
+    Returns {merged: True, status: "merged", canonical_path, draft_path,
+    paragraph_count, heading_count, table_count, image_count} on success, or
+    {merged: False, error: <message>, ...} on failure — with
+    file_restored: <bool> present only when a post-promotion verification
+    failure triggered a restore.
+    """
+    return docs_intel.merge_draft_into_canonical(
+        canonical_path=canonical_path,
+        draft_path=draft_path,
+        index_db_path=index_db_path,
     )
 
 

@@ -84,6 +84,84 @@ def test_outputs_dirs_is_preserved_by_normalize():
     assert "credentials_rule" in full
 
 
+def test_normalize_execution_policy_mode_accepts_both_vocabularies():
+    # Policy vocabulary passes through unchanged.
+    assert ec.normalize_execution_policy_mode("immediate") == "immediate"
+    assert ec.normalize_execution_policy_mode("relaxed") == "relaxed"
+    # Underlying project-posture vocabulary is translated.
+    assert ec.normalize_execution_policy_mode("autonomous") == "immediate"
+    assert ec.normalize_execution_policy_mode("interactive") == "relaxed"
+    # Case/whitespace tolerant.
+    assert ec.normalize_execution_policy_mode("  INTERACTIVE  ") == "relaxed"
+    # Unknown/missing/wrong type -> default 'immediate', never raises.
+    assert ec.normalize_execution_policy_mode(None) == "immediate"
+    assert ec.normalize_execution_policy_mode("bogus") == "immediate"
+    assert ec.normalize_execution_policy_mode(42) == "immediate"
+
+
+def test_build_execution_policy_immediate_default_shape():
+    policy = ec.build_execution_policy(None, execution_mode="autonomous")
+    assert policy == {
+        "execution_mode": "immediate",
+        "max_planning_turns": ec.DEFAULT_MAX_PLANNING_TURNS_IMMEDIATE,
+        "required_first_action": ec.REQUIRED_FIRST_ACTION_IMMEDIATE,
+        "no_confirmation": True,
+        "permitted_parallel_wave": True,
+        "claim_before_edit": True,
+        "genuine_blocker_escalation": ec.GENUINE_BLOCKER_ESCALATION_RULE,
+    }
+
+
+def test_build_execution_policy_relaxed_default_shape():
+    policy = ec.build_execution_policy(None, execution_mode="interactive")
+    assert policy["execution_mode"] == "relaxed"
+    assert policy["max_planning_turns"] == ec.DEFAULT_MAX_PLANNING_TURNS_RELAXED
+    assert policy["required_first_action"] == ec.REQUIRED_FIRST_ACTION_RELAXED
+    assert policy["no_confirmation"] is False
+    assert policy["permitted_parallel_wave"] is False
+    # claim_before_edit is non-negotiable regardless of mode.
+    assert policy["claim_before_edit"] is True
+
+
+def test_build_execution_policy_missing_mode_defaults_to_immediate():
+    # No execution_mode at all -> same as passing nothing / an unknown value.
+    policy = ec.build_execution_policy({})
+    assert policy["execution_mode"] == "immediate"
+    assert policy["required_first_action"] == "claim_sprint_item"
+
+
+def test_build_execution_policy_honors_max_planning_turns_override():
+    policy = ec.build_execution_policy(
+        {"max_planning_turns": 5}, execution_mode="autonomous",
+    )
+    assert policy["max_planning_turns"] == 5
+    # Other fields stay deterministic — not user-configurable.
+    assert policy["execution_mode"] == "immediate"
+    assert policy["no_confirmation"] is True
+
+
+def test_build_execution_policy_rejects_unsafe_max_planning_turns():
+    # Invalid/unsafe values fall back to the mode default rather than being
+    # persisted verbatim into a live policy.
+    for bad in (0, -5, "not-a-number", None, [], {}):
+        policy = ec.build_execution_policy(
+            {"max_planning_turns": bad}, execution_mode="autonomous",
+        )
+        assert policy["max_planning_turns"] == ec.DEFAULT_MAX_PLANNING_TURNS_IMMEDIATE
+    # An absurdly large override is clamped to the hard ceiling, not honored
+    # verbatim -- "relaxed" must never mean genuinely unbounded.
+    policy = ec.build_execution_policy(
+        {"max_planning_turns": 999999}, execution_mode="interactive",
+    )
+    assert policy["max_planning_turns"] == ec.MAX_PLANNING_TURNS_CEILING
+
+
+def test_build_execution_policy_non_dict_executor_config_is_tolerated():
+    for bad in (None, "nope", 42, ["list"]):
+        policy = ec.build_execution_policy(bad, execution_mode="autonomous")
+        assert policy["max_planning_turns"] == ec.DEFAULT_MAX_PLANNING_TURNS_IMMEDIATE
+
+
 def test_merge_repo_paths_dedupes_and_normalizes():
     existing = [{"cwd": " /a ", "hostname": "h1"}, {"cwd": "/b", "hostname": ""}]
     new = [{"cwd": "/a", "hostname": "h1"}, {"cwd": "/c"}, {"no_cwd": "x"}, "bad"]

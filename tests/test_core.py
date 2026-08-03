@@ -7736,10 +7736,18 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_handoff_tokens_body_hash",
         "_migrate_pg_project_capabilities",
         "_migrate_pg_capability_profiles",
+        "_migrate_pg_sprint_item_tool_requirements",
+        "_migrate_pg_sprint_item_artifact_declaration",
+        "_migrate_pg_docx_merge_manifests",
+        "_migrate_pg_proposal_evidence_links",
+        "_migrate_pg_wave_base_manifests",
+        "_migrate_pg_sprint_batch_claims",
+        "_migrate_pg_verification_runs",
+        "_migrate_pg_sprint_item_require_strict_evidence",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 131
+    assert len(allnames) == len(set(allnames)) == 139
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -8630,6 +8638,59 @@ async def test_checkpoint_writes_session_summary(db, tmp_path):
     assert row is not None
     summary_val = row["session_summary"] if hasattr(row, "__getitem__") else row[0]
     assert summary_val, "checkpoint() must write non-empty session_summary"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_scopes_pending_ids_to_session_version(db, tmp_path):
+    """660314c1 — checkpoint()'s pending_ids/next_goal must be scoped to the
+    calling session's own sprint_version bucket. Before the fix,
+    handle_checkpoint called get_sprint_items(..., status="pending") with NO
+    version filter, so a session scoped to one version (e.g. v0.2.6) got a
+    checkpoint whose pending_ids/next_goal leaked items from a completely
+    different version (e.g. v0.2.5) — a cross-version board-drift bug."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "ckpt-version-scope-test")
+    pid = p["id"]
+    in_scope = await db_module.add_sprint_item(db, pid, "v0.2.6", "in scope item")
+    out_of_scope = await db_module.add_sprint_item(
+        db, pid, "v0.2.5", "other version item"
+    )
+    s = await db_module.register_session(
+        db, pid, "ckpt-scoped-session", sprint_version="v0.2.6",
+    )
+    result = await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": pid}, db, str(tmp_path)
+    )
+    assert result["pending_count"] == 1, (
+        f"expected only the v0.2.6 item, got pending_count={result['pending_count']}"
+    )
+    assert in_scope["id"][:8] in result["pending_ids"]
+    assert out_of_scope["id"][:8] not in result["pending_ids"], (
+        "other-version item id leaked into checkpoint pending_ids"
+    )
+    assert in_scope["id"] in result["next_goal"]
+    assert out_of_scope["id"] not in result["next_goal"], (
+        "other-version item id leaked into checkpoint next_goal"
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_unscoped_session_sees_all_versions(db, tmp_path):
+    """A session with no stored sprint_version (never version-scoped) keeps
+    the original unscoped checkpoint behaviour — every version's pending
+    items are still visible. Back-compat guard for the 660314c1 fix."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "ckpt-unscoped-test")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v0.2.6", "item a")
+    await db_module.add_sprint_item(db, pid, "v0.2.5", "item b")
+    s = await db_module.register_session(db, pid, "ckpt-unscoped-session")
+    result = await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": pid}, db, str(tmp_path)
+    )
+    assert result["pending_count"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -14658,6 +14719,56 @@ async def test_register_and_remove_worktree(db):
 
 
 @pytest.mark.asyncio
+async def test_get_active_worktree_for_session_none_when_never_registered(db):
+    """e7548587 — the common case: a session that manages its own git
+    worktree manually (raw ``git worktree add``/cherry-pick, never calling
+    Meridian's create_worktree/register_worktree MCP tools) has NO
+    active_worktrees row at all. get_active_worktree_for_session must return
+    None for it — this is the structural reason complete_sprint_item's
+    merge-approval gate stays default-safe for most callers in a
+    multi-session repo, even in strict mode."""
+    p = await db_module.create_project(db, "no-registered-worktree")
+    session = await db_module.register_session(db, p["id"], "manual-git-session")
+
+    wt = await db_module.get_active_worktree_for_session(db, session["id"])
+    assert wt is None
+
+
+@pytest.mark.asyncio
+async def test_update_project_settings_require_merge_approval_tri_state(db):
+    """e7548587 — require_merge_approval is now a tri-state (0=off,
+    1=advisory, 2=strict), mirroring hitl_auto_answer's existing 0/1/2
+    pattern. update_project_settings must clamp into [0, 2] rather than
+    collapsing any truthy value down to 1 (the pre-fix bool-coercion bug that
+    would have silently downgraded a caller's requested strict=2 to
+    advisory=1)."""
+    p = await db_module.create_project(db, "merge-approval-tri-state")
+
+    # Default (never set) reads back as 1 (advisory) — unchanged behavior for
+    # every pre-existing project.
+    default_settings = await db_module.get_project_settings(db, p["id"])
+    assert default_settings["require_merge_approval"] == 1
+
+    strict = await db_module.update_project_settings(db, p["id"], require_merge_approval=2)
+    assert strict["require_merge_approval"] == 2
+    reread = await db_module.get_project_settings(db, p["id"])
+    assert reread["require_merge_approval"] == 2
+
+    off = await db_module.update_project_settings(db, p["id"], require_merge_approval=0)
+    assert off["require_merge_approval"] == 0
+
+    advisory = await db_module.update_project_settings(db, p["id"], require_merge_approval=1)
+    assert advisory["require_merge_approval"] == 1
+
+    # Out-of-range values clamp rather than raising or silently truncating to
+    # a bool (matches hitl_auto_answer's own clamp behavior).
+    clamped_high = await db_module.update_project_settings(db, p["id"], require_merge_approval=99)
+    assert clamped_high["require_merge_approval"] == 2
+    clamped_low = await db_module.update_project_settings(db, p["id"], require_merge_approval=-5)
+    assert clamped_low["require_merge_approval"] == 0
+
+
+@pytest.mark.asyncio
 async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
     """claim_sprint_item adds worktree_suggested fields when executor isolation=worktree."""
     import json as _json
@@ -14687,6 +14798,12 @@ async def test_claim_sprint_item_returns_worktree_fields_when_isolation_set(db):
     assert "git worktree add" in result["worktree_setup_cmd"]
     assert "git worktree remove" in result["worktree_cleanup_cmd"]
     assert "git merge" in result["worktree_merge_cmd"]
+    # eb2e44f8 — the claim response also names the base branch the worktree
+    # is expected to be created from, matching worktree_merge_cmd's target,
+    # so an executor can pass it straight to POST /worktrees' base_branch
+    # (together with the base SHA it observes) to persist an immutable base
+    # manifest for later merge-time validation.
+    assert result["worktree_base_branch"] == "dev"
 
 
 @pytest.mark.asyncio
@@ -17178,6 +17295,104 @@ async def test_start_session_injects_execution_mode_directive(db, tmp_path):
     assert res_if["agent_instructions"].startswith("EXECUTION MODE: interactive")
 
 
+def _mcp_result(resp):
+    """Parse a Meridian MCP tools/call response body into its result payload."""
+    assert resp.get("result") is not None, resp
+    return json.loads(resp["result"]["content"][0]["text"])
+
+
+def test_mcp_start_session_includes_execution_policy(client):
+    """75ac1c8e — start_session's execution_policy field is the canonical,
+    machine-readable contract: immediate mode by default (autonomous
+    project), relaxed for an interactive project, present on both compact
+    (default) and full (compact=False) shapes."""
+    pid = client.post("/projects", json={"name": "mcp-exec-policy-auto"}).json()["id"]
+    compact = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "exec-policy-compact",
+    }))
+    assert "execution_policy" in compact
+    policy = compact["execution_policy"]
+    assert policy is not None
+    assert policy["execution_mode"] == "immediate"
+    assert policy["required_first_action"] == "claim_sprint_item"
+    assert policy["no_confirmation"] is True
+    assert policy["permitted_parallel_wave"] is True
+    assert policy["claim_before_edit"] is True
+    assert isinstance(policy["max_planning_turns"], int) and policy["max_planning_turns"] >= 1
+    assert "genuine_blocker_escalation" in policy
+
+    full = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "exec-policy-full", "compact": False,
+    }))
+    assert full["execution_policy"] == policy
+
+    # Interactive project -> relaxed policy mode. POST /projects has no
+    # execution_mode field; set it via PATCH .../settings like the dashboard does.
+    pid2 = client.post("/projects", json={"name": "mcp-exec-policy-inter"}).json()["id"]
+    patch_resp = client.patch(
+        f"/projects/{pid2}/settings", json={"execution_mode": "interactive"},
+    )
+    assert patch_resp.status_code == 200
+    inter = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid2, "session_name": "exec-policy-inter",
+    }))
+    inter_policy = inter["execution_policy"]
+    assert inter_policy["execution_mode"] == "relaxed"
+    assert inter_policy["required_first_action"] == "get_sprint_items"
+    assert inter_policy["no_confirmation"] is False
+    assert inter_policy["permitted_parallel_wave"] is False
+    assert inter_policy["claim_before_edit"] is True
+
+
+def test_mcp_set_executor_config_max_planning_turns_reflected_in_start_session(client):
+    """75ac1c8e — an executor_config.max_planning_turns override set via
+    set_executor_config is reflected in the next start_session's
+    execution_policy without any other field changing."""
+    pid = client.post("/projects", json={"name": "mcp-exec-policy-override"}).json()["id"]
+    baseline = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "before-override",
+    }))
+    assert baseline["execution_policy"]["max_planning_turns"] == 1
+
+    _mcp_result(_mcp_call(client, "set_executor_config", {
+        "project_id": pid, "max_planning_turns": 4,
+    }))
+    after = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "after-override",
+    }))
+    assert after["execution_policy"]["max_planning_turns"] == 4
+    assert after["execution_policy"]["execution_mode"] == "immediate"
+
+    # An invalid override never produces an unsafe live policy — falls back
+    # to the immediate-mode default instead of persisting verbatim.
+    _mcp_result(_mcp_call(client, "set_executor_config", {
+        "project_id": pid, "max_planning_turns": -1,
+    }))
+    rejected = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "after-invalid-override",
+    }))
+    assert rejected["execution_policy"]["max_planning_turns"] == 1
+
+
+@pytest.mark.parametrize("mode", ["full", "delta", "starter", "goal"])
+def test_mcp_generate_handoff_embeds_execution_policy_tag_all_modes(client, mode):
+    """75ac1c8e — every generate_handoff mode's /goal text carries the same
+    canonical <execution_policy> tag (embedded in `content` for full/delta/
+    starter, or the entire body for goal mode)."""
+    pid = client.post("/projects", json={"name": f"mcp-handoff-exec-policy-{mode}"}).json()["id"]
+    sess = _mcp_result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": f"handoff-exec-policy-{mode}",
+    }))
+    result = _mcp_result(_mcp_call(client, "generate_handoff", {
+        "project_id": pid, "mode": mode, "session_id": sess.get("session_id"),
+    }))
+    body = result.get("content") or ""
+    assert 'execution_mode="immediate"' in body
+    assert 'required_first_action="claim_sprint_item"' in body
+    assert 'no_confirmation="true"' in body
+    assert 'claim_before_edit="true"' in body
+
+
 @pytest.mark.asyncio
 async def test_executor_goal_prompt_scopes_to_active_version(db):
     """The executor-goal MCP prompt filters its item list + /goal to the
@@ -18354,6 +18569,59 @@ async def test_workspace_proposal_promote_creates_sprint_item_and_links(db):
     # Sprint item actually exists.
     items = await db_module.get_sprint_items(db, project["id"])
     assert any(i["id"] == si_id for i in items)
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_promote_writes_durable_evidence_link(db):
+    """6cdc5df3 — promotion now ALSO writes a durable, typed
+    proposal_evidence_links row (not just the single promoted_to_sprint_item_id
+    column), so the relationship is queryable via get_proposal_evidence rather
+    than only inferable from that one legacy field."""
+    project = await db_module.create_project(db, "promo-evidence-target")
+    prop = await db_module.add_workspace_proposal(db, "Ship evidence linkage", "body")
+
+    result = await db_module.promote_workspace_proposal(
+        db, prop["id"], project["id"]
+    )
+    si_id = result["sprint_item_id"]
+    link = result["evidence_link"]
+    assert link is not None
+    assert link["proposal_id"] == prop["id"]
+    assert link["entity_type"] == "sprint_item"
+    assert link["entity_id"] == si_id
+    assert link["project_id"] == project["id"]
+
+    # The durable link is independently queryable via get_proposal_evidence —
+    # this is the actual "queryable link" the feature is about, not just a
+    # field on promote_workspace_proposal's one-shot return value.
+    evidence = await db_module.get_proposal_evidence(db, project["id"], prop["id"])
+    assert evidence["link_count"] == 1
+    assert len(evidence["sprint_items"]) == 1
+    assert evidence["sprint_items"][0]["id"] == si_id
+    assert evidence["notes"] == []
+    assert evidence["findings"] == []
+    assert evidence["decisions"] == []
+    assert evidence["artifacts"] == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_proposal_promote_evidence_link_is_idempotent_across_calls(db):
+    """Re-linking the same promotion's evidence (e.g. a caller re-running
+    link_proposal_evidence with the same ids) never duplicates the row."""
+    project = await db_module.create_project(db, "promo-evidence-dup")
+    prop = await db_module.add_workspace_proposal(db, "Dup-safe promotion", "body")
+    result = await db_module.promote_workspace_proposal(
+        db, prop["id"], project["id"]
+    )
+    si_id = result["sprint_item_id"]
+
+    # Simulate a redundant re-link of the exact same evidence.
+    await db_module.link_proposal_evidence(
+        db, project["id"], prop["id"], "sprint_item", si_id, label="Dup-safe promotion",
+    )
+    evidence = await db_module.get_proposal_evidence(db, project["id"], prop["id"])
+    assert evidence["link_count"] == 1
+    assert len(evidence["sprint_items"]) == 1
 
 
 @pytest.mark.asyncio

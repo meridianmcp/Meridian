@@ -1314,6 +1314,32 @@ async def _handle_mcp_request(
                             req_id, -32002, _tunnel_mod.CROSS_INSTANCE_MISS_MESSAGE,
                         )
                     if tunnel_result is not None:
+                        # a8c0f3b7 -- durable, structural prospecting receipt for
+                        # a TUNNEL-FORWARDED code-intel call (search_graph,
+                        # find_symbol, ...). This is THE single chokepoint every
+                        # tool call over this MCP connection passes through,
+                        # tunneled or native -- a bare Read/grep/git-show/
+                        # Get-Content bypass, or a sub-agent that never routes a
+                        # code-intel call through this connection, simply never
+                        # reaches this line, so no receipt is ever fabricated for
+                        # that work. Best-effort: never let a logging failure
+                        # break an already-successful tool call. See
+                        # meridian/code_intel_receipt.py.
+                        try:
+                            from .. import code_intel_receipt as _cir  # noqa: PLC0415
+                            if _cir.is_code_intel_receipt_tool(name):
+                                _receipt_pid = _cir.resolve_receipt_project_id(args)
+                                if _receipt_pid:
+                                    await _cir.record_prospect_receipt(
+                                        db,
+                                        tenant_id=tenant.get("id") if tenant else None,
+                                        project_id=_receipt_pid,
+                                        session_id=args.get("session_id"),
+                                        tool_name=name,
+                                        query=_cir.extract_query_hint(args),
+                                    )
+                        except Exception:  # noqa: BLE001
+                            pass
                         # Pass the tunneled server's result through verbatim — it
                         # already carries the MCP `content` envelope.
                         return _server._jsonrpc_ok(req_id, tunnel_result)
@@ -1550,6 +1576,289 @@ async def _sprint_item_file_claim_conflicts(
             "sprint_item_id": item_id,
         })
     return conflicts
+
+
+# ---------------------------------------------------------------------------
+# 18c488b6 — symbol-scoped resource-lock gate for claim_sprint_item
+#
+# _sprint_item_file_claim_conflicts (above) only ever compared touches_files
+# against file_locks — a whole-file-only view that silently discarded any
+# finer-grained symbol: declaration a sprint item's touches_resources might
+# carry, and never actually ACQUIRED anything (informational only, for
+# touches_files; the caller was expected to separately call claim_file).
+# Two disjoint symbols in the same file could never be scheduled reliably
+# (both got treated as one file-level unit) and overlapping symbol claims
+# were never hard-blocked at claim time.
+#
+# This gate closes that: for every touches_resources entry the item declares,
+# it ACQUIRES (not just checks) the appropriate lock —
+#   file:<path>            -> whole-file lock via claim_file
+#   symbol:<path>::<name>  -> a real symbol-range claim via claim_symbol, IF
+#                              the caller supplied that file's source in
+#                              resource_contents (the server has no direct
+#                              filesystem access to the target repo — see
+#                              handoff.build_declared_symbol_targets's same
+#                              tunnel-free boundary note); otherwise it falls
+#                              back to a whole-file lock with an EXPLICIT,
+#                              machine-readable fallback_reason (never a
+#                              silent downgrade).
+# Acquisitions this call newly makes are tracked so a later conflict (or a
+# later failure of the actual status transition) can roll back exactly what
+# THIS call took, leaving any pre-existing claim from earlier work untouched.
+# ---------------------------------------------------------------------------
+
+async def _session_holds_file_lock(db: Any, file_path: str, session_id: str) -> bool:
+    """True if ``session_id`` already holds the live whole-file lock on
+    ``file_path`` (read-only; used to distinguish a fresh acquisition from an
+    idempotent refresh for rollback bookkeeping)."""
+    claims = await db_module.get_file_claims(db, file_path)
+    lock = claims.get("file_lock")
+    return bool(lock and lock.get("session_id") == session_id)
+
+
+async def _session_holds_symbol_claim(
+    db: Any, file_path: str, symbol_name: str, session_id: str
+) -> bool:
+    """True if ``session_id`` already holds a live claim on ``symbol_name`` in
+    ``file_path`` (read-only; same rollback-bookkeeping purpose as
+    :func:`_session_holds_file_lock`)."""
+    claims = await db_module.get_symbol_claims(db, file_path)
+    return any(
+        c.get("symbol_name") == symbol_name and c.get("session_id") == session_id
+        for c in claims
+    )
+
+
+def _resource_content_lookup(
+    resource_contents: "dict[str, Any] | None", file_path: str
+) -> str | None:
+    """Best-effort lookup of caller-supplied source for ``file_path`` in the
+    optional ``resource_contents`` map, tolerant of the same backslash/``./``
+    path-separator variance :func:`_parse_touches_files` normalizes away."""
+    if not resource_contents or not isinstance(resource_contents, dict):
+        return None
+    if file_path in resource_contents:
+        val = resource_contents[file_path]
+        return val if isinstance(val, str) and val else None
+    normalized = file_path.strip().replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    for key, val in resource_contents.items():
+        k = str(key or "").strip().replace("\\", "/")
+        if k.startswith("./"):
+            k = k[2:]
+        if k == normalized and isinstance(val, str) and val:
+            return val
+    return None
+
+
+async def _sprint_item_resource_claim_gate(
+    db: Any,
+    project_id: str,
+    item_id: str,
+    session_id: str | None,
+    *,
+    resource_contents: "dict[str, Any] | None" = None,
+) -> dict[str, Any]:
+    """18c488b6 — transactional claim-time symbol/file resource-lock gate.
+
+    Parses the item's ``touches_resources`` and ACQUIRES the appropriate lock
+    (claim_file / claim_symbol — the same machinery ``claim_file``/
+    ``claim_symbol`` already use for AST/tree-sitter symbol-range resolution
+    and overlap detection) for every ``file:`` / ``symbol:`` entry, under
+    ``session_id``. All-or-nothing for this call: the first hard conflict with
+    ANOTHER live session rolls back every lock THIS call newly acquired (not
+    ones already held from earlier work) and returns ``ok=False`` with
+    structured ``conflicts`` + ``lock_scope`` — the caller (claim_sprint_item)
+    must not transition the item's status when this returns ``ok=False``.
+
+    Fail-open only for the cases that are genuinely "nothing to enforce":
+    no ``session_id`` (no identity to acquire under — every pre-18c488b6
+    caller that omits it, direct ``db_module.claim_sprint_item()`` callers
+    included, sees zero behavior change), item not found, or no declared
+    ``touches_resources``. A REAL conflict is always a hard ``ok=False``, never
+    silently swallowed.
+
+    Returns ``{"ok": True, "lock_scope": [...]}`` on success (including the
+    no-op cases above), or ``{"ok": False, "error": "RESOURCE_LOCKED",
+    "lock_scope": [...], "conflicts": [...], "message": ...}`` on conflict.
+    """
+    if not session_id:
+        return {"ok": True, "lock_scope": [], "skipped_reason": "no_session_id"}
+
+    item = await db_module.get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return {"ok": True, "lock_scope": []}
+
+    declared = db_module.parse_touches_resources(item.get("touches_resources"))
+    if not declared:
+        return {"ok": True, "lock_scope": []}
+
+    lock_scope: list[dict[str, Any]] = []
+    acquired_this_call: list[dict[str, str]] = []
+
+    async def _rollback() -> None:
+        for entry in reversed(acquired_this_call):
+            if entry["kind"] == "file":
+                await db_module.release_file(db, entry["file_path"], session_id)
+            else:
+                await db_module.release_symbol(
+                    db, session_id, entry["file_path"], entry["symbol"]
+                )
+
+    async def _blocked(entry: dict[str, Any], message: str) -> dict[str, Any]:
+        lock_scope.append(entry)
+        await _rollback()
+        return {
+            "ok": False,
+            "error": "RESOURCE_LOCKED",
+            "message": message,
+            "lock_scope": lock_scope,
+            "conflicts": [entry],
+        }
+
+    for resource in declared:
+        if resource.startswith("file:"):
+            file_path = resource[len("file:"):]
+            pre_held = await _session_holds_file_lock(db, file_path, session_id)
+            result = await db_module.claim_file(db, file_path, session_id, mode="write")
+            if result.get("claimed"):
+                lock_scope.append({
+                    "resource": resource, "scope": "file", "file_path": file_path,
+                    "acquired": True, "newly_acquired": not pre_held,
+                })
+                if not pre_held:
+                    acquired_this_call.append({"kind": "file", "file_path": file_path})
+                continue
+            return await _blocked(
+                {
+                    "resource": resource, "scope": "file", "file_path": file_path,
+                    "acquired": False,
+                    "conflict": {
+                        "reason": result.get("reason") or "locked",
+                        "holder_session_id": result.get("holder_session_id"),
+                    },
+                },
+                f"Cannot claim sprint item: resource {resource!r} is locked by "
+                f"another live session ({result.get('holder_session_id')}).",
+            )
+
+        if resource.startswith("symbol:"):
+            value = resource[len("symbol:"):]
+            file_path, sep, symbol_name = value.partition("::")
+            if not sep or not symbol_name or not file_path:
+                # Bare symbol id with no resolvable file scope (e.g. the
+                # handoff-side "symbol:<name>" shorthand) — nothing to lock.
+                lock_scope.append({
+                    "resource": resource, "scope": "none", "acquired": False,
+                    "fallback_reason": "no_file_scope",
+                })
+                continue
+
+            content = _resource_content_lookup(resource_contents, file_path)
+            fallback_reason: str | None = None
+            if content:
+                pre_held = await _session_holds_symbol_claim(
+                    db, file_path, symbol_name, session_id
+                )
+                symbol_result = await db_module.claim_symbol(
+                    db, session_id, file_path, symbol_name, content
+                )
+                if symbol_result.get("claimed"):
+                    lock_scope.append({
+                        "resource": resource, "scope": "symbol", "file_path": file_path,
+                        "symbol": symbol_name, "acquired": True,
+                        "newly_acquired": not pre_held,
+                        "line_start": symbol_result.get("line_start"),
+                        "line_end": symbol_result.get("line_end"),
+                    })
+                    if not pre_held:
+                        acquired_this_call.append({
+                            "kind": "symbol", "file_path": file_path, "symbol": symbol_name,
+                        })
+                    continue
+                if symbol_result.get("reason") in ("symbol_conflict", "file_locked"):
+                    _holder = symbol_result.get("holder_session_id")
+                    if not _holder:
+                        _conf = symbol_result.get("conflicts") or [{}]
+                        _holder = _conf[0].get("holder_session_id")
+                    return await _blocked(
+                        {
+                            "resource": resource, "scope": "symbol", "file_path": file_path,
+                            "symbol": symbol_name, "acquired": False,
+                            "conflict": {
+                                "reason": symbol_result.get("reason"),
+                                "holder_session_id": _holder,
+                                "details": symbol_result,
+                            },
+                        },
+                        f"Cannot claim sprint item: symbol {resource!r} is locked "
+                        "by another live session.",
+                    )
+                # unparseable / symbol_not_found — explicit fallback, recorded below.
+                fallback_reason = symbol_result.get("reason") or "unparseable"
+            else:
+                fallback_reason = "no_source_supplied"
+
+            pre_held_file = await _session_holds_file_lock(db, file_path, session_id)
+            file_result = await db_module.claim_file(db, file_path, session_id, mode="write")
+            if file_result.get("claimed"):
+                lock_scope.append({
+                    "resource": resource, "scope": "file", "file_path": file_path,
+                    "symbol": symbol_name, "acquired": True,
+                    "newly_acquired": not pre_held_file,
+                    "fallback_reason": fallback_reason,
+                })
+                if not pre_held_file:
+                    acquired_this_call.append({"kind": "file", "file_path": file_path})
+                continue
+            return await _blocked(
+                {
+                    "resource": resource, "scope": "file", "file_path": file_path,
+                    "symbol": symbol_name, "acquired": False,
+                    "fallback_reason": fallback_reason,
+                    "conflict": {
+                        "reason": file_result.get("reason") or "locked",
+                        "holder_session_id": file_result.get("holder_session_id"),
+                    },
+                },
+                f"Cannot claim sprint item: fallback whole-file lock for {resource!r} "
+                f"is held by another live session ({file_result.get('holder_session_id')}).",
+            )
+
+        # Other resource types (db:, route:, mcp_tool:, ...) are not
+        # code-locking concerns — left untouched by this gate.
+
+    return {"ok": True, "lock_scope": lock_scope}
+
+
+async def _rollback_sprint_item_resource_locks(
+    db: Any, session_id: str | None, lock_gate_result: "dict[str, Any] | None"
+) -> None:
+    """Release every resource this call's :func:`_sprint_item_resource_claim_gate`
+    NEWLY acquired, used when the gate itself succeeded but the sprint item's
+    status transition subsequently failed/raced/was blocked by another gate
+    (DEFERRED/SUPERSEDED/WAVE_GATE_PENDING/UNPROSPECTED, or another session won
+    the claim race) — the resource locks must not outlive a claim that never
+    actually landed. Only entries this specific call newly acquired are
+    touched (tracked via each lock_scope entry's own claim call, not a bulk
+    session release), so a pre-existing claim from earlier work is untouched.
+    """
+    if not session_id or not lock_gate_result:
+        return
+    for entry in lock_gate_result.get("lock_scope") or []:
+        if not entry.get("acquired") or not entry.get("newly_acquired"):
+            continue
+        scope = entry.get("scope")
+        try:
+            if scope == "file":
+                await db_module.release_file(db, entry["file_path"], session_id)
+            elif scope == "symbol":
+                await db_module.release_symbol(
+                    db, session_id, entry["file_path"], entry["symbol"]
+                )
+        except Exception:  # noqa: BLE001 — best-effort cleanup, never raise from here
+            pass
 
 
 async def _board_change_for_session(
@@ -2467,6 +2776,20 @@ async def _handle_task_tools(
             args.get("mode"),
             session_id,
         )
+        # b8f89491 — resolve + surface the effective sprint-version scope so a
+        # caller never has to infer it: an explicit version argument always
+        # wins; otherwise fall back to the calling session's own stored
+        # sprint_version. Mirrors generate_handoff's own resolution exactly
+        # (same helper) so this reported scope can never disagree with what
+        # generate_handoff actually used to build `content`.
+        _requested_version = args.get("version")
+        if isinstance(_requested_version, str) and not _requested_version.strip():
+            _requested_version = None
+        _effective_version = _requested_version
+        if _effective_version is None and session_id:
+            _effective_version = await handoff_module_local._resolve_session_sprint_version(
+                db, session_id
+            )
         # Fetch recent commits for reconcile annotations (non-fatal)
         _gh_project = await db_module.get_project(db, args["project_id"])
         _gh_commits = await _fetch_recent_commits(_gh_project or {}, tenant)
@@ -2499,6 +2822,20 @@ async def _handle_task_tools(
         if isinstance(_raw_fii, list):
             _force_include_ids = [str(x) for x in _raw_fii if x]
         _handoff_degraded = False
+        # 8a883f60 — opt-in, fail-closed strict evidence for this handoff's
+        # best-effort steps (mirrors complete_sprint_item's strict_evidence
+        # shape exactly — same name, same off-by-default contract). The
+        # out-param dict below is ALWAYS passed so evidence_status is emitted
+        # on every call regardless of strict_evidence — a pure ADDITION to the
+        # response, never a change to `content` itself. See
+        # handoff.generate_handoff's own docstring for the full contract.
+        _strict_evidence = bool(args.get("strict_evidence"))
+        # eb8b6894 — separate opt-in gate: whether the claimable batch's
+        # UNPROSPECTED exclusion requires durable pointers to have actually
+        # RESOLVED, not merely be present. Off by default; see
+        # handoff.generate_handoff's own strict_pointer_evidence docstring.
+        _strict_pointer_evidence = bool(args.get("strict_pointer_evidence"))
+        _evidence_status: dict[str, Any] = {}
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -2512,6 +2849,10 @@ async def _handle_task_tools(
                     identity=_resolve_caller_identity(tenant),
                     force_include_ids=_force_include_ids,
                     skip_ai_summary=_skip_ai,
+                    version=_requested_version,
+                    strict_evidence=_strict_evidence,
+                    evidence_status=_evidence_status,
+                    strict_pointer_evidence=_strict_pointer_evidence,
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -2519,6 +2860,27 @@ async def _handle_task_tools(
                 # backstop for DB-heavy projects.
                 timeout=180.0,
             )
+        except handoff_module_local.HandoffEvidenceRequired as exc:
+            # 8a883f60 — strict_evidence=True and at least one best-effort
+            # capability was failed/degraded: fail CLOSED. Nothing was
+            # rendered/written/persisted for this call (see
+            # generate_handoff's docstring) — surface a structured refusal
+            # instead of a plausible-looking-but-incomplete goal, mirroring
+            # complete_sprint_item's STRICT_EVIDENCE_BLOCKED response shape.
+            return {
+                "error": "HANDOFF_EVIDENCE_BLOCKED",
+                "project_id": args["project_id"],
+                "evidence_status": exc.evidence_status,
+                "evidence_errors": exc.errors,
+                "message": (
+                    "Refusing to generate handoff: strict evidence verification "
+                    "failed (" + ", ".join(e["code"] for e in exc.errors) + "). "
+                    "This handoff was NOT rendered or persisted. Resolve the "
+                    "underlying capability failure(s) and retry, or call "
+                    "generate_handoff without strict_evidence=true to get "
+                    "today's graceful-degrade behavior."
+                ),
+            }
         except asyncio.TimeoutError:
             path, content = await handoff_module_local._generate_handoff_l0(
                 db, args["project_id"], data_dir
@@ -2567,16 +2929,16 @@ async def _handle_task_tools(
                 )
         except Exception:  # noqa: BLE001
             _goal_warn = None
-        # 5234877f — wrap content in exactly ONE plain 4-backtick code fence so it
-        # renders as a single copy-pasteable block in any MCP client regardless of
-        # how the caller's markdown renderer handles surrounding context.  Four
-        # backticks (not three) avoids collision with nested ``` fences that appear
-        # inside the handoff body (e.g. the start_session code block in the Jinja2
-        # template).  This replaces the 642b1818 strip approach, which destroyed
-        # formatting and was still unreliable because callers kept adding their own
-        # blockquote/header wrappers around the plain text — the fence makes the
-        # block unambiguously self-delimiting at the wire level.
-        _plain_content = f"````\n{content}\n````"
+        # a5e8aa74 — return content EXACTLY as generate_handoff rendered it, via
+        # the one shared helper every transport calls (meridian/mcp/stdio_handler.py
+        # and meridian/routes/handoff.py use the same function). This replaces the
+        # 5234877f four-backtick fence: that wrapping meant the field was never the
+        # raw, copy-pasteable /goal text the trust protocol (see AGENTS.md's
+        # handoff-delivery section) depends on — a receiving session had to strip
+        # the fence itself before the block was usable, and the two independent
+        # transport-side wrap sites could drift out of sync with each other. See
+        # format_handoff_mcp_content's docstring for the full contract.
+        _plain_content = handoff_module_local.format_handoff_mcp_content(content)
         # 5abf3e12 — surface the stored per-session goal-compliance metric
         # (generate_handoff computed & persisted it) so the caller / dashboard
         # sees whether this session's /goal item list was fully completed.
@@ -2598,6 +2960,23 @@ async def _handle_task_tools(
         # field rather than breaking the mandatory handoff.
         _capability_contract = await handoff_module_local.build_effective_capability_contract(
             db, args["project_id"], board_stale=_handoff_degraded,
+            version=_effective_version,
+        )
+        # 6cdc5df3 — machine-readable proposal-to-evidence linkage, emitted on
+        # every generate_handoff mode alongside the capability contract above.
+        # Fully guarded — a failure degrades to no field rather than breaking
+        # the mandatory handoff.
+        _proposal_evidence = await handoff_module_local.build_proposal_evidence_for_handoff(
+            db, args["project_id"],
+        )
+        # d09c29fe — machine-readable DOCX-integrity gate, emitted on every
+        # generate_handoff mode alongside the two fields above. Tied to the
+        # proposal evidence just built (6cdc5df3) so a proposal-linked .docx
+        # artifact is gated too, not just an item's own pointer. Fully
+        # guarded — a failure degrades to no field rather than breaking the
+        # mandatory handoff.
+        _docx_integrity = await handoff_module_local.build_docx_integrity_gate_for_handoff(
+            db, args["project_id"], proposal_evidence=_proposal_evidence,
         )
         return {
             "file_path": path,
@@ -2613,6 +2992,40 @@ async def _handle_task_tools(
             "goal_length_warning": _goal_warn,
             "goal_compliance": _goal_compliance,
             "capability_contract": _capability_contract,
+            # 8a883f60 — explicit per-capability outcome (verified/skipped/
+            # failed/degraded, with exact reason + fallback used) for every
+            # best-effort step this call ran: code-pointer enrichment,
+            # resolved-pointer annotation, freshness re-query, wave-gate
+            # exclusion, graph-search availability. Pure ADDITION — emitted
+            # on every call regardless of strict_evidence; {} only when the
+            # 180s timeout fired before generate_handoff reached its own
+            # finalize step (see the l0_fallback/degraded handling above).
+            "handoff_evidence_status": _evidence_status,
+            # 8a883f60 — echoes the strict_evidence flag this call actually
+            # used, so a caller never has to re-derive it from args.
+            "strict_evidence": _strict_evidence,
+            # eb8b6894 — echoes the strict_pointer_evidence flag this call
+            # actually used (separate from strict_evidence above — see
+            # handoff.generate_handoff's docstring).
+            "strict_pointer_evidence": _strict_pointer_evidence,
+            # 6cdc5df3 — one entry per proposal id with linked evidence in this
+            # project (see meridian.db.proposal_links.get_proposal_evidence).
+            "proposal_evidence": _proposal_evidence,
+            # d09c29fe — DOCX audit status/findings/provenance for items/
+            # artifacts this handoff covers, plus the executable/executable_reasons
+            # readiness signal (see meridian.docx_integrity_gate).
+            "docx_integrity": _docx_integrity,
+            # b8f89491 — machine-readable scope: which sprint-version bucket
+            # this handoff actually resolved to, and why (explicit argument vs.
+            # session-derived vs. unscoped). effective_version is None when the
+            # call is genuinely unscoped (no version arg, no session, or a
+            # session with no stored sprint_version) — same meaning as before
+            # this field existed, just made explicit rather than silent.
+            "scope": {
+                "requested_version": _requested_version,
+                "effective_version": _effective_version,
+                "session_id": session_id,
+            },
         }
     if name == "load_handoff":
         # 5efe254b — trusted retrieval of the latest stored handoff for a project
@@ -3322,7 +3735,7 @@ async def _handle_sprint_tools(
     """Dispatch group: add_sprint_note, get_sprint_notes, add_sprint_item,
     fan_out_sprint_items, update_sprint_item, set_sprint, get_sprint_progress,
     get_sprint_items, get_parallelizable_groups, assign_sprint_waves,
-    analyze_sprint, claim_sprint_item, add_subtask, split_sprint_item,
+    analyze_sprint, claim_sprint_item, claim_parallel_batch, add_subtask, split_sprint_item,
     merge_sprint_items, complete_sprint_item, add_sprint_item_pointer,
     get_sprint_item_pointers, resolve_sprint_item_pointers,
     delete_sprint_item_pointer, complete_wave_gate, configure_wave_gate,
@@ -3348,6 +3761,7 @@ async def _handle_sprint_tools(
         handle_assign_sprint_waves,
         handle_analyze_sprint,
         handle_claim_sprint_item,
+        handle_claim_parallel_batch,
         handle_add_subtask,
         handle_split_sprint_item,
         handle_merge_sprint_items,
@@ -3376,6 +3790,7 @@ async def _handle_sprint_tools(
         "assign_sprint_waves": handle_assign_sprint_waves,
         "analyze_sprint": handle_analyze_sprint,
         "claim_sprint_item": handle_claim_sprint_item,
+        "claim_parallel_batch": handle_claim_parallel_batch,
         "add_subtask": handle_add_subtask,
         "split_sprint_item": handle_split_sprint_item,
         "merge_sprint_items": handle_merge_sprint_items,
@@ -4605,10 +5020,41 @@ async def _handle_tunnel_tools(
                 "hosted": True,
             }
 
+        # 525d86bb — persist a durable lifecycle record BEFORE dispatch, then
+        # consume it with the REAL result of the ONE synchronous wait below —
+        # never from any other code path. See db.verification_runs for the
+        # full contract (no detached monitor can complete a run; ambiguous
+        # evidence — e.g. status='ok' with no real exit_code — is rejected).
+        run_record = await db_module.create_verification_run(
+            db,
+            project_id,
+            test_cmd,
+            cwd=repo_path or None,
+            worktree=(exec_cfg.get("worktree") or "").strip() or None,
+            actor=tenant_id,
+        )
+
         result = await _tunnel_mod.send_run_cmd_control(
             tenant_id,
             cmd=test_cmd,
             cwd=repo_path or None,
+        )
+
+        # Consume the persisted record with the real, synchronous outcome —
+        # this call is the ONLY place a verification run is ever marked
+        # complete, and it only ever runs immediately after awaiting the
+        # genuine send_run_cmd_control result above (criterion: no detached
+        # monitor can report completion).
+        completed_run = await db_module.complete_verification_run(
+            db,
+            run_record["id"],
+            status=result.get("status") or "error",
+            exit_code=result.get("exit_code"),
+            passed=result.get("passed"),
+            failed=result.get("failed"),
+            stdout_tail=result.get("stdout_tail") or "",
+            stderr_tail=result.get("stderr_tail") or "",
+            message=result.get("message"),
         )
 
         # Enrich the result with project context so the caller has everything.
@@ -4616,6 +5062,7 @@ async def _handle_tunnel_tools(
         result["test_cmd"] = test_cmd
         if repo_path:
             result["cwd"] = repo_path
+        result["verification_run_id"] = completed_run["id"]
         return result
 
     return _MISS
@@ -4937,7 +5384,7 @@ async def _handle_code_index_tools(
         kind = str(kind).strip() if kind else None
         stale_graph = bool(args.get("stale_graph", False))
         from .. import prospect as _prospect  # noqa: PLC0415
-        return await _prospect.prospect_symbol_impl(
+        result = await _prospect.prospect_symbol_impl(
             symbol=symbol,
             project_id=project_id,
             root_dir=root_dir,
@@ -4947,6 +5394,28 @@ async def _handle_code_index_tools(
             tenant=tenant,
             data_dir=data_dir,
         )
+        # a8c0f3b7 -- durable, structural prospecting receipt. prospect_symbol
+        # is the promoted single entry point for code-intel prospecting
+        # (agent_defaults.py v12) and, unlike the tools it wraps, is ALWAYS
+        # dispatched natively by THIS server -- so writing the receipt here
+        # can never be spoofed by a caller's self-report. Best-effort: a
+        # receipt-write failure must never break the prospect call that
+        # already succeeded above. See meridian/code_intel_receipt.py.
+        try:
+            from .. import code_intel_receipt as _cir  # noqa: PLC0415
+            _receipt_pid = _cir.resolve_receipt_project_id(args)
+            if _receipt_pid:
+                await _cir.record_prospect_receipt(
+                    db,
+                    tenant_id=(tenant or {}).get("id"),
+                    project_id=_receipt_pid,
+                    session_id=args.get("session_id"),
+                    tool_name="prospect_symbol",
+                    query=symbol,
+                )
+        except Exception:  # noqa: BLE001 -- receipt logging must never break the call
+            pass
+        return result
     if name == "search_code_semantic":
         from .. import code_index as _code_index  # noqa: PLC0415
         from .. import hardening as _hardening  # noqa: PLC0415

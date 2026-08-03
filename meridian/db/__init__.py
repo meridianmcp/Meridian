@@ -1119,6 +1119,14 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_handoff_tokens_body_hash(db)
     await _migrate_project_capabilities(db)
     await _migrate_capability_profiles(db)
+    await _migrate_sprint_item_tool_requirements(db)
+    await _migrate_sprint_item_artifact_declaration(db)
+    await _migrate_docx_merge_manifests(db)
+    await _migrate_proposal_evidence_links(db)
+    await _migrate_wave_base_manifests(db)
+    await _migrate_sprint_batch_claims(db)
+    await _migrate_verification_runs(db)
+    await _migrate_sprint_item_require_strict_evidence(db)
     return db
 
 
@@ -1430,6 +1438,7 @@ _MERGE_PROJECT_TABLES: tuple[str, ...] = (
     "session_messages",
     "session_graph_snapshots",
     "sprint_item_pointers",
+    "proposal_evidence_links",
 )
 
 
@@ -1545,6 +1554,9 @@ async def get_project_settings(
         "hitl_auto_answer": int(data.get("hitl_auto_answer") or 0),
         # 0716c9e0 — parallel safety toggles; default ON (1).
         "auto_worktrees": int(data.get("auto_worktrees") if data.get("auto_worktrees") is not None else 1),
+        # e7548587 — tri-state: 0=off, 1=advisory (default, warn only via
+        # HITL), 2=strict (blocks completion on a genuine active, unmerged
+        # worktree unless explicitly overridden).
         "require_merge_approval": int(data.get("require_merge_approval") if data.get("require_merge_approval") is not None else 1),
         # Sprint-2/3 — codebase-memory-mcp toggle.
         "code_intel_enabled": int(data.get("code_intel_enabled") or 0),
@@ -1588,8 +1600,12 @@ async def update_project_settings(
         updates.append("auto_worktrees = ?")
         params.append(1 if auto_worktrees else 0)
     if require_merge_approval is not None:
+        # e7548587 — tri-state: 0=off, 1=advisory (warn only), 2=strict
+        # (blocks). Clamp like hitl_auto_answer's own tri-state, not a bool
+        # coercion — a bare truthy coercion here would silently collapse a
+        # caller's requested strict (2) down to advisory (1).
         updates.append("require_merge_approval = ?")
-        params.append(1 if require_merge_approval else 0)
+        params.append(max(0, min(2, int(require_merge_approval))))
     if code_intel_enabled is not None:
         updates.append("code_intel_enabled = ?")
         params.append(1 if code_intel_enabled else 0)
@@ -7011,13 +7027,22 @@ async def register_worktree(
     branch: str,
     path: str,
     item_id: str | None = None,
+    pid: int | None = None,
 ) -> dict[str, Any]:
-    """Register a new active git worktree. Returns the inserted row."""
+    """Register a new active git worktree. Returns the inserted row.
+
+    ``pid`` (eb2e44f8) — the OS PID of the process that created this
+    worktree, when the caller knows it. Optional and best-effort: when set,
+    ``worktree_cleanup.validate_worktree_cleanup_target`` uses it to refuse
+    real disk removal while that process is still alive. Omitting it simply
+    skips that liveness check (same fail-open-on-absent-data posture as
+    every other optional worktree field here).
+    """
     wid = _new_id()
     await db.execute(
-        "INSERT INTO active_worktrees (id, session_id, project_id, item_id, branch, path) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (wid, session_id, project_id, item_id, branch, path),
+        "INSERT INTO active_worktrees (id, session_id, project_id, item_id, branch, path, pid) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (wid, session_id, project_id, item_id, branch, path, pid),
     )
     await db.commit()
     async with db.execute(
@@ -10615,6 +10640,7 @@ from .sprint_items import (  # noqa: F401
     assign_sprint_waves,
     build_github_completion_comment,
     build_sprint_items_xml,
+    claim_parallel_batch,
     claim_sprint_item,
     collapse_sprint_item_clusters,
     complete_sprint_item,
@@ -10791,6 +10817,7 @@ from .locks import (  # noqa: F401
     claim_symbol,
     get_symbol_claims,
     release_symbol_claims_for_session,
+    release_symbol,
     get_symbol_hotspots,
     get_hotspot_suggestions,
     # Public docx-region claim functions
@@ -10805,6 +10832,24 @@ from .locks import (  # noqa: F401
     _increment_file_patch_counter,
     get_structural_degradation_warnings,
     flag_file_refactor,
+)
+
+
+from .docx_merge import (  # noqa: F401
+    # Private helpers (also called directly by tests)
+    _MERGE_OWNER_TTL_MINUTES,
+    _get_manifest_row,
+    _get_draft_row,
+    _migrate_docx_merge_manifests,
+    # fe989980 — wave-scoped merge manifest + serialized canonical merge gate
+    open_merge_manifest,
+    declare_merge_anchors,
+    claim_merge_owner,
+    release_merge_owner,
+    check_merge_stale_or_overlap,
+    record_merge_result,
+    finalize_merge_manifest,
+    get_merge_manifest,
 )
 
 
@@ -10889,4 +10934,62 @@ from .hooks import (  # noqa: F401
     get_custom_hook,
     update_custom_hook,
     delete_custom_hook,
+)
+
+
+# 6cdc5df3 — durable, typed proposal-to-evidence linkage. Imported LAST (after
+# sprint_items / workspace) since link_proposal_evidence validates entity_ids
+# against get_sprint_item's table (sprint_items), project_notes, and
+# decisions_pinned, all defined earlier in this module or in sprint_items.py.
+from .proposal_links import (  # noqa: F401
+    _VALID_PROPOSAL_ENTITY_TYPES,
+    _PROPOSAL_ENTITY_TABLE,
+    _PROPOSAL_ENTITY_BUCKET,
+    _migrate_proposal_evidence_links,
+    link_proposal_evidence,
+    unlink_proposal_evidence,
+    get_proposal_links,
+    get_proposal_evidence,
+    get_proposal_ids_for_project,
+)
+
+
+# eb2e44f8 — immutable wave base manifests for git worktrees (repo identity,
+# base branch/SHA, owning sprint item), checked by
+# meridian.worktree_merge_guard.validate_worktree_merge before a
+# merge/completion is allowed to proceed.
+from .worktree_manifest import (  # noqa: F401
+    _migrate_wave_base_manifests,
+    persist_worktree_manifest,
+    get_worktree_manifest,
+    get_worktree_manifest_history,
+)
+
+
+# 22cad9b8 — immutable batch-claim manifests for atomic parallel sprint-item
+# claims (durable "what batch was decided" record), backing
+# sprint_items.claim_parallel_batch. Mirrors the worktree_manifest import
+# immediately above.
+from .batch_claim import (  # noqa: F401
+    _migrate_sprint_batch_claims,
+    compute_batch_key,
+    persist_batch_claim_manifest,
+    get_batch_claim_manifest,
+    get_batch_claim_manifest_by_id,
+    get_batch_claim_manifest_history,
+    mark_batch_claim_outcome,
+)
+
+
+# 525d86bb — durable synchronous verification-run lifecycle records (start,
+# real exit_code/status, log artifact) for run_verification. Mirrors the
+# batch_claim import immediately above — a single-table, no-state-machine
+# shape.
+from .verification_runs import (  # noqa: F401
+    VERIFICATION_RUN_STATUSES,
+    _migrate_verification_runs,
+    create_verification_run,
+    get_verification_run,
+    list_verification_runs,
+    complete_verification_run,
 )

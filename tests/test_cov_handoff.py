@@ -8,12 +8,19 @@ pure helpers, and the HTTP endpoints (including error paths).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import re
+from pathlib import Path
 
 import pytest
 
+from meridian import capability_contract as cc
 from meridian import db as db_module
+from meridian import executor_contract as ec
 from meridian import handoff as handoff_module
+import meridian.server  # noqa: F401 — load the server before handler to avoid its import cycle
+from meridian.mcp import handler as mcp_handler
 
 
 def _run(coro):
@@ -565,6 +572,273 @@ def test_max_turns_from_settings():
     assert f({"executor_config": {"max_turns": 0}}) == 200       # non-positive → default
     assert f({"executor_config": {"max_turns": "nope"}}) == 200  # bad → default
     assert f({"executor_config": "notadict"}) == 200
+
+
+def test_execution_policy_from_settings():
+    """75ac1c8e — resolves the canonical execution policy from proj_settings +
+    the already-normalized execution_mode, honoring executor_config.max_planning_turns."""
+    f = handoff_module._execution_policy_from_settings
+    default = f(None, "autonomous")
+    assert default["execution_mode"] == "immediate"
+    assert default["required_first_action"] == "claim_sprint_item"
+    assert default["max_planning_turns"] == 1
+    assert default["no_confirmation"] is True
+    assert default["permitted_parallel_wave"] is True
+    assert default["claim_before_edit"] is True
+
+    relaxed = f({"executor_config": {}}, "interactive")
+    assert relaxed["execution_mode"] == "relaxed"
+    assert relaxed["required_first_action"] == "get_sprint_items"
+    assert relaxed["no_confirmation"] is False
+    assert relaxed["permitted_parallel_wave"] is False
+
+    overridden = f({"executor_config": {"max_planning_turns": 7}}, "autonomous")
+    assert overridden["max_planning_turns"] == 7
+
+    # A non-dict executor_config degrades to the mode default, never raises.
+    assert f({"executor_config": "nope"}, "autonomous")["max_planning_turns"] == 1
+
+
+def test_build_execution_policy_clause_renders_attributes_and_escapes():
+    from meridian.handoff import _build_execution_policy_clause
+
+    policy = {
+        "execution_mode": "immediate",
+        "max_planning_turns": 1,
+        "required_first_action": "claim_sprint_item",
+        "no_confirmation": True,
+        "permitted_parallel_wave": True,
+        "claim_before_edit": True,
+        "genuine_blocker_escalation": 'Escalate only for "genuine" blockers.',
+    }
+    clause = _build_execution_policy_clause(policy)
+    assert clause.startswith("\n<execution_policy ")
+    assert 'execution_mode="immediate"' in clause
+    assert 'max_planning_turns="1"' in clause
+    assert 'required_first_action="claim_sprint_item"' in clause
+    assert 'no_confirmation="true"' in clause
+    assert 'permitted_parallel_wave="true"' in clause
+    assert 'claim_before_edit="true"' in clause
+    assert clause.endswith("</execution_policy>")
+    # Falsy/invalid policy degrades to no tag.
+    assert _build_execution_policy_clause(None) == ""
+    assert _build_execution_policy_clause({}) == ""
+
+
+# ---------------------------------------------------------------------------
+# 6cfdabd7 — render the configured test command and parallelism policy in
+# handoffs. set_executor_config's test_cmd used to be silently ignored by
+# /goal rendering: the completion criteria and xdist test_gate_note both
+# hardcoded "pixi run test -n 3" regardless of what a project actually had
+# configured (or pixi.toml's own default, which had already moved to
+# "-n auto"). These tests cover the new settings-reading helpers directly.
+# ---------------------------------------------------------------------------
+
+
+def test_test_cmd_from_settings():
+    """Sibling of _max_turns_from_settings: same read pattern/fail-safe default."""
+    f = handoff_module._test_cmd_from_settings
+    assert f(None) == "pixi run test"
+    assert f({"executor_config": {}}) == "pixi run test"
+    assert f({"executor_config": {"test_cmd": "pixi run test -n auto"}}) == \
+        "pixi run test -n auto"
+    # Whitespace is trimmed.
+    assert f({"executor_config": {"test_cmd": "  pixi run test-pg  "}}) == \
+        "pixi run test-pg"
+    # Blank/non-string/non-dict all degrade to the default, never raise.
+    assert f({"executor_config": {"test_cmd": "   "}}) == "pixi run test"
+    assert f({"executor_config": {"test_cmd": 42}}) == "pixi run test"
+    assert f({"executor_config": "notadict"}) == "pixi run test"
+
+
+def test_branch_from_settings():
+    f = handoff_module._branch_from_settings
+    assert f(None) is None
+    assert f({"executor_config": {}}) is None
+    assert f({"executor_config": {"branch": "dev"}}) == "dev"
+    assert f({"executor_config": {"branch": "  main  "}}) == "main"
+    assert f({"executor_config": {"branch": "   "}}) is None
+    assert f({"executor_config": "notadict"}) is None
+
+
+def test_parallelism_policy_from_test_cmd():
+    f = handoff_module._parallelism_policy_from_test_cmd
+    assert f("pixi run test -n auto") == "-n auto"
+    assert f("pixi run test -n 8") == "-n 8"
+    assert f("pytest tests/ --numprocesses=4") == "-n 4"
+    assert f("pytest tests/ --numprocesses 4") == "-n 4"
+    # No -n/--numprocesses flag -> clearly-labeled fallback, never a guess.
+    assert f("pixi run test") == "not declared in test_cmd (task's own default applies)"
+    assert f("") == "not declared in test_cmd (task's own default applies)"
+
+
+def test_strip_parallelism_flag():
+    f = handoff_module._strip_parallelism_flag
+    # A flag present -> removed cleanly.
+    assert f("pixi run test -n auto") == "pixi run test"
+    assert f("pixi run test -n 8 -q") == "pixi run test -q"
+    # No flag present -> explicit no:xdist appended rather than a silent no-op,
+    # so the rendered triage command always actually disables parallelism.
+    assert f("pixi run test") == "pixi run test -p no:xdist"
+    assert f("") == "pixi run test -p no:xdist"
+
+
+def test_build_test_gate_config_clause_renders_effective_values():
+    from meridian.handoff import _build_test_gate_config_clause
+
+    clause = _build_test_gate_config_clause(
+        test_cmd="pixi run test -n auto", branch="dev", version="v0.3.1",
+    )
+    assert clause.startswith("\n<test_gate_config ")
+    assert 'test_cmd="pixi run test -n auto"' in clause
+    assert 'parallelism="-n auto"' in clause
+    assert 'branch="dev"' in clause
+    assert 'version="v0.3.1"' in clause
+    assert clause.endswith(" />")
+
+    # Unset branch/version render a clearly-labeled fallback, not omission.
+    unset = _build_test_gate_config_clause(test_cmd="pixi run test", branch=None, version=None)
+    assert 'branch="unset"' in unset
+    assert 'version="unscoped"' in unset
+
+
+def test_build_quick_start_goal_renders_effective_test_cmd_not_hardcoded():
+    """The bug this item fixes: a configured test_cmd must flow into BOTH the
+    completion criteria prose and the test_gate_note/test_gate_config -- not
+    a hardcoded 'pixi run test -n 3'."""
+    goal = handoff_module._build_quick_start_goal(
+        # ``version`` (below) scopes the claimable batch to items whose own
+        # ``version`` field matches -- give the item the matching value so it
+        # survives that filter and the completion/test_gate_note text is
+        # actually rendered (see _build_quick_start_goal's version handling).
+        [{"id": "c1", "title": "FEAT: real work", "version": "v0.4.0"}],
+        test_floor=100,
+        test_cmd="pixi run test -n auto",
+        branch="dev",
+        version="v0.4.0",
+    )
+    assert "-n 3" not in goal
+    assert "pixi run test -n auto passes 100+" in goal
+    assert 'test_cmd="pixi run test -n auto"' in goal
+    assert 'parallelism="-n auto"' in goal
+    assert 'branch="dev"' in goal
+    assert 'version="v0.4.0"' in goal
+
+
+def test_build_quick_start_goal_default_test_cmd_has_no_stale_flag():
+    """No executor_config configured -> the fallback is the bare project test
+    task with no independently-hardcoded -n value (that hardcoded value going
+    stale is the exact bug 6cfdabd7 fixes)."""
+    goal = handoff_module._build_quick_start_goal(
+        [{"id": "c1", "title": "FEAT: real work"}],
+    )
+    assert "-n 3" not in goal
+    assert "pixi run test passes" in goal
+    assert 'test_cmd="pixi run test"' in goal
+    assert 'parallelism="not declared in test_cmd' in goal
+    assert 'branch="unset"' in goal
+    assert 'version="unscoped"' in goal
+
+
+@pytest.mark.asyncio
+async def test_handoff_modes_render_same_effective_test_cmd_parallelism_branch_version(
+    db, tmp_path,
+):
+    """6cfdabd7 acceptance: full/delta/starter/goal all render the SAME
+    effective test_cmd/parallelism/branch/version for the SAME underlying
+    executor_config -- proving the four modes can never disagree, because
+    they all resolve settings via the SAME _test_cmd_from_settings/
+    _branch_from_settings helpers into the SAME shared _build_quick_start_goal
+    call."""
+    p = await db_module.create_project(db, "test-cmd-parity")
+    await db_module.set_executor_config(
+        db, p["id"],
+        {"test_cmd": "pixi run test -n auto", "branch": "dev", "test_min": 42},
+    )
+    s = await db_module.register_session(db, p["id"], "sess-parity")
+    await db_module.add_sprint_item(db, p["id"], "v1", "FEAT: parity check", force=True)
+
+    expected_snippets = [
+        'test_cmd="pixi run test -n auto"',
+        'parallelism="-n auto"',
+        'branch="dev"',
+        # No explicit version scope was requested for any mode below, so all
+        # four must agree on the SAME unscoped fallback label too.
+        'version="unscoped"',
+    ]
+
+    for mode in ("full", "delta", "starter", "goal"):
+        _, content, _ = await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+            session_id=s["id"],
+        )
+        for snippet in expected_snippets:
+            assert snippet in content, (
+                f"mode={mode!r} missing {snippet!r} -- handoff modes disagree "
+                "on the effective test_cmd/parallelism/branch"
+            )
+        # No mode should ever surface the old hardcoded, now-stale value.
+        assert "-n 3" not in content, f"mode={mode!r} leaked stale '-n 3' text"
+
+
+def test_build_quick_start_goal_execution_policy_default_immediate():
+    """75ac1c8e — the default executor handoff (no execution_policy passed,
+    execution_mode defaults to 'autonomous') always carries the immediate-mode
+    <execution_policy> tag right after <executor_directive>, on both the
+    empty-board and normal item paths."""
+    from meridian.handoff import _build_quick_start_goal
+
+    items_goal = _build_quick_start_goal([{"id": "abc123"}])
+    empty_goal = _build_quick_start_goal([])
+    for goal in (items_goal, empty_goal):
+        assert "</executor_directive>\n<execution_policy " in goal
+        assert 'execution_mode="immediate"' in goal
+        assert 'required_first_action="claim_sprint_item"' in goal
+        assert 'no_confirmation="true"' in goal
+        assert 'claim_before_edit="true"' in goal
+        tags, _ = _parse_goal_xml(goal)
+        assert "execution_policy" in tags
+
+
+def test_build_quick_start_goal_execution_policy_relaxed_mode_honored():
+    """Explicit execution_mode='interactive' produces the relaxed policy —
+    different required_first_action and no_confirmation=false — while the
+    <executor_directive> body keeps its own existing deferential framing."""
+    from meridian.handoff import _build_quick_start_goal
+
+    goal = _build_quick_start_goal(
+        [{"id": "abc123"}], execution_mode="interactive",
+    )
+    assert 'execution_mode="relaxed"' in goal
+    assert 'required_first_action="get_sprint_items"' in goal
+    assert 'no_confirmation="false"' in goal
+    assert 'permitted_parallel_wave="false"' in goal
+    # claim_before_edit is non-negotiable even in relaxed mode.
+    assert 'claim_before_edit="true"' in goal
+    tags, _ = _parse_goal_xml(goal)
+    assert "you are assisting interactively" in tags["executor_directive"].lower()
+
+
+def test_build_quick_start_goal_execution_policy_explicit_override():
+    """A caller-supplied execution_policy dict (e.g. from
+    _execution_policy_from_settings with a max_planning_turns override) is
+    serialized verbatim rather than recomputed from execution_mode alone."""
+    from meridian.handoff import _build_quick_start_goal
+
+    custom_policy = {
+        "execution_mode": "immediate",
+        "max_planning_turns": 3,
+        "required_first_action": "claim_sprint_item",
+        "no_confirmation": True,
+        "permitted_parallel_wave": True,
+        "claim_before_edit": True,
+        "genuine_blocker_escalation": "custom escalation text",
+    }
+    goal = _build_quick_start_goal(
+        [{"id": "abc123"}], execution_policy=custom_policy,
+    )
+    assert 'max_planning_turns="3"' in goal
+    assert "custom escalation text" in goal
 
 
 def test_note_tags_and_select_strategic_notes():
@@ -2093,3 +2367,959 @@ async def test_generate_handoff_full_renders_session_span(db, tmp_path):
     )
     assert "## Session span" in content
     assert "calendar day" in content
+
+
+# ---------------------------------------------------------------------------
+# 9c6cac08 (665 follow-up) — deterministic paste-ready handoff serialization
+# and scope fidelity.
+#
+# Item 23e20656 built ONE canonical, hashable per-item executor_contract
+# (meridian.executor_contract.build_executor_contract) with pure JSON/XML/
+# text projections (to_json / render_xml_clause / render_text). This section
+# proves — end-to-end, through generate_handoff / the MCP dispatch, not just
+# the isolated module already covered by tests/test_executor_contract.py —
+# that:
+#   1. the canonical serialization format itself is pinned (golden payloads),
+#   2. two calls against IDENTICAL DB state produce materially identical
+#      output (modulo the single-use goal_token/timestamps),
+#   3. the /goal text's <tool_requirements>/<sprint_item_pointers> XML
+#      clauses carry the SAME canonical JSON the sibling capability_contract
+#      field embeds — no independent re-derivation that could drift,
+#   4. a requested scope (a sprint version) is fully accounted for — every
+#      pending item is visible somewhere (claimable batch or a structured
+#      exclusion note), and nothing outside the requested scope leaks in,
+#   5. a non-executable state (an unavailable required tool) is visible
+#      across all three projections, not silently dropped.
+# ---------------------------------------------------------------------------
+
+
+_GOAL_TOKEN_RE = re.compile(r"<goal_token>[^<]*</goal_token>")
+
+
+def _strip_goal_token(content: str) -> str:
+    """Replace the single-use provenance token (dd07ece0) with a fixed
+    placeholder so two otherwise-identical /goal renders can be diffed
+    byte-for-byte. The token is a fresh nonce BY DESIGN (a new one is minted
+    on every call, see test_mint_handoff_token_produces_unique_tokens in
+    test_dd07ece0_handoff_token.py) — the one field explicitly exempted,
+    alongside timestamps/session ids, from the determinism guarantee."""
+    return _GOAL_TOKEN_RE.sub("<goal_token>STRIPPED</goal_token>", content)
+
+
+def _extract_xml_tag_body(content: str, tag: str) -> str:
+    """Pull the body text out of the FIRST ``<tag ...>...</tag>`` occurrence
+    and XML-unescape it — the tool_requirements/sprint_item_pointers clauses
+    embed canonical JSON, which needs unescaping before json.loads (the
+    renderer only escapes &/</>, not quotes, so this round-trips cleanly).
+    Attribute-agnostic: matches both a bare ``<tag>`` and an attributed
+    ``<tag count="1">`` opening (e.g. excluded_unprospected/
+    excluded_wave_gate_pending)."""
+    from xml.sax.saxutils import unescape as _xml_unescape
+
+    open_start = content.index(f"<{tag}")
+    open_end = content.index(">", open_start) + 1
+    end_marker = f"</{tag}>"
+    end = content.index(end_marker, open_end)
+    return _xml_unescape(content[open_end:end])
+
+
+# ---------------------------------------------------------------------------
+# (1) Golden canonical payloads — pins the EXACT serialization format so any
+# accidental drift (indent added, separators changed, key order changed)
+# breaks immediately, not just "still looks like JSON/XML/text".
+# ---------------------------------------------------------------------------
+
+
+def test_golden_executor_contract_json_xml_text_simple():
+    contract = {
+        "schema_version": 1,
+        "item_id": "golden-item",
+        "version": "v1",
+        "mode": "autonomous",
+        "executable": True,
+        "executable_reasons": [],
+        "allowed_tools": [],
+        "forbidden_tools": [],
+        "steps": [{
+            "order": 1, "kind": "finish",
+            "description": "Call complete_sprint_item(item_id, project_id).",
+        }],
+        "gate_after": None,
+        "contract_hash": "deadbeef",
+    }
+    assert ec.to_json(contract) == (
+        '{"allowed_tools":[],"contract_hash":"deadbeef","executable":true,'
+        '"executable_reasons":[],"forbidden_tools":[],"gate_after":null,'
+        '"item_id":"golden-item","mode":"autonomous","schema_version":1,'
+        '"steps":[{"description":"Call complete_sprint_item(item_id, project_id).",'
+        '"kind":"finish","order":1}],"version":"v1"}'
+    )
+    assert ec.render_xml_clause(contract) == (
+        '<executor_contract item_id="golden-item" mode="autonomous" '
+        'executable="true" contract_hash="deadbeef">\n'
+        '  <step order="1" kind="finish">Call complete_sprint_item(item_id, project_id).</step>\n'
+        "</executor_contract>"
+    )
+    assert ec.render_text(contract) == (
+        "Executor contract — item golden-item (version=v1, mode=autonomous)\n"
+        "Steps:\n"
+        "  1. Call complete_sprint_item(item_id, project_id)."
+    )
+
+
+def test_golden_executor_contract_serialize_and_hash_for_non_executable_contract():
+    """A richer, non-executable contract (missing required tool, an active
+    step, populated dependency/completion_checks/scope) — pins
+    serialize_executor_contract's canonical JSON exactly, then proves
+    contract_hash IS sha256 of that exact canonical form (computed in-test
+    via hashlib, not hand-transcribed, so this also guards the hashing
+    contract itself without risking a transcription typo on a 64-char hex
+    string)."""
+    contract = {
+        "schema_version": 1,
+        "item_id": "golden-item-2",
+        "version": "v1",
+        "scope": {
+            "project_id": "proj-1", "requested_version": None, "wave": None,
+            "track": None, "milestone_type": None, "priority": None,
+        },
+        "mode": "autonomous",
+        "executable": False,
+        "executable_reasons": ["missing_required_tools:Serena: find_symbol"],
+        "allowed_tools": [{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+            "call_template": None, "fallback": [], "risk_class": "read",
+            "availability_status": "missing", "fallback_used": None,
+        }],
+        "forbidden_tools": [{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "reason": "required tool unavailable; no fallback declared",
+        }],
+        "scheduling": {"touches_resources": []},
+        "steps": [
+            {
+                "order": 1, "kind": "tool_call",
+                "description": "Use Serena: find_symbol — locate target",
+                "tool": {
+                    "name": "find_symbol", "server_or_namespace": "Serena",
+                    "call_template": None,
+                },
+            },
+            {
+                "order": 2, "kind": "finish",
+                "description": "Call complete_sprint_item(item_id, project_id).",
+            },
+        ],
+        "gate_after": None,
+        "gate_blocking": None,
+        "dependency": {
+            "depends_on": None, "failure_mode": "continue",
+            "blocking_item": None, "satisfied": True,
+        },
+        "output_requirements": {
+            "artifact_kind": None, "planned_output": None, "policy": None,
+            "declared": False,
+        },
+        "pointers": None,
+        "completion_checks": {
+            "required_notes": False, "required_notes_satisfied": True,
+            "require_verification": False, "require_verification_satisfied": True,
+            "verification_on_file": None,
+            "prospecting": {
+                "declares_resources": False, "has_pointer_evidence": False,
+                "prospected": True, "prospect_bypass": False,
+            },
+        },
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "contract_hash": "fixedhash123",
+    }
+    expected_serialized = (
+        '{"allowed_tools":[{"availability_status":"missing","call_template":null,'
+        '"fallback":[],"fallback_used":null,"name":"find_symbol","purpose":"locate target",'
+        '"required_or_preferred":"required","risk_class":"read","server_or_namespace":"Serena"}],'
+        '"completion_checks":{"prospecting":{"declares_resources":false,"has_pointer_evidence":false,'
+        '"prospect_bypass":false,"prospected":true},"require_verification":false,'
+        '"require_verification_satisfied":true,"required_notes":false,"required_notes_satisfied":true,'
+        '"verification_on_file":null},"dependency":{"blocking_item":null,"depends_on":null,'
+        '"failure_mode":"continue","satisfied":true},"executable":false,'
+        '"executable_reasons":["missing_required_tools:Serena: find_symbol"],'
+        '"forbidden_tools":[{"name":"find_symbol","reason":"required tool unavailable; no fallback declared",'
+        '"server_or_namespace":"Serena"}],"gate_after":null,"gate_blocking":null,'
+        '"item_id":"golden-item-2","mode":"autonomous","output_requirements":{"artifact_kind":null,'
+        '"declared":false,"planned_output":null,"policy":null},"pointers":null,'
+        '"scheduling":{"touches_resources":[]},"schema_version":1,"scope":{"milestone_type":null,'
+        '"priority":null,"project_id":"proj-1","requested_version":null,"track":null,"wave":null},'
+        '"steps":[{"description":"Use Serena: find_symbol \\u2014 locate target","kind":"tool_call",'
+        '"order":1,"tool":{"call_template":null,"name":"find_symbol","server_or_namespace":"Serena"}},'
+        '{"description":"Call complete_sprint_item(item_id, project_id).","kind":"finish","order":2}],'
+        '"version":"v1"}'
+    )
+    serialized = ec.serialize_executor_contract(contract)
+    assert serialized == expected_serialized
+    assert "2026-01-01T00:00:00" not in serialized  # generated_at excluded
+    assert "fixedhash123" not in serialized  # contract_hash excluded
+    assert ec.executor_contract_hash(contract) == hashlib.sha256(
+        expected_serialized.encode("utf-8")
+    ).hexdigest()
+
+    # And the XML/text projections of the SAME contract make the
+    # non-executable state visible, not just the JSON.
+    xml = ec.render_xml_clause(contract)
+    text = ec.render_text(contract)
+    assert 'executable="false"' in xml
+    assert "<forbidden_tool>Serena: find_symbol</forbidden_tool>" in xml
+    assert "NOT EXECUTABLE" in text
+    assert "Do NOT rely on (confirmed unavailable):" in text
+
+
+# ---------------------------------------------------------------------------
+# (2) Repeated-run determinism — identical DB state, two calls, diff modulo
+# the goal_token / generated_at fields.
+# ---------------------------------------------------------------------------
+
+
+async def test_generate_handoff_goal_mode_deterministic_modulo_token(db, tmp_path):
+    p = await db_module.create_project(db, "determinism-goal-text")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "Refactor the parser",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+            "fallback": ["grep_search"],
+        }],
+    )
+    _, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+    _, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+    # Tokens themselves must differ (fresh nonce each call)...
+    assert content_a != content_b
+    # ...but everything else must be byte-identical.
+    assert _strip_goal_token(content_a) == _strip_goal_token(content_b)
+
+
+async def test_generate_handoff_capability_contract_deterministic_across_repeated_mcp_calls(
+    db, tmp_path
+):
+    """Same guarantee as test_capability_contract.py's
+    test_contract_serialize_is_byte_stable_for_same_state, but proven through
+    the REAL MCP generate_handoff dispatch (mcp/handler.py), which is what
+    actually ships to a caller — not just a direct build_capability_contract
+    unit call."""
+    p = await db_module.create_project(db, "determinism-mcp-contract")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "Refactor the auth handshake",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+        }],
+    )
+    result_a = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    result_b = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    cc_a, cc_b = result_a["capability_contract"], result_b["capability_contract"]
+    assert cc_a["contract_hash"] == cc_b["contract_hash"]
+    assert cc.serialize_contract(cc_a) == cc.serialize_contract(cc_b)
+    assert _strip_goal_token(result_a["content"]) == _strip_goal_token(result_b["content"])
+
+
+# ---------------------------------------------------------------------------
+# (3) XML/JSON projection parity — the /goal text's typed clauses must carry
+# the SAME canonical JSON as the sibling capability_contract field, for the
+# SAME request (never two independent derivations that could silently
+# drift).
+# ---------------------------------------------------------------------------
+
+
+async def test_tool_requirements_xml_clause_matches_capability_contract_json(db, tmp_path):
+    p = await db_module.create_project(db, "parity-toolreq")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Needs a specific tool",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+            "fallback": ["grep_search"],
+        }],
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    from_xml = json.loads(_extract_xml_tag_body(result["content"], "tool_requirements"))
+    assert from_xml == result["capability_contract"]["item_tool_requirements"]
+    assert any(e["item_id"] == item["id"] for e in from_xml)
+
+
+async def test_sprint_item_pointers_xml_clause_matches_capability_contract_json(db, tmp_path):
+    p = await db_module.create_project(db, "parity-pointers")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Touches a real file",
+        touches_resources=["file:meridian/parser.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "file:meridian/parser.py", "selector": {"type": "range", "start_line": 1, "end_line": 5}}],
+        label="entry point",
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    from_xml = json.loads(_extract_xml_tag_body(result["content"], "sprint_item_pointers"))
+    assert from_xml == result["capability_contract"]["item_sprint_item_pointers"]
+    assert any(e["item_id"] == item["id"] for e in from_xml)
+
+
+async def test_artifact_pointer_findings_xml_clause_matches_capability_contract_json(db, tmp_path):
+    """70c10ca3 (b730 follow-up) — the batch /goal's <artifact_pointer_findings>
+    clause and capability_contract's item_artifact_pointer_findings section
+    must carry IDENTICAL data for the SAME request, proven through the REAL
+    MCP generate_handoff dispatch (mirrors the tool_requirements/
+    sprint_item_pointers parity tests immediately above)."""
+    p = await db_module.create_project(db, "parity-artifact-findings")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    from_xml = json.loads(_extract_xml_tag_body(result["content"], "artifact_pointer_findings"))
+    assert from_xml == result["capability_contract"]["item_artifact_pointer_findings"]
+    assert len(from_xml) == 1
+    finding = from_xml[0]
+    assert finding["item_id"] == item["id"]
+    assert finding["warning_code"] == "insufficient_pointer_bare_docx"
+    assert finding["pointer_status"] == "weak"
+    assert finding["ready"] is False
+    assert finding["affected_pointer_ids"] == [str(stored["id"])]
+    # The readiness verification (3196ba0e) genuinely ran: a relative
+    # "outputs/report.docx" path does not exist from the test cwd.
+    assert finding["target_readiness"][0]["ready"] is False
+    assert finding["target_readiness"][0]["targets"][0]["status"] == "missing"
+
+
+_GOLDEN_ARTIFACT_FINDING_KEYS = {
+    "item_id", "classification", "policy", "warning_code",
+    "required_remediation", "affected_pointer_ids", "ready",
+    "pointer_status", "target_readiness",
+}
+
+
+async def test_golden_artifact_pointer_finding_schema_pinned(db, tmp_path):
+    """f9bacd5b (b730 follow-up, final gate) — pins the EXACT key set of an
+    ``item_artifact_pointer_findings`` entry, mirroring this file's own
+    golden-payload discipline (see the executor_contract golden tests above)
+    so an accidental field rename/removal/addition breaks immediately."""
+    p = await db_module.create_project(db, "golden-artifact-finding-schema")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "warn"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    findings = result["capability_contract"]["item_artifact_pointer_findings"]
+    assert len(findings) == 1
+    assert set(findings[0].keys()) == _GOLDEN_ARTIFACT_FINDING_KEYS
+
+
+async def test_artifact_pointer_findings_absent_when_no_active_warning(db, tmp_path):
+    p = await db_module.create_project(db, "parity-artifact-findings-none")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Renumber figure captions")
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert "<artifact_pointer_findings>" not in result["content"]
+    assert result["capability_contract"]["item_artifact_pointer_findings"] == []
+
+
+async def test_build_capability_contract_item_artifact_pointer_findings_empty_project(db):
+    p = await db_module.create_project(db, "artifact-findings-empty-contract")
+    contract = await cc.build_capability_contract(db, p["id"])
+    assert contract["item_artifact_pointer_findings"] == []
+
+
+async def test_extract_artifact_pointer_findings_self_fetch_matches_pre_annotated(db):
+    """Whether the caller pre-annotates items (via _annotate_resolved_pointers)
+    or passes raw items and lets extract_artifact_pointer_findings self-fetch
+    + resolve + verify readiness, the two paths must produce identical typed
+    output for the same underlying data."""
+    p = await db_module.create_project(db, "artifact-findings-self-fetch")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "warn"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+
+    raw_items = [dict(item)]
+    self_fetched = await cc.extract_artifact_pointer_findings(db, p["id"], raw_items)
+
+    annotated_items = [dict(item)]
+    await handoff_module._annotate_resolved_pointers(db, p["id"], annotated_items)
+    pre_annotated = await cc.extract_artifact_pointer_findings(db, p["id"], annotated_items)
+
+    assert self_fetched == pre_annotated
+    assert self_fetched[0]["item_id"] == item["id"]
+    assert self_fetched[0]["warning_code"] == "insufficient_pointer_bare_docx"
+
+
+async def test_build_capability_contract_accepts_explicit_items_override_for_artifact_findings(db):
+    p = await db_module.create_project(db, "artifact-findings-explicit-items")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "warn"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    items = [dict(item)]
+    contract = await cc.build_capability_contract(db, p["id"], items=items)
+    expected = await cc.extract_artifact_pointer_findings(db, p["id"], items)
+    assert contract["item_artifact_pointer_findings"] == expected
+
+
+async def test_generate_handoff_artifact_pointer_findings_deterministic_across_repeated_mcp_calls(
+    db, tmp_path
+):
+    """Same byte-stability guarantee the sibling capability_contract test
+    above proves, specific to the new item_artifact_pointer_findings section
+    and its <artifact_pointer_findings> XML twin."""
+    p = await db_module.create_project(db, "determinism-artifact-findings")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    result_a = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    result_b = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert (
+        result_a["capability_contract"]["item_artifact_pointer_findings"]
+        == result_b["capability_contract"]["item_artifact_pointer_findings"]
+    )
+    from_xml_a = json.loads(_extract_xml_tag_body(result_a["content"], "artifact_pointer_findings"))
+    from_xml_b = json.loads(_extract_xml_tag_body(result_b["content"], "artifact_pointer_findings"))
+    assert from_xml_a == from_xml_b
+    assert _strip_goal_token(result_a["content"]) == _strip_goal_token(result_b["content"])
+
+
+# ---------------------------------------------------------------------------
+# (4) Requested-vs-emitted scope fidelity — every pending item for the
+# requested version is visible SOMEWHERE (claimable batch or a structured
+# exclusion note); nothing silently vanishes, nothing outside scope leaks in.
+# ---------------------------------------------------------------------------
+
+
+async def test_requested_scope_fully_accounted_for_no_silent_drop(db, tmp_path):
+    p = await db_module.create_project(db, "scope-accounting")
+    item_plain = await db_module.add_sprint_item(db, p["id"], "v1", "Plain claimable item")
+    item_manual = await db_module.add_sprint_item(
+        db, p["id"], "v1", "MANUAL: publish blog post"
+    )
+    item_backburner = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Backburnered work", track="backburner"
+    )
+    item_wave_gated = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Deploy notification service", wave="wave-2"
+    )
+    item_unprospected = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Touches ghost file", touches_resources=["file:ghost.py"]
+    )
+    item_other_version = await db_module.add_sprint_item(
+        db, p["id"], "v2", "Other version item, must not leak into v1 scope"
+    )
+    await db_module.configure_wave_gate(
+        db, p["id"], wave_end="wave-1", actions=[{"type": "wait", "seconds": 1}],
+    )
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal", version="v1",
+    )
+
+    # Every requested-scope item is visible somewhere — claimable or excluded
+    # with a structured, named reason. Nothing silently disappears.
+    for it in (item_plain, item_manual, item_backburner, item_wave_gated, item_unprospected):
+        assert it["id"] in content, f"{it['title']!r} vanished from the requested-scope handoff"
+
+    # Only the genuinely-claimable item is in the claimable batch itself.
+    start = content.rindex("<sprint_items>") + len("<sprint_items>")
+    end = content.index("</sprint_items>", start)
+    assert content[start:end].strip() == f"Complete sprint items: {item_plain['id']}."
+
+    # And the two items with a UNIQUELY-tagged exclusion reason (manual/
+    # backburner share a generic <exclusions> tag, checked above via plain
+    # membership — wave-gate/unprospected each get their own distinct tag)
+    # are excluded for the RIGHT documented reason, not just "somewhere".
+    assert item_wave_gated["id"] in _extract_xml_tag_body(
+        content, "excluded_wave_gate_pending"
+    )
+    assert item_unprospected["id"] in _extract_xml_tag_body(content, "excluded_unprospected")
+    # Neither of those two structurally-excluded items is ALSO claimable.
+    assert item_wave_gated["id"] not in content[start:end]
+    assert item_unprospected["id"] not in content[start:end]
+
+    # No silent broadening: an item from an entirely different version never
+    # appears anywhere in this version-scoped handoff.
+    assert item_other_version["id"] not in content
+
+
+async def test_nonexistent_version_scope_does_not_broaden_to_whole_board(db, tmp_path):
+    """Requesting a version with zero pending items (typo'd/stale reference)
+    must FAIL VISIBLY — an empty, honestly-scoped /goal — never silently
+    broaden to show the rest of the board."""
+    p = await db_module.create_project(db, "nonexistent-version-scope")
+    item_v1 = await db_module.add_sprint_item(db, p["id"], "v1", "Real v1 item")
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+        version="v999-typo-does-not-exist",
+    )
+    assert item_v1["id"] not in content
+    assert "<executor_directive>Verify remaining work is complete.</executor_directive>" in content
+
+    # The MCP surface's own scope metadata makes the requested (empty) scope
+    # explicit rather than silently indistinguishable from "unscoped".
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff",
+        {"project_id": p["id"], "mode": "goal", "version": "v999-typo-does-not-exist"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert result["scope"]["requested_version"] == "v999-typo-does-not-exist"
+    assert result["scope"]["effective_version"] == "v999-typo-does-not-exist"
+
+
+# ---------------------------------------------------------------------------
+# (5) The embedded per-item executor_contract must never drift from a
+# standalone build of the SAME live state — and an unavailable required tool
+# must fail visibly across every projection, not just the JSON.
+# ---------------------------------------------------------------------------
+
+
+async def test_item_executor_contract_embedded_matches_standalone_build(db, tmp_path):
+    p = await db_module.create_project(db, "embed-vs-standalone")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Refactor the payments module",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+        }],
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    embedded = next(
+        e for e in result["capability_contract"]["item_executor_contracts"]
+        if e["item_id"] == item["id"]
+    )
+    fresh = await db_module.get_sprint_item(db, item["id"])
+    standalone = await ec.build_executor_contract(db, p["id"], fresh)
+    # The embedded entry's own generated_at was already stripped at build
+    # time (23e20656); serialize_executor_contract strips both sides' anyway,
+    # so the two must be byte-identical AND hash-identical.
+    assert ec.serialize_executor_contract(embedded) == ec.serialize_executor_contract(standalone)
+    assert embedded["contract_hash"] == standalone["contract_hash"]
+
+
+async def test_unavailable_required_tool_fails_visibly_across_all_three_projections(db):
+    """An item whose required tool is CONFIRMED unavailable (a live inventory
+    shows the plugin disabled, not merely 'unknown') must be visibly
+    non-executable in the JSON, the XML clause, AND the human-text
+    projection — proving the executor_contract really is the single source
+    of truth all three renderings agree on, not just the JSON field a caller
+    might not even look at."""
+    p = await db_module.create_project(db, "unavailable-tool-visibility")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Needs a dead tool",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+        }],
+    )
+    inventory = {
+        "tunnel_reachable": True,
+        "builtin_tools": set(),
+        "plugins": {"Serena": {"enabled": False, "invocable": False, "tools": set()}},
+        "stdio_registry": {},
+    }
+    contract = await ec.build_executor_contract(db, p["id"], item, tool_inventory=inventory)
+    assert contract["executable"] is False
+
+    as_json = ec.to_json(contract)
+    as_xml = ec.render_xml_clause(contract)
+    as_text = ec.render_text(contract)
+
+    assert contract["forbidden_tools"], "forbidden_tools must be non-empty in the built object"
+    assert json.loads(as_json)["forbidden_tools"][0]["name"] == "find_symbol"
+    assert 'executable="false"' in as_xml
+    assert "<forbidden_tool>Serena: find_symbol</forbidden_tool>" in as_xml
+    assert "NOT EXECUTABLE" in as_text
+    assert "Do NOT rely on (confirmed unavailable):" in as_text
+    assert "Serena: find_symbol" in as_text
+
+
+# ---------------------------------------------------------------------------
+# (6) A fresh session's /goal block alone must be sufficient to start — no
+# missing context a human would need to fill in by hand.
+# ---------------------------------------------------------------------------
+
+
+async def test_fresh_session_goal_block_self_sufficient_no_manual_reconstruction(db, tmp_path):
+    p = await db_module.create_project(db, "self-sufficient-goal")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the migration guard",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+            "fallback": ["grep_search"],
+        }],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "file:meridian/db/migrations.py", "selector": {"type": "range", "start_line": 100, "end_line": 120}}],
+        label="guard site",
+    )
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+
+    # Structurally self-contained: a fresh executor needs nothing beyond this
+    # single string to know WHAT to do, WHICH tool to use, WHERE to look, and
+    # WHEN to stop.
+    assert content.strip().startswith("/goal") or content.strip().startswith("/loop /goal")
+    assert "<executor_directive>" in content
+    assert item["id"] in content
+    assert "meridian/db/migrations.py:100-120" in content  # concrete pointer, inlined
+    assert "guard site" in content
+    assert "<goal_token>" in content  # provenance, verifiable on receipt
+    assert "<stop_conditions>" in content
+    assert "<completion_criteria>" in content
+    assert "<execution_policy" in content  # required_first_action etc., not just prose
+    # The typed tool-requirement contract is present verbatim, not just a
+    # hint the executor has to remember from earlier conversation turns.
+    tool_reqs = json.loads(_extract_xml_tag_body(content, "tool_requirements"))
+    assert any(
+        e["item_id"] == item["id"]
+        and any(r.get("name") == "find_symbol" for r in e.get("requirements", []))
+        for e in tool_reqs
+    )
+
+
+# ---------------------------------------------------------------------------
+# 8a883f60 — explicit, machine-readable evidence_status for generate_handoff's
+# best-effort steps (code-pointer enrichment, resolved-pointer annotation,
+# freshness re-query, wave-gate exclusion, graph-search availability), plus
+# the opt-in strict_evidence fail-closed gate. See meridian/handoff.py's
+# _capability_outcome / HandoffEvidenceRequired / _finalize_capability_status
+# for the implementation this section exercises.
+# ---------------------------------------------------------------------------
+
+_ALL_EVIDENCE_CAPS = {
+    "code_pointer_enrichment", "resolved_pointer_annotation",
+    "freshness_requery", "wave_gate_exclusion", "graph_search_availability",
+}
+
+
+@pytest.mark.parametrize("mode", ["full", "delta", "starter", "goal"])
+async def test_generate_handoff_evidence_status_always_reports_all_five_capabilities(
+    db, tmp_path, mode,
+):
+    """Acceptance point 1: every best-effort step gets an EXPLICIT outcome —
+    never a silently-missing key — on every executable mode, not just goal."""
+    p = await db_module.create_project(db, f"evidence-shape-{mode}")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+    evidence_status: dict = {}
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+        evidence_status=evidence_status,
+    )
+    assert set(evidence_status) == _ALL_EVIDENCE_CAPS
+    for cap_id, entry in evidence_status.items():
+        assert entry["status"] in {"verified", "skipped", "failed", "degraded"}, cap_id
+        # Acceptance point 2: exact reason, never blank/generic.
+        assert isinstance(entry["reason"], str) and entry["reason"].strip()
+        assert "fallback" in entry
+
+
+async def test_generate_handoff_evidence_status_starter_marks_pointer_steps_skipped(
+    db, tmp_path,
+):
+    """starter/compact structurally never resolves code pointers at all
+    (pre-existing behavior, unchanged) — that must read as an explicit
+    'skipped', not simply be absent from evidence_status."""
+    p = await db_module.create_project(db, "evidence-starter-skips")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+    evidence_status: dict = {}
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="starter",
+        evidence_status=evidence_status,
+    )
+    for cap_id in (
+        "code_pointer_enrichment", "resolved_pointer_annotation",
+        "graph_search_availability", "freshness_requery",
+    ):
+        assert evidence_status[cap_id]["status"] == "skipped", cap_id
+    # wave-gate exclusion IS a real check in starter mode.
+    assert evidence_status["wave_gate_exclusion"]["status"] == "verified"
+
+
+async def test_generate_handoff_evidence_status_is_pure_addition_content_unchanged(
+    db, tmp_path,
+):
+    """Acceptance point 5: passing evidence_status (default callers never do)
+    must not change `content` at all — pure addition, byte-identical modulo
+    the single-use goal_token (same 9c6cac08-style comparison the rest of
+    this file already uses for mode='goal')."""
+    p = await db_module.create_project(db, "evidence-pure-addition")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    _, content_without, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    _, content_with, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+        evidence_status={},
+    )
+    assert _strip_goal_token(content_without) == _strip_goal_token(content_with)
+
+
+@pytest.mark.parametrize("mode", ["full", "delta", "starter", "goal"])
+async def test_generate_handoff_evidence_status_deterministic_repeated_calls(
+    db, tmp_path, mode,
+):
+    """Acceptance point 4 — same 'call twice, diff' pattern 9c6cac08
+    established (see test_generate_handoff_goal_mode_deterministic_modulo_token
+    above), applied to evidence_status for each of the four modes. Unlike
+    `content` (which carries a fresh goal_token/timestamp each call),
+    evidence_status carries no wall-clock/nonce field at all, so it must be
+    EXACTLY equal across two calls against identical DB state — no stripping
+    needed."""
+    p = await db_module.create_project(db, f"evidence-determinism-{mode}")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+    status_a: dict = {}
+    status_b: dict = {}
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+        evidence_status=status_a,
+    )
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+        evidence_status=status_b,
+    )
+    assert status_a == status_b
+
+
+async def test_generate_handoff_evidence_status_survives_code_pointer_search_error(
+    db, tmp_path,
+):
+    """_annotate_code_pointers NEVER raises for a per-item search failure (it
+    catches it, sets prospect_status='error', and continues) — the outer
+    try/except around that call therefore can't see it on its own. This
+    proves generate_handoff recovers that signal instead of reporting
+    'verified' just because the outer call didn't raise (see
+    _code_pointer_enrichment_error_outcome)."""
+    p = await db_module.create_project(db, "evidence-searcher-blowup")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Fix OAuth redirect bug")
+
+    def _boom_searcher(_query):
+        raise RuntimeError("search index unavailable")
+
+    evidence_status: dict = {}
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
+        graph_searcher=_boom_searcher, evidence_status=evidence_status,
+    )
+    cpe = evidence_status["code_pointer_enrichment"]
+    assert cpe["status"] in {"failed", "degraded"}
+    assert "search index unavailable" in cpe["reason"]
+    assert cpe["fallback"]
+    # And the mandatory handoff still rendered — this is best-effort, not fatal.
+    assert content
+
+
+async def test_generate_handoff_evidence_status_wave_gate_fetch_failure(
+    db, tmp_path, monkeypatch,
+):
+    """A wave-gate config fetch failure (e.g. pre-migration DB) is reported
+    as an explicit failed capability with the real exception text, not
+    silently folded into 'verified' just because generate_handoff itself
+    kept going."""
+    p = await db_module.create_project(db, "evidence-wave-gate-blowup")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("wave_gate_configs table missing")
+
+    monkeypatch.setattr(db_module, "get_wave_gate_configs", _boom)
+
+    evidence_status: dict = {}
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
+        evidence_status=evidence_status,
+    )
+    wge = evidence_status["wave_gate_exclusion"]
+    assert wge["status"] == "failed"
+    assert "wave_gate_configs table missing" in wge["reason"]
+    assert wge["fallback"]
+    assert content  # still a valid mandatory handoff — degrade, don't break
+
+
+# ---------------------------------------------------------------------------
+# strict_evidence — opt-in, fail-closed (acceptance point 3). Mirrors
+# sprint_evidence_guard's strict_evidence/require_strict_evidence contract:
+# never engages unless a caller explicitly asks, and when it does, nothing
+# is rendered/persisted for that call.
+# ---------------------------------------------------------------------------
+
+
+async def test_generate_handoff_strict_evidence_off_by_default_same_as_before(
+    db, tmp_path, monkeypatch,
+):
+    """The exact same broken state (wave-gate fetch raising) that trips
+    strict_evidence below must NOT change behavior at all when
+    strict_evidence is omitted — today's graceful-degrade default."""
+    p = await db_module.create_project(db, "evidence-default-unaffected")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("wave_gate_configs table missing")
+
+    monkeypatch.setattr(db_module, "get_wave_gate_configs", _boom)
+
+    path, content, amended = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="full",
+    )
+    assert content  # rendered normally; no exception, no behavior change
+    assert Path(path).exists()
+
+
+async def test_generate_handoff_strict_evidence_raises_and_writes_nothing(
+    db, tmp_path, monkeypatch,
+):
+    """strict_evidence=True on a failed capability raises
+    HandoffEvidenceRequired BEFORE anything is rendered/written/persisted —
+    fail CLOSED, not a plausible-looking-but-incomplete goal."""
+    p = await db_module.create_project(db, "evidence-strict-blocks")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("wave_gate_configs table missing")
+
+    monkeypatch.setattr(db_module, "get_wave_gate_configs", _boom)
+
+    out_dir = tmp_path / "strict-out"
+    out_dir.mkdir()
+    with pytest.raises(handoff_module.HandoffEvidenceRequired) as excinfo:
+        await handoff_module.generate_handoff(
+            db, p["id"], str(out_dir), skip_ai_summary=True, mode="full",
+            strict_evidence=True,
+        )
+    errors = excinfo.value.errors
+    assert any(e["capability"] == "wave_gate_exclusion" for e in errors)
+    assert any(e["status"] == "failed" for e in errors)
+    assert excinfo.value.evidence_status["wave_gate_exclusion"]["status"] == "failed"
+    # Nothing was written for this refused call.
+    assert list(out_dir.iterdir()) == []
+    # And the pending_goal channel (5efe254b) was never touched either — a
+    # refused handoff must not leak a stale-but-plausible /goal into it.
+    pending = await db_module.get_pending_goal(db, p["id"])
+    assert pending is None
+
+
+async def test_generate_handoff_strict_evidence_passes_when_nothing_failed(
+    db, tmp_path,
+):
+    """strict_evidence=True must NOT block a genuinely clean run — only a
+    failed/degraded capability triggers the refusal, never 'skipped' ones."""
+    p = await db_module.create_project(db, "evidence-strict-clean")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    path, content, amended = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="starter",
+        strict_evidence=True,
+    )
+    assert content
+    assert Path(path).exists()
+
+
+async def test_generate_handoff_mcp_dispatch_returns_handoff_evidence_status(db, tmp_path):
+    """The real MCP dispatch (mcp/handler.py) — what actually ships to a
+    caller — surfaces handoff_evidence_status on every call, plus the
+    strict_evidence flag it echoed back, as pure additions alongside the
+    pre-existing capability_contract field."""
+    p = await db_module.create_project(db, "evidence-mcp-dispatch")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert set(result["handoff_evidence_status"]) == _ALL_EVIDENCE_CAPS
+    assert result["strict_evidence"] is False
+    assert result["content"]  # unaffected — still the bare /goal block
+    assert result["capability_contract"] is not None or result["capability_contract"] is None
+
+
+async def test_generate_handoff_mcp_dispatch_strict_evidence_blocked_response(
+    db, tmp_path, monkeypatch,
+):
+    """strict_evidence=true over the real MCP dispatch returns a structured
+    refusal (mirrors complete_sprint_item's STRICT_EVIDENCE_BLOCKED shape)
+    instead of raising an unhandled exception up through the transport."""
+    p = await db_module.create_project(db, "evidence-mcp-strict-blocked")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Some pending item")
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("wave_gate_configs table missing")
+
+    monkeypatch.setattr(db_module, "get_wave_gate_configs", _boom)
+
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "full", "strict_evidence": True},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert result["error"] == "HANDOFF_EVIDENCE_BLOCKED"
+    assert result["project_id"] == p["id"]
+    assert any(
+        e["capability"] == "wave_gate_exclusion" for e in result["evidence_errors"]
+    )
+    assert "wave_gate_exclusion" in result["evidence_status"]
+    assert "strict_evidence=true" not in result["message"] or "strict_evidence" in result["message"]

@@ -1707,7 +1707,9 @@ def test_reprobe_once_kills_and_respawns_stuck_persistent_slot():
             self.killed = 0
             self.ensured = 0
 
-        def kill(self):
+        def kill(self, reason: str = "stopped"):
+            # ddd46cc8 — _reprobe_once now calls kill(reason="reprobe_restart");
+            # accept (and ignore) the reason kwarg like the real SlotProxy.kill().
             self.killed += 1
             self.is_running = False
 
@@ -3790,6 +3792,103 @@ def test_probe_tar_entry_error_returns_false_on_popen_exception(monkeypatch):
     # Must not raise — returns False.
     result = tc._probe_tar_entry_error(["npx", "-y", "tool"], None, "dc")
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# ddd46cc8 — unified slot lifecycle contract: classification generality +
+# transient-vs-deterministic recovery behaviour through the REAL reconnect loop.
+# ---------------------------------------------------------------------------
+
+def test_classify_stderr_signature_generalises_across_module_names():
+    """Not hardcoded to mcp.server.fastmcp/pydantic_settings specifically — any
+    ModuleNotFoundError/ImportError signature is recognised, so a connector
+    missing a DIFFERENT dependency (fastapi, numpy, ...) is still caught."""
+    for module in ("fastapi", "numpy", "some_vendor.sub_package"):
+        r = tc._classify_stderr_signature(
+            f"ModuleNotFoundError: No module named '{module}'"
+        )
+        assert r is not None, module
+        assert r[0] is tc.SlotState.DEPENDENCY_MISSING
+        assert module in r[1]
+
+
+def test_classify_stderr_signature_ignores_module_named_error_mid_sentence():
+    """A stack trace that merely MENTIONS a module in passing (not the specific
+    'No module named' signature) must not false-positive as dependency-missing —
+    classification stays conservative, deferring to the generic CHILD_CRASHED
+    fallback for anything it doesn't specifically recognise."""
+    assert tc._classify_stderr_signature(
+        "AttributeError: module 'foo' has no attribute 'bar'"
+    ) is None
+
+
+def test_kill_reason_states_cover_every_reason_used_by_call_sites():
+    """Every reason string the codebase's own kill() call sites pass must map
+    to a real SlotState — a typo'd reason silently degrading to STOPPED is
+    acceptable, but the DOCUMENTED reasons must resolve to their INTENDED
+    (non-STOPPED-fallback) state."""
+    assert tc._KILL_REASON_STATES["idle_killed"] is tc.SlotState.IDLE_KILLED
+    assert tc._KILL_REASON_STATES["transport_closed"] is tc.SlotState.TRANSPORT_CLOSED
+    assert tc._KILL_REASON_STATES["reprobe_restart"] is tc.SlotState.RECONNECTING
+    assert tc._KILL_REASON_STATES["stopped"] is tc.SlotState.STOPPED
+
+
+def test_reconnect_loop_lazy_transient_startup_timeout_never_quarantines(monkeypatch):
+    """Mirror image of the deterministic-quarantine test: a slot whose readiness
+    probe repeatedly misses (STARTUP_TIMEOUT — a cold cache that just needs more
+    time, not a broken dependency) must keep retrying via the existing
+    fast-retry-then-cooldown shape FOREVER and never transition to QUARANTINED,
+    matching the b9e4967d/c325b8eb "never give up on a transient cause" policy."""
+    monkeypatch.setattr(tc, "_SLOT_REPROBE_INTERVAL", 0.01)
+    monkeypatch.setattr(tc, "_WATCHDOG_MAX_RETRIES", 1)
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+
+    class _NeverAnswersProc:
+        def __init__(self, *a, **k):
+            self.returncode = None
+        def poll(self):
+            return None  # process is "up" but never serves — pure readiness miss
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda *a, **k: _NeverAnswersProc())
+    # The proxy "spawns" fine (Popen succeeds) but never answers tools/list —
+    # this is the STARTUP_TIMEOUT path, not a spawn-time exception.
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
+
+    sent = []
+    n_requests = tc._WATCHDOG_MAX_RETRIES + 1
+
+    class FakeWS:
+        def __init__(self):
+            self._n = 0
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def __aiter__(self): return self
+        async def __anext__(self):
+            self._n += 1
+            if self._n <= n_requests:
+                return json.dumps({"type": "request", "id": str(self._n)})
+            if self._n < n_requests + 15:
+                await asyncio.sleep(0.02)
+                return json.dumps({"type": "ping"})
+            raise StopAsyncIteration
+        async def send(self, data): sent.append(json.loads(data))
+
+    class FakeHttpClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    import httpx as _httpx
+    import websockets as _ws
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: FakeWS())
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+
+    proxy = tc.SlotProxy(["docs", "server"], 8813, "docs")
+    asyncio.run(tc._run_connection_lazy("wss://x", proxy, "docs"))
+
+    statuses = [m for m in sent if m.get("type") == "plugin_status"]
+    assert not any(m.get("state") == "quarantined" for m in statuses), statuses
+    assert proxy.diagnostics.state is not tc.SlotState.QUARANTINED
+    assert proxy.diagnostics.state in tc._TRANSIENT_STATES
 
 
 # --- _spawn_with_cache_retry TAR_ENTRY_ERROR path --------------------------

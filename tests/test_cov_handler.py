@@ -949,14 +949,16 @@ def test_generate_handoff_warns_on_long_goal(tmp_path):
         _run(db.close())
 
 
-def test_generate_handoff_content_is_single_fenced_block(tmp_path):
-    """5234877f — generate_handoff content is delivered pre-wrapped in exactly one
-    4-backtick code fence (replacing the 642b1818 strip approach).  The outer fence
-    uses 4 backticks so any nested ``` fences inside the handoff body (e.g. the
-    start_session code block in the Jinja2 template) are rendered as content, not
-    as fence terminators.  Callers must output the field verbatim — no extra headers
-    or blockquotes."""
+def test_generate_handoff_content_is_raw_unwrapped(tmp_path):
+    """a5e8aa74 — generate_handoff content is delivered EXACTLY as rendered, with
+    NO Markdown code fence, header, or blockquote added around it. This replaces
+    the 5234877f four-backtick fence: that wrapping meant a receiving session
+    could never forward the content field verbatim as a paste-ready /goal block
+    without first stripping the fence itself, defeating the whole point of a
+    'display verbatim' contract. Callers must output the field exactly as-is."""
     import meridian.db as db_module
+    from meridian import handoff as handoff_module
+
     db = _make_db()
     try:
         proj = _run(db_module.create_project(db, "fence-proj"))
@@ -968,22 +970,24 @@ def test_generate_handoff_content_is_single_fenced_block(tmp_path):
         out = _run(mh._dispatch_mcp_tool(
             "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
         content = out["content"]
-        # Must start and end with a 4-backtick fence (exactly one outer wrapper).
-        assert content.startswith("````\n"), (
-            f"content must start with 4-backtick fence, got: {content[:30]!r}")
-        assert content.endswith("\n````"), (
-            f"content must end with 4-backtick fence, got: {content[-30:]!r}")
-        # The inner body (everything between the outer fences) must not start with ````
-        inner = content[5:-5]  # strip leading "````\n" (5 chars) and trailing "\n````" (5 chars)
-        assert not inner.startswith("````"), "no nested 4-backtick fences in the body"
+        # No outer 4-backtick wrapper of any kind.
+        assert not content.startswith("````"), (
+            f"content must not be fenced, got: {content[:30]!r}")
+        assert not content.endswith("````"), (
+            f"content must not be fenced, got: {content[-30:]!r}")
+        # The shared helper is a pure identity function — the field is exactly
+        # what it returns for the same input, proving there is no ad-hoc wrap
+        # left in the handler dispatch path.
+        assert content == handoff_module.format_handoff_mcp_content(content)
     finally:
         _run(db.close())
 
 
-def test_generate_handoff_content_fence_preserves_inner_triple_backticks(tmp_path):
-    """5234877f — inner ``` fences from the handoff body (e.g. the start_session
-    code block rendered by the Jinja2 template) are preserved verbatim inside the
-    outer 4-backtick fence — they are NOT stripped."""
+def test_generate_handoff_content_preserves_inner_triple_backticks(tmp_path):
+    """a5e8aa74 — inner ``` fences from the handoff body (e.g. the start_session
+    code block rendered by the Jinja2 template) are preserved verbatim and are
+    the ONLY fences in the returned content — there is no outer wrapper added
+    around them anymore (see the raw-unwrapped test above)."""
     import meridian.db as db_module
     db = _make_db()
     try:
@@ -992,16 +996,88 @@ def test_generate_handoff_content_fence_preserves_inner_triple_backticks(tmp_pat
         out = _run(mh._dispatch_mcp_tool(
             "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
         content = out["content"]
-        # The outer 4-backtick wrapper is present.
-        assert content.startswith("````\n")
-        assert content.endswith("\n````")
-        # The inner body contains the template's ``` start_session code block.
-        inner = content[5:-5]
+        assert not content.startswith("````")
+        assert not content.endswith("````")
         # The Jinja2 handoff template renders a ```\nstart_session(...)\n``` block
         # under "## Start a New Session". That inner fence must survive intact.
-        assert "```" in inner, (
-            "inner handoff body must contain the start_session ``` code block; "
+        assert "```" in content, (
+            "handoff body must contain the start_session ``` code block; "
             "if the template changed, update this test accordingly"
+        )
+    finally:
+        _run(db.close())
+
+
+def test_generate_handoff_content_parity_across_transports(monkeypatch, tmp_path):
+    """a5e8aa74 — transport-parity: the ``content`` field returned by
+    ``generate_handoff`` must be the same raw text whether it is reached
+    through the HTTP/MCP handler dispatch (meridian/mcp/handler.py,
+    ``_dispatch_mcp_tool``) or the stdio transport
+    (meridian/mcp/stdio_handler.py, ``call_tool``). Both used to wrap the
+    content in their own independent four-backtick fence (5234877f); now both
+    call the single shared ``handoff.format_handoff_mcp_content`` helper, so
+    this test proves the two transports cannot drift out of sync again.
+
+    mode='delta' is used on both sides because it deterministically disables
+    the AI-summary network seam regardless of transport (handler.py defaults
+    skip_ai_summary=True already; the stdio tool schema has no such argument
+    at all, so delta is the one denominator both transports share without a
+    network dependency or a fake summarizer fixture). The embedded
+    "_Generated at <ts> (delta mode)_" timestamp legitimately differs by a
+    few seconds between the two calls, so it is normalized out before the
+    byte-identical comparison.
+    """
+    import re
+
+    import mcp.types as mcp_types
+    import meridian.db as db_module
+    import meridian.server as server_module
+
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "transport-parity-proj"))
+        _run(db_module.set_goal(db, proj["id"], "", sprint="parity check"))
+
+        handler_out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff",
+            {"project_id": proj["id"], "mode": "delta"},
+            db, str(tmp_path),
+        ))
+        handler_content = handler_out["content"]
+
+        server = _stdio_server(monkeypatch, db)
+        call_handler = server.request_handlers[mcp_types.CallToolRequest]
+        called = _run(call_handler(
+            mcp_types.CallToolRequest(
+                params=mcp_types.CallToolRequestParams(
+                    name="generate_handoff",
+                    arguments={"project_id": proj["id"], "mode": "delta"},
+                )
+            )
+        ))
+        stdio_result = json.loads(called.root.content[0].text)
+        stdio_content = stdio_result["content"]
+
+        # Neither transport may add a fence, header, or blockquote wrapper.
+        for _c in (handler_content, stdio_content):
+            assert not _c.startswith("````"), f"content must not be fenced: {_c[:30]!r}"
+            assert not _c.endswith("````"), f"content must not be fenced: {_c[-30:]!r}"
+
+        # Byte-identical modulo the embedded generation timestamp and the
+        # single-use <goal_token> (dd07ece0) — both legitimately differ between
+        # two independent generate_handoff calls, fenced or not.
+        def _normalize(text: str) -> str:
+            text = re.sub(r"_Generated at [^_]*_", "_Generated at <ts>_", text)
+            text = re.sub(
+                r"<goal_token>[^<]*</goal_token>",
+                "<goal_token><tok></goal_token>",
+                text,
+            )
+            return text
+
+        assert _normalize(handler_content) == _normalize(stdio_content), (
+            "generate_handoff content diverged between the handler.py and "
+            "stdio_handler.py transports"
         )
     finally:
         _run(db.close())
@@ -1572,6 +1648,362 @@ def test_sprint_item_advisory_never_blocks_on_commit_fetch_error(monkeypatch):
             "complete_sprint_item",
             {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
         assert done["status"] == "done"  # completion succeeded despite git error
+    finally:
+        _run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# 5fe3502e — strict (fail-closed) evidence gate, full-stack via the MCP
+# complete_sprint_item dispatch. These prove the OPT-IN wiring itself (not
+# the typed-check logic, covered unit-style in
+# test_1ec33edf_stored_evidence_verification.py): default behavior is
+# byte-for-byte unchanged when strict_evidence is never requested, and the
+# gate only engages when a caller (or the item itself) explicitly asks.
+# ---------------------------------------------------------------------------
+
+def test_strict_evidence_default_off_never_blocks():
+    """DEFAULT CASE — no strict_evidence arg, no require_strict_evidence flag:
+    an item with ZERO evidence still completes exactly as it always has. This
+    is the backward-compatibility guarantee point 4 of 5fe3502e requires."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-default-off"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Bare item, no evidence", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert "error" not in done
+        assert done["status"] == "done"
+    finally:
+        _run(db.close())
+
+
+def test_strict_evidence_true_blocks_when_no_evidence():
+    """strict_evidence=true + zero evidence -> STRICT_EVIDENCE_BLOCKED, item
+    stays NOT done, and the typed EVIDENCE_ABSENT code is surfaced."""
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-blocked"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict bare item", "version": "v1"}, db, "/tmp"))
+        result = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "strict_evidence": True}, db, "/tmp"))
+        assert result.get("error") == "STRICT_EVIDENCE_BLOCKED"
+        codes = [e["code"] for e in result.get("evidence_errors", [])]
+        assert "EVIDENCE_ABSENT" in codes
+        still = _run(db_module.get_sprint_item(db, item["id"]))
+        assert still["status"] != "done"
+    finally:
+        _run(db.close())
+
+
+def test_strict_evidence_true_with_notes_completes():
+    """strict_evidence=true + real evidence (notes=) -> completes normally,
+    no STRICT_EVIDENCE_BLOCKED."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-with-notes"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict item with notes", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "strict_evidence": True,
+             "notes": "shipped it; verified via pixi run test"}, db, "/tmp"))
+        assert "error" not in done
+        assert done["status"] == "done"
+    finally:
+        _run(db.close())
+
+
+def test_strict_evidence_override_without_reason_still_blocks():
+    """override_strict_evidence=true alone (no reason) does NOT bypass the
+    gate — an override can never be the silent default (5fe3502e point 3)."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-override-noreason"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict override no reason", "version": "v1"}, db, "/tmp"))
+        result = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "strict_evidence": True,
+             "override_strict_evidence": True}, db, "/tmp"))
+        assert result.get("error") == "STRICT_EVIDENCE_BLOCKED"
+    finally:
+        _run(db.close())
+
+
+def test_strict_evidence_override_with_reason_completes_and_is_audited():
+    """override_strict_evidence=true + a non-empty override_reason bypasses
+    the block, completes the item, and writes an auditable action_audit_log
+    row (who/when/why) — surfaced on the response too."""
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-override-audited"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict override audited", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "strict_evidence": True,
+             "override_strict_evidence": True,
+             "override_reason": "verified outside Meridian, evidence not machine-declared",
+             "actor": "executor-1"}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+        assert "strict_evidence_override" in done
+        assert done["strict_evidence_override"]["actor"] == "executor-1"
+
+        log = _run(db_module.get_action_audit_log(
+            db, project_id=pid, event_type="sprint_item_strict_evidence_override",
+        ))
+        assert len(log) == 1
+        assert "verified outside Meridian" in log[0]["detail"]
+    finally:
+        _run(db.close())
+
+
+def test_require_strict_evidence_item_flag_engages_gate_without_call_arg():
+    """The item-level require_strict_evidence flag (set via update_sprint_item)
+    is sufficient on its own — a caller need not pass strict_evidence=true on
+    every completion call once the item itself is flagged."""
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "strict-item-flag"}, db, "/tmp"))
+        pid = proj["id"]
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Item-flagged strict item", "version": "v1"}, db, "/tmp"))
+        _run(mh._dispatch_mcp_tool(
+            "update_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "require_strict_evidence": True}, db, "/tmp"))
+        result = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert result.get("error") == "STRICT_EVIDENCE_BLOCKED"
+    finally:
+        _run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# e7548587 — enforce active-worktree merge approval before sprint completion.
+# require_merge_approval is now a tri-state (0=off, 1=advisory, 2=strict),
+# full-stack via the MCP complete_sprint_item dispatch. Mirrors the
+# 5fe3502e strict-evidence block above: default (advisory, mode 1) behavior
+# is unchanged, strict mode (2) actually blocks, and the authorized override
+# path is auditable.
+# ---------------------------------------------------------------------------
+
+def test_merge_approval_advisory_default_completes_with_warning():
+    """DEFAULT CASE (mode 1, advisory, unset == 1): a session with a genuine
+    active worktree still completes — only a merge_warning + HITL reminder
+    are attached, exactly the pre-e7548587 behavior. This is the
+    backward-compatibility guarantee: existing projects (all default to 1)
+    see zero behavior change."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-advisory"}, db, "/tmp"))
+        pid = proj["id"]
+        sess = _run(db_module.register_session(db, pid, "advisory-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Advisory merge item", "version": "v1"}, db, "/tmp"))
+        _run(db_module.register_worktree(
+            db, sess["id"], pid, "worktree/advisory", "../repo-worktree-advisory",
+            item_id=item["id"],
+        ))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+        assert done["merge_warning"]["worktree_branch"] == "worktree/advisory"
+        assert "override" not in done["merge_warning"]
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_strict_blocks_active_unmerged_worktree():
+    """require_merge_approval=2 (strict) + a genuine active worktree (per
+    get_active_worktree_for_session) -> MERGE_APPROVAL_REQUIRED, and the item
+    is NOT marked done."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-strict-block"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=2))
+        sess = _run(db_module.register_session(db, pid, "strict-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict merge item", "version": "v1"}, db, "/tmp"))
+        _run(db_module.register_worktree(
+            db, sess["id"], pid, "worktree/strict", "../repo-worktree-strict",
+            item_id=item["id"],
+        ))
+        result = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]}, db, "/tmp"))
+        assert result.get("error") == "MERGE_APPROVAL_REQUIRED"
+        assert result["worktree_branch"] == "worktree/strict"
+        still = _run(db_module.get_sprint_item(db, item["id"]))
+        assert still["status"] != "done"
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_strict_override_without_reason_still_blocks():
+    """override_merge_approval=true alone (no reason) does NOT bypass strict
+    mode — an override can never be the silent default, mirroring
+    5fe3502e's strict-evidence override contract exactly."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-strict-noreason"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=2))
+        sess = _run(db_module.register_session(db, pid, "strict-noreason-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict override no reason", "version": "v1"}, db, "/tmp"))
+        _run(db_module.register_worktree(
+            db, sess["id"], pid, "worktree/strict-nr", "../repo-worktree-strict-nr",
+            item_id=item["id"],
+        ))
+        result = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+             "override_merge_approval": True}, db, "/tmp"))
+        assert result.get("error") == "MERGE_APPROVAL_REQUIRED"
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_strict_override_with_reason_completes_and_is_audited():
+    """override_merge_approval=true + a non-empty
+    override_merge_approval_reason bypasses the strict block, completes the
+    item, and writes an auditable action_audit_log row (who/when/why) —
+    surfaced on the response too, mirroring
+    record_strict_evidence_override's contract."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-strict-audited"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=2))
+        sess = _run(db_module.register_session(db, pid, "strict-audited-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Strict override audited", "version": "v1"}, db, "/tmp"))
+        _run(db_module.register_worktree(
+            db, sess["id"], pid, "worktree/strict-aud", "../repo-worktree-strict-aud",
+            item_id=item["id"],
+        ))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+             "override_merge_approval": True,
+             "override_merge_approval_reason": "merged manually outside Meridian, verified by hand",
+             "actor": "executor-2"}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+        assert done["merge_warning"]["override"]["actor"] == "executor-2"
+
+        log = _run(db_module.get_action_audit_log(
+            db, project_id=pid, event_type="sprint_item_merge_approval_override",
+        ))
+        assert len(log) == 1
+        assert "merged manually outside Meridian" in log[0]["detail"]
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_strict_no_registered_worktree_never_blocked():
+    """DEFAULT-SAFE INVARIANT: even with require_merge_approval=2 (strict)
+    configured, a session that never registered an active worktree (the
+    common case for sessions managing their own git worktrees manually via
+    raw `git worktree add`/cherry-pick, rather than Meridian's
+    create_worktree/register_worktree MCP tools) is NEVER blocked — the gate
+    only engages for a genuinely registered, still-active worktree."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-strict-no-wt"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=2))
+        sess = _run(db_module.register_session(db, pid, "no-worktree-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "No worktree registered", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+        assert "merge_warning" not in done
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_strict_no_session_id_never_blocked():
+    """DEFAULT-SAFE INVARIANT: a completion call with no session_id at all
+    (e.g. a caller that never plumbed it through) skips the entire
+    merge-approval block regardless of mode — there is no session to look up
+    a worktree for."""
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-strict-no-session"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=2))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "No session id on completion", "version": "v1"}, db, "/tmp"))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"]}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+    finally:
+        _run(db.close())
+
+
+def test_merge_approval_off_mode_skips_check_entirely():
+    """require_merge_approval=0 (off): even a genuine active worktree gets
+    NO merge_warning and NO HITL reminder — the check is fully disabled."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "merge-off"}, db, "/tmp"))
+        pid = proj["id"]
+        _run(db_module.update_project_settings(db, pid, require_merge_approval=0))
+        sess = _run(db_module.register_session(db, pid, "off-exec"))
+        item = _run(mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": pid, "title": "Off mode item", "version": "v1"}, db, "/tmp"))
+        _run(db_module.register_worktree(
+            db, sess["id"], pid, "worktree/off", "../repo-worktree-off",
+            item_id=item["id"],
+        ))
+        done = _run(mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]}, db, "/tmp"))
+        assert done.get("error") is None
+        assert done["status"] == "done"
+        assert "merge_warning" not in done
     finally:
         _run(db.close())
 

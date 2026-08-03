@@ -535,11 +535,46 @@ def test_create_and_list_worktree(client):
     assert r.status_code == 201
     wt = r.json()
     assert wt["branch"] == "worktree/cov-test"
+    # eb2e44f8 — no base_sha/base_branch supplied above, so no manifest gets
+    # created (backward compatible with pre-eb2e44f8 callers).
+    assert "manifest" not in wt
 
     r2 = client.get(f"/projects/{p['id']}/worktrees")
     assert r2.status_code == 200
     ids = [w["id"] for w in r2.json()]
     assert wt["id"] in ids
+
+
+def test_create_worktree_with_base_manifest_fields_persists_manifest(client):
+    """eb2e44f8 — POST /projects/{id}/worktrees also supplying base_sha +
+    base_branch (+ optional pid/repo_identity) persists an immutable base
+    manifest alongside the worktree registration, returned under the
+    'manifest' key."""
+    p = _make_project(client, "cov-wt-manifest-create")
+    s = client.post(
+        "/sessions/register",
+        json={"project_id": p["id"], "name": "wt-manifest-session"},
+    ).json()
+
+    body = {
+        "session_id": s["id"],
+        "branch": "worktree/cov-manifest-test",
+        "path": "../repo-cov-manifest-test",
+        "pid": 424242,
+        "base_sha": "d" * 40,
+        "base_branch": "dev",
+        "repo_identity": "cov-test-repo",
+    }
+    r = client.post(f"/projects/{p['id']}/worktrees", json=body)
+    assert r.status_code == 201
+    wt = r.json()
+    assert wt["pid"] == 424242
+    assert "manifest" in wt
+    manifest = wt["manifest"]
+    assert manifest["base_sha"] == "d" * 40
+    assert manifest["base_branch"] == "dev"
+    assert manifest["repo_identity"] == "cov-test-repo"
+    assert manifest["worktree_id"] == wt["id"]
 
 
 def test_create_worktree_404_unknown_project(client):

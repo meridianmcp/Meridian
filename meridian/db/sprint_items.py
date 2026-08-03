@@ -30,6 +30,8 @@ from meridian.db import (  # noqa: PLC0415
     parse_touches_resources,
     _resource_sets_conflict,
 )
+from .. import tool_requirements as _tool_requirements  # 76dde31f (665 follow-up)
+from .. import artifact_declaration as _artifact_declaration  # 2f9cb288 (665 follow-up)
 
 
 # ---------------------------------------------------------------------------
@@ -774,6 +776,10 @@ async def add_sprint_item(
     sprint_name: str | None = None,
     prospect_bypass: bool = False,
     required_tool: str | None = None,
+    tool_requirements: Any = None,
+    artifact_kind: str | None = None,
+    planned_output: Any = None,
+    artifact_policy: Any = None,
     notes: str | None = None,
 ) -> dict[str, Any]:
     """Append a new ``todo`` sprint item to a project's checklist.
@@ -804,6 +810,36 @@ async def add_sprint_item(
     replace_symbol_body'). NULL means ordinary executor discretion. When set,
     it is rendered as a hard directive (not a hint) in the /goal block built by
     ``handoff._build_quick_start_goal`` / ``build_item_briefing``.
+    ``tool_requirements`` (76dde31f, 665 follow-up) is the TYPED successor to
+    ``required_tool``: a list of normalized entries (see
+    ``meridian.tool_requirements.normalize_tool_requirement`` for the schema —
+    name, server_or_namespace, required_or_preferred, purpose, call_template,
+    fallback, availability_check, verification). Distinct from
+    ``touches_resources`` (parallel-conflict scheduling metadata) and from
+    ``required_tool`` (a single free-form string) — once set, this structured
+    field is the CANONICAL source for what build_item_briefing / the batch
+    /goal's ``<tool_requirements>`` clause / the machine-readable capability
+    contract render; ``required_tool`` keeps working unchanged and is used as
+    a read-time compatibility fallback only when this field is empty (see
+    ``tool_requirements.effective_tool_requirements``). Raises ``ValueError``
+    (via ``tool_requirements.ToolRequirementError``) on malformed input —
+    unknown fields, missing required fields, secret-shaped values, or
+    machine-local absolute paths.
+    ``artifact_kind`` / ``planned_output`` / ``artifact_policy`` (2f9cb288,
+    665 follow-up) are the normalized, persisted artifact declaration
+    contract — see ``meridian.artifact_declaration`` for the full schema.
+    ``artifact_kind`` is a plain enum (``document_only``/``figure``/``table``),
+    NULL meaning "unknown" (never guessed). ``planned_output`` is a typed
+    pointer (validated via ``meridian.pointers.validate_pointer`` — NOT a
+    free-form path), carrying ``source_type``, ``targets``, ``label``, and
+    ``provenance_required``. ``artifact_policy`` is the artifact-pointer-check
+    policy (``artifact_pointer_check`` off/warn/strict plus guard flags); an
+    absent policy reads back as the project default (warn) via
+    ``artifact_declaration.effective_artifact_policy``, never a hard block.
+    All three raise ``ValueError`` (via ``artifact_declaration.ArtifactDeclarationError``)
+    on malformed input — unknown fields, bad enum values, or a secret-shaped /
+    machine-local-absolute-path value in ``planned_output`` (same screen
+    ``tool_requirements`` reuses).
     ``notes`` is optional free-form context stored on the item at creation time.
 
     Duplicate guard (b0d42ef6): unless ``force`` is True, the new ``title``
@@ -868,6 +904,19 @@ async def add_sprint_item(
                     }
     # 501ec93f — normalize + validate typed resource identifiers (raises on bad input).
     resources_json = serialize_touches_resources(touches_resources)
+    # 76dde31f (665 follow-up) — normalize + validate the typed tool_requirements
+    # contract (raises ToolRequirementError, a ValueError subclass, on bad input —
+    # same fail-fast discipline as the touches_resources line above).
+    tool_requirements_json = _tool_requirements.serialize_tool_requirements(tool_requirements)
+    # 2f9cb288 (665 follow-up) — normalize + validate the typed artifact
+    # declaration contract (raises ArtifactDeclarationError, a ValueError
+    # subclass, on bad input — same fail-fast discipline as above).
+    artifact_kind_value = (
+        _artifact_declaration.normalize_artifact_kind(artifact_kind)
+        if artifact_kind is not None else None
+    )
+    planned_output_json = _artifact_declaration.serialize_planned_output(planned_output)
+    artifact_policy_json = _artifact_declaration.serialize_artifact_policy(artifact_policy)
     iid = _new_id()
     # b944c905 — auto-populate a human-readable slug from the title (or a
     # caller-supplied one), deduped per project.
@@ -883,13 +932,15 @@ async def add_sprint_item(
         "(id, project_id, version, title, notes, item_group, human_id, depends_on, "
         "failure_mode, milestone_type, touches_resources, slug, nickname, "
         "deferred_until, track, priority, blocker_kind, wave, sprint_name, "
-        "prospect_bypass, required_tool) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "prospect_bypass, required_tool, tool_requirements, "
+        "artifact_kind, planned_output, artifact_policy) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (iid, project_id, version, title, notes, group, human_id,
          depends_on, failure_mode or "continue", milestone_type, resources_json,
          _item_slug, _item_nickname, deferred_until or None, track or None,
          priority, blocker_kind or None, wave or None, sprint_name or None,
-         1 if prospect_bypass else 0, required_tool or None),
+         1 if prospect_bypass else 0, required_tool or None, tool_requirements_json,
+         artifact_kind_value, planned_output_json, artifact_policy_json),
     )
     await db.commit()
     item = await get_sprint_item(db, iid)
@@ -2179,7 +2230,13 @@ async def claim_sprint_item(
     # wave_gate_configs table not yet migrated) lets the claim proceed so a
     # structural defect never permanently wedges the board.
     try:
-        _blocking_gate = await _get_blocking_wave_gate(db, project_id, item.get("wave"))
+        # ed8e4524 — pass the item's own sprint-version bucket so a
+        # version-scoped gate config only blocks/unblocks items in that SAME
+        # version; an unscoped (project-wide) config still applies to every
+        # item regardless of its version, exactly as before this fix.
+        _blocking_gate = await _get_blocking_wave_gate(
+            db, project_id, item.get("wave"), version=item.get("version")
+        )
     except Exception:  # noqa: BLE001 — gate must never wedge the board
         _blocking_gate = None
     if _blocking_gate is not None:
@@ -2358,7 +2415,12 @@ async def patch_sprint_item(
     prospect_bypass: Any = _UNSET,
     depends_on: Any = _UNSET,
     require_verification: Any = _UNSET,
+    require_strict_evidence: Any = _UNSET,
     required_tool: Any = _UNSET,
+    tool_requirements: Any = _UNSET,
+    artifact_kind: Any = _UNSET,
+    planned_output: Any = _UNSET,
+    artifact_policy: Any = _UNSET,
     github_channel: Any = _UNSET,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
@@ -2402,11 +2464,45 @@ async def patch_sprint_item(
     then requires an on-file PASS filed by a session distinct from the one
     completing it), or ``False`` / ``0`` to CLEAR it (ordinary completion,
     evidence gate only).
+    ``require_strict_evidence`` (5fe3502e) uses the ``_UNSET`` sentinel: omit
+    to leave unchanged, pass ``True`` / ``1`` to SET the opt-in fail-closed
+    evidence gate (``complete_sprint_item`` calls via
+    ``meridian.mcp.handlers.sprint_tools.handle_complete_sprint_item`` then
+    refuse completion — ``STRICT_EVIDENCE_BLOCKED`` — unless declared evidence
+    is present, resolves to something real, isn't stale, matches the
+    completing session's own worktree, and no file was edited without a
+    claim; see ``meridian.sprint_evidence_guard``), or ``False`` / ``0`` to
+    CLEAR it (ordinary advisory-only evidence checks). This is the persistent,
+    per-item counterpart to passing ``strict_evidence=true`` on a single
+    ``complete_sprint_item`` call — either is sufficient to engage the gate.
     ``required_tool`` (4d1fb28f) uses the ``_UNSET`` sentinel: omit to leave
     unchanged, pass an empty string / ``None`` to CLEAR the pin (ordinary
     executor discretion), or a free-form tool/plugin name (e.g. 'Serena:
     replace_symbol_body') to SET it — rendered as a hard directive in the
     /goal block, not left to executor habit.
+    ``tool_requirements`` (76dde31f, 665 follow-up) uses the ``_UNSET``
+    sentinel: omit to leave unchanged, pass ``None`` / ``[]`` to CLEAR the
+    structured contract (falls back to ``required_tool`` if still set — see
+    ``tool_requirements.effective_tool_requirements``), or a list of typed
+    entries (schema: name, server_or_namespace, required_or_preferred,
+    purpose, call_template, fallback, availability_check, verification) to
+    SET/REPLACE it wholesale. Raises ``ValueError`` (via
+    ``tool_requirements.ToolRequirementError``) on malformed input — unknown
+    fields, missing required fields, secret-shaped values, or machine-local
+    absolute paths.
+    ``artifact_kind`` / ``planned_output`` / ``artifact_policy`` (2f9cb288,
+    665 follow-up) each independently use the ``_UNSET`` sentinel: omit to
+    leave unchanged, pass ``None`` (or ``""`` for ``artifact_kind``) to CLEAR
+    it, or a valid value to SET/REPLACE it wholesale — see
+    ``meridian.artifact_declaration`` for the full schema. ``artifact_kind``
+    is one of ``document_only``/``figure``/``table``. ``planned_output`` is a
+    typed pointer object (``source_type``, ``targets``, ``label?``,
+    ``provenance_required?``), validated via
+    ``meridian.pointers.validate_pointer``. ``artifact_policy`` is
+    ``{artifact_pointer_check?, require_exact_figure_output_pointer?,
+    require_exact_table_output_pointer?, allow_document_only_override?}``.
+    Raises ``ValueError`` (via
+    ``artifact_declaration.ArtifactDeclarationError``) on malformed input.
     ``github_channel`` (7c82f7c8) uses the ``_UNSET`` sentinel: omit to leave
     unchanged, pass an empty string / ``None`` to CLEAR it, or one of
     {nightly, stable, graduated} to set it. Mirrors the channel:nightly /
@@ -2540,6 +2636,15 @@ async def patch_sprint_item(
         # (ordinary completion, evidence gate only). Stored as INTEGER 0/1.
         ns_fields.append("require_verification = ?")
         ns_values.append(1 if require_verification else 0)
+    if require_strict_evidence is not _UNSET:
+        # 5fe3502e — True/1 SETS the opt-in fail-closed evidence gate
+        # (complete_sprint_item's handler-level strict verification refuses
+        # completion on missing/invalid/stale/wrong-worktree evidence or
+        # unclaimed edits unless explicitly, auditedly overridden);
+        # False/0/None CLEARS it (ordinary advisory-only evidence checks).
+        # Stored as INTEGER 0/1, same shape as require_verification.
+        ns_fields.append("require_strict_evidence = ?")
+        ns_values.append(1 if require_strict_evidence else 0)
     if required_tool is not _UNSET:
         # 4d1fb28f — empty string / None CLEARS the pin (ordinary executor
         # discretion); any other value sets the free-form required-tool name.
@@ -2547,6 +2652,39 @@ async def patch_sprint_item(
         # replace_symbol_body', a named tunnel plugin, 'meridian__patch_file').
         ns_fields.append("required_tool = ?")
         ns_values.append(required_tool or None)
+    if tool_requirements is not _UNSET:
+        # 76dde31f (665 follow-up) — None/[] CLEARS the structured contract
+        # (falls back to required_tool if still set); any other value is
+        # validated/normalized and REPLACES the stored list wholesale. Raises
+        # ToolRequirementError (a ValueError) on malformed input.
+        ns_fields.append("tool_requirements = ?")
+        ns_values.append(_tool_requirements.serialize_tool_requirements(tool_requirements))
+    if artifact_kind is not _UNSET:
+        # 2f9cb288 (665 follow-up) — empty string / None CLEARS it (unknown);
+        # otherwise validate the enum (document_only/figure/table), like
+        # blocker_kind/github_channel. Raises ArtifactDeclarationError (a
+        # ValueError) on an unlisted value.
+        ns_fields.append("artifact_kind = ?")
+        ns_values.append(
+            _artifact_declaration.normalize_artifact_kind(artifact_kind)
+            if artifact_kind else None
+        )
+    if planned_output is not _UNSET:
+        # 2f9cb288 (665 follow-up) — None CLEARS the declared planned output;
+        # any other value is validated (a typed pointer, via
+        # meridian.pointers.validate_pointer — NOT a free-form path) and
+        # REPLACES the stored value wholesale. Raises ArtifactDeclarationError
+        # (a ValueError) on malformed input.
+        ns_fields.append("planned_output = ?")
+        ns_values.append(_artifact_declaration.serialize_planned_output(planned_output))
+    if artifact_policy is not _UNSET:
+        # 2f9cb288 (665 follow-up) — None CLEARS the per-item policy override
+        # (reads back as the project default warn policy — see
+        # artifact_declaration.effective_artifact_policy); any other value is
+        # validated/normalized and REPLACES the stored policy wholesale.
+        # Raises ArtifactDeclarationError (a ValueError) on malformed input.
+        ns_fields.append("artifact_policy = ?")
+        ns_values.append(_artifact_declaration.serialize_artifact_policy(artifact_policy))
     if github_channel is not _UNSET:
         # 7c82f7c8 — empty string / None CLEARS it; otherwise validate the
         # enum (nightly / stable / graduated), like blocker_kind.
@@ -3255,7 +3393,13 @@ def _item_declares_resources(item: dict[str, Any]) -> bool:
     return bool(raw) and raw not in ("[]", "null")
 
 
-def is_item_claim_prospected(item: dict[str, Any], *, has_pointer_evidence: bool) -> bool:
+def is_item_claim_prospected(
+    item: dict[str, Any],
+    *,
+    has_pointer_evidence: bool,
+    strict: bool = False,
+    target_resolved: "bool | None" = None,
+) -> bool:
     """d5849a67 — SINGLE SOURCE OF TRUTH for "would ``claim_sprint_item``'s
     UNPROSPECTED gate let this item through?"
 
@@ -3283,12 +3427,34 @@ def is_item_claim_prospected(item: dict[str, Any], *, has_pointer_evidence: bool
       persisted to ``sprint_item_pointers``, so an item showing
       ``prospect_status='prospected'`` can still have zero durable rows and
       would still be refused by ``claim_sprint_item``.
+
+    ``strict`` / ``target_resolved`` (eb8b6894) — OPT-IN, OFF by default
+    (mirrors ``generate_handoff``'s own ``strict_evidence``/8a883f60 opt-in
+    shape). ``has_pointer_evidence`` alone answers "does a row exist" —
+    PRESENCE, not RESOLUTION (see ``get_pointer_evidence_item_ids``'s own
+    docstring: it is presence-only BY DESIGN). When a caller has ALSO
+    resolved the item's pointers (e.g. ``handoff._annotate_resolved_pointers``
+    via ``pointers.aggregate_pointer_evidence``) and passes both
+    ``strict=True`` and the resulting ``target_resolved`` bool, a pointer
+    that is structurally present but explicitly did NOT resolve
+    (``target_resolved is False``) now FAILS this gate too — "a row exists"
+    can no longer, by itself, satisfy a strict caller. ``target_resolved is
+    None`` (the caller didn't compute a resolution-aware signal — every
+    existing call site, and every call that leaves ``strict`` at its
+    default) is treated exactly like ``strict=False``: nothing tightens,
+    zero behaviour change from before these kwargs existed. A caller that
+    never passes ``strict``/``target_resolved`` — i.e. every pre-existing
+    call site — sees byte-for-byte identical results.
     """
     if bool(item.get("prospect_bypass")):
         return True
     if not _item_declares_resources(item):
         return True
-    return bool(has_pointer_evidence)
+    if not bool(has_pointer_evidence):
+        return False
+    if strict and target_resolved is False:
+        return False
+    return True
 
 
 async def get_pointer_evidence_item_ids(
@@ -3305,6 +3471,24 @@ async def get_pointer_evidence_item_ids(
     fail open" (``is_item_claim_prospected`` is called with
     ``has_pointer_evidence=True`` in that case), mirroring
     ``claim_sprint_item``'s own try/except fail-open behaviour.
+
+    eb8b6894 — this function is, and stays, PRESENCE-ONLY BY DESIGN: a plain
+    SQL existence check (a durable row is in ``sprint_item_pointers``), no
+    :func:`meridian.pointers.resolve_pointer` call, no live-graph/tunnel
+    reach — that would require awaiting an async resolve per item from a
+    low-level DB helper with no tenant/symbol-resolver context available
+    here. It is intentionally NOT extended to answer "did the target
+    actually resolve" — that is a SEPARATE, RESOLUTION-aware signal, computed
+    one layer up where the resolve machinery already runs:
+    ``handoff._annotate_resolved_pointers`` resolves every stored pointer via
+    :func:`meridian.pointers.resolve_pointer` and rolls the per-pointer
+    result up via :func:`meridian.pointers.aggregate_pointer_evidence` into
+    each item's ``pointer_resolution_status["target_resolved"]`` — the
+    companion check a caller passes to ``is_item_claim_prospected(strict=True,
+    target_resolved=...)`` to close exactly the presence-vs-resolution gap
+    this function's own docstring calls out. This remains the ONE
+    presence-only source; it is deliberately paired with, not silently
+    conflated with, that resolution-aware companion.
     """
     ids = [i for i in (item_ids or []) if i]
     if not ids:
@@ -3753,6 +3937,462 @@ async def get_parallelizable_groups(
     }
 
 
+# ---------------------------------------------------------------------------
+# 22cad9b8 — atomic batch claim: reserve an ENTIRE parallel-safe batch (every
+# item's status AND every declared resource) before workers launch.
+#
+# get_parallelizable_groups (above) can prove a batch of items is safe to run
+# in parallel — their declared touches_resources are pairwise disjoint — but
+# it only COMPUTES that fact; nothing then atomically RESERVES it. Between
+# "compute the safe batch" and "each worker calls claim_sprint_item for its
+# item," another session can sneak in and claim one of those same resources,
+# or the batch composition can go stale (an item's declared resources drift,
+# or a sibling planner recolors the board). claim_parallel_batch closes that
+# gap: it is the single atomic operation that turns "this batch was proven
+# safe a moment ago" into "this batch is NOW reserved, or nothing changed."
+#
+# Design, mirroring eb2e44f8's immutable-manifest + this repo's existing
+# transactional-gate conventions (18c488b6's _sprint_item_resource_claim_gate
+# in meridian/mcp/handler.py, which this reuses the same acquire/rollback
+# shape from, kept self-contained here rather than imported across the
+# db→mcp layer boundary):
+#
+#   1. Validate every item exists, belongs to the project, and (for a
+#      multi-item batch) has NON-EMPTY declared touches_resources — an item
+#      with nothing declared can never be PROVEN parallel-safe, so it is
+#      refused as part of a multi-item batch rather than silently treated as
+#      conflict-free (empty ∩ anything == ∅ would otherwise let it slip
+#      through). A batch of exactly one such item is fine: nothing else in
+#      the batch exists for it to conflict with.
+#   2. Validate the requested batch is INTERNALLY conflict-free (no two
+#      items in it share/overlap a resource, using the same file⊃symbol-
+#      aware _resource_sets_conflict get_parallelizable_groups' coloring
+#      uses) — catches a stale or hand-assembled batch.
+#   3. Persist an immutable batch-claim manifest (db.batch_claim) BEFORE
+#      attempting any lock — a durable, auditable record of what was
+#      DECIDED, independent of whether the attempt below succeeds.
+#   4. Attempt, in order, for every item in the batch: claim the item's
+#      status (claim_sprint_item — the SAME gates/atomicity a normal solo
+#      claim gets: deferred/superseded/wave-gate/unprospected/race-lost all
+#      apply unchanged), then claim every one of its declared resources
+#      (file:/symbol: via claim_file/claim_symbol — preserving AST-resolved
+#      symbol-level concurrency, never downgraded to a coarser whole-file
+#      lock; any other typed resource via the generic claim_resource
+#      primitive). The FIRST failure anywhere — item-claim conflict/gate, or
+#      resource conflict — rolls back EVERYTHING this call acquired so far
+#      (resources released, item statuses reverted to what they were before
+#      this call touched them) and marks the manifest 'failed' with a
+#      structured detail identifying exactly what conflicted. No partial
+#      state is ever left behind.
+#   5. On full success the manifest is marked 'claimed' and every item comes
+#      back in_progress with its resources held.
+#
+# item_sessions lets a caller pre-assign a DISTINCT claiming session per item
+# (the normal real-parallelism shape: each worker gets its own session_id
+# before it launches, matching how 18c488b6's own tests exercise two
+# different sessions claiming two disjoint symbols in the same file) —
+# resources end up held under the SAME session that will actually do the
+# work, so nothing needs to be "handed off" after workers start. Any item_id
+# not present in item_sessions falls back to the top-level session_id (the
+# simple single-claimant case).
+# ---------------------------------------------------------------------------
+
+
+async def _claim_batch_resource(
+    db: aiosqlite.Connection,
+    resource: str,
+    session_id: str,
+    resource_contents: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Acquire ONE declared resource for the atomic batch gate.
+
+    Self-contained mirror of meridian.mcp.handler._sprint_item_resource_claim
+    _gate's per-resource acquisition logic (file:/symbol: via claim_file/
+    claim_symbol with AST-aware symbol disjointness and a whole-file
+    fallback when no source content is available; anything else via the
+    generic typed-resource lock claim_resource) — reimplemented here rather
+    than imported, since meridian.db must not depend on meridian.mcp.
+
+    Returns ``{"acquired": True, "newly_acquired": bool, "scope": "file"|
+    "symbol"|"generic"|"none", "resource": resource, ...}`` on success, or
+    ``{"acquired": False, "scope": ..., "resource": resource,
+    "holder_session_id": ..., "reason": ...}`` on conflict.
+    """
+    from meridian.db import (  # noqa: PLC0415
+        claim_file, claim_symbol, claim_resource,
+        get_file_claims, get_symbol_claims, get_resource_claims,
+    )
+
+    if resource.startswith("file:"):
+        file_path = resource[len("file:"):]
+        pre = await get_file_claims(db, file_path)
+        pre_held = bool((pre.get("file_lock") or {}).get("session_id") == session_id)
+        result = await claim_file(db, file_path, session_id, mode="write")
+        if result.get("claimed"):
+            return {
+                "acquired": True, "scope": "file", "resource": resource,
+                "file_path": file_path, "newly_acquired": not pre_held,
+            }
+        return {
+            "acquired": False, "scope": "file", "resource": resource,
+            "file_path": file_path,
+            "holder_session_id": result.get("holder_session_id"),
+            "reason": result.get("reason") or "locked",
+        }
+
+    if resource.startswith("symbol:"):
+        value = resource[len("symbol:"):]
+        file_path, sep, symbol_name = value.partition("::")
+        if not sep or not symbol_name or not file_path:
+            # Bare symbol id with no resolvable file scope — nothing to lock.
+            return {
+                "acquired": True, "scope": "none", "resource": resource,
+                "newly_acquired": False, "fallback_reason": "no_file_scope",
+            }
+
+        content = _batch_resource_content_lookup(resource_contents, file_path)
+        fallback_reason: str | None = None
+        if content:
+            symbol_claims = await get_symbol_claims(db, file_path)
+            pre_held = any(
+                c.get("symbol_name") == symbol_name and c.get("session_id") == session_id
+                for c in symbol_claims
+            )
+            symbol_result = await claim_symbol(db, session_id, file_path, symbol_name, content)
+            if symbol_result.get("claimed"):
+                return {
+                    "acquired": True, "scope": "symbol", "resource": resource,
+                    "file_path": file_path, "symbol": symbol_name,
+                    "newly_acquired": not pre_held,
+                }
+            if symbol_result.get("reason") in ("symbol_conflict", "file_locked"):
+                holder = symbol_result.get("holder_session_id")
+                if not holder:
+                    conf = symbol_result.get("conflicts") or [{}]
+                    holder = conf[0].get("holder_session_id")
+                return {
+                    "acquired": False, "scope": "symbol", "resource": resource,
+                    "file_path": file_path, "symbol": symbol_name,
+                    "holder_session_id": holder,
+                    "reason": symbol_result.get("reason"),
+                }
+            # unparseable / symbol_not_found — explicit fallback, recorded below.
+            fallback_reason = symbol_result.get("reason") or "unparseable"
+        else:
+            fallback_reason = "no_source_supplied"
+
+        file_claims = await get_file_claims(db, file_path)
+        pre_held_file = bool(
+            (file_claims.get("file_lock") or {}).get("session_id") == session_id
+        )
+        file_result = await claim_file(db, file_path, session_id, mode="write")
+        if file_result.get("claimed"):
+            return {
+                "acquired": True, "scope": "file", "resource": resource,
+                "file_path": file_path, "symbol": symbol_name,
+                "newly_acquired": not pre_held_file,
+                "fallback_reason": fallback_reason,
+            }
+        return {
+            "acquired": False, "scope": "file", "resource": resource,
+            "file_path": file_path, "symbol": symbol_name,
+            "holder_session_id": file_result.get("holder_session_id"),
+            "reason": file_result.get("reason") or "locked",
+            "fallback_reason": fallback_reason,
+        }
+
+    # Other typed resources (db:, route:, mcp_tool:, pypi:, github:, note:,
+    # decision:) — the generic typed-resource lock primitive.
+    claims = await get_resource_claims(db, resource)
+    pre_held = bool((claims.get("resource_lock") or {}).get("session_id") == session_id)
+    result = await claim_resource(db, resource, session_id)
+    if result.get("claimed"):
+        return {
+            "acquired": True, "scope": "generic", "resource": resource,
+            "newly_acquired": not pre_held,
+        }
+    return {
+        "acquired": False, "scope": "generic", "resource": resource,
+        "holder_session_id": result.get("holder_session_id"),
+        "reason": "locked",
+    }
+
+
+def _batch_resource_content_lookup(
+    resource_contents: dict[str, Any] | None, file_path: str
+) -> str | None:
+    """Best-effort lookup of caller-supplied source for ``file_path``,
+    tolerant of backslash/leading-``./`` path-separator variance. Mirrors
+    meridian.mcp.handler._resource_content_lookup."""
+    if not resource_contents or not isinstance(resource_contents, dict):
+        return None
+    if file_path in resource_contents:
+        val = resource_contents[file_path]
+        return val if isinstance(val, str) and val else None
+    normalized = file_path.strip().replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    for key, val in resource_contents.items():
+        k = str(key or "").strip().replace("\\", "/")
+        if k.startswith("./"):
+            k = k[2:]
+        if k == normalized and isinstance(val, str) and val:
+            return val
+    return None
+
+
+async def _release_batch_resource(
+    db: aiosqlite.Connection, entry: dict[str, Any], session_id: str
+) -> None:
+    """Release exactly one entry _claim_batch_resource newly acquired. Never
+    raises — best-effort cleanup during a batch rollback."""
+    from meridian.db import release_file, release_symbol, release_resource  # noqa: PLC0415
+    scope = entry.get("scope")
+    try:
+        if scope == "file":
+            await release_file(db, entry["file_path"], session_id)
+        elif scope == "symbol":
+            await release_symbol(db, session_id, entry["file_path"], entry["symbol"])
+        elif scope == "generic":
+            await release_resource(db, entry["resource"], session_id)
+        # scope == "none": nothing was ever acquired for this entry.
+    except Exception:  # noqa: BLE001 — best-effort cleanup, never raise from here
+        pass
+
+
+async def _revert_batch_item_claim(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    original_status: str,
+    original_actor: str | None,
+) -> None:
+    """Undo a claim_sprint_item this SAME batch call just made, used when a
+    LATER item/resource in the batch fails and the whole attempt must roll
+    back to a no-partial-claim state.
+
+    Reverts status back to ``original_status`` (whatever it was immediately
+    before this call claimed it) via _transition_status's atomic from-state
+    guard, then explicitly restores claimed_at/actor (mirroring
+    requeue_or_fail_stalled_item's re-queue bookkeeping — _transition_status
+    itself only clears claimed_at when told to set it "now", never to NULL).
+    """
+    reverted = await _transition_status(
+        db, project_id, item_id, original_status,
+        from_statuses=["in_progress"],
+    )
+    if reverted is None:
+        # Another session raced in and moved the item on from in_progress
+        # before this rollback landed — nothing safe to revert; leave it as
+        # is rather than force a status it may no longer legitimately hold.
+        return
+    await db.execute(
+        "UPDATE sprint_items SET claimed_at = NULL, actor = ? "
+        "WHERE id = ? AND project_id = ?",
+        (original_actor, item_id, project_id),
+    )
+    await db.commit()
+    _invalidate_sprint_items_cache(project_id)
+
+
+async def claim_parallel_batch(
+    db: aiosqlite.Connection,
+    project_id: str,
+    session_id: str,
+    item_ids: list[str],
+    *,
+    item_sessions: dict[str, str] | None = None,
+    resource_contents: dict[str, Any] | None = None,
+    force_manifest: bool = False,
+    manifest_reason: str | None = None,
+) -> dict[str, Any]:
+    """22cad9b8 — atomically claim a whole parallel-safe batch of sprint items.
+
+    ``session_id`` is the requesting/orchestrating session, recorded on the
+    durable batch manifest and used as the default claiming identity for any
+    item not overridden in ``item_sessions``. ``item_sessions`` optionally
+    maps ``{item_id: claiming_session_id}`` so a caller can pre-assign each
+    item to the DISTINCT worker session that will actually execute it —
+    resources then end up held under the session that does the work, so
+    nothing needs handing off once workers launch.
+
+    Returns ``{"ok": True, "manifest_id", "batch_key", "claimed_item_ids",
+    "items", "resources", "manifest"}`` on success, or ``{"ok": False,
+    "error": <code>, "message": ...}`` (plus error-specific fields) on any
+    rejection — never raises for an expected validation/conflict outcome, only
+    for a genuine caller bug (empty item_ids / missing session_id). See the
+    module-level comment above for the full step-by-step contract; error
+    codes are: ITEM_NOT_FOUND, UNDECLARED_RESOURCE_IN_BATCH,
+    BATCH_COMPOSITION_CONFLICT, BATCH_MANIFEST_EXISTS, ITEM_CLAIM_CONFLICT,
+    <claim_sprint_item's own blocked "error" values e.g. DEFERRED/SUPERSEDED/
+    WAVE_GATE_PENDING/UNPROSPECTED>, BATCH_RESOURCE_CONFLICT.
+    """
+    if not session_id:
+        raise ValueError("session_id is required to claim a batch")
+    seen_ids: set[str] = set()
+    ordered_ids: list[str] = []
+    for iid in item_ids or []:
+        if iid and iid not in seen_ids:
+            seen_ids.add(iid)
+            ordered_ids.append(iid)
+    if not ordered_ids:
+        raise ValueError("item_ids must be a non-empty list")
+
+    from .batch_claim import (  # noqa: PLC0415
+        persist_batch_claim_manifest, mark_batch_claim_outcome, compute_batch_key,
+    )
+
+    # ── 1. Load + validate every item exists and belongs to this project ───
+    items_by_id: dict[str, dict[str, Any]] = {}
+    for iid in ordered_ids:
+        item = await get_sprint_item(db, iid)
+        if item is None or item.get("project_id") != project_id:
+            return {
+                "ok": False,
+                "error": "ITEM_NOT_FOUND",
+                "message": f"sprint item {iid!r} not found in project {project_id!r}",
+                "item_id": iid,
+            }
+        items_by_id[iid] = item
+
+    item_resources: dict[str, list[str]] = {
+        iid: parse_touches_resources(items_by_id[iid].get("touches_resources"))
+        for iid in ordered_ids
+    }
+
+    # ── Undeclared-resource guard: never silently treat "nothing declared"
+    # as "safe to parallelize" (mirrors get_parallelizable_groups' de730a25
+    # invariant). A batch of exactly one item is exempt — nothing else in a
+    # singleton batch exists for it to conflict with. ──
+    if len(ordered_ids) > 1:
+        undeclared = [iid for iid in ordered_ids if not item_resources[iid]]
+        if undeclared:
+            return {
+                "ok": False,
+                "error": "UNDECLARED_RESOURCE_IN_BATCH",
+                "message": (
+                    "item(s) "
+                    f"{', '.join(i[:8] for i in undeclared)} declare no "
+                    "touches_resources, so parallel safety can't be proven for "
+                    "them. Claim them individually (a batch of one) instead of "
+                    "including them in a multi-item atomic batch."
+                ),
+                "undeclared_item_ids": undeclared,
+            }
+
+    # ── 2. Internal composition check: the requested batch must itself be
+    # conflict-free, using the same file⊃symbol-aware comparison
+    # get_parallelizable_groups' coloring uses. Catches a stale or
+    # hand-assembled batch that was never actually disjoint. ──
+    composition_conflicts: list[dict[str, Any]] = []
+    for i, a_id in enumerate(ordered_ids):
+        a_res = set(item_resources[a_id])
+        for b_id in ordered_ids[i + 1:]:
+            b_res = set(item_resources[b_id])
+            if _resource_sets_conflict(a_res, b_res):
+                composition_conflicts.append({
+                    "item_a": a_id, "item_b": b_id,
+                    "resources_a": sorted(a_res), "resources_b": sorted(b_res),
+                })
+    if composition_conflicts:
+        return {
+            "ok": False,
+            "error": "BATCH_COMPOSITION_CONFLICT",
+            "message": (
+                "requested batch is not internally conflict-free — two or more "
+                "items in it declare overlapping resources. Recompute the batch "
+                "via get_parallelizable_groups and retry."
+            ),
+            "conflicting_pairs": composition_conflicts,
+        }
+
+    resources_union = sorted({r for lst in item_resources.values() for r in lst})
+
+    # ── 3. Persist the immutable manifest BEFORE attempting any lock — a
+    # durable audit record of what was decided, independent of whether the
+    # attempt below actually succeeds. ──
+    try:
+        manifest = await persist_batch_claim_manifest(
+            db, project_id, session_id, ordered_ids, item_resources, resources_union,
+            force=force_manifest, reason=manifest_reason,
+        )
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "error": "BATCH_MANIFEST_EXISTS",
+            "message": str(exc),
+            "batch_key": compute_batch_key(ordered_ids),
+        }
+
+    # ── 4. Attempt to atomically claim every item's status AND every
+    # declared resource. All-or-nothing across the whole batch. ──
+    claimed_items: list[tuple[str, str, str | None]] = []  # (item_id, orig_status, orig_actor)
+    acquired_resources: list[dict[str, Any]] = []
+
+    async def _rollback_and_fail(error_code: str, message: str, **extra: Any) -> dict[str, Any]:
+        for entry in reversed(acquired_resources):
+            await _release_batch_resource(db, entry, entry["_session_id"])
+        for iid, orig_status, orig_actor in reversed(claimed_items):
+            await _revert_batch_item_claim(db, project_id, iid, orig_status, orig_actor)
+        detail = {"error": error_code, "message": message, **extra}
+        await mark_batch_claim_outcome(db, manifest["id"], "failed", failure_detail=detail)
+        return {"ok": False, "manifest_id": manifest["id"], **detail}
+
+    for iid in ordered_ids:
+        item = items_by_id[iid]
+        orig_status = item.get("status") or "pending"
+        orig_actor = item.get("actor")
+        claim_session = (item_sessions or {}).get(iid, session_id)
+        try:
+            claim_result = await claim_sprint_item(db, project_id, iid, actor=claim_session)
+        except ValueError as exc:
+            return await _rollback_and_fail(
+                "ITEM_CLAIM_CONFLICT",
+                f"could not claim sprint item {iid!r}: {exc}",
+                item_id=iid,
+            )
+        if claim_result is None:
+            return await _rollback_and_fail(
+                "ITEM_CLAIM_CONFLICT",
+                f"sprint item {iid!r} vanished during the batch claim attempt",
+                item_id=iid,
+            )
+        if isinstance(claim_result, dict) and claim_result.get("blocked"):
+            return await _rollback_and_fail(
+                claim_result.get("error") or "ITEM_CLAIM_BLOCKED",
+                claim_result.get("reason") or f"sprint item {iid!r} could not be claimed",
+                item_id=iid,
+            )
+        claimed_items.append((iid, orig_status, orig_actor))
+
+        for resource in item_resources[iid]:
+            outcome = await _claim_batch_resource(db, resource, claim_session, resource_contents)
+            if not outcome.get("acquired"):
+                return await _rollback_and_fail(
+                    "BATCH_RESOURCE_CONFLICT",
+                    f"resource {resource!r} (item {iid!r}) is locked by another "
+                    f"live session ({outcome.get('holder_session_id')}).",
+                    item_id=iid, resource=resource,
+                    holder_session_id=outcome.get("holder_session_id"),
+                )
+            if outcome.get("newly_acquired"):
+                outcome["_item_id"] = iid
+                outcome["_session_id"] = claim_session
+                acquired_resources.append(outcome)
+
+    final_manifest = await mark_batch_claim_outcome(db, manifest["id"], "claimed")
+    result_items = [await get_sprint_item(db, iid) for iid in ordered_ids]
+    return {
+        "ok": True,
+        "manifest_id": manifest["id"],
+        "batch_key": manifest["batch_key"],
+        "claimed_item_ids": ordered_ids,
+        "items": result_items,
+        "resources": resources_union,
+        "manifest": final_manifest,
+    }
+
+
 def _topo_depth_map(items: list[dict[str, Any]]) -> dict[str, int]:
     """Compute topological depth for each item in ``items`` by dependency.
 
@@ -4196,11 +4836,21 @@ async def analyze_sprint(
 # next-wave items, and a future add to claim_sprint_item can query this table.
 # ---------------------------------------------------------------------------
 
+# ed8e4524 — `version` (nullable) scopes a gate result to ONE sprint-version
+# bucket; NULL is the legacy/project-wide bucket (unchanged pre-fix meaning).
+# The UNIQUE constraint includes version so two DIFFERENT versions can each
+# complete their OWN gate for a wave_label they happen to share. This DDL is
+# the fallback safety net for a table created before the formal migration
+# runs (see meridian.db.migrations._migrate_wave_gate_results /
+# pg_adapter._migrate_pg_wave_gate_results, which are what actually create
+# this table at init_db time and are kept in sync with this text) — it is a
+# no-op on an already-existing table either way.
 _WAVE_GATE_RESULTS_TABLE_DDL = (
     "CREATE TABLE IF NOT EXISTS wave_gate_results ("
     "    id TEXT PRIMARY KEY,"
     "    project_id TEXT NOT NULL,"
     "    wave_label TEXT NOT NULL,"         # e.g. 'wave-1'
+    "    version TEXT,"                     # NULL = unscoped/legacy bucket
     "    gate_passed INTEGER NOT NULL DEFAULT 1,"  # always 1 (rejected gates never write)
     "    exit_code INTEGER,"
     "    passed_count INTEGER,"
@@ -4209,7 +4859,7 @@ _WAVE_GATE_RESULTS_TABLE_DDL = (
     "    evidence_snapshot TEXT,"           # JSON of the full payload
     "    actor TEXT,"
     "    completed_at TEXT NOT NULL DEFAULT (datetime('now')),"
-    "    UNIQUE(project_id, wave_label)"    # one gate result per project+wave
+    "    UNIQUE(project_id, wave_label, version)"  # one gate result per project+wave+version
     ")"
 )
 
@@ -4225,6 +4875,7 @@ async def complete_wave_gate(
     wave_label: str,
     verification_payload: dict[str, Any],
     actor: str | None = None,
+    version: str | None = None,
 ) -> dict[str, Any]:
     """d2430713 — record a verified wave gate completion and report next-wave readiness.
 
@@ -4238,11 +4889,23 @@ async def complete_wave_gate(
     only the genuine output of run_verification — which runs the REAL test suite on
     the caller's machine — is accepted.
 
+    ``version`` (ed8e4524) scopes this gate completion to ONE sprint-version
+    bucket, closing the cross-version leak where two different sprint versions
+    that happen to reuse the SAME ``wave_label`` (e.g. both have a 'wave-2')
+    could satisfy or unblock each other's gate. ``None`` (default) is the
+    LEGACY/unscoped behavior — exactly the pre-fix, project-wide check —
+    so a project with only one sprint version in play is unaffected. When
+    given, the duplicate-gate check AND the next-wave-items query are both
+    restricted to items/results stamped with this SAME version (mirroring
+    ``handoff._resolve_session_sprint_version`` / 660314c1's checkpoint fix,
+    which resolves an analogous scope for a session's pending items).
+
     On success a row is written to ``wave_gate_results`` and the function returns::
 
         {
             "gate_completed": True,
             "wave_label": "wave-1",
+            "version": "v0.2.6",              # the resolved scope, or None
             "next_wave_label": "wave-2",      # None if no next wave exists
             "next_wave_item_count": <int>,    # how many pending/todo items in next wave
             "next_wave_item_ids": [...],
@@ -4250,8 +4913,14 @@ async def complete_wave_gate(
         }
 
     Raises ValueError on evidence failure (bad payload) or if the gate for this
-    wave has already been completed.
+    wave (and version, when given) has already been completed.
     """
+    # ed8e4524 — normalize "" / whitespace-only to None, same convention as
+    # start_wave_run's version handling, so a legacy sprint_items.version of ""
+    # (the NOT-NULL column's empty-bucket default) lines up with an unscoped
+    # (NULL) wave_gate_results/configs row instead of silently mismatching it.
+    version = (version or "").strip() or None
+
     # ── 1. Validate evidence ────────────────────────────────────────────────────
     if not isinstance(verification_payload, dict):
         raise ValueError(
@@ -4302,17 +4971,28 @@ async def complete_wave_gate(
 
     # ── 2. Check for duplicate gate completion ────────────────────────────────────
     await _ensure_wave_gate_results_table(db)
+    # ed8e4524 — scope the duplicate check to `version` when given (a DIFFERENT
+    # version's completed row for the same wave_label must NOT be reported as
+    # "already completed" here — that was the exact cross-version block bug).
+    # version=None keeps the original unscoped match (any row for this
+    # project+wave_label, regardless of stored version, counts as a dup).
+    _dup_clauses = ["project_id = ?", "wave_label = ?"]
+    _dup_params: list[Any] = [project_id, wave_label]
+    if version is not None:
+        _dup_clauses.append("version = ?")
+        _dup_params.append(version)
     async with db.execute(
-        "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
-        (project_id, wave_label),
+        f"SELECT id FROM wave_gate_results WHERE {' AND '.join(_dup_clauses)}",
+        _dup_params,
     ) as _dup_cur:
         _dup_row = await _dup_cur.fetchone()
     if _dup_row is not None:
         existing_id = _dup_row[0] if not isinstance(_dup_row, dict) else _dup_row["id"]
+        _version_note = f" (version {version!r})" if version else ""
         raise ValueError(
-            f"Wave gate for {wave_label!r} on project {project_id!r} has already been "
-            f"completed (gate_id={existing_id!r}). Each wave gate may only be completed "
-            f"once."
+            f"Wave gate for {wave_label!r} on project {project_id!r}{_version_note} "
+            f"has already been completed (gate_id={existing_id!r}). Each wave gate "
+            f"may only be completed once."
         )
 
     # ── 3. Determine the next wave label ─────────────────────────────────────────
@@ -4323,12 +5003,23 @@ async def complete_wave_gate(
         next_wave_label = f"{_parts[0]}-{int(_parts[1]) + 1}"
 
     # ── 4. Find next-wave items (informational) ───────────────────────────────────
+    # ed8e4524 — THE confirmed defect: this query used to filter only on
+    # project_id + wave, so two sprint versions sharing the same wave label
+    # (e.g. both have a 'wave-2') would leak each other's items into
+    # next_wave_item_ids. version=None preserves the exact prior unscoped
+    # query (matches sprint_items.get_sprint_items's own `if version is not
+    # None` convention for "no filter means every version").
     next_wave_item_ids: list[str] = []
     if next_wave_label is not None:
+        _nw_clauses = ["project_id = ?", "wave = ?", "status IN ('pending', 'todo')"]
+        _nw_params: list[Any] = [project_id, next_wave_label]
+        if version is not None:
+            _nw_clauses.append("version = ?")
+            _nw_params.append(version)
         async with db.execute(
-            "SELECT id FROM sprint_items WHERE project_id = ? AND wave = ? "
-            "AND status IN ('pending', 'todo') ORDER BY added_at",
-            (project_id, next_wave_label),
+            f"SELECT id FROM sprint_items WHERE {' AND '.join(_nw_clauses)} "
+            f"ORDER BY added_at",
+            _nw_params,
         ) as _nw_cur:
             _nw_rows = await _nw_cur.fetchall()
         next_wave_item_ids = [
@@ -4340,13 +5031,14 @@ async def complete_wave_gate(
     evidence_snapshot = json.dumps(verification_payload)
     await db.execute(
         "INSERT INTO wave_gate_results "
-        "(id, project_id, wave_label, gate_passed, exit_code, passed_count, "
+        "(id, project_id, wave_label, version, gate_passed, exit_code, passed_count, "
         " failed_count, verification_status, evidence_snapshot, actor) "
-        "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
         (
             gate_id,
             project_id,
             wave_label,
+            version,
             v_exit,
             v_passed,
             v_failed if v_failed is not None else 0,
@@ -4360,6 +5052,7 @@ async def complete_wave_gate(
     return {
         "gate_completed": True,
         "wave_label": wave_label,
+        "version": version,
         "next_wave_label": next_wave_label,
         "next_wave_item_count": len(next_wave_item_ids),
         "next_wave_item_ids": next_wave_item_ids,
@@ -4396,17 +5089,23 @@ _VALID_WAVE_GATE_ACTIONS = frozenset({
     "push_dev", "push_main", "deploy", "wait", "run_verification",
 })
 
+# ed8e4524 — `version` (nullable) scopes a gate config to ONE sprint-version
+# bucket, same convention as wave_gate_results.version above. This DDL is the
+# fallback safety net (see the note above _WAVE_GATE_RESULTS_TABLE_DDL — kept
+# in sync with meridian.db.migrations._migrate_wave_gate_configs /
+# pg_adapter._migrate_pg_wave_gate_configs, the actual creation path).
 _WAVE_GATE_CONFIGS_TABLE_DDL = (
     "CREATE TABLE IF NOT EXISTS wave_gate_configs ("
     "    id TEXT PRIMARY KEY,"
     "    project_id TEXT NOT NULL,"
     "    wave_start TEXT NOT NULL,"     # first wave covered by this gate (documentation)
     "    wave_end TEXT NOT NULL,"       # boundary wave — enforcement key
+    "    version TEXT,"                 # NULL = unscoped/legacy bucket
     "    actions TEXT NOT NULL,"        # JSON array of {"type": ..., ...params}
     "    actor TEXT,"
     "    created_at TEXT NOT NULL DEFAULT (datetime('now')),"
     "    updated_at TEXT NOT NULL DEFAULT (datetime('now')),"
-    "    UNIQUE(project_id, wave_end)"  # one pipeline per boundary wave
+    "    UNIQUE(project_id, wave_end, version)"  # one pipeline per boundary wave+version
     ")"
 )
 
@@ -4439,6 +5138,7 @@ async def configure_wave_gate(
     actions: list[dict[str, Any]],
     wave_start: str | None = None,
     actor: str | None = None,
+    version: str | None = None,
 ) -> dict[str, Any]:
     """74a8f420 — configure (or on-the-fly reconfigure) a wave gate's action pipeline.
 
@@ -4454,14 +5154,29 @@ async def configure_wave_gate(
     run_verification (extra keys — e.g. {"type": "wait", "seconds": 30} — are
     preserved verbatim for the executor to read).
 
+    ``version`` (ed8e4524) scopes this gate CONFIG to ONE sprint-version
+    bucket — the same class of fix as ``complete_wave_gate``'s ``version``
+    param (see its docstring). ``None`` (default) is the legacy/unscoped
+    behavior: matches ANY existing config/result row for this ``wave_end``,
+    exactly the pre-fix project-wide semantics. When given, both the
+    immutability check (has this version's gate already passed?) and the
+    upsert lookup (does this version already have a config for this
+    wave_end?) are restricted to that SAME version, so version B can
+    configure and later complete its own ``wave_end`` boundary independently
+    of version A reusing the same label.
+
     Re-configuring an already-configured (but not yet passed) ``wave_end`` is
     an upsert — this is the "on-the-fly-configurable" half of the spec: a
     planner can revise the pipeline for a wave boundary right up until an
-    executor actually completes it. Once wave_gate_results has a row for
-    wave_end the config is immutable (raises ValueError) — rewriting a passed
-    gate's pipeline after the fact would silently invalidate evidence that
-    claim_sprint_item already relied on to unblock items.
+    executor actually completes it. Once wave_gate_results has a matching row
+    for wave_end (and version, when given) the config is immutable (raises
+    ValueError) — rewriting a passed gate's pipeline after the fact would
+    silently invalidate evidence that claim_sprint_item already relied on to
+    unblock items.
     """
+    # ed8e4524 — same "" -> None normalization as complete_wave_gate; see that
+    # function's docstring for why.
+    version = (version or "").strip() or None
     wave_end = str(wave_end or "").strip()
     if not wave_end:
         raise ValueError("configure_wave_gate requires a non-empty wave_end")
@@ -4490,23 +5205,40 @@ async def configure_wave_gate(
     await _ensure_wave_gate_configs_table(db)
     await _ensure_wave_gate_results_table(db)
 
-    # A passed gate's config is immutable — see docstring.
+    # A passed gate's config is immutable — see docstring. Scoped to `version`
+    # when given (ed8e4524): version=None matches ANY existing result row for
+    # this wave_end (unscoped, exactly the pre-fix behavior); an explicit
+    # version only matches a result row completed under that SAME version.
+    _passed_clauses = ["project_id = ?", "wave_label = ?"]
+    _passed_params: list[Any] = [project_id, wave_end]
+    if version is not None:
+        _passed_clauses.append("version = ?")
+        _passed_params.append(version)
     async with db.execute(
-        "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
-        (project_id, wave_end),
+        f"SELECT id FROM wave_gate_results WHERE {' AND '.join(_passed_clauses)}",
+        _passed_params,
     ) as _res_cur:
         _already_passed = await _res_cur.fetchone()
     if _already_passed is not None:
+        _version_note = f" (version {version!r})" if version else ""
         raise ValueError(
-            f"Wave gate for {wave_end!r} on project {project_id!r} has already "
-            "completed — its pipeline is immutable. Configure a NEW wave_end "
-            "boundary instead of reconfiguring a passed gate."
+            f"Wave gate for {wave_end!r} on project {project_id!r}{_version_note} "
+            "has already completed — its pipeline is immutable. Configure a NEW "
+            "wave_end boundary instead of reconfiguring a passed gate."
         )
 
     _actions_json = json.dumps(_normalized)
+    # ed8e4524 — same version scoping for the upsert lookup: a config row
+    # belonging to a DIFFERENT version (or the unscoped legacy bucket) must
+    # never be silently overwritten by this call.
+    _cfg_clauses = ["project_id = ?", "wave_end = ?"]
+    _cfg_params: list[Any] = [project_id, wave_end]
+    if version is not None:
+        _cfg_clauses.append("version = ?")
+        _cfg_params.append(version)
     async with db.execute(
-        "SELECT id FROM wave_gate_configs WHERE project_id = ? AND wave_end = ?",
-        (project_id, wave_end),
+        f"SELECT id FROM wave_gate_configs WHERE {' AND '.join(_cfg_clauses)}",
+        _cfg_params,
     ) as _cfg_cur:
         _existing = await _cfg_cur.fetchone()
     if _existing is not None:
@@ -4520,9 +5252,9 @@ async def configure_wave_gate(
         _config_id = _new_id()
         await db.execute(
             "INSERT INTO wave_gate_configs "
-            "(id, project_id, wave_start, wave_end, actions, actor) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (_config_id, project_id, wave_start, wave_end, _actions_json, actor),
+            "(id, project_id, wave_start, wave_end, version, actions, actor) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_config_id, project_id, wave_start, wave_end, version, _actions_json, actor),
         )
     await db.commit()
 
@@ -4532,22 +5264,39 @@ async def configure_wave_gate(
         "project_id": project_id,
         "wave_start": wave_start,
         "wave_end": wave_end,
+        "version": version,
         "actions": _normalized,
     }
 
 
 async def get_wave_gate_configs(
-    db: aiosqlite.Connection, project_id: str,
+    db: aiosqlite.Connection, project_id: str, version: str | None = None,
 ) -> list[dict[str, Any]]:
     """Read-only: list every configured wave gate for a project (oldest first),
     each annotated with ``gate_passed`` (whether wave_gate_results already has
     a matching row) so callers don't need a second query to know what's still
-    pending."""
+    pending.
+
+    ``version`` (ed8e4524) optionally restricts the listing to gates
+    EXPLICITLY configured under that exact sprint-version bucket. ``None``
+    (default) returns every configured gate regardless of its stored version
+    — the unchanged, original behavior every existing caller
+    (capability_contract.build_capability_contract, executor_contract,
+    handoff._build_quick_start_goal and friends) relies on, since none of
+    them pass this parameter.
+    """
     await _ensure_wave_gate_configs_table(db)
     await _ensure_wave_gate_results_table(db)
+    version = (version or "").strip() or None
+    _clauses = ["project_id = ?"]
+    _params: list[Any] = [project_id]
+    if version is not None:
+        _clauses.append("version = ?")
+        _params.append(version)
     async with db.execute(
-        "SELECT * FROM wave_gate_configs WHERE project_id = ? ORDER BY created_at",
-        (project_id,),
+        f"SELECT * FROM wave_gate_configs WHERE {' AND '.join(_clauses)} "
+        f"ORDER BY created_at",
+        _params,
     ) as _cur:
         _rows = await _cur.fetchall()
     out: list[dict[str, Any]] = []
@@ -4557,9 +5306,20 @@ async def get_wave_gate_configs(
             _cfg["actions"] = json.loads(_cfg.get("actions") or "[]")
         except (TypeError, ValueError):
             _cfg["actions"] = []
+        # ed8e4524 — the passed-check is scoped to THIS row's own stored
+        # version (not the listing filter above): an unscoped (NULL) config
+        # matches ANY results row for the wave_label (project-wide, exactly
+        # the pre-fix behavior); a version-scoped config only matches a
+        # results row completed under that SAME version.
+        _row_version = _cfg.get("version")
+        _res_clauses = ["project_id = ?", "wave_label = ?"]
+        _res_params: list[Any] = [project_id, _cfg.get("wave_end")]
+        if _row_version is not None:
+            _res_clauses.append("version = ?")
+            _res_params.append(_row_version)
         async with db.execute(
-            "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
-            (project_id, _cfg.get("wave_end")),
+            f"SELECT id FROM wave_gate_results WHERE {' AND '.join(_res_clauses)}",
+            _res_params,
         ) as _res_cur:
             _cfg["gate_passed"] = (await _res_cur.fetchone()) is not None
         out.append(_cfg)
@@ -4568,20 +5328,37 @@ async def get_wave_gate_configs(
 
 async def _get_blocking_wave_gate(
     db: aiosqlite.Connection, project_id: str, item_wave: str | None,
+    version: str | None = None,
 ) -> dict[str, Any] | None:
     """Return the lowest-boundary configured-but-unpassed wave gate that
     structurally blocks claiming an item in ``item_wave``, or None if nothing
-    blocks it (no wave on the item, no configs, an unparseable wave label, or
-    every configured boundary at-or-below this wave has already passed).
+    blocks it (no wave on the item, no configs, an unparseable wave label,
+    every configured boundary at-or-below this wave has already passed, or
+    every boundary-scoped config belongs to a DIFFERENT sprint version).
 
     This is the function claim_sprint_item calls to turn wave gates from
     advisory /goal prose into a real, structural claim-time block.
+
+    ``version`` (ed8e4524, pass the CLAIMED ITEM's own ``item.get("version")``)
+    is the item's sprint-version bucket. A gate config with an EXPLICIT
+    stored version only applies to — and can only be satisfied by evidence
+    from — items/completions in that SAME version, closing the cross-version
+    leak where completing version A's 'wave-1' gate could unblock version B's
+    'wave-2' items just because they share the label. A config with NO stored
+    version (the default when configure_wave_gate/complete_wave_gate are
+    called without ``version`` — still the common, single-sprint-version
+    case) remains PROJECT-WIDE and applies unconditionally regardless of the
+    item's own version, exactly like before this fix — this is what keeps a
+    project that never explicitly version-scopes its wave-gate calls
+    (including one whose items still carry an ordinary version string like
+    'v1') working unchanged.
     """
     _item_prefix, _item_num = _split_wave_label(item_wave)
     if _item_num is None:
         return None
     await _ensure_wave_gate_configs_table(db)
     await _ensure_wave_gate_results_table(db)
+    version = (version or "").strip() or None
     async with db.execute(
         "SELECT * FROM wave_gate_configs WHERE project_id = ?",
         (project_id,),
@@ -4591,16 +5368,24 @@ async def _get_blocking_wave_gate(
     _blocking_num: int | None = None
     for _row in _configs:
         _cfg = _row_to_dict(_row) or {}
+        _cfg_version = _cfg.get("version")
+        if _cfg_version is not None and _cfg_version != version:
+            continue  # a version-scoped config that isn't THIS item's version
         _cfg_prefix, _cfg_num = _split_wave_label(_cfg.get("wave_end"))
         if _cfg_num is None or _cfg_prefix != _item_prefix or _cfg_num >= _item_num:
             continue  # not a boundary strictly before this item's wave
+        _res_clauses = ["project_id = ?", "wave_label = ?"]
+        _res_params: list[Any] = [project_id, _cfg.get("wave_end")]
+        if _cfg_version is not None:
+            _res_clauses.append("version = ?")
+            _res_params.append(_cfg_version)
         async with db.execute(
-            "SELECT id FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
-            (project_id, _cfg.get("wave_end")),
+            f"SELECT id FROM wave_gate_results WHERE {' AND '.join(_res_clauses)}",
+            _res_params,
         ) as _res_cur:
             _passed = await _res_cur.fetchone()
         if _passed is not None:
-            continue  # this boundary's gate already passed
+            continue  # this boundary's gate already passed (for this version)
         if _blocking_num is None or _cfg_num < _blocking_num:
             try:
                 _cfg["actions"] = json.loads(_cfg.get("actions") or "[]")

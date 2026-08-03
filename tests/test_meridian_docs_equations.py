@@ -636,6 +636,68 @@ def test_edit_equation_local_malformed_new_payload_returns_error(tmp_path):
     assert "error" in result
     assert _read_docx_xml(path) == before
 
+def test_edit_equation_local_preserves_surrounding_run_order(tmp_path):
+    xml = _WRITE_XML.replace(
+        "      <m:oMath>\n",
+        "      <w:r><w:t>before</w:t></w:r>\n      <m:oMath>\n",
+    ).replace(
+        "      </m:oMath>\n    </w:p>",
+        "      </m:oMath>\n      <w:r><w:t>after</w:t></w:r>\n    </w:p>",
+    )
+    path = _write_docx(tmp_path, xml)
+    replacement = (
+        f'<m:oMath xmlns:m="{_M}">'
+        "<m:r><m:t>replacement</m:t></m:r>"
+        "</m:oMath>"
+    )
+
+    result = docs_intel.edit_equation_local(path, "0000C002", replacement)
+
+    assert "error" not in result
+    output = _read_docx_xml(path).decode("utf-8")
+    assert output.index("before") < output.index("replacement") < output.index("after")
+
+
+def test_append_text_run_after_math_adds_run_in_place(tmp_path):
+    path = _write_docx(tmp_path, _INLINE_XML)
+
+    result = docs_intel.append_text_run_after_math(path, "0000D001", " after")
+
+    assert result["status"] == "appended"
+    output = _read_docx_xml(path).decode("utf-8")
+    assert output.index("</m:oMath>") < output.index(" after")
+    assert output.index(" after") < output.index("End.")
+
+
+def test_append_text_run_after_math_rejects_ambiguous_equation(tmp_path):
+    xml = _INLINE_XML.replace(
+        "</m:oMath>",
+        "</m:oMath><m:oMath><m:r><m:t>G</m:t></m:r></m:oMath>",
+        1,
+    )
+    path = _write_docx(tmp_path, xml)
+
+    result = docs_intel.append_text_run_after_math(path, "0000D001", " after")
+
+    assert "error" in result
+    assert "math_index is required" in result["error"]
+    assert " after" not in _read_docx_xml(path).decode("utf-8")
+
+
+def test_append_text_run_after_math_selects_by_index(tmp_path):
+    xml = _INLINE_XML.replace(
+        "</m:oMath>",
+        "</m:oMath><m:oMath><m:r><m:t>G</m:t></m:r></m:oMath>",
+        1,
+    )
+    path = _write_docx(tmp_path, xml)
+
+    result = docs_intel.append_text_run_after_math(path, "0000D001", " after", math_index=1)
+
+    assert result["status"] == "appended"
+    output = _read_docx_xml(path).decode("utf-8")
+    assert output.index(">G<") < output.index(" after")
+
 
 # ---------------------------------------------------------------------------
 # remove_equation_local — display-mode (whole paragraph)
@@ -747,3 +809,159 @@ def test_existing_caption_functions_still_work_after_equation_additions(tmp_path
     assert "error" not in result
     assert result["status"] == "inserted"
     assert result["kind"] == "Figure"
+
+
+# ---------------------------------------------------------------------------
+# Configurable style policy (4efc63fd): insert_equation_local /
+# insert_caption / insert_highlighted_note consult resolve_style_policy
+# instead of hardcoding style choices. Deep policy-validation coverage lives
+# in extensions/meridian-docs/tests/test_docx_equation_style_audit.py; this
+# section covers the write-path integration on the existing equation fixtures.
+# ---------------------------------------------------------------------------
+
+def test_insert_equation_local_default_policy_centers_display_equation(tmp_path):
+    """No style_policy passed -> default equation_alignment="center" is still
+    applied to a newly inserted display-mode equation paragraph."""
+    path = _write_docx(tmp_path, _WRITE_XML)
+    result = docs_intel.insert_equation_local(path, "0000C003", _SIMPLE_OMATH, "after")
+    assert "error" not in result
+    xml = _read_docx_xml(path).decode("utf-8")
+    assert 'w:val="center"' in xml
+
+
+def test_insert_equation_local_append_mode_ignores_style_policy(tmp_path):
+    """position="append" has no paragraph of its own, so no pPr/jc/ind is added."""
+    path = _write_docx(tmp_path, _WRITE_XML)
+    before_paras = _count_paragraphs(path)
+    result = docs_intel.insert_equation_local(
+        path, "0000C003", _SIMPLE_OMATH, "append",
+        style_policy={"equation_alignment": "right", "body_indent_twips": 500},
+    )
+    assert "error" not in result
+    assert _count_paragraphs(path) == before_paras
+
+
+def test_insert_equation_local_custom_style_policy_alignment_and_indent(tmp_path):
+    path = _write_docx(tmp_path, _WRITE_XML)
+    result = docs_intel.insert_equation_local(
+        path, "0000C003", _SIMPLE_OMATH, "before",
+        style_policy={"equation_alignment": "right", "body_indent_twips": 240},
+    )
+    assert "error" not in result
+    xml = _read_docx_xml(path).decode("utf-8")
+    assert 'w:val="right"' in xml
+    assert 'w:left="240"' in xml
+
+
+def test_insert_equation_local_invalid_style_policy_errors_without_mutation(tmp_path):
+    path = _write_docx(tmp_path, _WRITE_XML)
+    before = _read_docx_xml(path)
+    result = docs_intel.insert_equation_local(
+        path, "0000C003", _SIMPLE_OMATH, "after",
+        style_policy={"equation_alignment": "sideways"},
+    )
+    assert "error" in result
+    assert _read_docx_xml(path) == before
+
+
+def test_insert_caption_default_policy_not_centered(tmp_path):
+    """Default caption_centered=False preserves pre-4efc63fd output exactly:
+    no w:jc on the caption paragraph."""
+    path = _write_docx(tmp_path, _WRITE_XML)
+    result = docs_intel.insert_caption(
+        docx_path=path, anchor_para_id="0000C001", kind="Figure",
+        label_text="Uncentered figure", position="after",
+    )
+    assert "error" not in result
+    xml = _read_docx_xml(path).decode("utf-8")
+    assert "w:jc" not in xml  # _WRITE_XML has no pre-existing alignment either
+
+
+def test_insert_caption_style_policy_centers_caption(tmp_path):
+    path = _write_docx(tmp_path, _WRITE_XML)
+    result = docs_intel.insert_caption(
+        docx_path=path, anchor_para_id="0000C001", kind="Figure",
+        label_text="Centered figure", position="after",
+        style_policy={"caption_centered": True},
+    )
+    assert "error" not in result
+    xml = _read_docx_xml(path).decode("utf-8")
+    assert 'w:val="center"' in xml
+
+
+def test_insert_caption_invalid_style_policy_errors_without_mutation(tmp_path):
+    path = _write_docx(tmp_path, _WRITE_XML)
+    before = _read_docx_xml(path)
+    result = docs_intel.insert_caption(
+        docx_path=path, anchor_para_id="0000C001", kind="Figure",
+        label_text="Bad policy", position="after",
+        style_policy={"caption_centered": "yes"},
+    )
+    assert "error" in result
+    assert _read_docx_xml(path) == before
+
+
+def test_insert_highlighted_note_default_policy_preserves_original_style(tmp_path):
+    path = _write_docx(tmp_path, _WRITE_XML)
+    result = docs_intel.insert_highlighted_note(
+        path, "Check this later.", "0000C001",
+    )
+    assert "error" not in result
+    assert result["style"] == "MeridianInternalNote"
+    xml = _read_docx_xml(path).decode("utf-8")
+    assert "MeridianInternalNote" in xml
+    assert 'w:val="yellow"' in xml
+
+
+def test_insert_highlighted_note_custom_style_policy(tmp_path):
+    path = _write_docx(tmp_path, _WRITE_XML)
+    result = docs_intel.insert_highlighted_note(
+        path, "Check this later.", "0000C001",
+        style_policy={"note_style": "MeridianReviewNote", "note_highlight_color": "cyan"},
+    )
+    assert "error" not in result
+    assert result["style"] == "MeridianReviewNote"
+    xml = _read_docx_xml(path).decode("utf-8")
+    assert "MeridianReviewNote" in xml
+    assert 'w:val="cyan"' in xml
+
+
+def test_insert_highlighted_note_invalid_style_policy_errors_without_mutation(tmp_path):
+    path = _write_docx(tmp_path, _WRITE_XML)
+    before = _read_docx_xml(path)
+    result = docs_intel.insert_highlighted_note(
+        path, "Check this later.", "0000C001",
+        style_policy={"note_highlight_color": "not-a-real-color"},
+    )
+    assert "error" in result
+    assert _read_docx_xml(path) == before
+
+
+# ---------------------------------------------------------------------------
+# audit_equation_style smoke coverage (full matrix lives in
+# extensions/meridian-docs/tests/test_docx_equation_style_audit.py)
+# ---------------------------------------------------------------------------
+
+def test_audit_equation_style_smoke_on_standalone_fixture(tmp_path):
+    path = _write_docx(tmp_path, _STANDALONE_XML)
+    result = docs_intel.audit_equation_style(path)
+    assert "error" not in result
+    assert result["equation_count"] == 2
+    assert isinstance(result["findings"], list)
+    assert result["finding_count"] == len(result["findings"])
+
+
+def test_audit_equation_style_smoke_on_table_numbered_fixture(tmp_path):
+    path = _write_docx(tmp_path, _TABLE_NUMBERED_XML)
+    result = docs_intel.audit_equation_style(path)
+    assert "error" not in result
+    assert result["equation_count"] == 3
+    # No duplicate/gap issues in this fixture: numbers are (1) and (2a).
+    types = {f["type"] for f in result["findings"]}
+    assert "duplicate_equation_number" not in types
+    assert "equation_number_gap" not in types
+
+
+def test_audit_equation_style_unknown_file_returns_error():
+    result = docs_intel.audit_equation_style("/no/such/file.docx")
+    assert "error" in result

@@ -14,6 +14,7 @@ of N" instead of silently implying only 3 pending items exist.
 
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -202,11 +203,32 @@ async def test_generate_handoff_goal_mode_uses_code_pointer_searcher(db, tmp_pat
             }
         ]
 
+    # 8a883f60 — evidence_status is a pure-addition output param: passing it
+    # must not change anything about `content` (still asserted below), and a
+    # caller that doesn't pass it (every OTHER test in this file) must see
+    # zero behavior change either.
+    evidence_status: dict = {}
     _, content, _ = await handoff_module.generate_handoff(
         db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
-        graph_searcher=searcher,
+        graph_searcher=searcher, evidence_status=evidence_status,
     )
     assert captured and "oauth" in captured[0]
+
+    # All five capabilities are always reported, even in goal mode.
+    assert set(evidence_status) == {
+        "code_pointer_enrichment", "resolved_pointer_annotation",
+        "freshness_requery", "wave_gate_exclusion", "graph_search_availability",
+    }
+    # A real, successful searcher call -> verified, not silently "maybe ok".
+    assert evidence_status["code_pointer_enrichment"]["status"] == "verified"
+    assert evidence_status["graph_search_availability"]["status"] == "verified"
+    assert evidence_status["wave_gate_exclusion"]["status"] == "verified"
+    # goal mode structurally never re-queries freshness (only full/delta do)
+    # -- reported explicitly as skipped, not simply absent.
+    assert evidence_status["freshness_requery"]["status"] == "skipped"
+    for entry in evidence_status.values():
+        assert entry["status"] in {"verified", "skipped", "failed", "degraded"}
+        assert entry["reason"]  # exact reason always present, never blank
 
 
 @pytest.mark.asyncio
@@ -230,11 +252,35 @@ async def test_generate_handoff_goal_mode_survives_pointer_resolve_blowup(
 
     monkeypatch.setattr(db_module, "get_sprint_item_pointers", _boom)
 
+    # 8a883f60 — default (non-strict) call: content behavior is UNCHANGED
+    # (both assertions below are the pre-existing ones, untouched), but the
+    # blowup is now visible as an explicit failed capability with the EXACT
+    # underlying reason instead of being indistinguishable from success.
+    evidence_status: dict = {}
     _, content, _ = await handoff_module.generate_handoff(
-        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+        evidence_status=evidence_status,
     )
     assert "resilient item" not in content  # title isn't rendered raw in goal mode...
     assert item["id"] in content  # ...but the id still is, and nothing crashed.
+
+    rpa = evidence_status["resolved_pointer_annotation"]
+    assert rpa["status"] == "failed"
+    assert "pointer fetch exploded" in rpa["reason"]  # exact cause, not generic
+    assert rpa["fallback"]  # an approved fallback is documented
+
+    # strict_evidence=True on the SAME broken state must fail CLOSED instead
+    # of silently emitting the plausible-looking-but-incomplete goal above:
+    # nothing is written for this call.
+    with pytest.raises(handoff_module.HandoffEvidenceRequired) as excinfo:
+        await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+            strict_evidence=True,
+        )
+    assert any(
+        e["capability"] == "resolved_pointer_annotation" for e in excinfo.value.errors
+    )
+    assert excinfo.value.evidence_status["resolved_pointer_annotation"]["status"] == "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -393,3 +439,233 @@ async def test_starter_preview_full_batch_includes_all_pending_ids(db, tmp_path)
     )
     for iid in ids:
         assert iid in content
+
+
+# ---------------------------------------------------------------------------
+# 9c6cac08 (665 follow-up) — deterministic paste-ready serialization and
+# scope fidelity, specific to the bare goal-only mode this file covers.
+# ---------------------------------------------------------------------------
+
+
+_GOAL_TOKEN_RE = re.compile(r"<goal_token>[^<]*</goal_token>")
+
+
+def _strip_goal_token(content: str) -> str:
+    return _GOAL_TOKEN_RE.sub("<goal_token>STRIPPED</goal_token>", content)
+
+
+@pytest.mark.asyncio
+async def test_goal_mode_repeated_calls_deterministic_modulo_token(db, tmp_path):
+    """Two generate_handoff(mode='goal') calls against IDENTICAL DB state
+    (including a durable pointer, which mode='goal' inlines) must be
+    byte-identical apart from the single-use goal_token."""
+    p = await db_module.create_project(db, "goal-mode-determinism")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Fix the migration guard")
+    await db_module.add_sprint_item_pointer(
+        db,
+        p["id"],
+        item["id"],
+        "code",
+        [
+            {
+                "uri": "file:meridian/db/migrations.py",
+                "selector": {"type": "range", "start_line": 100, "end_line": 120},
+            }
+        ],
+        label="guard site",
+    )
+
+    _, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+    _, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+    assert content_a != content_b  # tokens differ — fresh nonce every call
+    assert _strip_goal_token(content_a) == _strip_goal_token(content_b)
+
+
+@pytest.mark.asyncio
+async def test_goal_mode_scope_equals_requested_pending_items_exactly(db, tmp_path):
+    """With no exclusions in play, the claimable batch's id set must equal
+    EXACTLY the set get_sprint_items(version=..., pending) returns for that
+    version — no fewer (silent drop), no more (silent broadening from
+    another version)."""
+    p = await db_module.create_project(db, "goal-mode-scope-exact")
+    ids_v1 = set()
+    for i in range(3):
+        it = await db_module.add_sprint_item(
+            db, p["id"], "v1", f"v1 item {i}", force=True
+        )
+        ids_v1.add(it["id"])
+    await db_module.add_sprint_item(db, p["id"], "v2", "v2 item, out of scope")
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal", version="v1",
+    )
+    sprint_items_block = _sprint_items_tag_body(content)
+    emitted_ids = {
+        tok.strip().rstrip(".") for tok in
+        sprint_items_block.split("Complete sprint items:", 1)[-1].split(",")
+        if tok.strip().rstrip(".")
+    }
+    assert emitted_ids == ids_v1
+
+
+# ---------------------------------------------------------------------------
+# 70c10ca3 (b730 follow-up) — _build_artifact_pointer_findings_clause: the
+# batch /goal's own ``<artifact_pointer_findings>`` XML surface for 88f82c15's
+# warn/strict artifact-pointer verdict enriched with 3196ba0e's readiness
+# verification, so a MULTI-item /goal run sees the warning inline too — not
+# only when a caller separately requests a single-item build_item_briefing.
+# ---------------------------------------------------------------------------
+
+
+def test_build_artifact_pointer_findings_clause_empty_for_no_data():
+    assert handoff_module._build_artifact_pointer_findings_clause([]) == ""
+    # No warning active for this item -> still empty.
+    assert handoff_module._build_artifact_pointer_findings_clause(
+        [{"id": "x", "artifact_pointer_finding": None}]
+    ) == ""
+
+
+def test_build_artifact_pointer_findings_clause_embeds_canonical_json():
+    from meridian import pointers as pointers_module
+
+    items = [{
+        "id": "item-1",
+        "artifact_pointer_finding": {
+            "item_id": "item-1",
+            "warning_code": "insufficient_pointer_bare_docx",
+            "pointer_status": "weak",
+            "ready": False,
+            "affected_pointer_ids": ["ptr-1"],
+            "target_readiness": [{"pointer_id": "ptr-1", "ready": False, "targets": []}],
+        },
+    }]
+    out = handoff_module._build_artifact_pointer_findings_clause(items)
+    assert out.startswith("\n<artifact_pointer_findings>")
+    assert out.endswith("</artifact_pointer_findings>")
+    body = out[len("\n<artifact_pointer_findings>"):-len("</artifact_pointer_findings>")]
+    embedded = json.loads(body)
+    assert embedded == pointers_module.assemble_artifact_pointer_findings_from_annotated_items(items)
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_renders_artifact_pointer_findings_clause(db, tmp_path):
+    p = await db_module.create_project(db, "goal-mode-artifact-findings")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    assert "<artifact_pointer_findings>" in content
+    start = content.index("<artifact_pointer_findings>") + len("<artifact_pointer_findings>")
+    end = content.index("</artifact_pointer_findings>")
+    findings = json.loads(content[start:end])
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding["item_id"] == item["id"]
+    assert finding["warning_code"] == "insufficient_pointer_bare_docx"
+    assert finding["pointer_status"] == "weak"
+    assert finding["ready"] is False
+    assert finding["affected_pointer_ids"] == [str(stored["id"])]
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_omits_artifact_pointer_findings_when_no_warning(db, tmp_path):
+    p = await db_module.create_project(db, "goal-mode-artifact-findings-none")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Renumber figure captions")
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    assert "<artifact_pointer_findings>" not in content
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_artifact_pointer_findings_deterministic(db, tmp_path):
+    """Repeated calls against IDENTICAL DB state must render byte-identical
+    <artifact_pointer_findings> content — apart from the single-use goal_token
+    (the only field allowed to differ)."""
+    p = await db_module.create_project(db, "goal-mode-artifact-findings-determinism")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+
+    _, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    _, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    assert _strip_goal_token(content_a) == _strip_goal_token(content_b)
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_artifact_pointer_findings_respect_version_scope(
+    db, tmp_path
+):
+    """f9bacd5b (b730 follow-up, final gate) — a version-scoped mode='goal'
+    request must not leak an <artifact_pointer_findings> entry from a
+    DIFFERENT sprint version, and must not silently drop the entry that
+    genuinely belongs to the requested version. Mirrors
+    test_goal_mode_scope_equals_requested_pending_items_exactly's own
+    version-scope-exactness style, applied to the artifact-pointer-findings
+    clause specifically (not previously covered for this clause)."""
+    p = await db_module.create_project(db, "goal-mode-artifact-findings-version-scope")
+    item_v1 = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item_v1["id"], "docs",
+        [{"uri": "outputs/report.docx",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+    item_v2 = await db_module.add_sprint_item(
+        db, p["id"], "v2", "Insert a new ablation chart figure into the results section",
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item_v2["id"], "docs",
+        [{"uri": "outputs/figures/",
+          "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    )
+
+    _, content_v1, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal", version="v1",
+    )
+    findings_v1 = json.loads(
+        content_v1[
+            content_v1.index("<artifact_pointer_findings>") + len("<artifact_pointer_findings>"):
+            content_v1.index("</artifact_pointer_findings>")
+        ]
+    )
+    ids_v1 = {f["item_id"] for f in findings_v1}
+    assert item_v1["id"] in ids_v1  # requested-version finding present, not dropped
+    assert item_v2["id"] not in ids_v1  # other-version finding absent, not leaked
+
+    _, content_v2, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal", version="v2",
+    )
+    findings_v2 = json.loads(
+        content_v2[
+            content_v2.index("<artifact_pointer_findings>") + len("<artifact_pointer_findings>"):
+            content_v2.index("</artifact_pointer_findings>")
+        ]
+    )
+    ids_v2 = {f["item_id"] for f in findings_v2}
+    assert item_v2["id"] in ids_v2
+    assert item_v1["id"] not in ids_v2

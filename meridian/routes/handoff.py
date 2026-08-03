@@ -45,9 +45,27 @@ async def planner_handoff_endpoint(
     capability_contract = await handoff_module.build_effective_capability_contract(
         db, project_id,
     )
+    # 6cdc5df3 — machine-readable proposal-to-evidence linkage; best-effort,
+    # never breaks the planner handoff.
+    proposal_evidence = await handoff_module.build_proposal_evidence_for_handoff(
+        db, project_id,
+    )
+    # d09c29fe — machine-readable DOCX-integrity gate; best-effort, never
+    # breaks the planner handoff. Tied to the proposal evidence above so a
+    # proposal-linked .docx artifact is gated too (6cdc5df3).
+    docx_integrity = await handoff_module.build_docx_integrity_gate_for_handoff(
+        db, project_id, proposal_evidence=proposal_evidence,
+    )
     return {
-        "path": path, "content": content, "mode": "planner",
+        # a5e8aa74 — route through the same shared helper the MCP handler/stdio
+        # transports use so all transports share one raw-text contract (this
+        # endpoint was already raw; this just makes that guarantee explicit and
+        # keeps the three transports from being able to drift independently).
+        "path": path, "content": handoff_module.format_handoff_mcp_content(content),
+        "mode": "planner",
         "capability_contract": capability_contract,
+        "proposal_evidence": proposal_evidence,
+        "docx_integrity": docx_integrity,
     }
 
 
@@ -70,6 +88,13 @@ async def generate_handoff_endpoint(
         body.get("mode"),
         session_id if isinstance(session_id, str) else None,
     )
+    # b8f89491 — optional explicit sprint-version scope, same contract as the
+    # MCP path: wins over the session's own stored sprint_version; None (no
+    # version, no session, or a session with no stored scope) is unchanged
+    # unscoped behaviour.
+    _version = body.get("version")
+    if isinstance(_version, str) and not _version.strip():
+        _version = None
     skip_summary = not os.environ.get("ANTHROPIC_API_KEY")
     db = await _db(request)
     data_dir = _data_dir(request)
@@ -81,6 +106,7 @@ async def generate_handoff_endpoint(
                 skip_ai_summary=skip_summary,
                 mode=mode,
                 session_id=session_id if isinstance(session_id, str) else None,
+                version=_version if isinstance(_version, str) else None,
             ),
             timeout=90.0,
         )
@@ -96,7 +122,23 @@ async def generate_handoff_endpoint(
     capability_contract = await handoff_module.build_effective_capability_contract(
         db, project_id, board_stale=_board_stale,
     )
+    # 6cdc5df3 — machine-readable proposal-to-evidence linkage; best-effort,
+    # never breaks the mandatory handoff.
+    proposal_evidence = await handoff_module.build_proposal_evidence_for_handoff(
+        db, project_id,
+    )
+    # d09c29fe — machine-readable DOCX-integrity gate; best-effort, never
+    # breaks the mandatory handoff. Tied to the proposal evidence above so a
+    # proposal-linked .docx artifact is gated too (6cdc5df3).
+    docx_integrity = await handoff_module.build_docx_integrity_gate_for_handoff(
+        db, project_id, proposal_evidence=proposal_evidence,
+    )
     return {
-        "path": path, "content": content, "mode": mode,
+        # a5e8aa74 — same shared helper as the planner endpoint above and both
+        # MCP transports; see format_handoff_mcp_content's docstring.
+        "path": path, "content": handoff_module.format_handoff_mcp_content(content),
+        "mode": mode,
         "capability_contract": capability_contract,
+        "proposal_evidence": proposal_evidence,
+        "docx_integrity": docx_integrity,
     }

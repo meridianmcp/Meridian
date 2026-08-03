@@ -28,7 +28,7 @@ from typing import Any
 import meridian.server as _server
 from meridian import db as db_module
 from meridian import goal_md as goal_md_module
-from meridian._deps import validate_input_size
+from meridian._deps import validate_input_size, _hosted_mode
 
 
 async def handle_add_sprint_note(
@@ -144,10 +144,17 @@ async def handle_add_sprint_item(
             wave=args.get("wave"),
             sprint_name=args.get("sprint_name"),
             required_tool=args.get("required_tool"),
+            tool_requirements=args.get("tool_requirements"),
+            artifact_kind=args.get("artifact_kind"),
+            planned_output=args.get("planned_output"),
+            artifact_policy=args.get("policy"),
         )
     except ValueError as exc:
         # 501ec93f — malformed touches_resources identifier; also e08fee30 /
-        # 2282a636 bad priority / blocker_kind. Surface, don't crash.
+        # 2282a636 bad priority / blocker_kind; also 76dde31f (665 follow-up)
+        # malformed tool_requirements entries; also 2f9cb288 (665 follow-up)
+        # malformed artifact_kind/planned_output/policy declarations.
+        # Surface, don't crash.
         return {"error": str(exc)}
     # b0d42ef6 — duplicate guard blocked the insert: surface the error as-is
     # (no item was created, so the warnings below don't apply).
@@ -412,12 +419,38 @@ async def handle_update_sprint_item(
     # False/0/null clears it (ordinary completion, evidence gate only).
     if "require_verification" in args:
         _patch_kwargs["require_verification"] = args.get("require_verification")
+    # 5fe3502e — set/clear require_strict_evidence. Only forward when the
+    # caller supplied the key (_UNSET sentinel). True/1 sets the opt-in
+    # fail-closed evidence gate (complete_sprint_item's handler-level strict
+    # verification refuses completion on missing/invalid/stale/wrong-worktree
+    # evidence or an unclaimed edit unless explicitly, auditedly overridden);
+    # False/0/null clears it (ordinary advisory-only evidence checks).
+    if "require_strict_evidence" in args:
+        _patch_kwargs["require_strict_evidence"] = args.get("require_strict_evidence")
     # 4d1fb28f — set/clear the required_tool pin. Only forward when the caller
     # supplied the key (_UNSET sentinel), so omitting it leaves the stored
     # value untouched; pass "" / null to clear (ordinary executor discretion),
     # or a tool/plugin name to pin it — rendered as hard /goal guidance.
     if "required_tool" in args:
         _patch_kwargs["required_tool"] = args.get("required_tool")
+    # 76dde31f (665 follow-up) — set/clear/replace the typed tool_requirements
+    # contract. Only forward when the caller supplied the key (_UNSET
+    # sentinel), so omitting it leaves the stored value untouched; pass
+    # None/[] to clear (falls back to required_tool if still set), or a list
+    # of typed entries to set/replace it wholesale.
+    if "tool_requirements" in args:
+        _patch_kwargs["tool_requirements"] = args.get("tool_requirements")
+    # 2f9cb288 (665 follow-up) — set/clear/replace the typed artifact
+    # declaration contract. Only forward when the caller supplied the key
+    # (_UNSET sentinel), so omitting it leaves the stored value untouched;
+    # pass null (or "" for artifact_kind) to clear, or a valid value to
+    # set/replace it wholesale.
+    if "artifact_kind" in args:
+        _patch_kwargs["artifact_kind"] = args.get("artifact_kind")
+    if "planned_output" in args:
+        _patch_kwargs["planned_output"] = args.get("planned_output")
+    if "policy" in args:
+        _patch_kwargs["artifact_policy"] = args.get("policy")
     # 7c82f7c8 — set/clear github_channel. Only forward when the caller
     # supplied the key (_UNSET sentinel), so omitting it leaves the stored
     # value untouched; pass "" / null to clear, or one of
@@ -711,6 +744,8 @@ async def handle_claim_sprint_item(
     from ..handler import (  # noqa: PLC0415
         _parse_touches_files,
         _sprint_item_file_claim_conflicts,
+        _sprint_item_resource_claim_gate,
+        _rollback_sprint_item_resource_locks,
         _board_change_for_session,
         _suggest_files_for_title,
         _prospect_code_context,
@@ -768,6 +803,19 @@ async def handle_claim_sprint_item(
                 "conflicts": _file_conflicts,
             }
 
+    # 18c488b6 — symbol-scoped resource-lock gate: ACQUIRES (not just checks)
+    # a file or symbol claim for every touches_resources entry the item
+    # declares, under the caller's session_id. Unlike the touches_files
+    # CONFLICT check above, this is NEVER softened by worktree isolation —
+    # worktrees isolate the working tree, not the eventual merge, so a real
+    # symbol-range overlap stays a hard block regardless of isolation mode.
+    _resource_lock_gate = await _sprint_item_resource_claim_gate(
+        db, args["project_id"], args["item_id"], args.get("session_id"),
+        resource_contents=args.get("resource_contents"),
+    )
+    if not _resource_lock_gate.get("ok"):
+        return _resource_lock_gate
+
     try:
         # 5823db0b — actor attribution: record who claimed the item (explicit
         # actor arg, else the claiming session id).
@@ -776,6 +824,13 @@ async def handle_claim_sprint_item(
             db, args["project_id"], args["item_id"], actor=_claim_actor
         )
     except ValueError:
+        # 18c488b6 — the status transition never landed for THIS session (lost
+        # the race, or the item was otherwise unclaimable) — any resource locks
+        # the gate above newly acquired must not outlive a claim that never
+        # actually happened.
+        await _rollback_sprint_item_resource_locks(
+            db, args.get("session_id"), _resource_lock_gate
+        )
         # 10c0f6a0 — if already in_progress, check for stale claim and surface info
         _stale_item = await db_module.get_sprint_item(db, args["item_id"])
         if _stale_item and _stale_item.get("status") == "in_progress" and _stale_item.get("claimed_at"):
@@ -834,8 +889,17 @@ async def handle_claim_sprint_item(
     # and stop; the item was NOT claimed, so the worktree plumbing below (which
     # assumes a real item row) must be skipped.
     if isinstance(item, dict) and item.get("blocked"):
+        # 18c488b6 — a structural gate (DEFERRED/SUPERSEDED/WAVE_GATE_PENDING/
+        # UNPROSPECTED) declined the transition — same "never outlive a claim
+        # that didn't land" rollback as the ValueError-race path above.
+        await _rollback_sprint_item_resource_locks(
+            db, args.get("session_id"), _resource_lock_gate
+        )
         return item
     if item is None:
+        await _rollback_sprint_item_resource_locks(
+            db, args.get("session_id"), _resource_lock_gate
+        )
         raise ValueError("sprint item not found")
 
     if _suggest_worktree:
@@ -862,6 +926,13 @@ async def handle_claim_sprint_item(
             "worktree_suggested": True,
             "worktree_branch": wt_branch,
             "worktree_path": wt_path,
+            # eb2e44f8 — the base branch this worktree is expected to be
+            # created FROM. Matches worktree_merge_cmd's target below.
+            # Executors should pass this (plus the base SHA they observe
+            # right before `git worktree add`) to POST /worktrees'
+            # base_branch/base_sha so an immutable base manifest gets
+            # persisted for later merge-time validation.
+            "worktree_base_branch": "dev",
             "worktree_setup_cmd": f"git worktree add {wt_path} -b {wt_branch}",
             "worktree_cleanup_cmd": f"git worktree remove {wt_path} --force",
             "worktree_merge_cmd": (
@@ -882,6 +953,15 @@ async def handle_claim_sprint_item(
             ),
             "conflicts": _file_conflicts,
         }
+
+    # 18c488b6 — expose the symbol/file resource-lock scope this claim actually
+    # acquired (or explicitly fell back on) so the executor sees machine-readable
+    # lock_scope metadata rather than having to infer it. Omitted entirely when
+    # there was nothing to declare (no touches_resources) so the field stays
+    # compact for the common case.
+    if _resource_lock_gate.get("lock_scope"):
+        item = dict(item)
+        item["resource_lock_scope"] = _resource_lock_gate["lock_scope"]
 
     _bc_claim = await _board_change_for_session(
         db, args["project_id"], args.get("session_id")
@@ -924,6 +1004,41 @@ async def handle_claim_sprint_item(
         item["touches_resources_code_notes"] = _resource_code_notes
 
     return item
+
+
+async def handle_claim_parallel_batch(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: claim_parallel_batch.
+
+    22cad9b8 — thin wrapper over db.claim_parallel_batch: atomically claim an
+    entire parallel-safe batch of sprint items (every item's status AND
+    every declared resource) before launching workers, closing the gap
+    between get_parallelizable_groups computing a safe batch and each worker
+    individually calling claim_sprint_item afterward. See
+    meridian.db.sprint_items.claim_parallel_batch's docstring for the full
+    contract (structured error codes, all-or-nothing rollback semantics, the
+    immutable batch manifest).
+
+    ``item_ids`` (required, non-empty list) is typically one group from
+    get_parallelizable_groups' ``groups`` field. ``item_sessions`` (optional
+    ``{item_id: session_id}``) pre-assigns each item to the distinct worker
+    session that will execute it; omitted items default to the top-level
+    ``session_id``. ``resource_contents`` (optional ``{file_path: source}``)
+    supplies source text for any ``symbol:`` resources so they get a real
+    AST-resolved symbol claim instead of falling back to a whole-file lock.
+    """
+    return await db_module.claim_parallel_batch(
+        db, args["project_id"], args.get("session_id"), args.get("item_ids") or [],
+        item_sessions=args.get("item_sessions"),
+        resource_contents=args.get("resource_contents"),
+        force_manifest=args.get("force_manifest") in (True, 1, "true", "1", "yes"),
+        manifest_reason=args.get("manifest_reason"),
+    )
 
 
 async def handle_add_subtask(
@@ -992,15 +1107,113 @@ async def handle_complete_sprint_item(
         _close_or_propose_github_issue,
     )
     # 0716c9e0 — check active worktree before marking done.
+    # e7548587 — require_merge_approval is a TRI-STATE (mirrors
+    # hitl_auto_answer's own 0/1/2 pattern): 0=off (no check at all),
+    # 1=advisory (warn via HITL, always proceed — the ORIGINAL 0716c9e0
+    # behavior, still the default so existing projects see zero change),
+    # 2=strict (a genuine active, unmerged worktree per
+    # get_active_worktree_for_session actually BLOCKS completion). Before
+    # this fix, ANY nonzero value only ever warned — require_merge_approval
+    # was advisory-only regardless of configuration; that was the bug.
     _complete_session_id = args.get("session_id") or ""
+    _complete_actor = args.get("actor") or _complete_session_id or None
     _merge_warning: dict[str, Any] | None = None
     if _complete_session_id:
         try:
             _ps_complete = await db_module.get_project_settings(db, args["project_id"])
-            _req_merge = bool(int((_ps_complete or {}).get("require_merge_approval") or 1))
-            if _req_merge:
+            _raw_merge_mode = (_ps_complete or {}).get("require_merge_approval")
+            _merge_mode = (
+                max(0, min(2, int(_raw_merge_mode))) if _raw_merge_mode is not None else 1
+            )
+            if _merge_mode > 0:
                 _wt = await db_module.get_active_worktree_for_session(db, _complete_session_id)
                 if _wt:
+                    # eb2e44f8 — HARD GATE: when this worktree has a persisted
+                    # immutable base manifest, validate its actual git state
+                    # (HEAD ancestry, dirty tree, manifest staleness) before
+                    # completion is allowed to proceed at all — a real reject,
+                    # not just the advisory HITL below. Self-hosted only: the
+                    # git-level checks need local FS access, per the same
+                    # architectural law worktree_cleanup already follows.
+                    # Hosted mode and worktrees that never opted into a
+                    # manifest (base_sha/base_branch never supplied at
+                    # `POST /worktrees` time) fall through unchanged to the
+                    # pre-existing advisory-only HITL behavior below.
+                    _wt_manifest = await db_module.get_worktree_manifest(db, _wt["id"])
+                    if _wt_manifest is not None and not _hosted_mode():
+                        from meridian.worktree_merge_guard import (  # noqa: PLC0415
+                            validate_worktree_merge,
+                        )
+                        _validation = await validate_worktree_merge(
+                            db, _server._REPO_ROOT, _wt["id"]
+                        )
+                        if not _validation.get("ok"):
+                            return {
+                                "error": "WORKTREE_MERGE_BLOCKED",
+                                "item_id": args["item_id"],
+                                "worktree_id": _wt["id"],
+                                "validation": _validation,
+                                "message": (
+                                    "Refusing to complete: worktree failed pre-merge "
+                                    "validation ("
+                                    + ", ".join(
+                                        e["code"] for e in _validation.get("errors", [])
+                                    )
+                                    + "). Fix the underlying issue (commit/stash "
+                                    "uncommitted changes, reconcile the branch with its "
+                                    "recorded base, or reclaim a fresh worktree if the "
+                                    "manifest is stale) and retry."
+                                ),
+                            }
+
+                    # e7548587 — STRICT merge-approval gate (mode 2 only).
+                    # Blocks unless the caller passes BOTH
+                    # override_merge_approval=true AND a non-empty
+                    # override_merge_approval_reason in the SAME call —
+                    # record_merge_approval_override then writes an
+                    # auditable action_audit_log row (who/when/why), mirroring
+                    # 5fe3502e's record_strict_evidence_override exactly. Mode
+                    # 1 (advisory, the pre-existing default) never enters this
+                    # branch — it falls straight through to the unconditional
+                    # HITL-reminder-only behavior below, byte-for-byte
+                    # unchanged from before this fix.
+                    _merge_approval_override: dict[str, Any] | None = None
+                    if _merge_mode >= 2:
+                        _mrg_override_requested = bool(args.get("override_merge_approval"))
+                        _mrg_override_reason = (
+                            args.get("override_merge_approval_reason") or ""
+                        ).strip()
+                        if _mrg_override_requested and _mrg_override_reason:
+                            from meridian.worktree_merge_guard import (  # noqa: PLC0415
+                                record_merge_approval_override,
+                            )
+                            _merge_approval_override = await record_merge_approval_override(
+                                db, args["project_id"], args["item_id"],
+                                actor=_complete_actor,
+                                reason=_mrg_override_reason,
+                                worktree=_wt,
+                                tenant_id=(tenant or {}).get("id"),
+                            )
+                        else:
+                            return {
+                                "error": "MERGE_APPROVAL_REQUIRED",
+                                "item_id": args["item_id"],
+                                "worktree_id": _wt["id"],
+                                "worktree_branch": _wt["branch"],
+                                "worktree_path": _wt["path"],
+                                "message": (
+                                    f"Refusing to complete {args['item_id']}: session "
+                                    f"{_complete_session_id!r} has an active, unmerged "
+                                    f"worktree on branch '{_wt['branch']}' at "
+                                    f"'{_wt['path']}' and this project requires strict "
+                                    "merge approval (require_merge_approval=2). Merge it "
+                                    f"first (git checkout dev && git merge {_wt['branch']} "
+                                    "--no-edit), or pass override_merge_approval=true "
+                                    "with a non-empty override_merge_approval_reason to "
+                                    "explicitly acknowledge and complete anyway (audited)."
+                                ),
+                            }
+
                     _hitl = await db_module.request_hitl(
                         db, args["project_id"],
                         f"Session has active worktree on branch '{_wt['branch']}' "
@@ -1015,6 +1228,8 @@ async def handle_complete_sprint_item(
                         "hitl_id": (_hitl or {}).get("id"),
                         "message": "Merge reminder filed — see HITL queue.",
                     }
+                    if _merge_approval_override:
+                        _merge_warning["override"] = _merge_approval_override
         except Exception:  # noqa: BLE001
             pass
 
@@ -1061,9 +1276,127 @@ async def handle_complete_sprint_item(
                 ),
             }
 
+    # e7548587 — _complete_actor is now computed up top (alongside
+    # _complete_session_id), before the merge-approval block that needs it
+    # for record_merge_approval_override's audit trail.
+
+    # 5fe3502e — STRICT (fail-closed) evidence gate. OPT-IN ONLY: engages when
+    # the caller explicitly passes strict_evidence=true, or the item itself
+    # is flagged require_strict_evidence — mirrors eb2e44f8's worktree-merge
+    # guard exactly (a hard reject, computed BEFORE marking done, that never
+    # engages for a caller that didn't ask for it). Every OTHER completion
+    # path above/below this block is completely unaffected: the pre-existing
+    # advisory evidence checks (required_notes existence gate,
+    # _check_stored_evidence's mechanical disk/DB check inside
+    # db.complete_sprint_item) still run exactly as before regardless of this
+    # flag — this is an ADDITIONAL gate layered on top, not a replacement.
+    _strict_evidence = bool(args.get("strict_evidence")) or bool(
+        (_pre_item or {}).get("require_strict_evidence")
+    )
+    _strict_evidence_override: dict[str, Any] | None = None
+    if _strict_evidence and _pre_item is not None and _pre_item.get("project_id") == args["project_id"]:
+        from meridian.sprint_evidence_guard import (  # noqa: PLC0415
+            verify_strict_completion_evidence,
+            record_strict_evidence_override,
+        )
+        _evidence_check = await verify_strict_completion_evidence(
+            db, _server._REPO_ROOT, args["project_id"], args["item_id"], _pre_item,
+            task_id=args.get("task_id"), notes=args.get("notes"),
+            session_id=_complete_session_id or None,
+        )
+        if not _evidence_check.get("ok"):
+            _override_requested = bool(args.get("override_strict_evidence"))
+            _override_reason = (args.get("override_reason") or "").strip()
+            if _override_requested and _override_reason:
+                # 5fe3502e point 3 — an explicit override is auditable (who/
+                # when/why) and can never be the silent default: it requires
+                # BOTH override_strict_evidence=true AND a non-empty
+                # override_reason in the SAME call. record_strict_evidence_
+                # override raises ValueError if reason is empty (belt and
+                # suspenders — already guarded by the `and _override_reason`
+                # check above, but the module itself never trusts a caller
+                # to have checked).
+                _strict_evidence_override = await record_strict_evidence_override(
+                    db, args["project_id"], args["item_id"],
+                    actor=_complete_actor,
+                    reason=_override_reason,
+                    errors=_evidence_check.get("errors", []),
+                    tenant_id=(tenant or {}).get("id"),
+                )
+            else:
+                return {
+                    "error": "STRICT_EVIDENCE_BLOCKED",
+                    "item_id": args["item_id"],
+                    "evidence_errors": _evidence_check.get("errors", []),
+                    "message": (
+                        "Refusing to complete: strict evidence verification "
+                        "failed ("
+                        + ", ".join(
+                            e["code"] for e in _evidence_check.get("errors", [])
+                        )
+                        + "). Fix the underlying issue (attach real evidence, "
+                        "re-verify from the correct worktree, claim modified "
+                        "files) and retry, or pass override_strict_evidence=true "
+                        "with a non-empty override_reason to explicitly "
+                        "acknowledge and complete anyway (audited)."
+                    ),
+                }
+
+    # a8c0f3b7 — CODE-INTEL PROSPECTING RECEIPT gate. Opt-in via the PROJECT's
+    # capability manifest, not a per-call flag: a no-op (zero behavior change)
+    # unless the project has declared the "code_intel_prospecting" capability
+    # via set_capability_manifest — mirrors the megasprint's own capability-
+    # manifest contract ("old projects are not broken by this feature
+    # existing"). When declared, this turns claim_sprint_item's existing
+    # best-effort code_context.hint nudge ("prospect before editing") into
+    # something auditable: complete_sprint_item now verifies a durable,
+    # server-written receipt (meridian.code_intel_receipt) exists proving a
+    # real search_graph/find_symbol/prospect_symbol call happened since this
+    # item was claimed — not something that trusts the calling agent's
+    # self-report. Fails CLOSED only for availability_policy="required"
+    # (mirrors verify_strict_completion_evidence's fail-closed contract);
+    # "optional"/"degraded_ok" degrade with a warning instead of blocking.
+    _code_intel_check: dict[str, Any] | None = None
+    _code_intel_override: dict[str, Any] | None = None
+    if _pre_item is not None and _pre_item.get("project_id") == args["project_id"]:
+        from meridian.code_intel_receipt import (  # noqa: PLC0415
+            verify_code_intel_prospecting,
+            record_prospect_receipt_override,
+        )
+        _code_intel_check = await verify_code_intel_prospecting(
+            db, tenant, args["project_id"], _pre_item,
+            session_id=_complete_session_id or None,
+        )
+        if _code_intel_check.get("applicable") and not _code_intel_check.get("ok"):
+            _ci_override_requested = bool(args.get("override_code_intel_receipt"))
+            _ci_override_reason = (args.get("override_reason") or "").strip()
+            if _ci_override_requested and _ci_override_reason:
+                # Same auditable-override contract as strict evidence / merge
+                # approval above: BOTH the explicit flag AND a non-empty
+                # reason are required in the SAME call, or it is refused.
+                _code_intel_override = await record_prospect_receipt_override(
+                    db, args["project_id"], args["item_id"],
+                    actor=_complete_actor,
+                    reason=_ci_override_reason,
+                    check=_code_intel_check,
+                    tenant_id=(tenant or {}).get("id"),
+                )
+            else:
+                return {
+                    "error": _code_intel_check.get("code") or "CODE_INTEL_RECEIPT_BLOCKED",
+                    "item_id": args["item_id"],
+                    "capability": _code_intel_check.get("capability"),
+                    "message": _code_intel_check.get("message") or (
+                        "Refusing to complete: code-intel prospecting-receipt "
+                        "verification failed. Pass "
+                        "override_code_intel_receipt=true with a non-empty "
+                        "override_reason to explicitly acknowledge and "
+                        "complete anyway (audited)."
+                    ),
+                }
+
     # 5823db0b — quality gate + actor attribution. Pass evidence notes and
     # the completing actor; surface the required_notes gate as a clean error.
-    _complete_actor = args.get("actor") or _complete_session_id or None
     try:
         item = await db_module.complete_sprint_item(
             db, args["project_id"], args["item_id"],
@@ -1120,6 +1453,27 @@ async def handle_complete_sprint_item(
     if _merge_warning:
         item = dict(item)
         item["merge_warning"] = _merge_warning
+    if _strict_evidence_override:
+        # 5fe3502e point 3 — surface the audited override on the response so
+        # the completion is never silently "cleaner" than what actually
+        # happened: anyone reading this item's completion can see strict
+        # evidence verification failed and was explicitly, auditedly overridden.
+        item = dict(item)
+        item["strict_evidence_override"] = _strict_evidence_override
+    if _code_intel_check and _code_intel_check.get("applicable"):
+        # a8c0f3b7 — surface the prospecting-receipt verdict on the response
+        # whenever the gate actually applied: a degraded/warned pass (policy
+        # optional/degraded_ok, or code-intel genuinely unavailable) is never
+        # silently indistinguishable from a real receipt, and an audited
+        # override is always visible on the completed item, same as strict
+        # evidence above.
+        item = dict(item)
+        if _code_intel_check.get("degraded"):
+            item["code_intel_receipt_warning"] = _code_intel_check.get("warning")
+        elif _code_intel_check.get("receipt"):
+            item["code_intel_receipt"] = _code_intel_check.get("receipt")
+        if _code_intel_override:
+            item["code_intel_receipt_override"] = _code_intel_override
     # fdaa5b55 — item has a linked GitHub issue: auto-close (meridian_auto)
     # or post a proposed-closure comment + non-blocking HITL (manual/unset).
     # Never lets a GitHub failure undo the completion that already succeeded
@@ -1447,9 +1801,26 @@ async def handle_complete_wave_gate(
 
     actor = str(args.get("actor") or "").strip() or None
 
+    # ed8e4524 — scope this gate to the active sprint-version bucket, the SAME
+    # class of fix 660314c1 applied to checkpoint's pending/next_goal: an
+    # explicit version wins; otherwise fall back to resolving the CALLING
+    # session's own stored sprint_version via the identical helper
+    # (handoff._resolve_session_sprint_version) rather than inventing a new
+    # resolution mechanism. Neither given -> version stays None, which
+    # preserves the exact pre-fix, project-wide behavior for a project with
+    # only one sprint version in play.
+    version = str(args.get("version") or "").strip() or None
+    session_id = str(args.get("session_id") or "").strip() or None
+    if version is None and session_id:
+        from meridian import handoff as handoff_module_local  # noqa: PLC0415
+        version = await handoff_module_local._resolve_session_sprint_version(
+            db, session_id
+        )
+
     try:
         result = await db_module.complete_wave_gate(
-            db, project_id, wave_label, verification_payload, actor=actor
+            db, project_id, wave_label, verification_payload, actor=actor,
+            version=version,
         )
     except ValueError as exc:
         return {"error": str(exc)}
@@ -1762,9 +2133,23 @@ async def handle_configure_wave_gate(
     wave_start = str(args.get("wave_start") or "").strip() or None
     actor = str(args.get("actor") or "").strip() or None
 
+    # ed8e4524 — same version-scope resolution as handle_complete_wave_gate
+    # (above) and 660314c1's checkpoint fix: explicit version wins, else
+    # resolve from session_id via handoff._resolve_session_sprint_version,
+    # else stay unscoped (legacy/project-wide) — see that handler for the
+    # full rationale.
+    version = str(args.get("version") or "").strip() or None
+    session_id = str(args.get("session_id") or "").strip() or None
+    if version is None and session_id:
+        from meridian import handoff as handoff_module_local  # noqa: PLC0415
+        version = await handoff_module_local._resolve_session_sprint_version(
+            db, session_id
+        )
+
     try:
         result = await db_module.configure_wave_gate(
             db, project_id, wave_end, actions, wave_start=wave_start, actor=actor,
+            version=version,
         )
     except ValueError as exc:
         return {"error": str(exc)}

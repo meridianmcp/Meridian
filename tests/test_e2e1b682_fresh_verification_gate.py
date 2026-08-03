@@ -198,6 +198,78 @@ async def test_items_without_require_verification_unaffected(db):
 
 
 @pytest.mark.asyncio
+async def test_require_verification_and_strict_evidence_gates_compose():
+    """5fe3502e coexistence check — an item can carry BOTH the pre-existing
+    require_verification gate (e2e1b682, this file's subject) and the new
+    strict_evidence fail-closed gate (meridian.sprint_evidence_guard) at the
+    same time, via the full MCP complete_sprint_item dispatch. Each gate is
+    independent: satisfying one does not satisfy the other, and both must be
+    satisfied before completion succeeds.
+    """
+    import meridian.server  # noqa: F401 — import first, avoids handler/server import cycle
+    from meridian.mcp import handler as mh
+
+    db_conn = await db_module.init_db(":memory:")
+    try:
+        p = await mh._dispatch_mcp_tool(
+            "create_project", {"name": "verif-plus-strict"}, db_conn, "/tmp"
+        )
+        item = await mh._dispatch_mcp_tool(
+            "add_sprint_item",
+            {"project_id": p["id"], "title": "double-gated item", "version": "v1"},
+            db_conn, "/tmp",
+        )
+        await db_module.patch_sprint_item(
+            db_conn, p["id"], item["id"],
+            require_verification=True, require_strict_evidence=True,
+        )
+        await db_module.claim_sprint_item(
+            db_conn, p["id"], item["id"], actor="implementer-session"
+        )
+
+        # Neither gate satisfied yet: completion must be refused by ONE of
+        # the two gates (which fires first is an implementation detail —
+        # the strict_evidence gate happens to run before require_verification
+        # in the current handler ordering, since it is checked in the MCP
+        # handler before db.complete_sprint_item is ever called).
+        blocked = await mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": p["id"], "item_id": item["id"], "actor": "implementer-session"},
+            db_conn, "/tmp",
+        )
+        assert blocked.get("error") in ("STRICT_EVIDENCE_BLOCKED", "VERIFICATION_REQUIRED")
+
+        # Supply real evidence (satisfies strict_evidence) but STILL no
+        # independent verification on file — require_verification now blocks.
+        still_blocked = await mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": p["id"], "item_id": item["id"], "actor": "implementer-session",
+             "notes": "fixed the referenced function"},
+            db_conn, "/tmp",
+        )
+        assert still_blocked.get("error") == "VERIFICATION_REQUIRED"
+
+        # Satisfy require_verification too (independent fresh-session PASS).
+        # The prior VERIFICATION_REQUIRED attempt raised before persisting
+        # anything (db.complete_sprint_item never reaches its write on that
+        # path), so notes= must be supplied again here to keep strict_evidence
+        # satisfied on this final, successful call.
+        await db_module.record_sprint_item_verification(
+            db_conn, p["id"], item["id"], "fresh-verifier-session", "pass",
+        )
+        done = await mh._dispatch_mcp_tool(
+            "complete_sprint_item",
+            {"project_id": p["id"], "item_id": item["id"], "actor": "implementer-session",
+             "notes": "fixed the referenced function and re-verified"},
+            db_conn, "/tmp",
+        )
+        assert done.get("error") is None
+        assert done["status"] == "done"
+    finally:
+        await db_conn.close()
+
+
+@pytest.mark.asyncio
 async def test_count_sprint_items_awaiting_verification(db):
     p = await db_module.create_project(db, "verif-count-test")
 

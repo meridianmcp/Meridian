@@ -1100,3 +1100,1387 @@ async def test_resolve_text_quote_anchors_docx_paragraph_and_flags_drift(tmp_pat
     assert miss["resolved"] is True
     assert miss["found"] is False
     assert miss["drift"] is True
+
+
+# ---------------------------------------------------------------------------
+# 3196ba0e — fail-closed artifact readiness verification (b730 follow-up)
+#
+# verify_target_readiness / verify_pointer_readiness answer the COMPLETION-
+# time question "is this target genuinely ready?" — distinct from
+# validate_pointer's opt-in, WRITE-time target_kind='existing' check above.
+# meridian-outputs (figure_resolver / provenance_getter) is a separate
+# package not importable from core, so these tests stub those seams exactly
+# like _stub_symbol_resolver / _stub_node_resolver / _stub_citation_resolver
+# do for resolve_pointer's own seams.
+# ---------------------------------------------------------------------------
+
+from meridian.pointers import verify_target_readiness, verify_pointer_readiness
+
+
+@pytest.mark.asyncio
+async def test_readiness_missing_uri_reported_explicitly():
+    out = await verify_target_readiness({"target_kind": "existing"})
+    assert out["ready"] is False
+    assert out["status"] == "missing_uri"
+
+
+@pytest.mark.asyncio
+async def test_readiness_non_local_uri_skipped_not_faked_ready():
+    """A zotero:/doc:/finding:/URL uri is out of scope for a filesystem
+    readiness check — reported ready (skipped), never silently checked."""
+    out = await verify_target_readiness({"uri": "zotero:ABCD1234", "target_kind": "existing"})
+    assert out["ready"] is True
+    assert out["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_readiness_target_kind_omitted_defaults_to_existing(tmp_path):
+    missing = tmp_path / "nope.py"
+    out = await verify_target_readiness({"uri": str(missing)})
+    assert out["target_kind"] == "existing"
+    assert out["ready"] is False
+    assert out["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_readiness_injectable_path_and_dir_checkers():
+    """path_exists / is_dir are injectable seams, same pattern validate_pointer
+    already uses for path_exists — tests never need to touch a real filesystem."""
+    calls = []
+
+    def _exists(uri):
+        calls.append(("exists", uri))
+        return True
+
+    def _isdir(uri):
+        calls.append(("isdir", uri))
+        return False
+
+    out = await verify_target_readiness(
+        {"uri": "fake/path.csv", "target_kind": "existing"},
+        path_exists=_exists, is_dir=_isdir,
+    )
+    assert out["ready"] is True
+    assert ("exists", "fake/path.csv") in calls
+    assert ("isdir", "fake/path.csv") in calls
+
+
+# -- existing: file present / missing / is-a-directory -----------------------
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_file_present_no_resolver(tmp_path):
+    """existing + file present + no figure_resolver -> ready, but explicitly
+    'unresolved' (meridian-outputs unavailable) — never faked as canonical."""
+    real = tmp_path / "results.csv"
+    real.write_text("a,b\n1,2\n")
+    out = await verify_target_readiness({"uri": str(real), "target_kind": "existing"})
+    assert out["ready"] is True
+    assert out["status"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_missing_file(tmp_path):
+    missing = tmp_path / "nope.csv"
+    out = await verify_target_readiness({"uri": str(missing), "target_kind": "existing"})
+    assert out["ready"] is False
+    assert out["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_path_is_a_directory(tmp_path):
+    out = await verify_target_readiness({"uri": str(tmp_path), "target_kind": "existing"})
+    assert out["ready"] is False
+    assert out["status"] == "is_directory"
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_path_is_a_directory_before_provenance(tmp_path):
+    """A planned_new target naming an existing DIRECTORY is rejected before
+    provenance is even consulted."""
+    async def _prov(_outputs_dir, _path):
+        raise AssertionError("provenance_getter must not be called for a directory")
+
+    out = await verify_target_readiness(
+        {"uri": str(tmp_path), "target_kind": "planned_new"}, provenance_getter=_prov,
+    )
+    assert out["ready"] is False
+    assert out["status"] == "is_directory"
+
+
+# -- planned_new: creation + provenance registration --------------------------
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_not_created_yet(tmp_path):
+    """Naming a future path is never enough on its own (the sprint spec's
+    core requirement for this item)."""
+    future = tmp_path / "not_written_yet.png"
+    out = await verify_target_readiness({"uri": str(future), "target_kind": "planned_new"})
+    assert out["ready"] is False
+    assert out["status"] == "not_created"
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_before_record_provenance(tmp_path):
+    """File was created, but record_provenance was never called for it — an
+    in-memory ledger stub mirrors extensions/meridian-outputs' annotate.py
+    record_provenance/get_provenance contract (path -> record dict | None)."""
+    made = tmp_path / "figure_1.png"
+    made.write_bytes(b"\x89PNG\r\n")
+    ledger: dict = {}
+
+    async def _get_provenance(_outputs_dir, path):
+        return ledger.get(path)
+
+    out = await verify_target_readiness(
+        {"uri": str(made), "target_kind": "planned_new"}, provenance_getter=_get_provenance,
+    )
+    assert out["ready"] is False
+    assert out["status"] == "provenance_missing"
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_after_record_provenance(tmp_path):
+    """Once a provenance record exists for the same path, the SAME target
+    flips to ready — mirroring record_provenance's real upsert-then-
+    get_provenance round trip."""
+    made = tmp_path / "figure_1.png"
+    made.write_bytes(b"\x89PNG\r\n")
+    ledger: dict = {}
+
+    async def _get_provenance(_outputs_dir, path):
+        return ledger.get(path)
+
+    before = await verify_target_readiness(
+        {"uri": str(made), "target_kind": "planned_new"}, provenance_getter=_get_provenance,
+    )
+    assert before["ready"] is False
+
+    # Simulate record_provenance(outputs_dir, made, ...) having been called.
+    ledger[str(made)] = {
+        "path": str(made), "generating_script": "plot_results.py", "recorded_at": 1234.0,
+    }
+
+    after = await verify_target_readiness(
+        {"uri": str(made), "target_kind": "planned_new"}, provenance_getter=_get_provenance,
+    )
+    assert after["ready"] is True
+    assert after["status"] == "ready"
+    assert after["provenance"]["generating_script"] == "plot_results.py"
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_provenance_getter_unavailable(tmp_path):
+    """No provenance_getter wired at all (meridian-outputs unavailable) must
+    degrade explicitly to ready=False — never silently pass."""
+    made = tmp_path / "table_2.csv"
+    made.write_text("x,y\n1,2\n")
+    out = await verify_target_readiness({"uri": str(made), "target_kind": "planned_new"})
+    assert out["ready"] is False
+    assert out["status"] == "provenance_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_readiness_planned_new_provenance_getter_raises_degrades(tmp_path):
+    """A provenance_getter that raises (tool present but unreachable) must
+    never be silently converted into success."""
+    made = tmp_path / "table_3.csv"
+    made.write_text("x,y\n1,2\n")
+
+    async def _boom(_outputs_dir, _path):
+        raise RuntimeError("meridian-outputs tunnel down")
+
+    out = await verify_target_readiness(
+        {"uri": str(made), "target_kind": "planned_new"}, provenance_getter=_boom,
+    )
+    assert out["ready"] is False
+    assert out["status"] == "provenance_check_failed"
+    assert "tunnel down" in out["reason"]
+
+
+# -- existing: canonical vs archival vs ambiguous resolution ------------------
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_canonical_vs_archival_resolution(tmp_path):
+    """canonical (non-archival) vs archival/stale classification is recorded,
+    but BOTH stay ready=True — archival is deprioritized evidence, not a
+    second gate (mirrors OutputsFtsIndex.search's own never-hard-exclude
+    policy for archival rows)."""
+    canon = tmp_path / "run.csv"
+    canon.write_text("a,b\n1,2\n")
+    stale = tmp_path / "run_old.csv"
+    stale.write_text("a,b\n1,2\n")
+
+    async def _resolver_canonical(_outputs_dir, file_path):
+        return {"path": file_path, "is_archival": False, "canonical_path": None}
+
+    async def _resolver_archival(_outputs_dir, file_path):
+        return {"path": file_path, "is_archival": True, "canonical_path": str(canon)}
+
+    canon_out = await verify_target_readiness(
+        {"uri": str(canon), "target_kind": "existing"}, figure_resolver=_resolver_canonical,
+    )
+    assert canon_out["ready"] is True
+    assert canon_out["status"] == "canonical"
+
+    stale_out = await verify_target_readiness(
+        {"uri": str(stale), "target_kind": "existing"}, figure_resolver=_resolver_archival,
+    )
+    assert stale_out["ready"] is True
+    assert stale_out["status"] == "archival"
+    assert stale_out["resolved"]["canonical_path"] == str(canon)
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_ambiguous_basename_resolution(tmp_path):
+    """Multiple same-basename candidates (the meridian-outputs extension's
+    relocation-tolerant basename-fallback tier) are surfaced as ambiguous,
+    not silently collapsed to canonical."""
+    figure = tmp_path / "plot.png"
+    figure.write_bytes(b"\x89PNG\r\n")
+
+    async def _resolver_ambiguous(_outputs_dir, file_path):
+        return {"path": file_path, "is_archival": False,
+                "match_type": "basename", "candidate_count": 3}
+
+    out = await verify_target_readiness(
+        {"uri": str(figure), "target_kind": "existing"}, figure_resolver=_resolver_ambiguous,
+    )
+    assert out["ready"] is True
+    assert out["status"] == "ambiguous"
+    assert out["resolved"]["candidate_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_meridian_outputs_unavailable_no_resolver(tmp_path):
+    """No figure_resolver at all — the tool genuinely unavailable. File
+    presence still satisfies readiness, but status must say 'unresolved',
+    never 'canonical' (never fake success for an unreachable check)."""
+    real = tmp_path / "output.npy"
+    real.write_bytes(b"\x93NUMPY")
+    out = await verify_target_readiness({"uri": str(real), "target_kind": "existing"})
+    assert out["ready"] is True
+    assert out["status"] == "unresolved"
+    assert "unavailable" in out["reason"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_existing_meridian_outputs_resolver_raises_degrades(tmp_path):
+    """A figure_resolver that raises (tool present but unreachable) degrades
+    explicitly rather than silently reporting canonical."""
+    real = tmp_path / "output.json"
+    real.write_text("{}")
+
+    async def _boom(_outputs_dir, _path):
+        raise RuntimeError("outputs tunnel timeout")
+
+    out = await verify_target_readiness(
+        {"uri": str(real), "target_kind": "existing"}, figure_resolver=_boom,
+    )
+    assert out["ready"] is True
+    assert out["status"] == "degraded"
+    assert "timeout" in out["reason"]
+
+
+@pytest.mark.asyncio
+async def test_readiness_default_figure_resolver_wraps_outputs_indexer(tmp_path):
+    """The core-local default figure_resolver (used when a caller wants real
+    resolution without injecting a stub) really does reuse
+    outputs_indexer.resolve_figure_output rather than duplicating resolution
+    policy — proven end-to-end against a real (tiny) outputs tree."""
+    outputs_dir = tmp_path / "outputs"
+    outputs_dir.mkdir()
+    csv_path = outputs_dir / "metrics.csv"
+    csv_path.write_text("epoch,loss\n1,0.5\n")
+
+    resolver = pointers_module._default_figure_resolver()
+    out = await verify_target_readiness(
+        {"uri": str(csv_path), "target_kind": "existing"},
+        outputs_dir=str(outputs_dir), figure_resolver=resolver,
+    )
+    assert out["ready"] is True
+    assert out["status"] == "canonical"
+    assert out["resolved"]["path"] == str(csv_path)
+
+
+# -- pointer-level wrapper -----------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_readiness_pointer_level_requires_every_target_ready(tmp_path):
+    good = tmp_path / "good.csv"
+    good.write_text("a\n1\n")
+    missing = tmp_path / "missing.csv"
+
+    ptr = {
+        "source_type": "experiment",
+        "label": "run artifacts",
+        "targets": [
+            {"uri": str(good), "target_kind": "existing"},
+            {"uri": str(missing), "target_kind": "existing"},
+        ],
+    }
+    out = await verify_pointer_readiness(ptr)
+    assert out["ready"] is False
+    assert out["label"] == "run artifacts"
+    assert out["targets"][0]["ready"] is True
+    assert out["targets"][1]["ready"] is False
+    assert out["targets"][1]["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_readiness_pointer_level_all_ready_when_every_target_passes(tmp_path):
+    a = tmp_path / "a.csv"
+    a.write_text("x\n")
+    b = tmp_path / "b.png"
+    b.write_bytes(b"\x89PNG")
+    ptr = {"source_type": "experiment", "targets": [
+        {"uri": str(a), "target_kind": "existing"},
+        {"uri": str(b), "target_kind": "existing"},
+    ]}
+    out = await verify_pointer_readiness(ptr)
+    assert out["ready"] is True
+    assert all(t["ready"] for t in out["targets"])
+
+
+@pytest.mark.asyncio
+async def test_readiness_pointer_level_empty_targets_never_vacuously_ready():
+    out = await verify_pointer_readiness({"source_type": "experiment", "targets": []})
+    assert out["ready"] is False
+    assert out["targets"] == []
+
+
+@pytest.mark.asyncio
+async def test_readiness_pointer_level_malformed_target_never_raises():
+    out = await verify_pointer_readiness({"source_type": "x", "targets": ["not-a-dict"]})
+    assert out["ready"] is False
+    assert out["targets"][0]["status"] == "malformed_target"
+
+
+# ---------------------------------------------------------------------------
+# 88f82c15 (b730 follow-up) — evaluate_artifact_pointer_policy: the warn/
+# strict POLICY evaluator that runs at handoff-ANNOTATION time, distinct
+# from (and built on top of) verify_target_readiness/verify_pointer_readiness
+# above (a completion-time, per-target, I/O-backed check) and the 5fd9d2fd
+# classifier (meridian.artifact_classification.classify_artifact_work, which
+# this evaluator reuses rather than duplicating).
+#
+# Covers: off/warn/strict mode behavior, every insufficiency reason code
+# (bare docx / directory / generic tool reference / unsupported type /
+# missing entirely), the "cannot self-declare out of the check" invariant,
+# and the false-positive exception (a genuinely document_only/caption_only
+# item with a bare/insufficient pointer must NEVER warn).
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+from meridian.pointers import evaluate_artifact_pointer_policy
+
+
+_STRICT_POLICY = _json.dumps({"artifact_pointer_check": "strict"})
+_WARN_POLICY = _json.dumps({"artifact_pointer_check": "warn"})
+_OFF_POLICY = _json.dumps({"artifact_pointer_check": "off"})
+
+
+def _figure_item(**overrides):
+    item = {"id": "art-1", "title": "Insert a new ablation chart figure into the results"}
+    item.update(overrides)
+    return item
+
+
+# --- required result shape -------------------------------------------------
+
+def test_evaluate_artifact_pointer_policy_always_returns_required_fields():
+    """Each result must include: item id, classification, policy, warning
+    code, required remediation, and affected pointer ids."""
+    result = evaluate_artifact_pointer_policy(_figure_item())
+    for key in (
+        "item_id", "classification", "policy",
+        "warning_code", "required_remediation", "affected_pointer_ids",
+    ):
+        assert key in result
+    assert result["item_id"] == "art-1"
+    assert isinstance(result["classification"], dict)
+    assert isinstance(result["policy"], dict)
+
+
+def test_evaluate_artifact_pointer_policy_never_raises_on_malformed_item():
+    result = evaluate_artifact_pointer_policy(None)  # type: ignore[arg-type]
+    assert result["warning_code"] is None
+    assert result["ready"] is True
+    result2 = evaluate_artifact_pointer_policy({})
+    assert result2["warning_code"] is None
+
+
+# --- default policy is warn -------------------------------------------------
+
+def test_default_artifact_pointer_check_is_warn_when_undeclared():
+    result = evaluate_artifact_pointer_policy(_figure_item())
+    assert result["policy"]["artifact_pointer_check"] == "warn"
+    assert result["warning_code"] == "missing_pointer"
+    assert result["ready"] is True  # warn mode never blocks
+
+
+# --- not artifact-sensitive: never warns, regardless of policy -------------
+
+def test_not_sensitive_item_never_warns_even_under_strict():
+    item = _figure_item(
+        title="Renumber figure captions after Figure 4 was deleted",
+        artifact_policy=_STRICT_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["classification"]["classification"] == "caption_only"
+    assert result["classification"]["is_artifact_sensitive"] is False
+    assert result["warning_code"] is None
+    assert result["ready"] is True
+
+
+def test_false_positive_document_only_declared_kind_with_bare_pointer_never_warns():
+    """A genuinely document_only item (declared kind wins, per 5fd9d2fd) with
+    a bare .docx pointer must NOT warn, even under strict policy."""
+    item = _figure_item(
+        title="Insert a new ablation chart figure",  # figure-sounding title
+        artifact_kind="document_only",  # explicit override — genuinely document_only
+        touches_resources=_json.dumps(["file:outputs/report.docx"]),
+        artifact_policy=_STRICT_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["classification"]["classification"] == "document_only"
+    assert result["classification"]["rule"] == "declared_artifact_kind"
+    assert result["warning_code"] is None
+    assert result["ready"] is True
+
+
+def test_false_positive_fallback_caption_only_with_bare_pointer_never_warns():
+    item = _figure_item(
+        title="Renumber figure captions",
+        touches_resources=_json.dumps(["file:outputs/report.docx"]),
+        artifact_policy=_STRICT_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["classification"]["classification"] == "caption_only"
+    assert result["warning_code"] is None
+
+
+# --- a figure/table item cannot self-declare its way out --------------------
+
+def test_allow_document_only_override_does_not_bypass_a_sensitive_verdict():
+    """policy.allow_document_only_override is NOT consulted to flip a
+    genuinely sensitive (figure/table) classification to safe — only the
+    classifier's own verdict (declared kind, or fallback evidence) can do
+    that. A figure/table item cannot self-declare its way out of the check."""
+    item = _figure_item(
+        artifact_policy=_json.dumps({
+            "artifact_pointer_check": "strict",
+            "allow_document_only_override": True,
+        }),
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["classification"]["is_artifact_sensitive"] is True
+    assert result["warning_code"] == "missing_pointer"
+    assert result["ready"] is False
+
+
+# --- insufficiency reason codes ---------------------------------------------
+
+def test_insufficient_bare_docx_pointer_warns_with_specific_code():
+    item = _figure_item(
+        touches_resources=_json.dumps(["file:outputs/report.docx"]),
+        artifact_policy=_WARN_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] == "insufficient_pointer_bare_docx"
+    assert result["required_remediation"]
+    assert "docx" in result["required_remediation"].lower()
+    assert result["ready"] is True  # warn mode
+
+
+def test_insufficient_directory_pointer_warns_with_specific_code():
+    item = _figure_item(
+        touches_resources=_json.dumps(["file:outputs/figures/"]),
+        artifact_policy=_WARN_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] == "insufficient_pointer_directory"
+
+
+def test_insufficient_generic_tool_reference_warns_and_names_pointer_id():
+    item = _figure_item(
+        pointer_records=[{
+            "id": "ptr-abc123",
+            "source_type": "code",
+            "targets": [{"uri": "mcp_tool:search_outputs"}],
+        }],
+        artifact_policy=_WARN_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] == "insufficient_pointer_generic_reference"
+    assert result["affected_pointer_ids"] == ["ptr-abc123"]
+
+
+def test_insufficient_unsupported_extension_warns_with_specific_code():
+    item = _figure_item(
+        touches_resources=_json.dumps(["file:outputs/figures/notes.txt"]),
+        artifact_policy=_WARN_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] == "insufficient_pointer_unsupported_type"
+
+
+def test_missing_pointer_entirely_uses_missing_pointer_code():
+    item = _figure_item(artifact_policy=_WARN_POLICY)
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] == "missing_pointer"
+    assert result["affected_pointer_ids"] == []
+
+
+def test_concrete_evidence_never_warns_even_under_strict():
+    item = _figure_item(
+        touches_resources=_json.dumps(["file:outputs/figures/ablation.png"]),
+        artifact_policy=_STRICT_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] is None
+    assert result["ready"] is True
+
+
+# --- off/warn/strict mode matrix --------------------------------------------
+
+def test_warn_mode_emits_warning_but_stays_ready():
+    item = _figure_item(artifact_policy=_WARN_POLICY)
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] is not None
+    assert result["ready"] is True
+
+
+def test_strict_mode_emits_warning_and_is_not_ready():
+    item = _figure_item(artifact_policy=_STRICT_POLICY)
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] is not None
+    assert result["ready"] is False
+
+
+def test_off_mode_suppresses_warning_but_preserves_classification_and_policy():
+    """off mode: the policy warning is suppressed while raw declarations
+    (classification + effective policy) are still preserved."""
+    item = _figure_item(artifact_policy=_OFF_POLICY)
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] is None
+    assert result["required_remediation"] is None
+    assert result["affected_pointer_ids"] == []
+    assert result["ready"] is True
+    # "raw declarations... preserved" — the real classification/policy are
+    # NOT replaced with empty/unknown placeholders just because checking is off.
+    assert result["classification"]["classification"] == "figure"
+    assert result["classification"]["is_artifact_sensitive"] is True
+    assert result["policy"]["artifact_pointer_check"] == "off"
+
+
+def test_off_mode_with_insufficient_pointer_also_suppresses():
+    item = _figure_item(
+        touches_resources=_json.dumps(["file:outputs/report.docx"]),
+        artifact_policy=_OFF_POLICY,
+    )
+    result = evaluate_artifact_pointer_policy(item)
+    assert result["warning_code"] is None
+    assert result["ready"] is True
+
+
+# ---------------------------------------------------------------------------
+# 70c10ca3 (b730 follow-up) — build_artifact_pointer_finding /
+# assemble_artifact_pointer_findings_from_annotated_items: combine 88f82c15's
+# warn/strict policy verdict with 3196ba0e's fail-closed readiness
+# verification into ONE canonical, machine-readable finding.
+# ---------------------------------------------------------------------------
+
+from meridian.pointers import build_artifact_pointer_finding  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_none_when_no_active_warning():
+    """A genuinely non-sensitive item produces no finding at all — mirrors
+    evaluate_artifact_pointer_policy's own restraint."""
+    item = {"id": "art-1", "title": "Renumber figure captions"}
+    out = await build_artifact_pointer_finding(item)
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_missing_pointer_status():
+    """No candidate pointer at all -> pointer_status 'missing', and an empty
+    target_readiness (there is no durable row to verify)."""
+    item = _figure_item(artifact_policy=_WARN_POLICY)
+    out = await build_artifact_pointer_finding(item)
+    assert out is not None
+    assert out["warning_code"] == "missing_pointer"
+    assert out["pointer_status"] == "missing"
+    assert out["affected_pointer_ids"] == []
+    assert out["target_readiness"] == []
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_weak_pointer_status_and_readiness(tmp_path):
+    """A bare .docx durable pointer -> pointer_status 'weak', and its
+    readiness IS verified (via the default core-local figure_resolver) for
+    the implicated pointer id."""
+    docx = tmp_path / "report.docx"
+    docx.write_bytes(b"PK\x03\x04")  # a real file on disk
+    item = _figure_item(
+        artifact_policy=_STRICT_POLICY,
+        pointer_records=[{
+            "id": "ptr-1",
+            "source_type": "docs",
+            "targets": [{"uri": str(docx), "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+        }],
+    )
+    stored_pointers = [{"id": "ptr-1", "targets": [{"uri": str(docx), "target_kind": "existing"}]}]
+    out = await build_artifact_pointer_finding(item, stored_pointers=stored_pointers)
+    assert out is not None
+    assert out["warning_code"] == "insufficient_pointer_bare_docx"
+    assert out["pointer_status"] == "weak"
+    assert out["affected_pointer_ids"] == ["ptr-1"]
+    assert len(out["target_readiness"]) == 1
+    entry = out["target_readiness"][0]
+    assert entry["pointer_id"] == "ptr-1"
+    # entry is the FULL verify_pointer_readiness result for this pointer
+    # (pointer-level ready + a per-target verdict list), plus pointer_id.
+    assert entry["ready"] is True
+    assert len(entry["targets"]) == 1
+    target_verdict = entry["targets"][0]
+    # The DEFAULT figure_resolver was genuinely consulted (not merely
+    # "figure_resolver is None -> unavailable") — proven by the distinct
+    # "not found in the meridian-outputs index" reason text only that branch
+    # produces (see verify_target_readiness).
+    assert target_verdict["status"] == "unresolved"
+    assert "meridian-outputs index" in target_verdict["reason"]
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_target_readiness_missing_when_file_absent(tmp_path):
+    absent = tmp_path / "does_not_exist.docx"
+    item = _figure_item(
+        artifact_policy=_STRICT_POLICY,
+        pointer_records=[{
+            "id": "ptr-missing",
+            "source_type": "docs",
+            "targets": [{"uri": str(absent), "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+        }],
+    )
+    stored_pointers = [{"id": "ptr-missing", "targets": [{"uri": str(absent), "target_kind": "existing"}]}]
+    out = await build_artifact_pointer_finding(item, stored_pointers=stored_pointers)
+    entry = out["target_readiness"][0]
+    assert entry["ready"] is False
+    assert entry["targets"][0]["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_consumes_injected_figure_resolver(tmp_path):
+    """canonical / archival / ambiguous all propagate through target_readiness
+    when a caller injects a stub figure_resolver — proving readiness data,
+    not just file-presence, is genuinely consumed end to end."""
+    stale = tmp_path / "run_old.docx"
+    stale.write_bytes(b"PK\x03\x04")
+    item = _figure_item(
+        artifact_policy=_STRICT_POLICY,
+        pointer_records=[{
+            "id": "ptr-archival",
+            "source_type": "docs",
+            "targets": [{"uri": str(stale), "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+        }],
+    )
+    stored_pointers = [{"id": "ptr-archival", "targets": [{"uri": str(stale), "target_kind": "existing"}]}]
+
+    async def _archival_resolver(_outputs_dir, file_path):
+        return {"path": file_path, "is_archival": True, "canonical_path": "run.docx"}
+
+    out = await build_artifact_pointer_finding(
+        item, stored_pointers=stored_pointers, figure_resolver=_archival_resolver,
+    )
+    entry = out["target_readiness"][0]
+    assert entry["ready"] is True
+    target_verdict = entry["targets"][0]
+    assert target_verdict["status"] == "archival"
+    assert target_verdict["resolved"]["canonical_path"] == "run.docx"
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_reuses_supplied_policy_result_verbatim():
+    """policy_result, when given, is used AS-IS — no independent
+    recomputation from `item` (proven by an item that would otherwise
+    classify as non-sensitive/None)."""
+    canned_policy = {
+        "item_id": "hand-crafted",
+        "classification": {"classification": "table", "is_artifact_sensitive": True},
+        "policy": {"artifact_pointer_check": "warn"},
+        "warning_code": "insufficient_pointer_directory",
+        "required_remediation": "point at the file, not the directory",
+        "affected_pointer_ids": [],
+        "ready": True,
+    }
+    out = await build_artifact_pointer_finding({}, policy_result=canned_policy)
+    assert out["item_id"] == "hand-crafted"
+    assert out["warning_code"] == "insufficient_pointer_directory"
+    assert out["pointer_status"] == "weak"
+    assert out["target_readiness"] == []
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_multiple_affected_ids_sorted(tmp_path):
+    a = tmp_path / "a.docx"
+    a.write_bytes(b"PK")
+    b = tmp_path / "b.docx"
+    b.write_bytes(b"PK")
+    canned_policy = {
+        "item_id": "multi",
+        "classification": {}, "policy": {},
+        "warning_code": "insufficient_pointer_bare_docx",
+        "required_remediation": "x",
+        "affected_pointer_ids": ["ptr-b", "ptr-a"],
+        "ready": True,
+    }
+    stored_pointers = [
+        {"id": "ptr-b", "targets": [{"uri": str(b), "target_kind": "existing"}]},
+        {"id": "ptr-a", "targets": [{"uri": str(a), "target_kind": "existing"}]},
+    ]
+    out = await build_artifact_pointer_finding(
+        {}, policy_result=canned_policy, stored_pointers=stored_pointers,
+    )
+    assert [t["pointer_id"] for t in out["target_readiness"]] == ["ptr-a", "ptr-b"]
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_readiness_failure_degrades_not_raises(monkeypatch):
+    canned_policy = {
+        "item_id": "boom-item",
+        "classification": {}, "policy": {},
+        "warning_code": "insufficient_pointer_bare_docx",
+        "required_remediation": "x",
+        "affected_pointer_ids": ["ptr-boom"],
+        "ready": True,
+    }
+    stored_pointers = [{"id": "ptr-boom", "targets": [{"uri": "x.docx", "target_kind": "existing"}]}]
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("readiness check exploded")
+
+    monkeypatch.setattr(pointers_module, "verify_pointer_readiness", _boom)
+    out = await build_artifact_pointer_finding(
+        {}, policy_result=canned_policy, stored_pointers=stored_pointers,
+    )
+    assert out is not None
+    entry = out["target_readiness"][0]
+    assert entry["pointer_id"] == "ptr-boom"
+    assert entry["ready"] is False
+    assert entry["status"] == "verification_error"
+
+
+@pytest.mark.asyncio
+async def test_build_artifact_pointer_finding_missing_affected_pointer_id_skipped():
+    """An affected_pointer_ids entry with no matching stored_pointers row is
+    silently skipped (never crashes, never fabricates a verdict) — even when
+    OTHER stored_pointers rows exist (proves it's an id-match miss, not just
+    an empty stored_pointers short-circuit)."""
+    canned_policy = {
+        "item_id": "orphan",
+        "classification": {}, "policy": {},
+        "warning_code": "insufficient_pointer_directory",
+        "required_remediation": "x",
+        "affected_pointer_ids": ["ptr-does-not-exist"],
+        "ready": True,
+    }
+    out = await build_artifact_pointer_finding(
+        {}, policy_result=canned_policy,
+        stored_pointers=[{"id": "ptr-unrelated", "targets": [{"uri": "x.docx", "target_kind": "existing"}]}],
+    )
+    assert out["target_readiness"] == []
+
+
+def test_build_artifact_pointer_finding_never_raises_on_evaluate_blowup(monkeypatch):
+    """A raising evaluate_artifact_pointer_policy (no policy_result supplied)
+    degrades to None, never crashes this mandatory annotation path."""
+    def _boom(_item):
+        raise RuntimeError("classification exploded")
+
+    monkeypatch.setattr(pointers_module, "evaluate_artifact_pointer_policy", _boom)
+    import asyncio as _asyncio
+    out = _asyncio.run(build_artifact_pointer_finding({"id": "x"}))
+    assert out is None
+
+
+# ---------------------------------------------------------------------------
+# assemble_artifact_pointer_findings_from_annotated_items — pure assembly
+# ---------------------------------------------------------------------------
+
+from meridian.pointers import (  # noqa: E402
+    assemble_artifact_pointer_findings_from_annotated_items,
+)
+
+
+def test_assemble_artifact_pointer_findings_empty_when_none_active():
+    items = [{"id": "a", "title": "no problem here"}]
+    assert assemble_artifact_pointer_findings_from_annotated_items(items) == []
+
+
+def test_assemble_artifact_pointer_findings_skips_items_with_none_finding():
+    items = [{"id": "a", "artifact_pointer_finding": None}]
+    assert assemble_artifact_pointer_findings_from_annotated_items(items) == []
+
+
+def test_assemble_artifact_pointer_findings_sorted_by_item_id():
+    items = [
+        {"id": "zzz", "artifact_pointer_finding": {"item_id": "zzz", "warning_code": "missing_pointer"}},
+        {"id": "aaa", "artifact_pointer_finding": {"item_id": "aaa", "warning_code": "missing_pointer"}},
+    ]
+    out = assemble_artifact_pointer_findings_from_annotated_items(items)
+    assert [e["item_id"] for e in out] == ["aaa", "zzz"]
+
+
+def test_assemble_artifact_pointer_findings_ignores_malformed_entries():
+    items = [
+        "not-a-dict",
+        {"artifact_pointer_finding": {"item_id": "no-id"}},  # missing top-level id
+        {"id": "ok", "artifact_pointer_finding": {"item_id": "ok", "warning_code": "missing_pointer"}},
+    ]
+    out = assemble_artifact_pointer_findings_from_annotated_items(items)
+    assert [e["item_id"] for e in out] == ["ok"]
+
+
+# ---------------------------------------------------------------------------
+# eb8b6894 — distinguish pointer PRESENCE from successful TARGET RESOLUTION.
+#
+# Confirmed bug: a checkpoint/handoff projection could show a durable pointer
+# row EXISTS and mark provenance "satisfied" even when resolve_pointer
+# reports every target unresolved. These tests exercise the three new
+# explicit signals (structural_valid / target_resolved / provenance_verified),
+# the live-vs-fallback resolution_source distinction, the item-level rollup
+# (pointers.aggregate_pointer_evidence), and the opt-in STRICT gate
+# (db.is_item_claim_prospected(strict=True, target_resolved=...)) that makes
+# an unresolved-but-present pointer fail a strict caller instead of quietly
+# passing.
+# ---------------------------------------------------------------------------
+
+from meridian.pointers import (  # noqa: E402
+    check_structural_validity,
+    build_typed_pointer_record,
+    aggregate_pointer_evidence,
+    verify_pointer_readiness,
+    default_figure_resolver,
+    compute_pointer_readiness_for_record,
+)
+from meridian import handoff as handoff_module  # noqa: E402
+
+
+def test_check_structural_validity_pure_pass_and_fail():
+    ok = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2},
+         "target_kind": "existing"},
+    ]}
+    valid, err = check_structural_validity(ok)
+    assert valid is True and err is None
+
+    bad = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "bogus"}},
+    ]}
+    valid, err = check_structural_validity(bad)
+    assert valid is False
+    assert "bogus" in err
+
+
+def test_check_structural_validity_never_touches_real_filesystem():
+    """A STORED pointer (row_to_pointer shape) always carries an EXPLICIT
+    target_kind on every target — re-validating it with the REAL filesystem
+    checker would retroactively disk-check every implicit-'existing' pointer
+    ever written (see the module docstring). check_structural_validity must
+    stay pure: a target_kind='existing' pointer at a path that does NOT
+    exist on disk must still be reported structurally valid."""
+    stored = {
+        "source_type": "code",
+        "targets": [{
+            "uri": "definitely/does/not/exist/on/this/machine.py",
+            "selector": {"type": "range", "start_line": 1, "end_line": 2},
+            "target_kind": "existing",
+        }],
+    }
+    valid, err = check_structural_validity(stored)
+    assert valid is True and err is None
+
+
+def test_build_typed_pointer_record_target_resolved_true_for_fully_resolved_pointer():
+    stored = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2},
+         "target_kind": "existing"},
+    ]}
+    resolved = {"source_type": "code", "targets": [
+        {"resolved": True, "selector_type": "range", "uri": "a.py",
+         "range": {"start_line": 1, "end_line": 2}},
+    ]}
+    rec = build_typed_pointer_record(stored, resolved)
+    assert rec["structural_valid"] is True
+    assert "structural_error" not in rec
+    assert rec["target_resolved"] is True
+    assert "target_resolved_reason" not in rec
+    # range has no live/fallback resolution concept.
+    assert rec["resolution_source"] == "not_applicable"
+    # No readiness was supplied — tri-state None, never coerced to False.
+    assert rec["provenance_verified"] is None
+    assert rec["provenance_reason"]
+
+
+def test_build_typed_pointer_record_target_resolved_false_carries_reason():
+    """The core bug scenario: a durable pointer row (structurally valid) whose
+    target the resolver could NOT find — target_resolved must be False with
+    an explicit reason, distinct from structural_valid (still True: the
+    pointer itself is well-formed)."""
+    stored = {"source_type": "code", "targets": [
+        {"uri": "file:x.py", "selector": {"type": "symbol", "qualified_name": "x.missing"},
+         "target_kind": "existing"},
+    ]}
+    resolved = {"source_type": "code", "targets": [
+        {"resolved": False, "selector_type": "symbol", "uri": "file:x.py",
+         "qualified_name": "x.missing", "reason": "no matching symbol in graph snapshot"},
+    ]}
+    rec = build_typed_pointer_record(stored, resolved)
+    assert rec["structural_valid"] is True
+    assert rec["target_resolved"] is False
+    assert "unresolved" in rec["target_resolved_reason"]
+    assert "no matching symbol in graph snapshot" in rec["target_resolved_reason"]
+
+
+def test_build_typed_pointer_record_target_resolved_false_with_no_resolve_pass_at_all():
+    """resolved=None (never resolved) must also read as NOT resolved — never
+    vacuously True just because nothing failed."""
+    stored = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}},
+    ]}
+    rec = build_typed_pointer_record(stored, None)
+    assert rec["target_resolved"] is False
+    assert "not been resolved" in rec["target_resolved_reason"]
+
+
+def test_build_typed_pointer_record_resolution_source_from_symbol_match():
+    stored = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "symbol", "qualified_name": "a.b"},
+         "target_kind": "existing"},
+    ]}
+    resolved_live = {"source_type": "code", "targets": [
+        {"resolved": True, "selector_type": "symbol", "uri": "a.py",
+         "qualified_name": "a.b", "resolution_source": "live_graph"},
+    ]}
+    assert build_typed_pointer_record(stored, resolved_live)["resolution_source"] == "live_graph"
+
+    resolved_stale = {"source_type": "code", "targets": [
+        {"resolved": True, "selector_type": "symbol", "uri": "a.py",
+         "qualified_name": "a.b", "resolution_source": "stale_snapshot"},
+    ]}
+    assert build_typed_pointer_record(stored, resolved_stale)["resolution_source"] == "stale_snapshot"
+
+
+def test_build_typed_pointer_record_resolution_source_mixed_across_targets():
+    stored = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "symbol", "qualified_name": "a.b"}},
+        {"uri": "b.py", "selector": {"type": "symbol", "qualified_name": "c.d"}},
+    ]}
+    resolved = {"source_type": "code", "targets": [
+        {"resolved": True, "selector_type": "symbol", "uri": "a.py",
+         "qualified_name": "a.b", "resolution_source": "live_graph"},
+        {"resolved": True, "selector_type": "symbol", "uri": "b.py",
+         "qualified_name": "c.d", "resolution_source": "stale_snapshot"},
+    ]}
+    rec = build_typed_pointer_record(stored, resolved)
+    assert rec["resolution_source"] == "mixed"
+
+
+def test_build_typed_pointer_record_provenance_verified_none_without_readiness():
+    stored = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 1},
+         "target_kind": "existing"},
+    ]}
+    rec = build_typed_pointer_record(stored, None, readiness=None)
+    assert rec["provenance_verified"] is None
+    assert "not computed" in rec["provenance_reason"]
+
+
+@pytest.mark.asyncio
+async def test_build_typed_pointer_record_provenance_verified_reflects_readiness(tmp_path):
+    """Wires an ACTUAL verify_pointer_readiness result in: a range selector
+    always resolves (target_resolved True) regardless of whether the file
+    exists — provenance_verified is the SEPARATE signal that catches that,
+    proving all three fields answer genuinely different questions."""
+    missing = str(tmp_path / "does_not_exist.py")
+    stored = {"source_type": "code", "targets": [
+        {"uri": missing, "selector": {"type": "range", "start_line": 1, "end_line": 1},
+         "target_kind": "existing"},
+    ]}
+    resolved = {"source_type": "code", "targets": [
+        {"resolved": True, "selector_type": "range", "uri": missing,
+         "range": {"start_line": 1, "end_line": 1}},
+    ]}
+    readiness = await verify_pointer_readiness(stored)
+    rec = build_typed_pointer_record(stored, resolved, readiness=readiness)
+    # target_resolved is True (range resolves unconditionally)...
+    assert rec["target_resolved"] is True
+    # ...but provenance_verified correctly catches the missing file.
+    assert rec["provenance_verified"] is False
+    assert rec["provenance_reason"]
+
+    real_file = tmp_path / "real.py"
+    real_file.write_text("x = 1\n")
+    stored_real = {"source_type": "code", "targets": [
+        {"uri": str(real_file), "selector": {"type": "range", "start_line": 1, "end_line": 1},
+         "target_kind": "existing"},
+    ]}
+    readiness_real = await verify_pointer_readiness(stored_real)
+    rec_real = build_typed_pointer_record(stored_real, resolved, readiness=readiness_real)
+    assert rec_real["provenance_verified"] is True
+    assert "provenance_reason" not in rec_real
+
+
+@pytest.mark.asyncio
+async def test_compute_pointer_readiness_for_record_never_raises_on_malformed_pointer():
+    # No 'targets' key at all — verify_pointer_readiness degrades gracefully.
+    out = await compute_pointer_readiness_for_record({"source_type": "code"})
+    assert isinstance(out, dict)
+    assert out["ready"] is False
+
+
+def test_default_figure_resolver_returns_callable():
+    resolver = default_figure_resolver()
+    assert callable(resolver)
+
+
+# ---------------------------------------------------------------------------
+# aggregate_pointer_evidence — item-level rollup
+# ---------------------------------------------------------------------------
+
+def test_aggregate_pointer_evidence_empty_list_is_not_vacuously_true():
+    out = aggregate_pointer_evidence([])
+    assert out == {
+        "structural_valid": None,
+        "target_resolved": False,
+        "provenance_verified": None,
+        "resolution_source": "not_applicable",
+    }
+
+
+def test_aggregate_pointer_evidence_all_pass():
+    records = [
+        {"structural_valid": True, "target_resolved": True,
+         "provenance_verified": True, "resolution_source": "live_graph"},
+        {"structural_valid": True, "target_resolved": True,
+         "provenance_verified": None, "resolution_source": "not_applicable"},
+    ]
+    out = aggregate_pointer_evidence(records)
+    assert out["structural_valid"] is True
+    assert out["target_resolved"] is True
+    assert out["provenance_verified"] is True  # no False anywhere, >=1 True
+    assert out["resolution_source"] == "live_graph"
+
+
+def test_aggregate_pointer_evidence_one_unresolved_fails_the_whole_item():
+    records = [
+        {"structural_valid": True, "target_resolved": True,
+         "provenance_verified": True, "resolution_source": "live_graph"},
+        {"structural_valid": True, "target_resolved": False,
+         "provenance_verified": None, "resolution_source": "stale_snapshot"},
+    ]
+    out = aggregate_pointer_evidence(records)
+    assert out["target_resolved"] is False  # NOT vacuously True
+    assert out["resolution_source"] == "mixed"
+
+
+def test_aggregate_pointer_evidence_provenance_false_dominates():
+    records = [
+        {"structural_valid": True, "target_resolved": True,
+         "provenance_verified": None, "resolution_source": "not_applicable"},
+        {"structural_valid": True, "target_resolved": True,
+         "provenance_verified": False, "resolution_source": "not_applicable"},
+    ]
+    out = aggregate_pointer_evidence(records)
+    assert out["provenance_verified"] is False
+
+
+# ---------------------------------------------------------------------------
+# db.is_item_claim_prospected — opt-in STRICT gate (target_resolved-aware)
+# ---------------------------------------------------------------------------
+
+def test_is_item_claim_prospected_default_unaffected_by_new_kwargs():
+    """Every pre-existing call site (no strict/target_resolved kwargs) sees
+    byte-for-byte identical results — the presence-only check is untouched."""
+    item = {"touches_resources": ["file:x.py"]}
+    assert db_module.is_item_claim_prospected(item, has_pointer_evidence=True) is True
+    assert db_module.is_item_claim_prospected(item, has_pointer_evidence=False) is False
+
+
+def test_is_item_claim_prospected_strict_false_target_resolved_is_ignored():
+    """strict=False (the default) never consults target_resolved, even if a
+    caller happens to pass it — mirrors the OFF-by-default opt-in contract."""
+    item = {"touches_resources": ["file:x.py"]}
+    assert db_module.is_item_claim_prospected(
+        item, has_pointer_evidence=True, strict=False, target_resolved=False,
+    ) is True
+
+
+def test_is_item_claim_prospected_strict_true_blocks_unresolved_row():
+    """THE fix: a row exists (has_pointer_evidence=True) but did NOT resolve
+    (target_resolved=False) — under strict=True this must now FAIL the gate,
+    not pass just because a row exists."""
+    item = {"touches_resources": ["file:x.py"]}
+    assert db_module.is_item_claim_prospected(
+        item, has_pointer_evidence=True, strict=True, target_resolved=False,
+    ) is False
+
+
+def test_is_item_claim_prospected_strict_true_passes_when_resolved():
+    item = {"touches_resources": ["file:x.py"]}
+    assert db_module.is_item_claim_prospected(
+        item, has_pointer_evidence=True, strict=True, target_resolved=True,
+    ) is True
+
+
+def test_is_item_claim_prospected_strict_true_target_resolved_none_falls_back():
+    """A caller that opts into strict=True but has no resolution-aware signal
+    (target_resolved=None — e.g. never annotated) is NOT punished: it falls
+    back to the presence-only result, exactly like strict=False."""
+    item = {"touches_resources": ["file:x.py"]}
+    assert db_module.is_item_claim_prospected(
+        item, has_pointer_evidence=True, strict=True, target_resolved=None,
+    ) is True
+
+
+def test_is_item_claim_prospected_strict_true_bypass_and_no_resources_still_win():
+    """prospect_bypass and 'never a real prospecting candidate' still short-
+    circuit True even under strict=True — strict only tightens the
+    has_pointer_evidence branch, nothing else."""
+    bypassed = {"touches_resources": ["file:x.py"], "prospect_bypass": True}
+    assert db_module.is_item_claim_prospected(
+        bypassed, has_pointer_evidence=False, strict=True, target_resolved=False,
+    ) is True
+    no_resources = {}
+    assert db_module.is_item_claim_prospected(
+        no_resources, has_pointer_evidence=False, strict=True, target_resolved=False,
+    ) is True
+
+
+# ---------------------------------------------------------------------------
+# handoff._annotate_resolved_pointers — the end-to-end bug-fix demonstration
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_distinguishes_presence_from_resolution(db):
+    """THE confirmed bug, reproduced and fixed: a durable pointer row exists
+    (pointer_provenance.satisfied stays True — presence-only, unchanged
+    behavior) while the resolver could not find the target at all (default
+    resolver, empty codebase_graph_entities snapshot in this test db) — the
+    new pointer_resolution_status field must show target_resolved=False and
+    strict_satisfied=False, making the mismatch explicit instead of hidden."""
+    p = await db_module.create_project(db, "eb8b6894-presence-vs-resolution")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the thing",
+        touches_resources=["file:meridian/nonexistent_module.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "file:meridian/nonexistent_module.py",
+          "selector": {"type": "symbol", "qualified_name": "totally.unindexed.symbol"}}],
+    )
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], [item])
+    it = out[0]
+
+    # Presence-only field: unchanged, still (incorrectly, by itself) "satisfied".
+    assert it["pointer_provenance"]["satisfied"] is True
+
+    # The new, resolution-aware companion tells the real story.
+    status = it["pointer_resolution_status"]
+    assert status["structural_valid"] is True
+    assert status["target_resolved"] is False
+    assert status["strict_satisfied"] is False
+
+    # And the per-pointer record backing that rollup carries the same signal.
+    rec = it["pointer_records"][0]
+    assert rec["structural_valid"] is True
+    assert rec["target_resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_resolution_status_present_even_with_zero_pointers(db):
+    p = await db_module.create_project(db, "eb8b6894-zero-pointers")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Needs prospecting",
+        touches_resources=["file:meridian/some_module.py"],
+    )
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], [item])
+    it = out[0]
+    assert it["pointer_resolution_status"]["target_resolved"] is False
+    assert it["pointer_resolution_status"]["strict_satisfied"] is False
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_fully_resolved_range_pointer_is_strict_satisfied(db):
+    """A range pointer at a REAL, existing file resolves AND is strict_satisfied
+    — the strict gate must not punish genuinely-good evidence."""
+    p = await db_module.create_project(db, "eb8b6894-resolved-range")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the migration guard",
+        touches_resources=["file:meridian/db/migrations.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "meridian/db/migrations.py",
+          "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+    )
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], [item])
+    it = out[0]
+    status = it["pointer_resolution_status"]
+    assert status["target_resolved"] is True
+    assert status["strict_satisfied"] is True
+
+
+# ---------------------------------------------------------------------------
+# eb8b6894 — resolution_source: default resolver tags the cached snapshot
+# path explicitly (never presumed "live").
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_default_symbol_resolver_tags_stale_snapshot(db):
+    p = await db_module.create_project(db, "eb8b6894-stale-snapshot-tag")
+    await db_module.upsert_graph_entities(db, p["id"], [
+        {"qualified_name": "auth.login_user", "file": "auth.py"},
+    ])
+    resolved = await resolve_pointer(
+        db,
+        {"source_type": "code", "targets": [
+            {"uri": "auth.py", "selector": {"type": "symbol",
+                                             "qualified_name": "auth.login_user"}},
+        ]},
+        project_id=p["id"],
+    )
+    target = resolved["targets"][0]
+    assert target["resolved"] is True
+    assert target["resolution_source"] == "stale_snapshot"
+
+
+@pytest.mark.asyncio
+async def test_symbol_resolver_stub_without_resolution_source_reports_unknown():
+    """A caller-injected symbol_resolver that doesn't self-report a source
+    (e.g. a bare test stub) must never be PRESUMED live."""
+    async def _stub(_db, _pid, _q, _lim):
+        return [{"qualified_name": "a.b", "file": "a.py"}]
+
+    resolved = await resolve_pointer(
+        None,
+        {"source_type": "code", "targets": [
+            {"uri": "a.py", "selector": {"type": "symbol", "qualified_name": "a.b"}},
+        ]},
+        project_id="p",
+        symbol_resolver=_stub,
+    )
+    assert resolved["targets"][0]["resolution_source"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_build_symbol_resolver_tags_live_graph_vs_stale_snapshot(monkeypatch):
+    """prospect.build_symbol_resolver — the SAME live-vs-fallback distinction
+    test_mcp_resolve_pointers_reaches_live_graph_via_tenant already proves
+    exists at the resolution level, now surfaced explicitly as
+    resolution_source rather than left implicit."""
+    from meridian import prospect as prospect_module
+    from meridian.routes import tunnel as tunnel_module
+
+    async def _fake_call_tunnel(tid, name, args, **kw):
+        if name == "codebase__search_graph":
+            return {"content": [{"type": "text", "text":
+                '{"results": [{"qualified_name": "meridian.server.mcp_tools_doc", '
+                '"file": "meridian/server.py"}]}'}]}
+        raise AssertionError(f"unexpected tunnel tool: {name}")
+
+    monkeypatch.setattr(tunnel_module, "call_tunnel_tool", _fake_call_tunnel)
+    monkeypatch.setattr(tunnel_module, "has_active_tunnel", lambda tid: True)
+
+    resolver = prospect_module.build_symbol_resolver(tenant={"id": "tenant-live"})
+    hits = await resolver(None, "proj", "meridian.server.mcp_tools_doc", 5)
+    assert hits
+    assert hits[0]["resolution_source"] == "live_graph"
+
+
+@pytest.mark.asyncio
+async def test_build_symbol_resolver_snapshot_fallback_tags_stale_snapshot(db, monkeypatch):
+    """No active tunnel at all -> falls all the way through to the cached
+    codebase_graph_entities snapshot; that fallback must be tagged too."""
+    from meridian import prospect as prospect_module
+    from meridian.routes import tunnel as tunnel_module
+
+    monkeypatch.setattr(tunnel_module, "has_active_tunnel", lambda tid: False)
+    p = await db_module.create_project(db, "eb8b6894-resolver-fallback")
+    await db_module.upsert_graph_entities(db, p["id"], [
+        {"qualified_name": "billing.charge_customer", "file": "billing.py"},
+    ])
+    resolver = prospect_module.build_symbol_resolver(tenant={"id": "tenant-none"})
+    hits = await resolver(db, p["id"], "billing.charge_customer", 5)
+    assert hits
+    assert hits[0]["resolution_source"] == "stale_snapshot"
+
+
+# ---------------------------------------------------------------------------
+# eb8b6894 — strict_pointer_evidence opt-in: excludes an item whose durable
+# pointer never resolved from the claimable /goal batch, WITHOUT affecting
+# the default (non-strict) caller at all.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_generate_handoff_strict_pointer_evidence_excludes_unresolved_item(db, tmp_path):
+    p = await db_module.create_project(db, "eb8b6894-strict-gate-goal")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Fix the thing",
+        touches_resources=["file:meridian/nonexistent_module.py"],
+    )
+    await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "code",
+        [{"uri": "file:meridian/nonexistent_module.py",
+          "selector": {"type": "symbol", "qualified_name": "totally.unindexed.symbol"}}],
+    )
+
+    # Default (non-strict): presence alone satisfies the gate — item is
+    # claimable, exactly as before this sprint item existed.
+    _, default_content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+    )
+    assert item["id"] in default_content
+    assert "<excluded_unprospected" not in default_content
+
+    # strict_pointer_evidence=True: the SAME item is now excluded, because
+    # its durable pointer never actually resolved.
+    _, strict_content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+        strict_pointer_evidence=True,
+    )
+    assert "<excluded_unprospected" in strict_content
+    assert item["id"] in strict_content  # named in the exclusion tag itself
+
+
+def test_build_quick_start_goal_default_ignores_pointer_resolution_status():
+    """Direct unit-level proof that omitting strict_pointer_evidence (every
+    pre-existing caller) is unaffected by an item's pointer_resolution_status
+    even when that status says target_resolved=False."""
+    items = [{
+        "id": "item-1", "title": "do the thing",
+        "touches_resources": ["file:x.py"],
+        "pointer_resolution_status": {"target_resolved": False, "strict_satisfied": False},
+    }]
+    out = handoff_module._build_quick_start_goal(items, pointer_evidence_ids={"item-1"})
+    assert "<excluded_unprospected" not in out
+    assert "item-1" in out
+
+
+def test_build_quick_start_goal_strict_pointer_evidence_excludes_when_unresolved():
+    items = [{
+        "id": "item-1", "title": "do the thing",
+        "touches_resources": ["file:x.py"],
+        "pointer_resolution_status": {"target_resolved": False, "strict_satisfied": False},
+    }]
+    out = handoff_module._build_quick_start_goal(
+        items, pointer_evidence_ids={"item-1"}, strict_pointer_evidence=True,
+    )
+    assert "<excluded_unprospected" in out
+    assert "item-1" in out

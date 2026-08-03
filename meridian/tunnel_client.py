@@ -26,12 +26,15 @@ import asyncio
 import base64
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import time
 import uuid
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from . import __version__
@@ -403,6 +406,310 @@ def _port_is_open(port: int, host: str = "127.0.0.1", timeout: float = 0.25) -> 
         return False
 
 
+# ---------------------------------------------------------------------------
+# Slot lifecycle contract (ddd46cc8) — one deterministic state machine and
+# diagnostic contract shared by every connector slot (fs/code/extract/ppt/
+# word/dc/docs/zotero/outputs/debug), instead of the ad-hoc "_unhealthy" bool
+# + free-text reason/detail each of _run_connection_lazy /
+# _run_extract_pool_connection previously reinvented on its own.
+#
+# Confirmed failure pattern this closes: a connector child process can exit
+# during import/startup because a Python dependency it needs (e.g.
+# ``mcp.server.fastmcp``, ``pydantic_settings``) is missing. That used to
+# collapse into the same generic "disconnected; reconnecting" symptom as a
+# transient network hiccup, so nothing distinguished "will recover on its own"
+# from "needs an operator to install a package" without reading raw logs.
+# ---------------------------------------------------------------------------
+
+
+class SlotState(str, Enum):
+    """Every state a connector slot's lifecycle can be in.
+
+    String-valued so a state serializes as-is over the wire (plugin_status
+    messages) and into diagnostics dicts with no extra mapping step.
+    """
+
+    CONFIGURED = "configured"                  # SlotProxy created, never spawned
+    PREFLIGHTING = "preflighting"               # first-spawn readiness probe in flight
+    STARTING = "starting"                       # Popen issued, awaiting readiness
+    READY = "ready"                             # process/port up, not yet health-probed
+    HEALTHY = "healthy"                         # answered tools/list successfully
+    DEGRADED = "degraded"                       # serving, but a recent probe/report was bad
+    TRANSPORT_CLOSED = "transport_closed"       # a previously-healthy transport died
+    CHILD_CRASHED = "child_crashed"             # process exited before ever serving
+    DEPENDENCY_MISSING = "dependency_missing"   # import-time dependency error
+    STARTUP_TIMEOUT = "startup_timeout"         # cold-spawn readiness window exceeded
+    TOOLS_LIST_TIMEOUT = "tools_list_timeout"   # tools/list probe never answered
+    IDLE_KILLED = "idle_killed"                 # intentionally killed after idle window
+    RECONNECTING = "reconnecting"               # backing off before the next attempt
+    QUARANTINED = "quarantined"                 # deterministic failure; auto-retry paused
+    STOPPED = "stopped"                         # explicitly torn down
+
+
+# Deterministic failure states: retrying the identical spawn fails the
+# identical way until an operator changes something (installs a dependency,
+# fixes a command). These are the states that earn a slot QUARANTINED instead
+# of being retried forever at the fast cadence.
+_DETERMINISTIC_STATES = frozenset({SlotState.DEPENDENCY_MISSING, SlotState.CHILD_CRASHED})
+
+# Transient failure states: the identical retry MAY succeed next time (cold
+# cache finishing a download, a network blip, a slow boot) — these keep the
+# existing "never give up, just back off" philosophy (b9e4967d / c325b8eb)
+# unchanged.
+_TRANSIENT_STATES = frozenset({
+    SlotState.TRANSPORT_CLOSED, SlotState.STARTUP_TIMEOUT,
+    SlotState.TOOLS_LIST_TIMEOUT, SlotState.RECONNECTING, SlotState.DEGRADED,
+})
+
+# Consecutive deterministic-classified reprobe failures before a slot is
+# quarantined. >1 so a single misclassified blip can't quarantine a slot that
+# would have recovered on the very next attempt.
+_QUARANTINE_THRESHOLD = 3
+# Background auto-recheck cadence once quarantined — deliberately much slower
+# than _WATCHDOG_COOLDOWN_SECONDS so a quarantined slot stops spamming spawn
+# attempts/logs, while still holding a standing (slow) chance to self-heal if
+# the operator fixes it without restarting the tunnel. An explicit
+# reprobe_slot() call bypasses this cadence entirely for immediate recovery.
+_QUARANTINE_COOLDOWN_SECONDS = 30 * 60.0
+
+# Kill reasons SlotProxy.kill() understands, mapped to the resulting state.
+# An unrecognised reason falls back to STOPPED rather than raising, so a typo
+# in a call site degrades to "generic stop" instead of crashing the tunnel.
+_KILL_REASON_STATES: "dict[str, SlotState]" = {
+    "idle_killed": SlotState.IDLE_KILLED,
+    "transport_closed": SlotState.TRANSPORT_CLOSED,
+    "reprobe_restart": SlotState.RECONNECTING,
+    "config_reload": SlotState.STOPPED,
+    "stopped": SlotState.STOPPED,
+}
+
+
+@dataclass
+class SlotDiagnostics:
+    """Machine-readable lifecycle diagnostics for one connector slot.
+
+    One instance lives at ``SlotProxy.diagnostics`` for the slot's whole life;
+    every lifecycle-affecting call (spawn, probe, kill, reprobe) updates it in
+    place instead of each call site inventing its own ad-hoc status fields.
+    ``to_dict()`` is what rides along on plugin_status wire messages and is
+    what a health/list/call diagnostics surface would report.
+    """
+
+    slot: str
+    state: SlotState = SlotState.CONFIGURED
+    phase: str = "configured"
+    retry_count: int = 0
+    consecutive_deterministic_failures: int = 0
+    next_retry_at: "float | None" = None
+    root_cause: "str | None" = None
+    stderr_summary: "str | None" = None
+    dependency_missing: "str | None" = None
+    exit_code: "int | None" = None
+    last_healthy_at: "float | None" = None
+    last_probe_at: "float | None" = None
+    quarantine_reason: "str | None" = None
+    updated_at: float = field(default_factory=time.monotonic)
+
+    def set(self, state: "SlotState", *, phase: "str | None" = None, **fields: Any) -> None:
+        """Transition to *state*, optionally setting any other field at once.
+
+        Centralizing "set state + bump updated_at" here is what keeps every
+        call site (ensure_running, _preflight_slot, kill, the reprobe loops)
+        from hand-rolling its own bookkeeping — a large part of what "unify
+        the lifecycle" means in practice for this dataclass's callers.
+        """
+        self.state = state
+        self.phase = phase if phase is not None else state.value
+        self.updated_at = time.monotonic()
+        for k, v in fields.items():
+            setattr(self, k, v)
+
+    def to_dict(self) -> dict:
+        """JSON-safe snapshot for wire messages / diagnostics endpoints."""
+        return {
+            "slot": self.slot,
+            "state": self.state.value,
+            "phase": self.phase,
+            "retry_count": self.retry_count,
+            "next_retry_at": self.next_retry_at,
+            "root_cause": self.root_cause,
+            "stderr_summary": self.stderr_summary,
+            "dependency_missing": self.dependency_missing,
+            "exit_code": self.exit_code,
+            "last_healthy_at": self.last_healthy_at,
+            "last_probe_at": self.last_probe_at,
+            "quarantine_reason": self.quarantine_reason,
+        }
+
+
+def _slot_is_quarantined(diagnostics: "SlotDiagnostics") -> bool:
+    """True once *diagnostics* has been explicitly placed into QUARANTINED."""
+    return diagnostics.state is SlotState.QUARANTINED
+
+
+def _note_reprobe_failure(
+    diagnostics: "SlotDiagnostics", classification: "tuple[SlotState, str] | None"
+) -> bool:
+    """Record one failed reprobe attempt; return True iff the slot is now quarantined.
+
+    *classification* is ``(state, detail)`` from a classifier such as
+    :func:`_classify_stderr_signature` / :func:`_classify_launch_exception`, or
+    ``None`` when the failure could not be classified (treated as transient —
+    an unclassifiable failure must never quarantine a slot on its own).
+
+    Deterministic classifications accumulate in
+    ``consecutive_deterministic_failures``; once that streak reaches
+    :data:`_QUARANTINE_THRESHOLD` the slot transitions to QUARANTINED. A
+    non-deterministic (or unclassified) failure resets the streak to 0 — only
+    a genuinely *consistent* deterministic signature earns quarantine, one
+    flaky blip mixed into an otherwise-transient run must not.
+    """
+    diagnostics.retry_count += 1
+    if classification is not None and classification[0] in _DETERMINISTIC_STATES:
+        state, detail = classification
+        diagnostics.consecutive_deterministic_failures += 1
+        diagnostics.set(state, phase="reprobe_failed", root_cause=detail)
+        if diagnostics.consecutive_deterministic_failures >= _QUARANTINE_THRESHOLD:
+            diagnostics.set(
+                SlotState.QUARANTINED,
+                phase="quarantined",
+                quarantine_reason=detail,
+                next_retry_at=time.monotonic() + _QUARANTINE_COOLDOWN_SECONDS,
+            )
+            return True
+        return False
+    # Transient or unclassified failure — never quarantine, reset the
+    # deterministic streak so a flaky blip can't accumulate toward it.
+    diagnostics.consecutive_deterministic_failures = 0
+    reason = classification[1] if classification is not None else diagnostics.root_cause
+    diagnostics.set(SlotState.RECONNECTING, phase="reprobe_failed", root_cause=reason)
+    return False
+
+
+def _note_reprobe_success(diagnostics: "SlotDiagnostics") -> None:
+    """Record a successful reprobe/health check — clears quarantine + failure streak."""
+    diagnostics.set(
+        SlotState.HEALTHY,
+        phase="recovered",
+        retry_count=0,
+        consecutive_deterministic_failures=0,
+        quarantine_reason=None,
+        root_cause=None,
+        next_retry_at=None,
+        last_healthy_at=time.monotonic(),
+        last_probe_at=time.monotonic(),
+    )
+
+
+async def reprobe_slot(proxy: "SlotProxy", probe=None) -> "SlotDiagnostics":
+    """Explicit, operator-triggered recovery attempt — bypasses any quarantine cooldown.
+
+    This is the "explicit reprobe/recovery semantics" the slot lifecycle
+    contract promises: a quarantined slot's background loop backs off to
+    :data:`_QUARANTINE_COOLDOWN_SECONDS` so it stops spamming retries, but an
+    operator (or a test, or a future admin action) can call this directly at
+    any time to force ONE immediate attempt regardless of that cooldown. On
+    success the slot's diagnostics are fully reset to HEALTHY (quarantine
+    cleared); on failure the diagnostics reflect the latest classification but
+    quarantine is only re-armed if the failure is again deterministic.
+    """
+    if probe is None:
+        probe = _probe_slot_health
+    healthy = await _reprobe_once(proxy, probe)
+    if healthy:
+        _note_reprobe_success(proxy.diagnostics)
+    else:
+        # ensure_running()/kill() already classified the failure onto
+        # proxy.diagnostics during _reprobe_once — reuse that classification
+        # rather than re-deriving it, so this stays a thin recovery trigger.
+        current = proxy.diagnostics.state
+        classification = (
+            (current, proxy.diagnostics.root_cause or "reprobe failed")
+            if current in _DETERMINISTIC_STATES
+            else None
+        )
+        _note_reprobe_failure(proxy.diagnostics, classification)
+    return proxy.diagnostics
+
+
+# --- failure classification (pure, unit-tested) -----------------------------
+
+# Dependency-missing signature: a child process that tried to import a
+# required Python package that isn't installed. Matched against captured
+# stderr text; the extracted module name makes the diagnostic meaningful
+# (e.g. "mcp.server.fastmcp", "pydantic_settings") rather than a bare grep hit.
+_MODULE_NOT_FOUND_RE = re.compile(
+    r"(?:ModuleNotFoundError|ImportError):\s*No module named ['\"]([\w\.\-]+)['\"]"
+)
+
+
+def _classify_stderr_signature(stderr_text: "str | None") -> "tuple[SlotState, str] | None":
+    """Classify a child process's captured stderr into a deterministic failure.
+
+    Returns ``(SlotState.DEPENDENCY_MISSING, detail)`` when the text shows a
+    Python import-time failure (``ModuleNotFoundError`` / ``ImportError`` —
+    the confirmed pattern for connectors that need e.g. ``mcp.server.fastmcp``
+    or ``pydantic_settings``). Returns ``None`` when the text doesn't match any
+    known deterministic signature, so the caller falls back to a generic
+    classification. Pure + never raises.
+    """
+    if not stderr_text:
+        return None
+    m = _MODULE_NOT_FOUND_RE.search(stderr_text)
+    if m:
+        module = m.group(1)
+        return (
+            SlotState.DEPENDENCY_MISSING,
+            f"missing Python dependency: {module!r} is not installed in the "
+            "environment running this connector — install it (or reinstall "
+            "the connector's package), then reprobe the slot.",
+        )
+    return None
+
+
+def _classify_launch_exception(exc: BaseException) -> "tuple[SlotState, str]":
+    """Classify a Popen-level launch failure (the launcher itself never started).
+
+    ``FileNotFoundError`` (ENOENT — the interpreter/binary/launcher isn't on
+    PATH) is treated as DEPENDENCY_MISSING: something the slot depends on to
+    even start is absent. Anything else is CHILD_CRASHED — still a
+    deterministic failure, just not specifically a missing-dependency
+    signature. Pure + never raises.
+    """
+    if isinstance(exc, FileNotFoundError):
+        return (SlotState.DEPENDENCY_MISSING, f"launcher executable not found: {exc}")
+    return (SlotState.CHILD_CRASHED, f"failed to launch: {exc}")
+
+
+def _probe_fast_exit_stderr(
+    cmd: "list[str]", env: "dict | None", wait_seconds: float = 2.0
+) -> "str | None":
+    """Best-effort: re-run *cmd* with stderr captured, for failure classification.
+
+    Mirrors :func:`_probe_tar_entry_error`'s shape (a short diagnostic spawn,
+    never the live server) but is a distinct probe used only to feed
+    :func:`_classify_stderr_signature` — kept separate so it can never change
+    :func:`_probe_tar_entry_error`'s own behaviour/tests. Never raises; any
+    failure to even run the probe returns ``None`` ("couldn't classify").
+    """
+    try:
+        probe = subprocess.Popen(
+            cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            _, stderr_bytes = probe.communicate(timeout=wait_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                probe.kill()
+                probe.communicate()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        return stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+    except Exception:  # noqa: BLE001 — diagnostic probe must never raise
+        return None
+
+
 class SlotProxy:
     """Manages one tunnel slot's mcp-proxy subprocess with lazy spawning.
 
@@ -473,6 +780,9 @@ class SlotProxy:
             "env": env,
             "label": label,
         }
+        # ddd46cc8 — unified lifecycle diagnostics shared by ensure_running,
+        # _preflight_slot, kill, and the reprobe loops (see SlotDiagnostics).
+        self.diagnostics = SlotDiagnostics(slot=label)
 
     @property
     def is_running(self) -> bool:
@@ -595,6 +905,10 @@ class SlotProxy:
                     )
                     self._reused = True
                     self.touch()
+                    self.diagnostics.set(
+                        SlotState.HEALTHY, phase="reused_existing",
+                        last_healthy_at=time.monotonic(),
+                    )
                     return
                 if _is_slot_claimed_by_live_client(self.port, self.client_id):
                     # Port is held by a peer tunnel — do NOT kill it; fail
@@ -605,6 +919,14 @@ class SlotProxy:
                         "by a live tunnel client — cannot spawn; resolve the port "
                         "conflict before restarting",
                         file=sys.stderr, flush=True,
+                    )
+                    # ddd46cc8 — a peer-owned port is not this slot's own failure to
+                    # retry into; DEGRADED (transient-classified) rather than a
+                    # deterministic state, since the conflict may clear on its own
+                    # once the peer's tunnel/session ends.
+                    self.diagnostics.set(
+                        SlotState.DEGRADED, phase="port_conflict",
+                        root_cause=f"port {self.port} held by a live peer tunnel",
                     )
                     return
                 # Orphaned occupant — clear it so the fresh Popen gets a
@@ -618,6 +940,10 @@ class SlotProxy:
                 f"on port {self.port}",
                 flush=True,
             )
+            # ddd46cc8 — enter STARTING before the Popen so a concurrent reader of
+            # .diagnostics (e.g. a health/status surface) never sees a stale
+            # terminal state (HEALTHY/QUARANTINED/...) while a spawn is in flight.
+            self.diagnostics.set(SlotState.STARTING, phase="spawning")
             try:
                 # a9d1ef7f — use _spawn_with_cache_retry so a uvx/npx spawn failure
                 # triggers a scoped cache clear for JUST that tool + one retry before
@@ -633,8 +959,13 @@ class SlotProxy:
                 # cascades into all 7 slots disconnecting simultaneously". Running the
                 # blocking chain on a worker thread via asyncio.to_thread lets the loop
                 # keep servicing other slots while this one's spawn is slow/failing.
+                #
+                # ddd46cc8 — self.diagnostics is also passed through so a fast-exit
+                # spawn failure (e.g. a Python child dying on ModuleNotFoundError at
+                # import time) gets classified onto it (dependency_missing vs a
+                # generic child_crashed) instead of surfacing only as a bare log line.
                 self._proc = await asyncio.to_thread(
-                    _spawn_with_cache_retry, self.cmd, self.env, self.label
+                    _spawn_with_cache_retry, self.cmd, self.env, self.label, self.diagnostics
                 )
                 self.holder["proc"] = self._proc
                 # aaddb273 — record ownership so a subsequent tunnel startup can
@@ -647,6 +978,14 @@ class SlotProxy:
                 )
                 self._proc = None
                 self.holder["proc"] = None
+                # ddd46cc8 — classify the launch failure (missing interpreter/binary
+                # vs a generic launch crash) so callers reading .diagnostics can tell
+                # "will never work until fixed" from "try again".
+                state, detail = _classify_launch_exception(exc)
+                self.diagnostics.set(
+                    state, phase="spawn_failed", root_cause=detail,
+                    retry_count=self.diagnostics.retry_count + 1,
+                )
                 return
             # e75f4fc4 — poll real readiness instead of a blind fixed sleep.
             # A blind asyncio.sleep(1.0) was long enough for a warm restart but
@@ -673,9 +1012,23 @@ class SlotProxy:
             # _cold_spawn_budget falls back to the same (2, 3.0) default as
             # before.
             _probe_attempts, _probe_delay = _cold_spawn_budget(self.label)
+            # ddd46cc8 — _spawn_with_cache_retry may already have classified a
+            # fast-exit as a DETERMINISTIC failure (dependency_missing /
+            # child_crashed) via the diagnostics side-channel above. Remember
+            # that BEFORE overwriting .state with PREFLIGHTING, so a failed
+            # readiness probe below re-affirms the specific deterministic
+            # classification instead of downgrading it to the generic (and
+            # transient-retried-forever) STARTUP_TIMEOUT.
+            _fast_exit_state = (
+                self.diagnostics.state if self.diagnostics.state in _DETERMINISTIC_STATES
+                else None
+            )
+            _fast_exit_cause = self.diagnostics.root_cause
+            self.diagnostics.set(SlotState.PREFLIGHTING, phase="cold_spawn_probe")
             healthy = await _probe_slot_health(
                 self.port, attempts=_probe_attempts, delay=_probe_delay
             )
+            self.diagnostics.last_probe_at = time.monotonic()
             if not healthy:
                 # Don't raise — the existing behavior never raised here either.
                 # A caller's actual request will now get an honest connection
@@ -688,9 +1041,33 @@ class SlotProxy:
                     "fail; the request-timeout watchdog will retry if so",
                     flush=True,
                 )
+                if _fast_exit_state is not None:
+                    # Re-affirm the deterministic classification rather than
+                    # downgrading it — the readiness probe failing is exactly
+                    # what a dependency-missing/crashing child looks like.
+                    self.diagnostics.set(
+                        _fast_exit_state, phase="cold_spawn_probe",
+                        root_cause=_fast_exit_cause,
+                        retry_count=self.diagnostics.retry_count + 1,
+                    )
+                else:
+                    # ddd46cc8 — STARTUP_TIMEOUT is transient (cold caches finish
+                    # on their own timeline), never a quarantine trigger by itself.
+                    self.diagnostics.set(
+                        SlotState.STARTUP_TIMEOUT, phase="cold_spawn_probe",
+                        root_cause="cold-spawn readiness window exceeded",
+                        retry_count=self.diagnostics.retry_count + 1,
+                    )
+            else:
+                self.diagnostics.set(
+                    SlotState.HEALTHY, phase="cold_spawn_ready",
+                    retry_count=0, consecutive_deterministic_failures=0,
+                    quarantine_reason=None, root_cause=None,
+                    last_healthy_at=time.monotonic(),
+                )
             self.touch()
 
-    def kill(self) -> None:
+    def kill(self, reason: str = "stopped") -> None:
         """Terminate the proxy process (best-effort, no-op if not running).
 
         aaddb273 — also clears the slot-claim file so a subsequent startup does
@@ -702,6 +1079,15 @@ class SlotProxy:
         live server. Just drop our reuse tracking instead — the next
         ensure_running() call re-detects it (still there → reused again; gone
         → this slot spawns its own).
+
+        ddd46cc8 — *reason* records WHY the process was torn down onto
+        ``self.diagnostics`` (via :data:`_KILL_REASON_STATES`) so a caller
+        inspecting a slot's state afterward can tell an intentional idle-kill
+        (``"idle_killed"``) apart from a request-timeout-triggered teardown
+        (``"transport_closed"``) or a plain explicit stop (the default,
+        ``"stopped"``). An unrecognised reason maps to STOPPED rather than
+        raising. Not recorded on the reused-occupant early return above — we
+        did not actually tear anything down in that case.
         """
         if self._reused:
             self._reused = False
@@ -710,6 +1096,10 @@ class SlotProxy:
         self._proc = None
         self.holder["proc"] = None
         _clear_slot_claim(self.port)
+        self.diagnostics.set(
+            _KILL_REASON_STATES.get(reason, SlotState.STOPPED),
+            phase=reason, root_cause=reason,
+        )
 
     def sync_holder(self) -> None:
         """Sync the holder's proc reference (watchdog may have replaced it)."""
@@ -735,7 +1125,9 @@ async def _idle_killer(proxy: "SlotProxy", idle_seconds: float = _IDLE_KILL_SECO
                 "killing proxy to free resources (will restart on next request)",
                 flush=True,
             )
-            proxy.kill()
+            # ddd46cc8 — reason="idle_killed" so diagnostics distinguish this
+            # intentional teardown from a crash/timeout-triggered kill.
+            proxy.kill(reason="idle_killed")
 
 
 def _tunnel_client_git_root() -> str:
@@ -928,19 +1320,34 @@ async def _probe_slot_health(
 
 
 async def _report_slot_health(
-    ws, label: str, healthy: bool, *, reason: str | None = None, detail: str | None = None
+    ws, label: str, healthy: bool, *,
+    reason: str | None = None, detail: str | None = None,
+    state: str | None = None, retry_count: int | None = None,
+    quarantine_reason: str | None = None,
 ) -> None:
     """Send a ``plugin_status`` control message up the slot's WebSocket so the
     server can suppress (or restore) this slot's tools. Best-effort. (d71ba2e7)
 
     9a8645c1 — an unhealthy report may carry a ``reason`` (e.g. ``access_denied``)
     and a human-readable ``detail`` so the dashboard shows an actionable warning
-    instead of a silent dead dot."""
+    instead of a silent dead dot.
+
+    ddd46cc8 — ``state``/``retry_count``/``quarantine_reason`` are optional and
+    purely additive (the SlotDiagnostics lifecycle contract). Omitted (the
+    default for every pre-existing caller) ⇒ the message is byte-identical to
+    before this change; only call sites that explicitly pass them get the
+    richer diagnostics on the wire."""
     msg: dict = {"type": "plugin_status", "slot": label, "healthy": healthy}
     if reason:
         msg["reason"] = reason
     if detail:
         msg["detail"] = detail
+    if state:
+        msg["state"] = state
+    if retry_count is not None:
+        msg["retry_count"] = retry_count
+    if quarantine_reason:
+        msg["quarantine_reason"] = quarantine_reason
     try:
         await ws.send(json.dumps(msg))
     except Exception:  # noqa: BLE001 — never let health reporting break the relay
@@ -1041,7 +1448,7 @@ async def _reprobe_once(proxy, probe) -> bool:
         await proxy.ensure_running()
     healthy = proxy.is_running and await probe(proxy.port)
     if not healthy and proxy.is_running:
-        proxy.kill()
+        proxy.kill(reason="reprobe_restart")
         await proxy.ensure_running()
         healthy = proxy.is_running and await probe(proxy.port)
     return healthy
@@ -1082,7 +1489,10 @@ async def _kill_on_request_timeout(proxy) -> None:
                 "proxy so the next request respawns it (watchdog)",
                 file=sys.stderr, flush=True,
             )
-            proxy.kill()
+            # ddd46cc8 — reason="transport_closed": the slot WAS serving and its
+            # transport just died mid-request, distinct from a fresh child_crashed
+            # at spawn time or an intentional idle_killed teardown.
+            proxy.kill(reason="transport_closed")
     except Exception:  # noqa: BLE001 — recovery must never break the relay loop
         pass
 
@@ -1094,6 +1504,7 @@ async def _preflight_slot(
     *,
     attempts: int | None = None,
     delay: float | None = None,
+    proxy: "SlotProxy | None" = None,
 ) -> bool:
     """Probe a slot after its first spawn; report unhealthy on failure. Returns
     the health result so callers can log it. (d71ba2e7)
@@ -1111,6 +1522,12 @@ async def _preflight_slot(
       slot label via :func:`_cold_spawn_budget` — the same lookup
       :meth:`SlotProxy.ensure_running` uses (050dcb6b), so the two independent
       first-spawn readiness probes always agree on cold-fetch slots.
+
+    ddd46cc8 — *proxy* is optional and purely additive: when given, its
+    ``.diagnostics`` is updated (HEALTHY on success, TOOLS_LIST_TIMEOUT on
+    failure) and the failure report also carries the machine-readable
+    ``state``/``phase`` fields. Callers that don't pass a proxy (including
+    every pre-existing call site/test) see byte-identical behavior to before.
     """
     if attempts is None or delay is None:
         _def_attempts, _def_delay = _cold_spawn_budget(label)
@@ -1118,7 +1535,11 @@ async def _preflight_slot(
             attempts = _def_attempts
         if delay is None:
             delay = _def_delay
+    if proxy is not None:
+        proxy.diagnostics.set(SlotState.PREFLIGHTING, phase="preflight_probe")
     healthy = await _probe_slot_health(port, attempts=attempts, delay=delay)
+    if proxy is not None:
+        proxy.diagnostics.last_probe_at = time.monotonic()
     if not healthy:
         reason, detail = _preflight_failure_hint(label, port)
         print(
@@ -1126,7 +1547,24 @@ async def _preflight_slot(
             f"marking slot unhealthy (its tools will be suppressed): {detail}",
             file=sys.stderr, flush=True,
         )
-        await _report_slot_health(ws, label, False, reason=reason, detail=detail)
+        if proxy is not None:
+            proxy.diagnostics.set(
+                SlotState.TOOLS_LIST_TIMEOUT, phase="preflight_failed",
+                root_cause=detail, retry_count=proxy.diagnostics.retry_count + 1,
+            )
+            await _report_slot_health(
+                ws, label, False, reason=reason, detail=detail,
+                state=proxy.diagnostics.state.value,
+            )
+        else:
+            await _report_slot_health(ws, label, False, reason=reason, detail=detail)
+    elif proxy is not None:
+        proxy.diagnostics.set(
+            SlotState.HEALTHY, phase="preflight_ok",
+            retry_count=0, consecutive_deterministic_failures=0,
+            quarantine_reason=None, root_cause=None,
+            last_healthy_at=time.monotonic(),
+        )
     return healthy
 
 
@@ -1210,6 +1648,23 @@ async def _run_connection_lazy(
         race on every cycle instead of giving it room to clear. Never gives up
         for good — same rationale as b9e4967d: the underlying cause (AV rule
         change, network hiccup) may still clear on its own.
+
+        ddd46cc8 — a THIRD tier on top of the fast-retry/cooldown shape above:
+        ``_reprobe_once`` re-runs ``ensure_running()`` internally, which is
+        what classifies each failure onto ``proxy.diagnostics`` (dependency-
+        missing / child-crashed / unclassified-transient). Once that
+        classification is deterministic for ``_QUARANTINE_THRESHOLD``
+        consecutive cycles the slot is QUARANTINED: reporting switches to the
+        (much slower) ``_QUARANTINE_COOLDOWN_SECONDS`` cadence instead of the
+        ``_WATCHDOG_COOLDOWN_SECONDS`` one, so a slot that will provably never
+        recover on its own (e.g. a genuinely missing Python dependency) stops
+        spamming spawn attempts/logs at the fast cadence. It still is not a
+        dead end — this loop keeps running at the slower cadence, and
+        :func:`reprobe_slot` lets an operator force an immediate recheck any
+        time. A failure that never classifies as deterministic (the case
+        every pre-existing test drives, since they monkeypatch
+        ``ensure_running``/``_reprobe_once`` without touching diagnostics)
+        never quarantines — behaviour for that case is unchanged.
         """
         nonlocal _unhealthy, _reprobe_task
         failures = 0
@@ -1229,6 +1684,7 @@ async def _run_connection_lazy(
             if recovered:
                 _unhealthy = False
                 _reprobe_task = None
+                _note_reprobe_success(proxy.diagnostics)
                 print(
                     f"tunnel:{label}: slot recovered — re-advertising tools",
                     flush=True,
@@ -1236,6 +1692,33 @@ async def _run_connection_lazy(
                 await _report_slot_health(ws, label, True)
                 return
             failures += 1
+            # ddd46cc8 — classify this cycle's failure via whatever
+            # ensure_running() just recorded on proxy.diagnostics (a fully
+            # mocked _reprobe_once/ensure_running in a test leaves it
+            # un-classified, which is correctly treated as transient below).
+            _current_state = proxy.diagnostics.state
+            _classification = (
+                (_current_state, proxy.diagnostics.root_cause or "reprobe failed")
+                if _current_state in _DETERMINISTIC_STATES else None
+            )
+            if _note_reprobe_failure(proxy.diagnostics, _classification):
+                if not gave_up_fast_retry or interval != _QUARANTINE_COOLDOWN_SECONDS:
+                    print(
+                        f"tunnel:{label}: {proxy.diagnostics.quarantine_reason} — "
+                        "quarantining the slot (deterministic failure; auto-retry "
+                        f"backed off to every {_QUARANTINE_COOLDOWN_SECONDS / 60:.0f}min; "
+                        "call reprobe_slot() to force an immediate recheck once fixed)",
+                        file=sys.stderr, flush=True,
+                    )
+                await _report_slot_health(
+                    ws, label, False, reason="quarantined",
+                    detail=proxy.diagnostics.quarantine_reason,
+                    state=SlotState.QUARANTINED.value,
+                    quarantine_reason=proxy.diagnostics.quarantine_reason,
+                )
+                gave_up_fast_retry = True
+                interval = _QUARANTINE_COOLDOWN_SECONDS
+                continue
             if failures > _WATCHDOG_MAX_RETRIES:
                 if not gave_up_fast_retry:
                     print(
@@ -1348,7 +1831,9 @@ async def _run_connection_lazy(
                         # Pre-flight the proxy once, the first time we bring it up.
                         if not _preflight_done and not _was_running:
                             _preflight_done = True
-                            if not await _preflight_slot(ws, proxy.port, label):
+                            # ddd46cc8 — proxy=proxy so a failing preflight also
+                            # lands on the shared SlotDiagnostics contract.
+                            if not await _preflight_slot(ws, proxy.port, label, proxy=proxy):
                                 # _preflight_slot already reported unhealthy; just
                                 # start the background re-probe.
                                 await _mark_unhealthy(already_reported=True)
@@ -2055,6 +2540,7 @@ def _spawn_with_cache_retry(
     cmd: "list[str]",
     env: "dict | None",
     label: str,
+    diagnostics: "SlotDiagnostics | None" = None,
 ) -> "subprocess.Popen":
     """Spawn *cmd* via ``subprocess.Popen``; on failure, do a scoped cache clear and retry once.
 
@@ -2081,6 +2567,18 @@ def _spawn_with_cache_retry(
     Uses ``_spawn_kwargs()`` internally (same as every other Popen site in this
     file) so the Windows ``CREATE_NEW_PROCESS_GROUP`` flag is always applied.
     (a9d1ef7f, 3db4f8d8)
+
+    ddd46cc8 — *diagnostics* is optional and purely additive: every existing
+    caller (including every test that calls this function positionally with
+    3 args) passes ``None`` and sees byte-identical behaviour/return value.
+    When given, a fast-exit failure is ALSO classified via
+    :func:`_classify_stderr_signature` (dependency-missing detection — the
+    confirmed "child exits during import because e.g. mcp.server.fastmcp or
+    pydantic_settings is missing" pattern) using a second, separate
+    diagnostic probe (:func:`_probe_fast_exit_stderr`) so it never touches
+    :func:`_probe_tar_entry_error`'s own behaviour. The classification is
+    recorded on *diagnostics* as a side effect; the return value/retry
+    behaviour of this function is unaffected either way.
     """
     kwargs = _spawn_kwargs()
     # 2026-07-19 — merge in explicitly-resolved, sandbox-immune cache-dir vars
@@ -2120,6 +2618,28 @@ def _spawn_with_cache_retry(
     # a broken extraction dies within milliseconds.
     time.sleep(0.1)
     if proc.poll() is not None:
+        # ddd46cc8 — classify the fast exit onto *diagnostics* (dependency-missing
+        # vs a generic crash) BEFORE the TAR/cache-clear handling below, using a
+        # separate diagnostic probe so _probe_tar_entry_error's own behaviour is
+        # untouched. Best-effort: exit_code/stderr_summary are recorded even when
+        # no deterministic signature matches, so a caller always sees SOMETHING.
+        if diagnostics is not None:
+            _fast_exit_stderr = _probe_fast_exit_stderr(cmd, env, wait_seconds=2.0)
+            _classification = _classify_stderr_signature(_fast_exit_stderr)
+            if _classification is not None:
+                _state, _detail = _classification
+                diagnostics.set(
+                    _state, phase="fast_exit", root_cause=_detail,
+                    dependency_missing=_detail, exit_code=proc.returncode,
+                    stderr_summary=(_fast_exit_stderr or "")[:500],
+                )
+            else:
+                diagnostics.set(
+                    SlotState.CHILD_CRASHED, phase="fast_exit",
+                    root_cause=f"process exited immediately (code {proc.returncode})",
+                    exit_code=proc.returncode,
+                    stderr_summary=(_fast_exit_stderr or "")[:500] or None,
+                )
         # Process already exited — check if it was a TAR extraction error.
         # Run a diagnostic probe with stderr captured to identify the class.
         if _probe_tar_entry_error(cmd, env, label, wait_seconds=5.0):
@@ -3790,6 +4310,48 @@ def _run_cmd_timeout() -> float:
     return 300.0
 
 
+# 525d86bb — the environment a SHELL-STRING run_cmd inherits.
+#
+# ROOT CAUSE of the exit-status masking this item was filed to fix: on
+# Windows, ``asyncio.create_subprocess_shell`` spawns the target command via
+# ``cmd.exe /c "<cmd>"``. That cmd.exe CHILD resolves a bare program name
+# (e.g. ``python``) through ITS OWN PATH search — which does NOT get the
+# "directory the calling process loaded from" freebie Windows' CreateProcess
+# gives the EXEC form (``create_subprocess_exec``/``create_subprocess_exec``
+# with a list of tokens): the exec form finds a sibling ``python.exe`` next
+# to *this* interpreter even when that directory is nowhere on PATH, because
+# CreateProcess's own search order checks the calling process's own directory
+# first. The shell form's cmd.exe child has no such relationship to this
+# interpreter, so when the venv/pixi Scripts directory isn't separately on
+# PATH it fails with "'python' is not recognized as an internal or external
+# command" and exits 1 — cmd.exe's own honest exit code for THAT failure, not
+# the target command's real exit status. Reproduced live: identical
+# ``python -c "...sys.exit(0)"`` returns 0 via the exec form and 1 via the
+# shell form in the same process/environment. The caller cannot tell "python
+# ran and returned 1" from "cmd.exe never found python" — before this fix
+# both look identical (status='ok', exit_code=1). This is exactly the
+# wrapper-vs-wrapped ambiguity acceptance criterion 3 calls out: a wrapping
+# layer's OWN exit code must never stand in for the wrapped command's.
+#
+# The fix hands the shell child a PATH guaranteed to include the directory
+# this interpreter is running from, so a bare ``python`` (and anything
+# installed alongside it) resolves exactly as reliably for the shell form as
+# it already does for the exec form. Returns None on non-Windows (no cmd.exe
+# indirection to correct for — POSIX ``/bin/sh -c`` has no analogous gap).
+def _shell_subprocess_env() -> "dict[str, str] | None":
+    if sys.platform != "win32":
+        return None
+    py_dir = os.path.dirname(sys.executable)
+    if not py_dir:
+        return None
+    env = dict(os.environ)
+    existing_path = env.get("PATH", "")
+    parts = existing_path.split(os.pathsep) if existing_path else []
+    if py_dir not in parts:
+        env["PATH"] = py_dir + (os.pathsep + existing_path if existing_path else "")
+    return env
+
+
 async def _handle_run_cmd(cmd: "str | list", cwd: "str | None") -> dict:
     """0e973e52 — spawn *cmd* as a local process and return structured results.
 
@@ -3838,6 +4400,7 @@ async def _handle_run_cmd(cmd: "str | list", cwd: "str | None") -> dict:
                 stdout=_asyncio.subprocess.PIPE,
                 stderr=_asyncio.subprocess.PIPE,
                 cwd=cwd or None,
+                env=_shell_subprocess_env(),
             )
         try:
             stdout_b, stderr_b = await _asyncio.wait_for(

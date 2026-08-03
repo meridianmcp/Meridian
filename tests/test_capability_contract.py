@@ -501,3 +501,67 @@ def test_http_planner_handoff_includes_capability_contract(client):
     body = r.json()
     assert "capability_contract" in body
     assert body["capability_contract"]["project_id"] == pid
+
+
+# ---------------------------------------------------------------------------
+# item_executor_contracts (23e20656, 665 follow-up) — the unified per-item
+# executor_contract, composed once and embedded in the SAME project-wide
+# JSON contract as item_tool_requirements/item_sprint_item_pointers.
+# ---------------------------------------------------------------------------
+
+async def test_contract_embeds_executor_contract_per_pending_item(db):
+    project = await db_module.create_project(db, "cap-contract-executor-embed")
+    item = await db_module.add_sprint_item(
+        db, project["id"], "v1", "Refactor the auth module",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+        }],
+    )
+    contract = await cc.build_capability_contract(db, project["id"])
+    assert "item_executor_contracts" in contract
+    by_id = {e["item_id"]: e for e in contract["item_executor_contracts"]}
+    assert item["id"] in by_id
+    entry = by_id[item["id"]]
+    assert entry["mode"] in ("autonomous", "interactive")
+    assert entry["allowed_tools"][0]["name"] == "find_symbol"
+    assert "contract_hash" in entry
+    # The per-item entry's own wall-clock generated_at must NOT leak into the
+    # embedded form (it would break the outer contract's own determinism).
+    assert "generated_at" not in entry
+
+
+async def test_contract_hash_stable_despite_embedded_executor_contracts(db):
+    """The outer project-wide contract_hash must still be byte-stable across
+    two builds of the SAME underlying state, even though each embedded
+    item_executor_contracts entry is built fresh (with its own wall-clock
+    moment) on every call."""
+    project = await db_module.create_project(db, "cap-contract-executor-stable")
+    await db_module.add_sprint_item(
+        db, project["id"], "v1", "Refactor the payments module",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+        }],
+    )
+    contract_a = await cc.build_capability_contract(db, project["id"])
+    contract_b = await cc.build_capability_contract(db, project["id"])
+    assert cc.serialize_contract(contract_a) == cc.serialize_contract(contract_b)
+    assert contract_a["contract_hash"] == contract_b["contract_hash"]
+
+
+async def test_contract_embedded_executor_contract_surfaces_unprospected_block(db):
+    """An item that declares touches_resources but has no durable pointer
+    evidence is structurally unclaimable (claim_sprint_item's UNPROSPECTED
+    gate) -- the embedded per-item executor_contract must say so explicitly,
+    not just the standalone build_executor_contract call."""
+    project = await db_module.create_project(db, "cap-contract-executor-unprospected")
+    item = await db_module.add_sprint_item(
+        db, project["id"], "v1", "Touches code with no pointer evidence yet",
+        touches_resources=["file:ghost_module.py"],
+    )
+    contract = await cc.build_capability_contract(db, project["id"])
+    by_id = {e["item_id"]: e for e in contract["item_executor_contracts"]}
+    entry = by_id[item["id"]]
+    assert entry["executable"] is False
+    assert "unprospected_resources" in entry["executable_reasons"]

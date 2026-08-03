@@ -328,6 +328,8 @@ def consume_tools_list_changed(tenant_id: str) -> bool:
 def _record_slot_health(
     tenant_id: str, slot: str, healthy: bool,
     reason: "str | None" = None, detail: "str | None" = None,
+    *, state: "str | None" = None, retry_count: "int | None" = None,
+    quarantine_reason: "str | None" = None,
 ) -> None:
     """Record a core slot's health for a tenant (from a plugin_status message).
     9a8645c1 — when unhealthy, also stash an optional reason/detail; healthy
@@ -337,7 +339,15 @@ def _record_slot_health(
     :func:`notify_tools_list_changed` so the recovered slot's tools become visible
     to an already-connected MCP session (which cached the old tools/list) on its
     next tools/list, instead of staying hidden until a full tunnel reconnect. The
-    prior state MUST be read before we overwrite it below."""
+    prior state MUST be read before we overwrite it below.
+
+    ddd46cc8 — ``state``/``retry_count``/``quarantine_reason`` are optional and
+    purely additive: a client's ``tunnel_client.py`` SlotDiagnostics lifecycle
+    contract (state machine: configured/starting/healthy/dependency_missing/
+    quarantined/...) rides along on the same ``plugin_status`` message and is
+    stored verbatim so ``tunnel_status()``'s ``slot_status`` surfaces it with no
+    further wiring. Omitted (an older client, or a call site that never passes
+    them) leaves the stored dict in its pre-existing ``{reason, detail}`` shape."""
     if not slot:
         return
     was_unhealthy = not _slot_is_healthy(tenant_id, slot)
@@ -359,11 +369,18 @@ def _record_slot_health(
         # dark despite the TTL). ``was_unhealthy`` is the prior state read above.
         if not was_unhealthy:
             _slot_unhealthy_since.setdefault(tenant_id, {})[slot] = time.monotonic()
-        if reason or detail:
-            _slot_status_detail.setdefault(tenant_id, {})[slot] = {
+        if reason or detail or state or quarantine_reason:
+            entry = {
                 "reason": reason or "unhealthy",
                 "detail": detail or "",
             }
+            if state:
+                entry["state"] = state
+            if retry_count is not None:
+                entry["retry_count"] = retry_count
+            if quarantine_reason:
+                entry["quarantine_reason"] = quarantine_reason
+            _slot_status_detail.setdefault(tenant_id, {})[slot] = entry
 
 
 def _slot_is_healthy(tenant_id: str, slot: str) -> bool:
@@ -515,9 +532,13 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
 
             if msg_type == "plugin_status":
                 # d71ba2e7 — client reports this slot's live health (+ 9a8645c1 reason).
+                # ddd46cc8 — state/retry_count/quarantine_reason are optional
+                # SlotDiagnostics fields; absent on an older client (msg.get → None).
                 _record_slot_health(
                     tenant_id, msg.get("slot") or "fs", msg.get("healthy", True),
                     reason=msg.get("reason"), detail=msg.get("detail"),
+                    state=msg.get("state"), retry_count=msg.get("retry_count"),
+                    quarantine_reason=msg.get("quarantine_reason"),
                 )
                 continue
 
@@ -627,9 +648,12 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
             if msg_type == "ping":
                 continue
             if msg_type == "plugin_status":
+                # ddd46cc8 — see the "fs" plugin_status handler above.
                 _record_slot_health(
                     tenant_id, msg.get("slot") or "code", msg.get("healthy", True),
                     reason=msg.get("reason"), detail=msg.get("detail"),
+                    state=msg.get("state"), retry_count=msg.get("retry_count"),
+                    quarantine_reason=msg.get("quarantine_reason"),
                 )
                 continue
             if msg_type == "response":
@@ -716,9 +740,12 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
             if msg_type == "ping":
                 continue
             if msg_type == "plugin_status":
+                # ddd46cc8 — see the "fs" plugin_status handler above.
                 _record_slot_health(
                     tenant_id, msg.get("slot") or "extract", msg.get("healthy", True),
                     reason=msg.get("reason"), detail=msg.get("detail"),
+                    state=msg.get("state"), retry_count=msg.get("retry_count"),
+                    quarantine_reason=msg.get("quarantine_reason"),
                 )
                 continue
             if msg_type == "response":
@@ -821,9 +848,12 @@ async def _serve_tunnel_ws(
                 # a898710a — dc/ppt/word slots report health too; record it so a
                 # failed pre-flight surfaces as "unhealthy" (not "inactive"), and
                 # a later healthy report clears the diagnostic.
+                # ddd46cc8 — see the "fs" plugin_status handler above.
                 _record_slot_health(
                     tenant_id, msg.get("slot") or label, msg.get("healthy", True),
                     reason=msg.get("reason"), detail=msg.get("detail"),
+                    state=msg.get("state"), retry_count=msg.get("retry_count"),
+                    quarantine_reason=msg.get("quarantine_reason"),
                 )
                 continue
             if msg_type == "response":
@@ -928,6 +958,15 @@ async def set_tunnel_active_repo(request: Request) -> Response:
     The tunnel client's _run_extract_pool_connection handles this message and
     updates SerenaPool.default_repo_path at runtime — no tunnel restart needed.
     Returns 503 when no extract tunnel is connected, 404 when auth fails.
+
+    46fd16f1 — delegates to :func:`send_active_repo_control` instead of sending
+    the WebSocket message itself, so this HTTP entry point ALSO updates
+    ``_tenant_active_repo`` (previously it only pushed the WS control message,
+    leaving the server-side cache stale — a worktree-scoped caller that
+    switched repos through this REST endpoint would see subsequent
+    ``call_tunnel_tool`` calls without an explicit ``repo_path`` [e.g.
+    ``prospect_symbol``'s Serena rung] keep routing to whatever repo was
+    active BEFORE this call, silently querying the wrong checkout).
     """
     if not _hosted_mode():
         return Response(
@@ -972,39 +1011,30 @@ async def set_tunnel_active_repo(request: Request) -> Response:
         )
 
     tenant_id = tenant["id"]
-    ws = _tunnel_extract_sockets.get(tenant_id)
-    if ws is None:
-        return Response(
-            content='{"status":"not_connected","message":"no active extract tunnel — start meridian --tunnel first"}',
-            status_code=503,
-            media_type="application/json",
-        )
+    result = await send_active_repo_control(tenant_id, repo_path)
+    status = result.get("status")
+    if status == "not_connected":
+        return Response(content=json.dumps(result), status_code=503, media_type="application/json")
+    if status == "error":
+        return Response(content=json.dumps(result), status_code=502, media_type="application/json")
 
-    try:
-        await ws.send_json({"type": "set_active_repo", "repo_path": repo_path})
-    except Exception as exc:
-        _log.debug("set_active_repo: send error for %s: %s", tenant_id[:8], exc)
-        return Response(
-            content=json.dumps({"status": "error", "message": str(exc)}),
-            status_code=502,
-            media_type="application/json",
-        )
-
-    return Response(
-        content=json.dumps({"status": "ok", "repo_path": repo_path}),
-        status_code=200,
-        media_type="application/json",
-    )
+    return Response(content=json.dumps(result), status_code=200, media_type="application/json")
 
 
 async def send_active_repo_control(tenant_id: str, repo_path: str) -> dict[str, str]:
     """Send set_active_repo over the extract WebSocket for a tenant.
 
-    Called by the MCP handler (no HTTP round-trip needed). Returns a status dict
-    with ``status`` of ``"ok"``, ``"not_connected"``, or ``"error"``.
+    Called by the MCP handler AND the ``/tunnel/active-repo`` HTTP route (no
+    HTTP round-trip needed from the former). Returns a status dict with
+    ``status`` of ``"ok"``, ``"not_connected"``, or ``"error"``.
 
     4d9ad87b — always updates _tenant_active_repo so subsequent call_tunnel_tool
     calls can inject X-Meridian-Repo-Path without a separate set_active_repo.
+
+    46fd16f1 — this is now the SOLE place that mutates ``_tenant_active_repo``;
+    every caller that changes the active repo (MCP tool, HTTP route) must route
+    through here so the cache never goes stale relative to the WS control
+    message actually sent to the tunnel client.
     """
     _tenant_active_repo[tenant_id] = repo_path
     ws = _tunnel_extract_sockets.get(tenant_id)
@@ -3293,6 +3323,8 @@ _WORD_WRITE_TOOLS = frozenset({
     "set_document_properties",
     "convert_document",
     "copy_document",
+    # Confirmed active in the pinned uvx docx-mcp==0.1.8 tools/list contract.
+    "search_and_replace",
 })
 
 # Argument keys a docx-mcp tool uses to name its target document, in priority order.
@@ -3308,7 +3340,7 @@ def _word_write_target(name: str, arguments: "dict | None") -> "str | None":
     be found in ``arguments`` (fail-open — we can't guard what we can't identify).
     """
     bare = name.split("__", 1)[1] if "__" in name else name
-    if bare not in _WORD_WRITE_TOOLS:
+    if bare != "search_and_replace" and bare not in _WORD_WRITE_TOOLS:
         return None
     if not isinstance(arguments, dict):
         return None
@@ -3370,6 +3402,152 @@ async def check_word_write_conflict(
             f"retry. To edit in parallel, claim_file the document first."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# 273df573 — scoped docx-region claim gate for the meridian-docs (docs) tunnel
+# slot. Reuses the SAME richer Model-B primitive
+# (meridian.db.locks.check_docx_region_write_conflict) that the native
+# update_paragraph MCP tool already enforces, rather than the plainer
+# whole-file-only check_word_write_conflict above: two sessions holding
+# non-overlapping SCOPED element claims on the same .docx may both proceed,
+# and only a whole-file lock or a same-element claim by another session
+# blocks. A tool with no natural paragraph-shaped anchor argument (e.g.
+# relocate_figure's integer figure_index) degrades to element_id=None —
+# whole-document-only checking, the "whole-document fallback" tier.
+# ---------------------------------------------------------------------------
+
+# Bare meridian-docs tool name -> (path_arg_name, anchor_arg_name_or_None).
+# Only MUTATING tools (ones that re-save the .docx zip container) appear here;
+# any name absent from this map is treated as read-only/non-mutating and is
+# never gated. anchor_arg_name is None when the tool has no argument that is
+# itself a real w14:paraId/p{N}-shaped element identifier — passing an
+# integer position (figure_index/table_index) or a non-paragraph key
+# (citation_key) into check_docx_region_write_conflict's element_id would
+# compare incompatible id spaces, so those correctly fall back to the
+# whole-document check instead. index_document / index_document_structure /
+# index_equations write only a local sidecar SQLite cache, never the .docx
+# itself, so they are intentionally excluded (not writers of the target file).
+_DOCS_WRITE_TOOLS: "dict[str, tuple[str, str | None]]" = {
+    "insert_image": ("docx_path", "anchor_para_id"),
+    "insert_figure_block": ("docx_path", "anchor_para_id"),
+    "insert_caption": ("docx_path", "anchor_para_id"),
+    "edit_caption": ("docx_path", "caption_para_id"),
+    "remove_caption": ("docx_path", "caption_para_id"),
+    "retrofit_plaintext_captions": ("docx_path", None),
+    "insert_cross_reference": ("docx_path", "anchor_para_id"),
+    "insert_citation": ("docx_path", "anchor_para_id"),
+    "edit_citation": ("docx_path", "anchor_para_id"),
+    "remove_citation": ("docx_path", "anchor_para_id"),
+    "insert_equation": ("docx_path", "anchor_para_id"),
+    "edit_equation": ("docx_path", "equation_para_id"),
+    "append_text_run_after_math": ("docx_path", "equation_para_id"),
+    "remove_equation": ("docx_path", "equation_para_id"),
+    "insert_bibliography_entry": ("docx_path", None),
+    "update_bibliography_entry": ("docx_path", None),
+    "remove_bibliography_entry": ("docx_path", None),
+    "sync_bibliography": ("docx_path", None),
+    "renumber_sequences": ("docx_path", None),
+    "insert_highlighted_note": ("docx_path", "anchor_para_id"),
+    "write_section": ("docx_path", "anchor_para_id"),
+    "move_section": ("docx_path", "section_id"),
+    "copy_section": ("docx_path", "section_id"),
+    "relocate_figure": ("docx_path", None),
+    "relocate_table": ("docx_path", None),
+    "highlight_document": ("docx_path", None),
+    "merge_docx_draft": ("canonical_path", None),
+}
+
+
+def _docs_write_target(
+    name: str, arguments: "dict | None"
+) -> "tuple[str, str | None] | None":
+    """Return ``(docx_path, element_id)`` for a MUTATING docs-slot tool, else None.
+
+    ``name`` is the BARE (prefix-stripped) meridian-docs tool name. Returns None
+    for a read-only tool, an unknown tool, or a writer whose path argument can't
+    be found in ``arguments`` (fail-open — we can't guard what we can't identify).
+    ``element_id`` is None whenever the tool has no natural paragraph-shaped
+    anchor argument (whole-document fallback) or that argument was omitted for
+    this call.
+    """
+    bare = name.split("__", 1)[1] if "__" in name else name
+    spec = _DOCS_WRITE_TOOLS.get(bare)
+    if spec is None or not isinstance(arguments, dict):
+        return None
+    path_key, anchor_key = spec
+    path_val = arguments.get(path_key)
+    if not isinstance(path_val, str) or not path_val.strip():
+        return None
+    element_id = None
+    if anchor_key is not None:
+        anchor_val = arguments.get(anchor_key)
+        if isinstance(anchor_val, str) and anchor_val.strip():
+            element_id = anchor_val.strip()
+    return path_val.strip(), element_id
+
+
+async def check_docs_write_conflict(
+    db: Any,
+    tenant_id: str,
+    name: str,
+    arguments: "dict | None",
+    session_id: "str | None" = None,
+) -> "dict | None":
+    """Consult scoped docx-region claims before relaying a MUTATING docs-slot tool.
+
+    Returns a conflict verdict dict (``{"blocked": True, "reason": ..., "holder":
+    ..., "message": ...}`` — the shape :func:`meridian.db.locks.
+    check_docx_region_write_conflict` returns) when another live session's
+    whole-file lock or scoped element claim conflicts with this write, else
+    ``None`` (clear — the relay may proceed).
+
+    Deliberately delegates to :func:`meridian.db.locks.check_docx_region_write_
+    conflict` (Model B) rather than duplicating :func:`check_word_write_conflict`'s
+    plainer whole-file-only check above — this is the SAME gate ``update_paragraph``
+    already enforces, so once ``session_id`` is actually present (see below), a
+    scoped element claim is evaluated identically whether the write reaches the
+    .docx via the native MCP path or this tunneled relay path.
+
+    How ``session_id`` reaches this function (273df573 fix): the caller
+    (:func:`call_tunnel_tool` below) passes through whatever ``session_id`` it
+    was given, which ``meridian/mcp/handler.py`` extracts from the incoming
+    ``tools/call`` arguments via ``args.get("session_id")`` — the SAME
+    extraction ``check_word_write_conflict`` relies on, and nothing in this
+    module does anything different for the docs slot. The part that had to
+    change was upstream of tunnel.py entirely: each of the 27 mutating
+    ``@mcp.tool()`` wrappers in ``extensions/meridian-docs/meridian_docs/
+    server.py`` now declares an optional ``session_id`` parameter in its own
+    signature, so it appears in that tool's advertised MCP ``inputSchema`` and
+    a compliant client actually has a field to populate. Before that, no
+    wrapper declared the parameter, so ``args.get("session_id")`` was always
+    empty for a real meridian-docs call even though this extraction code was
+    already correct — a scoped claim held by the CALLING session itself could
+    not be recognized as the caller's own, and every no-anchor-argument tool
+    (relocate_figure, relocate_table, highlight_document, merge_docx_draft,
+    retrofit_plaintext_captions, the bibliography tools, renumber_sequences)
+    was blocked by any scoped claim on the file from anyone, including its own
+    owner.
+
+    Fail-open by design — a missing db, an unidentifiable target, or a claim-
+    lookup error degrades to None (no block). This guard SURFACES a conflict; it
+    acquires no claim of its own — claim_docx_region is the real coordination
+    primitive.
+    """
+    target = _docs_write_target(name, arguments)
+    if not target or db is None:
+        return None
+    docx_path, element_id = target
+    try:
+        return await db_module.check_docx_region_write_conflict(
+            db, session_id, docx_path, element_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — never wedge a write on a lookup error
+        _log.debug(
+            "docs write-guard: check_docx_region_write_conflict(%s) failed: %s",
+            docx_path, exc,
+        )
+        return None
 
 
 # 7ef712a8 — code-intel graph tools identify a project by the *local repo-path
@@ -3859,6 +4037,13 @@ async def call_tunnel_tool(
     error. Fail-open — no db / unidentifiable target / lookup error passes through
     unchanged.
 
+    273df573 — same protection for a MUTATING meridian-docs (docs) slot tool, via
+    :func:`check_docs_write_conflict`, but using the richer scoped element-or-
+    whole-file Model B gate (:func:`meridian.db.locks.check_docx_region_write_
+    conflict`) so non-overlapping element claims on the same file don't false-
+    block each other. Read-only docs tools are never gated. Fail-open, same as
+    the word-slot guard.
+
     2ce5bc76 — when ``index_repository`` succeeds, its fingerprint is stored per
     (tenant, project_id) so future ``search_graph`` calls can detect a stale
     index and inject a ``_graph_staleness`` warning instead of silently returning
@@ -3936,6 +4121,17 @@ async def call_tunnel_tool(
         )
         if conflict is not None:
             raise RuntimeError(conflict["message"])
+    # 273df573 — scoped docx-region claim protection on the meridian-docs (docs)
+    # slot, mirroring the word-slot guard above but using the richer whole-file-
+    # or-scoped-element Model B check (check_docs_write_conflict / meridian.db.
+    # locks.check_docx_region_write_conflict) so non-overlapping element claims
+    # on the same file don't false-block each other.
+    if label == "docs":
+        conflict = await check_docs_write_conflict(
+            db, tenant_id, name, arguments, session_id=session_id,
+        )
+        if conflict is not None:
+            raise RuntimeError(conflict["message"])
     # 4d9ad87b — resolve repo_path: explicit arg wins, then cached value from the
     # last send_active_repo_control call for this tenant.
     effective_repo_path = repo_path or _tenant_active_repo.get(tenant_id)
@@ -3985,6 +4181,33 @@ async def call_tunnel_tool(
                 pass
         raise RuntimeError(_msg)
     result = resp.get("result")
+    if label == "word" and bare_name == "search_and_replace":
+        # The live docx-mcp server wraps its text response in
+        # structuredContent.result. Accept only its observed positive-count
+        # message; a zero count or any other shape is ambiguous and must not be
+        # reported as a successful document mutation.
+        if not isinstance(result, dict) or result.get("isError") is True:
+            raise RuntimeError(
+                "Word search_and_replace returned an unexpected result envelope"
+            )
+        structured = result.get("structuredContent")
+        message = structured.get("result") if isinstance(structured, dict) else None
+        marker = "替换了"
+        prefix = "搜索替换完成:"
+        if not isinstance(message, str) or not message.strip().startswith(prefix):
+            raise RuntimeError(
+                "Word search_and_replace returned no structured replacement count"
+            )
+        suffix = message.strip().split(marker, 1)[-1].strip() if marker in message else ""
+        if not suffix.endswith("处"):
+            raise RuntimeError(
+                "Word search_and_replace returned no structured replacement count"
+            )
+        count_text = suffix[:-1].strip()
+        if not count_text.isdigit() or int(count_text) <= 0:
+            raise RuntimeError(
+                "Word search_and_replace did not report a positive replacement count"
+            )
     # caf95f81 — detect silent truncation in get_code_snippet responses from the
     # code slot.  When the declared line range (start_line/end_line) is
     # meaningfully larger than the actual source line count, attach a

@@ -491,7 +491,9 @@ async def prospect_symbol_impl(
     return result
 
 
-def _normalize_prospect_hit(hit: Any, qualified_name: str) -> dict[str, Any]:
+def _normalize_prospect_hit(
+    hit: Any, qualified_name: str, *, resolution_source: str | None = None,
+) -> dict[str, Any]:
     """Normalise ONE prospect_symbol_impl hit into the ``{qualified_name, file,
     ...}`` shape :func:`pointers._resolve_symbol` expects.
 
@@ -502,10 +504,21 @@ def _normalize_prospect_hit(hit: Any, qualified_name: str) -> dict[str, Any]:
     and only backfills ``qualified_name``/``file`` when missing/falsy so
     :func:`pointers._resolve_symbol`'s exact-match + ``file`` read never KeyErrors
     or silently mismatches across rungs.
+
+    ``resolution_source`` (eb8b6894) — when given, stamped onto the
+    normalized hit (unless the raw hit already carries one) so
+    :func:`pointers._resolve_symbol` can report explicitly whether this match
+    came from the LIVE tunnel-connected graph or a fallback — see
+    :func:`build_symbol_resolver`.
     """
     if not isinstance(hit, dict):
-        return {"qualified_name": qualified_name}
+        base: dict[str, Any] = {"qualified_name": qualified_name}
+        if resolution_source:
+            base["resolution_source"] = resolution_source
+        return base
     out = dict(hit)
+    if resolution_source and not out.get("resolution_source"):
+        out["resolution_source"] = resolution_source
     if not out.get("qualified_name"):
         out["qualified_name"] = (
             hit.get("name_path") or hit.get("name") or qualified_name
@@ -569,12 +582,32 @@ def build_symbol_resolver(
                 )
                 hits = result.get("hits") or []
                 if hits:
-                    return [_normalize_prospect_hit(h, qn) for h in hits]
+                    # eb8b6894 — rung "graph"/"serena" are both LIVE
+                    # tunnel-connected lookups (codebase__search_graph /
+                    # extractor__find_symbol); "semantic" is a local BM25
+                    # fallback (no tunnel needed, but not the live graph
+                    # either). Reuses prospect_symbol_impl's OWN "rung"
+                    # label rather than inventing a new distinction.
+                    _rung = result.get("rung")
+                    _source = "live_graph" if _rung in ("graph", "serena") else "local_fallback"
+                    return [
+                        _normalize_prospect_hit(h, qn, resolution_source=_source)
+                        for h in hits
+                    ]
             except Exception:  # noqa: BLE001 — fall through to the snapshot search
                 pass
         try:
             from .db import search_graph_entities as _sg  # noqa: PLC0415
-            return await _sg(db, project_id or "", qn, limit)
+            _snapshot_hits = await _sg(db, project_id or "", qn, limit)
+            # eb8b6894 — this is the SAME production-empty codebase_graph_entities
+            # snapshot table pointers.py's own default symbol_resolver falls
+            # back to (see its docstring) — tag it identically so a caller
+            # never mistakes "matched the stale snapshot" for "matched the
+            # live graph".
+            return [
+                _normalize_prospect_hit(h, qn, resolution_source="stale_snapshot")
+                for h in (_snapshot_hits or [])
+            ]
         except Exception:  # noqa: BLE001 — resolver seam must never raise
             return []
 

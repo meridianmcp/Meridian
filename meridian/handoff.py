@@ -32,10 +32,24 @@ from xml.sax.saxutils import escape as _xml_escape  # 5abf3e12 — XML-safe /goa
 import aiosqlite
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
+from . import artifact_classification as artifact_classification_module
+from . import artifact_declaration as artifact_declaration_module
 from . import capability_contract as capability_contract_module
 from . import db as db_module
-from .db.sprint_items import _is_deferred, is_item_claim_prospected, _split_wave_label
-from .executor_config import build_executor_config_block, has_executor_config
+from . import docx_integrity_gate as docx_integrity_gate_module
+from . import executor_contract as executor_contract_module
+from . import tool_requirements as tool_requirements_module
+from .db.sprint_items import (
+    _is_deferred,
+    is_item_claim_prospected,
+    _item_declares_resources,
+    _split_wave_label,
+)
+from .executor_config import (
+    build_executor_config_block,
+    build_execution_policy,
+    has_executor_config,
+)
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 _env = Environment(
@@ -44,6 +58,14 @@ _env = Environment(
     keep_trailing_newline=True,
 )
 _DEFAULT_GOAL_TEST_FLOOR = 2150
+# 6cfdabd7 — fallback test invocation when a project has no executor_config.
+# test_cmd set. Deliberately NOT hardcoding a `-n <value>` parallelism flag
+# here: baking in a fixed flag is exactly the staleness bug this constant
+# exists to prevent (the prior /goal text hardcoded "-n 3" long after
+# pixi.toml's own `test` task moved to "-n auto"). Leaving the bare command
+# lets the project's own task definition own the parallelism policy, so this
+# fallback can never drift out of sync with it again.
+_DEFAULT_GOAL_TEST_CMD = "pixi run test"
 _STRATEGIC_NOTE_TAGS = {"planning", "strategy", "competitive", "acquisition"}
 _SESSION_HANDOFF_STATE: dict[str, str] = {}
 
@@ -538,6 +560,29 @@ def _format_content(content) -> str:
     return json.dumps(content, indent=2)
 
 
+def format_handoff_mcp_content(content: str) -> str:
+    """Return the exact ``content`` string every MCP transport must emit.
+
+    a5e8aa74 — ``generate_handoff`` already renders raw, correct text; the
+    bug was that ``meridian/mcp/handler.py`` and
+    ``meridian/mcp/stdio_handler.py`` each independently wrapped that text in
+    a four-backtick Markdown code fence (5234877f) before returning it as the
+    MCP tool result's ``content`` field. That wrapping meant a receiving
+    Claude Code session could never forward the field verbatim as a single
+    paste-ready ``/goal`` block — it had to strip a fence first, and the two
+    independent wrap sites could silently drift out of sync with each other.
+
+    Both transports (and the HTTP route in ``meridian/routes/handoff.py``,
+    which never wrapped to begin with) now call this ONE helper so there is
+    exactly one place that defines the wire contract: the ``content`` field
+    is byte-identical to what ``generate_handoff`` rendered — no code fence,
+    no header, no blockquote, no other wrapping added on the way out. Any
+    future transport must call this helper too rather than re-implementing
+    (or re-breaking) the contract independently.
+    """
+    return content
+
+
 # 08c355c2 — staleness threshold for the legacy goal_states.sprint free-text
 # field. Once sprint-item tracking is in use, this field is never updated, so
 # months-old text silently renders at equal weight to current data. Any sprint
@@ -700,6 +745,92 @@ def _max_turns_from_settings(proj_settings: dict[str, Any] | None) -> int:
         return _DEFAULT_GOAL_MAX_TURNS
 
 
+def _test_cmd_from_settings(proj_settings: dict[str, Any] | None) -> str:
+    """Extract executor_config.test_cmd (6cfdabd7). Sibling of
+    _max_turns_from_settings — same two-input read pattern, same fail-safe
+    convention: a missing/non-dict executor_config or a blank test_cmd
+    returns _DEFAULT_GOAL_TEST_CMD rather than raising or returning empty."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    if not isinstance(cfg, dict):
+        return _DEFAULT_GOAL_TEST_CMD
+    raw = cfg.get("test_cmd")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return _DEFAULT_GOAL_TEST_CMD
+
+
+def _branch_from_settings(proj_settings: dict[str, Any] | None) -> str | None:
+    """Extract executor_config.branch (6cfdabd7). Returns None when unset so
+    callers render an explicit, clearly-labeled fallback instead of guessing
+    a branch name."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    if not isinstance(cfg, dict):
+        return None
+    raw = cfg.get("branch")
+    return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+
+# 6cfdabd7 — matches a pytest-xdist worker-count flag in either `-n VALUE` or
+# `--numprocesses VALUE`/`--numprocesses=VALUE` form, so the parallelism
+# policy displayed in a /goal is read off whatever the project's actual
+# test_cmd says rather than a second hardcoded assumption.
+_PARALLELISM_FLAG_RE = re.compile(r"(?:-n|--numprocesses)(?:[= ]+)(\S+)")
+
+
+def _parallelism_policy_from_test_cmd(test_cmd: str) -> str:
+    """Read the effective pytest-xdist parallelism policy off an already-
+    resolved test_cmd, e.g. '-n auto' out of 'pixi run test -n auto' (6cfdabd7).
+
+    Returns a clearly-labeled fallback when the command carries no explicit
+    -n/--numprocesses flag, rather than asserting a parallelism value the
+    configured command doesn't actually specify — this is the exact anti-
+    staleness property the old hardcoded "-n 3" text lacked.
+    """
+    match = _PARALLELISM_FLAG_RE.search(test_cmd or "")
+    if match:
+        return f"-n {match.group(1)}"
+    return "not declared in test_cmd (task's own default applies)"
+
+
+def _strip_parallelism_flag(test_cmd: str) -> str:
+    """Return ``test_cmd`` with any -n/--numprocesses flag removed, for the
+    "rerun without parallelism" triage step in the xdist test_gate_note
+    (6cfdabd7). Falls back to appending ' -p no:xdist' when the command
+    carries no removable flag, so the triage command shown is always derived
+    from the ACTUAL effective test_cmd instead of a second hardcoded
+    fallback invocation.
+    """
+    base = (test_cmd or _DEFAULT_GOAL_TEST_CMD).strip()
+    stripped = re.sub(r"\s{2,}", " ", _PARALLELISM_FLAG_RE.sub("", base)).strip()
+    if stripped and stripped != base:
+        return stripped
+    return f"{base} -p no:xdist"
+
+
+def _build_test_gate_config_clause(
+    *, test_cmd: str, branch: str | None, version: str | None,
+) -> str:
+    """6cfdabd7 — render the resolved test_cmd/parallelism/branch/version as
+    one machine-readable ``<test_gate_config>`` tag, sourced from the
+    project's actual executor_config (``_test_cmd_from_settings`` /
+    ``_branch_from_settings``) rather than a hardcoded string. Every handoff
+    mode (full/delta/starter/goal) renders this from the SAME underlying
+    config via the shared ``_build_quick_start_goal`` call, so the four
+    modes can never disagree on these values. ``branch``/``version`` fall
+    back to a clearly-labeled 'unset'/'unscoped' rather than silently
+    omitting the attribute or guessing a value.
+    """
+    _attr_escape = {chr(34): "&quot;"}
+    _parallelism = _parallelism_policy_from_test_cmd(test_cmd)
+    _branch = _xml_escape(branch, _attr_escape) if branch else "unset"
+    _version = _xml_escape(str(version), _attr_escape) if version else "unscoped"
+    return (
+        f'\n<test_gate_config test_cmd="{_xml_escape(test_cmd, _attr_escape)}" '
+        f'parallelism="{_xml_escape(_parallelism, _attr_escape)}" '
+        f'branch="{_branch}" version="{_version}" />'
+    )
+
+
 def _completion_mode_from_settings(proj_settings: dict[str, Any] | None) -> str:
     """9f57374b — executor_config.completion_mode ('strict'|'lenient', default
     'strict'). 'strict' keeps the anti-stop failure framing on the /goal."""
@@ -738,6 +869,25 @@ def _loop_enabled_from_settings(
     ws = workspace_settings or {}
     default = ws.get("loop_enabled_default")
     return True if default is None else bool(default)
+
+
+def _execution_policy_from_settings(
+    proj_settings: dict[str, Any] | None,
+    execution_mode: str,
+) -> dict[str, Any]:
+    """75ac1c8e — resolve the canonical execution policy dict for this project.
+
+    Same two-input shape as every other ``_xxx_from_settings`` helper in this
+    module (``proj_settings`` + the already-normalized ``execution_mode``) so
+    every ``_build_quick_start_goal`` call site can wire it in identically.
+    Delegates to ``executor_config.build_execution_policy`` — see that
+    docstring for the field contract. Never raises: a non-dict/missing
+    executor_config degrades to the mode's defaults.
+    """
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    return build_execution_policy(
+        cfg if isinstance(cfg, dict) else {}, execution_mode=execution_mode
+    )
 
 
 def _partition_into_waves(
@@ -963,10 +1113,52 @@ def _build_goal_pointer_lines(pending_sprint_items: list[dict[str, Any]]) -> str
     return "\n" + "\n".join(f"- {_xml_escape(line)}" for line in lines)
 
 
+def _build_execution_policy_clause(policy: dict[str, Any] | None) -> str:
+    """75ac1c8e — render the canonical ``<execution_policy>`` /goal tag.
+
+    Every field except the escalation-rule prose lands as an XML attribute
+    (not free text) so a receiver can parse the policy deterministically —
+    e.g. ``required_first_action="claim_sprint_item"`` — instead of having to
+    interpret ``<executor_directive>``'s prose to figure out what to do
+    first. ``policy`` is expected to already be the dict shape
+    ``executor_config.build_execution_policy`` returns (see
+    ``_execution_policy_from_settings``). Returns ``""`` for a falsy/invalid
+    policy so a caller with no policy degrades to no tag rather than a
+    malformed one.
+    """
+    if not isinstance(policy, dict) or not policy:
+        return ""
+    _attr_escape = {chr(34): "&quot;"}
+    mode = _xml_escape(str(policy.get("execution_mode") or "immediate"), _attr_escape)
+    try:
+        turns = int(policy.get("max_planning_turns") or 1)
+    except (TypeError, ValueError):
+        turns = 1
+    first_action = _xml_escape(
+        str(policy.get("required_first_action") or ""), _attr_escape
+    )
+    no_confirmation = "true" if policy.get("no_confirmation") else "false"
+    parallel_wave = "true" if policy.get("permitted_parallel_wave") else "false"
+    claim_before_edit = "true" if policy.get("claim_before_edit") else "false"
+    escalation = _xml_escape(str(policy.get("genuine_blocker_escalation") or ""))
+    # Attribute names deliberately mirror the JSON dict's own keys 1:1
+    # (execution_mode, max_planning_turns, ...) so a receiver reading either
+    # surface (start_session's execution_policy dict, or this tag) uses the
+    # SAME field names — no separate mapping to remember.
+    return (
+        f'\n<execution_policy execution_mode="{mode}" max_planning_turns="{turns}" '
+        f'required_first_action="{first_action}" no_confirmation="{no_confirmation}" '
+        f'permitted_parallel_wave="{parallel_wave}" '
+        f'claim_before_edit="{claim_before_edit}">{escalation}</execution_policy>'
+    )
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
     test_floor: int = _DEFAULT_GOAL_TEST_FLOOR,
+    test_cmd: str = _DEFAULT_GOAL_TEST_CMD,
+    branch: str | None = None,
     version: str | None = None,
     execution_mode: str = "autonomous",
     max_turns: int = _DEFAULT_GOAL_MAX_TURNS,
@@ -982,6 +1174,8 @@ def _build_quick_start_goal(
     pointer_evidence_ids: "frozenset[str] | set[str] | None" = None,
     include_pointer_lines: bool = False,
     completion_criteria_override: str | None = None,
+    execution_policy: dict[str, Any] | None = None,
+    strict_pointer_evidence: bool = False,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -1041,6 +1235,22 @@ def _build_quick_start_goal(
     basis) rather than "confirmed no evidence" (which would risk mass-excluding
     every resource-declaring item on a transient DB hiccup).
 
+    ``strict_pointer_evidence`` (eb8b6894) — OPT-IN, OFF by default (mirrors
+    ``generate_handoff``'s own ``strict_evidence``/8a883f60 opt-in shape).
+    When False (every existing caller), the UNPROSPECTED exclusion below is
+    PRESENCE-only, byte-for-byte identical to before this flag existed: a
+    durable pointer row is enough to satisfy the gate regardless of whether
+    it ever actually resolved. When True, a pending item whose
+    ``pointer_resolution_status`` (set by ``_annotate_resolved_pointers`` —
+    both call sites that build a /goal run that annotation pass first) shows
+    a durable row that did NOT resolve (``target_resolved is False``) is ALSO
+    excluded — "a row exists" can no longer, by itself, satisfy a strict
+    caller's claimable batch. An item never annotated with
+    ``pointer_resolution_status`` (e.g. the starter/compact mode, which never
+    resolves pointers at all) is unaffected either way — there is no
+    resolution-aware signal to tighten against, so it falls back to the same
+    presence-only check.
+
     ``include_pointer_lines`` (682005f4) — when True, append each remaining
     item's resolved pointer(s) (``item["resolved_pointers"]``, set by
     ``_annotate_resolved_pointers``) as short lines inside ``<sprint_items>``
@@ -1048,6 +1258,34 @@ def _build_quick_start_goal(
     delta/starter output is byte-for-byte unchanged; the goal-only handoff
     mode turns it on since that mode strips the separate L1 section that
     would otherwise carry this same information.
+
+    ``execution_policy`` (75ac1c8e) — the canonical dict from
+    ``executor_config.build_execution_policy`` (see
+    ``_execution_policy_from_settings``), rendered as a structured
+    ``<execution_policy>`` tag right after ``<executor_directive>`` via
+    :func:`_build_execution_policy_clause`, in BOTH the empty-board and
+    normal branches below. ``None`` (the default — every existing call site
+    that hasn't been updated to pass it) computes a policy from the
+    ``execution_mode`` param alone via ``build_execution_policy({},
+    execution_mode=execution_mode)``, so the tag is always present and no
+    caller can silently omit it.
+
+    ``test_cmd`` (6cfdabd7) — the project's EFFECTIVE test invocation,
+    sourced by the caller from ``executor_config.test_cmd`` via
+    ``_test_cmd_from_settings`` (default ``_DEFAULT_GOAL_TEST_CMD``, the bare
+    "pixi run test" — deliberately no hardcoded ``-n`` flag, see that
+    constant's comment). Replaces what used to be a literal hardcoded
+    "pixi run test -n 3" string in both the completion criteria and the
+    xdist ``<test_gate_note>`` triage guidance — those now interpolate this
+    value, and the derived parallelism policy (``_parallelism_policy_from_
+    test_cmd``) is additionally rendered on a dedicated ``<test_gate_config>``
+    tag together with ``branch``/``version`` so every handoff mode reports
+    the SAME effective values for the SAME underlying config.
+
+    ``branch`` (6cfdabd7) — the project's ``executor_config.branch``, sourced
+    by the caller via ``_branch_from_settings``. ``None`` renders as an
+    explicit ``branch="unset"`` on ``<test_gate_config>`` rather than being
+    omitted or guessed.
     """
     _completion_override = (
         completion_criteria_override.strip()
@@ -1055,6 +1293,17 @@ def _build_quick_start_goal(
         and completion_criteria_override.strip()
         else None
     )
+    _effective_test_cmd = (
+        test_cmd.strip()
+        if isinstance(test_cmd, str) and test_cmd.strip()
+        else _DEFAULT_GOAL_TEST_CMD
+    )
+    _policy = (
+        execution_policy
+        if isinstance(execution_policy, dict) and execution_policy
+        else build_execution_policy({}, execution_mode=execution_mode)
+    )
+    _policy_clause = _build_execution_policy_clause(_policy)
     try:
         _turns = int(max_turns)
         if _turns <= 0:
@@ -1076,6 +1325,18 @@ def _build_quick_start_goal(
             item for item in pending_sprint_items
             if item.get("version") == version
         ]
+    # 76dde31f (665 follow-up) — capture the version-scoped pending-item list
+    # HERE, before any of the manual/backburner/unprospected/wave-gate
+    # exclusions below narrow `pending_sprint_items` down to just today's
+    # claimable batch. The <tool_requirements> clause deliberately reports
+    # the FULL typed inventory (status in {todo, pending}, deferred already
+    # excluded by the caller, version-scoped) rather than the narrower
+    # claimable subset, so it matches EXACTLY what
+    # capability_contract.build_capability_contract's item_tool_requirements
+    # section computes via the identical filter criteria — see
+    # capability_contract._resolve_pending_items_for_contract and
+    # _build_tool_requirements_clause below.
+    _all_pending_for_tool_requirements = list(pending_sprint_items)
     # 3a02041a — split MANUAL/human items out of the executable list so they are
     # never named under the "claim and execute" directive; they're surfaced
     # separately as the maintainer's own todo (no completion-pressure language).
@@ -1129,7 +1390,18 @@ def _build_quick_start_goal(
             True if pointer_evidence_ids is None
             else _it.get("id") in pointer_evidence_ids
         )
-        if is_item_claim_prospected(_it, has_pointer_evidence=_has_evidence):
+        # eb8b6894 — when the caller opted into strict_pointer_evidence, pull
+        # the resolution-aware signal _annotate_resolved_pointers already
+        # computed for this item (None when never annotated, e.g. starter
+        # mode — falls back to the presence-only check exactly as before).
+        _target_resolved = (
+            (_it.get("pointer_resolution_status") or {}).get("target_resolved")
+            if strict_pointer_evidence else None
+        )
+        if is_item_claim_prospected(
+            _it, has_pointer_evidence=_has_evidence,
+            strict=strict_pointer_evidence, target_resolved=_target_resolved,
+        ):
             _included_sprint_items.append(_it)
         else:
             _excluded_unprospected.append(_it)
@@ -1221,7 +1493,8 @@ def _build_quick_start_goal(
         # exactly as the prior prose form did.
         return (
             f"{_loop_prefix}/goal\n"
-            "<executor_directive>Verify remaining work is complete.</executor_directive>\n"
+            "<executor_directive>Verify remaining work is complete.</executor_directive>"
+            f"{_policy_clause}\n"
             # 0d5453bc — explicit single-run wording: full suite runs once,
             # at the end of the megasprint, not per item.
             f"<completion_criteria>{_xml_escape(_empty_completion)}"
@@ -1378,7 +1651,7 @@ def _build_quick_start_goal(
     else:
         _completion_text = (
             "Done when all listed sprint items are marked complete via "
-            "complete_sprint_item(), pixi run test passes "
+            f"complete_sprint_item(), {_effective_test_cmd} passes "
             f"{test_floor}+ (run the full suite ONCE at the very end of the "
             "entire megasprint as the single deploy gate -- not per item; "
             "per-item verification uses targeted tests for that item only), "
@@ -1386,7 +1659,8 @@ def _build_quick_start_goal(
         )
     return (
         f"{_loop_prefix}/goal\n"
-        f"<executor_directive>{_xml_escape(directive)}</executor_directive>\n"
+        f"<executor_directive>{_xml_escape(directive)}</executor_directive>"
+        f"{_policy_clause}\n"
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
         # board query keeps a resumed session honest about mid-run injections
         # and already-claimed items instead of trusting a stale list.
@@ -1411,8 +1685,16 @@ def _build_quick_start_goal(
         + (
             ""
             if _completion_override is not None or _stype == "general"
-            else "\n<test_gate_note>" + _xml_escape(
-            "If `pixi run test -n 3` produces an INTERNALERROR "
+            # 6cfdabd7 — <test_gate_config> is the machine-readable source of
+            # truth for the effective test_cmd/parallelism/branch/version;
+            # the <test_gate_note> prose below interpolates the SAME
+            # _effective_test_cmd rather than a second, independently
+            # hardcoded command string.
+            else _build_test_gate_config_clause(
+                test_cmd=_effective_test_cmd, branch=branch, version=version,
+            )
+            + "\n<test_gate_note>" + _xml_escape(
+            f"If `{_effective_test_cmd}` produces an INTERNALERROR "
             "or worker crash (a line starting with 'INTERNALERROR>' rather than a "
             "normal 'FAILED tests/...' line), this is very likely a parallel-execution "
             "flake, not a regression in your code. Before concluding your change broke "
@@ -1420,8 +1702,9 @@ def _build_quick_start_goal(
             "crashed test in isolation (`pixi run python -m pytest <path>::<test> -q "
             "--timeout=60 -p no:xdist`), (3) if it passes standalone, your change is "
             "very likely fine — restore your changes (`git stash pop`) and re-run the "
-            "full suite WITHOUT -n 3 (`pixi run python -m pytest tests/ -q "
-            "--timeout=60`) for a clean, honest count before deciding pass/fail."
+            "full suite WITHOUT the configured parallelism flag (`"
+            f"{_strip_parallelism_flag(_effective_test_cmd)}`) "
+            "for a clean, honest count before deciding pass/fail."
             ) + "</test_gate_note>"
         )
         + f"{_not_done_until}\n"
@@ -1440,6 +1723,31 @@ def _build_quick_start_goal(
         # category: same hard, unconditional treatment, for items with no
         # item-level pin of their own.
         + _build_workspace_tool_priority_clause(pending_sprint_items, tool_priority_map)
+        # de4d4293 — compact per-item routing hint for the CLAIMABLE batch
+        # ONLY (pending_sprint_items — already narrowed by the manual/
+        # backburner/unprospected/wave-gate exclusions above), deliberately
+        # bounded unlike the full-inventory clauses below. See
+        # _build_executor_routing_clause's own docstring for why.
+        + _build_executor_routing_clause(pending_sprint_items)
+        # 76dde31f (665 follow-up) — typed per-item tool_requirements contract:
+        # the FULL pending inventory (see _all_pending_for_tool_requirements
+        # above), not the narrower claimable-now batch the two clauses above
+        # use, so this matches capability_contract's item_tool_requirements
+        # section exactly.
+        + _build_tool_requirements_clause(_all_pending_for_tool_requirements)
+        # 665 follow-up — typed per-item durable sprint_item_pointers
+        # contract: the SAME full pending inventory as the tool_requirements
+        # clause above (not the narrower claimable-now batch), so this
+        # matches capability_contract's item_sprint_item_pointers section
+        # exactly for the same request.
+        + _build_pointer_records_clause(_all_pending_for_tool_requirements)
+        # 70c10ca3 (b730 follow-up) — typed per-item artifact-pointer
+        # findings (88f82c15's warn/strict verdict + 3196ba0e's readiness
+        # verification): the SAME full pending inventory as the two clauses
+        # above, so this matches capability_contract's
+        # item_artifact_pointer_findings section exactly for the same
+        # request.
+        + _build_artifact_pointer_findings_clause(_all_pending_for_tool_requirements)
         + f"{_manual_note}"
         f"{_backburner_note}"
         f"{_excluded_unprospected_note}"
@@ -1508,6 +1816,165 @@ def _build_required_tool_clause(items: list[dict[str, Any]]) -> str:
         "a hard requirement, not a suggestion: " + "; ".join(pins)
     )
     return f"\n<required_tool>{_xml_escape(body)}</required_tool>"
+
+
+def _build_executor_routing_clause(items: list[dict[str, Any]]) -> str:
+    """de4d4293 — build a COMPACT ``<executor_routing>`` XML clause: one
+    short line per item naming the tool an executor should reach for FIRST.
+
+    This is the fix for the "confirmed handoff gap" this item shipped to
+    close: starter (and every other) mode's paste-ready /goal text used to
+    carry item ids and generic executor rules but NOTHING about which tool
+    routes THIS item. Sourced from
+    ``executor_contract.build_routing_summary`` — explicit
+    ``tool_requirements``/``required_tool`` when the item declares one, else
+    a best-effort default-category lookup (see
+    ``executor_contract.infer_default_routing_category`` for the built-in
+    orchestration/code-investigation/handoff/tunnel-verification/DOCX
+    lookup table) — the SAME canonical extraction
+    ``capability_contract.build_capability_contract``'s
+    ``item_routing_summary`` field reads, so the /goal text and the
+    structured JSON never independently drift for overlapping items.
+
+    Deliberately bounded and deliberately NOT the full per-item
+    ``executor_contract`` (allowed/forbidden tools, steps, gates, completion
+    checks — that stays in the structured
+    ``capability_contract.item_executor_contracts`` JSON field only).
+    ``items`` here is expected to be the FINAL claimable batch — the same
+    list already named in ``<sprint_items>`` — deliberately narrower than
+    the full pending-inventory scope ``_build_tool_requirements_clause``
+    below uses: inlining a full per-item contract for every item in the
+    entire backlog into this prose is exactly the unbounded-size mistake
+    23e20656 already made once (95KB+ on a 37-69 item board — see
+    ``capability_contract.build_capability_contract``'s own docstring for
+    the incident). One compact line per claimable item keeps this clause a
+    few KB even for a 40+ item scope.
+
+    The embedded ``hash`` attribute is
+    ``executor_contract.routing_summary_hash`` of the SAME entries this
+    clause renders — a caller can recompute
+    ``build_routing_summary(claimable_items)`` independently and confirm the
+    hash matches, proving this compact prose block was not hand-edited
+    after generation without needing the full structured contract inline.
+
+    Returns ``""`` when no item in ``items`` has a resolvable hint (explicit
+    or inferred), so an ordinary /goal with nothing to route never grows a
+    line of noise.
+    """
+    summary = executor_contract_module.build_routing_summary(items)
+    if not summary:
+        return ""
+    _hash = executor_contract_module.routing_summary_hash(summary)
+    body = "; ".join(
+        f"{h['item_id']}: {h['server_or_namespace']}: {h['name']} "
+        f"({h['required_or_preferred']}/{h['source']})"
+        for h in summary
+    )
+    return f'\n<executor_routing hash="{_xml_escape(_hash)}">{_xml_escape(body)}</executor_routing>'
+
+
+def _build_tool_requirements_clause(items: list[dict[str, Any]]) -> str:
+    """76dde31f (665 follow-up) — build a ``<tool_requirements>`` XML clause
+    carrying the TYPED, canonical per-item tool-requirement contract.
+
+    Distinct from ``_build_required_tool_clause`` above (a single free-form
+    string pin, rendered as short prose): this clause embeds the CANONICAL
+    JSON of every pending item's normalized ``tool_requirements`` entries
+    (structured field when set; a legacy ``required_tool`` pin as a read-time
+    compatibility fallback otherwise — see
+    ``tool_requirements.effective_tool_requirements``). The body is the SAME
+    canonical JSON ``capability_contract.build_capability_contract`` embeds in
+    its ``item_tool_requirements`` section for the SAME request, so the batch
+    /goal's XML rendering and the structured ``generate_handoff`` response
+    never diverge — one typed extraction
+    (``capability_contract.extract_tool_requirements``), two representations
+    of the identical data, never two independently-maintained derivations.
+
+    Returns an empty string when no item in the batch has an effective tool
+    requirement, so it never adds noise to an ordinary /goal.
+    """
+    per_item = capability_contract_module.extract_tool_requirements(items)
+    if not per_item:
+        return ""
+    body = json.dumps(per_item, sort_keys=True, separators=(",", ":"))
+    return f"\n<tool_requirements>{_xml_escape(body)}</tool_requirements>"
+
+
+def _build_pointer_records_clause(items: list[dict[str, Any]]) -> str:
+    """665 follow-up — build a ``<sprint_item_pointers>`` XML clause carrying
+    the TYPED, canonical per-item durable pointer records.
+
+    Distinct from ``_build_goal_pointer_lines`` above (compact, human-
+    readable lines rendered INSIDE ``<sprint_items>`` — kept byte-for-byte
+    unchanged for legacy backward compatibility): this clause embeds the
+    FULL typed record per pointer — source_type, target uri, selector/
+    anchor, target_kind (existing/planned_new), label, an explicit per-
+    target resolution status (resolved/unresolved/planned/stale/archival),
+    canonical/archival metadata where available — plus each item's
+    provenance-required state (whether durable pointer evidence is REQUIRED
+    to satisfy the prospecting gate, whether a human bypassed it, and
+    whether it is currently satisfied). Items must already carry
+    ``pointer_records``/``pointer_provenance`` (set by
+    ``_annotate_resolved_pointers`` — both call sites that build a /goal run
+    that annotation pass first).
+
+    The body is the SAME canonical JSON
+    ``capability_contract.extract_sprint_item_pointers`` produces for items
+    annotated the same way, via the shared
+    ``pointers.assemble_pointer_entries_from_annotated_items`` — so the
+    batch /goal's XML rendering and the structured ``generate_handoff`` JSON
+    response never diverge for the same request.
+
+    Returns ``""`` when nothing in the batch has an effective pointer or a
+    required-provenance state worth reporting, so it never adds noise to an
+    ordinary /goal.
+    """
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
+
+    entries = pointers_module.assemble_pointer_entries_from_annotated_items(items)
+    if not entries:
+        return ""
+    body = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+    return f"\n<sprint_item_pointers>{_xml_escape(body)}</sprint_item_pointers>"
+
+
+def _build_artifact_pointer_findings_clause(items: list[dict[str, Any]]) -> str:
+    """70c10ca3 (b730 follow-up) — build an ``<artifact_pointer_findings>``
+    XML clause carrying the TYPED, canonical per-item artifact-pointer
+    findings: 88f82c15's warn/strict policy verdict (classification,
+    effective policy, warning code, remediation, ready/executability)
+    enriched with 3196ba0e's fail-closed readiness verification
+    (canonical/archival/unresolved/ambiguous/missing/...) for each pointer
+    id the verdict implicates.
+
+    Distinct from ``_build_pointer_records_clause`` above (every stored
+    pointer's resolved shape + item-level provenance-required state) and
+    from ``build_item_briefing``'s single-item ``<artifact_pointer_policy>``
+    clause (the bare policy verdict, no readiness data, only ever rendered
+    for ONE item at a time): this clause is the multi-item batch /goal's own
+    surface for the SAME finding — so a multi-item /goal run sees artifact-
+    pointer warnings inline too, not only when a caller separately requests
+    a single-item briefing.
+
+    Items must already carry ``artifact_pointer_finding`` (set by
+    ``_annotate_resolved_pointers`` — both call sites that build a /goal run
+    that annotation pass first). The body is the SAME canonical JSON
+    ``capability_contract.extract_artifact_pointer_findings`` produces for
+    items annotated the same way, via the shared
+    ``pointers.assemble_artifact_pointer_findings_from_annotated_items`` —
+    so the batch /goal's XML rendering and the structured
+    ``generate_handoff`` JSON response never diverge for the same request.
+
+    Returns ``""`` when nothing in the batch has an active finding, so it
+    never adds noise to an ordinary /goal.
+    """
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
+
+    entries = pointers_module.assemble_artifact_pointer_findings_from_annotated_items(items)
+    if not entries:
+        return ""
+    body = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+    return f"\n<artifact_pointer_findings>{_xml_escape(body)}</artifact_pointer_findings>"
 
 
 # ---------------------------------------------------------------------------
@@ -1770,6 +2237,78 @@ def build_item_briefing(
                 f"hard requirement, not a suggestion: {required_tool}"
             )
             + "</required_tool>"
+        )
+    # 76dde31f (665 follow-up) — typed tool_requirements contract: structured
+    # field wins when set; required_tool above is used as a read-time
+    # compatibility fallback only when it's empty (see
+    # tool_requirements.effective_tool_requirements). The body is the SAME
+    # canonical JSON capability_contract.extract_tool_requirements would embed
+    # for this item, so a caller can parse it back into the identical typed
+    # objects rather than re-deriving them from prose.
+    _tool_requirements = tool_requirements_module.effective_tool_requirements(item)
+    if _tool_requirements:
+        parts.append(
+            "<tool_requirements>"
+            + _xml_escape(tool_requirements_module.canonical_json(_tool_requirements))
+            + "</tool_requirements>"
+        )
+    # 2f9cb288 (665 follow-up) — typed artifact declaration contract: only
+    # rendered when the item actually declares SOMETHING (mirrors
+    # tool_requirements's "no tag when nothing declared" restraint above).
+    # ``policy`` is always the EFFECTIVE (merged-with-project-default) one —
+    # an executor reasoning about enforcement needs the resolved answer, not
+    # "whatever this one item happened to set" — see
+    # artifact_declaration.effective_artifact_policy.
+    if artifact_declaration_module.has_artifact_declaration(item):
+        _artifact_decl: dict[str, Any] = {
+            "artifact_kind": artifact_declaration_module.effective_artifact_kind(item),
+            "planned_output": artifact_declaration_module.effective_planned_output(item),
+            "policy": artifact_declaration_module.effective_artifact_policy(item),
+        }
+        parts.append(
+            "<artifact_declaration>"
+            + _xml_escape(json.dumps(_artifact_decl, sort_keys=True))
+            + "</artifact_declaration>"
+        )
+    # 5fd9d2fd (665 follow-up) — deterministic figure/table-vs-safe-category
+    # classification: declared artifact_kind FIRST (authoritative, see
+    # artifact_classification.classify_artifact_work), conservative
+    # title/notes/pointer evidence as a fallback for legacy items with no
+    # declared kind. Rendered whenever the classifier found SOMETHING to say
+    # — mirrors <artifact_declaration>'s "no tag when nothing declared"
+    # restraint, but the ONE genuinely uninformative fallback result (no
+    # artifact_kind AND no title/notes/pointer signal at all — rule
+    # "no_signal_ambiguous") is skipped too, so an item with nothing to do
+    # with artifacts doesn't get a noise tag on every briefing.
+    _artifact_classification = artifact_classification_module.classify_artifact_work(item)
+    if _artifact_classification.get("rule") != "no_signal_ambiguous":
+        parts.append(
+            "<artifact_work_classification>"
+            + _xml_escape(json.dumps(_artifact_classification, sort_keys=True))
+            + "</artifact_work_classification>"
+        )
+    # 88f82c15 (b730 follow-up) — warn/strict artifact-pointer policy verdict
+    # (pointers.evaluate_artifact_pointer_policy): rendered ONLY when it found
+    # an ACTIVE warning (figure/table-sensitive work, no exact output pointer
+    # on file, and policy is warn/strict — never "off", which suppresses the
+    # surface entirely) — mirrors <artifact_declaration>/
+    # <artifact_work_classification>'s "no tag when nothing to say" restraint.
+    # A ``ready: false`` field inside this clause is the explicit,
+    # machine-readable "do not call complete_sprint_item yet" signal for a
+    # "strict" policy — an executor reading this briefing sees it inline,
+    # not buried in prose. Lazy import: mirrors
+    # ``_annotate_resolved_pointers``'s own local ``pointers`` import.
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
+
+    try:
+        _artifact_pointer_policy = pointers_module.evaluate_artifact_pointer_policy(item)
+    except Exception:  # noqa: BLE001 — a briefing must never break on this
+        _artifact_pointer_policy = None
+    if _artifact_pointer_policy and _artifact_pointer_policy.get("warning_code"):
+        parts.append(
+            "<artifact_pointer_policy>"
+            + _xml_escape(json.dumps(_artifact_pointer_policy, sort_keys=True))
+            + "</artifact_pointer_policy>"
         )
     parts += [
         f"<completion_criteria>{_xml_escape(completion_text)}</completion_criteria>",
@@ -2586,8 +3125,13 @@ async def _annotate_code_pointers(
                     item["prospect_status"] = "prospected"
                 else:
                     item["prospect_status"] = "no_valid_match"
-        except Exception:  # noqa: BLE001 — enrichment is best-effort, never fatal
+        except Exception as _prospect_exc:  # noqa: BLE001 — enrichment is best-effort, never fatal
             item["prospect_status"] = "error"
+            # 8a883f60 — record the exact cause alongside the status so a
+            # caller building an evidence_status entry never has to fall
+            # back to a generic "something went wrong" (see
+            # _code_pointer_enrichment_error_outcome). Purely additive.
+            item["prospect_error"] = f"{type(_prospect_exc).__name__}: {_prospect_exc}"
             continue
     return pending_items
 
@@ -2697,6 +3241,7 @@ async def _annotate_resolved_pointers(
     pending_items: list[dict[str, Any]],
     *,
     node_resolver: Callable[[str], Any] | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """36fea6ca — attach each pending item's DURABLE, resolved pointers as a
     ``resolved_pointers`` list for inline rendering in the handoff markdown.
@@ -2706,33 +3251,205 @@ async def _annotate_resolved_pointers(
     resolve_sprint_item_pointers uses), then flatten every resolved target into a
     compact string line. Items with no stored pointers are left untouched.
 
-    Fully guarded: a per-item failure degrades to no ``resolved_pointers`` for
-    that item; the pass NEVER raises so the mandatory handoff can't break.
+    665 follow-up — in the SAME resolve pass, ALSO attach:
+
+    * ``pointer_records`` — the FULL typed, machine-readable record per pointer
+      (see ``pointers.build_typed_pointer_record``): source_type, target uri,
+      selector/anchor, target_kind (existing/planned_new), label, an explicit
+      per-target resolution ``status`` (resolved/unresolved/planned/stale/
+      archival), and canonical/archival metadata where available. This is
+      what ``_build_pointer_records_clause`` embeds verbatim as canonical
+      JSON in the /goal block's ``<sprint_item_pointers>`` XML clause, and
+      what ``capability_contract.extract_sprint_item_pointers`` reuses
+      directly (no re-fetch/re-resolve) when it finds this field already set
+      — see that function's docstring. ONE ``resolve_pointer`` call per
+      stored pointer produces both this and ``resolved_pointers`` above —
+      never two independent resolve passes over the same data.
+    * ``pointer_provenance`` — item-level ``{required, bypassed, satisfied}``
+      derived read-only from the SAME evidence signal
+      ``claim_sprint_item``'s UNPROSPECTED gate checks
+      (``is_item_claim_prospected`` / ``_item_declares_resources`` — this
+      pass never touches the gate itself, it only reports its state), so a
+      receiving executor sees explicitly whether durable pointer evidence is
+      REQUIRED for this item and whether it is currently SATISFIED, instead
+      of re-deriving it from the raw pointer list. Computed for every item
+      (even one with zero stored pointers — that IS the "required but not
+      yet satisfied" case), unlike ``resolved_pointers``/``pointer_records``
+      which need >=1 stored row to produce anything.
+    * ``pointer_resolution_status`` (eb8b6894) — item-level rollup of the
+      PER-POINTER ``structural_valid``/``target_resolved``/
+      ``provenance_verified``/``resolution_source`` fields each
+      ``pointer_records`` entry now carries (see
+      ``pointers.aggregate_pointer_evidence``), plus ``strict_satisfied`` —
+      whether ``is_item_claim_prospected``'s STRICT gate would accept this
+      item using RESOLUTION-aware evidence rather than bare row-presence
+      (``pointer_provenance["satisfied"]`` stays presence-only and
+      byte-for-byte unchanged; this is the new, additive, resolution-aware
+      sibling). Computed unconditionally, same as ``pointer_provenance``.
+      This is the field ``_build_quick_start_goal``'s
+      ``strict_pointer_evidence`` opt-in consults so a durable-but-unresolved
+      pointer can no longer silently satisfy a strict claimability gate.
+    * ``artifact_pointer_policy`` (88f82c15, b730 follow-up) — the
+      ``pointers.evaluate_artifact_pointer_policy`` warn/strict verdict for
+      this item: classification, effective policy, an active warning code +
+      remediation + affected pointer ids when this is figure/table-sensitive
+      work with no exact output pointer on file, and a ``ready`` bool (False
+      only under a ``"strict"`` policy with an active warning). Computed
+      AFTER ``pointer_records`` above so the evaluator sees the SAME durable
+      pointer evidence this pass just resolved, never a stale/pre-annotation
+      view. Like ``pointer_provenance``, computed unconditionally (even for
+      an item with zero stored pointers — "missing_pointer" is itself a
+      possible verdict).
+    * ``artifact_pointer_finding`` (70c10ca3, b730 follow-up) — the SAME
+      ``artifact_pointer_policy`` verdict enriched with 3196ba0e's fail-
+      closed ``verify_pointer_readiness`` provenance/existence check
+      (canonical/archival/unresolved/ambiguous/missing/...) for every
+      pointer id the verdict implicates (see
+      ``pointers.build_artifact_pointer_finding``). ``None`` when
+      ``artifact_pointer_policy`` has no active warning — mirrors that
+      field's own "nothing to say" restraint. This is the ONE canonical
+      finding ``_build_artifact_pointer_findings_clause`` (batch /goal XML)
+      and ``capability_contract.extract_artifact_pointer_findings`` (JSON
+      ``item_artifact_pointer_findings``) both read, so an artifact-pointer
+      warning is never hidden in prose-only text.
+
+    Fully guarded: a per-item failure degrades to no ``resolved_pointers``/
+    ``pointer_records``/``pointer_provenance``/``pointer_resolution_status``/
+    ``artifact_pointer_policy``/``artifact_pointer_finding`` for that item;
+    the pass NEVER raises so the mandatory handoff can't break.
+
+    ``stats`` (8a883f60) — optional output dict. When given, incremented in
+    place with ``items_checked``, ``items_fetch_failed`` (the
+    ``get_sprint_item_pointers`` per-item try/except below actually fired),
+    and ``pointers_resolve_failed`` (a ``resolve_pointer`` call for one
+    stored pointer raised). This function's per-item guards mean it NEVER
+    raises even when every single item's fetch/resolve fails — silently
+    "completing successfully" while doing nothing useful for any item. This
+    counter is what lets a caller (``generate_handoff``'s
+    ``evidence_status``) tell that apart from a genuine, fully-successful
+    pass, instead of reporting "verified" either way. Pure addition: ``None``
+    (the default) means zero behavior change from before this parameter
+    existed.
     """
-    from .pointers import resolve_pointer  # noqa: PLC0415 — avoid import cycle
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
     for item in pending_items:
         iid = item.get("id")
         if not iid:
             continue
+        if stats is not None:
+            stats["items_checked"] = stats.get("items_checked", 0) + 1
         try:
             stored = await db_module.get_sprint_item_pointers(db, iid)
-        except Exception:  # noqa: BLE001 — pre-migration DB / fetch failure
+        except Exception as _fetch_exc:  # noqa: BLE001 — pre-migration DB / fetch failure
+            if stats is not None:
+                stats["items_fetch_failed"] = stats.get("items_fetch_failed", 0) + 1
+                stats["last_fetch_error"] = f"{type(_fetch_exc).__name__}: {_fetch_exc}"
             continue
-        if not stored:
-            continue
-        rendered: list[dict[str, Any]] = []
-        for ptr in stored:
-            try:
-                resolved = await resolve_pointer(
-                    db, ptr, project_id=project_id, node_resolver=node_resolver
+        # 665 follow-up — provenance state is meaningful even with zero
+        # durable pointers, so it's computed unconditionally per item, unlike
+        # resolved_pointers/pointer_records below (which need >=1 stored row).
+        try:
+            item["pointer_provenance"] = {
+                "required": (
+                    _item_declares_resources(item)
+                    and not bool(item.get("prospect_bypass"))
+                ),
+                "bypassed": bool(item.get("prospect_bypass")),
+                "satisfied": is_item_claim_prospected(
+                    item, has_pointer_evidence=bool(stored)
+                ),
+            }
+        except Exception:  # noqa: BLE001 — provenance annotation is best-effort
+            pass
+        typed_records: list[dict[str, Any]] = []
+        if stored:
+            rendered: list[dict[str, Any]] = []
+            for ptr in stored:
+                try:
+                    resolved = await pointers_module.resolve_pointer(
+                        db, ptr, project_id=project_id, node_resolver=node_resolver
+                    )
+                except Exception as _resolve_exc:  # noqa: BLE001 — resolve_pointer never raises, but be safe
+                    if stats is not None:
+                        stats["pointers_resolve_failed"] = (
+                            stats.get("pointers_resolve_failed", 0) + 1
+                        )
+                        stats["last_resolve_error"] = (
+                            f"{type(_resolve_exc).__name__}: {_resolve_exc}"
+                        )
+                    continue
+                formatted = _format_resolved_pointer(resolved)
+                if formatted:
+                    rendered.append(formatted)
+                # eb8b6894 — best-effort completion-time readiness check per
+                # pointer (the SAME shared primitive
+                # pointers.build_item_pointer_records uses for
+                # capability_contract's JSON path), so provenance_verified is
+                # populated identically wherever a typed record is built —
+                # never re-derived independently by each caller.
+                _readiness = await pointers_module.compute_pointer_readiness_for_record(ptr)
+                try:
+                    typed = pointers_module.build_typed_pointer_record(
+                        ptr, resolved, readiness=_readiness,
+                    )
+                except Exception:  # noqa: BLE001 — one bad pointer must not drop the rest
+                    typed = None
+                if typed:
+                    typed_records.append(typed)
+            if rendered:
+                item["resolved_pointers"] = rendered
+            if typed_records:
+                item["pointer_records"] = typed_records
+        # eb8b6894 — item-level rollup of the PER-POINTER structural_valid/
+        # target_resolved/provenance_verified/resolution_source fields (see
+        # pointers.aggregate_pointer_evidence), PLUS strict_satisfied: whether
+        # is_item_claim_prospected's STRICT gate would let this item through
+        # using RESOLUTION-aware evidence instead of bare row-presence — the
+        # signal _build_quick_start_goal consults when a caller opts into
+        # strict_pointer_evidence=True. Computed unconditionally (even for
+        # zero stored pointers), mirroring pointer_provenance above; purely
+        # additive and best-effort — never breaks the mandatory handoff.
+        try:
+            _resolution_status = pointers_module.aggregate_pointer_evidence(typed_records)
+            _resolution_status["strict_satisfied"] = is_item_claim_prospected(
+                item, has_pointer_evidence=bool(stored), strict=True,
+                target_resolved=(
+                    _resolution_status["target_resolved"] if stored else None
+                ),
+            )
+            item["pointer_resolution_status"] = _resolution_status
+        except Exception:  # noqa: BLE001 — resolution-status rollup is best-effort
+            pass
+        # 88f82c15 (b730 follow-up) — warn/strict artifact-pointer policy
+        # verdict, computed AFTER pointer_records above so it sees this same
+        # pass's durable pointer evidence. Best-effort: never breaks the
+        # mandatory handoff.
+        try:
+            item["artifact_pointer_policy"] = (
+                pointers_module.evaluate_artifact_pointer_policy(item)
+            )
+        except Exception:  # noqa: BLE001 — policy annotation is best-effort
+            pass
+        # 70c10ca3 (b730 follow-up) — combine that SAME policy verdict with
+        # 3196ba0e's fail-closed readiness verification (canonical/archival/
+        # unresolved/ambiguous/missing/...) for each pointer the policy
+        # verdict implicates, so every downstream projection (batch /goal
+        # XML, capability_contract JSON, generate_handoff response metadata)
+        # can consume ONE canonical finding instead of re-deriving it. Reuses
+        # `stored` (this item's raw durable pointers, already fetched above)
+        # for the readiness lookup — no extra DB round trip. `None` when
+        # there is no active warning (see build_artifact_pointer_finding).
+        # Best-effort: never breaks the mandatory handoff.
+        try:
+            item["artifact_pointer_finding"] = (
+                await pointers_module.build_artifact_pointer_finding(
+                    item,
+                    policy_result=item.get("artifact_pointer_policy"),
+                    stored_pointers=stored,
                 )
-            except Exception:  # noqa: BLE001 — resolve_pointer never raises, but be safe
-                continue
-            formatted = _format_resolved_pointer(resolved)
-            if formatted:
-                rendered.append(formatted)
-        if rendered:
-            item["resolved_pointers"] = rendered
+            )
+        except Exception:  # noqa: BLE001 — finding annotation is best-effort
+            pass
     return pending_items
 
 
@@ -3849,13 +4566,98 @@ async def _generate_handoff_l0(
     return str(out_path.resolve()), content
 
 
+def _build_artifact_readiness_warnings(
+    pending_items: "list[dict[str, Any]] | None",
+) -> "list[str]":
+    """5fd9d2fd (665 follow-up) — surface figure/table-sensitive pending
+    items that have no ``planned_output``/durable pointer evidence yet, as
+    ``=== HANDOFF READINESS ===`` warning line(s). Best-effort: any failure
+    (bad item shape, classifier error) degrades to no warnings — this must
+    never break the mandatory handoff.
+    """
+    try:
+        summary = artifact_classification_module.summarize_artifact_classifications(
+            pending_items
+        )
+    except Exception:  # noqa: BLE001
+        return []
+    warnings: list[str] = []
+    missing = summary.get("sensitive_without_pointer") or []
+    if missing:
+        n = len(missing)
+        sample = ", ".join(missing[:5])
+        more = f" (+{n - 5} more)" if n > 5 else ""
+        warnings.append(
+            f"⚠ {n} pending item{'s' if n != 1 else ''} look like figure/table "
+            f"work with no planned_output/pointer evidence yet: {sample}{more}"
+        )
+    return warnings
+
+
+def _build_artifact_policy_blocking_warnings(
+    pending_items: "list[dict[str, Any]] | None",
+) -> "list[str]":
+    """88f82c15 (b730 follow-up) — surface STRICT-mode artifact-pointer-policy
+    violations as BLOCKING ``=== HANDOFF READINESS ===`` lines, distinct from
+    (and additive to) ``_build_artifact_readiness_warnings``'s warn-mode
+    aggregate above.
+
+    Reuses :func:`meridian.pointers.evaluate_artifact_pointer_policy` — the
+    per-item warn/strict policy evaluator built on the 5fd9d2fd classifier
+    and 3196ba0e's pointer-readiness primitives — never re-derives
+    classification/insufficiency logic independently. Only an item whose
+    evaluator verdict is ``ready=False`` (i.e. an active warning under a
+    ``"strict"`` policy — ``"warn"``/``"off"`` never produce a blocking
+    line here) is included.
+
+    A non-empty return means the handoff is NOT executable: a receiving
+    executor must resolve every listed item's pointer (or the project must
+    relax its policy) before calling ``complete_sprint_item`` on it.
+    Best-effort: any failure (bad item shape, evaluator error) degrades to
+    no warnings — this must never break the mandatory handoff.
+    """
+    from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
+
+    lines: list[str] = []
+    for item in pending_items or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            result = pointers_module.evaluate_artifact_pointer_policy(item)
+        except Exception:  # noqa: BLE001
+            continue
+        if result.get("ready") is False and result.get("warning_code"):
+            _cls = (result.get("classification") or {}).get("classification")
+            lines.append(
+                f"✗ NOT EXECUTABLE — item {result.get('item_id')} [{_cls}] fails "
+                f"strict artifact_pointer_check ({result.get('warning_code')}): "
+                f"{result.get('required_remediation')}"
+            )
+    return lines
+
+
 def _build_readiness_block(
     sprint: "str | None",
     pending_count: int,
     decisions_count: int,
     sprint_stale_days: "int | None" = None,
+    artifact_warnings: "list[str] | None" = None,
+    artifact_policy_blocking: "list[str] | None" = None,
 ) -> str:
-    """Build the =HANDOFF READINESS= header block prepended to every handoff."""
+    """Build the =HANDOFF READINESS= header block prepended to every handoff.
+
+    ``artifact_warnings`` (5fd9d2fd, 665 follow-up) — pre-formatted warning
+    lines from ``_build_artifact_readiness_warnings`` (figure/table-sensitive
+    pending items with no planned_output/pointer evidence yet). Optional and
+    additive: every existing positional call site keeps working unchanged.
+
+    ``artifact_policy_blocking`` (88f82c15, b730 follow-up) — pre-formatted
+    BLOCKING lines from ``_build_artifact_policy_blocking_warnings`` (items
+    that fail a ``"strict"`` ``artifact_pointer_check`` policy). Optional and
+    additive, like ``artifact_warnings`` above. A non-empty list gets a
+    leading "HANDOFF NOT READY" summary line so the block is unambiguous at
+    a glance, distinct from the softer ``⚠`` warn-mode lines.
+    """
     lines = ["=== HANDOFF READINESS ==="]
     if sprint_stale_days is not None:
         # 08c355c2 — sprint field is stale: demote it with an age warning so
@@ -3878,6 +4680,17 @@ def _build_readiness_block(
     else:
         n = decisions_count
         lines.append(f"✓ {n} pinned decision{'s' if n != 1 else ''}")
+    for _w in artifact_warnings or []:
+        lines.append(_w)
+    _blocking = artifact_policy_blocking or []
+    if _blocking:
+        n = len(_blocking)
+        lines.append(
+            f"✗ HANDOFF NOT READY — {n} pending item{'s' if n != 1 else ''} "
+            "blocked by strict artifact_pointer_check policy:"
+        )
+        for _b in _blocking:
+            lines.append(_b)
     lines.append("=========================")
     return "\n".join(lines)
 
@@ -4044,6 +4857,7 @@ async def _resolve_session_sprint_version(
 
 async def build_effective_capability_contract(
     db: Any, project_id: str, *, board_stale: bool = False,
+    version: "str | None" = None, items: "list[dict[str, Any]] | None" = None,
 ) -> "dict[str, Any] | None":
     """98aaccf4 — thin, fully-guarded wrapper over
     ``capability_contract.build_capability_contract`` for the two trusted
@@ -4058,13 +4872,302 @@ async def build_effective_capability_contract(
 
     ``board_stale`` is passed straight through -- see
     ``capability_contract.build_capability_contract`` for what it means.
+
+    ``version`` / ``items`` (76dde31f, 665 follow-up) are also passed
+    straight through -- they scope the contract's ``item_tool_requirements``
+    section (see ``capability_contract.build_capability_contract`` and
+    ``_build_tool_requirements_clause`` above) so it agrees with the batch
+    /goal's own ``<tool_requirements>`` clause for the SAME request.
     """
     try:
         return await capability_contract_module.build_capability_contract(
-            db, project_id, board_stale=board_stale,
+            db, project_id, board_stale=board_stale, version=version, items=items,
         )
     except Exception:  # noqa: BLE001 — capability contract is best-effort
         return None
+
+
+async def build_proposal_evidence_for_handoff(
+    db: Any, project_id: str, *, limit: int = 10,
+) -> "list[dict[str, Any]] | None":
+    """6cdc5df3 — machine-readable proposal-to-evidence linkage, emitted
+    alongside every ``generate_handoff`` mode (mirrors
+    :func:`build_effective_capability_contract`'s fully-guarded wrapper
+    style). Answers "what's linked to proposal X" directly from the handoff
+    read path, replacing the old approach of grepping ``item_group`` strings
+    for a proposal-id prefix (see ``meridian.db.proposal_links`` module
+    docstring for that history).
+
+    Returns one entry per proposal id that currently has at least one
+    evidence link in this project (most-recently-linked first, capped at
+    ``limit``), each entry being the full hydrated
+    :func:`meridian.db.proposal_links.get_proposal_evidence` result for that
+    id. An empty list means the project has no linked proposals yet (not an
+    error). ``None`` only when the lookup itself failed — best-effort, never
+    breaks the mandatory handoff.
+    """
+    try:
+        proposal_ids = await db_module.get_proposal_ids_for_project(
+            db, project_id, limit=limit,
+        )
+        return [
+            await db_module.get_proposal_evidence(db, project_id, pid)
+            for pid in proposal_ids
+        ]
+    except Exception:  # noqa: BLE001 — proposal evidence is best-effort
+        return None
+
+
+async def build_docx_integrity_gate_for_handoff(
+    db: Any, project_id: str, *,
+    pending_items: "list[dict[str, Any]] | None" = None,
+    proposal_evidence: "list[dict[str, Any]] | None" = None,
+) -> "dict[str, Any] | None":
+    """d09c29fe — thin, fully-guarded wrapper over
+    :func:`meridian.docx_integrity_gate.build_docx_integrity_gate`, mirroring
+    :func:`build_effective_capability_contract` / :func:`build_proposal_evidence_for_handoff`'s
+    own wrapper style so all three "best-effort structured field" emissions
+    follow one convention. Emitted alongside every ``generate_handoff`` mode
+    the same way those two already are.
+
+    Composes 93cd9798 (render-capability detection), 4efc63fd (equation-style
+    audit), and dccc2311 (write-transaction integrity concept) into a single
+    per-artifact ``ready``/``executable`` verdict — see
+    ``meridian.docx_integrity_gate`` module docstring for the full
+    composition. ``proposal_evidence`` should be the SAME list
+    :func:`build_proposal_evidence_for_handoff` already produced for this
+    handoff (6cdc5df3 tie-in — a proposal's linked ``.docx`` artifact
+    evidence is gated too, not just an item's own pointer); pass ``None``
+    when unavailable, which degrades to item-pointer-only coverage rather
+    than failing.
+
+    Returns ``None`` on any failure so a caller can simply skip attaching the
+    field, exactly like the two sibling wrappers above — never breaks the
+    mandatory handoff.
+    """
+    try:
+        return await docx_integrity_gate_module.build_docx_integrity_gate(
+            db, project_id,
+            pending_items=pending_items,
+            proposal_evidence=proposal_evidence,
+        )
+    except Exception:  # noqa: BLE001 — docx integrity gate is best-effort
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 8a883f60 — explicit, machine-readable outcome for every best-effort step
+# generate_handoff runs: code-pointer enrichment, resolved-pointer annotation,
+# freshness re-query, wave-gate exclusion, graph-search availability.
+#
+# Before this, every one of those steps was "catch Exception, degrade
+# silently, keep going" — the ONLY visible trace was an occasional free-text
+# skip-reason string (``code_pointer_skip_reason``) baked into the rendered
+# template, with no equivalent for the other four steps at all. A /goal could
+# therefore look complete and paste-ready while one or more of these had
+# silently failed, with no machine-readable signal a caller could act on.
+#
+# ``_capability_outcome`` builds ONE typed entry; ``generate_handoff`` (and
+# its ``goal``/``starter`` mode helpers) populate a ``dict[str, entry]``
+# keyed by the ``_CAP_*`` ids below as they go, using the EXACT SAME
+# try/except boundaries that already existed (this is additive instrumentation
+# of existing guards, not new guards) — no existing skip-reason value, log
+# line, or rendered content changes as a result.
+#
+# ``strict_evidence`` (mirrors 5fe3502e's ``sprint_evidence_guard`` opt-in
+# shape and naming EXACTLY — see that module's docstring — rather than
+# inventing a fourth different opt-in convention alongside it and
+# e7548587's tri-state ``require_merge_approval``) is OFF by default: a
+# caller that never passes it sees zero behavior change beyond the new,
+# purely additive ``evidence_status`` output. When a caller opts in and at
+# least one capability is ``failed``/``degraded`` (``skipped`` is not a
+# problem — see below), :func:`_finalize_capability_status` raises
+# :class:`HandoffEvidenceRequired` BEFORE any rendering/persistence happens
+# for that call — fail CLOSED, mirroring ``verify_strict_completion_evidence``'s
+# own contract of never letting a caller who asked for strict evidence walk
+# away with a plausible-looking-but-incomplete result.
+# ---------------------------------------------------------------------------
+
+_CAP_CODE_POINTER_ENRICHMENT = "code_pointer_enrichment"
+_CAP_RESOLVED_POINTER_ANNOTATION = "resolved_pointer_annotation"
+_CAP_FRESHNESS_REQUERY = "freshness_requery"
+_CAP_WAVE_GATE_EXCLUSION = "wave_gate_exclusion"
+_CAP_GRAPH_SEARCH_AVAILABILITY = "graph_search_availability"
+
+# The full, stable set of capability ids every ``evidence_status`` dict
+# carries, regardless of mode — a mode that structurally never runs a given
+# step (e.g. 'starter' never resolves code pointers) still reports it
+# explicitly as ``skipped`` with a reason, rather than simply omitting the
+# key, so a caller can rely on all five keys always being present.
+_ALL_CAPABILITY_IDS = (
+    _CAP_CODE_POINTER_ENRICHMENT,
+    _CAP_RESOLVED_POINTER_ANNOTATION,
+    _CAP_FRESHNESS_REQUERY,
+    _CAP_WAVE_GATE_EXCLUSION,
+    _CAP_GRAPH_SEARCH_AVAILABILITY,
+)
+
+_CAPABILITY_STATUSES = frozenset({"verified", "skipped", "failed", "degraded"})
+
+
+def _capability_outcome(
+    status: str, reason: str, *, fallback: str | None = None,
+) -> dict[str, Any]:
+    """Build one typed ``evidence_status`` entry.
+
+    ``status`` is one of verified/skipped/failed/degraded (acceptance point
+    1). ``reason`` must be the EXACT, specific cause — never a generic
+    "something went wrong" (acceptance point 2) — every call site below
+    passes the real exception type+message or the real structural reason.
+    ``fallback`` documents the approved degrade path actually used, when one
+    exists (e.g. "pending items rendered without code_pointers"); ``None``
+    when nothing was substituted (e.g. a genuine ``failed``/``skipped`` with
+    no fallback, or a clean ``verified``).
+    """
+    assert status in _CAPABILITY_STATUSES, f"invalid capability status: {status!r}"
+    return {"status": status, "reason": reason, "fallback": fallback}
+
+
+def _code_pointer_enrichment_error_outcome(
+    pending_items: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """8a883f60 — a genuine PER-ITEM search failure inside
+    ``_annotate_code_pointers`` never propagates to its caller: that
+    function's own per-item try/except catches it, sets
+    ``item["prospect_status"] = "error"``, and moves on to the next item —
+    by design ("this must NEVER raise", see its docstring). That means the
+    caller's own outer try/except around the ``_annotate_code_pointers``
+    call can only ever observe a totally different, unrelated crash — it
+    would otherwise report "verified" even when every eligible item's
+    prospector call raised. This inspects the per-item ``prospect_status``
+    values ``_annotate_code_pointers`` already sets to recover that signal.
+
+    Returns ``None`` when no item errored (the caller keeps its own
+    verified/degraded-by-cap outcome); an explicit failed/degraded entry
+    otherwise — ``failed`` when EVERY attempted item errored, ``degraded``
+    when only some did.
+    """
+    errored = [it for it in pending_items if it.get("prospect_status") == "error"]
+    if not errored:
+        return None
+    attempted = [
+        it for it in pending_items
+        if it.get("prospect_status") in ("error", "prospected", "no_valid_match", "no_match")
+    ]
+    status = "failed" if len(errored) >= len(attempted) else "degraded"
+    _last_error = next(
+        (it.get("prospect_error") for it in reversed(errored) if it.get("prospect_error")),
+        "unknown error",
+    )
+    return _capability_outcome(
+        status,
+        f"{len(errored)} of {len(attempted)} prospected pending item(s) raised "
+        f"during their own code-pointer search call — {_last_error}",
+        fallback="those item(s) rendered without code_pointers",
+    )
+
+
+def _resolved_pointer_annotation_error_outcome(
+    stats: dict[str, Any],
+) -> dict[str, Any] | None:
+    """8a883f60 — the twin of :func:`_code_pointer_enrichment_error_outcome`
+    for ``_annotate_resolved_pointers``: that function's own per-item/per-
+    pointer try/excepts mean a genuine ``get_sprint_item_pointers``/
+    ``resolve_pointer`` failure never propagates out — it would otherwise
+    silently "complete successfully" while doing nothing useful for any
+    item. Inspects the ``stats`` dict that function optionally populates
+    (``items_checked``/``items_fetch_failed``/``pointers_resolve_failed``/
+    ``last_fetch_error``/``last_resolve_error``).
+
+    Returns ``None`` when nothing failed (caller keeps its own verified/
+    degraded-by-settings-fetch outcome); an explicit failed/degraded entry
+    otherwise — ``failed`` only when every checked item's fetch failed.
+    """
+    checked = stats.get("items_checked", 0)
+    fetch_failed = stats.get("items_fetch_failed", 0)
+    resolve_failed = stats.get("pointers_resolve_failed", 0)
+    if not fetch_failed and not resolve_failed:
+        return None
+    if fetch_failed and checked and fetch_failed >= checked:
+        return _capability_outcome(
+            "failed",
+            f"sprint_item_pointers fetch raised for all {checked} checked "
+            f"pending item(s) — {stats.get('last_fetch_error', 'unknown error')}",
+            fallback="those item(s) rendered without resolved_pointers/pointer_records",
+        )
+    parts = []
+    if fetch_failed:
+        parts.append(
+            f"{fetch_failed}/{checked} item(s) failed the sprint_item_pointers "
+            f"fetch ({stats.get('last_fetch_error', 'unknown error')})"
+        )
+    if resolve_failed:
+        parts.append(
+            f"{resolve_failed} stored pointer(s) failed resolve_pointer "
+            f"({stats.get('last_resolve_error', 'unknown error')})"
+        )
+    return _capability_outcome(
+        "degraded", "; ".join(parts),
+        fallback="affected item(s)/pointer(s) rendered without resolved_pointers/pointer_records",
+    )
+
+
+class HandoffEvidenceRequired(ValueError):
+    """Raised by generate_handoff (and its goal/starter helpers) when
+    ``strict_evidence=True`` and at least one best-effort capability in
+    ``evidence_status`` is ``failed`` or ``degraded`` rather than
+    ``verified``/``skipped`` (acceptance point 3).
+
+    Mirrors ``sprint_evidence_guard``'s fail-closed, opt-in-only contract:
+    never engages for a caller that didn't pass ``strict_evidence=True`` (or,
+    for goal/starter, have it threaded through from generate_handoff), and
+    when it does engage, NOTHING is rendered, written to disk, or persisted
+    for this call — the handoff is refused outright rather than emitting a
+    plausible-looking-but-incomplete goal. ``skipped`` capabilities never
+    trigger this: a mode that structurally doesn't run a step (e.g.
+    'starter' never resolving code pointers) is not itself a failure.
+    """
+
+    def __init__(self, evidence_status: dict[str, Any], errors: list[dict[str, Any]]):
+        self.evidence_status = evidence_status
+        self.errors = errors
+        codes = ", ".join(e["code"] for e in errors)
+        super().__init__(
+            f"generate_handoff refused (strict_evidence=True): {codes}"
+        )
+
+
+def _finalize_capability_status(
+    capability_status: dict[str, Any],
+    evidence_status: "dict[str, Any] | None",
+    *,
+    strict_evidence: bool,
+) -> None:
+    """Surface ``capability_status`` via the caller-supplied ``evidence_status``
+    output dict (when given — pure addition, see the module-level comment
+    above), then enforce strict mode.
+
+    Must be called AFTER every one of the five capabilities has been recorded
+    but BEFORE any rendering/persistence for this handoff call — see
+    :class:`HandoffEvidenceRequired`'s fail-closed contract.
+    """
+    if evidence_status is not None:
+        evidence_status.clear()
+        evidence_status.update(capability_status)
+    if not strict_evidence:
+        return
+    errors = [
+        {
+            "code": f"{cap_id.upper()}_{info.get('status', 'unknown').upper()}",
+            "capability": cap_id,
+            "status": info.get("status"),
+            "reason": info.get("reason"),
+        }
+        for cap_id, info in capability_status.items()
+        if isinstance(info, dict) and info.get("status") in ("failed", "degraded")
+    ]
+    if errors:
+        raise HandoffEvidenceRequired(dict(capability_status), errors)
 
 
 async def generate_handoff(
@@ -4082,6 +5185,9 @@ async def generate_handoff(
     identity: str | None = None,
     force_include_ids: list[str] | None = None,
     version: str | None = None,
+    strict_evidence: bool = False,
+    evidence_status: dict[str, Any] | None = None,
+    strict_pointer_evidence: bool = False,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -4102,37 +5208,79 @@ async def generate_handoff(
     Use when a human genuinely wants a backburnered item back in scope for one
     planning run without permanently re-enabling claiming.
 
-    ``version`` (efaa918a) — optional explicit sprint-version bucket, currently
-    consumed by ``mode='starter'``/``'compact'`` ONLY (see the regression this
-    closes below). When omitted and ``session_id`` is given, the STARTER path
-    falls back to that session's own ``sprint_version`` (the same scope
-    ``start_session(version=...)`` already resolved and stored on the session
-    row) rather than showing the whole project's backlog across every version.
+    ``version`` (efaa918a, extended by b8f89491) — optional explicit sprint-
+    version bucket. Resolved ONCE, up front, and threaded through EVERY
+    executable mode (``starter``/``compact``, ``goal``, ``full``, ``delta``):
+    an explicit ``version`` argument always wins; otherwise, when
+    ``session_id`` is given, it falls back to that session's own
+    ``sprint_version`` (the same scope ``start_session(version=...)`` already
+    resolved and stored on the session row). ``None`` (no explicit version,
+    no session, or a session with no stored scope) preserves the original
+    unscoped behaviour — every pending item across every version is returned,
+    unchanged from before this parameter existed.
 
-    KNOWN REGRESSION FIXED (efaa918a): ``generate_handoff(mode='starter')``
-    called ``get_sprint_items(db, project_id)`` with NO version filter at all
-    and never passed a ``version`` to ``_build_quick_start_goal`` either (that
-    function's own ``version`` kwarg existed but was dead code — no call site
-    in this file ever passed it a real value). The practical effect: a
-    version-scoped session (e.g. ``start_session(version='v0.2.5')``) still
-    got the ENTIRE cross-version backlog (~44 items in one observed case) in
-    its starter /goal, and freshly-added v0.2.5 items — not yet prospected —
-    got silently excluded by the (correctly-functioning) unprospected gate
-    while unrelated OLDER items (already prospected from an earlier round)
-    dominated the executable list instead. Fixed here for the starter path by
-    resolving and threading the session's own scope through to
-    ``_generate_starter_handoff``.
+    KNOWN REGRESSION FIXED (efaa918a, then b8f89491): ``generate_handoff``
+    used to call ``get_sprint_items(db, project_id)`` with NO version filter
+    at all for the full/delta/goal paths, and never passed ``version`` to
+    ``_build_quick_start_goal`` either (that function's own ``version`` kwarg
+    existed but was dead code on those paths). The practical effect: a
+    version-scoped session (e.g. ``start_session(version='v0.2.6')``) still
+    got the ENTIRE cross-version backlog in its full/goal /goal block, and the
+    "=== HANDOFF READINESS ===" header leaked the project-global legacy
+    ``goal.sprint`` text (e.g. stale ``v0.2.5`` copy) even for a v0.2.6-scoped
+    session — no reliable, scoped, paste-ready /goal was ever produced for
+    the session's own work. efaa918a fixed the starter/compact path only;
+    b8f89491 closes the same gap for full/delta/goal by resolving
+    ``_effective_version`` once here and threading it into every
+    ``get_sprint_items`` call, ``_build_quick_start_goal``, and the readiness
+    header's sprint text (via ``get_sprint_version_description``, keeping the
+    project-global sprint field itself untouched). The MCP dispatch layer
+    (``mcp/handler.py``) additionally returns a machine-readable
+    ``scope: {requested_version, effective_version, session_id}`` so a caller
+    never has to infer what scope a handoff actually resolved to.
 
-    NOT FIXED (separate, larger issue — see the efaa918a investigation notes
-    below): the full/delta (mode='full'/'delta') and goal-only (mode='goal')
-    paths have the IDENTICAL underlying gap — neither ever passes ``version``
-    to ``get_sprint_items`` or ``_build_quick_start_goal`` either, so they too
-    always return every sprint version. Fixing those requires touching more
-    call sites (the full/delta branch's ~250-line pending-items pipeline, plus
-    every ``generate_handoff(mode='full'/'delta'/'goal')`` caller across
-    handler.py/server.py that would need to start passing the caller's own
-    session scope) and is out of scope for this item; flagged here rather than
-    silently expanded into.
+    ``evidence_status`` (8a883f60) — optional output dict. When given (any
+    dict, typically ``{}``), it is populated in place with the explicit,
+    per-capability outcome of every best-effort step this call ran: code-
+    pointer enrichment, resolved-pointer annotation, freshness re-query,
+    wave-gate exclusion, and graph-search availability — one of
+    verified/skipped/failed/degraded each, with the exact reason and, when
+    one was used, the approved fallback (see ``_capability_outcome``). Pure
+    ADDITION: a caller that passes ``None`` (the default) sees zero
+    functional change to the returned ``(path, content, amended)`` or to
+    ``content`` itself. Applies uniformly across full/delta/starter/goal —
+    every mode reports all five keys, marking any step that mode
+    structurally never runs (e.g. 'starter' never resolves code pointers) as
+    ``skipped`` rather than omitting it.
+
+    ``strict_evidence`` (8a883f60) — optional, OFF by default, mirrors
+    ``sprint_evidence_guard``'s opt-in/fail-closed shape exactly (see the
+    module-level comment above ``_capability_outcome``). When True and any
+    capability above is ``failed``/``degraded``, raises
+    :class:`HandoffEvidenceRequired` BEFORE anything is rendered or
+    persisted for this call, carrying the full ``evidence_status`` plus a
+    typed ``errors`` list. A caller that never opts in is completely
+    unaffected — same content, same persistence, same exceptions as before
+    this parameter existed.
+
+    ``strict_pointer_evidence`` (eb8b6894) — optional, OFF by default,
+    mirrors ``strict_evidence``'s own opt-in shape but governs a DIFFERENT,
+    finer-grained gate: whether the claimable/goal batch and its
+    ``<excluded_unprospected>`` exclusion list require durable pointer
+    TARGETS to have actually resolved (not merely have a row present) — see
+    ``_build_quick_start_goal``'s own docstring and
+    ``pointers.aggregate_pointer_evidence``. Threaded through to every
+    executable mode (full/delta/starter/goal) exactly like ``version``
+    above. Unlike ``strict_evidence``, this never raises
+    :class:`HandoffEvidenceRequired` — a structurally-valid-but-unresolved
+    item is simply EXCLUDED from the claimable batch (the same "excluded,
+    not blocking" mechanism the existing UNPROSPECTED gate already uses),
+    never a hard refusal of the whole handoff call. A caller that never
+    opts in (the default, every pre-existing call site) sees zero
+    functional change: the claimable batch and ``pointer_provenance`` field
+    are computed exactly as before this parameter existed; only the new,
+    purely additive ``pointer_resolution_status`` field appears on every
+    item either way.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -4140,6 +5288,11 @@ async def generate_handoff(
     if mode == "planner":
         _pl_path, _pl_content = await _generate_planner_handoff(db, project_id, output_dir)
         return _pl_path, _pl_content, False
+    # b8f89491 — resolve the effective sprint-version scope ONCE, for every
+    # remaining executable mode. See the ``version`` docstring above.
+    _effective_version = version
+    if _effective_version is None:
+        _effective_version = await _resolve_session_sprint_version(db, session_id)
     _project_completion_criteria_override: str | None = None
     try:
         _stored_criteria = await db_module.get_sprint_version_description(
@@ -4150,16 +5303,16 @@ async def generate_handoff(
     except Exception:  # noqa: BLE001 - optional pre-migration/project setting
         pass
     if mode in {"starter", "compact"}:
-        _starter_version = version
-        if _starter_version is None:
-            _starter_version = await _resolve_session_sprint_version(db, session_id)
         _st_path, _st_content = await _generate_starter_handoff(
             db,
             project,
             output_dir,
             identity=identity,
             completion_criteria_override=_project_completion_criteria_override,
-            version=_starter_version,
+            version=_effective_version,
+            strict_evidence=strict_evidence,
+            evidence_status=evidence_status,
+            strict_pointer_evidence=strict_pointer_evidence,
         )
         return _st_path, _st_content, False
     if mode == "goal":
@@ -4174,6 +5327,10 @@ async def generate_handoff(
             graph_searcher=graph_searcher,
             force_include_ids=force_include_ids,
             completion_criteria_override=_project_completion_criteria_override,
+            version=_effective_version,
+            strict_evidence=strict_evidence,
+            evidence_status=evidence_status,
+            strict_pointer_evidence=strict_pointer_evidence,
         )
         return _g_path, _g_content, False
     if mode not in {"full", "delta"}:
@@ -4235,8 +5392,13 @@ async def generate_handoff(
     workspace_notes = await db_module.get_workspace_notes(db)
     # 45f519a0 — include_deferred=False so a deferred item is genuinely invisible
     # to executors in the handoff pending-items list, not just gated at claim time.
+    # b8f89491 — version=_effective_version scopes the ENTIRE downstream pipeline
+    # (pending, in_progress, and — for mode='delta' — completed items, since all
+    # three are derived from this one list) to the caller's sprint-version bucket
+    # instead of always returning the whole project's cross-version backlog.
     sprint_items_all = await db_module.get_sprint_items(
-        db, project_id, include_human=False, include_deferred=False
+        db, project_id, include_human=False, include_deferred=False,
+        version=_effective_version,
     )
     # Separate genuinely pending from actively-claimed in_progress items so:
     # (1) quick_start_goal only names items that haven't been claimed yet, and
@@ -4284,9 +5446,20 @@ async def generate_handoff(
     # handoff instead of silently omitting pointers — a zero-pointer handoff was
     # otherwise indistinguishable from "enrichment never attempted". Fully guarded.
     code_pointer_skip_reason: str | None = None
+    # 8a883f60 — explicit per-capability outcome dict; see the module comment
+    # above _capability_outcome. Populated using the EXACT SAME try/except
+    # boundaries as the pre-existing best-effort logic below — additive
+    # instrumentation only, no existing skip-reason value changes.
+    _capability_status: dict[str, Any] = {}
     if _code_pointers_enabled(proj_settings):
         searcher = graph_searcher or _resolve_graph_searcher(project_id)
         if searcher is not None:
+            _capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+                "verified",
+                "graph searcher available ("
+                + ("explicit graph_searcher argument" if graph_searcher is not None
+                   else "resolved via active tunnel connector") + ")",
+            )
             try:
                 pending_sprint_items = await _annotate_code_pointers(
                     pending_sprint_items, searcher
@@ -4303,31 +5476,105 @@ async def generate_handoff(
                         f"items — {_capped} further pending item(s) not prospected "
                         f"this pass"
                     )
-            except Exception:  # noqa: BLE001 — enrichment is best-effort
+                # 8a883f60 — _annotate_code_pointers NEVER raises for a per-item
+                # search failure (it catches it, sets prospect_status="error",
+                # and continues) — recover that signal explicitly rather than
+                # reporting "verified" just because this outer call didn't raise.
+                _cp_err = _code_pointer_enrichment_error_outcome(pending_sprint_items)
+                if _cp_err is not None:
+                    if _capped:
+                        _cp_err = dict(_cp_err)
+                        _cp_err["reason"] += (
+                            f"; additionally capped at {_MAX_ENRICHED_ITEMS} items"
+                        )
+                    _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _cp_err
+                elif _capped:
+                    _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                        "degraded", code_pointer_skip_reason,
+                        fallback=(
+                            f"first {_MAX_ENRICHED_ITEMS} pending items prospected; "
+                            "remainder left unprospected this pass"
+                        ),
+                    )
+                else:
+                    _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                        "verified",
+                        "code-pointer enrichment completed for every eligible pending item",
+                    )
+            except Exception as _cp_exc:  # noqa: BLE001 — enrichment is best-effort
                 code_pointer_skip_reason = (
                     "code-pointer enrichment skipped — graph searcher errored"
+                )
+                _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                    "failed",
+                    f"graph searcher raised {type(_cp_exc).__name__}: {_cp_exc}",
+                    fallback="pending items rendered without code_pointers",
                 )
         else:
             code_pointer_skip_reason = (
                 "code-pointer enrichment skipped — no live tunnel/graph searcher"
             )
+            _capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+                "degraded",
+                "no live tunnel/graph searcher registered for this project",
+                fallback="pending items rendered without code_pointers",
+            )
+            _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                "degraded", code_pointer_skip_reason,
+                fallback="pending items rendered without code_pointers",
+            )
+    else:
+        _capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+            "skipped", "code-pointer enrichment disabled via project settings",
+        )
+        _capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+            "skipped", "code-pointer enrichment disabled via project settings",
+        )
     # 36fea6ca — inline each pending item's DURABLE resolved pointers in the
     # handoff markdown (default on via workspace_settings.handoff_inline_pointers)
     # so a resuming session sees exact locations without a separate
     # resolve_sprint_item_pointers call. Fully guarded: a missing settings column,
     # pre-migration pointers table, or resolve failure degrades to no inline
     # pointers and never breaks the mandatory handoff.
+    _inline_ws_fetch_failed = False
     try:
         _inline_ws = await db_module.get_workspace_settings(db)
     except Exception:  # noqa: BLE001 — column/row may be absent on older DBs
         _inline_ws = {}
+        _inline_ws_fetch_failed = True
     if (_inline_ws or {}).get("handoff_inline_pointers", True):
+        _rp_stats: dict[str, int] = {}
         try:
             pending_sprint_items = await _annotate_resolved_pointers(
-                db, project_id, pending_sprint_items
+                db, project_id, pending_sprint_items, stats=_rp_stats,
             )
-        except Exception:  # noqa: BLE001 — inline pointers are best-effort
-            pass
+            # 8a883f60 — _annotate_resolved_pointers NEVER raises for a
+            # per-item fetch/resolve failure either — recover that signal
+            # from _rp_stats rather than reporting "verified" just because
+            # this outer call didn't raise.
+            _rp_err = _resolved_pointer_annotation_error_outcome(_rp_stats)
+            if _rp_err is not None:
+                _capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _rp_err
+            elif _inline_ws_fetch_failed:
+                _capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+                    "degraded",
+                    "workspace settings fetch failed; defaulted handoff_inline_pointers=on",
+                    fallback="proceeded with the default (inline pointers enabled)",
+                )
+            else:
+                _capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+                    "verified", "durable resolved-pointer annotation completed",
+                )
+        except Exception as _rp_exc:  # noqa: BLE001 — inline pointers are best-effort
+            _capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+                "failed",
+                f"resolved-pointer annotation raised {type(_rp_exc).__name__}: {_rp_exc}",
+                fallback="pending items rendered without resolved_pointers/pointer_records",
+            )
+    else:
+        _capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+            "skipped", "handoff_inline_pointers disabled in workspace settings",
+        )
     # 81396666 — annotate each pending item with a suggested_model hint when the
     # per-project model_tier_hints_enabled toggle is on. Fully guarded: failure
     # degrades to no hint and never breaks the mandatory handoff.
@@ -4376,8 +5623,18 @@ async def generate_handoff(
     _wave_gate_pending = None
     try:
         _wave_gate_pending = await db_module.get_wave_gate_configs(db, project_id)
-    except Exception:  # noqa: BLE001
+        _capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "verified",
+            f"wave-gate config fetch succeeded ({len(_wave_gate_pending or [])} "
+            "configured gate(s))",
+        )
+    except Exception as _wg_exc:  # noqa: BLE001
         _wave_gate_pending = None
+        _capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "failed",
+            f"get_wave_gate_configs raised {type(_wg_exc).__name__}: {_wg_exc}",
+            fallback="no wave-gate exclusion applied this pass",
+        )
     # dd19b6a4 — re-query sprint items + sessions immediately before finalizing
     # the pending list. Everything above this point (the session-summary
     # asyncio.gather fan-out, code-pointer/graph-searcher enrichment, resolved-
@@ -4397,9 +5654,13 @@ async def generate_handoff(
     # filters/refreshes status, it does not re-run the enrichment pipeline.
     # Best-effort: any failure degrades to the original (slightly stale)
     # snapshot rather than breaking the mandatory handoff.
+    _freshness_status = "verified"
+    _freshness_reason = "sprint-item + session freshness re-query completed"
+    _freshness_fallback: str | None = None
     try:
         _fresh_sprint_items = await db_module.get_sprint_items(
-            db, project_id, include_human=False, include_deferred=False
+            db, project_id, include_human=False, include_deferred=False,
+            version=_effective_version,
         )
         _fresh_status_by_id = {
             it["id"]: it.get("status") for it in _fresh_sprint_items if it.get("id")
@@ -4418,15 +5679,39 @@ async def generate_handoff(
         in_progress_items = [
             it for it in _fresh_sprint_items if it.get("status") == "in_progress"
         ]
-    except Exception:  # noqa: BLE001 — cross-check is best-effort
-        pass
+    except Exception as _fr_exc:  # noqa: BLE001 — cross-check is best-effort
+        _freshness_status = "failed"
+        _freshness_reason = (
+            f"sprint-item freshness re-query raised {type(_fr_exc).__name__}: {_fr_exc}"
+        )
+        _freshness_fallback = (
+            "used the pre-enrichment snapshot; an item claimed/completed "
+            "elsewhere mid-generation may still appear pending"
+        )
     try:
         sessions = await db_module.get_sessions(db, project_id, active_only=False)
         session_names = {s["id"]: s["name"] for s in sessions}
         for t in tasks:
             session_names.setdefault(t["session_id"], "(unknown-session)")
-    except Exception:  # noqa: BLE001 — cross-check is best-effort
-        pass
+    except Exception as _sr_exc:  # noqa: BLE001 — cross-check is best-effort
+        if _freshness_status == "verified":
+            _freshness_status = "degraded"
+            _freshness_reason = (
+                f"session freshness re-query raised {type(_sr_exc).__name__}: {_sr_exc}"
+            )
+            _freshness_fallback = "sessions/session_names reflect the earlier snapshot"
+    _capability_status[_CAP_FRESHNESS_REQUERY] = _capability_outcome(
+        _freshness_status, _freshness_reason, fallback=_freshness_fallback,
+    )
+    # 8a883f60 — every best-effort capability above is now recorded; surface
+    # it via the caller-supplied evidence_status output dict and, when
+    # strict_evidence=True, fail CLOSED before anything below this point is
+    # built/rendered/persisted (pointer_evidence_ids, quick_start_goal, the
+    # goal_token mint, the rendered template, the on-disk file, or any DB
+    # write — see _finalize_capability_status / HandoffEvidenceRequired).
+    _finalize_capability_status(
+        _capability_status, evidence_status, strict_evidence=strict_evidence,
+    )
     # d5849a67 — batch-resolve durable pointer evidence for the pending batch so
     # the excluded_unprospected list below uses the SAME evidence signal
     # claim_sprint_item checks per-item (sprint_item_pointers rows), not the
@@ -4435,12 +5720,19 @@ async def generate_handoff(
     _pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
         db, [it.get("id") for it in pending_sprint_items]
     )
+    _effective_execution_mode = db_module.normalize_execution_mode(
+        project.get("execution_mode")
+    )
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
-        execution_mode=db_module.normalize_execution_mode(
-            project.get("execution_mode")
-        ),
+        execution_mode=_effective_execution_mode,
         max_turns=_max_turns_from_settings(proj_settings),
+        # 6cfdabd7 — render the EFFECTIVE test_cmd/branch (executor_config,
+        # not a hardcoded string) so the completion criteria and
+        # <test_gate_config>/<test_gate_note> agree with what this project
+        # actually has configured via set_executor_config.
+        test_cmd=_test_cmd_from_settings(proj_settings),
+        branch=_branch_from_settings(proj_settings),
         hitl_auto_answer_mode=_hitl_aa_mode,
         completion_mode=_completion_mode_from_settings(proj_settings),
         goal_group_style=_goal_group_style_from_settings(proj_settings),
@@ -4459,6 +5751,20 @@ async def generate_handoff(
         # excluded_unprospected tag agrees with claim_sprint_item's own gate.
         pointer_evidence_ids=_pointer_evidence_ids,
         completion_criteria_override=_project_completion_criteria_override,
+        # b8f89491 — belt-and-suspenders: pending_sprint_items is already
+        # scoped via get_sprint_items(version=...) above, but this function's
+        # own version filter guards any future call site that forgets to
+        # pre-filter its input list.
+        version=_effective_version,
+        # 75ac1c8e — canonical execution policy (bounds planning, forces the
+        # first required action); executor_config.max_planning_turns override
+        # honored via _execution_policy_from_settings.
+        execution_policy=_execution_policy_from_settings(
+            proj_settings, _effective_execution_mode
+        ),
+        # eb8b6894 — opt-in STRICT pointer gate: excludes an item whose
+        # durable pointer row exists but never actually resolved.
+        strict_pointer_evidence=strict_pointer_evidence,
     )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
@@ -4493,6 +5799,29 @@ async def generate_handoff(
     # sprint-item tracking took over as the authoritative source of work.
     _has_any_sprint_items = bool(sprint_items_all)
     _sprint_stale = _sprint_stale_days(goal, _has_any_sprint_items)
+
+    # b8f89491 — when this handoff is scoped to a version with its own stored
+    # description, prefer that over the project-global legacy goal.sprint text
+    # for EVERY display surface (the Jinja2 template's own "**Sprint:**" line,
+    # AND the readiness header built further below) — goal.sprint is a
+    # separate, project-global data source that would otherwise leak an
+    # unrelated/stale version's text into a version-scoped session's handoff
+    # even though item-level filtering is already correctly scoped above. The
+    # legacy staleness demotion is skipped for the override (it only applies
+    # to the unscoped goal.sprint field). Mutating `goal` here (shallow copy)
+    # rather than only the readiness block's own local means the two surfaces
+    # can never disagree — a fix that only touched the readiness header left
+    # the template's own Sprint line still leaking the global text.
+    if _effective_version:
+        try:
+            _version_desc = await db_module.get_sprint_version_description(
+                db, project_id, _effective_version
+            )
+        except Exception:  # noqa: BLE001 — display override is best-effort
+            _version_desc = None
+        if _version_desc:
+            goal = {**goal, "sprint": f"{_effective_version} — {_version_desc}"}
+            _sprint_stale = None
 
     if mode == "delta":
         # 00dbeed0 — since_ts MUST be durable, not the in-memory
@@ -4645,11 +5974,17 @@ async def generate_handoff(
     if ws_block:
         content = f"{ws_block}\n\n{content}"
 
+    # b8f89491 — `goal["sprint"]`/`_sprint_stale` were already resolved to the
+    # version-scoped description (when one is in scope) right after `goal` was
+    # fetched above, so the readiness header and the template's own "Sprint:"
+    # line can never disagree.
     readiness_block = _build_readiness_block(
         sprint=goal.get("sprint"),
         pending_count=len(pending_sprint_items),
         decisions_count=len([d for d in pinned_decisions if d.get("status") == "active"]),
         sprint_stale_days=_sprint_stale,
+        artifact_warnings=_build_artifact_readiness_warnings(pending_sprint_items),
+        artifact_policy_blocking=_build_artifact_policy_blocking_warnings(pending_sprint_items),
     )
     content = f"{readiness_block}\n\n{content}"
 
@@ -4964,6 +6299,9 @@ async def _generate_starter_handoff(
     *,
     completion_criteria_override: str | None = None,
     version: str | None = None,
+    strict_evidence: bool = False,
+    evidence_status: dict[str, Any] | None = None,
+    strict_pointer_evidence: bool = False,
 ) -> tuple[str, str]:
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
@@ -4979,6 +6317,20 @@ async def _generate_starter_handoff(
     the pre-existing behavior (every version, unscoped) — see generate_handoff's
     own docstring for the regression this closes when the caller resolves a
     session's own scope and passes it through here.
+
+    ``strict_evidence``/``evidence_status`` (8a883f60) — threaded straight
+    through from ``generate_handoff``; see its docstring. Starter/compact
+    never resolves code pointers at all (structural, not a failure), so
+    ``code_pointer_enrichment``, ``resolved_pointer_annotation``,
+    ``graph_search_availability``, and ``freshness_requery`` are always
+    reported ``skipped`` here — only ``wave_gate_exclusion`` reflects a real
+    check in this mode.
+
+    ``strict_pointer_evidence`` (eb8b6894) — threaded straight through too,
+    but has no resolution-aware signal to act on here: starter/compact never
+    runs ``_annotate_resolved_pointers``, so no pending item carries
+    ``pointer_resolution_status`` and ``_build_quick_start_goal`` falls back
+    to its ordinary presence-only check regardless of this flag.
     """
     project_id = project["id"]
     sprint_items_all = await db_module.get_sprint_items(
@@ -5020,10 +6372,37 @@ async def _generate_starter_handoff(
     # 74a8f420 — see the twin comment in generate_handoff: exclude items gated
     # behind a configured-but-unpassed wave gate boundary. Guarded, fail-open.
     _s_wave_gate_pending = None
+    _s_capability_status: dict[str, Any] = {
+        _CAP_CODE_POINTER_ENRICHMENT: _capability_outcome(
+            "skipped", "starter/compact mode does not run code-pointer enrichment",
+        ),
+        _CAP_RESOLVED_POINTER_ANNOTATION: _capability_outcome(
+            "skipped", "starter/compact mode does not resolve durable pointers",
+        ),
+        _CAP_GRAPH_SEARCH_AVAILABILITY: _capability_outcome(
+            "skipped", "starter/compact mode does not attempt code-pointer enrichment",
+        ),
+        _CAP_FRESHNESS_REQUERY: _capability_outcome(
+            "skipped", "freshness re-query only runs for full/delta modes",
+        ),
+    }
     try:
         _s_wave_gate_pending = await db_module.get_wave_gate_configs(db, project["id"])
-    except Exception:  # noqa: BLE001
+        _s_capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "verified",
+            f"wave-gate config fetch succeeded ({len(_s_wave_gate_pending or [])} "
+            "configured gate(s))",
+        )
+    except Exception as _s_wg_exc:  # noqa: BLE001
         _s_wave_gate_pending = None
+        _s_capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "failed",
+            f"get_wave_gate_configs raised {type(_s_wg_exc).__name__}: {_s_wg_exc}",
+            fallback="no wave-gate exclusion applied this pass",
+        )
+    _finalize_capability_status(
+        _s_capability_status, evidence_status, strict_evidence=strict_evidence,
+    )
     # d5849a67 — see the twin comment in generate_handoff: batch-resolve durable
     # pointer evidence so the starter handoff's excluded_unprospected list also
     # agrees with claim_sprint_item's own gate. Guarded, fail-open.
@@ -5034,12 +6413,20 @@ async def _generate_starter_handoff(
         )
     except Exception:  # noqa: BLE001
         _s_pointer_evidence_ids = None
+    _s_execution_mode = db_module.normalize_execution_mode(
+        project.get("execution_mode")
+    )
     quick_start_goal = _build_quick_start_goal(
         pending,
-        execution_mode=db_module.normalize_execution_mode(
-            project.get("execution_mode")
-        ),
+        execution_mode=_s_execution_mode,
         max_turns=_max_turns_from_settings(settings),
+        # 6cfdabd7 — same EFFECTIVE test_cmd/branch/version rendering as the
+        # full/delta and goal-only call sites, sourced from this project's
+        # actual executor_config so starter/compact never disagrees with the
+        # other three handoff modes.
+        test_cmd=_test_cmd_from_settings(settings),
+        branch=_branch_from_settings(settings),
+        version=version,
         hitl_auto_answer_mode=_s_hitl_mode,
         completion_mode=_completion_mode_from_settings(settings),
         goal_group_style=_goal_group_style_from_settings(settings),
@@ -5050,6 +6437,10 @@ async def _generate_starter_handoff(
         tool_priority_map=(_s_ws_settings or {}).get("tool_priority_map"),
         pointer_evidence_ids=_s_pointer_evidence_ids,
         completion_criteria_override=completion_criteria_override,
+        # 75ac1c8e — canonical execution policy (bounds planning, forces the
+        # first required action).
+        execution_policy=_execution_policy_from_settings(settings, _s_execution_mode),
+        strict_pointer_evidence=strict_pointer_evidence,
     )
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the
@@ -5089,8 +6480,24 @@ async def _generate_goal_only_handoff(
     graph_searcher: Callable[[str], Any] | None = None,
     force_include_ids: list[str] | None = None,
     completion_criteria_override: str | None = None,
+    version: str | None = None,
+    strict_evidence: bool = False,
+    evidence_status: dict[str, Any] | None = None,
+    strict_pointer_evidence: bool = False,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
+
+    ``strict_evidence``/``evidence_status`` (8a883f60) — threaded straight
+    through from ``generate_handoff``; see its docstring.
+    ``freshness_requery`` is always reported ``skipped`` here (this mode,
+    like starter/compact, never re-queries pending items right before
+    rendering — only full/delta do); the other four capabilities reflect
+    real checks, exactly as in full/delta.
+
+    ``version`` (b8f89491) — optional effective sprint-version scope, resolved
+    by the caller (``generate_handoff``) from an explicit ``version`` argument
+    or the calling session's own ``sprint_version``. ``None`` preserves the
+    original unscoped behaviour (every pending item, every version).
 
     No readiness header, no workspace decisions/notes, no L0/L1/L2 context —
     unlike every other mode (including ``starter``/``compact``, which still
@@ -5120,8 +6527,12 @@ async def _generate_goal_only_handoff(
         raise ValueError(f"project not found: {project_id}")
     # 45f519a0 — include_deferred=False; force_include_ids re-adds specific ids
     # below, mirroring generate_handoff's own full/delta handling.
+    # b8f89491 — version=version scopes this mode the same way full/delta are
+    # scoped, closing the gap where goal-only mode always returned every
+    # sprint version regardless of the caller's session scope.
     sprint_items_all = await db_module.get_sprint_items(
-        db, project_id, include_human=False, include_deferred=False
+        db, project_id, include_human=False, include_deferred=False,
+        version=version,
     )
     pending_sprint_items = [
         it for it in sprint_items_all
@@ -5153,26 +6564,92 @@ async def _generate_goal_only_handoff(
         _ws_settings = await db_module.get_workspace_settings(db)
     except Exception:  # noqa: BLE001 — column/row may be absent on older DBs
         _ws_settings = None
+    # 8a883f60 — explicit per-capability outcome dict; see the module comment
+    # above _capability_outcome. Same try/except boundaries as the
+    # pre-existing best-effort logic — additive instrumentation only.
+    _g_capability_status: dict[str, Any] = {
+        _CAP_FRESHNESS_REQUERY: _capability_outcome(
+            "skipped", "freshness re-query only runs for full/delta modes",
+        ),
+    }
     if _code_pointers_enabled(proj_settings):
         searcher = graph_searcher or _resolve_graph_searcher(project_id)
         if searcher is not None:
+            _g_capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+                "verified",
+                "graph searcher available ("
+                + ("explicit graph_searcher argument" if graph_searcher is not None
+                   else "resolved via active tunnel connector") + ")",
+            )
             try:
                 pending_sprint_items = await _annotate_code_pointers(
                     pending_sprint_items, searcher
                 )
-            except Exception:  # noqa: BLE001 — enrichment is best-effort
-                pass
+                # 8a883f60 — see the twin comment in generate_handoff:
+                # _annotate_code_pointers never raises for a per-item search
+                # failure, so recover that signal from prospect_status.
+                _g_cp_err = _code_pointer_enrichment_error_outcome(pending_sprint_items)
+                if _g_cp_err is not None:
+                    _g_capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _g_cp_err
+                else:
+                    _g_capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                        "verified",
+                        "code-pointer enrichment completed for every eligible pending item",
+                    )
+            except Exception as _g_cp_exc:  # noqa: BLE001 — enrichment is best-effort
+                _g_capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                    "failed",
+                    f"graph searcher raised {type(_g_cp_exc).__name__}: {_g_cp_exc}",
+                    fallback="pending items rendered without code_pointers",
+                )
+        else:
+            _g_capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+                "degraded",
+                "no live tunnel/graph searcher registered for this project",
+                fallback="pending items rendered without code_pointers",
+            )
+            _g_capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+                "degraded",
+                "code-pointer enrichment skipped — no live tunnel/graph searcher",
+                fallback="pending items rendered without code_pointers",
+            )
+    else:
+        _g_capability_status[_CAP_GRAPH_SEARCH_AVAILABILITY] = _capability_outcome(
+            "skipped", "code-pointer enrichment disabled via project settings",
+        )
+        _g_capability_status[_CAP_CODE_POINTER_ENRICHMENT] = _capability_outcome(
+            "skipped", "code-pointer enrichment disabled via project settings",
+        )
     # 36fea6ca — same durable-pointer resolution generate_handoff's full/delta
     # branch uses (gated by workspace_settings.handoff_inline_pointers, default
     # on). Unlike full/delta, this mode's ONLY rendering surface for the
     # result is the /goal block itself (see include_pointer_lines below).
     if (_ws_settings or {}).get("handoff_inline_pointers", True):
+        _g_rp_stats: dict[str, int] = {}
         try:
             pending_sprint_items = await _annotate_resolved_pointers(
-                db, project_id, pending_sprint_items
+                db, project_id, pending_sprint_items, stats=_g_rp_stats,
             )
-        except Exception:  # noqa: BLE001 — inline pointers are best-effort
-            pass
+            # 8a883f60 — see the twin comment in generate_handoff:
+            # _annotate_resolved_pointers never raises for a per-item fetch/
+            # resolve failure, so recover that signal from _g_rp_stats.
+            _g_rp_err = _resolved_pointer_annotation_error_outcome(_g_rp_stats)
+            if _g_rp_err is not None:
+                _g_capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _g_rp_err
+            else:
+                _g_capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+                    "verified", "durable resolved-pointer annotation completed",
+                )
+        except Exception as _g_rp_exc:  # noqa: BLE001 — inline pointers are best-effort
+            _g_capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+                "failed",
+                f"resolved-pointer annotation raised {type(_g_rp_exc).__name__}: {_g_rp_exc}",
+                fallback="pending items rendered without resolved_pointers/pointer_records",
+            )
+    else:
+        _g_capability_status[_CAP_RESOLVED_POINTER_ANNOTATION] = _capability_outcome(
+            "skipped", "handoff_inline_pointers disabled in workspace settings",
+        )
 
     _hitl_mode = 0
     try:
@@ -5187,8 +6664,21 @@ async def _generate_goal_only_handoff(
     _wave_gate_pending = None
     try:
         _wave_gate_pending = await db_module.get_wave_gate_configs(db, project_id)
-    except Exception:  # noqa: BLE001
+        _g_capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "verified",
+            f"wave-gate config fetch succeeded ({len(_wave_gate_pending or [])} "
+            "configured gate(s))",
+        )
+    except Exception as _g_wg_exc:  # noqa: BLE001
         _wave_gate_pending = None
+        _g_capability_status[_CAP_WAVE_GATE_EXCLUSION] = _capability_outcome(
+            "failed",
+            f"get_wave_gate_configs raised {type(_g_wg_exc).__name__}: {_g_wg_exc}",
+            fallback="no wave-gate exclusion applied this pass",
+        )
+    _finalize_capability_status(
+        _g_capability_status, evidence_status, strict_evidence=strict_evidence,
+    )
     _pointer_evidence_ids = None
     try:
         _pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
@@ -5197,10 +6687,16 @@ async def _generate_goal_only_handoff(
     except Exception:  # noqa: BLE001
         _pointer_evidence_ids = None
 
+    _g_execution_mode = db_module.normalize_execution_mode(project.get("execution_mode"))
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
-        execution_mode=db_module.normalize_execution_mode(project.get("execution_mode")),
+        execution_mode=_g_execution_mode,
         max_turns=_max_turns_from_settings(proj_settings),
+        # 6cfdabd7 — same EFFECTIVE test_cmd/branch rendering as the
+        # full/delta and starter call sites (version is already threaded
+        # below via the pre-existing belt-and-suspenders param).
+        test_cmd=_test_cmd_from_settings(proj_settings),
+        branch=_branch_from_settings(proj_settings),
         hitl_auto_answer_mode=_hitl_mode,
         completion_mode=_completion_mode_from_settings(proj_settings),
         goal_group_style=_goal_group_style_from_settings(proj_settings),
@@ -5214,6 +6710,12 @@ async def _generate_goal_only_handoff(
         # 682005f4(b) — thread resolved pointers into the goal block itself.
         include_pointer_lines=True,
         completion_criteria_override=completion_criteria_override,
+        # b8f89491 — belt-and-suspenders, mirroring the full/delta call site.
+        version=version,
+        # 75ac1c8e — canonical execution policy (bounds planning, forces the
+        # first required action).
+        execution_policy=_execution_policy_from_settings(proj_settings, _g_execution_mode),
+        strict_pointer_evidence=strict_pointer_evidence,
     )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.

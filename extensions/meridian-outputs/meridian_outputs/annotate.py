@@ -60,7 +60,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from . import outputs_local
+from . import fingerprint, outputs_local
 
 _log = logging.getLogger(__name__)
 
@@ -147,6 +147,7 @@ class ProvenanceRecord:
     note: str | None = None
     recorded_at: float = 0.0
     recorded_at_iso: str = ""
+    content_hash: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -197,7 +198,19 @@ def record_provenance(
                            (e.g. "re-run after formula v3 fix").
 
     Returns:
-      The stored record as a dict, or ``{"error": ...}`` on failure.
+      The stored record as a dict (path, generating_script, params,
+      sprint_item_id, decision_id, note, recorded_at, recorded_at_iso,
+      content_hash), or ``{"error": ...}`` on failure.
+
+    bd5b8d79 -- ``content_hash`` is a best-effort SHA-256 of ``path``'s
+    on-disk bytes AT THE MOMENT this record is written, via
+    :func:`fingerprint.script_content_hash` (the SAME hasher
+    ``fingerprint.py`` already uses for its own script-staleness ledger --
+    no new hash scheme is introduced here). ``None`` when ``path`` doesn't
+    exist yet or isn't readable at record time. This is what lets a later
+    reader (``provenance_status.get_provenance_status``) detect that a file
+    has been relocated/regenerated since this record was made, by comparing
+    against a freshly-computed hash at lookup time.
 
     6af1518d (requirement 3) -- once the record is successfully written,
     ``path`` is also registered for TARGETED, PROMPT indexing via
@@ -221,6 +234,12 @@ def record_provenance(
         except Exception:  # noqa: BLE001 -- best-effort fallback only
             generating_script = None
 
+    try:
+        content_hash = fingerprint.script_content_hash(path)
+    except Exception:  # noqa: BLE001 -- best-effort snapshot only, never
+        # blocks the (already-durable) provenance write on a hashing failure.
+        content_hash = None
+
     now = time.time()
     record = ProvenanceRecord(
         path=path,
@@ -231,6 +250,7 @@ def record_provenance(
         note=note,
         recorded_at=now,
         recorded_at_iso=datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+        content_hash=content_hash,
     )
 
     key = _normalize_path(path)
@@ -270,8 +290,19 @@ def get_provenance(outputs_dir: str, path: str) -> dict[str, Any] | None:
     Returns:
       The record dict for `path` (``path``, ``generating_script``,
       ``params``, ``sprint_item_id``, ``decision_id``, ``note``,
-      ``recorded_at``, ``recorded_at_iso``), or None if nothing has ever
-      been recorded for this path under this outputs_dir.
+      ``recorded_at``, ``recorded_at_iso``, ``content_hash``), or None if
+      nothing has ever been recorded for this path under this outputs_dir.
+
+    Deliberately a PURE exact-match primitive -- bd5b8d79. A bare ``None``
+    here is ambiguous ("never recorded" vs. "recorded, but this path was
+    never even discovered by the outputs walker" vs. "not recorded, but a
+    directory-level MERIDIAN_NOTES.md note covers it") and this function does
+    NOT try to resolve that ambiguity by blending in outputs_local's index
+    membership or its directory-annotation fallback -- that composition
+    lives in :func:`meridian_outputs.provenance_status.get_provenance_status`,
+    which calls this function as its first, most-authoritative tier and
+    layers the richer status on top. Keeping this function narrow means its
+    contract (exact key in, exact record out, nothing else) never drifts.
     """
     key = _normalize_path(path) if path else ""
     if not key:

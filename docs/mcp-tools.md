@@ -201,6 +201,7 @@ Store project-level executor defaults so worker sessions start with repo path, e
 | `codebase_code_dirs` | array | optional | b970fe07 — directories codebase-memory-mcp (the tunnel's code-intel slot) auto-indexes. Deduped-union across the tenant's projects; used only when --code-dir is not passed on the CLI. Overwrites the existing list. |
 | `context_threshold` | integer | optional | Turns before a context-budget warning is surfaced to the session. |
 | `max_turns` | integer | optional | Turn ceiling injected into the /goal string ('Stop after N turns'). Default 200. |
+| `max_planning_turns` | integer | optional | 75ac1c8e — override for the execution_policy planning-turn ceiling (turns allowed before the required first action). Default 1 in immediate/autonomous mode, 10 in relaxed/interactive mode; clamped 1-50. Invalid/non-positive values fall back to the mode default rather than erroring. |
 
 **Example:**
 ```
@@ -462,8 +463,11 @@ Read-only: Generate a context handoff document. `mode='full'` writes the complet
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `mode` | string | optional |  |
 | `session_id` | string | optional | Optional session id for auto-delta on repeated calls in the same session. |
+| `version` | string | optional | (b8f89491) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this handoff to — applies to every mode (full/delta/starter/compact/goal), not just starter. Wins over the calling session's own stored sprint_version. Omit to fall back to session_id's scope, or to the whole project's cross-version backlog when neither is set. |
 | `force_include_ids` | array | optional | (45f519a0) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming. |
 | `skip_ai_summary` | boolean | optional | 65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time. |
+| `strict_evidence` | boolean | optional | (8a883f60) Opt-in, off by default — mirrors complete_sprint_item's strict_evidence shape exactly. When true, a failed/degraded pointer-enrichment/freshness/wave-gate/graph-search capability makes this call refuse to render or persist a handoff at all, returning {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, evidence_errors, message} instead. Leave false/omitted for today's graceful-degrade behavior (handoff_evidence_status is still returned either way). |
+| `strict_pointer_evidence` | boolean | optional | (eb8b6894) Opt-in, off by default, separate from strict_evidence above. When true, the claimable/goal batch's UNPROSPECTED exclusion requires a pending item's durable pointer(s) to have actually RESOLVED (resolve_pointer succeeded), not merely be PRESENT as a row — a structurally-valid-but-unresolved pointer no longer silently satisfies the gate. Never raises/blocks the whole handoff (unlike strict_evidence): an affected item is simply excluded from the claimable batch, the same way today's presence-only UNPROSPECTED gate already excludes items. Every pending item's pointer_resolution_status (structural_valid/target_resolved/provenance_verified/resolution_source/strict_satisfied) is always returned regardless of this flag — it only changes which items make the claimable cut. |
 
 **Example:**
 ```

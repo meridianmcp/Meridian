@@ -453,6 +453,90 @@ def test_document_content_tree_empty_body():
     tree = docs_intel.document_content_tree(buf.getvalue())
     assert tree["blocks"] == [] and tree["tree"] == []
     assert tree["paragraph_count"] == 0 and tree["table_count"] == 0
+    assert tree["duplicate_para_ids"] == []
+
+
+# ---------------------------------------------------------------------------
+# 827b6bdc — duplicate native w14:paraId detection. Word's own invariant is
+# that w14:paraId is unique per paragraph, but nothing verified that before
+# this item; document_content_tree must detect and REPORT a duplicate, never
+# silently let two distinct paragraphs collapse onto the same id.
+# ---------------------------------------------------------------------------
+
+_DUPLICATE_PARA_ID_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="6BDC5378">
+      <w:r><w:t>First paragraph, original owner of 6BDC5378.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="AAAA9999">
+      <w:r><w:t>An unrelated, uniquely-identified paragraph in between.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="6BDC5378">
+      <w:r><w:t>Second, unrelated paragraph that WRONGLY shares 6BDC5378.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+
+def _duplicate_para_id_docx() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", _DUPLICATE_PARA_ID_XML)
+    return buf.getvalue()
+
+
+def test_document_content_tree_reports_duplicate_native_para_id():
+    """827b6bdc regression: a real-world malformed/hand-edited/merged .docx
+    can carry the SAME native w14:paraId on two distinct paragraphs (the
+    reference case this item names: "duplicate 6BDC5378")."""
+    tree = docs_intel.document_content_tree(_duplicate_para_id_docx())
+    dups = tree["duplicate_para_ids"]
+    assert len(dups) == 1
+    entry = dups[0]
+    assert entry["para_id"] == "6BDC5378"
+    assert entry["occurrence_count"] == 2
+    # Enough location info to actually find the problem: body-order index +
+    # a text snippet from EACH duplicate, not just "duplicate found".
+    indices = [o["index"] for o in entry["occurrences"]]
+    texts = [o["text"] for o in entry["occurrences"]]
+    assert indices == [0, 2]
+    assert "First paragraph" in texts[0]
+    assert "Second, unrelated paragraph" in texts[1]
+    # Both paragraphs are STILL present in blocks (never silently merged or
+    # dropped) even though they share a para_id -- surfaced, not collapsed.
+    dup_blocks = [b for b in tree["blocks"] if b.get("para_id") == "6BDC5378"]
+    assert len(dup_blocks) == 2
+    assert dup_blocks[0]["text"] != dup_blocks[1]["text"]
+
+
+def test_document_content_tree_no_duplicates_reports_empty_list():
+    """The overwhelmingly common case (every native id unique) reports zero
+    duplicates -- purely additive, every existing caller unaffected."""
+    assert docs_intel.document_content_tree(_rich_docx())["duplicate_para_ids"] == []
+    assert docs_intel.document_content_tree(_synthetic_docx())["duplicate_para_ids"] == []
+
+
+def test_duplicate_native_para_id_does_not_disturb_synthesized_ids():
+    """A duplicated NATIVE id must not confuse the synthesized-id fallback
+    path used for a paragraph that carries no native id at all."""
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="6BDC5378"><w:r><w:t>Dup one.</w:t></w:r></w:p>
+    <w:p><w:r><w:t>No native id at all.</w:t></w:r></w:p>
+    <w:p w14:paraId="6BDC5378"><w:r><w:t>Dup two.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    tree = docs_intel.document_content_tree(_make_docx_from_xml(xml))
+    assert len(tree["duplicate_para_ids"]) == 1
+    synth_block = next(b for b in tree["blocks"] if b["text"] == "No native id at all.")
+    assert synth_block["para_id"].startswith("sp")
 
 
 # ---------------------------------------------------------------------------

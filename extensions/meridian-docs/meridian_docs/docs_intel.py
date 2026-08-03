@@ -44,6 +44,8 @@ import os
 import re
 import shutil
 import sqlite3
+import tempfile
+import threading
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -895,6 +897,41 @@ def _seq_cached_number(block: dict[str, Any], seq_re: re.Pattern[str]) -> str | 
     return None
 
 
+class StructureIndexNotTrustworthyError(Exception):
+    """e9b2cd2b — the structural sidecar (docx_headings/docx_figures/docx_tables,
+    populated by :func:`index_docx_structure`) is either STALE (the source
+    .docx's content has changed since the last successful indexing run) or
+    INCOMPLETE (that run never finished walking the document -- e.g. it
+    crashed partway through, or is still in progress).
+
+    Raised by :func:`get_local_structure_elements` (default behavior) instead
+    of silently returning partial or outdated counts as if they were
+    authoritative. Callers that explicitly want the best-effort data anyway
+    (diagnostics, manual inspection) can pass ``allow_stale=True`` to get the
+    data back with a ``"freshness"`` key describing why it wasn't trusted.
+    """
+
+
+def _source_fingerprint(source: str | bytes | bytearray) -> str:
+    """SHA-256 hex digest of the exact source .docx bytes.
+
+    e9b2cd2b — reads the FULL file into memory when ``source`` is a path, so
+    the fingerprint reflects the exact bytes :func:`document_content_tree`
+    is about to parse. This is a stronger freshness signal than the mtime
+    tracking :func:`index_docx`/:func:`check_staleness` already do for the
+    paragraph index: an mtime changes on a touch/copy/restore even when the
+    content is byte-identical (false positive staleness) and can also stay
+    put across a content-changing in-place edit on some filesystems/tools
+    (false negative). A content hash has neither failure mode.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        raw = bytes(source)
+    else:
+        with open(source, "rb") as fh:
+            raw = fh.read()
+    return hashlib.sha256(raw).hexdigest()
+
+
 def index_docx_structure(
     source: str | bytes | bytearray,
     index_db_path: str,
@@ -913,10 +950,51 @@ def index_docx_structure(
     table captions by SEQ Table field codes.  Raw table blocks (``kind="table"``)
     are stored with their cell data serialised as JSON.
 
-    Returns a summary ``{index_db, heading_count, figure_count, table_count}``.
-    Idempotent: all three structural tables are fully replaced on each run.
+    Returns a summary ``{index_db, heading_count, figure_count, table_count,
+    complete, source_sha256, duplicate_para_ids}``.  Idempotent: all three
+    structural tables are fully replaced on each run.
+
+    827b6bdc — ``duplicate_para_ids`` is document_content_tree's own
+    native-``w14:paraId``-collision report, passed through unchanged (READ-ONLY:
+    this indexer never renumbers/mutates the source to resolve a collision it
+    finds — see ``meridian.doc_store.repair_duplicate_para_ids`` for the
+    explicit, separately-invoked repair path). Empty list on the overwhelmingly
+    common case of a document with no duplicated native ids.
+
+    e9b2cd2b — freshness metadata: a SHA-256 fingerprint of the source .docx
+    bytes and an explicit "complete boundary" marker are stamped into
+    ``docx_index_meta`` (keys ``structure_source_sha256``,
+    ``structure_source_path``, ``structure_complete``,
+    ``structure_indexed_at``). The completeness marker is written as ``"0"``
+    (and committed immediately, in its own small transaction) BEFORE the
+    document walk starts, and only flipped to ``"1"`` -- atomically, in the
+    SAME commit as the headings/figures/tables replacement -- once the walk
+    and the write have both fully succeeded. If this function is interrupted
+    anywhere in between (a malformed/truncated document, a crash mid-walk,
+    etc.) the marker is left at ``"0"``, so a later read via
+    :func:`get_structure_freshness` / :func:`get_local_structure_elements`
+    correctly reports the index as incomplete rather than trusting whatever
+    rows happen to be sitting in the tables. See also
+    :func:`check_structure_staleness` for detecting a source that has
+    changed content since the last COMPLETE run.
     """
     from ._vendored_content_tree import document_content_tree  # noqa: PLC0415
+
+    source_path = source if isinstance(source, str) else None
+    source_sha256 = _source_fingerprint(source)
+
+    # Open the completeness boundary: commit "incomplete" up front so any
+    # interruption during the walk/write below leaves this as the last
+    # truthfully-committed state.
+    _boundary_conn = _connect(index_db_path)
+    try:
+        _boundary_conn.execute(
+            "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+            ("structure_complete", "0"),
+        )
+        _boundary_conn.commit()
+    finally:
+        _boundary_conn.close()
 
     tree = document_content_tree(source)
     blocks: list[dict[str, Any]] = tree.get("blocks") or []
@@ -1043,6 +1121,27 @@ def index_docx_structure(
             "VALUES (?, ?, ?, ?, ?)",
             tables_out,
         )
+        # e9b2cd2b — close the completeness boundary opened above and stamp
+        # the source fingerprint in the SAME commit as the table replacement,
+        # so a reader never observes "complete=1" paired with rows that
+        # haven't actually finished writing (or a fingerprint that doesn't
+        # match what was just indexed).
+        conn.execute(
+            "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+            ("structure_source_sha256", source_sha256),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+            ("structure_source_path", source_path),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+            ("structure_indexed_at", datetime.now(timezone.utc).isoformat()),
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO docx_index_meta (key, value) VALUES (?, ?)",
+            ("structure_complete", "1"),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1052,10 +1151,132 @@ def index_docx_structure(
         "heading_count": len(headings_out),
         "figure_count": len(figures_out),
         "table_count": len(tables_out),
+        "complete": True,
+        "source_sha256": source_sha256,
+        # 827b6bdc — surfaces document_content_tree's own duplicate native
+        # w14:paraId report (see _vendored_content_tree.document_content_tree)
+        # so a caller of this read-only indexer learns about an ambiguous
+        # source document without indexing having silently "fixed" it.
+        "duplicate_para_ids": tree.get("duplicate_para_ids", []),
     }
 
 
-def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
+def check_structure_staleness(index_db_path: str) -> dict[str, Any]:
+    """e9b2cd2b — compare the structural index's last-recorded SHA-256
+    fingerprint against the source .docx's CURRENT content on disk.
+
+    Mirrors :func:`check_staleness` (which tracks the paragraph index via
+    mtime) but for the structural index populated by
+    :func:`index_docx_structure`, and compares a content hash rather than an
+    mtime -- see :func:`_source_fingerprint` for why that's a stronger
+    signal.
+
+    Returns ``{"stale": bool, "source_path": str|None, "reason": str}``.
+    A structural index that was never built, or was built from raw bytes
+    (no trackable path), always reports ``stale=False`` -- there is nothing
+    to compare against, so silence rather than a false-positive staleness
+    claim.
+    """
+    conn = _connect(index_db_path)
+    try:
+        rows = dict(
+            conn.execute(
+                "SELECT key, value FROM docx_index_meta "
+                "WHERE key IN ('structure_source_path', 'structure_source_sha256')"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+    source_path = rows.get("structure_source_path")
+    if not source_path:
+        return {"stale": False, "source_path": None, "reason": "no-source-tracked"}
+    stored_sha256 = rows.get("structure_source_sha256")
+    try:
+        with open(source_path, "rb") as fh:
+            current_sha256 = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return {"stale": False, "source_path": source_path, "reason": "source-unreadable"}
+    if stored_sha256 is None or stored_sha256 != current_sha256:
+        return {"stale": True, "source_path": source_path, "reason": "sha256-mismatch"}
+    return {"stale": False, "source_path": source_path, "reason": "current"}
+
+
+def get_structure_freshness(index_db_path: str) -> dict[str, Any]:
+    """e9b2cd2b — combined completeness + staleness verdict for the
+    structural index (:func:`index_docx_structure`'s ``docx_headings`` /
+    ``docx_figures`` / ``docx_tables`` tables).
+
+    Returns::
+
+        {
+          "indexed": bool,      # False if index_docx_structure was never run
+          "complete": bool,     # False if the last run didn't finish (crashed
+                                 # mid-walk, or is currently in progress)
+          "stale": bool,        # True if the source .docx's content has
+                                 # changed since the last COMPLETE run
+          "trustworthy": bool,  # complete and not stale (or never indexed --
+                                 # there's nothing to distrust yet)
+          "source_path": str | None,
+          "source_sha256": str | None,
+          "reason": str,
+        }
+
+    ``trustworthy=False`` is the fail-closed signal :func:`get_local_structure_elements`
+    checks by default.
+    """
+    conn = _connect(index_db_path)
+    try:
+        rows = dict(
+            conn.execute(
+                "SELECT key, value FROM docx_index_meta WHERE key IN ("
+                "'structure_complete', 'structure_source_path', "
+                "'structure_source_sha256')"
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+
+    if "structure_complete" not in rows:
+        return {
+            "indexed": False,
+            "complete": True,
+            "stale": False,
+            "trustworthy": True,
+            "source_path": None,
+            "source_sha256": None,
+            "reason": "never-indexed",
+        }
+
+    complete = rows.get("structure_complete") == "1"
+    source_path = rows.get("structure_source_path")
+    source_sha256 = rows.get("structure_source_sha256")
+
+    if not complete:
+        return {
+            "indexed": True,
+            "complete": False,
+            "stale": False,
+            "trustworthy": False,
+            "source_path": source_path,
+            "source_sha256": source_sha256,
+            "reason": "incomplete-run",
+        }
+
+    staleness = check_structure_staleness(index_db_path)
+    return {
+        "indexed": True,
+        "complete": True,
+        "stale": staleness["stale"],
+        "trustworthy": not staleness["stale"],
+        "source_path": staleness["source_path"],
+        "source_sha256": source_sha256,
+        "reason": staleness["reason"],
+    }
+
+
+def get_local_structure_elements(
+    index_db_path: str, *, allow_stale: bool = False
+) -> dict[str, Any]:
     """c39ae092 — retrieve all locally-stored structural elements from the sidecar.
 
     Returns ``{headings, figures, tables}`` lists read from the
@@ -1063,7 +1284,29 @@ def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
     :func:`index_docx_structure`.  Returns empty lists for any table that
     does not yet exist (i.e., :func:`index_docx_structure` was never called on
     this sidecar).
+
+    e9b2cd2b — FAILS CLOSED by default: if the structural index is STALE (the
+    source .docx's content changed since the last successful
+    :func:`index_docx_structure` run) or INCOMPLETE (that run never
+    finished), raises :class:`StructureIndexNotTrustworthyError` instead of
+    returning partial/outdated counts as if they were authoritative. A
+    sidecar that was never structurally indexed is NOT considered stale or
+    incomplete (there's nothing to distrust yet) -- it just returns empty
+    lists, same as before this change.
+
+    Pass ``allow_stale=True`` to opt into reading the best-effort data
+    anyway (e.g. for diagnostics); the returned dict then always carries a
+    ``"freshness"`` key with the :func:`get_structure_freshness` verdict so
+    the caller can see exactly why it wasn't trusted.
     """
+    freshness = get_structure_freshness(index_db_path)
+    if not freshness["trustworthy"] and not allow_stale:
+        raise StructureIndexNotTrustworthyError(
+            f"structural index at {index_db_path!r} is not trustworthy "
+            f"(reason={freshness['reason']!r}); pass allow_stale=True to "
+            "read the best-effort data anyway"
+        )
+
     conn = _connect(index_db_path)
     try:
         heading_rows = conn.execute(
@@ -1103,7 +1346,7 @@ def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
         }
         for r in table_rows
     ]
-    return {
+    result = {
         "headings": headings,
         "figures": figures,
         "tables": tables,
@@ -1111,6 +1354,13 @@ def get_local_structure_elements(index_db_path: str) -> dict[str, Any]:
         "figure_count": len(figures),
         "table_count": len(tables),
     }
+    if allow_stale:
+        # e9b2cd2b — only attached when the caller explicitly opted into
+        # reading possibly-untrustworthy data, so it's visible exactly when
+        # it matters and callers that never hit the stale/incomplete path
+        # see the same shape this function has always returned.
+        result["freshness"] = freshness
+    return result
 
 
 def get_document_section_map(source: str | bytes | bytearray) -> dict[str, Any]:
@@ -1214,14 +1464,185 @@ def _load_docx_xml_stdlib(path: str) -> tuple[bytes, ET.Element]:
     return raw, root
 
 
-def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> None:
+class DocxWriteVerificationError(OSError):
+    """dccc2311 — fail-closed rejection of a staged DOCX write transaction.
+
+    Raised by :func:`_atomic_write_docx_bytes` when the disposable staged
+    artifact fails structural verification (see ``_docx_structural_manifest``)
+    BEFORE it is ever promoted over the live file — ``dest`` is guaranteed
+    byte-for-byte untouched whenever this is raised.
+
+    Subclasses ``OSError`` (not a bare ``Exception``) so it is caught, without
+    any call-site change, by every one of this module's ~25 existing
+    ``except OSError as exc: return {"error": ...}`` guards around
+    ``_save_docx_xml_stdlib`` / ``_save_docx_with_new_parts_stdlib`` — while
+    still being distinguishable via ``isinstance()`` by tests/callers that
+    want the specific fail-closed-verification failure mode rather than a
+    generic disk/permission error.
+    """
+
+    def __init__(self, message: str, *, manifest: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.manifest = manifest or {}
+
+
+# dccc2311 — single serialized canonical-merge point per destination path.
+# Every write that goes through _atomic_write_docx_bytes only ever mutates
+# the live file inside this lock, keyed on the destination's normalized
+# absolute path — two threads racing to promote a staged draft into the SAME
+# .docx can never interleave their promotion (one full stage -> verify ->
+# promote cycle always completes before the next begins for that path).
+# Writers targeting DIFFERENT destinations never block each other, and the
+# lock table only ever grows by distinct live destination paths (bounded by
+# the number of documents actually being written to, not by request count).
+#
+# 5988a5bb — widened from ``threading.Lock`` to ``threading.RLock``. Callers
+# with their own caller-specific post-write check (move_section /
+# copy_section / relocate_figure / relocate_table / merge_draft_into_canonical)
+# now hold this SAME lock across their entire stage+promote ->
+# verify -> conditional-restore sequence, not just the promote step —
+# ``_atomic_write_docx_bytes`` still acquires it internally for its own
+# stage+promote step, so a caller holding it at the top needs reentrant
+# acquisition from the SAME thread to avoid deadlocking itself. This closes
+# the SAME-PROCESS race window between promotion and a subsequent
+# verify/restore completely. It does NOT — and structurally cannot, since a
+# lock (reentrant or not) is process-local — protect against a DIFFERENT
+# process promoting to the same ``dest`` in that window; the cross-process
+# case is instead covered by the compare-and-swap fingerprint check in
+# ``_safe_restore_after_verification_failure`` (comparing ``dest``'s CURRENT
+# on-disk bytes against what THIS writer itself promoted before deciding
+# whether a verification-failure restore is safe).
+_DOCX_PROMOTION_LOCKS: dict[str, threading.RLock] = {}
+_DOCX_PROMOTION_LOCKS_GUARD = threading.Lock()
+
+
+def _docx_promotion_lock(dest: str) -> threading.RLock:
+    """Return the process-wide, reentrant promotion lock for ``dest``'s
+    canonical path (5988a5bb — reentrant so a caller can hold it across a
+    stage+promote -> verify -> conditional-restore sequence while
+    ``_atomic_write_docx_bytes`` also reentrantly acquires it internally for
+    its own stage+promote step; see the module-level comment above)."""
+    key = os.path.normcase(os.path.abspath(dest))
+    with _DOCX_PROMOTION_LOCKS_GUARD:
+        lock = _DOCX_PROMOTION_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _DOCX_PROMOTION_LOCKS[key] = lock
+        return lock
+
+
+def _docx_style_count(raw: bytes) -> int:
+    """Count ``<w:style>`` elements in ``word/styles.xml`` (0 when absent)."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        if "word/styles.xml" not in zf.namelist():
+            return 0
+        data = zf.read("word/styles.xml")
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return 0
+    return sum(1 for _ in root.iter(_q(_W, "style")))
+
+
+_HEADER_FOOTER_PART_RE = re.compile(r"^word/(?:header|footer)\d+\.xml$")
+
+
+def _docx_equation_count(raw: bytes) -> int:
+    """Count ``<m:oMath>`` elements across ``word/document.xml`` plus any
+    ``word/header<N>.xml`` / ``word/footer<N>.xml`` parts present."""
+    total = 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        names = [
+            name for name in zf.namelist()
+            if name == "word/document.xml" or _HEADER_FOOTER_PART_RE.match(name)
+        ]
+        for name in names:
+            try:
+                part_root = ET.fromstring(zf.read(name))
+            except ET.ParseError:
+                continue
+            total += sum(1 for _ in part_root.iter(_q(_M, "oMath")))
+    return total
+
+
+def _docx_relationship_count(raw: bytes) -> int:
+    """Count ``<Relationship>`` elements across every ``*.rels`` part."""
+    total = 0
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        for name in zf.namelist():
+            if not name.endswith(".rels"):
+                continue
+            try:
+                rels_root = ET.fromstring(zf.read(name))
+            except ET.ParseError:
+                continue
+            total += sum(1 for _ in rels_root.iter(_q(_PKG_REL_NS, "Relationship")))
+    return total
+
+
+def _docx_structural_manifest(raw: bytes) -> dict[str, int]:
+    """Structural fingerprint used to gate a write transaction (dccc2311).
+
+    Counts the four structural families a DOCX write transaction must never
+    silently lose: embedded media (images), paragraph styles, equations, and
+    OOXML package relationships. Computed identically on the PRE-write bytes
+    and the STAGED post-write bytes so a caller can compare before ever
+    promoting a staged artifact into the live file.
+    """
+    return {
+        "media_count": _docx_media_count(raw),
+        "style_count": _docx_style_count(raw),
+        "equation_count": _docx_equation_count(raw),
+        "relationship_count": _docx_relationship_count(raw),
+    }
+
+
+def _docx_manifest_hash(changed_parts: dict[str, bytes]) -> str:
+    """Deterministic SHA-256 over the parts a write transaction actually changed.
+
+    Hashing only the CHANGED parts (never the whole repackaged archive) means
+    the hash identifies the transaction's actual delta: two transactions that
+    produce the exact same logical edit hash IDENTICALLY regardless of
+    unrelated ZIP member ordering, and two transactions that touch different
+    content hash differently even when everything else in the document is
+    byte-identical. Part names are sorted first, so caller iteration order
+    never affects the result — pure function of ``changed_parts``, so the
+    same input always yields the same hash.
+    """
+    h = hashlib.sha256()
+    for name in sorted(changed_parts):
+        name_bytes = name.encode("utf-8")
+        h.update(len(name_bytes).to_bytes(4, "big"))
+        h.update(name_bytes)
+        data = changed_parts[name]
+        h.update(len(data).to_bytes(8, "big"))
+        h.update(data)
+    return h.hexdigest()
+
+
+def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> dict[str, Any]:
     """Write ``root`` back into ``dest`` as ``word/document.xml``.
 
     All other ZIP members from ``raw`` are preserved byte-for-byte.
     Writes to a BytesIO buffer first, then flushes to disk.
 
+    Hardened (dccc2311) to route through :func:`_atomic_write_docx_bytes`'s
+    stage -> verify -> promote transaction: media/style/relationship counts
+    are gated to be UNCHANGED (this function only ever rewrites
+    ``word/document.xml`` — every other part is copied through byte-for-byte,
+    so those three families can never legitimately move here; a mismatch
+    means the staged artifact is corrupt, not that an intentional edit
+    happened). Equation count is intentionally NOT gated — editing
+    ``word/document.xml`` is the entire point of most callers
+    (insert_equation_local et al.) and is expected to change it.
+
     Backs up the existing file to ``dest + ".bak"`` when it already exists
     (best-effort, non-fatal on failure — same pattern as meridian/doc_store.py).
+
+    Returns :func:`_atomic_write_docx_bytes`'s transaction dict, ``{
+    "manifest_hash", "pre_counts", "post_counts", "promoted_sha256"}``
+    (5988a5bb) — callers that don't need it (most existing call sites, which
+    predate this change) simply ignore the return value.
     """
     new_xml = ET.tostring(root, encoding="unicode")
     new_document_bytes = (
@@ -1238,15 +1659,136 @@ def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> None:
                     data = new_document_bytes
                 dst.writestr(info, data)
 
-    if os.path.exists(dest):
-        backup = dest + ".bak"
-        try:
-            shutil.copy2(dest, backup)
-        except OSError:
-            pass  # backup failure is non-fatal
+    return _atomic_write_docx_bytes(
+        out.getvalue(),
+        dest,
+        pre_manifest=_docx_structural_manifest(raw),
+        protected_keys=("media_count", "style_count", "relationship_count"),
+        changed_parts={"word/document.xml": new_document_bytes},
+    )
 
-    with open(dest, "wb") as fh:
-        fh.write(out.getvalue())
+
+def _atomic_write_docx_bytes(
+    payload: bytes,
+    dest: str,
+    *,
+    pre_manifest: dict[str, int] | None = None,
+    protected_keys: tuple[str, ...] = (),
+    changed_parts: dict[str, bytes] | None = None,
+) -> dict[str, Any]:
+    """Persist a DOCX as a disposable-worker-artifact transaction (dccc2311).
+
+    1. STAGE — ``payload`` (the complete, already-repackaged ZIP) is flushed
+       to a disposable temp file in ``dest``'s own directory. It is NEVER
+       written to ``dest`` directly — ``dest`` is not touched at all unless
+       and until verification (step 2) passes.
+    2. VERIFY — when ``pre_manifest`` is supplied, the staged file is
+       re-opened FRESH FROM DISK (never the in-memory ``payload`` object,
+       which would just re-validate the build step's own intent) and its
+       structural manifest (:func:`_docx_structural_manifest`) is compared
+       against ``pre_manifest`` for every key in ``protected_keys``. Any
+       mismatch — or a staged artifact that isn't even a valid .docx — is a
+       fail-closed verification failure: :class:`DocxWriteVerificationError`
+       is raised, the staged file is discarded, and ``dest`` is left
+       byte-for-byte untouched (never a partially-written or corrupted file).
+    3. PROMOTE — the ONLY point at which the live file changes is inside
+       :func:`_docx_promotion_lock`'s single serialized canonical-merge
+       point for this destination — an ``os.replace`` (atomic on the same
+       filesystem) swaps the verified staged artifact over ``dest``. Two
+       concurrent writers targeting the same ``dest`` can never interleave
+       their promotions.
+
+    A pre-existing ``dest`` is backed up to ``dest + ".bak"`` immediately
+    before promotion (best-effort, non-fatal on failure).
+
+    Returns ``{"manifest_hash", "pre_counts", "post_counts", "promoted_sha256"}``
+    — the manifest hash is always computed (from ``changed_parts`` when
+    given, else ``None``); ``pre_counts``/``post_counts`` are ``None`` when
+    ``pre_manifest`` was not supplied (legacy callers that run their OWN
+    separate range-hash verification, like move_section/copy_section/
+    relocate_table via :func:`_verify_docx_write`, keep working exactly as
+    before — this is purely additive). ``promoted_sha256`` (5988a5bb) is a
+    full-body SHA-256 over the EXACT bytes this call promoted (the staged
+    artifact, re-read fresh from disk after flush — never the in-memory
+    ``payload`` object), always computed regardless of ``pre_manifest``. It
+    is the "what did THIS writer actually put on disk" fingerprint a
+    caller-specific post-write check uses to tell apart "verification
+    failed but nobody has touched dest since I promoted" (safe to restore my
+    own pre-image) from "a different writer's promotion has already landed
+    since mine" (restoring would destroy that writer's completed work — see
+    :func:`_safe_restore_after_verification_failure`).
+    """
+    parent = os.path.dirname(os.path.abspath(dest)) or "."
+    os.makedirs(parent, exist_ok=True)
+    manifest_hash = _docx_manifest_hash(changed_parts) if changed_parts else None
+    post_counts: dict[str, int] | None = None
+    promoted_sha256: str | None = None
+
+    staged_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".meridian-docx-stage-", suffix=".tmp", dir=parent, delete=False
+        ) as fh:
+            staged_path = fh.name
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        with open(staged_path, "rb") as fh:
+            staged_bytes = fh.read()
+        promoted_sha256 = hashlib.sha256(staged_bytes).hexdigest()
+
+        if pre_manifest is not None:
+            try:
+                post_counts = _docx_structural_manifest(staged_bytes)
+            except (zipfile.BadZipFile, KeyError) as exc:
+                raise DocxWriteVerificationError(
+                    "post-write verification failed: the staged artifact for "
+                    f"{dest} is not a valid .docx after being flushed to disk: "
+                    f"{exc} — discarding it, {dest} is untouched",
+                    manifest={"pre_counts": pre_manifest, "post_counts": None},
+                ) from exc
+
+            mismatches = {
+                key: {"expected": pre_manifest.get(key), "actual": post_counts.get(key)}
+                for key in protected_keys
+                if post_counts.get(key) != pre_manifest.get(key)
+            }
+            if mismatches:
+                raise DocxWriteVerificationError(
+                    "post-write verification failed: the staged .docx does "
+                    "not preserve structural elements this write must never "
+                    f"lose ({dest}) — discarding the staged artifact instead "
+                    f"of promoting a corrupted write; {dest} is untouched",
+                    manifest={
+                        "pre_counts": pre_manifest,
+                        "post_counts": post_counts,
+                        "count_mismatches": mismatches,
+                    },
+                )
+
+        # --- PROMOTE: the single serialized canonical-merge point ----------
+        with _docx_promotion_lock(dest):
+            if os.path.exists(dest):
+                try:
+                    shutil.copy2(dest, dest + ".bak")
+                except OSError:
+                    pass
+            os.replace(staged_path, dest)
+            staged_path = None
+    finally:
+        if staged_path:
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+
+    return {
+        "manifest_hash": manifest_hash,
+        "pre_counts": pre_manifest,
+        "post_counts": post_counts,
+        "promoted_sha256": promoted_sha256,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1350,15 +1892,120 @@ def _restore_docx_backup(dest: str) -> bool:
     succeeded; a missing/failed backup is reported (not raised) so the
     caller can surface it in the error payload rather than mask the
     original verification failure.
+
+    5988a5bb (finding 2) -- routed through the SAME stage-to-temp-in-
+    ``dest``'s-own-directory + fsync + ``os.replace`` pattern every other
+    write in this module uses, instead of writing straight into ``dest`` via
+    ``shutil.copy2``. An interrupted restore (disk full, AV lock, permission
+    revoked mid-copy) now leaves ``dest`` and the disposable temp file
+    untouched -- ``os.replace`` is atomic on the same filesystem, so ``dest``
+    is either the OLD content (interrupted before replace) or the FULLY
+    restored backup content (replace completed); it can never be left
+    truncated or partially overwritten as a direct in-place copy risked.
     """
     backup = dest + ".bak"
     if not os.path.exists(backup):
         return False
+    parent = os.path.dirname(os.path.abspath(dest)) or "."
+    staged_path: str | None = None
     try:
-        shutil.copy2(backup, dest)
+        fd, staged_path = tempfile.mkstemp(
+            prefix=".meridian-docx-restore-", suffix=".tmp", dir=parent
+        )
+        with open(backup, "rb") as src, os.fdopen(fd, "wb") as fh:
+            shutil.copyfileobj(src, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(staged_path, dest)
+        staged_path = None
         return True
     except OSError:
         return False
+    finally:
+        if staged_path:
+            try:
+                os.unlink(staged_path)
+            except OSError:
+                pass
+
+
+def _docx_file_sha256(path: str) -> str | None:
+    """SHA-256 over ``path``'s raw bytes, read fresh from disk.
+
+    5988a5bb -- the compare-and-swap fingerprint used to tell "dest still
+    holds exactly what THIS writer promoted" apart from "a different writer
+    has already promoted something newer" (see
+    :func:`_safe_restore_after_verification_failure`). Returns ``None``
+    (rather than raising) when ``path`` cannot be read -- a missing/
+    unreadable file is itself informative to the caller (it can never match
+    a real ``promoted_sha256``), not a reason to blow up a post-write
+    verification-failure handler that is already in an error path.
+    """
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _safe_restore_after_verification_failure(
+    write_dest: str,
+    promoted_sha256: str | None,
+) -> tuple[bool, bool, bool]:
+    """Compare-and-swap-safe gate in front of :func:`_restore_docx_backup` (5988a5bb).
+
+    Only called once a caller-specific post-write check (e.g.
+    :func:`_verify_docx_write`) has already found a mismatch on
+    ``write_dest``. A bare, unconditional restore is unsafe: if a DIFFERENT
+    writer (a different process, or a different concurrent claim on a
+    non-overlapping region of the SAME file -- see
+    :func:`claim_docx_region`'s module docs) promoted its own write to
+    ``write_dest`` in the window between THIS writer's own promotion and
+    THIS writer's verify, the mismatch this writer is reacting to is a false
+    positive caused by that other writer's legitimate, already-promoted
+    work -- blindly restoring from THIS writer's own ``.bak`` would silently
+    destroy it.
+
+    Re-reads ``write_dest``'s CURRENT on-disk bytes (fresh from disk) and
+    compares their SHA-256 against ``promoted_sha256`` --
+    :func:`_atomic_write_docx_bytes`'s own fingerprint of exactly what THIS
+    writer promoted (returned as ``transaction["promoted_sha256"]``).
+    ``promoted_sha256`` can itself be ``None`` -- not only from a genuinely
+    concurrent writer, but also when the caller's own write helper didn't
+    return transaction info at all (e.g. a stubbed/broken lower-level write
+    path in a test, or a future caller that hasn't been updated) -- that
+    case is reported distinctly below rather than misdiagnosed as a
+    confirmed concurrent write.
+
+    Returns ``(safe_to_restore, restored, concurrent_write_detected)``:
+
+    * ``(True, restored, False)`` -- ``write_dest`` still held exactly what
+      this writer promoted (nobody has touched it since); a restore was
+      attempted and ``restored`` reports whether it succeeded.
+    * ``(False, False, True)`` -- POSITIVE evidence of a different writer:
+      both fingerprints were available and did not match. Restore was
+      deliberately NOT attempted, and ``write_dest`` is left exactly as
+      that other writer left it.
+    * ``(False, False, False)`` -- restore eligibility could not be
+      determined at all (``promoted_sha256`` or ``write_dest`` itself was
+      unavailable) -- NOT positive evidence of a concurrent write, just
+      insufficient information to safely restore. Restore is still NOT
+      attempted (the same fail-closed default), but callers should not
+      report this as a confirmed cross-writer clobber.
+    """
+    current_sha256 = _docx_file_sha256(write_dest) if os.path.isfile(write_dest) else None
+    safe_to_restore = (
+        promoted_sha256 is not None
+        and current_sha256 is not None
+        and current_sha256 == promoted_sha256
+    )
+    if not safe_to_restore:
+        concurrent_write_detected = promoted_sha256 is not None and current_sha256 is not None
+        return False, False, concurrent_write_detected
+    return True, _restore_docx_backup(write_dest), False
 
 
 def _verify_docx_write(
@@ -1599,13 +2246,17 @@ def _build_caption_paragraph(
     label_text: str,
     seq_cached: str = "1",
     ref_bookmark: str | None = None,
+    centered: bool = False,
 ) -> ET.Element:
     """Build a ``<w:p>`` element for a Word caption using the Caption style.
 
     Produces::
 
         <w:p>
-          <w:pPr><w:pStyle w:val="Caption"/></w:pPr>
+          <w:pPr>
+            <w:pStyle w:val="Caption"/>
+            <w:jc w:val="center"/>     <!-- only when centered=True -->
+          </w:pPr>
           <w:bookmarkStart w:id="0" w:name="_Ref123456789"/>
           <w:r><w:t xml:space="preserve">Figure </w:t></w:r>
           <w:fldSimple w:instr="SEQ Figure \\* ARABIC">
@@ -1627,6 +2278,10 @@ def _build_caption_paragraph(
     inserted elsewhere (see :func:`insert_cross_reference`) resolves to just
     ``"Figure 3"`` and stays correct across reordering/renumbering on Word's
     next field refresh, instead of hand-typed prose text going stale.
+
+    4efc63fd — ``centered`` (from ``style_policy["caption_centered"]`` via
+    :func:`resolve_style_policy`) adds ``w:jc w:val="center"`` to the
+    paragraph; default ``False`` preserves this function's original output.
     """
     if kind not in ("Figure", "Table"):
         raise ValueError(f"caption kind must be 'Figure' or 'Table', got {kind!r}")
@@ -1639,6 +2294,8 @@ def _build_caption_paragraph(
     pPr = ET.SubElement(p, _q(_W, "pPr"))
     pStyle = ET.SubElement(pPr, _q(_W, "pStyle"))
     pStyle.set(_q(_W, "val"), _CAPTION_STYLE)
+    if centered:
+        ET.SubElement(pPr, _q(_W, "jc"), {_q(_W, "val"): "center"})
 
     if ref_bookmark:
         bm_start = ET.SubElement(p, _q(_W, "bookmarkStart"))
@@ -2102,6 +2759,395 @@ def insert_image(
         "docx_path": docx_path,
     }
 
+
+def _verify_figure_block_write(
+    docx_path: str,
+    *,
+    image_para_id: str,
+    expected_seq_number: int,
+    expected_label_text: str,
+) -> dict[str, Any] | None:
+    """19be1551 — post-write verification for :func:`insert_figure_block`.
+
+    Re-reads ``docx_path`` FRESH FROM DISK (never the in-memory tree that was
+    just serialized -- that would only re-validate this function's own
+    intent, not the actual write) and confirms, in order: the image
+    paragraph is present and centered (``w:jc w:val="center"``); the very
+    next body element is a paragraph (no other paragraph -- and in
+    particular no OTHER image -- landed between them); that paragraph
+    carries a ``SEQ Figure`` field whose cached number matches
+    ``expected_seq_number``; and its rendered text contains
+    ``expected_label_text``. Returns ``None`` when every check passes, or an
+    ``{"error": ...}`` dict on the first mismatch -- mirroring
+    :func:`_verify_docx_write`'s "real error instead of a false success
+    payload" discipline (9907df44) for the one case that helper does not
+    already cover (a newly inserted pair with no prior on-disk baseline to
+    diff against).
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    body_list = list(body2)
+    w14_para_id = _q(_W14, "paraId")
+    image_idx = next(
+        (i for i, el in enumerate(body_list) if el.get(w14_para_id) == image_para_id),
+        None,
+    )
+    if image_idx is None:
+        return {
+            "error": (
+                f"post-write verification failed: image paragraph "
+                f"{image_para_id!r} not found anywhere in {docx_path} after "
+                "the write"
+            )
+        }
+
+    image_para = body_list[image_idx]
+    if image_para.find(f".//{_q(_W, 'drawing')}") is None:
+        return {
+            "error": (
+                "post-write verification failed: paragraph "
+                f"{image_para_id!r} no longer contains a <w:drawing> image "
+                "after the write"
+            )
+        }
+    if _paragraph_alignment(image_para) != "center":
+        return {
+            "error": (
+                "post-write verification failed: image paragraph "
+                f"{image_para_id!r} is not centered (w:jc=\"center\") after "
+                "the write"
+            )
+        }
+
+    if image_idx + 1 >= len(body_list):
+        return {
+            "error": (
+                "post-write verification failed: no paragraph immediately "
+                f"follows the image paragraph {image_para_id!r} after the "
+                "write -- the caption is missing"
+            )
+        }
+    caption_para = body_list[image_idx + 1]
+    if caption_para.tag != _q(_W, "p"):
+        return {
+            "error": (
+                "post-write verification failed: the element immediately "
+                f"following image paragraph {image_para_id!r} is not a "
+                "paragraph"
+            )
+        }
+
+    fld = caption_para.find(_q(_W, "fldSimple"))
+    instr = fld.get(_q(_W, "instr")) if fld is not None else None
+    if fld is None or "SEQ Figure" not in (instr or ""):
+        return {
+            "error": (
+                "post-write verification failed: the paragraph immediately "
+                f"following image paragraph {image_para_id!r} does not "
+                "contain a SEQ Figure field"
+            )
+        }
+    seq_text_el = fld.find(f".//{_q(_W, 't')}")
+    seq_text = seq_text_el.text if seq_text_el is not None else None
+    if seq_text != str(expected_seq_number):
+        return {
+            "error": (
+                "post-write verification failed: caption SEQ number "
+                f"mismatch (expected {expected_seq_number!r}, got "
+                f"{seq_text!r})"
+            )
+        }
+
+    caption_text = "".join(t.text or "" for t in caption_para.iter(_q(_W, "t")))
+    if expected_label_text not in caption_text:
+        return {
+            "error": (
+                "post-write verification failed: caption label text "
+                f"mismatch (expected to contain {expected_label_text!r}, "
+                f"got {caption_text!r})"
+            )
+        }
+    return None
+
+
+def insert_figure_block(
+    docx_path: str,
+    image_path: str,
+    label_text: str,
+    anchor_para_id: str | None = None,
+    position: str = "after",
+    width_inches: float | None = None,
+    height_inches: float | None = None,
+    section_heading: str | None = None,
+    index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """19be1551 — atomically insert a centered image paragraph AND its
+    adjacent real SEQ Figure caption in a SINGLE document-load-mutate-save
+    transaction.
+
+    This is deliberately NOT the same as calling :func:`insert_image` then
+    :func:`insert_caption` back to back: that composition already "works"
+    today but performs two separate zip rewrites, so a failure between them
+    can leave an orphan image with no caption, or a caption whose SEQ number
+    raced against a concurrent writer. Here both paragraphs are built
+    against ONE shared in-memory document tree and reach disk via exactly
+    one call to :func:`_save_docx_with_image` -- there is no window in which
+    only one half of the pair exists on disk.
+
+    Anchor resolution is identical to :func:`insert_image`: ``anchor_para_id``
+    must name a direct body paragraph, and ``position`` ("before"/"after",
+    default "after") places the IMAGE paragraph relative to it; ``None``
+    appends the block before the document's trailing ``sectPr``. The caption
+    paragraph is always inserted immediately after the image paragraph --
+    that placement is not itself configurable, mirroring
+    :func:`insert_caption`'s own rule that a Figure caption can never precede
+    its image.
+
+    The caption is built exactly like :func:`insert_caption` with
+    ``kind="Figure"``: ``seq_number`` is the count of existing SEQ Figure
+    captions in the document plus one, and ``ref_bookmark`` is a fresh
+    ``_Ref<digits>`` cross-reference bookmark -- both computed against the
+    document tree BEFORE either new paragraph is inserted, exactly like
+    :func:`insert_caption` does, which is safe here specifically because
+    atomicity removes the race a second writer's caption could otherwise
+    land in between. ``style_policy["caption_centered"]`` (via
+    :func:`resolve_style_policy`) controls whether the caption itself also
+    gets ``w:jc w:val="center"``; the image paragraph is always centered
+    regardless of style_policy or of any alignment the anchor paragraph
+    happens to carry -- the new paragraph's own ``w:jc`` is authoritative and
+    never inherits a neighbor's alignment.
+
+    After the single save, the file is re-read FRESH FROM DISK and verified
+    (see :func:`_verify_figure_block_write`): the image paragraph must be
+    present and centered, the caption must immediately follow with nothing
+    in between, and its SEQ number/label text must match what was written.
+    On a verification failure the pre-write backup :func:`_save_docx_with_image`
+    left at ``docx_path + ".bak"`` is restored via :func:`_restore_docx_backup`
+    -- the same backup-then-restore mechanism this module's other post-write
+    verification failures already use (9907df44) -- and an error is returned
+    instead of a false success payload.
+
+    Supported image formats, dimension inference, and the six-inch default
+    width all match :func:`insert_image`.
+
+    Returns ``{status, image_para_id, image_name, kind, seq_number,
+    label_text, section_heading, ref_bookmark, docx_path}``, or
+    ``{"error": message}`` without mutating the document on validation
+    failure or verification failure that could not be cleanly restored.
+    """
+    if not isinstance(docx_path, str) or not docx_path:
+        return {"error": "docx_path must be a non-empty string"}
+    if not isinstance(image_path, str) or not image_path:
+        return {"error": "image_path must be a non-empty string"}
+    if position not in ("before", "after"):
+        return {"error": "position must be before or after"}
+    if not label_text or not str(label_text).strip():
+        return {"error": "label_text must be a non-empty string"}
+    suffix = os.path.splitext(image_path)[1].lower()
+    image_type = _IMAGE_TYPES.get(suffix)
+    if image_type is None:
+        return {"error": f"unsupported image format: {suffix or 'missing extension'}"}
+    if width_inches is not None and width_inches <= 0:
+        return {"error": "width_inches must be greater than zero"}
+    if height_inches is not None and height_inches <= 0:
+        return {"error": "height_inches must be greater than zero"}
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    try:
+        with open(image_path, "rb") as handle:
+            image_bytes = handle.read()
+    except OSError as exc:
+        return {"error": f"could not read image {image_path}: {exc}"}
+    if not image_bytes:
+        return {"error": f"image file is empty: {image_path}"}
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+        width_emu, height_emu = _image_size_emu(
+            image_bytes, suffix, width_inches, height_inches
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"document has no body: {docx_path}"}
+    children = list(body)
+    if anchor_para_id is None:
+        insert_at = next(
+            (idx for idx, child in enumerate(children) if child.tag == _q(_W, "sectPr")),
+            len(children),
+        )
+    else:
+        located = _find_para_by_id(root, anchor_para_id)
+        if located is None:
+            return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+        _located_body, anchor, anchor_idx = located
+        if _located_body is not body or children[anchor_idx] is not anchor:
+            return {
+                "error": (
+                    "anchor_para_id must identify a direct body paragraph; "
+                    "table-cell paragraphs cannot anchor image insertion"
+                )
+            }
+        insert_at = anchor_idx + (1 if position == "after" else 0)
+
+    entries: dict[str, bytes] = {}
+    with zipfile.ZipFile(io.BytesIO(raw)) as source:
+        for info in source.infolist():
+            entries[info.filename] = source.read(info.filename)
+    rels_xml = entries.get("word/_rels/document.xml.rels")
+    rels_root = (
+        ET.fromstring(rels_xml)
+        if rels_xml
+        else ET.Element(_q(_PACKAGE_REL_NS, "Relationships"))
+    )
+    relationship_id = _next_relationship_id(rels_root)
+    image_name = _next_media_name(entries, f".{image_type[0]}")
+    taken = _existing_para_ids(root)
+    image_para_id = _new_para_id(taken)
+    doc_pr_id = len(root.findall(f".//{_q(_WP, 'docPr')}")) + 1
+
+    # Caption metadata (seq_number, ref_bookmark) is computed against the
+    # ORIGINAL root, before either new paragraph is inserted -- identical
+    # timing to insert_caption's own computation. Safe here specifically
+    # because both paragraphs land in the same save transaction: there is no
+    # window for a second writer's caption to land in between and shift the
+    # count out from under us.
+    seq_number = _count_seq_captions(root, "Figure") + 1
+    ref_bookmark = _next_ref_bookmark_name(root)
+    label_text_clean = label_text.strip()
+
+    paragraph = ET.Element(_q(_W, "p"))
+    paragraph.set(_q(_W14, "paraId"), image_para_id)
+    ppr = ET.SubElement(paragraph, _q(_W, "pPr"))
+    ET.SubElement(ppr, _q(_W, "jc"), {_q(_W, "val"): "center"})
+    run = ET.SubElement(paragraph, _q(_W, "r"))
+    run.append(
+        _build_image_drawing(
+            relationship_id, width_emu, height_emu, doc_pr_id, image_name
+        )
+    )
+
+    caption_p = _build_caption_paragraph(
+        kind="Figure",
+        label_text=label_text_clean,
+        seq_cached=str(seq_number),
+        ref_bookmark=ref_bookmark,
+        centered=policy["caption_centered"],
+    )
+
+    body.insert(insert_at, paragraph)
+    body.insert(insert_at + 1, caption_p)
+
+    # 5988a5bb -- hold docx_path's promotion lock across stage+promote
+    # (_save_docx_with_image, which is not itself lock-aware, so this
+    # caller must bracket it explicitly) THROUGH the post-write verify and
+    # any conditional restore below, closing the same-process window
+    # between promotion and verify/restore entirely (see
+    # _docx_promotion_lock's module-level comment). promoted_sha256 is
+    # computed locally right after the write (rather than returned from
+    # _save_docx_with_image, which has other callers -- insert_image /
+    # insert_caption -- this fix does not touch) since it is simply
+    # docx_path's own fresh-from-disk fingerprint immediately after THIS
+    # writer's own promotion.
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_image(
+                raw, root, image_bytes, image_name, relationship_id,
+                image_type[1], docx_path
+            )
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = _docx_file_sha256(docx_path)
+
+        verify_error = _verify_figure_block_write(
+            docx_path,
+            image_para_id=image_para_id,
+            expected_seq_number=seq_number,
+            expected_label_text=label_text_clean,
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to docx_path
+            # since our own promotion, in which case this verification
+            # "failure" is a false positive and restoring from our own
+            # backup would destroy that writer's completed, already-
+            # promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["image_para_id"] = image_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+    if index_db_path and os.path.exists(index_db_path):
+        _upsert_sidecar_caption(
+            index_db_path=index_db_path,
+            kind="Figure",
+            para_id=None,  # newly inserted caption para has no w14:paraId yet
+            seq_number=str(seq_number),
+            caption_text=f"Figure {seq_number}. {label_text_clean}",
+            section_heading=section_heading,
+            ref_bookmark=ref_bookmark,
+        )
+
+    return {
+        "status": "inserted",
+        "image_para_id": image_para_id,
+        "image_name": image_name,
+        "kind": "Figure",
+        "seq_number": seq_number,
+        "label_text": label_text_clean,
+        "section_heading": section_heading,
+        "ref_bookmark": ref_bookmark,
+        "docx_path": docx_path,
+    }
+
+
 def find_image_paragraph(
     docx_path: str,
     figure_index: int | None = None,
@@ -2216,6 +3262,7 @@ def insert_caption(
     position: str = "after",
     section_heading: str | None = None,
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real Word Caption paragraph into a .docx file.
 
@@ -2226,6 +3273,10 @@ def insert_caption(
     The SEQ number is auto-incremented: it equals the count of existing SEQ
     captions of the same kind in the document plus one.  Word will recompute
     the final numbering on the next field refresh (F9).
+
+    4efc63fd — ``style_policy["caption_centered"]`` (default ``False``, via
+    :func:`resolve_style_policy`) controls whether the new caption paragraph
+    gets ``w:jc w:val="center"``.
 
     Args:
         docx_path:       Absolute path to the .docx file (mutated in place).
@@ -2243,6 +3294,8 @@ def insert_caption(
                          belongs to.  Stored in the sidecar ``section`` column.
         index_db_path:   If supplied, the sidecar SQLite index is invalidated
                          after the write so the next read auto-reindexes.
+        style_policy:    Optional overrides merged via
+                         :func:`resolve_style_policy`.
 
     Returns:
         ``{status, kind, seq_number, label_text, section_heading, ref_bookmark,
@@ -2273,6 +3326,11 @@ def insert_caption(
         return {"error": "label_text must be a non-empty string"}
 
     try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
         raw, root = _load_docx_xml_stdlib(docx_path)
     except FileNotFoundError as exc:
         return {"error": str(exc)}
@@ -2293,6 +3351,7 @@ def insert_caption(
         label_text=label_text.strip(),
         seq_cached=str(seq_number),
         ref_bookmark=ref_bookmark,
+        centered=policy["caption_centered"],
     )
 
     insert_at = child_idx if position == "before" else child_idx + 1
@@ -3873,21 +4932,399 @@ def get_local_equations(index_db_path: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Configurable document style policy (4efc63fd)
+# ---------------------------------------------------------------------------
+#
+# A single dict-shaped "style policy" that write-back functions consult
+# instead of hardcoding style choices (caption centering, equation body
+# indentation/alignment, internal-note style name + highlight color), and
+# that audit_equation_style below uses as its "expected" baseline. Plain
+# dicts -- not a dataclass -- to match this module's existing convention of
+# returning/consuming JSON-shaped dicts everywhere (MCP tool boundary).
+#
+# _style_policy_defaults() is a function (not a module-level dict literal)
+# specifically so it can reference _INTERNAL_NOTE_STYLE_DEFAULT /
+# _INTERNAL_NOTE_HIGHLIGHT_COLOR, which are defined later in this file --
+# names inside a function body resolve at CALL time, long after the whole
+# module has finished importing, so the forward reference is safe.
+
+_VALID_EQUATION_ALIGNMENTS = {"left", "center", "right", "both"}
+
+# The fixed set of values OOXML's <w:highlight w:val="..."/> accepts.
+_VALID_HIGHLIGHT_COLORS = {
+    "black", "blue", "cyan", "darkBlue", "darkCyan", "darkGray", "darkGreen",
+    "darkMagenta", "darkRed", "darkYellow", "green", "lightGray", "magenta",
+    "none", "red", "white", "yellow",
+}
+
+
+def _style_policy_defaults() -> dict[str, Any]:
+    """Built-in defaults -- reproduce today's pre-4efc63fd behavior except
+    where called out below.
+
+    ``equation_alignment`` defaults to ``"center"`` (the conventional
+    display-equation layout, matching :func:`insert_image`'s already-centered
+    figures) rather than "leave unset" -- this is a deliberate, documented
+    behavior addition for newly inserted display equations, not a bug: no
+    existing test asserts an inserted equation paragraph has no ``pPr``, and
+    keeping the audit's "expected" alignment and the writer's actual output
+    in sync (one policy, two consumers) is the whole point of this feature.
+    """
+    return {
+        "caption_centered": False,
+        "body_indent_twips": 0,
+        "equation_alignment": "center",
+        "equation_punctuation_required": True,
+        "equation_punctuation_chars": ".,;:",
+        "note_style": _INTERNAL_NOTE_STYLE_DEFAULT,
+        "note_highlight_color": _INTERNAL_NOTE_HIGHLIGHT_COLOR,
+    }
+
+
+def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    """4efc63fd -- merge caller-supplied overrides onto the default document
+    style policy, validating every key/value so a malformed policy raises
+    ``ValueError`` immediately (callers turn that into ``{"error": ...}``
+    *before* touching any file) instead of producing malformed OOXML or
+    silently doing nothing.
+
+    Recognised keys (all optional -- any subset may be overridden):
+
+      caption_centered (bool):     whether :func:`insert_caption` adds
+                                    ``w:jc w:val="center"`` to new captions.
+      body_indent_twips (int>=0):  left-indent (in twips, 1/20 pt) applied to
+                                    a newly inserted DISPLAY equation
+                                    paragraph's ``pPr`` by
+                                    :func:`insert_equation_local`.
+      equation_alignment (str):    one of "left"/"center"/"right"/"both" --
+                                    both the alignment :func:`insert_equation_local`
+                                    writes into new display-equation paragraphs
+                                    AND the alignment :func:`audit_equation_style`
+                                    treats as "correct".
+      equation_punctuation_required (bool): whether
+                                    :func:`audit_equation_style` checks
+                                    trailing punctuation at all.
+      equation_punctuation_chars (str): the accepted trailing-punctuation
+                                    characters (checked by
+                                    :func:`audit_equation_style`).
+      note_style (str):            OOXML paragraph style name
+                                    :func:`insert_highlighted_note` (inline
+                                    mode) writes for new notes.
+      note_highlight_color (str):  ``<w:highlight>`` value (must be a valid
+                                    OOXML highlight color) for new notes.
+
+    Raises:
+      ValueError: an unknown key, or a value of the wrong type/out of range.
+    """
+    defaults = _style_policy_defaults()
+    if not overrides:
+        return defaults
+
+    unknown = sorted(set(overrides) - set(defaults))
+    if unknown:
+        raise ValueError(f"unknown style policy key(s): {unknown}")
+
+    policy = dict(defaults)
+    policy.update(overrides)
+
+    if not isinstance(policy["caption_centered"], bool):
+        raise ValueError("style policy 'caption_centered' must be a bool")
+
+    indent = policy["body_indent_twips"]
+    if not isinstance(indent, int) or isinstance(indent, bool) or indent < 0:
+        raise ValueError("style policy 'body_indent_twips' must be a non-negative int")
+
+    if policy["equation_alignment"] not in _VALID_EQUATION_ALIGNMENTS:
+        raise ValueError(
+            "style policy 'equation_alignment' must be one of "
+            f"{sorted(_VALID_EQUATION_ALIGNMENTS)}"
+        )
+
+    if not isinstance(policy["equation_punctuation_required"], bool):
+        raise ValueError("style policy 'equation_punctuation_required' must be a bool")
+
+    punct_chars = policy["equation_punctuation_chars"]
+    if not isinstance(punct_chars, str) or not punct_chars:
+        raise ValueError("style policy 'equation_punctuation_chars' must be a non-empty string")
+
+    note_style = policy["note_style"]
+    if not isinstance(note_style, str) or not note_style.strip():
+        raise ValueError("style policy 'note_style' must be a non-empty string")
+
+    if policy["note_highlight_color"] not in _VALID_HIGHLIGHT_COLORS:
+        raise ValueError(
+            "style policy 'note_highlight_color' must be one of "
+            f"{sorted(_VALID_HIGHLIGHT_COLORS)}"
+        )
+
+    return policy
+
+
+def _paragraph_alignment(para_elem: ET.Element) -> str | None:
+    """Return the explicit ``w:jc`` value on ``para_elem``'s ``pPr``, or
+    ``None`` when no alignment is explicitly set (Word's own default renders
+    that as left-aligned)."""
+    pPr = para_elem.find(_q(_W, "pPr"))
+    if pPr is None:
+        return None
+    jc = pPr.find(_q(_W, "jc"))
+    if jc is None:
+        return None
+    return jc.get(_q(_W, "val"))
+
+
+def _trailing_text_after_omath(para_elem: ET.Element, omath_el: ET.Element) -> str:
+    """Concatenate the text of every element following ``omath_el`` within its
+    immediate parent inside ``para_elem``.
+
+    Mirrors :func:`append_text_run_after_math`'s insertion point exactly --
+    this is how :func:`audit_equation_style` reads back whatever a prior
+    ``append_text_run_after_math`` call wrote (or detects that nothing was
+    ever appended).
+    """
+    parent = next(
+        (candidate for candidate in para_elem.iter() if omath_el in list(candidate)),
+        None,
+    )
+    if parent is None:
+        return ""
+    siblings = list(parent)
+    idx = siblings.index(omath_el)
+    w_t = _q(_W, "t")
+    return "".join(
+        "".join(t.text or "" for t in sib.iter(w_t)) for sib in siblings[idx + 1:]
+    )
+
+
+_EQ_LEADING_INT_RE = re.compile(r"^\(\s*(\d+)")
+
+
+def _leading_equation_number(number_text: str | None) -> int | None:
+    """Extract the leading integer from an equation number like ``"(2a)"`` ->
+    ``2``, or ``None`` for a non-numeric label like ``"(A.1)"``/``"(eq3)"``
+    that has no well-defined "next integer" for gap detection."""
+    if not number_text:
+        return None
+    m = _EQ_LEADING_INT_RE.match(number_text)
+    return int(m.group(1)) if m else None
+
+
+def audit_equation_style(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """4efc63fd -- audit every equation in a .docx and report STRUCTURED
+    findings (never free-text) covering alignment, trailing punctuation, and
+    numbering consistency, so a caller can programmatically triage a document
+    before submission instead of eyeballing it.
+
+    Three finding categories:
+
+    1. ``misaligned_equation`` -- scoped to STANDALONE equations that occupy
+       their own paragraph (a "display" equation: the paragraph's only
+       content besides ``pPr`` is the ``<m:oMath>``/``<m:oMathPara>`` --
+       exactly what :func:`insert_equation_local`'s ``before``/``after``
+       positions produce). Its paragraph-level ``w:jc`` (missing == "left")
+       is compared against ``style_policy["equation_alignment"]``. Inline
+       equations mixed into running prose, and table-numbered equations
+       (whose 2-column layout has its own alignment conventions), are
+       intentionally excluded -- neither has one well-defined "expected"
+       paragraph alignment.
+
+    2. ``missing_trailing_punctuation`` / ``incorrect_trailing_punctuation``
+       -- for the same display-equation paragraphs (skipped entirely when
+       ``style_policy["equation_punctuation_required"]`` is False), the text
+       of any run(s) immediately following the ``<m:oMath>`` -- the exact
+       spot :func:`append_text_run_after_math` writes to -- is checked
+       against ``style_policy["equation_punctuation_chars"]``. No trailing
+       text at all -> "missing"; trailing text whose last non-whitespace
+       character isn't an accepted character -> "incorrect".
+
+    3. ``duplicate_equation_number`` / ``equation_number_gap`` -- across every
+       ``table-numbered`` equation (the ``"(1)"``/``"(2a)"`` pattern
+       :func:`parse_docx_equations_local` already detects), numbers are
+       compared whitespace-normalized for exact duplicates, and each number's
+       LEADING integer (``"2a"`` -> ``2``) is checked for a contiguous
+       1..max sequence. Non-numeric labels (``"(A.1)"``, ``"(eq3)"``) still
+       participate in duplicate detection but are excluded from gap
+       detection (no well-defined "next integer").
+
+    Args:
+      docx_path:     Absolute path to the .docx file. Read-only -- this
+                     function never mutates the file.
+      style_policy:  Optional overrides merged onto the default style policy
+                     via :func:`resolve_style_policy`.
+
+    Returns:
+      ``{docx_path, equation_count, findings, finding_count,
+      findings_by_type, policy}`` or ``{"error": <message>}`` when the file
+      cannot be read or the style policy is invalid.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    equations = parse_docx_equations_local(docx_path)
+    findings: list[dict[str, Any]] = []
+
+    m_omath_tag = _qm("oMath")
+    m_omath_para_tag = _qm("oMathPara")
+
+    for eq in equations:
+        if eq["pattern"] != "standalone":
+            continue
+        located = _find_para_by_id(root, eq["para_id"])
+        if located is None:
+            continue  # unresolvable id (e.g. a table-embedded standalone) -- skip
+        _body, para_elem, _idx = located
+
+        # Resolve the paragraph's direct-child oMath(s) (unwrapping a single
+        # oMathPara if that's how it's wrapped). A paragraph containing more
+        # than one equation is ambiguous -- which one does trailing text
+        # belong to? -- so it's skipped entirely, mirroring
+        # append_text_run_after_math's own "math_index required" guard
+        # against the same ambiguity rather than guessing.
+        direct_omaths = para_elem.findall(m_omath_tag)
+        top_level_el = None
+        if direct_omaths:
+            top_level_el = direct_omaths[0] if len(direct_omaths) == 1 else None
+        else:
+            omath_para_el = para_elem.find(m_omath_para_tag)
+            if omath_para_el is not None:
+                direct_omaths = omath_para_el.findall(m_omath_tag)
+                if len(direct_omaths) == 1:
+                    top_level_el = omath_para_el
+        if len(direct_omaths) != 1 or top_level_el is None:
+            continue
+        omath_el = direct_omaths[0]
+
+        # "Display equation" = nothing but pPr precedes the equation in the
+        # paragraph. Content AFTER the equation -- e.g. a trailing
+        # punctuation run written by append_text_run_after_math -- is
+        # expected and does NOT disqualify it (that's exactly what the
+        # punctuation check below reads back). Content BEFORE the equation
+        # (prose mixed with the equation, as in an inline
+        # "Einstein: E=mc^2" sentence) DOES disqualify it -- there is no
+        # single sensible alignment/punctuation expectation for a sentence
+        # that merely contains an equation.
+        siblings = list(para_elem)
+        top_idx = siblings.index(top_level_el)
+        preceding = [c for c in siblings[:top_idx] if c.tag != _q(_W, "pPr")]
+        if preceding:
+            continue  # inline equation mixed with prose -- no alignment/punctuation check
+
+        actual_alignment = _paragraph_alignment(para_elem) or "left"
+        expected_alignment = policy["equation_alignment"]
+        if actual_alignment != expected_alignment:
+            findings.append({
+                "type": "misaligned_equation",
+                "para_id": eq["para_id"],
+                "ordinal": eq["ordinal"],
+                "expected_alignment": expected_alignment,
+                "actual_alignment": actual_alignment,
+            })
+
+        if policy["equation_punctuation_required"]:
+            trailing = _trailing_text_after_omath(para_elem, omath_el)
+            stripped = trailing.rstrip()
+            if not stripped:
+                findings.append({
+                    "type": "missing_trailing_punctuation",
+                    "para_id": eq["para_id"],
+                    "ordinal": eq["ordinal"],
+                    "expected_punctuation_chars": policy["equation_punctuation_chars"],
+                })
+            elif stripped[-1] not in policy["equation_punctuation_chars"]:
+                findings.append({
+                    "type": "incorrect_trailing_punctuation",
+                    "para_id": eq["para_id"],
+                    "ordinal": eq["ordinal"],
+                    "actual_trailing_text": trailing,
+                    "actual_char": stripped[-1],
+                    "expected_punctuation_chars": policy["equation_punctuation_chars"],
+                })
+
+    numbered = [eq for eq in equations if eq["pattern"] == "table-numbered" and eq["number"]]
+
+    grouped_by_norm: dict[str, list[dict[str, Any]]] = {}
+    for eq in numbered:
+        norm = re.sub(r"\s+", "", eq["number"])
+        grouped_by_norm.setdefault(norm, []).append(eq)
+    for group in grouped_by_norm.values():
+        if len(group) > 1:
+            findings.append({
+                "type": "duplicate_equation_number",
+                "number": group[0]["number"],
+                "para_ids": [g["para_id"] for g in group],
+                "ordinals": [g["ordinal"] for g in group],
+            })
+
+    leading_ints = sorted({
+        v for v in (_leading_equation_number(eq["number"]) for eq in numbered)
+        if v is not None
+    })
+    if leading_ints:
+        expected_range = set(range(1, leading_ints[-1] + 1))
+        for missing in sorted(expected_range - set(leading_ints)):
+            findings.append({"type": "equation_number_gap", "missing_number": missing})
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "docx_path": docx_path,
+        "equation_count": len(equations),
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+        "policy": policy,
+    }
+
+
+# ---------------------------------------------------------------------------
 # WRITE: insert / edit / remove equation
 # ---------------------------------------------------------------------------
 
-def _build_omath_paragraph(omml_raw: str) -> ET.Element:
+def _build_omath_paragraph(
+    omml_raw: str,
+    alignment: str | None = None,
+    indent_twips: int = 0,
+) -> ET.Element:
     """Wrap a raw OMML string in a new <w:p> for display-mode insertion.
 
     Produces::
 
         <w:p>
+          <w:pPr>
+            <w:jc w:val="..."/>        <!-- only when alignment is given -->
+            <w:ind w:left="..."/>      <!-- only when indent_twips > 0 -->
+          </w:pPr>
           <m:oMath>...</m:oMath>
         </w:p>
+
+    ``alignment``/``indent_twips`` (4efc63fd) come from a resolved style
+    policy (see :func:`resolve_style_policy`) so the paragraph's ``pPr`` is
+    omitted entirely when neither is set -- matching this function's
+    original (pre-4efc63fd) output exactly.
 
     The oMath element is parsed from ``omml_raw`` and appended as a child.
     """
     p = ET.Element(_q(_W, "p"))
+    if alignment or indent_twips:
+        pPr = ET.SubElement(p, _q(_W, "pPr"))
+        if alignment:
+            ET.SubElement(pPr, _q(_W, "jc"), {_q(_W, "val"): alignment})
+        if indent_twips:
+            ET.SubElement(pPr, _q(_W, "ind"), {_q(_W, "left"): str(indent_twips)})
     omath_el = ET.fromstring(omml_raw)
     p.append(omath_el)
     return p
@@ -3899,6 +5336,7 @@ def insert_equation_local(
     payload: str,
     position: str = "after",
     index_db_path: str | None = None,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Insert an equation into a .docx file.
 
@@ -3915,6 +5353,12 @@ def insert_equation_local(
     the ``<m:oMath>`` element is appended as a direct child of the anchor
     ``<w:p>`` (inline equation style).
 
+    4efc63fd — ``style_policy`` (resolved via :func:`resolve_style_policy`)
+    supplies the new display paragraph's alignment (``equation_alignment``,
+    default ``"center"``) and left indentation (``body_indent_twips``,
+    default 0 / no indent). Not consulted for ``position="append"`` (inline
+    equations have no paragraph of their own to style).
+
     Args:
         docx_path:       Absolute path to the .docx file (mutated in place).
         anchor_para_id:  ``w14:paraId`` or ``p{N}`` / ``tbl{N}`` of the
@@ -3924,6 +5368,9 @@ def insert_equation_local(
         position:        ``"before"``, ``"after"``, or ``"append"`` (default
                          ``"after"``).
         index_db_path:   If supplied, sidecar is invalidated after write.
+        style_policy:    Optional overrides merged via
+                         :func:`resolve_style_policy`; see that function's
+                         docstring for keys.
 
     Returns:
         ``{status, position, para_id, omml, docx_path}``
@@ -3933,6 +5380,11 @@ def insert_equation_local(
         return {"error": f"position must be 'before', 'after', or 'append', got {position!r}"}
     if not payload or not str(payload).strip():
         return {"error": "payload must be a non-empty string (OMML XML or LaTeX)"}
+
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     # Resolve OMML before touching the file — fail fast on bad input.
     try:
@@ -3961,7 +5413,11 @@ def insert_equation_local(
         anchor_elem.append(omath_el)
     else:
         # Display: insert a new <w:p> wrapping the equation.
-        new_p = _build_omath_paragraph(omml)
+        new_p = _build_omath_paragraph(
+            omml,
+            alignment=policy["equation_alignment"],
+            indent_twips=policy["body_indent_twips"],
+        )
         insert_at = child_idx if position == "before" else child_idx + 1
         body.insert(insert_at, new_p)
 
@@ -3989,19 +5445,21 @@ def edit_equation_local(
 ) -> dict[str, Any]:
     """a80af3a0 — Replace the <m:oMath> in an existing equation paragraph.
 
-    Locates the paragraph by ``equation_para_id``, verifies it contains at
-    least one ``<m:oMath>``, removes all existing ``<m:oMath>`` children, and
-    inserts the new equation (resolved from OMML or LaTeX).
+    Locates the paragraph by equation_para_id, verifies it contains at
+    least one <m:oMath>, removes all existing equation containers, and
+    inserts the new equation (resolved from OMML or LaTeX). The replacement
+    occupies the first existing equation slot so surrounding text runs retain
+    their original order.
 
     Args:
         docx_path:         Absolute path to the .docx file (mutated in place).
-        equation_para_id:  ``w14:paraId`` or ``p{N}`` of the equation paragraph.
+        equation_para_id:  w14:paraId or p{N} of the equation paragraph.
         new_payload:       Raw OMML XML or LaTeX expression.
         index_db_path:     If supplied, sidecar is invalidated after write.
 
     Returns:
-        ``{status, equation_para_id, omml, docx_path}``
-        or ``{"error": <message>}`` on failure.
+        {status, equation_para_id, omml, docx_path}
+        or {"error": <message>} on failure.
     """
     if not new_payload or not str(new_payload).strip():
         return {"error": "new_payload must be a non-empty string (OMML XML or LaTeX)"}
@@ -4026,12 +5484,10 @@ def edit_equation_local(
 
     _body, para_elem, _cidx = result
 
-    # Verify: paragraph must contain at least one oMath.
     m_omath_tag = _qm("oMath")
-    existing = [el for el in para_elem if el.tag == m_omath_tag]
-    if not existing:
-        # Also check deeper (oMath might be wrapped in oMathPara).
-        existing = list(para_elem.iter(m_omath_tag))
+    m_omath_para_tag = _qm("oMathPara")
+    equation_container_tags = (m_omath_tag, m_omath_para_tag)
+    existing = list(para_elem.iter(m_omath_tag))
     if not existing:
         return {
             "error": (
@@ -4040,15 +5496,36 @@ def edit_equation_local(
             )
         }
 
-    # Remove all direct-child oMath elements (and oMathPara wrappers).
-    m_omath_para_tag = _qm("oMathPara")
-    for child in list(para_elem):
-        if child.tag in (m_omath_tag, m_omath_para_tag):
-            para_elem.remove(child)
-
-    # Append the new oMath.
-    omath_el = ET.fromstring(omml)
-    para_elem.append(omath_el)
+    # Replace the first direct equation container in place. A display equation
+    # may be wrapped in <m:oMathPara>; replacing that wrapper preserves the
+    # paragraph child slot just as replacing a direct <m:oMath> does.
+    replacement = ET.fromstring(omml)
+    direct_containers = [
+        child for child in list(para_elem) if child.tag in equation_container_tags
+    ]
+    if direct_containers:
+        new_children = []
+        inserted = False
+        for child in list(para_elem):
+            if child.tag in equation_container_tags:
+                if not inserted:
+                    new_children.append(replacement)
+                    inserted = True
+            else:
+                new_children.append(child)
+        para_elem[:] = new_children
+    else:
+        # Preserve legacy behavior for unusual nested equation markup by
+        # replacing the first nested <m:oMath> in its existing parent.
+        parent = next(
+            (candidate for candidate in para_elem.iter() if existing[0] in list(candidate)),
+            None,
+        )
+        if parent is None:
+            return {"error": "could not locate the existing equation container"}
+        children = list(parent)
+        children[children.index(existing[0])] = replacement
+        parent[:] = children
 
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)
@@ -4061,6 +5538,93 @@ def edit_equation_local(
         "status": "edited",
         "equation_para_id": equation_para_id,
         "omml": omml,
+        "docx_path": docx_path,
+    }
+
+def append_text_run_after_math(
+    docx_path: str,
+    equation_para_id: str,
+    text: str,
+    math_index: int | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """Append a normal Word text run immediately after a selected equation.
+
+    The paragraph is resolved by its stable paragraph id. If it contains more
+    than one equation, math_index is required to avoid guessing which equation
+    receives the text.
+    """
+    if not isinstance(text, str) or not text:
+        return {"error": "text must be a non-empty string"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, equation_para_id)
+    if result is None:
+        return {"error": f"para_id {equation_para_id!r} not found in {docx_path}"}
+
+    _body, para_elem, _cidx = result
+    m_omath_tag = _qm("oMath")
+    equations = list(para_elem.iter(m_omath_tag))
+    if not equations:
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} does not contain an <m:oMath> element"
+            )
+        }
+    if math_index is None and len(equations) != 1:
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} contains {len(equations)} equations; "
+                "math_index is required"
+            )
+        }
+    if math_index is None:
+        selected_index = 0
+    elif not isinstance(math_index, int) or isinstance(math_index, bool):
+        return {"error": "math_index must be a non-negative integer"}
+    elif math_index < 0 or math_index >= len(equations):
+        return {
+            "error": (
+                f"math_index {math_index} is out of range for "
+                f"{len(equations)} equations"
+            )
+        }
+    else:
+        selected_index = math_index
+
+    selected = equations[selected_index]
+    parent = next(
+        (candidate for candidate in para_elem.iter() if selected in list(candidate)),
+        None,
+    )
+    if parent is None:
+        return {"error": "could not locate the selected equation container"}
+
+    run = ET.Element(_q(_W, "r"))
+    text_elem = ET.SubElement(run, _q(_W, "t"))
+    text_elem.text = text
+    children = list(parent)
+    children.insert(children.index(selected) + 1, run)
+    parent[:] = children
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "appended",
+        "equation_para_id": equation_para_id,
+        "math_index": selected_index,
+        "text": text,
         "docx_path": docx_path,
     }
 
@@ -5398,7 +6962,12 @@ def _next_note_bookmark_name(root: ET.Element) -> str:
     return f"{_INTERNAL_NOTE_BOOKMARK_PREFIX}{max_seen + 1}"
 
 
-def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.Element:
+def _build_internal_note_paragraph(
+    text: str,
+    note_id: str,
+    style: str,
+    highlight_color: str = _INTERNAL_NOTE_HIGHLIGHT_COLOR,
+) -> ET.Element:
     """Build a ``<w:p>`` for a highlighted internal-author-note paragraph.
 
     Produces a paragraph styled ``style`` (falls back to Normal rendering in
@@ -5406,6 +6975,10 @@ def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.El
     ``w:highlight`` is what guarantees visible distinctiveness regardless),
     wrapped in a ``_MNote<digits>`` bookmark so :func:`list_internal_notes`
     and future tooling can locate it precisely instead of re-matching on text.
+
+    4efc63fd -- ``highlight_color`` (from
+    ``style_policy["note_highlight_color"]`` via :func:`resolve_style_policy`)
+    defaults to the original hardcoded ``"yellow"``.
     """
     p = ET.Element(_q(_W, "p"))
     pPr = ET.SubElement(p, _q(_W, "pPr"))
@@ -5419,7 +6992,7 @@ def _build_internal_note_paragraph(text: str, note_id: str, style: str) -> ET.El
     r = ET.SubElement(p, _q(_W, "r"))
     rPr = ET.SubElement(r, _q(_W, "rPr"))
     highlight = ET.SubElement(rPr, _q(_W, "highlight"))
-    highlight.set(_q(_W, "val"), _INTERNAL_NOTE_HIGHLIGHT_COLOR)
+    highlight.set(_q(_W, "val"), highlight_color)
     t = ET.SubElement(r, _q(_W, "t"))
     t.set(_q(_XML_NS, "space"), "preserve")
     t.text = text
@@ -6158,6 +7731,7 @@ def insert_highlighted_note(
     mode: str = "inline",
     author: str = "Meridian",
     initials: str = "M",
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Insert an internal note inline or as a native Word comment.
 
@@ -6165,6 +7739,16 @@ def insert_highlighted_note(
     mode="comment" writes Word's comments.xml part, relationship, content-type
     override, range markers, and comment reference so Microsoft Word displays
     the note in its normal review pane.
+
+    4efc63fd — ``style_policy`` (resolved via :func:`resolve_style_policy`)
+    supplies the OOXML paragraph style name (``note_style``, default
+    ``"MeridianInternalNote"``) and highlight color (``note_highlight_color``,
+    default ``"yellow"``) for ``mode="inline"`` notes. Not consulted for
+    ``mode="comment"`` (Word comments have no paragraph style/highlight of
+    their own — they live in a separate comments.xml part).  Distinct from
+    the existing ``style`` parameter above, which selects the note's
+    *category* (currently only ``"internal_note"`` is supported), not its
+    OOXML rendering.
     """
     if not text or not str(text).strip():
         return {"error": "text must be a non-empty string"}
@@ -6179,6 +7763,11 @@ def insert_highlighted_note(
         }
     if mode not in ("inline", "comment"):
         return {"error": f"mode must be 'inline' or 'comment', got {mode!r}"}
+
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
     if mode == "comment":
         result = insert_word_comment(
@@ -6212,7 +7801,7 @@ def insert_highlighted_note(
 
     note_id = _next_note_bookmark_name(root)
     note_p = _build_internal_note_paragraph(
-        text.strip(), note_id, _INTERNAL_NOTE_STYLE_DEFAULT
+        text.strip(), note_id, policy["note_style"], policy["note_highlight_color"]
     )
 
     insert_at = child_idx if position == "before" else child_idx + 1
@@ -6235,7 +7824,7 @@ def insert_highlighted_note(
         "text": text.strip(),
         "anchor_para_id": anchor_para_id,
         "position": position,
-        "style": _INTERNAL_NOTE_STYLE_DEFAULT,
+        "style": policy["note_style"],
         "docx_path": docx_path,
     }
 
@@ -6723,6 +8312,260 @@ def _bookmarks_split_by_range(
     return split_names
 
 
+# ---------------------------------------------------------------------------
+# fe989980 -- wave-scoped merge manifests: the file-level promotion step.
+#
+# meridian.db.docx_merge (in the hosted/self-hosted Meridian core package)
+# owns the DURABLE, cross-session coordination for a wave of parallel DOCX
+# edits: open_merge_manifest / declare_merge_anchors / claim_merge_owner /
+# check_merge_stale_or_overlap / record_merge_result / finalize_merge_manifest.
+# That module resolves WHO may merge and WHETHER a draft is still valid
+# (ownership, declared-anchor overlap, staleness against the canonical
+# file's current revision) -- but it never touches a real .docx: this
+# extension is stdlib-only and deliberately has NO dependency on the
+# meridian core package or its database (see server.py's module docstring
+# -- "Thin MCP stdio server exposing the docs_intel DOCX parser as tools",
+# run locally via ``uvx meridian-docs``, no DB connectivity at all).
+#
+# merge_draft_into_canonical is the file-level counterpart those DB
+# primitives call out to once their gate is clear: a wave's serialized
+# merge owner promotes their already-accepted draft (a COMPLETE, isolated
+# .docx produced by move_section/copy_section/relocate_table/relocate_figure
+# below, called with draft_output_path -- never the canonical file itself)
+# over the canonical file. It reuses the exact stage -> verify -> promote
+# transaction (_atomic_write_docx_bytes) every direct write in this module
+# already goes through, so a structurally corrupt draft can never reach
+# canonical_path, plus the SAME post-write re-read-from-disk verification +
+# backup/restore discipline (_verify_docx_write / _restore_docx_backup,
+# 9907df44) move_section et al. use for their own in-place writes -- applied
+# here to a whole-document promotion instead of an in-place range edit.
+# ---------------------------------------------------------------------------
+
+def merge_draft_into_canonical(
+    canonical_path: str,
+    draft_path: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """fe989980 -- promote an isolated wave-scoped draft into ``canonical_path``.
+
+    Called by a wave's serialized merge owner AFTER the DB-side gate
+    (``meridian.db.docx_merge.check_merge_stale_or_overlap``, over the
+    separate Meridian MCP connection) has already cleared -- this function
+    performs no ownership/overlap/staleness checks of its own; that
+    coordination is durable, cross-session state this stdlib-only, DB-free
+    extension cannot see.
+
+    Promotion:
+      1. ``draft_path`` is read and parsed; a draft that does not exist or
+         is not a valid .docx is rejected with ``canonical_path`` untouched.
+      2. The draft's whole-document bytes are staged, structurally verified
+         against ``canonical_path``'s CURRENT media/style/relationship
+         counts (:func:`_atomic_write_docx_bytes`'s existing ``pre_manifest``
+         gate -- the same invariant every direct write in this module
+         preserves), and only then promoted -- an existing ``canonical_path``
+         is backed up to ``canonical_path + ".bak"`` immediately before the
+         swap. A structural-invariant violation here means the STAGED draft
+         is corrupt: raised as an error, ``canonical_path`` is guaranteed
+         byte-for-byte untouched (promotion never runs).
+      3. Post-promotion, ``canonical_path`` is re-read FRESH FROM DISK and
+         its structural counts + a whole-body content hash are compared
+         against the draft's OWN (pre-promotion) counts/hash -- the same
+         :func:`_verify_docx_write` discipline move_section/copy_section/
+         relocate_table/relocate_figure apply to their in-place writes,
+         applied here to confirm the promotion itself actually landed
+         (catches a silent no-op promotion or a concurrent external write).
+         On mismatch, ``canonical_path`` is best-effort restored from the
+         backup :func:`_atomic_write_docx_bytes` just wrote and this returns
+         an ERROR -- never a false success.
+
+    Returns ``{"merged": True, "status": "merged", "canonical_path",
+    "draft_path", "paragraph_count", "heading_count", "table_count",
+    "image_count"}`` on success.
+
+    Returns ``{"merged": False, "error": <message>, ...}`` on failure --
+    with ``"file_restored": <bool>`` present only for the post-promotion
+    verification-failure case (step 3); every other failure mode leaves
+    ``canonical_path`` untouched by construction, so there is nothing to
+    restore.
+    """
+    if not draft_path or not os.path.exists(draft_path):
+        return {
+            "merged": False,
+            "error": f"draft_path {draft_path!r} does not exist",
+        }
+
+    try:
+        with open(draft_path, "rb") as fh:
+            draft_bytes = fh.read()
+    except OSError as exc:
+        return {
+            "merged": False,
+            "error": f"could not read draft_path {draft_path!r}: {exc}",
+        }
+
+    try:
+        draft_raw, draft_root = _load_docx_xml_stdlib(draft_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "merged": False,
+            "error": f"draft_path {draft_path!r} is not a valid .docx: {exc}",
+        }
+
+    draft_body = draft_root.find(_q(_W, "body"))
+    if draft_body is None:
+        return {
+            "merged": False,
+            "error": f"draft_path {draft_path!r} has no <w:body> element",
+        }
+
+    draft_children = list(draft_body)
+    draft_counts = _structural_counts([draft_body])
+    draft_counts["image_count"] = _docx_media_count(draft_raw)
+    expected_hash = _hash_elements(draft_children)
+
+    pre_manifest: dict[str, int] | None = None
+    if os.path.exists(canonical_path):
+        try:
+            with open(canonical_path, "rb") as fh:
+                canonical_raw = fh.read()
+            pre_manifest = _docx_structural_manifest(canonical_raw)
+        except (OSError, zipfile.BadZipFile, KeyError) as exc:
+            return {
+                "merged": False,
+                "error": (
+                    f"could not read existing canonical_path {canonical_path!r} "
+                    f"before merging: {exc}"
+                ),
+            }
+
+    # 5988a5bb -- hold canonical_path's promotion lock across stage+promote
+    # (_atomic_write_docx_bytes, which reentrantly acquires it internally)
+    # THROUGH the post-write verify and any conditional restore below,
+    # closing the same-process window between promotion and verify/restore
+    # entirely (see _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(canonical_path):
+        try:
+            transaction = _atomic_write_docx_bytes(
+                draft_bytes,
+                canonical_path,
+                pre_manifest=pre_manifest,
+                protected_keys=("media_count", "style_count", "relationship_count"),
+            )
+        except DocxWriteVerificationError as exc:
+            return {
+                "merged": False,
+                "error": (
+                    "merge rejected: the draft does not preserve structural "
+                    f"elements the canonical file must never lose: {exc}"
+                ),
+            }
+        except OSError as exc:
+            return {
+                "merged": False,
+                "error": f"could not write {canonical_path}: {exc}",
+            }
+
+        verify_error = _verify_docx_write(
+            canonical_path,
+            expected_counts=draft_counts,
+            expected_hash=expected_hash,
+            expected_range=(0, len(draft_children)),
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore. A different (concurrent)
+            # writer may have already promoted something newer to
+            # canonical_path since our own promotion, in which case this
+            # verification "failure" is a false positive and restoring from
+            # our own backup would destroy that writer's completed,
+            # already-promoted work -- check first.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    canonical_path,
+                    transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            verify_error["merged"] = False
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {canonical_path} was left untouched, exactly as "
+                        "that other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {canonical_path} was left untouched "
+                        "rather than risk it -- investigate manually."
+                    )
+            verify_error["canonical_path"] = canonical_path
+            verify_error["draft_path"] = draft_path
+            return verify_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "merged": True,
+        "status": "merged",
+        "canonical_path": canonical_path,
+        "draft_path": draft_path,
+        **draft_counts,
+    }
+
+
+def _resolve_draft_dest(
+    docx_path: str,
+    draft_output_path: str | None,
+    wave_run_id: str | None,
+) -> "dict[str, Any] | str":
+    """fe989980 -- shared opt-in draft-mode validation for the four
+    structural mutators (move_section / copy_section / relocate_table /
+    relocate_figure). Returns the resolved write destination (a plain
+    ``str``) on success, or an ``{"error": ...}`` dict for the caller to
+    return verbatim.
+
+    ``draft_output_path`` and ``wave_run_id`` must be supplied together or
+    not at all -- wave-scoped drafting needs both an isolated write target
+    AND the identifier that scopes its ``meridian.db.docx_merge`` manifest
+    (this extension has no DB access to validate ``wave_run_id`` against;
+    it is opaque here, threaded through only for the caller's own
+    cross-reference). Omitting both is the legacy path: the destination is
+    ``docx_path`` itself, byte-identical to pre-fe989980 behavior.
+    """
+    if bool(wave_run_id) != bool(draft_output_path):
+        return {
+            "error": (
+                "wave_run_id and draft_output_path must be provided "
+                "together -- wave-scoped drafting requires both an "
+                "isolated draft target and the wave identifier that scopes "
+                "its merge manifest"
+            )
+        }
+    if not draft_output_path:
+        return docx_path
+    dest = draft_output_path.strip()
+    if not dest:
+        return {"error": "draft_output_path must be a non-empty path"}
+    if os.path.normcase(os.path.abspath(dest)) == os.path.normcase(os.path.abspath(docx_path)):
+        return {
+            "error": (
+                "draft_output_path must differ from docx_path -- a "
+                "wave-scoped draft must be an isolated artifact, never the "
+                "canonical file itself"
+            )
+        }
+    return dest
+
+
 def move_section(
     docx_path: str,
     section_id: str,
@@ -6730,6 +8573,8 @@ def move_section(
     destination_position: str = "after",
     index_db_path: str | None = None,
     allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
 ) -> dict[str, Any]:
     """6ff24136 -- move an existing section (heading + its content) to a new
     location in the document.
@@ -6797,17 +8642,38 @@ def move_section(
                                       to proceed even when the move would
                                       split a bookmark's start/end across the
                                       move boundary (see e87b8338 above).
+        draft_output_path:            fe989980 -- when given (together with
+                                      ``wave_run_id``), the move is written to
+                                      this ISOLATED path instead of
+                                      ``docx_path`` -- ``docx_path`` is only
+                                      ever READ, never mutated. Must differ
+                                      from ``docx_path``. Omitted (the
+                                      default), this call is byte-identical
+                                      to the pre-fe989980 direct-write
+                                      behavior.
+        wave_run_id:                  fe989980 -- opaque wave identifier,
+                                      required together with
+                                      ``draft_output_path``; threaded straight
+                                      into the return payload so a caller can
+                                      cross-reference this write against the
+                                      matching ``meridian.db.docx_merge``
+                                      manifest. Never validated or persisted
+                                      by this stdlib-only, DB-free extension.
 
     Returns:
         ``{status, section_id, heading_text, moved_block_count,
         destination_anchor_para_id, destination_position,
-        renumber_sequences, find_references_to, docx_path}``.
+        renumber_sequences, find_references_to, docx_path, wave_run_id,
+        is_draft}``. ``docx_path`` in the result is the file actually
+        written -- ``draft_output_path`` when given, else the input
+        ``docx_path`` (unchanged legacy behavior).
 
         ``{"error": <message>}`` when ``section_id`` /
         ``destination_anchor_para_id`` can't be resolved, the destination
         falls inside the section being moved, the move would split a
-        bookmark (and ``allow_bookmark_split`` is not set), or the write
-        fails (file NOT mutated on error in every one of these cases).
+        bookmark (and ``allow_bookmark_split`` is not set), ``wave_run_id``/
+        ``draft_output_path`` are not both given or not both omitted, or the
+        write fails (file NOT mutated on error in every one of these cases).
 
         9907df44 -- after a successful write, mandatory post-write
         verification re-reads the file from disk and compares structural
@@ -6821,6 +8687,11 @@ def move_section(
         return {
             "error": f"destination_position must be 'before' or 'after', got {destination_position!r}"
         }
+
+    dest_error = _resolve_draft_dest(docx_path, draft_output_path, wave_run_id)
+    if isinstance(dest_error, dict):
+        return dest_error
+    dest = dest_error
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -6943,34 +8814,74 @@ def move_section(
     for offset, el in enumerate(moved_elements):
         body.insert(insert_at + offset, el)
 
-    try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    # 5988a5bb -- hold dest's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write verify and any conditional restore below,
+    # closing the same-process window between promotion and verify/restore
+    # entirely (see _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(dest):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, dest)
+        except OSError as exc:
+            return {"error": f"could not write {dest}: {exc}"}
 
-    # 9907df44 -- mandatory post-write verification: re-read docx_path FRESH
-    # FROM DISK and confirm the on-disk document actually reflects this move
-    # before trusting/reporting the write as a success. A stale/buggy write
-    # path (or one that silently no-ops) is caught here instead of producing
-    # a false "moved" success -- same abort discipline as the pre-write
-    # reference/bookmark-split checks above (real error, no misleading
-    # status), except the file has already been written, so best-effort
-    # restore it to the pre-write backup first.
-    verify_error = _verify_docx_write(
-        docx_path,
-        expected_counts=baseline_counts,
-        expected_hash=expected_hash,
-        expected_range=(insert_at, insert_at + len(moved_elements)),
-    )
-    if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(docx_path)
-        verify_error["section_id"] = section_id
-        verify_error["moved_block_count"] = len(moved_elements)
-        return verify_error
+        # 9907df44 -- mandatory post-write verification: re-read dest FRESH
+        # FROM DISK and confirm the on-disk document actually reflects this move
+        # before trusting/reporting the write as a success. A stale/buggy write
+        # path (or one that silently no-ops) is caught here instead of producing
+        # a false "moved" success -- same abort discipline as the pre-write
+        # reference/bookmark-split checks above (real error, no misleading
+        # status), except the file has already been written, so best-effort
+        # restore it to the pre-write backup first.
+        verify_error = _verify_docx_write(
+            dest,
+            expected_counts=baseline_counts,
+            expected_hash=expected_hash,
+            expected_range=(insert_at, insert_at + len(moved_elements)),
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to dest since
+            # our own promotion, in which case this verification "failure"
+            # is a false positive and restoring from our own backup would
+            # destroy that writer's completed, already-promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            verify_error["section_id"] = section_id
+            verify_error["moved_block_count"] = len(moved_elements)
+            return verify_error
 
-    _invalidate_sidecar_mtime(index_db_path)
+    # fe989980 -- in draft mode, docx_path (the canonical/source file) was
+    # never touched, so its sidecar index is still accurate: skip invalidating it.
+    if not draft_output_path:
+        _invalidate_sidecar_mtime(index_db_path)
 
-    renumber_result = renumber_sequences(docx_path, index_db_path=index_db_path)
+    renumber_result = renumber_sequences(dest, index_db_path=index_db_path)
 
     return {
         "status": "moved",
@@ -6981,7 +8892,9 @@ def move_section(
         "destination_position": destination_position,
         "renumber_sequences": renumber_result,
         "find_references_to": references_result,
-        "docx_path": docx_path,
+        "docx_path": dest,
+        "wave_run_id": wave_run_id,
+        "is_draft": bool(draft_output_path),
     }
 
 
@@ -6996,6 +8909,8 @@ def copy_section(
     destination_position: str = "after",
     index_db_path: str | None = None,
     trim_original_to: str | None = None,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
 ) -> dict[str, Any]:
     """8213050a -- duplicate an existing section (heading + its content) to a
     new location in the document, leaving the original untouched (unless
@@ -7084,13 +8999,26 @@ def copy_section(
                                       original section's body (heading kept).
                                       ``None`` (default) leaves the original
                                       fully untouched.
+        draft_output_path:            fe989980 -- same opt-in wave-scoped
+                                      draft mode as :func:`move_section`: when
+                                      given (with ``wave_run_id``), the copy
+                                      is written to this ISOLATED path instead
+                                      of ``docx_path``, which is only ever
+                                      read. Omitted (the default), behavior
+                                      is byte-identical to pre-fe989980.
+        wave_run_id:                  fe989980 -- required together with
+                                      ``draft_output_path``; see
+                                      :func:`move_section`.
 
     Returns:
         ``{status, section_id, heading_text, new_heading_para_id,
         copied_block_count, para_id_map, bookmark_map,
         destination_anchor_para_id, destination_position,
-        renumber_sequences, find_references_to, trimmed_original, docx_path}``
-        -- ``para_id_map`` / ``bookmark_map`` are ``{old: new}`` dicts for
+        renumber_sequences, find_references_to, trimmed_original, docx_path,
+        wave_run_id, is_draft}`` -- ``docx_path`` in the result is the file
+        actually written (``draft_output_path`` when given, else the input
+        ``docx_path``). ``para_id_map`` / ``bookmark_map`` are ``{old: new}``
+        dicts for
         every paraId/bookmark that existed in the original section and was
         renamed in the copy (originals lacking a native paraId aren't keyed
         in ``para_id_map``, but the copy still gets one -- see
@@ -7112,6 +9040,11 @@ def copy_section(
         return {
             "error": f"destination_position must be 'before' or 'after', got {destination_position!r}"
         }
+
+    dest_path_error = _resolve_draft_dest(docx_path, draft_output_path, wave_run_id)
+    if isinstance(dest_path_error, dict):
+        return dest_path_error
+    dest = dest_path_error
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -7310,36 +9243,76 @@ def copy_section(
             expected_counts["paragraph_count"] += 1
         trimmed = True
 
-    try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    # 5988a5bb -- hold dest's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write verify and any conditional restore below,
+    # closing the same-process window between promotion and verify/restore
+    # entirely (see _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(dest):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, dest)
+        except OSError as exc:
+            return {"error": f"could not write {dest}: {exc}"}
 
-    # 9907df44 -- mandatory post-write verification: re-read docx_path FRESH
-    # FROM DISK and confirm the copy actually landed before trusting/
-    # reporting success. The copy is located by its own fresh
-    # new_heading_para_id rather than a fixed body index, since a subsequent
-    # trim of the original section can itself shift indices -- searching by
-    # paraId sidesteps needing to re-derive that arithmetic here too. Same
-    # abort discipline as the pre-write checks above (real error, no
-    # misleading status), except the file has already been written, so
-    # best-effort restore it to the pre-write backup first.
-    verify_error = _verify_docx_write(
-        docx_path,
-        expected_counts=expected_counts,
-        expected_hash=expected_hash if new_heading_para_id is not None else None,
-        locate_by_paraid=new_heading_para_id,
-        expected_len=len(copied_elements),
-    )
-    if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(docx_path)
-        verify_error["section_id"] = section_id
-        verify_error["copied_block_count"] = len(copied_elements)
-        return verify_error
+        # 9907df44 -- mandatory post-write verification: re-read dest FRESH
+        # FROM DISK and confirm the copy actually landed before trusting/
+        # reporting success. The copy is located by its own fresh
+        # new_heading_para_id rather than a fixed body index, since a subsequent
+        # trim of the original section can itself shift indices -- searching by
+        # paraId sidesteps needing to re-derive that arithmetic here too. Same
+        # abort discipline as the pre-write checks above (real error, no
+        # misleading status), except the file has already been written, so
+        # best-effort restore it to the pre-write backup first.
+        verify_error = _verify_docx_write(
+            dest,
+            expected_counts=expected_counts,
+            expected_hash=expected_hash if new_heading_para_id is not None else None,
+            locate_by_paraid=new_heading_para_id,
+            expected_len=len(copied_elements),
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to dest since
+            # our own promotion, in which case this verification "failure"
+            # is a false positive and restoring from our own backup would
+            # destroy that writer's completed, already-promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            verify_error["section_id"] = section_id
+            verify_error["copied_block_count"] = len(copied_elements)
+            return verify_error
 
-    _invalidate_sidecar_mtime(index_db_path)
+    # fe989980 -- in draft mode, docx_path was never touched; its sidecar
+    # index is still accurate, so skip invalidating it.
+    if not draft_output_path:
+        _invalidate_sidecar_mtime(index_db_path)
 
-    renumber_result = renumber_sequences(docx_path, index_db_path=index_db_path)
+    renumber_result = renumber_sequences(dest, index_db_path=index_db_path)
 
     return {
         "status": "copied",
@@ -7354,7 +9327,9 @@ def copy_section(
         "renumber_sequences": renumber_result,
         "find_references_to": references_result,
         "trimmed_original": trimmed,
-        "docx_path": docx_path,
+        "docx_path": dest,
+        "wave_run_id": wave_run_id,
+        "is_draft": bool(draft_output_path),
     }
 
 
@@ -7371,6 +9346,277 @@ def copy_section(
 # for, so this locates the source purely by its own body-child position.
 # ---------------------------------------------------------------------------
 
+def relocate_figure(
+    docx_path: str,
+    figure_index: int,
+    destination_anchor_para_id: str,
+    destination_position: str = "after",
+    index_db_path: str | None = None,
+    allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
+) -> dict[str, Any]:
+    """Relocate one image paragraph together with its immediately following Figure caption.
+
+    The source is selected by the same 1-based image order exposed by
+    find_image_paragraph. The operation is deliberately strict: the image
+    must be a direct body paragraph and the next body child must contain
+    a SEQ Figure field. This prevents accidentally detaching a caption
+    or moving an image out of a table cell.
+
+    The two existing body elements are moved as one live OOXML range, so image
+    relationship IDs, drawing properties, paragraph IDs, bookmarks, and
+    caption formatting are preserved verbatim. The operation gates bookmark
+    splits before writing, verifies the saved document from disk, invalidates
+    the local structure sidecar, and runs renumber_sequences so Figure
+    SEQ caches and REF display text remain correct after the reorder.
+
+    Returns {status, figure_index, moved_block_count, image_para_id,
+    caption_para_id, new_body_index, renumber_sequences, docx_path,
+    wave_run_id, is_draft}, or an {"error": ...} result with the source
+    document untouched for validation and pre-write safety failures.
+    ``docx_path`` in the result is the file actually written --
+    ``draft_output_path`` when given (fe989980; requires ``wave_run_id`` too
+    -- see :func:`move_section`), else the input ``docx_path`` (unchanged
+    legacy behavior).
+    """
+    if destination_position not in ("before", "after"):
+        return {
+            "error": (
+                "destination_position must be 'before' or 'after', "
+                f"got {destination_position!r}"
+            )
+        }
+    if (
+        not isinstance(figure_index, int)
+        or isinstance(figure_index, bool)
+        or figure_index < 1
+    ):
+        return {
+            "error": (
+                "figure_index must be a positive 1-based int, "
+                f"got {figure_index!r}"
+            )
+        }
+
+    dest_path_error = _resolve_draft_dest(docx_path, draft_output_path, wave_run_id)
+    if isinstance(dest_path_error, dict):
+        return dest_path_error
+    dest = dest_path_error
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    body_list = list(body)
+    w_p = _q(_W, "p")
+    w14_para_id = _q(_W14, "paraId")
+    w_drawing = _q(_W, "drawing")
+    w_pict = _q(_W, "pict")
+    w_fld_simple = _q(_W, "fldSimple")
+    w_instr = _q(_W, "instr")
+    w_instr_text = _q(_W, "instrText")
+
+    def _has_image(paragraph: ET.Element) -> bool:
+        return (
+            paragraph.find(f".//{w_drawing}") is not None
+            or paragraph.find(f".//{w_pict}") is not None
+        )
+
+    def _has_figure_seq(paragraph: ET.Element) -> bool:
+        for field in paragraph.iter(w_fld_simple):
+            if _SEQ_FIGURE_RE.search(field.get(w_instr) or ""):
+                return True
+        for instr in paragraph.iter(w_instr_text):
+            if _SEQ_FIGURE_RE.search("".join(instr.itertext())):
+                return True
+        return False
+
+    image_indices = [
+        i for i, child in enumerate(body_list)
+        if child.tag == w_p and _has_image(child)
+    ]
+    if figure_index > len(image_indices):
+        return {
+            "error": (
+                f"figure_index {figure_index} is out of range: document has "
+                f"{len(image_indices)} direct-body image paragraph(s)"
+            )
+        }
+
+    source_idx = image_indices[figure_index - 1]
+    caption_idx = source_idx + 1
+    if caption_idx >= len(body_list) or body_list[caption_idx].tag != w_p:
+        return {
+            "error": (
+                f"figure {figure_index} image paragraph at body index {source_idx} "
+                "is not immediately followed by a paragraph caption"
+            )
+        }
+    caption_el = body_list[caption_idx]
+    if not _has_figure_seq(caption_el):
+        return {
+            "error": (
+                f"figure {figure_index} image paragraph at body index {source_idx} "
+                "is not immediately followed by a SEQ Figure caption"
+            )
+        }
+
+    dest_result = _find_para_by_id(root, destination_anchor_para_id)
+    if dest_result is None:
+        return {
+            "error": (
+                f"para_id {destination_anchor_para_id!r} not found in {docx_path}"
+            )
+        }
+    _dbody, _delem, dest_idx = dest_result
+    if source_idx <= dest_idx < caption_idx + 1:
+        return {
+            "error": (
+                "destination_anchor_para_id resolves inside the figure block "
+                "(image + caption); choose an anchor outside it"
+            )
+        }
+
+    dest_section_bounds = (
+        _locate_section_bounds(body, destination_anchor_para_id)
+        if destination_position == "after"
+        else None
+    )
+
+    split_bookmarks = _bookmarks_split_by_range(
+        body_list, source_idx, caption_idx + 1
+    )
+    if split_bookmarks and not allow_bookmark_split:
+        return {
+            "error": (
+                f"aborting relocate_figure: moving figure {figure_index} would "
+                f"split bookmark(s) {split_bookmarks!r} across the move boundary "
+                "(their w:bookmarkStart and w:bookmarkEnd would end up in two "
+                "disconnected parts of the document) -- pass "
+                "allow_bookmark_split=True to force the move anyway"
+            ),
+            "split_bookmarks": split_bookmarks,
+        }
+
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
+    moved_elements = body_list[source_idx:caption_idx + 1]
+    expected_hash = _hash_elements(moved_elements)
+    removed_count = len(moved_elements)
+
+    for element in moved_elements:
+        body.remove(element)
+
+    def _shift(index: int) -> int:
+        if index >= caption_idx + 1:
+            return index - removed_count
+        if index >= source_idx:
+            return source_idx
+        return index
+
+    if dest_section_bounds is not None:
+        _dest_start_idx, dest_end_idx, _dest_heading_text, _dest_level = (
+            dest_section_bounds
+        )
+        insert_at = _shift(dest_end_idx)
+    else:
+        dest_idx_after = _shift(dest_idx)
+        insert_at = (
+            dest_idx_after
+            if destination_position == "before"
+            else dest_idx_after + 1
+        )
+
+    for offset, element in enumerate(moved_elements):
+        body.insert(insert_at + offset, element)
+
+    # 5988a5bb -- hold dest's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write verify and any conditional restore below,
+    # closing the same-process window between promotion and verify/restore
+    # entirely (see _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(dest):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, dest)
+        except OSError as exc:
+            return {"error": f"could not write {dest}: {exc}"}
+
+        verify_error = _verify_docx_write(
+            dest,
+            expected_counts=baseline_counts,
+            expected_hash=expected_hash,
+            expected_range=(insert_at, insert_at + removed_count),
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to dest since
+            # our own promotion, in which case this verification "failure"
+            # is a false positive and restoring from our own backup would
+            # destroy that writer's completed, already-promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            verify_error["figure_index"] = figure_index
+            verify_error["moved_block_count"] = removed_count
+            return verify_error
+
+    # fe989980 -- in draft mode, docx_path was never touched; its sidecar
+    # index is still accurate, so skip invalidating it.
+    if not draft_output_path:
+        _invalidate_sidecar_mtime(index_db_path)
+    renumber_result = renumber_sequences(
+        dest, index_db_path=index_db_path
+    )
+
+    image_para_id = body_list[source_idx].get(w14_para_id)
+    caption_para_id = body_list[caption_idx].get(w14_para_id)
+    return {
+        "status": "moved",
+        "figure_index": figure_index,
+        "moved_block_count": removed_count,
+        "image_para_id": image_para_id,
+        "caption_para_id": caption_para_id,
+        "new_body_index": insert_at,
+        "destination_anchor_para_id": destination_anchor_para_id,
+        "destination_position": destination_position,
+        "renumber_sequences": renumber_result,
+        "docx_path": dest,
+        "wave_run_id": wave_run_id,
+        "is_draft": bool(draft_output_path),
+    }
+
 def relocate_table(
     docx_path: str,
     table_index: int,
@@ -7378,6 +9624,8 @@ def relocate_table(
     destination_position: str = "after",
     index_db_path: str | None = None,
     allow_bookmark_split: bool = False,
+    draft_output_path: str | None = None,
+    wave_run_id: str | None = None,
 ) -> dict[str, Any]:
     """c031622b -- move an existing bare ``<w:tbl>`` (no owning heading) to a
     new location in the document, atomically.
@@ -7447,10 +9695,23 @@ def relocate_table(
                                       to proceed even when the move would
                                       split a bookmark's start/end across the
                                       move boundary (see e87b8338 above).
+        draft_output_path:            fe989980 -- same opt-in wave-scoped
+                                      draft mode as :func:`move_section`: when
+                                      given (with ``wave_run_id``), the move
+                                      is written to this ISOLATED path instead
+                                      of ``docx_path``, which is only ever
+                                      read. Omitted (the default), behavior
+                                      is byte-identical to pre-fe989980.
+        wave_run_id:                  fe989980 -- required together with
+                                      ``draft_output_path``; see
+                                      :func:`move_section`.
 
     Returns:
         ``{status, table_index, new_table_index, row_count, col_count,
-        destination_anchor_para_id, destination_position, docx_path}``.
+        destination_anchor_para_id, destination_position, docx_path,
+        wave_run_id, is_draft}``. ``docx_path`` in the result is the file
+        actually written (``draft_output_path`` when given, else the input
+        ``docx_path``).
 
         ``{"error": <message>}`` when ``table_index`` is out of range or does
         not identify a ``<w:tbl>``, ``destination_anchor_para_id`` can't be
@@ -7470,6 +9731,11 @@ def relocate_table(
         return {
             "error": f"destination_position must be 'before' or 'after', got {destination_position!r}"
         }
+
+    dest_path_error = _resolve_draft_dest(docx_path, draft_output_path, wave_run_id)
+    if isinstance(dest_path_error, dict):
+        return dest_path_error
+    dest = dest_path_error
 
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -7590,29 +9856,69 @@ def relocate_table(
 
     body.insert(insert_at, target_el)
 
-    try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    # 5988a5bb -- hold dest's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write verify and any conditional restore below,
+    # closing the same-process window between promotion and verify/restore
+    # entirely (see _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(dest):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, dest)
+        except OSError as exc:
+            return {"error": f"could not write {dest}: {exc}"}
 
-    # 9907df44 -- mandatory post-write verification: re-read docx_path FRESH
-    # FROM DISK and confirm the table actually landed at insert_at before
-    # trusting/reporting the move as a success. Same abort discipline as the
-    # pre-write bookmark-split check above (real error, no misleading
-    # status), except the file has already been written, so best-effort
-    # restore it to the pre-write backup first.
-    verify_error = _verify_docx_write(
-        docx_path,
-        expected_counts=baseline_counts,
-        expected_hash=expected_hash,
-        expected_range=(insert_at, insert_at + 1),
-    )
-    if verify_error is not None:
-        verify_error["file_restored"] = _restore_docx_backup(docx_path)
-        verify_error["table_index"] = table_index
-        return verify_error
+        # 9907df44 -- mandatory post-write verification: re-read dest FRESH
+        # FROM DISK and confirm the table actually landed at insert_at before
+        # trusting/reporting the move as a success. Same abort discipline as the
+        # pre-write bookmark-split check above (real error, no misleading
+        # status), except the file has already been written, so best-effort
+        # restore it to the pre-write backup first.
+        verify_error = _verify_docx_write(
+            dest,
+            expected_counts=baseline_counts,
+            expected_hash=expected_hash,
+            expected_range=(insert_at, insert_at + 1),
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to dest since
+            # our own promotion, in which case this verification "failure"
+            # is a false positive and restoring from our own backup would
+            # destroy that writer's completed, already-promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            verify_error["table_index"] = table_index
+            return verify_error
 
-    _invalidate_sidecar_mtime(index_db_path)
+    # fe989980 -- in draft mode, docx_path was never touched; its sidecar
+    # index is still accurate, so skip invalidating it.
+    if not draft_output_path:
+        _invalidate_sidecar_mtime(index_db_path)
 
     return {
         "status": "moved",
@@ -7622,7 +9928,9 @@ def relocate_table(
         "col_count": table_meta["col_count"],
         "destination_anchor_para_id": destination_anchor_para_id,
         "destination_position": destination_position,
-        "docx_path": docx_path,
+        "docx_path": dest,
+        "wave_run_id": wave_run_id,
+        "is_draft": bool(draft_output_path),
     }
 
 
@@ -7702,6 +10010,16 @@ def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes]
     that are not already present in the original archive AND overwrites parts
     that are. Every other original ZIP member is preserved byte-for-byte.
 
+    Hardened (dccc2311) to route through :func:`_atomic_write_docx_bytes`'s
+    stage -> verify -> promote transaction, gating media/style counts to be
+    UNCHANGED. Unlike :func:`_save_docx_xml_stdlib`, relationship and
+    equation counts are deliberately NOT gated here: every current caller of
+    this multi-part writer (insert_word_comment, highlight_document_matches,
+    set_page_header/footer) legitimately adds relationships and/or new
+    content-type overrides as part of a correct write, so a relationship-count
+    delta is expected, not a corruption signal. Media and styles are never
+    legitimately touched by any of them, so those two stay hard invariants.
+
     Backs up the existing file to ``dest + ".bak"`` when it already exists
     (best-effort, non-fatal on failure -- same pattern as
     :func:`_save_docx_xml_stdlib`).
@@ -7723,15 +10041,13 @@ def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes]
                 if part_name not in written:
                     dst.writestr(part_name, data)
 
-    if os.path.exists(dest):
-        backup = dest + ".bak"
-        try:
-            shutil.copy2(dest, backup)
-        except OSError:
-            pass  # backup failure is non-fatal
-
-    with open(dest, "wb") as fh:
-        fh.write(out.getvalue())
+    _atomic_write_docx_bytes(
+        out.getvalue(),
+        dest,
+        pre_manifest=_docx_structural_manifest(raw),
+        protected_keys=("media_count", "style_count"),
+        changed_parts=dict(updated_parts),
+    )
 
 
 def _insert_before_closing_tag(xml_bytes: bytes, root_tag_name: str, new_element_xml: str) -> bytes:

@@ -20,6 +20,7 @@ specifically and the full resilience story:
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -104,6 +105,79 @@ def test_word_slot_cancel_propagates_cleanly(monkeypatch):
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(tc._reconnect_loop_lazy("wss://x/tunnel-word/t", _word_proxy(), "word"))
+
+
+def test_word_slot_dependency_missing_quarantines_via_real_reprobe(monkeypatch):
+    """ddd46cc8 — the unified lifecycle contract applies uniformly across
+    connector slots, not just the generic 'fs' slot other tests exercise. The
+    word slot (uvx docx-mcp) is the one this sprint's task singles out for
+    'preserve existing per-connector behavior' — prove its reconnect path
+    quarantines on a persistent dependency-missing failure exactly like any
+    other slot, through the REAL _reprobe() closure (not a stubbed
+    _reprobe_once)."""
+    monkeypatch.setattr(tc, "_SLOT_REPROBE_INTERVAL", 0.01)
+    monkeypatch.setattr(tc, "_WATCHDOG_MAX_RETRIES", 1)
+    monkeypatch.setattr(tc, "_QUARANTINE_THRESHOLD", 2)
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+
+    def always_missing(cmd, *a, **k):
+        raise FileNotFoundError("no such file: uvx")
+    monkeypatch.setattr(tc.subprocess, "Popen", always_missing)
+
+    sent = []
+    n_requests = tc._WATCHDOG_MAX_RETRIES + 1
+
+    class FakeWS:
+        def __init__(self):
+            self._n = 0
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        def __aiter__(self): return self
+        async def __anext__(self):
+            self._n += 1
+            if self._n <= n_requests:
+                return json.dumps({"type": "request", "id": str(self._n)})
+            if self._n < n_requests + 20:
+                await asyncio.sleep(0.02)
+                return json.dumps({"type": "ping"})
+            raise StopAsyncIteration
+        async def send(self, data): sent.append(json.loads(data))
+
+    class FakeHttpClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+    import httpx as _httpx
+    import websockets as _ws
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: FakeWS())
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
+
+    proxy = _word_proxy()
+    asyncio.run(tc._run_connection_lazy("wss://x/tunnel-word/t", proxy, "word"))
+
+    assert proxy.diagnostics.state is tc.SlotState.QUARANTINED
+    assert proxy.diagnostics.quarantine_reason
+    statuses = [m for m in sent if m.get("type") == "plugin_status"]
+    assert any(m.get("state") == "quarantined" and m.get("slot") == "word" for m in statuses)
+
+
+def test_word_slot_explicit_reprobe_recovers_from_quarantine(monkeypatch):
+    """Once quarantined, reprobe_slot() (the operator-triggered recovery hook)
+    can force an immediate recheck outside the slow quarantine cooldown, and
+    fully clears the quarantine once the underlying issue is fixed."""
+    proxy = _word_proxy()
+    proxy.diagnostics.set(
+        tc.SlotState.QUARANTINED, quarantine_reason="uvx not found",
+        consecutive_deterministic_failures=tc._QUARANTINE_THRESHOLD,
+    )
+
+    async def fake_reprobe_once(p, probe):
+        return True  # operator installed uvx; the slot now comes up fine
+    monkeypatch.setattr(tc, "_reprobe_once", fake_reprobe_once)
+
+    result = asyncio.run(tc.reprobe_slot(proxy))
+    assert result.state is tc.SlotState.HEALTHY
+    assert result.quarantine_reason is None
 
 
 def test_word_slot_ws_url_routes_to_tunnel_word():

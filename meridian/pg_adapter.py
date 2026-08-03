@@ -2521,6 +2521,193 @@ async def _migrate_pg_file_docx_region_claims(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_docx_merge_manifests(conn: PostgresConnection) -> None:
+    """fe989980 — wave-scoped DOCX merge manifests + serialized canonical merge gate.
+
+    Creates docx_merge_manifests / docx_merge_drafts / docx_merge_anchor_locks
+    on existing Postgres DBs. Mirrors db.docx_merge._migrate_docx_merge_manifests.
+    Runs on every DB (LATE, not hosted-only — sessions exist on customer DBs
+    too, same rationale as _migrate_pg_file_docx_region_claims).
+    """
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS docx_merge_manifests ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    wave_id TEXT NOT NULL,"
+        f"    file_path TEXT NOT NULL,"
+        f"    status TEXT NOT NULL DEFAULT 'open',"
+        f"    base_revision TEXT,"
+        f"    merge_owner_session_id TEXT,"
+        f"    merge_owner_claimed_at TEXT,"
+        f"    merge_owner_expires_at TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    completed_at TEXT,"
+        f"    verification TEXT"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_docx_merge_manifests_wave_file "
+        f"ON docx_merge_manifests (wave_id, file_path);"
+        f"CREATE TABLE IF NOT EXISTS docx_merge_drafts ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    manifest_id TEXT NOT NULL REFERENCES docx_merge_manifests(id) ON DELETE CASCADE,"
+        f"    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,"
+        f"    draft_path TEXT NOT NULL,"
+        f"    anchors TEXT NOT NULL DEFAULT '[]',"
+        f"    declared_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    merged_at TEXT"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_docx_merge_drafts_manifest_session "
+        f"ON docx_merge_drafts (manifest_id, session_id);"
+        f"CREATE TABLE IF NOT EXISTS docx_merge_anchor_locks ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    manifest_id TEXT NOT NULL REFERENCES docx_merge_manifests(id) ON DELETE CASCADE,"
+        f"    element_id TEXT NOT NULL,"
+        f"    draft_id TEXT,"
+        f"    session_id TEXT NOT NULL,"
+        f"    merged_at TEXT NOT NULL DEFAULT ({_TS})"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_docx_merge_anchor_locks_manifest_element "
+        f"ON docx_merge_anchor_locks (manifest_id, element_id);"
+        f"CREATE INDEX IF NOT EXISTS idx_docx_merge_anchor_locks_session "
+        f"ON docx_merge_anchor_locks (session_id);"
+    )
+
+
+async def _migrate_pg_proposal_evidence_links(conn: PostgresConnection) -> None:
+    """6cdc5df3 — proposal_evidence_links: durable, typed proposal-to-evidence
+    linkage (notes/findings/sprint_items/decisions/artifacts). Mirrors
+    db.proposal_links._migrate_proposal_evidence_links. Not present in the
+    base CREATE_TABLES_CORE literal — this guarded migration is the only
+    creation path on Postgres, matching _migrate_pg_docx_merge_manifests.
+
+    The UNIQUE index is what makes link_proposal_evidence's
+    ``ON CONFLICT ... DO NOTHING`` idempotent-insert pattern work.
+    """
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS proposal_evidence_links ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    project_id TEXT NOT NULL,"
+        f"    proposal_id TEXT NOT NULL,"
+        f"    entity_type TEXT NOT NULL,"
+        f"    entity_id TEXT NOT NULL,"
+        f"    label TEXT,"
+        f"    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_evidence_links_unique "
+        f"ON proposal_evidence_links(project_id, proposal_id, entity_type, entity_id);"
+        f"CREATE INDEX IF NOT EXISTS idx_proposal_evidence_links_proposal "
+        f"ON proposal_evidence_links(project_id, proposal_id);"
+        f"CREATE INDEX IF NOT EXISTS idx_proposal_evidence_links_entity "
+        f"ON proposal_evidence_links(entity_type, entity_id);"
+    )
+
+
+async def _migrate_pg_wave_base_manifests(conn: PostgresConnection) -> None:
+    """eb2e44f8 — immutable wave_base_manifests + active_worktrees.pid.
+
+    Creates wave_base_manifests on existing Postgres DBs and adds the
+    ``pid`` column to ``active_worktrees``. Mirrors
+    db.worktree_manifest._migrate_wave_base_manifests. Not present in the
+    base CREATE_TABLES_CORE literal — this guarded migration is the only
+    creation path on Postgres, matching _migrate_pg_docx_merge_manifests.
+
+    The partial unique index (``WHERE superseded_at IS NULL``) is the
+    schema-level half of the immutability contract described in
+    db.worktree_manifest's module docstring: Postgres supports partial
+    indexes with identical syntax to SQLite, so this is a straight mirror,
+    not a workaround.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS wave_base_manifests ("
+        "    id TEXT PRIMARY KEY,"
+        "    worktree_id TEXT NOT NULL REFERENCES active_worktrees(id),"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    session_id TEXT NOT NULL,"
+        "    item_id TEXT,"
+        "    repo_identity TEXT NOT NULL,"
+        "    base_branch TEXT NOT NULL,"
+        "    base_sha TEXT NOT NULL,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    superseded_at TEXT,"
+        "    superseded_reason TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_base_manifests_worktree "
+        "ON wave_base_manifests(worktree_id);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_wave_base_manifests_active "
+        "ON wave_base_manifests(worktree_id) WHERE superseded_at IS NULL;"
+        "ALTER TABLE active_worktrees ADD COLUMN IF NOT EXISTS pid INTEGER"
+    )
+
+
+async def _migrate_pg_sprint_batch_claims(conn: PostgresConnection) -> None:
+    """22cad9b8 — immutable sprint_batch_claims: atomic parallel-batch claim
+    manifests, mirroring wave_base_manifests' immutability pattern.
+
+    Creates sprint_batch_claims on existing Postgres DBs. Not present in the
+    base CREATE_TABLES_CORE literal — this guarded migration is the only
+    creation path on Postgres, matching _migrate_pg_wave_base_manifests.
+
+    The partial unique index (``WHERE superseded_at IS NULL``) is the
+    schema-level half of the immutability contract described in
+    db.batch_claim's module docstring: only one ACTIVE manifest may exist
+    per (project_id, batch_key) at a time.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS sprint_batch_claims ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    session_id TEXT NOT NULL,"
+        "    batch_key TEXT NOT NULL,"
+        "    item_ids TEXT NOT NULL,"
+        "    item_resource_map TEXT NOT NULL,"
+        "    resources TEXT NOT NULL,"
+        "    status TEXT NOT NULL DEFAULT 'pending',"
+        "    failure_detail TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    resolved_at TEXT,"
+        "    superseded_at TEXT,"
+        "    superseded_reason TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_sprint_batch_claims_project "
+        "ON sprint_batch_claims(project_id);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sprint_batch_claims_active "
+        "ON sprint_batch_claims(project_id, batch_key) WHERE superseded_at IS NULL;"
+    )
+
+
+async def _migrate_pg_verification_runs(conn: PostgresConnection) -> None:
+    """525d86bb — verification_runs: durable synchronous run_verification
+    lifecycle records (mirrors SQLite).
+
+    One row per run_verification dispatch: created with status='running'
+    before the command is sent over the tunnel, completed exactly once (by
+    db.verification_runs.complete_verification_run) with the REAL
+    exit_code/status/log artifact right after the synchronous
+    send_run_cmd_control wait resolves — no other writer, no polling.
+    Mirrors db.verification_runs._migrate_verification_runs.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS verification_runs ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    command TEXT NOT NULL,"
+        "    cwd TEXT,"
+        "    worktree TEXT,"
+        "    actor TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'running',"
+        "    exit_code INTEGER,"
+        "    passed INTEGER,"
+        "    failed INTEGER,"
+        "    stdout_tail TEXT,"
+        "    stderr_tail TEXT,"
+        "    message TEXT,"
+        f"    started_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    ended_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_verification_runs_project "
+        "ON verification_runs(project_id, started_at DESC);"
+    )
+
+
 async def _migrate_pg_sprint_version_descriptions(conn: PostgresConnection) -> None:
     """f9188526 — sprint_version_descriptions: per-version-bucket summary text.
 
@@ -3127,12 +3314,19 @@ async def _migrate_pg_wave_gate_results(conn: PostgresConnection) -> None:
 
     Mirrors db._migrate_wave_gate_results. Idempotent via CREATE TABLE IF NOT
     EXISTS + CREATE INDEX IF NOT EXISTS.
+
+    ed8e4524 — added nullable ``version`` (sprint-version scope; NULL =
+    unscoped/legacy) via ``ADD COLUMN IF NOT EXISTS`` for a table that
+    predates this fix. Same residual-constraint note as the SQLite mirror
+    (db.migrations._migrate_wave_gate_results): the UNIQUE constraint on an
+    already-existing table is not retroactively widened to include version.
     """
     await conn.executescript(
         "CREATE TABLE IF NOT EXISTS wave_gate_results ("
         "    id TEXT PRIMARY KEY,"
         "    project_id TEXT NOT NULL,"
         "    wave_label TEXT NOT NULL,"
+        "    version TEXT,"
         "    gate_passed INTEGER NOT NULL DEFAULT 1,"
         "    exit_code INTEGER,"
         "    passed_count INTEGER,"
@@ -3141,10 +3335,13 @@ async def _migrate_pg_wave_gate_results(conn: PostgresConnection) -> None:
         "    evidence_snapshot TEXT,"
         "    actor TEXT,"
         "    completed_at TEXT NOT NULL DEFAULT (now()::text),"
-        "    UNIQUE(project_id, wave_label)"
+        "    UNIQUE(project_id, wave_label, version)"
         ");"
+        "ALTER TABLE wave_gate_results ADD COLUMN IF NOT EXISTS version TEXT;"
         "CREATE INDEX IF NOT EXISTS idx_wave_gate_results_project "
-        "ON wave_gate_results(project_id, wave_label)"
+        "ON wave_gate_results(project_id, wave_label);"
+        "CREATE INDEX IF NOT EXISTS idx_wave_gate_results_project_version "
+        "ON wave_gate_results(project_id, wave_label, version)"
     )
 
 
@@ -3157,6 +3354,13 @@ async def _migrate_pg_wave_gate_configs(conn: PostgresConnection) -> None:
 
     Mirrors db.migrations._migrate_wave_gate_configs. Idempotent via CREATE
     TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS.
+
+    ed8e4524 — added nullable ``version`` (sprint-version scope; NULL =
+    unscoped/legacy, applies to every item regardless of its own version) via
+    ``ADD COLUMN IF NOT EXISTS`` for a table that predates this fix. Same
+    residual-constraint note as the SQLite mirror
+    (db.migrations._migrate_wave_gate_configs): the UNIQUE constraint on an
+    already-existing table is not retroactively widened to include version.
     """
     await conn.executescript(
         "CREATE TABLE IF NOT EXISTS wave_gate_configs ("
@@ -3164,14 +3368,18 @@ async def _migrate_pg_wave_gate_configs(conn: PostgresConnection) -> None:
         "    project_id TEXT NOT NULL,"
         "    wave_start TEXT NOT NULL,"
         "    wave_end TEXT NOT NULL,"
+        "    version TEXT,"
         "    actions TEXT NOT NULL,"
         "    actor TEXT,"
         "    created_at TEXT NOT NULL DEFAULT (now()::text),"
         "    updated_at TEXT NOT NULL DEFAULT (now()::text),"
-        "    UNIQUE(project_id, wave_end)"
+        "    UNIQUE(project_id, wave_end, version)"
         ");"
+        "ALTER TABLE wave_gate_configs ADD COLUMN IF NOT EXISTS version TEXT;"
         "CREATE INDEX IF NOT EXISTS idx_wave_gate_configs_project "
-        "ON wave_gate_configs(project_id, wave_end)"
+        "ON wave_gate_configs(project_id, wave_end);"
+        "CREATE INDEX IF NOT EXISTS idx_wave_gate_configs_project_version "
+        "ON wave_gate_configs(project_id, wave_end, version)"
     )
 
 
@@ -3673,6 +3881,61 @@ async def _migrate_pg_capability_profiles(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_item_tool_requirements(conn: PostgresConnection) -> None:
+    """76dde31f (665 follow-up) — sprint_items.tool_requirements: typed,
+    per-item MCP tool-requirement contract (mirrors SQLite).
+
+    Nullable TEXT column holding a JSON array of normalized entries (see
+    meridian.tool_requirements). Distinct from touches_resources (scheduling
+    metadata) and the legacy free-form required_tool pin (4d1fb28f) — the
+    structured field is canonical once set; required_tool remains a
+    read-time compatibility fallback only when this column is empty.
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db.migrations._migrate_sprint_item_tool_requirements.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS tool_requirements TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_artifact_declaration(conn: PostgresConnection) -> None:
+    """2f9cb288 (b7308039 / 665 follow-up) — sprint_items.artifact_kind /
+    planned_output / artifact_policy (mirrors SQLite).
+
+    ``artifact_kind`` is a plain enum column (like milestone_type/priority);
+    ``planned_output``/``artifact_policy`` are nullable JSON-encoded TEXT
+    columns, validated via meridian.artifact_declaration before ever
+    reaching this table. NULL on all three = no declaration (read back as
+    "unknown"/project-default, never a guess or a hard block).
+
+    ADD COLUMN IF NOT EXISTS is idempotent. Mirrors
+    db.migrations._migrate_sprint_item_artifact_declaration.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS artifact_kind TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS planned_output TEXT;"
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS artifact_policy TEXT"
+    )
+
+
+async def _migrate_pg_sprint_item_require_strict_evidence(conn: PostgresConnection) -> None:
+    """5fe3502e — opt-in fail-closed completion-evidence gate flag.
+
+    require_strict_evidence (INTEGER 0/1, NOT NULL DEFAULT 0) marks a sprint
+    item as needing the STRICT (fail-closed) evidence verification in
+    meridian.sprint_evidence_guard before complete_sprint_item's handler will
+    let the completion stick. Mirrors require_verification's shape exactly.
+
+    ADD COLUMN IF NOT EXISTS is idempotent; existing rows default to 0.
+    Mirrors db.migrations._migrate_sprint_item_require_strict_evidence.
+    """
+    await conn.executescript(
+        "ALTER TABLE sprint_items ADD COLUMN IF NOT EXISTS "
+        "require_strict_evidence INTEGER NOT NULL DEFAULT 0"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -3770,4 +4033,12 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_handoff_tokens_body_hash,
     _migrate_pg_project_capabilities,
     _migrate_pg_capability_profiles,
+    _migrate_pg_sprint_item_tool_requirements,
+    _migrate_pg_sprint_item_artifact_declaration,
+    _migrate_pg_docx_merge_manifests,
+    _migrate_pg_proposal_evidence_links,
+    _migrate_pg_wave_base_manifests,
+    _migrate_pg_sprint_batch_claims,
+    _migrate_pg_verification_runs,
+    _migrate_pg_sprint_item_require_strict_evidence,
 )

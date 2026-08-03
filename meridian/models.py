@@ -183,8 +183,11 @@ class ProjectSettings(BaseModel):
     require_merge_approval: int = Field(
         default=1,
         ge=0,
-        le=1,
-        description="0716c9e0: warn via HITL when completing an item with an active worktree (default ON).",
+        le=2,
+        description="0716c9e0/e7548587: merge-approval mode for completing an item with an "
+        "active worktree. 0=off (no check), 1=advisory (warn via HITL, proceed — "
+        "default), 2=strict (BLOCKS completion on a genuine active, unmerged worktree "
+        "unless explicitly overridden with override_merge_approval + a reason).",
     )
     code_intel_enabled: int = Field(
         default=0,
@@ -207,7 +210,7 @@ class ProjectSettingsPatch(BaseModel):
     executor_config: ExecutorConfig | None = None
     hitl_auto_answer: int | None = Field(default=None, ge=0, le=2)
     auto_worktrees: int | None = Field(default=None, ge=0, le=1)
-    require_merge_approval: int | None = Field(default=None, ge=0, le=1)
+    require_merge_approval: int | None = Field(default=None, ge=0, le=2)
     code_intel_enabled: int | None = Field(default=None, ge=0, le=1)
     execution_mode: Literal["autonomous", "interactive"] | None = None
 
@@ -333,6 +336,20 @@ class HandoffResult(BaseModel):
     # the 02038afe/ac80aaaf sibling items land) without a models.py migration
     # each time. None only if contract-building itself failed (best-effort).
     capability_contract: dict[str, Any] | None = None
+    # 6cdc5df3 — machine-readable proposal-to-evidence linkage (see
+    # meridian.db.proposal_links): one hydrated entry per proposal id with
+    # evidence linked in this project. list, not a typed submodel, for the
+    # same forward-compat reason as capability_contract above. None only if
+    # the lookup itself failed (best-effort); empty list means no linked
+    # proposals yet.
+    proposal_evidence: list[dict[str, Any]] | None = None
+    # d09c29fe -- machine-readable DOCX-integrity gate (see
+    # meridian.docx_integrity_gate): per-artifact render/equation-audit/
+    # provenance findings plus the executable/executable_reasons readiness
+    # signal. dict, not a typed submodel, for the same forward-compat reason
+    # as capability_contract above. None only if gate-building itself failed
+    # (best-effort).
+    docx_integrity: dict[str, Any] | None = None
 
 
 class TaskUpdate(BaseModel):
@@ -383,5 +400,36 @@ class WorktreeCreate(BaseModel):
     branch: str = Field(..., min_length=1, description="Git branch name, e.g. worktree/abc12345.")
     path: str = Field(..., min_length=1, description="Filesystem path of the worktree.")
     item_id: str | None = Field(default=None, description="Sprint item this worktree was created for.")
+    pid: int | None = Field(
+        default=None,
+        description=(
+            "eb2e44f8 — OS PID of the process that created this worktree. "
+            "Used by the cleanup guard to confirm no live process is still "
+            "using the directory before it is removed from disk."
+        ),
+    )
+    base_sha: str | None = Field(
+        default=None,
+        description=(
+            "eb2e44f8 — commit SHA the worktree was branched from. Supplying "
+            "this together with base_branch persists an IMMUTABLE base "
+            "manifest for the worktree, later checked before merge/completion "
+            "is allowed to proceed. Omitting it skips manifest creation "
+            "entirely (backward compatible)."
+        ),
+    )
+    base_branch: str | None = Field(
+        default=None,
+        description="eb2e44f8 — branch the worktree was branched from, e.g. 'dev'.",
+    )
+    repo_identity: str | None = Field(
+        default=None,
+        description=(
+            "eb2e44f8 — stable identity for the repo this worktree belongs to "
+            "(e.g. a remote URL or repo name). Free-form; recorded on the base "
+            "manifest for audit purposes only, never validated against disk. "
+            "Defaults to project_id when omitted."
+        ),
+    )
 
 

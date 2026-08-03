@@ -4931,7 +4931,12 @@ async def _build_continue_payload(
         _settings = await db_module.get_project_settings(db, project_id)
         _max_turns = handoff_module._max_turns_from_settings(_settings)
     except Exception:  # noqa: BLE001
+        _settings = None
         _max_turns = handoff_module._DEFAULT_GOAL_MAX_TURNS
+    # 75ac1c8e — canonical execution policy, same helper every generate_handoff
+    # call site uses, so a "continue" resume's /goal carries the same
+    # <execution_policy> tag as a fresh handoff.
+    _exec_policy = handoff_module._execution_policy_from_settings(_settings, _mode)
     _hitl_mode = await _hitl_auto_answer_mode_safe(db, project_id)
     # d5849a67 — same durable pointer-evidence resolution as generate_handoff,
     # so this resume payload's excluded_unprospected list also agrees with
@@ -4952,6 +4957,7 @@ async def _build_continue_payload(
         max_turns=_max_turns,
         hitl_auto_answer_mode=_hitl_mode,
         pointer_evidence_ids=_continue_pointer_evidence_ids,
+        execution_policy=_exec_policy,
     )
     recent = await db_module.get_tasks(db, project_id, limit=5)
     pending_slim = [

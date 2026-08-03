@@ -516,3 +516,264 @@ async def test_annotate_surfaces_cap_beyond_limit():
     assert all("code_pointers" not in it for it in out[cap:])
     # ...while in-cap items were prospected.
     assert out[0]["prospect_status"] == "prospected"
+
+
+# ---------------------------------------------------------------------------
+# 88f82c15 (b730 follow-up) — artifact_pointer_policy wiring:
+# _annotate_resolved_pointers attaches the warn/strict policy verdict
+# (pointers.evaluate_artifact_pointer_policy) per pending item; the readiness
+# block surfaces a BLOCKING line for strict-mode violations;
+# build_item_briefing renders a per-item <artifact_pointer_policy> clause.
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_attaches_artifact_pointer_policy(db):
+    """Computed even with ZERO stored durable pointers — 'missing_pointer'
+    is itself a possible verdict."""
+    p = await db_module.create_project(db, "artifact-policy-annotate")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Insert a new ablation chart figure into the results",
+        artifact_policy={"artifact_pointer_check": "warn"},
+    )
+    items = [{"id": item["id"], "title": item["title"], "artifact_policy": item["artifact_policy"]}]
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], items)
+    policy_result = out[0]["artifact_pointer_policy"]
+    assert policy_result["item_id"] == item["id"]
+    assert policy_result["warning_code"] == "missing_pointer"
+    assert policy_result["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_flags_durable_bare_docx_pointer_as_strict_blocking(db):
+    """A durable sprint_item_pointer whose target is a bare .docx path is
+    INSUFFICIENT figure/table evidence; under a strict policy the item is
+    reported not-ready, and the durable pointer's own id is named."""
+    p = await db_module.create_project(db, "artifact-policy-strict")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{
+            "uri": "outputs/report.docx",
+            "selector": {"type": "range", "start_line": 1, "end_line": 1},
+        }],
+    )
+    items = [{"id": item["id"], "title": item["title"], "artifact_policy": item["artifact_policy"]}]
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], items)
+    policy_result = out[0]["artifact_pointer_policy"]
+    assert policy_result["warning_code"] == "insufficient_pointer_bare_docx"
+    assert policy_result["ready"] is False
+    assert policy_result["affected_pointer_ids"] == [str(stored["id"])]
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_not_sensitive_item_no_policy_warning(db):
+    p = await db_module.create_project(db, "artifact-policy-safe")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Renumber figure captions")
+    items = [{"id": item["id"], "title": item["title"]}]
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], items)
+    policy_result = out[0]["artifact_pointer_policy"]
+    assert policy_result["warning_code"] is None
+    assert policy_result["ready"] is True
+
+
+# ---------------------------------------------------------------------------
+# 70c10ca3 (b730 follow-up) — artifact_pointer_finding wiring:
+# _annotate_resolved_pointers ALSO attaches the SAME policy verdict enriched
+# with 3196ba0e's fail-closed readiness verification (canonical/archival/
+# unresolved/ambiguous/missing/...) for every implicated pointer, so the
+# JSON/capability_contract projection (and generate_handoff's response
+# metadata) carries the identical finding the human XML clause already did
+# — not just prose.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_attaches_artifact_pointer_finding_none_when_no_warning(db):
+    p = await db_module.create_project(db, "artifact-finding-safe")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Renumber figure captions")
+    items = [{"id": item["id"], "title": item["title"]}]
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], items)
+    # An item with no active warning contributes no finding at all — mirrors
+    # artifact_pointer_policy's own "nothing to say" restraint.
+    assert out[0]["artifact_pointer_finding"] is None
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_attaches_artifact_pointer_finding_for_weak_pointer(db):
+    p = await db_module.create_project(db, "artifact-finding-weak")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Regenerate the results table with new benchmark numbers",
+        artifact_policy={"artifact_pointer_check": "strict"},
+    )
+    stored = await db_module.add_sprint_item_pointer(
+        db, p["id"], item["id"], "docs",
+        [{
+            "uri": "outputs/report.docx",
+            "selector": {"type": "range", "start_line": 1, "end_line": 1},
+        }],
+    )
+    items = [{"id": item["id"], "title": item["title"], "artifact_policy": item["artifact_policy"]}]
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], items)
+    finding = out[0]["artifact_pointer_finding"]
+    assert finding is not None
+    # The SAME canonical fields artifact_pointer_policy already carried...
+    assert finding["warning_code"] == "insufficient_pointer_bare_docx"
+    assert finding["ready"] is False
+    assert finding["affected_pointer_ids"] == [str(stored["id"])]
+    # ...PLUS the new pointer_status + readiness verification this item adds.
+    assert finding["pointer_status"] == "weak"
+    assert len(finding["target_readiness"]) == 1
+    tr = finding["target_readiness"][0]
+    assert tr["pointer_id"] == str(stored["id"])
+    # "outputs/report.docx" is a relative path that does not exist on disk
+    # from the test working directory — the fail-closed readiness check
+    # must report it as genuinely missing, never silently ready.
+    assert tr["ready"] is False
+    assert tr["targets"][0]["status"] == "missing"
+
+
+@pytest.mark.asyncio
+async def test_annotate_resolved_pointers_artifact_pointer_finding_missing_pointer_status(db):
+    """Zero candidate pointers at all -> pointer_status 'missing' and an
+    empty target_readiness (there's no durable row to verify)."""
+    p = await db_module.create_project(db, "artifact-finding-missing")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Insert a new ablation chart figure into the results",
+        artifact_policy={"artifact_pointer_check": "warn"},
+    )
+    items = [{"id": item["id"], "title": item["title"], "artifact_policy": item["artifact_policy"]}]
+    out = await handoff_module._annotate_resolved_pointers(db, p["id"], items)
+    finding = out[0]["artifact_pointer_finding"]
+    assert finding["warning_code"] == "missing_pointer"
+    assert finding["pointer_status"] == "missing"
+    assert finding["target_readiness"] == []
+
+
+# ---------------------------------------------------------------------------
+# _build_artifact_policy_blocking_warnings — pure, no DB needed
+# ---------------------------------------------------------------------------
+
+
+def test_build_artifact_policy_blocking_warnings_strict_mode_blocks():
+    items = [{
+        "id": "blk-1",
+        "title": "Insert a new ablation chart figure",
+        "artifact_policy": _json.dumps({"artifact_pointer_check": "strict"}),
+    }]
+    warnings = handoff_module._build_artifact_policy_blocking_warnings(items)
+    assert len(warnings) == 1
+    assert "blk-1" in warnings[0]
+    assert "NOT EXECUTABLE" in warnings[0]
+
+
+def test_build_artifact_policy_blocking_warnings_warn_mode_does_not_block():
+    items = [{
+        "id": "blk-2",
+        "title": "Insert a new ablation chart figure",
+        "artifact_policy": _json.dumps({"artifact_pointer_check": "warn"}),
+    }]
+    assert handoff_module._build_artifact_policy_blocking_warnings(items) == []
+
+
+def test_build_artifact_policy_blocking_warnings_off_mode_does_not_block():
+    items = [{
+        "id": "blk-3",
+        "title": "Insert a new ablation chart figure",
+        "artifact_policy": _json.dumps({"artifact_pointer_check": "off"}),
+    }]
+    assert handoff_module._build_artifact_policy_blocking_warnings(items) == []
+
+
+def test_build_artifact_policy_blocking_warnings_false_positive_document_only():
+    items = [{
+        "id": "blk-4",
+        "title": "Insert a new ablation chart figure",
+        "artifact_kind": "document_only",
+        "artifact_policy": _json.dumps({"artifact_pointer_check": "strict"}),
+    }]
+    assert handoff_module._build_artifact_policy_blocking_warnings(items) == []
+
+
+def test_build_artifact_policy_blocking_warnings_never_raises_on_bad_input():
+    assert handoff_module._build_artifact_policy_blocking_warnings(None) == []
+    assert handoff_module._build_artifact_policy_blocking_warnings("not-a-list") == []  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# _build_readiness_block — artifact_policy_blocking rendering
+# ---------------------------------------------------------------------------
+
+
+def test_build_readiness_block_renders_blocking_lines_and_summary():
+    block = handoff_module._build_readiness_block(
+        "week-1", 2, 1,
+        artifact_policy_blocking=["✗ NOT EXECUTABLE — item x1 [figure] fails strict artifact_pointer_check (missing_pointer): fix it"],
+    )
+    assert "HANDOFF NOT READY" in block
+    assert "item x1" in block
+    warn_idx = block.index("HANDOFF NOT READY")
+    close_idx = block.index("=========================")
+    assert warn_idx < close_idx
+
+
+def test_build_readiness_block_backward_compatible_without_artifact_policy_blocking():
+    block = handoff_module._build_readiness_block("week-1", 2, 1)
+    assert "=== HANDOFF READINESS ===" in block
+    assert "HANDOFF NOT READY" not in block
+
+
+# ---------------------------------------------------------------------------
+# build_item_briefing — <artifact_pointer_policy> clause
+# ---------------------------------------------------------------------------
+
+
+def _extract_clause(briefing: str, tag: str):
+    open_tag, close_tag = f"<{tag}>", f"</{tag}>"
+    if open_tag not in briefing:
+        return None
+    start = briefing.index(open_tag) + len(open_tag)
+    end = briefing.index(close_tag)
+    return _json.loads(briefing[start:end])
+
+
+def test_build_item_briefing_renders_artifact_pointer_policy_when_active():
+    item = {
+        "id": "item-uuid", "title": "Insert a new ablation chart figure",
+        "artifact_policy": _json.dumps({"artifact_pointer_check": "strict"}),
+    }
+    briefing = handoff_module.build_item_briefing(item)
+    embedded = _extract_clause(briefing, "artifact_pointer_policy")
+    assert embedded is not None
+    assert embedded["warning_code"] == "missing_pointer"
+    assert embedded["ready"] is False
+
+
+def test_build_item_briefing_omits_artifact_pointer_policy_when_off():
+    item = {
+        "id": "item-uuid", "title": "Insert a new ablation chart figure",
+        "artifact_policy": _json.dumps({"artifact_pointer_check": "off"}),
+    }
+    briefing = handoff_module.build_item_briefing(item)
+    assert "<artifact_pointer_policy>" not in briefing
+
+
+def test_build_item_briefing_omits_artifact_pointer_policy_when_not_sensitive():
+    item = {"id": "item-uuid", "title": "Renumber figure captions"}
+    briefing = handoff_module.build_item_briefing(item)
+    assert "<artifact_pointer_policy>" not in briefing
+
+
+def test_build_item_briefing_omits_artifact_pointer_policy_when_sufficient_evidence():
+    item = {
+        "id": "item-uuid", "title": "Insert a new ablation chart figure",
+        "touches_resources": _json.dumps(["file:outputs/figures/ablation.png"]),
+        "artifact_policy": _json.dumps({"artifact_pointer_check": "strict"}),
+    }
+    briefing = handoff_module.build_item_briefing(item)
+    assert "<artifact_pointer_policy>" not in briefing

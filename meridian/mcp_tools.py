@@ -112,6 +112,108 @@ _TOOL_EXAMPLES: dict[str, str] = {
 }
 
 
+# 76dde31f (665 follow-up) — typed per-item tool_requirements schema, shared
+# verbatim between add_sprint_item and update_sprint_item so the two tool
+# definitions can never drift on field names/enum values. Distinct from
+# touches_resources (parallel-conflict scheduling metadata) and the legacy
+# free-form required_tool pin (a single string) — see
+# meridian.tool_requirements.normalize_tool_requirement for the canonical
+# validation this mirrors.
+_TOOL_REQUIREMENTS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "description": (
+        "76dde31f — typed per-item MCP tool-requirement contract, distinct from "
+        "touches_resources (scheduling metadata) and the legacy free-form "
+        "required_tool pin (a single string). Each entry: name, server_or_namespace, "
+        "required_or_preferred ('required'|'preferred'), purpose (all required); "
+        "call_template, fallback (a string or list of alternate tool ids), "
+        "availability_check, verification (all optional). Once set, this structured "
+        "field is the CANONICAL source build_item_briefing / the batch /goal's "
+        "<tool_requirements> clause / the machine-readable capability contract render "
+        "— required_tool keeps working and is used as a read-time compatibility "
+        "fallback only when this is empty. No secrets or machine-local absolute paths "
+        "(validated, same check as set_capability_manifest). Pass [] to clear."
+    ),
+    "items": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "The tool's name, e.g. 'find_symbol'."},
+            "server_or_namespace": {"type": "string", "description": "Which server/namespace it lives under, e.g. 'Serena', 'meridian', 'Filesystem'."},
+            "required_or_preferred": {"type": "string", "enum": ["required", "preferred"],
+                "description": "'required' = hard requirement; 'preferred' = soft preference, never blocking."},
+            "purpose": {"type": "string", "description": "Why this item needs it."},
+            "call_template": {"type": "string", "description": "Optional example invocation/signature."},
+            "fallback": {
+                "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
+                "description": "Optional alternate tool id(s) to try, in order, if this one is unavailable.",
+            },
+            "availability_check": {"type": "string", "description": "Optional: how to confirm the tool is present (e.g. a tools/list name match)."},
+            "verification": {"type": "string", "description": "Optional: how to confirm the call actually worked."},
+        },
+        "required": ["name", "server_or_namespace", "required_or_preferred", "purpose"],
+    },
+}
+
+
+# 2f9cb288 (665 follow-up) — typed per-item artifact declaration schema,
+# shared verbatim between add_sprint_item and update_sprint_item (same
+# sharing discipline as _TOOL_REQUIREMENTS_SCHEMA above) so the three tool
+# definitions can never drift on field names/enum values. See
+# meridian.artifact_declaration for the canonical validation this mirrors.
+_ARTIFACT_KIND_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "enum": ["document_only", "figure", "table"],
+    "description": (
+        "2f9cb288 — the kind of artifact this item produces. Omit when unknown "
+        "(never guessed/inferred) — an absent value is distinct from any listed "
+        "kind. Pass an empty string on update_sprint_item to CLEAR it."
+    ),
+}
+
+_PLANNED_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "2f9cb288 — a TYPED POINTER declaring where this item's output is "
+        "expected to land — NOT a free-form path. Validated via meridian.pointers."
+        "validate_pointer: source_type + a non-empty targets array of "
+        "{uri, selector, target_kind?, subSelector?}, plus an optional label. "
+        "Do not infer this from a directory or a generic 'mcp_tool:' resource id "
+        "— only an explicit pointer counts. No secrets or machine-local absolute "
+        "paths (same check as set_capability_manifest / tool_requirements). Pass "
+        "null on update_sprint_item to clear."
+    ),
+    "properties": {
+        "source_type": {"type": "string", "description": "e.g. 'code', 'docs', 'experiment' — what kind of source the target lives in."},
+        "targets": {
+            "type": "array",
+            "description": "Non-empty array of {uri, selector, target_kind?, subSelector?} — see add_sprint_item_pointer for the full selector shape (range/symbol/node_id/zotero_key/text_quote/finding_id).",
+            "items": {"type": "object"},
+        },
+        "label": {"type": "string", "description": "Optional human-readable label for this output."},
+        "provenance_required": {"type": "boolean", "description": "Whether the executor must record_provenance for this output before it counts as satisfied. Default false."},
+    },
+    "required": ["source_type", "targets"],
+}
+
+_ARTIFACT_POLICY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "2f9cb288 — per-item override of how strictly a missing/wrong artifact "
+        "output pointer is enforced. Absent (omit, or on update_sprint_item pass "
+        "null to clear) falls back to the project default: artifact_pointer_check="
+        "'warn', every guard flag false — never a silent 'off', never a silent "
+        "'strict'. See meridian.artifact_declaration.effective_artifact_policy."
+    ),
+    "properties": {
+        "artifact_pointer_check": {"type": "string", "enum": ["off", "warn", "strict"],
+            "description": "off = no enforcement; warn = surface but don't block (default); strict = block completion without a valid planned_output pointer."},
+        "require_exact_figure_output_pointer": {"type": "boolean", "description": "When true, a figure-kind item must declare an exact planned_output pointer (default false)."},
+        "require_exact_table_output_pointer": {"type": "boolean", "description": "When true, a table-kind item must declare an exact planned_output pointer (default false)."},
+        "allow_document_only_override": {"type": "boolean", "description": "When true, a document_only-kind item may override/bypass the pointer check (default false)."},
+    },
+}
+
+
 _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "create_project", "description": "Create a new Meridian project.",
      "inputSchema": {"type": "object", "properties": {
@@ -161,7 +263,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "human_id": {"type": "string"},
          "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]}},
          "required": ["session_name"]}},
-    {"name": "start_session", "description": "Register a session and return orientation. Compact by default (session_id, sprint focus + status counts, 3 recent tasks, board_change count) to keep an executor's context small. Pass compact=false for the full block (goal XML, decisions, MERIDIAN.md instructions, workspace context, sprint items) — or fetch it later with get_session_brief. Pass version to scope the session to one sprint-version bucket (e.g. 'v0.1.x'): the orientation's sprint counts/items filter to it and the scope is remembered for the /goal template. Omit version to auto-scope to the bucket with the most pending items (empty board → unscoped). Also returns capability_contract (98aaccf4): a machine-readable {requested, effective, availability, manifest_hash, executable, executable_reasons, generated_at} object describing the project's declared capabilities and whether an executor can run right now — null if contract-building failed.",
+    {"name": "start_session", "description": "Register a session and return orientation. Compact by default (session_id, sprint focus + status counts, 3 recent tasks, board_change count) to keep an executor's context small. Pass compact=false for the full block (goal XML, decisions, MERIDIAN.md instructions, workspace context, sprint items) — or fetch it later with get_session_brief. Pass version to scope the session to one sprint-version bucket (e.g. 'v0.1.x'): the orientation's sprint counts/items filter to it and the scope is remembered for the /goal template. Omit version to auto-scope to the bucket with the most pending items (empty board → unscoped). Also returns capability_contract (98aaccf4): a machine-readable {requested, effective, availability, manifest_hash, executable, executable_reasons, generated_at} object describing the project's declared capabilities and whether an executor can run right now — null if contract-building failed. Also returns execution_policy (75ac1c8e): a machine-readable {execution_mode, max_planning_turns, required_first_action, no_confirmation, permitted_parallel_wave, claim_before_edit, genuine_blocker_escalation} object — 'immediate' (default) names the exact first tool call to make and bounds planning turns before it; 'relaxed' is the explicit ask-first/planning posture. Derived from the project's execution_mode; max_planning_turns is executor_config-overridable via set_executor_config.",
      "inputSchema": {"type": "object", "properties": {
           "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "session_name": {"type": "string", "description": "Optional (599d0097): omit or leave blank to auto-generate a meaningful name from the first pending sprint item title + a timestamp, instead of inventing a string."},
           "human_id": {"type": "string"},
@@ -217,22 +319,49 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "mode='goal' (682005f4) returns ONLY the bare /goal block itself - no readiness "
         "header, no workspace decisions/notes, no L0/L1/L2 context - with each pending "
         "item's resolved code pointer(s), if any, rendered inline in <sprint_items>. "
-        "DISPLAY THE RETURNED content FIELD VERBATIM to the user (5234877f) - the server "
-        "delivers content pre-wrapped in a single 4-backtick code fence so it renders as "
-        "one copy-pasteable block in any markdown client. Do NOT add extra headers, "
-        "blockquotes, or fences around it — just output the field value as-is. "
+        "FORWARD THE RETURNED content FIELD VERBATIM to the user (a5e8aa74) - the "
+        "server delivers content as the EXACT raw handoff text, with NO Markdown "
+        "code fence, header, or blockquote added around it (earlier versions wrapped "
+        "it in a 4-backtick fence under 5234877f; that wrapping was removed because it "
+        "broke copy-paste fidelity for the /goal trust protocol - see "
+        "format_handoff_mcp_content in meridian/handoff.py). Output the field value "
+        "as-is, as the sole plain-text bubble - do NOT add your own fence, header, "
+        "blockquote, or any other wrapping on the calling side either. "
         "Do NOT just narrate that the handoff succeeded; paste the actual text. "
         "Also returns capability_contract (98aaccf4) on every mode: a machine-readable "
         "{requested, effective, availability, manifest_hash, executable, "
         "executable_reasons, generated_at} object describing the project's declared "
         "capabilities and whether an executor can run right now — null if contract-"
-        "building failed.",
+        "building failed. Also returns scope (b8f89491) on every mode: "
+        "{requested_version, effective_version, session_id} — which sprint-version "
+        "bucket the handoff actually resolved to (explicit version arg wins over the "
+        "session's own stored sprint_version; both null means genuinely unscoped, "
+        "every version). Every mode's /goal text (full/delta/starter/goal, embedded in "
+        "content or returned bare) also carries a structured <execution_policy "
+        "execution_mode=... max_planning_turns=... required_first_action=... no_confirmation=... "
+        "permitted_parallel_wave=... claim_before_edit=...> tag (75ac1c8e) right after "
+        "<executor_directive> — the SAME canonical policy start_session's execution_policy "
+        "field returns, so a receiver can identify the required first action from the tag "
+        "attributes without interpreting prose. "
+        "Also returns handoff_evidence_status (8a883f60) on every mode: an explicit "
+        "{code_pointer_enrichment, resolved_pointer_annotation, freshness_requery, "
+        "wave_gate_exclusion, graph_search_availability} object — each a "
+        "{status: verified|skipped|failed|degraded, reason, fallback} entry for that "
+        "best-effort step, so a silently-degraded handoff is never indistinguishable "
+        "from a fully-verified one. Pass strict_evidence=true to fail CLOSED instead: "
+        "if any capability comes back failed/degraded, nothing is rendered or persisted "
+        "and the call returns {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, "
+        "evidence_errors, message} — default (strict_evidence omitted/false) behavior is "
+        "completely unchanged.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"]},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."},
+         "version": {"type": "string", "description": "(b8f89491) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this handoff to — applies to every mode (full/delta/starter/compact/goal), not just starter. Wins over the calling session's own stored sprint_version. Omit to fall back to session_id's scope, or to the whole project's cross-version backlog when neither is set."},
          "force_include_ids": {"type": "array", "items": {"type": "string"}, "description": "(45f519a0) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming."},
-         "skip_ai_summary": {"type": "boolean", "description": "65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time."}},
+         "skip_ai_summary": {"type": "boolean", "description": "65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time."},
+         "strict_evidence": {"type": "boolean", "description": "(8a883f60) Opt-in, off by default — mirrors complete_sprint_item's strict_evidence shape exactly. When true, a failed/degraded pointer-enrichment/freshness/wave-gate/graph-search capability makes this call refuse to render or persist a handoff at all, returning {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, evidence_errors, message} instead. Leave false/omitted for today's graceful-degrade behavior (handoff_evidence_status is still returned either way)."},
+         "strict_pointer_evidence": {"type": "boolean", "description": "(eb8b6894) Opt-in, off by default, separate from strict_evidence above. When true, the claimable/goal batch's UNPROSPECTED exclusion requires a pending item's durable pointer(s) to have actually RESOLVED (resolve_pointer succeeded), not merely be PRESENT as a row — a structurally-valid-but-unresolved pointer no longer silently satisfies the gate. Never raises/blocks the whole handoff (unlike strict_evidence): an affected item is simply excluded from the claimable batch, the same way today's presence-only UNPROSPECTED gate already excludes items. Every pending item's pointer_resolution_status (structural_valid/target_resolved/provenance_verified/resolution_source/strict_satisfied) is always returned regardless of this flag — it only changes which items make the claimable cut."}},
          "required": []}},
     {"name": "load_handoff", "description":
         "Read-only: Return the latest stored handoff for a project as an MCP tool "
@@ -630,7 +759,26 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "f7ee1ba7 — pass session_id to enable scoped-region claim enforcement: "
         "if another session has claimed the target para_id (or holds a whole-file "
         "lock), the write is REJECTED with error='docx_region_conflict'. Use "
-        "claim_docx_region to acquire your region before writing.",
+        "claim_docx_region to acquire your region before writing. "
+        "5988a5bb — mandatory post-write verification now re-reads the file "
+        "from disk and confirms the target paragraph's text actually landed "
+        "before this ever reports success; on a rare verification failure the "
+        "write is best-effort restored from backup and an error is returned "
+        "instead. Response also now includes pre_counts/post_counts (the "
+        "media/style/equation/relationship structural manifest from before "
+        "and after the write). Three further OPT-IN parameters (each omitted "
+        "by default, byte-identical behavior when omitted): "
+        "expected_content_hash — a fail-closed precondition: if the source "
+        "file's current on-disk content hash doesn't match, the write is "
+        "REJECTED before anything is touched (get the current hash from a "
+        "prior get_document_structure/get_structure staleness check). "
+        "draft_output_path + wave_run_id (both-or-neither, with session_id "
+        "also required) — writes to an ISOLATED draft path instead of the "
+        "canonical file, claiming the paragraph as this wave's anchor via the "
+        "real docx-merge manifest so a conflicting concurrent draft on the "
+        "same paragraph is rejected; response carries draft_path/wave_run_id/ "
+        "is_draft instead of elements_resynced (the canonical index is not "
+        "touched until a merge).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
@@ -639,7 +787,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "new_text": {"type": "string", "description": "New paragraph text as a single unformatted run. Provide this OR runs, not both."},
          "runs": {"type": "array", "description": "List of runs — each a plain string or a {text, bold?, italic?, underline?} object. Provide this OR new_text, not both.",
                   "items": {"type": ["string", "object"]}},
-         "session_id": {"type": "string", "description": "f7ee1ba7 — calling session id. When provided, scoped-region claim enforcement activates: the write is rejected if another session claims the target para_id or holds a whole-file lock. Without session_id the guard is skipped (legacy/unclaimed writes pass through)."}},
+         "session_id": {"type": "string", "description": "f7ee1ba7 — calling session id. When provided, scoped-region claim enforcement activates: the write is rejected if another session claims the target para_id or holds a whole-file lock. Without session_id the guard is skipped (legacy/unclaimed writes pass through). 5988a5bb — also required (together with draft_output_path/wave_run_id) to use wave-scoped draft mode."},
+         "expected_content_hash": {"type": "string", "description": "5988a5bb — opt-in fail-closed precondition: the write is rejected BEFORE touching the file if this doesn't match the source's CURRENT on-disk content hash. Omit for the pre-5988a5bb advisory-only staleness warning instead."},
+         "draft_output_path": {"type": "string", "description": "5988a5bb — opt-in wave-scoped draft mode: write to this isolated path instead of the canonical `doc`. Must be given together with wave_run_id and session_id; must differ from `doc`."},
+         "wave_run_id": {"type": "string", "description": "5988a5bb — the wave identifier scoping this draft's meridian.db.docx_merge manifest. Must be given together with draft_output_path and session_id."}},
          "required": ["doc", "para_id"]}},
     {"name": "find_symbol_usages", "description":
         "9605edb0 — READ-ONLY cross-reference tracking: given a document and "
@@ -1027,7 +1178,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "root_dir": {"type": "string", "description": "Absolute path to the source tree root — used for the search_code_semantic fallback. If omitted, the semantic leg is skipped."},
          "limit": {"type": "integer", "description": "Max results per rung (default 5)."},
          "stale_graph": {"type": "boolean", "description": "Set true to SKIP the graph rung and go straight to Serena (e.g. you already know the graph is stale from a _graph_staleness warning)."},
-         "kind": {"type": "string", "description": "Optional symbol kind filter passed to search_code_semantic fallback (function/class/method/etc)."}},
+         "kind": {"type": "string", "description": "Optional symbol kind filter passed to search_code_semantic fallback (function/class/method/etc)."},
+         "session_id": {"type": "string", "description": "a8c0f3b7 — optional Meridian session id. Purely for attribution: when supplied, the durable code-intel prospecting receipt this call records (meridian.code_intel_receipt) is attributed to this session, strengthening complete_sprint_item's prospecting-receipt gate. Never required and never affects the prospect result itself."}},
          "required": ["symbol"]}},
     {"name": "add_sprint_item_pointer", "description":
         "2976e168 — attach a GENERIC POINTER to a sprint item: a portable, composable "
@@ -1516,7 +1668,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "wave": {"type": "string",
                   "description": "58a45b92 — stored, deterministic wave/batch label (e.g. 'wave-1') for enforced wave-a/wave-b grouping. Usually auto-filled by assign_sprint_waves from the conflict-free parallel groups; set it here only to pin an item to a specific wave up front. Omit to leave unassigned."},
          "required_tool": {"type": "string",
-                  "description": "4d1fb28f — pin the specific MCP tool/plugin the executor MUST use for this item (e.g. 'Serena: replace_symbol_body', 'meridian__patch_file', a named tunnel plugin) instead of leaving tool choice to executor habit. Rendered as a hard directive in the /goal block (not a soft hint) — see build_item_briefing / the batch /goal's <required_tool> clause. Omit for ordinary executor discretion."}},
+                  "description": "4d1fb28f — pin the specific MCP tool/plugin the executor MUST use for this item (e.g. 'Serena: replace_symbol_body', 'meridian__patch_file', a named tunnel plugin) instead of leaving tool choice to executor habit. Rendered as a hard directive in the /goal block (not a soft hint) — see build_item_briefing / the batch /goal's <required_tool> clause. Omit for ordinary executor discretion."},
+         "tool_requirements": _TOOL_REQUIREMENTS_SCHEMA,
+         "artifact_kind": _ARTIFACT_KIND_SCHEMA,
+         "planned_output": _PLANNED_OUTPUT_SCHEMA,
+         "policy": _ARTIFACT_POLICY_SCHEMA},
          "required": ["version", "title"]}},
     {"name": "fan_out_sprint_items",
      "description":
@@ -1575,8 +1731,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                         "description": "56f607ec — set/fix another sprint item's id this one depends on (must complete first before this item is claimable/surfaced by get_parallelizable_groups). Previously depends_on could only be set at creation time via add_sprint_item, with no way to correct ordering on an already-filed item — real ordering had to fall back to prose in notes, which get_parallelizable_groups cannot see. Pass an empty string to CLEAR it (independently claimable); omit to leave unchanged. Cannot equal item_id itself (self-dependency)."},
          "require_verification": {"type": "boolean",
                              "description": "e2e1b682 — set true to require an independent fresh-session PASS (see complete_sprint_item's verifier_session_id/verification_verdict) before the item can be completed. A same-session self-report does not satisfy this gate. Set false to re-enable ordinary completion (evidence gate only). Omit to leave unchanged."},
+         "require_strict_evidence": {"type": "boolean",
+                             "description": "5fe3502e — set true to require STRICT (fail-closed) completion-evidence verification: complete_sprint_item then refuses (STRICT_EVIDENCE_BLOCKED) unless declared evidence is present, resolves to something real on disk/in the DB, isn't stale (predates the current claim), matches the completing session's own worktree, and no file was edited without a claim_file/claim_symbol lock — unless the caller explicitly passes override_strict_evidence=true with a non-empty override_reason (audited). Set false to re-enable ordinary advisory-only evidence checks. Omit to leave unchanged. Equivalent to passing strict_evidence=true on a single complete_sprint_item call, but persists across attempts."},
          "required_tool": {"type": "string",
                   "description": "4d1fb28f — pin (or re-pin) the specific MCP tool/plugin the executor MUST use for this item, rendered as a hard directive in the /goal block — not left to executor habit. Pass an empty string to CLEAR the pin (ordinary executor discretion); omit to leave unchanged."},
+         "tool_requirements": _TOOL_REQUIREMENTS_SCHEMA,
+         "artifact_kind": _ARTIFACT_KIND_SCHEMA,
+         "planned_output": _PLANNED_OUTPUT_SCHEMA,
+         "policy": _ARTIFACT_POLICY_SCHEMA,
          "github_channel": {"type": "string", "enum": ["nightly", "stable", "graduated"],
                   "description": "7c82f7c8 — release-channel classification for this item's linked, auto-filed GitHub issue (fdaa5b55), mirroring the channel:nightly / channel:stable labels applied via which issue template (.github/ISSUE_TEMPLATE/) the reporter picked. 'graduated' marks a bug that started as nightly-only noise but is now confirmed reproducing on stable too — needs a real fix before general release. Pass an empty string to CLEAR it; omit to leave unchanged."}},
          "required": ["item_id"]}},
@@ -1601,7 +1763,25 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "claim is stale (claimed 2h+ ago, or the claiming session is dead/closed) — the "
         "exact stale-cleanup pattern of closing items left behind by a dead session keeps "
         "working automatically. For a live, non-stale foreign claim, pass "
-        "force_foreign_claim=true to explicitly acknowledge and complete anyway.",
+        "force_foreign_claim=true to explicitly acknowledge and complete anyway. "
+        "5fe3502e — pass strict_evidence=true (or flag the item require_strict_evidence=true "
+        "via update_sprint_item) for STRICT, fail-closed evidence verification: completion is "
+        "refused (STRICT_EVIDENCE_BLOCKED, with typed evidence_errors codes — EVIDENCE_ABSENT/"
+        "EVIDENCE_INVALID/EVIDENCE_STALE/WRONG_WORKTREE/UNCLAIMED_EDIT) unless evidence is "
+        "present, verifiable, fresh, from the right worktree, and every modified file was "
+        "claimed. Default (no strict_evidence, no require_strict_evidence) behavior is exactly "
+        "the pre-existing advisory-only evidence checks — nothing changes unless you opt in. "
+        "a8c0f3b7 — CODE-INTEL PROSPECTING RECEIPT gate: opt in at the PROJECT level via "
+        "set_capability_manifest(capabilities=[{id:'code_intel_prospecting', ...}]) — no "
+        "per-call flag needed, and a no-op for projects that never declared it. When declared, "
+        "completion of an item that has touches_resources and no prospect_bypass is refused "
+        "(CODE_INTEL_RECEIPT_MISSING) unless a durable receipt shows a real search_graph/"
+        "find_symbol/prospect_symbol call happened since the item was claimed (see "
+        "meridian.code_intel_receipt) — or refused (CODE_INTEL_UNAVAILABLE) when the capability "
+        "is availability_policy='required' and code-intel itself is unavailable. Pass "
+        "override_code_intel_receipt=true with a non-empty override_reason to acknowledge and "
+        "complete anyway (audited). 'optional'/'degraded_ok' policies never block — they degrade "
+        "with a code_intel_receipt_warning on the returned item instead.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
@@ -1612,7 +1792,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "verifier_session_id": {"type": "string", "description": "e2e1b682 — session id of the fresh, independent, read-only-tools verifier subsession that PASSED/FAILED this item. Must differ from actor/session_id or the require_verification gate rejects it as non-independent. Ignored on items without require_verification set."},
          "verification_verdict": {"type": "string", "enum": ["pass", "fail"], "description": "e2e1b682 — the fresh verifier subsession's independent PASS/FAIL determination. Required (with verifier_session_id) to satisfy require_verification in the same call as completion."},
          "verification_notes": {"type": "string", "description": "e2e1b682 — optional free-text explanation from the verifier (especially useful on a fail verdict)."},
-         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit override, never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."}},
+         "force_foreign_claim": {"type": "boolean", "description": "8693b6a8 — set true to complete an item claimed by a DIFFERENT, still-live (non-stale) actor. An explicit override, never inferred; omit/false for normal completion. Not needed to close items left behind by a stale/dead claiming session — that is detected automatically."},
+         "strict_evidence": {"type": "boolean", "description": "5fe3502e — opt in to the STRICT, fail-closed evidence gate for THIS call only (see meridian.sprint_evidence_guard). Omit/false preserves the exact pre-existing advisory-only behavior. Equivalent, persistent alternative: update_sprint_item(require_strict_evidence=true)."},
+         "override_strict_evidence": {"type": "boolean", "description": "5fe3502e — explicit, audited override of a STRICT_EVIDENCE_BLOCKED rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Never inferred; omit/false for normal strict behavior."},
+         "override_reason": {"type": "string", "description": "5fe3502e — REQUIRED alongside override_strict_evidence=true (or a8c0f3b7's override_code_intel_receipt=true): why the rejection is being overridden. Recorded to action_audit_log (who/when/why) — an override with no reason is refused, not silently accepted."},
+         "override_code_intel_receipt": {"type": "boolean", "description": "a8c0f3b7 — explicit, audited override of a CODE_INTEL_RECEIPT_MISSING / CODE_INTEL_UNAVAILABLE rejection. Must be paired with a non-empty override_reason in the SAME call, or it is ignored and the block stands. Only relevant for a project that declared the 'code_intel_prospecting' capability."}},
          "required": ["item_id"]}},
     {"name": "reconcile_sprint_drift", "description":
         "Read-only: Cross-reference pending sprint items against recent git commits and "
@@ -1712,13 +1896,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "{gate_completed, wave_label, next_wave_label, next_wave_item_count, "
         "next_wave_item_ids, gate_id}. Each wave gate may only be completed once "
         "(duplicate calls return an error). Security note: this is a deploy-adjacent "
-        "gate — only actual run_verification output satisfies it.",
+        "gate — only actual run_verification output satisfies it. ed8e4524 — SCOPED "
+        "TO SPRINT VERSION: pass version (or session_id to auto-resolve the calling "
+        "session's scope) so two different sprint versions that happen to share the "
+        "SAME wave_label (e.g. both have a 'wave-2') never satisfy or unblock each "
+        "other's gate — omit both to keep the exact prior project-wide behavior for "
+        "a single-version project.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "wave_label": {"type": "string", "description": "The wave whose gate is being completed, e.g. 'wave-1'. Must match the wave field on sprint_items that were just executed."},
          "verification_payload": {"type": "object", "description": "The FULL dict returned by run_verification. Must have status='ok' and exit_code=0. Any other value (non-zero exit, error, not_configured, not_connected) is rejected. Do NOT fabricate or self-report — the server validates the payload."},
-         "actor": {"type": "string", "description": "Optional session_id or actor name to record who completed the gate."}},
+         "actor": {"type": "string", "description": "Optional session_id or actor name to record who completed the gate."},
+         "version": {"type": "string", "description": "ed8e4524 — Optional sprint-version bucket this gate belongs to (e.g. 'v0.2.6'). Wins over session_id's resolved scope. Omit (and omit session_id) for the legacy project-wide gate behavior."},
+         "session_id": {"type": "string", "description": "ed8e4524 — Optional: resolve the version scope from this session's own sprint_version (same helper handoff._resolve_session_sprint_version uses for checkpoint) when version is not given explicitly."}},
          "required": ["wave_label", "verification_payload"]}},
     {"name": "start_wave_run", "description":
         "2a654cb0 — DURABLE WAVE STATE: open a wave run before dispatching a parallel "
@@ -1807,14 +1998,20 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "checkpoint. Re-configuring an un-passed wave_end is an upsert — the pipeline can be "
         "revised right up until an executor completes it; once passed the config is immutable "
         "(returns {\"error\": ...}). Returns {configured, gate_config_id, project_id, "
-        "wave_start, wave_end, actions} on success.",
+        "wave_start, wave_end, actions} on success. ed8e4524 — SCOPED TO SPRINT VERSION: "
+        "pass version (or session_id to auto-resolve the calling session's scope) so two "
+        "different sprint versions that happen to share the SAME wave_end label never "
+        "reconfigure or immutably block each other's gate — omit both to keep the exact "
+        "prior project-wide behavior for a single-version project.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "wave_end": {"type": "string", "description": "The boundary wave, e.g. 'wave-3'. Any item in a later wave (same 'prefix-N' family) is structurally blocked from claim_sprint_item until this gate completes."},
          "wave_start": {"type": "string", "description": "Optional: first wave covered by this gate (documentation only, defaults to wave_end) — e.g. wave_start='wave-1' with wave_end='wave-3' covers waves 1-3 under one checkpoint."},
          "actions": {"type": "array", "description": "Non-empty ordered list of {\"type\": push_dev|push_main|deploy|wait|run_verification, ...params} action dicts — the deterministic pipeline that must run before the next wave unlocks.", "items": {"type": "object"}},
-         "actor": {"type": "string", "description": "Optional session_id or actor name to record who configured the gate."}},
+         "actor": {"type": "string", "description": "Optional session_id or actor name to record who configured the gate."},
+         "version": {"type": "string", "description": "ed8e4524 — Optional sprint-version bucket this gate belongs to (e.g. 'v0.2.6'). Wins over session_id's resolved scope. Omit (and omit session_id) for the legacy project-wide gate behavior."},
+         "session_id": {"type": "string", "description": "ed8e4524 — Optional: resolve the version scope from this session's own sprint_version (same helper handoff._resolve_session_sprint_version uses for checkpoint) when version is not given explicitly."}},
          "required": ["wave_end", "actions"]}},
     {"name": "analyze_sprint", "description":
         "PLANNING: Read-only synthesis of the current sprint into one structured brief — "
@@ -2026,7 +2223,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "codebase_code_dirs": {"type": "array", "items": {"type": "string"},
              "description": "b970fe07 — directories codebase-memory-mcp (the tunnel's code-intel slot) auto-indexes. Deduped-union across the tenant's projects; used only when --code-dir is not passed on the CLI. Overwrites the existing list."},
          "context_threshold": {"type": "integer", "description": "Turns before a context-budget warning is surfaced to the session."},
-         "max_turns": {"type": "integer", "description": "Turn ceiling injected into the /goal string ('Stop after N turns'). Default 200."}},
+         "max_turns": {"type": "integer", "description": "Turn ceiling injected into the /goal string ('Stop after N turns'). Default 200."},
+         "max_planning_turns": {"type": "integer", "description": "75ac1c8e — override for the execution_policy planning-turn ceiling (turns allowed before the required first action). Default 1 in immediate/autonomous mode, 10 in relaxed/interactive mode; clamped 1-50. Invalid/non-positive values fall back to the mode default rather than erroring."}},
          "required": []}},
     {"name": "get_capability_manifest", "description":
         "649e095f — Read-only: return a project's structured capability manifest "
@@ -2346,12 +2544,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]}},
          "required": ["file", "anchor", "content"]}},
     {"name": "claim_sprint_item",
-     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at + actor. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, or its touches_files overlap active file claims from another live session.",
+     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at + actor. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, its touches_files overlap active file claims from another live session, or (18c488b6) a touches_resources file:/symbol: entry is locked by another live session — this last check ACQUIRES the resource lock (via claim_file/claim_symbol) as part of claiming, is a hard block regardless of worktree isolation, and rolls back cleanly if the claim itself doesn't land.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
          "actor": {"type": "string", "description": "Executor id/name recorded as having claimed the item (5823db0b; defaults to session_id)."},
-         "session_id": {"type": "string", "description": "Optional caller session id; its own file claims are ignored for conflict checks."}},
+         "session_id": {"type": "string", "description": "Optional caller session id; its own file claims are ignored for conflict checks, and it is the identity any touches_resources symbol/file locks are acquired under (18c488b6). Omitting it skips resource-lock acquisition entirely (fail-open — no behavior change from before 18c488b6)."},
+         "resource_contents": {"type": "object", "description": "18c488b6 — optional map of {file_path: file_content} for any symbol: entries in the item's touches_resources. The server has no direct filesystem access to your repo, so supplying a file's current content here is what lets a symbol: resource get a REAL AST-resolved line-range lock (via claim_symbol) instead of falling back to a whole-file lock. Omit a file's content (or omit this arg entirely) and its symbol: resources fall back to a whole-file lock with an explicit fallback_reason in the response's resource_lock_scope — never a silent downgrade."}},
          "required": ["item_id"]}},
     {"name": "add_subtask",
      "description": "Add a child sprint item under an existing parent item. Inherits the parent's version. Status starts as pending. Rejects if the parent is already done, failed, or skipped. Pass owner='human' or owner='ai' to build a mixed-ownership task chain: owned subtasks added in sequence become a strict chain (each depends on the previous owned sibling), and completing one auto-advances ownership — an AI→human step files a HITL handoff, a human→AI step un-blocks the next AI subtask. The parent stays in_progress until all subtasks are terminal.",
@@ -2723,9 +2922,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "split_sprint_item":         "executor",
     "merge_sprint_items":        "executor",
     "add_subtask":               "executor",
-    "add_sprint_item_pointer":       "executor",
-    "get_sprint_item_pointers":      "executor",
-    "resolve_sprint_item_pointers":  "executor",
+    "add_sprint_item_pointer":       "both",
+    "get_sprint_item_pointers":      "both",
+    "resolve_sprint_item_pointers":  "both",
     "delete_sprint_item_pointer":    "executor",
     "claim_file":                "executor",
     "release_file":              "executor",
@@ -3269,7 +3468,7 @@ _EXECUTOR_DEFAULT_CATEGORIES: frozenset[str] = frozenset({
 })
 _PLANNER_DEFAULT_CATEGORIES: frozenset[str] = frozenset({
     "session", "project", "sprint-management", "decisions", "notes",
-    "workspace", "analysis", "research", "hitl", "plugin",
+    "workspace", "analysis", "research", "hitl", "plugin", "code-intel",
 })
 
 # Minimal stop-word set (mirrors handoff._extract_keywords) — inlined here to
