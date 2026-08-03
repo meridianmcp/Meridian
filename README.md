@@ -48,7 +48,7 @@ other's task log, and resume from a compressed handoff when context fills up.
 ### Option 1 — binary release (recommended)
 
 Signed binaries for Windows, macOS (Apple Silicon), and Linux are attached to
-every [GitHub release](https://github.com/meridianmcp/Meridian/releases) (current: v0.1.9).
+every [GitHub release](https://github.com/meridianmcp/Meridian/releases) (current: v0.2.6).
 
 **Linux / macOS (one-liner via uv):**
 ```bash

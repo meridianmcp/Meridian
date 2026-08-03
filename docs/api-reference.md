@@ -19,7 +19,7 @@ Check server health.
 {
   "status": "ok",
   "service": "meridian",
-  "version": "0.1.9",
+  "version": "0.2.6",
   "git_sha": "a555660ef312"
 }
 ```
@@ -1237,4 +1237,3 @@ No auth required.
 | `GET` | `/zotero/mcp/{tenant_id}/{rest:path}` | Same as zotero_mcp_proxy but for sub-paths |
 | `OPTIONS` | `/zotero/mcp/{tenant_id}/{rest:path}` | Same as zotero_mcp_proxy but for sub-paths |
 | `POST` | `/zotero/mcp/{tenant_id}/{rest:path}` | Same as zotero_mcp_proxy but for sub-paths |
-

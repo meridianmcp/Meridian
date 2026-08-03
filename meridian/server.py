@@ -4105,7 +4105,7 @@ async def api_reference_doc() -> str:
         "{\n"
         '  "status": "ok",\n'
         '  "service": "meridian",\n'
-        '  "version": "0.1.9",\n'
+        '  "version": "0.2.6",\n'
         '  "git_sha": "a555660ef312"\n'
         "}\n"
         "```\n"

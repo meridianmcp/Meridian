@@ -109,7 +109,7 @@ def _frozen_default_to_tunnel(
     as the Pro filesystem tunnel client (``meridian --tunnel --repo .``). A
     frozen build that reaches ``main()`` with no explicit mode flag must NOT
     fall through to the dashboard HTTP server (the old ``__main__entry.py``
-    default of uvicorn on port 7700 — the v0.1.9 "starts a dashboard, never
+    default of uvicorn on port 7700 — the v0.2.6 "starts a dashboard, never
     spawns slots" bug). So when frozen and no mode was requested, default to
     the tunnel path.
 

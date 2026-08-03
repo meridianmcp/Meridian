@@ -46,7 +46,7 @@ def _read_version() -> str:
                 continue
     except Exception:
         pass
-    return "1.0.0-alpha"
+    return "0.2.6"
 
 
 def _read_git_sha() -> str:
