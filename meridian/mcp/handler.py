@@ -3066,7 +3066,20 @@ async def _handle_task_tools(
         if not _token:
             return {"valid": False, "reason": "not_found"}
         _pid = args.get("project_id") or ""
-        return await handoff_module_local.verify_handoff_token(db, _token, _pid)
+        # efaa918a body-hash binding (2ee0000c) — presented_body is the FULL
+        # pasted block (token + SECURITY banner included, since that's what a
+        # caller actually has); strip those back out so the hash matches what
+        # was bound at mint time. Omitting presented_body leaves this exactly
+        # the prior token-only provenance check.
+        _presented_body = args.get("presented_body")
+        _body_for_check = (
+            handoff_module_local.strip_goal_token_banner(_presented_body)
+            if isinstance(_presented_body, str)
+            else None
+        )
+        return await handoff_module_local.verify_handoff_token(
+            db, _token, _pid, body=_body_for_check
+        )
     return _MISS
 
 
