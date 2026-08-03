@@ -9640,6 +9640,16 @@ def test_oauth_metadata_includes_meridian_branding(client):
     body = r.json()
     assert body["client_name"] == "Meridian"
     assert body["logo_uri"] == "https://usemeridian.us/static/logo.svg"
+    assert "offline_access" in body["scopes_supported"]
+    assert "refresh_token" in body["grant_types_supported"]
+
+
+def test_oidc_discovery_alias_matches_oauth_metadata(client):
+    """ChatGPT's OIDC discovery probe must not fail before OAuth setup."""
+    oauth = client.get("/.well-known/oauth-authorization-server")
+    oidc = client.get("/.well-known/openid-configuration")
+    assert oidc.status_code == 200
+    assert oidc.json() == oauth.json()
 
 
 def test_oauth_protected_resource_metadata(client):
@@ -9667,6 +9677,7 @@ def test_oauth_dcr_includes_client_secret_expires_at(client):
     assert "client_secret_expires_at" in body, "client_secret_expires_at missing from DCR response"
     assert body["client_secret_expires_at"] == 0
     assert isinstance(body["client_secret_expires_at"], int)
+    assert "refresh_token" in body["grant_types"]
 
 
 def test_workspace_accept_sets_pending_invite_cookie(client, monkeypatch):

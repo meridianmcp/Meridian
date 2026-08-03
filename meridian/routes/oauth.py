@@ -323,11 +323,27 @@ async def _oauth_meta(request: Request):
         "token_endpoint": f"{b}/oauth/token",
         "registration_endpoint": f"{b}/oauth/register",
         "device_authorization_endpoint": f"{b}/oauth/device",
-        "scopes_supported": ["mcp"],
+        # ChatGPT's current custom-MCP setup checks discovery metadata for a
+        # refresh-capable OAuth grant before it will finish creating the app.
+        # The token endpoint already issues/rotates refresh tokens; advertise
+        # that contract instead of making clients guess it.
+        "scopes_supported": ["mcp", "offline_access"],
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["client_secret_post", "none"]})
+
+
+@router.get("/.well-known/openid-configuration")
+async def _openid_meta(request: Request):
+    """OIDC discovery alias for clients that probe this path before OAuth AS metadata.
+
+    Meridian uses OAuth authorization-code + PKCE rather than issuing OIDC
+    identity tokens, but the discovery document is the same authorization
+    server contract.  ChatGPT currently probes both standard discovery paths;
+    returning the OAuth metadata here avoids a needless 404 during app setup.
+    """
+    return await _oauth_meta(request)
 
 
 @router.get("/.well-known/oauth-protected-resource")
@@ -364,7 +380,7 @@ async def _oauth_reg(request: Request):
     return JSONResponse({"client_id": cid, "client_secret": cs,
         "client_secret_expires_at": 0,
         "redirect_uris": redirect_uris,
-        "grant_types": ["authorization_code"],
+        "grant_types": ["authorization_code", "refresh_token"],
         "token_endpoint_auth_method": "client_secret_post"}, status_code=201)
 
 
