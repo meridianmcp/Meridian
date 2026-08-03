@@ -1879,6 +1879,92 @@ def test_planner_handoff_endpoint_timeout_returns_504(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 45f519a0/8a883f60/eb8b6894 — POST /projects/{id}/handoff previously silently
+# dropped force_include_ids/strict_evidence/strict_pointer_evidence from the
+# request body even though the MCP HTTP dispatch (handler.py) already threaded
+# all three. These tests prove the REST route now forwards them for real.
+# ---------------------------------------------------------------------------
+
+
+def test_post_handoff_endpoint_force_include_ids_threads_through(client):
+    """force_include_ids in the POST body re-includes a deferred item that a
+    plain call (no override) leaves hidden — proving the REST route actually
+    forwards the field to generate_handoff instead of dropping it."""
+    project = client.post("/projects", json={"name": "http-force-include"}).json()
+    pid = project["id"]
+    future = "2099-01-01T00:00:00"
+    item = _run(db_module.add_sprint_item(
+        client.app.state.db, pid, "v1", "HTTP deferred task", deferred_until=future,
+    ))
+
+    # Baseline: without force_include_ids the deferred item stays hidden.
+    baseline = client.post(f"/projects/{pid}/handoff")
+    assert baseline.status_code == 200
+    assert "HTTP deferred task" not in baseline.json()["content"]
+
+    r = client.post(
+        f"/projects/{pid}/handoff",
+        json={"force_include_ids": [item["id"]]},
+    )
+    assert r.status_code == 200
+    assert "HTTP deferred task" in r.json()["content"]
+    # deferred_until is NOT cleared by the one-call override.
+    refetched = _run(db_module.get_sprint_item(client.app.state.db, item["id"]))
+    assert refetched["deferred_until"] == future
+
+
+def test_post_handoff_endpoint_strict_evidence_returns_structured_422(client, monkeypatch):
+    """strict_evidence=True on a failed capability now returns a structured
+    422 (HANDOFF_EVIDENCE_BLOCKED) instead of falling through to a generic
+    500, mirroring the MCP HTTP dispatch's own HandoffEvidenceRequired
+    refusal shape (see test_generate_handoff_strict_evidence_raises_and_writes_nothing
+    above for the underlying handoff_module-level behavior this wraps)."""
+    project = client.post("/projects", json={"name": "http-strict-evidence"}).json()
+    pid = project["id"]
+    client.post(
+        f"/projects/{pid}/sprint-items", json={"version": "v1", "title": "pending item"},
+    )
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("wave_gate_configs table missing")
+
+    monkeypatch.setattr(db_module, "get_wave_gate_configs", _boom)
+
+    r = client.post(f"/projects/{pid}/handoff", json={"strict_evidence": True})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["error"] == "HANDOFF_EVIDENCE_BLOCKED"
+    assert detail["project_id"] == pid
+    assert any(
+        e["capability"] == "wave_gate_exclusion" for e in detail["evidence_errors"]
+    )
+
+
+def test_post_handoff_endpoint_omitting_new_args_is_backward_compatible(client, monkeypatch):
+    """Regression: a request body with none of the new keys (force_include_ids/
+    strict_evidence/strict_pointer_evidence/version) behaves exactly as
+    before — even the SAME failed-capability state that trips strict_evidence
+    above must still degrade gracefully (200, not 422/500) when
+    strict_evidence is simply absent from the body."""
+    project = client.post("/projects", json={"name": "http-backward-compat"}).json()
+    pid = project["id"]
+    client.post(
+        f"/projects/{pid}/sprint-items", json={"version": "v1", "title": "compat item"},
+    )
+
+    async def _boom(*_a, **_k):
+        raise RuntimeError("wave_gate_configs table missing")
+
+    monkeypatch.setattr(db_module, "get_wave_gate_configs", _boom)
+
+    r = client.post(f"/projects/{pid}/handoff", json={"mode": "full"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mode"] == "full"
+    assert "compat item" in body["content"]
+
+
+# ---------------------------------------------------------------------------
 # ddd8b9bf — hitl_auto_answer_mode adapts /goal HITL clause + agent_instructions
 # ---------------------------------------------------------------------------
 
