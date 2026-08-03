@@ -1275,6 +1275,14 @@ async def _handle_mcp_request(
     if method == "tools/call":
         name = params.get("name", "")
         args = params.get("arguments") or {}
+        # Some MCP host bridges qualify a server's tool name with the server
+        # namespace even though tools/list correctly advertises the bare name
+        # (for example ``meridian.get_sprint_items`` vs ``get_sprint_items``).
+        # Accept only our exact compatibility prefix so the advertised tool
+        # identity remains canonical and unrelated dotted tunnel names are not
+        # rewritten.
+        if isinstance(name, str) and name.startswith("meridian."):
+            name = name.removeprefix("meridian.")
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
         # 95499c3e / decision 6fe5210c — Option A project-scope enforcement for
