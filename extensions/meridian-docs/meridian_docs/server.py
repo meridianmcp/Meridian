@@ -380,6 +380,8 @@ def insert_figure_block(
     section_heading: str | None = None,
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """19be1551 — atomically insert a centered image paragraph AND its
@@ -414,6 +416,20 @@ def insert_figure_block(
     must match what was written. On a verification failure, the pre-write
     backup is restored and an error is returned instead of a false success.
 
+    ddd79188 — AFTER that structural verification passes, a real
+    render-capability check (check_render_capability) also runs against the
+    just-written file: structural re-parse alone can never prove the
+    document actually opens/renders in Word. "rendered" continues normally
+    with render evidence attached. "failed" (a render backend was available
+    but errored on this document) restores the pre-write backup and returns
+    an error, same as a structural verification failure. "unavailable-with-
+    reason" (no render backend in this environment) ALSO fails closed by
+    default — never reported as verified — unless allow_degraded_render=True
+    is passed together with a non-empty degraded_render_reason, an audited
+    opt-in that keeps the write but stamps render_verified=False /
+    render_degraded=True on the result instead of silently treating "could
+    not check" as "passed".
+
     Supported image formats, dimension inference, and the six-inch default
     width all match insert_image.
 
@@ -438,6 +454,18 @@ def insert_figure_block(
                        new figure/caption without a stale cache.
       style_policy:    Optional style policy overrides (see
                        resolve_style_policy).
+      allow_degraded_render: ddd79188 — explicit, audited opt-in to accept
+                       this write when no render backend is available in
+                       this environment (render status
+                       "unavailable-with-reason"). Requires
+                       degraded_render_reason. Never bypasses a real render
+                       "failed" status — only the "no backend available"
+                       case can be degraded.
+      degraded_render_reason: Required, non-empty when allow_degraded_render
+                       is True; carried onto the result as an audit trail
+                       (this stdlib-only, DB-free extension does not persist
+                       it itself — a caller with DB access, e.g. Meridian
+                       core, is responsible for logging/pinning it).
       session_id:      273df573 — identifies the calling Meridian session to
                        the tunnel-layer DOCX region-claim guard
                        (check_docs_write_conflict in meridian/routes/
@@ -447,9 +475,11 @@ def insert_figure_block(
 
     Returns:
       {status, image_para_id, image_name, kind, seq_number, label_text,
-      section_heading, ref_bookmark, docx_path}
+      section_heading, ref_bookmark, docx_path, render_status,
+      render_verified, render_backend, render_detail}
       or {error: <message>} on failure (file NOT left mutated on validation
-      failure; restored from backup on a post-write verification failure).
+      failure; restored from backup on a structural- or render-verification
+      failure).
     """
     return docs_intel.insert_figure_block(
         docx_path=docx_path,
@@ -462,6 +492,8 @@ def insert_figure_block(
         section_heading=section_heading,
         index_db_path=index_db_path,
         style_policy=style_policy,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 
@@ -1885,6 +1917,8 @@ def merge_docx_draft(
     canonical_path: str,
     draft_path: str,
     index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """fe989980 — promote an isolated wave-scoped draft into canonical_path.
@@ -1910,6 +1944,21 @@ def merge_docx_draft(
     mismatch canonical_path is best-effort restored from that backup and
     this returns an error, never a false success.
 
+    ddd79188 — AFTER that structural verification passes, a real
+    render-capability check (check_render_capability) also runs against the
+    now-promoted canonical_path: structural re-parse alone can never prove
+    the promoted document actually opens/renders in Word. "rendered"
+    continues normally with render evidence attached. "failed" (a render
+    backend was available but errored on this document) restores
+    canonical_path from the SAME backup and returns an error, same as a
+    structural verification failure. "unavailable-with-reason" (no render
+    backend in this environment) ALSO fails closed by default — never
+    reported as verified — unless allow_degraded_render=True is passed
+    together with a non-empty degraded_render_reason, an audited opt-in
+    that keeps the promotion but stamps render_verified=False /
+    render_degraded=True on the result instead of silently treating "could
+    not check" as "passed".
+
     session_id: 273df573 — identifies the calling Meridian session to the
       tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
       meridian/routes/tunnel.py; the guarded path is canonical_path, since
@@ -1917,16 +1966,24 @@ def merge_docx_draft(
       no effect when this tool is invoked outside Meridian's tunnel (e.g.
       standalone `uvx meridian-docs`).
 
+    allow_degraded_render / degraded_render_reason: see insert_figure_block's
+      docstring for the shared contract — required together, and the
+      reason is carried onto the result as an audit trail rather than
+      persisted by this stdlib-only, DB-free extension itself.
+
     Returns {merged: True, status: "merged", canonical_path, draft_path,
-    paragraph_count, heading_count, table_count, image_count} on success, or
+    paragraph_count, heading_count, table_count, image_count, render_status,
+    render_verified, render_backend, render_detail} on success, or
     {merged: False, error: <message>, ...} on failure — with
-    file_restored: <bool> present only when a post-promotion verification
-    failure triggered a restore.
+    file_restored: <bool> present only when a post-promotion structural- or
+    render-verification failure triggered a restore.
     """
     return docs_intel.merge_draft_into_canonical(
         canonical_path=canonical_path,
         draft_path=draft_path,
         index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 

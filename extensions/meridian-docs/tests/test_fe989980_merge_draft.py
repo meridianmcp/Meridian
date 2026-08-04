@@ -31,7 +31,34 @@ import inspect
 import io
 import zipfile
 
+import pytest
+
 from meridian_docs import docs_intel, server
+
+
+@pytest.fixture(autouse=True)
+def _default_render_capability(monkeypatch):
+    """ddd79188 -- merge_draft_into_canonical now invokes the real
+    render-capability gate (render_gate.check_render_capability) AFTER
+    structural verification passes. Every test in this file exercises
+    STRUCTURAL merge/draft correctness and must not depend on -- or be
+    slowed/blocked by -- whichever render backends (LibreOffice, Word COM)
+    happen to be installed on the machine running the suite. Stub a
+    successful 'rendered' result by default so every existing assertion
+    here keeps testing exactly what it tested before this gate existed.
+    Tests that specifically exercise the render gate's own
+    rendered/unavailable-with-reason/failed contract override this stub
+    explicitly (see the "render-capability gate" section below).
+    """
+    monkeypatch.setattr(
+        docs_intel.render_gate,
+        "check_render_capability",
+        lambda docx_path, **kwargs: {
+            "status": "rendered",
+            "backend": "test-stub",
+            "detail": {"stub": True},
+        },
+    )
 
 
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -419,7 +446,8 @@ def test_server_wrappers_expose_draft_params():
 def test_server_exposes_merge_docx_draft_tool():
     sig = inspect.signature(server.merge_docx_draft)
     assert list(sig.parameters) == [
-        "canonical_path", "draft_path", "index_db_path", "session_id",
+        "canonical_path", "draft_path", "index_db_path",
+        "allow_degraded_render", "degraded_render_reason", "session_id",
     ]
 
 
@@ -434,3 +462,183 @@ def test_server_merge_docx_draft_delegates_to_docs_intel(tmp_path):
     result = server.merge_docx_draft(canonical, draft)
 
     assert result["merged"] is True
+
+
+# ---------------------------------------------------------------------------
+# 5. Render-capability gate (ddd79188): rendered / unavailable-with-reason /
+#    failed, invoked AFTER structural verification passes -- closes the gap
+#    between structural re-parse and real Word/COM render verification.
+# ---------------------------------------------------------------------------
+
+def _draft_for_merge(tmp_path, canonical_name="canonical.docx", draft_name="draft.docx"):
+    canonical = _write_docx(tmp_path, _TWO_SECTION_XML, canonical_name)
+    draft = str(tmp_path / draft_name)
+    move_result = docs_intel.move_section(
+        canonical, "H0000002", "H0000001", destination_position="before",
+        draft_output_path=draft, wave_run_id="wave-1",
+    )
+    assert move_result["status"] == "moved"
+    return canonical, draft
+
+
+def test_merge_draft_into_canonical_rendered_status_reports_render_evidence(tmp_path, monkeypatch):
+    canonical, draft = _draft_for_merge(tmp_path)
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {
+            "status": "rendered", "backend": "libreoffice-soffice",
+            "detail": {"converted_via": "soffice", "output_filename": "out.pdf"},
+        },
+    )
+
+    result = docs_intel.merge_draft_into_canonical(canonical, draft)
+
+    assert result["merged"] is True
+    assert result["render_status"] == "rendered"
+    assert result["render_verified"] is True
+    assert result["render_backend"] == "libreoffice-soffice"
+    assert result["render_detail"]["converted_via"] == "soffice"
+
+
+def test_merge_draft_into_canonical_render_failed_restores_and_errors(tmp_path, monkeypatch):
+    """A structurally-valid promotion whose render attempt genuinely FAILS
+    must be restored from the pre-promotion backup and reported as an
+    error -- never silently accepted just because structural re-parse
+    passed."""
+    canonical, draft = _draft_for_merge(tmp_path)
+    with open(canonical, "rb") as fh:
+        original_canonical_bytes = fh.read()
+
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {
+            "status": "failed", "reason": "soffice crashed", "backend": "libreoffice-soffice",
+        },
+    )
+
+    result = docs_intel.merge_draft_into_canonical(canonical, draft)
+
+    assert result["merged"] is False
+    assert "error" in result
+    assert result["render_status"] == "failed"
+    assert result["file_restored"] is True
+    with open(canonical, "rb") as fh:
+        assert fh.read() == original_canonical_bytes, (
+            "a real render failure must restore canonical_path to its "
+            "pre-merge content, exactly like a structural verification "
+            "failure"
+        )
+
+
+def test_merge_draft_into_canonical_render_unavailable_fails_closed_by_default(tmp_path, monkeypatch):
+    """No render backend in this environment must NOT be silently treated as
+    verified -- by default this fails closed (restore + error) for
+    canonical/production promotion, exactly like a real render failure."""
+    canonical, draft = _draft_for_merge(tmp_path)
+    with open(canonical, "rb") as fh:
+        original_canonical_bytes = fh.read()
+
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {
+            "status": "unavailable-with-reason",
+            "reason": "no render backend available in this environment",
+        },
+    )
+
+    result = docs_intel.merge_draft_into_canonical(canonical, draft)
+
+    assert result["merged"] is False
+    assert "error" in result
+    assert result["render_status"] == "unavailable-with-reason"
+    assert result["file_restored"] is True
+    with open(canonical, "rb") as fh:
+        assert fh.read() == original_canonical_bytes
+
+
+def test_merge_draft_into_canonical_render_unavailable_degrades_with_audited_override(tmp_path, monkeypatch):
+    """allow_degraded_render=True + a non-empty degraded_render_reason is the
+    ONLY way to accept a promotion with no render verification -- and it
+    must never be reported as verified even when accepted."""
+    canonical, draft = _draft_for_merge(tmp_path)
+
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {
+            "status": "unavailable-with-reason",
+            "reason": "no render backend available in this environment",
+        },
+    )
+
+    result = docs_intel.merge_draft_into_canonical(
+        canonical, draft,
+        allow_degraded_render=True,
+        degraded_render_reason="CI sandbox has no LibreOffice/Word installed",
+    )
+
+    assert result["merged"] is True
+    assert result["render_status"] == "unavailable-with-reason"
+    assert result["render_verified"] is False
+    assert result["render_degraded"] is True
+    assert result["degraded_render_reason"] == "CI sandbox has no LibreOffice/Word installed"
+
+
+def test_merge_draft_into_canonical_allow_degraded_render_requires_non_empty_reason(tmp_path):
+    canonical, draft = _draft_for_merge(tmp_path)
+    with open(canonical, "rb") as fh:
+        original_canonical_bytes = fh.read()
+
+    result = docs_intel.merge_draft_into_canonical(
+        canonical, draft, allow_degraded_render=True,
+    )
+
+    assert result["merged"] is False
+    assert "error" in result
+    assert "degraded_render_reason" in result["error"]
+    with open(canonical, "rb") as fh:
+        assert fh.read() == original_canonical_bytes, (
+            "an invalid allow_degraded_render/degraded_render_reason pairing "
+            "must be rejected before any promotion is attempted"
+        )
+
+
+def test_merge_draft_into_canonical_structural_reparse_alone_never_yields_verified_render(tmp_path, monkeypatch):
+    """The critical invariant this whole item exists for: a promotion that
+    passes REAL structural verification (_verify_docx_write is NOT stubbed
+    -- this is a genuine promote + re-parse) must still fail closed when the
+    render backend cannot confirm the document actually renders. Structural
+    correctness and render verification are two separate,
+    independently-enforced checks; passing one must never be reported as
+    satisfying the other."""
+    canonical, draft = _draft_for_merge(tmp_path)
+
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {"status": "unavailable-with-reason", "reason": "no backend"},
+    )
+
+    result = docs_intel.merge_draft_into_canonical(canonical, draft)
+
+    # The promotion's STRUCTURE was genuinely fine -- yet the overall call
+    # still reports failure, because structural correctness alone is not
+    # enough to be reported "merged".
+    assert result["merged"] is False
+    assert "error" in result
+    assert result["render_status"] == "unavailable-with-reason"
+
+
+def test_server_merge_docx_draft_threads_degraded_render_params(tmp_path, monkeypatch):
+    canonical, draft = _draft_for_merge(tmp_path)
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {"status": "unavailable-with-reason", "reason": "no backend"},
+    )
+
+    result = server.merge_docx_draft(
+        canonical, draft,
+        allow_degraded_render=True, degraded_render_reason="no backend in test env",
+    )
+
+    assert result["merged"] is True
+    assert result["render_verified"] is False
+    assert result["render_degraded"] is True

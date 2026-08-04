@@ -52,6 +52,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Any
 
+from . import render_gate
+
 # OOXML namespaces.
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
@@ -2339,6 +2341,155 @@ def _safe_restore_after_verification_failure(
     return True, _restore_docx_backup(write_dest), False
 
 
+# ---------------------------------------------------------------------------
+# Render-capability gate (ddd79188) -- shared by insert_figure_block and
+# merge_draft_into_canonical. Closes the gap between STRUCTURAL verification
+# (this module's own re-parse-and-check, above) and REAL Word/COM (or
+# LibreOffice) render verification: a document can pass every structural
+# check here and still fail to open in Word. Must only be called AFTER
+# structural verification has already succeeded, and while the caller still
+# holds ``write_dest``'s :func:`_docx_promotion_lock` -- this function may
+# itself restore ``write_dest`` from the SAME pre-write ``.bak`` a structural
+# verification failure would restore from, so it needs the identical
+# compare-and-swap safety :func:`_safe_restore_after_verification_failure`
+# gives that path (never blindly clobber a different, already-promoted
+# concurrent writer's work).
+# ---------------------------------------------------------------------------
+
+def _enforce_render_verification(
+    write_dest: str,
+    *,
+    promoted_sha256: str | None,
+    allow_degraded_render: bool,
+    degraded_render_reason: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Invoke :func:`render_gate.check_render_capability` on ``write_dest``
+    and enforce its three-state contract (93cd9798: ``rendered`` /
+    ``unavailable-with-reason`` / ``failed``) as a write-time gate.
+
+    Returns ``(error, render_info)`` -- exactly one is non-``None``:
+
+    * ``(None, render_info)`` -- the write may stand. ``render_info`` is a
+      dict of render-evidence fields (``render_status``, ``render_verified``,
+      plus backend/reason detail) to merge into the caller's success payload.
+    * ``(error, None)`` -- the write must be rejected. ``error`` already
+      carries ``"error"``, ``"file_restored"``, and
+      ``"concurrent_write_detected"`` -- the same shape the caller's own
+      structural-verification-failure branch returns -- so the caller can
+      layer its own identifying fields (``docx_path`` / ``canonical_path`` /
+      ``draft_path`` / ``merged``) on top and return it verbatim.
+
+    Three-state handling:
+
+      - ``"rendered"`` -- a real render backend actually produced visual
+        output for this document. The ONLY status that means "verified" --
+        ``render_verified`` is ``True`` only here.
+      - ``"failed"`` -- a render backend WAS available but the render attempt
+        for THIS document errored. This is a real, confirmed problem: the
+        write is restored from backup (never left half-verified) and an
+        error is returned -- never reported as ``"rendered"``.
+      - ``"unavailable-with-reason"`` -- no render backend exists in this
+        environment. This says nothing about the document itself, but it
+        also means visual-render verification genuinely did not happen --
+        so this FAILS CLOSED (restore + error) for canonical/production
+        promotion by default, exactly like ``"failed"`` does. The only way
+        to proceed anyway is an EXPLICIT, audited opt-in:
+        ``allow_degraded_render=True`` paired with a non-empty
+        ``degraded_render_reason`` -- the write is then kept, but
+        ``render_verified`` is still ``False`` and ``render_degraded`` /
+        ``degraded_render_reason`` are stamped onto the payload so no
+        caller can mistake a degraded acceptance for a real verification.
+    """
+    try:
+        render_result = render_gate.check_render_capability(write_dest)
+    except Exception as exc:  # noqa: BLE001 -- a broken checker must fail closed, never crash the write or masquerade as verified
+        render_result = {
+            "status": render_gate.FAILED,
+            "reason": f"render capability check raised {type(exc).__name__}: {exc}",
+        }
+    if (
+        not isinstance(render_result, dict)
+        or render_result.get("status") not in render_gate.RENDER_STATUSES
+    ):
+        render_result = {
+            "status": render_gate.FAILED,
+            "reason": f"render capability check returned an invalid result: {render_result!r}",
+        }
+
+    status = render_result.get("status")
+    reason = render_result.get("reason")
+    backend = render_result.get("backend")
+    detail = render_result.get("detail")
+
+    if status == render_gate.RENDERED:
+        return None, {
+            "render_status": status,
+            "render_verified": True,
+            "render_backend": backend,
+            "render_detail": detail,
+        }
+
+    degraded_accepted = (
+        status == render_gate.UNAVAILABLE_WITH_REASON
+        and allow_degraded_render
+        and bool(degraded_render_reason and str(degraded_render_reason).strip())
+    )
+    if degraded_accepted:
+        return None, {
+            "render_status": status,
+            "render_verified": False,
+            "render_reason": reason,
+            "render_degraded": True,
+            "degraded_render_reason": str(degraded_render_reason).strip(),
+        }
+
+    # Fail closed: restore-then-error -- identical CAS discipline to a
+    # structural verification failure, since a real (concurrent) writer may
+    # have already promoted something newer to write_dest since our own
+    # promotion.
+    safe_to_restore, restored, concurrent_write_detected = (
+        _safe_restore_after_verification_failure(write_dest, promoted_sha256)
+    )
+    if status == render_gate.FAILED:
+        headline = f"render verification failed: {reason or 'unknown render error'}"
+    else:
+        headline = (
+            "render verification unavailable in this environment "
+            f"({reason or 'no render backend available'}) -- failing closed for "
+            "canonical/production promotion. Pass allow_degraded_render=True "
+            "with a non-empty degraded_render_reason to explicitly accept this "
+            "write without real visual-render verification (audited degrade, "
+            "never a silent one)."
+        )
+    error: dict[str, Any] = {
+        "error": headline,
+        "render_status": status,
+        "render_reason": reason,
+        "file_restored": restored,
+        "concurrent_write_detected": concurrent_write_detected,
+    }
+    if not safe_to_restore:
+        if concurrent_write_detected:
+            error["error"] = (
+                error["error"]
+                + " -- AND a different writer's promotion has landed on this "
+                "file since ours, so this could not be safely auto-corrected: "
+                "restoring from our own backup would destroy that writer's "
+                f"already-promoted work. {write_dest} was left untouched, "
+                "exactly as that other writer left it -- investigate manually."
+            )
+        else:
+            error["error"] = (
+                error["error"]
+                + " -- this write's own promotion fingerprint is unavailable, "
+                "so it could not be safely confirmed that restoring from "
+                "backup would not destroy a different writer's work; "
+                f"{write_dest} was left untouched rather than risk it -- "
+                "investigate manually."
+            )
+    return error, None
+
+
 def _verify_docx_write(
     docx_path: str,
     *,
@@ -3532,6 +3683,8 @@ def insert_figure_block(
     section_heading: str | None = None,
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """19be1551 — atomically insert a centered image paragraph AND its
     adjacent real SEQ Figure caption in a SINGLE document-load-mutate-save
@@ -3582,10 +3735,27 @@ def insert_figure_block(
     Supported image formats, dimension inference, and the six-inch default
     width all match :func:`insert_image`.
 
+    ddd79188 -- AFTER structural verification passes, this also invokes
+    :func:`render_gate.check_render_capability` on the just-written
+    ``docx_path`` (see :func:`_enforce_render_verification`) -- structural
+    XML re-parse alone (the check above) can never prove the document
+    actually opens/renders correctly in Word. ``"rendered"`` continues
+    normally with render evidence attached to the success payload.
+    ``"failed"`` (a render backend WAS available but errored on this
+    document) restores ``docx_path`` from the SAME pre-write backup and
+    returns an error -- exactly like a structural verification failure.
+    ``"unavailable-with-reason"`` (no render backend in this environment)
+    ALSO fails closed by default -- it is never reported as verified --
+    unless the caller explicitly passes ``allow_degraded_render=True`` with
+    a non-empty ``degraded_render_reason``, an audited opt-in that keeps the
+    write but stamps ``render_verified=False`` / ``render_degraded=True`` on
+    the payload rather than silently treating "could not check" as "passed".
+
     Returns ``{status, image_para_id, image_name, kind, seq_number,
-    label_text, section_heading, ref_bookmark, docx_path}``, or
-    ``{"error": message}`` without mutating the document on validation
-    failure or verification failure that could not be cleanly restored.
+    label_text, section_heading, ref_bookmark, docx_path, render_status,
+    render_verified, ...}``, or ``{"error": message}`` without mutating the
+    document on validation failure, structural verification failure, or
+    render-verification failure that could not be cleanly restored.
     """
     if not isinstance(docx_path, str) or not docx_path:
         return {"error": "docx_path must be a non-empty string"}
@@ -3595,6 +3765,16 @@ def insert_figure_block(
         return {"error": "position must be before or after"}
     if not label_text or not str(label_text).strip():
         return {"error": "label_text must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
     suffix = os.path.splitext(image_path)[1].lower()
     image_type = _IMAGE_TYPES.get(suffix)
     if image_type is None:
@@ -3757,6 +3937,22 @@ def insert_figure_block(
             verify_error["docx_path"] = docx_path
             return verify_error
 
+        # ddd79188 -- structural verification alone (above) can never prove
+        # the document actually renders in Word; run the real render-
+        # capability gate now, still inside the promotion lock so a
+        # fail-closed restore has the same CAS safety a structural failure
+        # gets. Must run AFTER structural verification, not instead of it.
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["image_para_id"] = image_para_id
+            render_error["docx_path"] = docx_path
+            return render_error
+
     _invalidate_sidecar_mtime(index_db_path)
     if index_db_path and os.path.exists(index_db_path):
         _upsert_sidecar_caption(
@@ -3779,6 +3975,7 @@ def insert_figure_block(
         "section_heading": section_heading,
         "ref_bookmark": ref_bookmark,
         "docx_path": docx_path,
+        **render_info,
     }
 
 
@@ -9005,6 +9202,8 @@ def merge_draft_into_canonical(
     canonical_path: str,
     draft_path: str,
     index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """fe989980 -- promote an isolated wave-scoped draft into ``canonical_path``.
 
@@ -9037,17 +9236,44 @@ def merge_draft_into_canonical(
          On mismatch, ``canonical_path`` is best-effort restored from the
          backup :func:`_atomic_write_docx_bytes` just wrote and this returns
          an ERROR -- never a false success.
+      4. ddd79188 -- AFTER step 3's structural verification passes,
+         :func:`render_gate.check_render_capability` is invoked on the now-
+         promoted ``canonical_path`` (see :func:`_enforce_render_verification`).
+         Structural reparse alone (step 3) can never prove the promoted
+         document actually opens/renders in Word. ``"rendered"`` continues
+         normally with render evidence attached. ``"failed"`` (a render
+         backend errored on this specific document) restores
+         ``canonical_path`` from the SAME backup and returns an error, same
+         as a step-3 failure. ``"unavailable-with-reason"`` (no render
+         backend in this environment) ALSO fails closed by default --
+         never reported as verified -- unless the caller explicitly passes
+         ``allow_degraded_render=True`` with a non-empty
+         ``degraded_render_reason`` (audited opt-in: the promotion is kept
+         but ``render_verified=False`` / ``render_degraded=True`` are
+         stamped onto the payload).
 
     Returns ``{"merged": True, "status": "merged", "canonical_path",
     "draft_path", "paragraph_count", "heading_count", "table_count",
-    "image_count"}`` on success.
+    "image_count", "render_status", "render_verified", ...}`` on success.
 
     Returns ``{"merged": False, "error": <message>, ...}`` on failure --
     with ``"file_restored": <bool>`` present only for the post-promotion
-    verification-failure case (step 3); every other failure mode leaves
+    structural-verification-failure case (step 3) or the render-verification
+    failure case (step 4); every other failure mode leaves
     ``canonical_path`` untouched by construction, so there is nothing to
     restore.
     """
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "merged": False,
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            ),
+        }
     if not draft_path or not os.path.exists(draft_path):
         return {
             "merged": False,
@@ -9125,6 +9351,8 @@ def merge_draft_into_canonical(
                 "error": f"could not write {canonical_path}: {exc}",
             }
 
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
         verify_error = _verify_docx_write(
             canonical_path,
             expected_counts=draft_counts,
@@ -9139,10 +9367,7 @@ def merge_draft_into_canonical(
             # our own backup would destroy that writer's completed,
             # already-promoted work -- check first.
             safe_to_restore, restored, concurrent_write_detected = (
-                _safe_restore_after_verification_failure(
-                    canonical_path,
-                    transaction.get("promoted_sha256") if transaction else None,
-                )
+                _safe_restore_after_verification_failure(canonical_path, promoted_sha256)
             )
             verify_error["merged"] = False
             verify_error["file_restored"] = restored
@@ -9171,6 +9396,23 @@ def merge_draft_into_canonical(
             verify_error["draft_path"] = draft_path
             return verify_error
 
+        # ddd79188 -- structural verification alone (above) can never prove
+        # the promoted document actually renders in Word; run the real
+        # render-capability gate now, still inside the promotion lock so a
+        # fail-closed restore has the same CAS safety a structural failure
+        # gets. Must run AFTER structural verification, not instead of it.
+        render_error, render_info = _enforce_render_verification(
+            canonical_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["merged"] = False
+            render_error["canonical_path"] = canonical_path
+            render_error["draft_path"] = draft_path
+            return render_error
+
     _invalidate_sidecar_mtime(index_db_path)
 
     return {
@@ -9179,6 +9421,7 @@ def merge_draft_into_canonical(
         "canonical_path": canonical_path,
         "draft_path": draft_path,
         **draft_counts,
+        **render_info,
     }
 
 
