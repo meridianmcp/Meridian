@@ -126,7 +126,22 @@ def search_document(
     element_types: list[str] | None = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """BM25-search all searchable DOCX XML parts with structural filters."""
+    """BM25-search all searchable DOCX XML parts with structural filters.
+
+    c7cc9da4 -- the anchor-resolution surface for review-session
+    recommendations: every result carries a stable ``element_id``
+    (paragraph/heading/section/table/caption), an exact literal
+    ``quoted_text`` (safe to quote verbatim, unlike ``snippet`` which may be
+    "…"-truncated), and a ``word_search_locator`` -- ``{find_text, part,
+    element_id, unique_in_part, occurrence_count_in_part}`` -- telling a
+    reviewer whether pasting ``find_text`` into Word's own Ctrl+F box lands
+    unambiguously on this occurrence. Image anchors resolve via a
+    ``figure_caption`` result's ``element_id`` (its caption) paired with
+    ``find_image_paragraph`` for the picture paragraph itself; equation
+    anchors come from ``extract_equations`` / ``get_equations`` instead,
+    since OMML math has no searchable body text. See
+    ``docs_intel.search_document_xml`` for the full contract.
+    """
     return docs_intel.search_document_xml(
         docx_path=docx_path,
         query=query,
@@ -162,7 +177,19 @@ def highlight_document(
 
 @mcp.tool()
 def read_document_snapshot(docx_path: str) -> dict[str, Any]:
-    """Read the last saved DOCX snapshot without writing or requiring a close."""
+    """Read the last saved DOCX snapshot without writing or requiring a close.
+
+    c7cc9da4 -- the entry point for a Meridian-docs review session: never
+    treats a Word ~$ lock file as a blocker, and always reads the last
+    SAVED on-disk bytes (unsaved Word edits are invisible until saved).
+    Returns a ``source_sha256`` fingerprint of those exact bytes -- record
+    it and re-check it (e.g. via ``render_gate.verify_promotion_readiness``)
+    before promoting any later draft/overlay, so a promotion never lands
+    against content the review never actually saw -- plus an explicit
+    ``limitations`` list spelling out both caveats for a caller that
+    forwards this snapshot into a recommendation or report. See
+    ``docs_intel.read_document_snapshot`` for the full contract.
+    """
     return docs_intel.read_document_snapshot(docx_path)
 
 

@@ -18,6 +18,8 @@ module exists to report honestly rather than assume away.
 """
 from __future__ import annotations
 
+import hashlib
+import zipfile
 from typing import Any, Callable
 
 from meridian_docs import render_gate, server
@@ -30,6 +32,52 @@ def _write_dummy_docx(tmp_path, name: str = "doc.docx") -> str:
     path = tmp_path / name
     path.write_bytes(b"not a real docx -- render_gate never opens this itself")
     return str(path)
+
+
+_DOCUMENT_XML_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+{paragraphs}
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def _write_real_docx(
+    tmp_path,
+    name: str = "doc.docx",
+    *,
+    paragraph_count: int = 2,
+    media_files: list[str] | None = None,
+    table_count: int = 0,
+) -> str:
+    """A genuinely valid, parseable .docx -- unlike ``_write_dummy_docx``,
+    used for ``verify_promotion_readiness`` tests, which DOES parse content
+    (structural counts) rather than delegating entirely to a render backend.
+    """
+    paragraphs = "\n".join(
+        f'    <w:p w14:paraId="P{i:07d}"><w:r><w:t>Paragraph {i}.</w:t></w:r></w:p>'
+        for i in range(paragraph_count)
+    )
+    tables = "\n".join(
+        "    <w:tbl><w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>"
+        for _ in range(table_count)
+    )
+    document_xml = _DOCUMENT_XML_TEMPLATE.format(paragraphs=paragraphs + "\n" + tables)
+    path = tmp_path / name
+    with zipfile.ZipFile(str(path), "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", document_xml)
+        for media_name in media_files or []:
+            archive.writestr(f"word/media/{media_name}", b"fake-binary-media")
+    return str(path)
+
+
+def _sha256_of(path: str) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
 
 
 def _fake_backend(
@@ -279,3 +327,159 @@ def test_server_tool_is_registered_as_an_mcp_tool():
     assert callable(server.check_render_capability)
     sig = inspect.signature(server.check_render_capability)
     assert list(sig.parameters) == ["docx_path"]
+
+
+# ---------------------------------------------------------------------------
+# verify_promotion_readiness (c7cc9da4) -- fingerprint equality + structural/
+# render verification gate for a review session's draft/overlay promotion.
+# ---------------------------------------------------------------------------
+
+def test_verify_promotion_readiness_ready_when_fingerprint_and_structure_hold(tmp_path):
+    canonical_path = _write_real_docx(tmp_path, "canonical.docx", paragraph_count=2)
+    draft_path = _write_real_docx(tmp_path, "draft.docx", paragraph_count=3)
+    expected = _sha256_of(canonical_path)
+
+    result = render_gate.verify_promotion_readiness(
+        canonical_path, draft_path, expected, backends=[]
+    )
+
+    assert result["ready"] is True
+    assert result["reason"] is None
+    assert result["fingerprint_check"]["match"] is True
+    assert result["fingerprint_check"]["expected_source_sha256"] == expected
+    assert result["structural_check"]["dropped_families"] == []
+    # backends=[] -> render backend genuinely unavailable in this test env;
+    # that must NOT block readiness when require_render defaults to False.
+    assert result["render_check"]["status"] == render_gate.UNAVAILABLE_WITH_REASON
+
+
+def test_verify_promotion_readiness_refuses_on_fingerprint_mismatch(tmp_path):
+    canonical_path = _write_real_docx(tmp_path, "canonical.docx")
+    draft_path = _write_real_docx(tmp_path, "draft.docx")
+
+    result = render_gate.verify_promotion_readiness(
+        canonical_path, draft_path, "0" * 64, backends=[]
+    )
+
+    assert result["ready"] is False
+    assert result["fingerprint_check"]["match"] is False
+    assert "changed on disk" in result["reason"]
+
+
+def test_verify_promotion_readiness_refuses_when_draft_drops_media(tmp_path):
+    canonical_path = _write_real_docx(
+        tmp_path, "canonical.docx", media_files=["image1.png"]
+    )
+    draft_path = _write_real_docx(tmp_path, "draft.docx", media_files=[])
+    expected = _sha256_of(canonical_path)
+
+    result = render_gate.verify_promotion_readiness(
+        canonical_path, draft_path, expected, backends=[]
+    )
+
+    assert result["ready"] is False
+    assert "media_count" in result["structural_check"]["dropped_families"]
+    assert "media_count" in result["reason"]
+
+
+def test_verify_promotion_readiness_refuses_when_draft_drops_a_table(tmp_path):
+    canonical_path = _write_real_docx(tmp_path, "canonical.docx", table_count=1)
+    draft_path = _write_real_docx(tmp_path, "draft.docx", table_count=0)
+    expected = _sha256_of(canonical_path)
+
+    result = render_gate.verify_promotion_readiness(
+        canonical_path, draft_path, expected, backends=[]
+    )
+
+    assert result["ready"] is False
+    assert "table_count" in result["structural_check"]["dropped_families"]
+
+
+def test_verify_promotion_readiness_adding_structure_is_fine(tmp_path):
+    canonical_path = _write_real_docx(tmp_path, "canonical.docx", media_files=[])
+    draft_path = _write_real_docx(tmp_path, "draft.docx", media_files=["new.png"])
+    expected = _sha256_of(canonical_path)
+
+    result = render_gate.verify_promotion_readiness(
+        canonical_path, draft_path, expected, backends=[]
+    )
+
+    assert result["ready"] is True
+    assert result["structural_check"]["dropped_families"] == []
+
+
+def test_verify_promotion_readiness_require_render_blocks_when_unavailable(tmp_path):
+    canonical_path = _write_real_docx(tmp_path, "canonical.docx")
+    draft_path = _write_real_docx(tmp_path, "draft.docx")
+    expected = _sha256_of(canonical_path)
+
+    result = render_gate.verify_promotion_readiness(
+        canonical_path, draft_path, expected, require_render=True, backends=[]
+    )
+
+    assert result["ready"] is False
+    assert "require_render" in result["reason"]
+    assert result["render_check"]["status"] == render_gate.UNAVAILABLE_WITH_REASON
+
+
+def test_verify_promotion_readiness_require_render_passes_when_rendered(tmp_path):
+    canonical_path = _write_real_docx(tmp_path, "canonical.docx")
+    draft_path = _write_real_docx(tmp_path, "draft.docx")
+    expected = _sha256_of(canonical_path)
+    fake_backend = _fake_backend("fake-ok", available=True, render=lambda path: {"ok": True})
+
+    result = render_gate.verify_promotion_readiness(
+        canonical_path,
+        draft_path,
+        expected,
+        require_render=True,
+        backends=[fake_backend],
+    )
+
+    assert result["ready"] is True
+    assert result["render_check"]["status"] == render_gate.RENDERED
+
+
+def test_verify_promotion_readiness_never_mutates_either_file(tmp_path):
+    canonical_path = _write_real_docx(tmp_path, "canonical.docx")
+    draft_path = _write_real_docx(tmp_path, "draft.docx")
+    expected = _sha256_of(canonical_path)
+    canonical_before = _sha256_of(canonical_path)
+    draft_before = _sha256_of(draft_path)
+
+    render_gate.verify_promotion_readiness(
+        canonical_path, draft_path, "0" * 64, backends=[]
+    )
+    render_gate.verify_promotion_readiness(
+        canonical_path, draft_path, expected, require_render=True, backends=[]
+    )
+
+    assert _sha256_of(canonical_path) == canonical_before
+    assert _sha256_of(draft_path) == draft_before
+
+
+def test_verify_promotion_readiness_fails_closed_on_missing_arguments(tmp_path):
+    canonical_path = _write_real_docx(tmp_path, "canonical.docx")
+
+    assert render_gate.verify_promotion_readiness("", "draft.docx", "abc")["ready"] is False
+    assert render_gate.verify_promotion_readiness(canonical_path, "", "abc")["ready"] is False
+    assert render_gate.verify_promotion_readiness(canonical_path, "draft.docx", "")["ready"] is False
+
+
+def test_verify_promotion_readiness_fails_closed_on_missing_files(tmp_path):
+    missing = str(tmp_path / "does_not_exist.docx")
+    draft_path = _write_real_docx(tmp_path, "draft.docx")
+
+    canonical_missing = render_gate.verify_promotion_readiness(
+        missing, draft_path, "a" * 64, backends=[]
+    )
+    assert canonical_missing["ready"] is False
+    assert "canonical_path" in canonical_missing["reason"]
+
+    canonical_path = _write_real_docx(tmp_path, "canonical.docx")
+    expected = _sha256_of(canonical_path)
+    draft_missing = render_gate.verify_promotion_readiness(
+        canonical_path, missing, expected, backends=[]
+    )
+    assert draft_missing["ready"] is False
+    assert draft_missing["structural_check"]["error"]

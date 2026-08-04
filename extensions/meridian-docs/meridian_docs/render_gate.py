@@ -37,16 +37,31 @@ Rendering itself is delegated to pluggable :class:`RenderBackend` probes
 COM automation via ``pywin32``) so this module stays a thin, mockable
 detection layer -- exactly like ``local_ingest.py``'s PDF boundary defers to
 the caller rather than shipping a bespoke PDF engine.
+
+c7cc9da4 -- :func:`verify_promotion_readiness` builds on both halves of
+that pairing (a fingerprinted read-only snapshot + this module's render
+check) to gate a Meridian-docs REVIEW SESSION's draft/overlay promotion:
+source-fingerprint equality against the snapshot's ``source_sha256``, a
+cheap structural comparison, and this module's own three-state render
+check, combined into one fail-closed readiness verdict that never mutates
+either file -- the actual promotion still goes through
+``docs_intel.merge_draft_into_canonical``.
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
+
+from . import docs_intel
 
 __all__ = [
     "RENDERED",
@@ -58,6 +73,7 @@ __all__ = [
     "KNOWN_BACKENDS",
     "detect_backend",
     "check_render_capability",
+    "verify_promotion_readiness",
 ]
 
 # ---------------------------------------------------------------------------
@@ -311,3 +327,223 @@ def check_render_capability(
         return _result(FAILED, reason=f"{type(exc).__name__}: {exc}", backend=backend.name)
 
     return _result(RENDERED, backend=backend.name, detail=detail)
+
+
+# ---------------------------------------------------------------------------
+# Promotion gate: fingerprint equality + structural/render verification
+# (c7cc9da4) for a Meridian-docs review session's draft/overlay.
+# ---------------------------------------------------------------------------
+
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _sha256_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _read_file_bytes(path: str) -> bytes | None:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _docx_media_count(raw: bytes) -> int:
+    """Count ``word/media/*`` parts in the ZIP bytes.
+
+    Deliberately self-contained (does not reach into
+    ``docs_intel``'s private ``_docx_media_count``) so this module keeps its
+    own minimal, independently-readable structural check -- the same
+    stdlib-only philosophy the rest of this module already follows.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            return sum(1 for name in archive.namelist() if name.startswith("word/media/"))
+    except zipfile.BadZipFile:
+        return 0
+
+
+def _docx_table_count(raw: bytes) -> int:
+    """Count top-level ``<w:tbl>`` elements in ``word/document.xml``."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            document_xml = archive.read("word/document.xml")
+    except (KeyError, zipfile.BadZipFile):
+        return 0
+    try:
+        root = ET.fromstring(document_xml)
+    except ET.ParseError:
+        return 0
+    return sum(1 for _ in root.iter(f"{{{_W_NS}}}tbl"))
+
+
+def _structural_snapshot(raw: bytes) -> dict[str, int | None]:
+    """A cheap, read-only structural fingerprint: paragraph/media/table
+    counts. Reuses ``docs_intel.parse_docx`` (public API) for the paragraph
+    count rather than duplicating OOXML paragraph-walking logic here.
+    """
+    try:
+        paragraph_count: int | None = len(docs_intel.parse_docx(raw))
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile, ET.ParseError):
+        paragraph_count = None
+    return {
+        "paragraph_count": paragraph_count,
+        "media_count": _docx_media_count(raw),
+        "table_count": _docx_table_count(raw),
+    }
+
+
+def verify_promotion_readiness(
+    canonical_path: str,
+    draft_path: str,
+    expected_source_sha256: str,
+    *,
+    require_render: bool = False,
+    backends: Sequence[RenderBackend] = KNOWN_BACKENDS,
+) -> dict[str, Any]:
+    """Fail-closed pre-promotion gate for a Meridian-docs review-session draft.
+
+    A review session reads a read-only snapshot of ``canonical_path`` (via
+    ``docs_intel.read_document_snapshot``, which stamps a ``source_sha256``
+    fingerprint of the exact bytes it read), accumulates recommendations
+    anchored against that snapshot, and stages any accepted edits into an
+    ISOLATED draft/overlay -- never ``canonical_path`` itself (see
+    ``move_section`` / ``copy_section`` / ``relocate_figure`` /
+    ``relocate_table``'s ``draft_output_path`` parameter). Before that draft
+    is handed to ``merge_docx_draft`` (``docs_intel.merge_draft_into_
+    canonical``) for the actual promotion, THIS function is the check a
+    caller must never skip:
+
+      1. SOURCE-FINGERPRINT EQUALITY -- ``canonical_path`` is re-read and
+         re-fingerprinted exactly as it sits on disk RIGHT NOW and compared
+         against ``expected_source_sha256`` (the ``source_sha256`` the
+         review session's original ``read_document_snapshot`` call
+         recorded). A mismatch means ``canonical_path`` was saved -- in
+         Word, or by a different writer -- since the review snapshot was
+         taken, so every recommendation's anchor may now point at stale
+         content: this is refused (``ready=False``), never silently waved
+         through.
+      2. STRUCTURAL VERIFICATION -- a cheap, read-only comparison of
+         paragraph/media/table counts between ``draft_path`` and
+         ``canonical_path``. ``draft_path`` must parse as a valid .docx and
+         must never have FEWER media or table elements than
+         ``canonical_path`` (it may add; it must never silently drop) --
+         the same "never silently lose structural content" invariant
+         ``docs_intel._atomic_write_docx_bytes`` already enforces at write
+         time, applied here as an early, pre-flight sanity check rather
+         than a duplicate of that write-time gate (``merge_docx_draft``
+         still performs its own, more thorough structural verification at
+         promotion time; this is a cheap first filter, not a replacement).
+      3. RENDER VERIFICATION -- ``check_render_capability`` is run against
+         ``draft_path`` (the artifact about to become canonical) and its
+         three-state result is always returned under ``render_check``. In
+         keeping with this module's core contract -- "we could not check"
+         must never be conflated with "we verified" OR treated as a
+         document defect -- an environment with no render backend does NOT
+         fail this gate by default (``require_render=False``): the
+         "unavailable-with-reason" result is surfaced as a caveat, not a
+         blocker. Pass ``require_render=True`` for a caller/project that
+         has declared rendering a REQUIRED capability (mirroring the
+         required/optional/degraded_ok distinction Meridian's capability
+         manifests already use elsewhere) -- with it set, anything other
+         than a real ``"rendered"`` result blocks promotion.
+
+    This function NEVER mutates ``canonical_path`` or ``draft_path`` -- it
+    is pure read-only verification, fail-closed by construction (any
+    missing argument, unreadable file, fingerprint mismatch, or dropped
+    structural family makes ``ready=False``). The actual promotion
+    (staging, atomic swap, restore-on-failure) remains
+    ``merge_docx_draft``'s job -- this only decides whether that call
+    should be attempted at all.
+
+    Returns ``{"ready": bool, "reason": str | None, "fingerprint_check":
+    {...}, "structural_check": {...}, "render_check": {...} | None}``.
+    ``reason`` is ``None`` exactly when ``ready`` is ``True``; otherwise it
+    is a semicolon-joined summary of every check that failed (not just the
+    first one), so a caller sees the whole picture in one call.
+    """
+    if not canonical_path or not str(canonical_path).strip():
+        return {"ready": False, "reason": "canonical_path must be a non-empty string"}
+    if not draft_path or not str(draft_path).strip():
+        return {"ready": False, "reason": "draft_path must be a non-empty string"}
+    if not expected_source_sha256 or not str(expected_source_sha256).strip():
+        return {
+            "ready": False,
+            "reason": (
+                "expected_source_sha256 must be a non-empty string -- pass "
+                "the source_sha256 a prior docs_intel.read_document_snapshot "
+                "call recorded for canonical_path before this review "
+                "session's recommendations were built"
+            ),
+        }
+
+    reasons: list[str] = []
+
+    canonical_raw = _read_file_bytes(canonical_path)
+    if canonical_raw is None:
+        return {
+            "ready": False,
+            "reason": f"could not read canonical_path: {canonical_path!r}",
+        }
+    current_source_sha256 = _sha256_bytes(canonical_raw)
+    fingerprint_match = current_source_sha256 == expected_source_sha256
+    fingerprint_check: dict[str, Any] = {
+        "expected_source_sha256": expected_source_sha256,
+        "current_source_sha256": current_source_sha256,
+        "match": fingerprint_match,
+    }
+    if not fingerprint_match:
+        reasons.append(
+            "canonical_path has changed on disk since the review snapshot's "
+            "source_sha256 was recorded -- every recommendation's anchor "
+            "may now point at stale content; refusing to promote"
+        )
+
+    draft_raw = _read_file_bytes(draft_path)
+    structural_check: dict[str, Any]
+    if draft_raw is None:
+        structural_check = {"error": f"could not read draft_path: {draft_path!r}"}
+        reasons.append(structural_check["error"])
+    else:
+        canonical_structure = _structural_snapshot(canonical_raw)
+        draft_structure = _structural_snapshot(draft_raw)
+        dropped = [
+            key
+            for key in ("media_count", "table_count")
+            if draft_structure[key] is not None
+            and canonical_structure[key] is not None
+            and draft_structure[key] < canonical_structure[key]
+        ]
+        structural_check = {
+            "canonical": canonical_structure,
+            "draft": draft_structure,
+            "dropped_families": dropped,
+        }
+        if draft_structure["paragraph_count"] is None:
+            reasons.append(f"draft_path {draft_path!r} is not a parseable .docx")
+        if dropped:
+            reasons.append(
+                "draft_path has FEWER " + ", ".join(dropped) + " than "
+                "canonical_path -- a draft must never silently drop "
+                "structural content relative to what it is replacing"
+            )
+
+    render_check: dict[str, Any] | None = None
+    if draft_raw is not None:
+        render_check = check_render_capability(draft_path, backends=backends)
+        if require_render and render_check["status"] != RENDERED:
+            reasons.append(
+                "require_render=True and draft_path did not verify as "
+                f"rendered (status={render_check['status']!r}): "
+                f"{render_check.get('reason', '(no reason given)')}"
+            )
+
+    ready = not reasons
+    return {
+        "ready": ready,
+        "reason": None if ready else "; ".join(reasons),
+        "fingerprint_check": fingerprint_check,
+        "structural_check": structural_check,
+        "render_check": render_check,
+    }

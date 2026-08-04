@@ -10355,6 +10355,27 @@ def _search_snippet(text: str, terms: list[str], radius: int = 90) -> str:
     return prefix + text[start:end] + suffix
 
 
+def _search_locator_text(text: str, terms: list[str], radius: int = 40) -> str:
+    """c7cc9da4 -- a short, LITERAL substring of ``text`` around the first
+    match: exact characters only, never an ellipsis or any other synthesized
+    character, so pasting this verbatim into Word's own Ctrl+F Find box
+    actually locates this occurrence.
+
+    Distinct from :func:`_search_snippet`, which is a human-readable preview
+    (may be prefixed/suffixed with "…") and is not guaranteed to be an exact
+    substring Word's own Find can match.
+    """
+    if not text:
+        return ""
+    folded = text.casefold()
+    positions = [folded.find(term) for term in terms if term and folded.find(term) >= 0]
+    if not positions:
+        return text.strip()[: radius * 2]
+    start = max(0, min(positions) - radius)
+    end = min(len(text), max(positions) + max(map(len, terms)) + radius)
+    return text[start:end].strip()
+
+
 def _search_element_text(element: ET.Element) -> str:
     return "".join(
         node.text or ""
@@ -10553,6 +10574,7 @@ def _bm25_search_units(
             enriched = dict(unit)
             enriched["bm25_score"] = score
             enriched["snippet"] = _search_snippet(unit["text"], terms)
+            enriched["quoted_text"] = _search_locator_text(unit["text"], terms)
             enriched["highlight_ranges"] = [
                 [match.start(), match.end()]
                 for term in terms
@@ -10561,6 +10583,43 @@ def _bm25_search_units(
             scored.append((score, order, enriched))
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [unit for _score, _order, unit in scored[: max(0, int(limit))]]
+
+
+def _attach_word_search_locators(
+    results: list[dict[str, Any]], all_units: list[dict[str, Any]]
+) -> None:
+    """c7cc9da4 -- stamp each result with a Word-Find-ready locator.
+
+    A recommendation anchored to a search result needs more than
+    ``element_id`` (which addresses an OOXML paragraph/table/section, not
+    something a human reviewer can act on directly inside Word):
+    ``word_search_locator`` pairs the same literal text ``quoted_text``
+    already carries with how many times that EXACT literal string occurs
+    anywhere else in the same XML part (counted across ``all_units`` --
+    the unfiltered, whole-part unit list, not just the returned matches, so
+    the count reflects the real document, not just this query's results).
+
+    ``unique_in_part=True`` means pasting ``find_text`` into Word's own
+    Ctrl+F box lands on this occurrence and only this one; otherwise
+    ``occurrence_count_in_part`` tells the reviewer how many Find-Next
+    presses to expect -- this module has no way to drive Word's cursor
+    itself, so an honest count is the best it can hand back.
+    """
+    part_corpus: dict[str, str] = {}
+    for unit in all_units:
+        part_corpus[unit["part"]] = part_corpus.get(unit["part"], "") + "\n" + unit["text"]
+    for result in results:
+        quoted_text = result.get("quoted_text") or ""
+        part = result.get("part", "")
+        corpus = part_corpus.get(part, "")
+        occurrences = corpus.casefold().count(quoted_text.casefold()) if quoted_text else 0
+        result["word_search_locator"] = {
+            "find_text": quoted_text,
+            "part": part,
+            "element_id": result.get("element_id"),
+            "unique_in_part": occurrences == 1,
+            "occurrence_count_in_part": occurrences,
+        }
 
 
 def search_document_xml(
@@ -10578,6 +10637,33 @@ def search_document_xml(
     tables. This is a stateless first-stage search; the existing sidecar FTS5
     index remains the fast paragraph-only path, while this surface covers the
     whole package and leaves a clean seam for a future vector engine.
+
+    c7cc9da4 -- this is the anchor-resolution surface for a Meridian-docs
+    review session's recommendations. Each result carries, in addition to
+    ``element_id`` (the stable paragraph/section/table/caption id a
+    recommendation attaches to):
+
+      - ``quoted_text``: an exact, literal substring of the source text
+        around the match -- unlike ``snippet``, it never contains a
+        synthesized "…" truncation marker, so it is safe to quote verbatim
+        in a recommendation or paste into Word's own Find box.
+      - ``word_search_locator``: ``{find_text, part, element_id,
+        unique_in_part, occurrence_count_in_part}`` -- ``find_text`` is the
+        same literal text as ``quoted_text``; ``unique_in_part`` tells a
+        reviewer whether a plain Ctrl+F search for it in Word will land on
+        this occurrence and only this one, or whether ``Find Next`` will be
+        needed ``occurrence_count_in_part`` times.
+
+    Image anchors resolve via the neighboring ``figure_caption`` result's
+    ``element_id`` (the caption paragraph) together with
+    :func:`find_image_paragraph`, which returns the picture paragraph's own
+    id for a given ``figure_index`` -- an image paragraph carries no
+    searchable text of its own, so it is never a direct search hit. Equation
+    anchors are NOT covered by this search (OMML math markup has no
+    ``<w:t>`` body text to match against) -- use
+    :func:`parse_docx_equations_local` (exposed as the ``extract_equations``
+    / ``get_equations`` MCP tools), which carries its own stable equation
+    ids, for those.
     """
     if not query or not str(query).strip():
         return []
@@ -10586,13 +10672,16 @@ def search_document_xml(
             raw = handle.read()
     except OSError as exc:
         return [{"error": str(exc)}]
+    all_units = _iter_document_search_units(raw)
     requested = {str(value).casefold() for value in element_types or []}
     units = [
         unit
-        for unit in _iter_document_search_units(raw)
+        for unit in all_units
         if _search_allowed_type(unit["element_type"], requested)
     ]
-    return _bm25_search_units(units, str(query), limit)
+    results = _bm25_search_units(units, str(query), limit)
+    _attach_word_search_locators(results, all_units)
+    return results
 
 
 def _highlight_run_if_matching(run: ET.Element, terms: list[str], color: str) -> bool:
@@ -10837,6 +10926,29 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
     That file is reported as a hint, not treated as a blocker. The returned
     content is the last saved on-disk snapshot; unsaved edits remain visible
     only inside Word until the document is saved.
+
+    c7cc9da4 -- this is the entry point for a Meridian-docs REVIEW SESSION: a
+    non-mutating pass over a .docx that may currently be open in Word. Two
+    fields exist specifically to support that workflow:
+
+      - "source_sha256": a SHA-256 fingerprint of the EXACT bytes this call
+        just read (same family as index_docx_structure's source_sha256).
+        A review session that accumulates recommendations anchored against
+        this snapshot and later stages accepted edits into a disposable
+        draft (never docx_path itself -- see move_section / copy_section /
+        relocate_table / relocate_figure's draft_output_path parameter, and
+        merge_docx_draft for promotion) must re-fingerprint docx_path
+        immediately before that promotion and refuse to proceed on any
+        mismatch. See render_gate.verify_promotion_readiness, which
+        performs exactly that compare-and-refuse check plus structural/
+        render verification, fail-closed, without mutating either file.
+      - "limitations": explicit, human-readable caveats about what this
+        snapshot does NOT prove -- most importantly, that content typed in
+        Word since the last save is invisible here. A caller (human or
+        agent) building recommendations from this snapshot should surface
+        these limitations alongside anything derived from it, rather than
+        silently treating "read succeeded" as "reflects what's on screen in
+        Word right now".
     """
     try:
         with open(docx_path, "rb") as handle:
@@ -10865,9 +10977,24 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
         "docx_path": docx_path,
         "byte_size": len(raw),
         "saved_mtime": _stat_mtime(docx_path),
+        "source_sha256": _source_fingerprint(raw),
         "word_lock_hint": os.path.exists(lock_hint),
         "xml_parts": xml_parts,
         "paragraph_count": len(paragraphs),
         "heading_count": sum(1 for paragraph in paragraphs if _is_heading(paragraph["style"])),
         "paragraphs": paragraphs,
+        "limitations": [
+            "This reflects only the last SAVED state of docx_path. Any "
+            "edits made in Word since the last save -- including changes "
+            "Word is only holding in memory or in autosave/recovery "
+            "buffers -- are NOT visible here until the document is "
+            "actually saved to disk.",
+            "word_lock_hint=True only means a ~$ lock file exists next to "
+            "docx_path, which usually indicates Word (or another "
+            "application) currently has it open. It is informational "
+            "only -- it never blocked and never delayed this read, and "
+            "its absence is not proof the file is closed (a crashed Word "
+            "session can leave the lock file behind, and a non-Word "
+            "writer may not create one at all).",
+        ],
     }
