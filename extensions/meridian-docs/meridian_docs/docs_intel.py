@@ -1438,6 +1438,18 @@ def _load_docx_xml_stdlib(path: str) -> tuple[bytes, ET.Element]:
     Raises ``FileNotFoundError`` when the path is absent.
     Raises ``ValueError`` when the file is not a valid .docx ZIP or is missing
     ``word/document.xml``.
+
+    b17ef22b — contract with :func:`_save_docx_xml_stdlib`: callers must
+    thread ``raw_bytes`` through to ``_save_docx_xml_stdlib`` UNMODIFIED
+    (every existing call site already does — ``raw, root =
+    _load_docx_xml_stdlib(path)`` followed later by
+    ``_save_docx_xml_stdlib(raw, root, dest)``). ``_save_docx_xml_stdlib``
+    re-reads the ORIGINAL ``word/document.xml`` straight out of ``raw`` to
+    recover the namespace prefixes/declarations the source document actually
+    used, so it can preserve them (and keep ``mc:Ignorable`` valid) on
+    write-back rather than letting ``ET.tostring`` renumber or silently drop
+    them. Passing a ``raw`` that doesn't match ``document_root``'s true
+    origin defeats that preservation.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"no such file: {path}")
@@ -1620,6 +1632,267 @@ def _docx_manifest_hash(changed_parts: dict[str, bytes]) -> str:
     return h.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# b17ef22b — namespace-prefix-preserving, fail-closed word/document.xml
+# write-back.
+#
+# THE DEFECT: ``ET.tostring()`` decides which prefix to print for a given
+# namespace URI purely from the process-global ``register_namespace()``
+# table (module load only pre-registers the common OOXML namespaces above)
+# plus auto-generated ``ns0``/``ns1``/... fallbacks for anything else. Two
+# distinct ways this silently mangles a round-tripped document that this
+# module didn't intend to touch at all:
+#
+#   1. A namespace that IS referenced by some element/attribute tag in the
+#      document, but uses a prefix this module never registered (a vendor
+#      extension namespace, or simply a non-default prefix convention some
+#      other tool wrote the file with) gets renumbered to ``ns0``/``ns1``/...
+#      on write-back instead of keeping its original prefix.
+#   2. A namespace declared on the root purely for markup-compatibility
+#      (listed in ``mc:Ignorable``, or simply one of the several namespaces
+#      real Word documents always declare whether or not THIS document
+#      happens to use it) is invisible to ``ET.tostring()``'s "is this URI
+#      referenced by some q-name in the tree" walk — xmlns declarations are
+#      consumed into the parser's namespace context at parse time and are
+#      never represented as element attributes, so an unreferenced-but-
+#      declared namespace is dropped from the output ENTIRELY. This breaks
+#      ``mc:Ignorable`` (per ECMA-376 Part 3, every prefix token in its
+#      value must stay a currently-declared namespace prefix) and narrows
+#      the package's advertised namespace support out from under it.
+#
+# THE FIX (scoped to _save_docx_xml_stdlib / _load_docx_xml_stdlib only —
+# see AGENTS.md item b17ef22b; this module's other ET-based part writers,
+# e.g. header/footer/comments/rels parts, are NOT touched here):
+#
+#   1. Before ``ET.tostring()``, temporarily register EVERY namespace prefix
+#      the ORIGINAL word/document.xml actually declared (not just the fixed
+#      module-load set) so referenced namespaces keep their real prefix
+#      instead of getting renumbered. Reads ``raw`` (the untouched original
+#      ZIP bytes every caller already threads through unchanged from
+#      ``_load_docx_xml_stdlib`` to ``_save_docx_xml_stdlib``) rather than
+#      requiring a signature change — ``_load_docx_xml_stdlib`` has ~50
+#      call sites across this file owned by other in-flight work, so
+#      widening its return tuple is out of scope here.
+#   2. After serializing, re-splice back any root-level namespace
+#      declaration that was present in the original but that ET's "only if
+#      referenced" walk dropped (case 2 above) — preserving markup-
+#      compatibility declarations even when nothing in the tree happens to
+#      use them.
+#   3. Fail closed, BEFORE ever building the replacement ZIP or touching
+#      disk (raising :class:`DocxWriteVerificationError`, same fail-closed
+#      contract as dccc2311's structural-manifest gate) if: the serialized
+#      XML isn't well-formed; any original namespace URI ends up bound to a
+#      DIFFERENT prefix in the output (defense-in-depth behind step 1 — the
+#      one scenario step 1 alone cannot fully rule out is two distinct
+#      original URIs sharing a prefix via a nested re-declaration, since
+#      ``register_namespace`` is a single global URI -> prefix slot); or
+#      ``mc:Ignorable`` ends up referencing an undeclared prefix.
+#
+# Known, deliberately out-of-scope limitations (documented per this item's
+# own fallback clause rather than risking a rushed full rewrite):
+#   - Only ROOT-level namespace declarations are tracked/preserved. A
+#     namespace prefix re-declared on some DESCENDANT element (legal XML,
+#     essentially never produced by Word) is not specially preserved.
+#   - This does not convert the writer to a true "edit only the touched XML
+#     parts" transactional model — it keeps the existing whole-document
+#     ET parse/serialize architecture (structurally required by the ~50
+#     other call sites in this file) and hardens IT to be namespace- and
+#     mc:Ignorable-preserving plus fail-closed instead.
+#   - The temporary registration window is guarded by a single process-wide
+#     lock (``_NAMESPACE_REGISTRATION_LOCK``), not a per-document one, since
+#     ``xml.etree.ElementTree``'s namespace table is itself process-global
+#     state with no per-call scoping available in the stdlib. This fully
+#     preserves correctness (no cross-document leakage is possible, since
+#     the critical section is serialized end-to-end) at the cost of
+#     serializing the in-memory ``ET.tostring()`` step (not any disk I/O)
+#     across concurrent writes to *different* documents.
+# ---------------------------------------------------------------------------
+
+# Guards the temporary ET.register_namespace(...) / ET.tostring() / restore
+# window in _save_docx_xml_stdlib -- see the module comment above for why a
+# lock (rather than per-call scoping, which the stdlib namespace table does
+# not support) is required for correctness under concurrent writers.
+_NAMESPACE_REGISTRATION_LOCK = threading.Lock()
+
+_MC_URI = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_MC_IGNORABLE_ATTR = _q(_MC_URI, "Ignorable")
+
+
+def _root_namespace_declarations(document_xml_bytes: bytes) -> list[tuple[str, str]]:
+    """Return the ``(prefix, uri)`` namespace declarations bound on the ROOT
+    element of ``document_xml_bytes``, in document order (``prefix`` is
+    ``""`` for an unprefixed/default declaration).
+
+    Uses ``ET.iterparse(events=("start-ns", "start"))`` — the real XML
+    parser's own namespace-scope tracking — rather than a regex over the raw
+    start tag, so this can never disagree with what ``ET.fromstring`` itself
+    considers a namespace binding (single- vs double-quoted attribute
+    values, entity-escaped characters in a URI, whitespace variations, etc.
+    all come for free). Collection stops at the first ``start`` event: every
+    real .docx declares its namespaces once, on the ``<w:document>`` root,
+    so that is also the first element this ever sees.
+    """
+    declarations: list[tuple[str, str]] = []
+    for event, value in ET.iterparse(io.BytesIO(document_xml_bytes), events=("start-ns", "start")):
+        if event == "start-ns":
+            prefix, uri = value
+            declarations.append((prefix or "", uri))
+        else:
+            break
+    return declarations
+
+
+def _extract_root_start_tag(xml_bytes: bytes) -> str:
+    """Return the literal root-element start tag (e.g. the full
+    ``<w:document xmlns:w="..." ...>`` or self-closing ``<w:document .../>``
+    text, verbatim) from a serialized XML document, skipping past any
+    leading XML declaration / comments / processing instructions.
+
+    A plain ``str.index("<")`` is not enough because ``<?xml ...?>`` also
+    starts with ``<``; this walks forward past any ``<?...?>``/``<!--...-->``
+    prologue, then scans the root tag's own text honoring quoted attribute
+    values so a literal ``>`` inside one (illegal in OOXML, but this stays
+    defensive) cannot truncate the match early.
+    """
+    text = xml_bytes.decode("utf-8")
+    pos = 0
+    length = len(text)
+    while True:
+        start = text.index("<", pos)
+        if text.startswith("<?", start):
+            pos = text.index("?>", start) + 1
+            continue
+        if text.startswith("<!--", start):
+            pos = text.index("-->", start) + 1
+            continue
+        i = start + 1
+        quote: str | None = None
+        while i < length:
+            ch = text[i]
+            if quote:
+                if ch == quote:
+                    quote = None
+            elif ch in ("'", '"'):
+                quote = ch
+            elif ch == ">":
+                return text[start : i + 1]
+            i += 1
+        raise ValueError("unterminated root element start tag")
+
+
+def _xml_escape_attr_value(value: str) -> str:
+    """Escape ``value`` for embedding as a double-quoted XML attribute value."""
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+
+
+def _restore_dropped_namespace_declarations(
+    original_document_xml: bytes, new_document_xml: bytes
+) -> bytes:
+    """Re-insert any root-level ``xmlns:*`` declaration present in the
+    ORIGINAL ``word/document.xml`` that ``ET.tostring`` silently dropped
+    from the newly-serialized output because nothing in the tree happens to
+    reference that namespace URI (see the module comment above — this is
+    the case ``ET.register_namespace`` cannot fix, since it only affects the
+    prefix chosen for namespaces ET decides to emit at all).
+    """
+    original_decls = _root_namespace_declarations(original_document_xml)
+    if not original_decls:
+        return new_document_xml
+
+    new_decls = _root_namespace_declarations(new_document_xml)
+    new_uris = {uri for _prefix, uri in new_decls}
+    missing = [(prefix, uri) for prefix, uri in original_decls if uri not in new_uris]
+    if not missing:
+        return new_document_xml
+
+    insertion = "".join(
+        f' xmlns:{prefix}="{_xml_escape_attr_value(uri)}"'
+        if prefix
+        else f' xmlns="{_xml_escape_attr_value(uri)}"'
+        for prefix, uri in missing
+    )
+
+    text = new_document_xml.decode("utf-8")
+    tag = _extract_root_start_tag(new_document_xml)
+    tag_start = text.index(tag)
+    if tag.endswith("/>"):
+        repaired_tag = tag[:-2] + insertion + "/>"
+    else:
+        repaired_tag = tag[:-1] + insertion + ">"
+    repaired_text = text[:tag_start] + repaired_tag + text[tag_start + len(tag) :]
+    return repaired_text.encode("utf-8")
+
+
+def _assert_namespace_prefixes_preserved(
+    original_decls: list[tuple[str, str]],
+    final_decls: list[tuple[str, str]],
+    dest: str,
+) -> None:
+    """Fail closed if any namespace URI bound to a given prefix in the
+    ORIGINAL document.xml ends up bound to a DIFFERENT prefix in the
+    newly-serialized output.
+
+    Defense-in-depth behind the register/restore step in
+    :func:`_save_docx_xml_stdlib`: that step makes this impossible in the
+    overwhelming common case, but ``ET.register_namespace`` is keyed on a
+    single global URI -> prefix slot, so two distinct original namespace
+    URIs that happen to share a prefix via a nested re-declaration (legal
+    XML, essentially never produced by Word, and not itself tracked by
+    :func:`_root_namespace_declarations`) could still yield an ambiguous or
+    incorrect result this check exists to catch — rejecting the write
+    rather than risking a silently corrupted package.
+    """
+    original_by_uri: dict[str, str] = {}
+    for prefix, uri in original_decls:
+        original_by_uri.setdefault(uri, prefix)
+
+    final_by_uri: dict[str, str] = {}
+    for prefix, uri in final_decls:
+        final_by_uri.setdefault(uri, prefix)
+
+    mismatches = {
+        uri: {"original_prefix": orig_prefix, "new_prefix": final_by_uri[uri]}
+        for uri, orig_prefix in original_by_uri.items()
+        if uri in final_by_uri and final_by_uri[uri] != orig_prefix
+    }
+    if mismatches:
+        raise DocxWriteVerificationError(
+            f"post-write verification failed: {dest} would have one or more "
+            "namespace prefixes renamed on write-back (an original "
+            "xmlns declaration re-emitted under a different prefix) -- "
+            f"discarding the staged write, {dest} is untouched",
+            manifest={"prefix_mismatches": mismatches},
+        )
+
+
+def _assert_mc_ignorable_prefixes_declared(
+    reparsed_root: ET.Element,
+    final_decls: list[tuple[str, str]],
+    dest: str,
+) -> None:
+    """Fail closed if ``mc:Ignorable`` on the write-back's root element lists
+    a namespace prefix that is not (or no longer) declared.
+
+    Per ECMA-376 Part 3 (Markup Compatibility and Extensibility), every
+    prefix token in ``mc:Ignorable`` must be a currently in-scope namespace
+    prefix -- an ``mc:Ignorable`` referencing an undeclared prefix is a
+    document Word and other OOXML consumers can refuse to open cleanly or
+    silently mishandle.
+    """
+    ignorable = reparsed_root.get(_MC_IGNORABLE_ATTR)
+    if not ignorable:
+        return
+    declared_prefixes = {prefix for prefix, _uri in final_decls if prefix}
+    missing = [token for token in ignorable.split() if token not in declared_prefixes]
+    if missing:
+        raise DocxWriteVerificationError(
+            f"post-write verification failed: mc:Ignorable in {dest} "
+            f"references undeclared namespace prefix(es) {missing!r} after "
+            f"write-back -- discarding the staged write, {dest} is untouched",
+            manifest={"ignorable": ignorable, "missing_prefixes": missing},
+        )
+
+
 def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> dict[str, Any]:
     """Write ``root`` back into ``dest`` as ``word/document.xml``.
 
@@ -1643,11 +1916,69 @@ def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> dict[str, 
     "manifest_hash", "pre_counts", "post_counts", "promoted_sha256"}``
     (5988a5bb) — callers that don't need it (most existing call sites, which
     predate this change) simply ignore the return value.
+
+    b17ef22b — namespace-prefix-preserving, fail-closed write-back (see the
+    module comment above ``_NAMESPACE_REGISTRATION_LOCK`` for the full
+    design). Before serializing, every namespace prefix ``raw``'s ORIGINAL
+    ``word/document.xml`` actually declared is registered so referenced
+    namespaces keep their real prefix instead of being renumbered; after
+    serializing, any originally-declared-but-unreferenced namespace ET
+    dropped is spliced back onto the root; and the result is rejected
+    (``DocxWriteVerificationError``, before any bytes are staged to disk) if
+    it isn't well-formed XML, if any original namespace prefix was renamed,
+    or if ``mc:Ignorable`` ends up referencing an undeclared prefix.
     """
-    new_xml = ET.tostring(root, encoding="unicode")
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        original_document_xml = zf.read("word/document.xml")
+    original_ns_decls = _root_namespace_declarations(original_document_xml)
+
+    with _NAMESPACE_REGISTRATION_LOCK:
+        snapshot = dict(ET._namespace_map)  # type: ignore[attr-defined]
+        try:
+            for prefix, uri in original_ns_decls:
+                ET.register_namespace(prefix, uri)
+            new_xml = ET.tostring(root, encoding="unicode")
+        finally:
+            ET._namespace_map.clear()  # type: ignore[attr-defined]
+            ET._namespace_map.update(snapshot)  # type: ignore[attr-defined]
+
     new_document_bytes = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + new_xml
     ).encode("utf-8")
+
+    # Validate well-formedness BEFORE the namespace-restore splice touches
+    # the string: _restore_dropped_namespace_declarations itself parses
+    # (via _root_namespace_declarations) to discover what ET emitted, and a
+    # malformed ET.tostring() result would otherwise surface as an
+    # unhandled xml.etree.ElementTree.ParseError there instead of the
+    # intended fail-closed DocxWriteVerificationError.
+    try:
+        ET.fromstring(new_document_bytes)
+    except ET.ParseError as exc:
+        raise DocxWriteVerificationError(
+            "post-write verification failed: the serialized "
+            f"word/document.xml for {dest} is not well-formed XML: {exc} -- "
+            f"discarding the staged write, {dest} is untouched",
+            manifest={"parse_error": str(exc)},
+        ) from exc
+
+    new_document_bytes = _restore_dropped_namespace_declarations(
+        original_document_xml, new_document_bytes
+    )
+
+    try:
+        reparsed_root = ET.fromstring(new_document_bytes)
+    except ET.ParseError as exc:
+        raise DocxWriteVerificationError(
+            "post-write verification failed: the namespace-repaired "
+            f"word/document.xml for {dest} is not well-formed XML: {exc} -- "
+            f"discarding the staged write, {dest} is untouched",
+            manifest={"parse_error": str(exc)},
+        ) from exc
+
+    final_ns_decls = _root_namespace_declarations(new_document_bytes)
+    _assert_namespace_prefixes_preserved(original_ns_decls, final_ns_decls, dest)
+    _assert_mc_ignorable_prefixes_declared(reparsed_root, final_ns_decls, dest)
 
     out = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(raw)) as src:
