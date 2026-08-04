@@ -19,7 +19,12 @@ import pytest
 from meridian import db as db_module
 from meridian import handoff as handoff_module
 from meridian import semantic_search as ss
-from meridian.semantic_search import SemanticSearcher, should_escalate
+from meridian.semantic_search import (
+    SemanticMatch,
+    SemanticSearcher,
+    score_confidence,
+    should_escalate,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -807,3 +812,263 @@ async def test_generate_handoff_related_records_lookup_failure_never_breaks_hand
     )
     assert path and content  # the handoff itself still succeeded
     assert related == {"query": "rate limiting", "candidates": []}
+
+
+# ---------------------------------------------------------------------------
+# 3d3ccf2d — confidence-scored semantic matches with deterministic abstention
+# (follow-up on 2204ce80's hybrid_candidate_retrieval). score_confidence() is
+# pure/DB-free: no embedding, no I/O — fully testable against hand-built
+# (id, score) lists, no numpy/model2vec required.
+# ---------------------------------------------------------------------------
+
+
+def test_score_confidence_empty_returns_empty():
+    assert score_confidence([]) == []
+
+
+def test_score_confidence_confident_when_clear_leader():
+    """A single strong, unrivalled candidate (a paraphrase: no lexical overlap
+    with the query but clearly the right concept) is confident — above the
+    floor, and its margin against the implicit 0.0 baseline (no runner-up) is
+    ample."""
+    matches = score_confidence([("a", 0.85)], floor=0.37, min_margin=0.05)
+    assert len(matches) == 1
+    m = matches[0]
+    assert isinstance(m, SemanticMatch)
+    assert m.id == "a"
+    assert m.semantic_score == 0.85
+    assert m.fused_score == 0.85
+    assert m.lexical_score is None
+    assert m.threshold == 0.37
+    assert m.confident is True
+    assert m.reason == "confident_match"
+
+
+def test_score_confidence_below_floor_is_never_confident():
+    """A candidate below the absolute confidence floor is refused regardless
+    of margin — plain low-confidence noise is never auto-bound."""
+    matches = score_confidence([("a", 0.30)], floor=0.37, min_margin=0.05)
+    assert matches[0].confident is False
+    assert matches[0].reason == "below_confidence_threshold"
+
+
+def test_score_confidence_close_runner_up_marks_both_ambiguous():
+    """Two near-tied candidates — modelling a stale record and the fresh one
+    that superseded it, both plausible — both clear the floor but neither
+    leads the other by the required margin. Deterministic abstention refuses
+    to pick a winner: BOTH come back non-confident rather than one being
+    guessed."""
+    matches = score_confidence(
+        [("fresh", 0.60), ("stale", 0.58)], floor=0.37, min_margin=0.05,
+    )
+    by_id = {m.id: m for m in matches}
+    assert by_id["fresh"].confident is False
+    assert by_id["fresh"].reason == "ambiguous_runner_up"
+    assert by_id["stale"].confident is False
+
+
+def test_score_confidence_wide_margin_is_confident():
+    """A clear leader over a genuinely weaker runner-up IS confident — the
+    margin gate only fires on near-ties, not on the mere existence of a
+    second candidate."""
+    matches = score_confidence(
+        [("best", 0.80), ("distant", 0.40)], floor=0.37, min_margin=0.05,
+    )
+    by_id = {m.id: m for m in matches}
+    assert by_id["best"].confident is True
+    assert by_id["best"].reason == "confident_match"
+
+
+def test_score_confidence_respects_custom_min_margin():
+    """The margin requirement is caller-tunable: the same ranked pair is
+    confident under the default margin and ambiguous under a stricter one."""
+    ranked = [("a", 0.70), ("b", 0.60)]  # margin ~0.10
+    lenient = score_confidence(ranked, floor=0.37, min_margin=0.05)
+    assert lenient[0].confident is True
+    strict = score_confidence(ranked, floor=0.37, min_margin=0.15)
+    assert strict[0].confident is False
+    assert strict[0].reason == "ambiguous_runner_up"
+
+
+def test_score_confidence_fuses_lexical_and_semantic_when_provided():
+    """A lexical corroboration blends into fused_score (mirroring
+    db.hybrid_candidate_retrieval's own 0.6/0.4 split) and can re-rank the
+    set; a candidate with no lexical entry fuses to its raw semantic score."""
+    ranked = [("a", 0.50), ("b", 0.45)]
+    matches = score_confidence(
+        ranked, floor=0.30, min_margin=0.05,
+        lexical_scores={"b": 0.95},  # b gets a strong lexical boost
+    )
+    # b's fused score (0.6*0.95 + 0.4*0.45 = 0.75) now outranks a's (0.50).
+    assert matches[0].id == "b"
+    by_id = {m.id: m for m in matches}
+    assert by_id["b"].lexical_score == 0.95
+    assert by_id["a"].lexical_score is None
+
+
+def test_score_confidence_lexical_boost_cannot_rescue_low_semantic_score():
+    """The 'lexical false positive' guard: a candidate that shares vocabulary
+    with the query (strong lexical score) but is semantically unrelated (weak
+    semantic score) is never confident — a lexical boost can raise the
+    reported fused_score but can never manufacture confidence for a
+    candidate the embedding model itself found irrelevant. The gate checks
+    the RAW semantic score, not the fused one."""
+    ranked = [("wrong_meaning", 0.10)]
+    matches = score_confidence(
+        ranked, floor=0.37, min_margin=0.05,
+        lexical_scores={"wrong_meaning": 0.99},  # near-perfect keyword overlap
+    )
+    m = matches[0]
+    assert m.fused_score > 0.37  # the lexical signal pulls the fused score up...
+    assert m.confident is False  # ...but the raw semantic score never cleared the floor
+    assert m.reason == "below_confidence_threshold"
+
+
+def test_rank_confident_wraps_rank_and_scores(monkeypatch):
+    """SemanticSearcher.rank_confident() = rank() + score_confidence(): only
+    candidates that survive rank()'s own floor filter reach scoring at all."""
+    np = pytest.importorskip("numpy")
+
+    s = SemanticSearcher()
+    vecs = {
+        "query": np.array([1.0, 0.0]),
+        "high": np.array([0.98, 0.20]),   # cosine ~0.98
+        "mid": np.array([0.60, 0.80]),    # cosine 0.60
+        "low": np.array([0.30, 0.95]),    # cosine ~0.30 (below the 0.37 floor)
+    }
+    monkeypatch.setattr(s, "embed", _stub_embed_from_map(vecs))
+    candidates = [("h", "high"), ("m", "mid"), ("l", "low")]
+    matches = s.rank_confident("query", candidates, floor=0.37, min_margin=0.05)
+    ids = [m.id for m in matches]
+    assert "l" not in ids  # never survives rank()'s own floor filter
+    by_id = {m.id: m for m in matches}
+    assert by_id["h"].confident is True
+    assert by_id["h"].reason == "confident_match"
+
+
+def test_rank_confident_empty_when_rank_unavailable(monkeypatch):
+    """When the underlying rank() returns [] (unavailable/tripped mid-flight)
+    rank_confident() degrades to [] too — never raises, never fabricates a
+    verdict from nothing."""
+    s = SemanticSearcher()
+    monkeypatch.setattr(s, "embed", lambda texts: None)
+    assert s.rank_confident("q", [("a", "text")]) == []
+
+
+# ---------------------------------------------------------------------------
+# _maybe_semantic_escalate wiring — direct calls with a mocked rank(), on the
+# default SQLite ``db`` fixture. _maybe_semantic_escalate's own SQL helpers
+# (_pure_fts_count_and_trigram_top, _semantic_candidate_corpus) already fail
+# safe on a non-PG dialect (see their own docstrings/try-except), so this
+# exercises the NEW confidence-gating wiring without needing TEST_DATABASE_URL
+# — mirroring the existing db_pg-gated tests above but for the parts that
+# don't need real Postgres SQL.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_maybe_semantic_escalate_merges_confident_paraphrase_match(db, monkeypatch):
+    """A single strong, unrivalled semantic hit — a paraphrase, no lexical
+    overlap with the query but clearly the right concept — is merged in and
+    carries its typed score breakdown."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "escalate-paraphrase")
+    note = await db_module.add_project_note(
+        db, p["id"], "Token bucket",
+        "limits how many requests a client can make per window",
+    )
+
+    from meridian import semantic_search
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank",
+        lambda query, cands, floor=None: [(note["id"], 0.80)],
+    )
+
+    tasks, notes, decisions, sprint_items = await db_module._maybe_semantic_escalate(
+        db, p["id"], "throttling requests per client", 10, [], [], [], [],
+    )
+    assert len(notes) == 1
+    assert notes[0]["id"] == note["id"]
+    assert notes[0]["semantic"] is True
+    assert notes[0]["semantic_reason"] == "confident_match"
+    assert notes[0]["semantic_score"] == 0.80
+
+
+@pytest.mark.asyncio
+async def test_maybe_semantic_escalate_refuses_below_floor_match(db, monkeypatch):
+    """A weak semantic score below the confidence floor is never merged in —
+    deterministic abstention, not a guess (the 'lexical false positive' /
+    plain-noise case: an unrelated record must never be surfaced as a hit)."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "escalate-below-floor")
+    note = await db_module.add_project_note(db, p["id"], "Unrelated", "nothing to do with it")
+
+    from meridian import semantic_search
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank",
+        lambda query, cands, floor=None: [(note["id"], 0.10)],
+    )
+
+    tasks, notes, decisions, sprint_items = await db_module._maybe_semantic_escalate(
+        db, p["id"], "something else entirely", 10, [], [], [], [],
+    )
+    assert notes == []
+
+
+@pytest.mark.asyncio
+async def test_maybe_semantic_escalate_abstains_on_near_tied_stale_vs_fresh(db, monkeypatch):
+    """Two near-tied candidates — modelling a stale record and the fresh one
+    that superseded it, both plausible matches for the query — are BOTH
+    refused: too close to call, so neither is auto-bound."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "escalate-stale-vs-fresh")
+    stale = await db_module.add_project_note(db, p["id"], "Old rate limiter", "v1 approach")
+    fresh = await db_module.add_project_note(db, p["id"], "New rate limiter", "v2 approach")
+
+    from meridian import semantic_search
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank",
+        lambda query, cands, floor=None: [(fresh["id"], 0.60), (stale["id"], 0.58)],
+    )
+
+    tasks, notes, decisions, sprint_items = await db_module._maybe_semantic_escalate(
+        db, p["id"], "rate limiter approach", 10, [], [], [], [],
+    )
+    assert notes == []  # neither auto-bound — deterministic abstention
+
+
+@pytest.mark.asyncio
+async def test_maybe_semantic_escalate_never_leaks_across_projects(db, monkeypatch):
+    """The candidate corpus is scoped to project_id BEFORE ranking ever runs —
+    exact project scoping is a hard gate confidence scoring never touches.
+    Even a permissive fake rank() that confidently scores everything it's
+    offered cannot resurrect a candidate from a different project, because
+    that candidate is never in the pool to begin with."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p_a = await db_module.create_project(db, "escalate-leak-a")
+    p_b = await db_module.create_project(db, "escalate-leak-b")
+    note_a = await db_module.add_project_note(
+        db, p_a["id"], "Shared topic", "same wording appears in both projects")
+    note_b = await db_module.add_project_note(
+        db, p_b["id"], "Shared topic", "same wording appears in both projects")
+
+    from meridian import semantic_search
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank",
+        lambda query, cands, floor=None: [(cid, 0.90) for cid, _ in cands],
+    )
+
+    tasks, notes, decisions, sprint_items = await db_module._maybe_semantic_escalate(
+        db, p_a["id"], "shared topic", 10, [], [], [], [],
+    )
+    ids = {n["id"] for n in notes}
+    assert note_a["id"] in ids
+    assert note_b["id"] not in ids

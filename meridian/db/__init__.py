@@ -4201,6 +4201,22 @@ async def _maybe_semantic_escalate(
     corpus hit the cap — these rows are real matches within that bounded
     window, but the window is not exhaustive, so callers must not treat a
     capped escalation as an authoritative "nothing else matches" answer.
+
+    3d3ccf2d (follow-up on 2204ce80) — candidates are ranked, then scored via
+    :func:`semantic_search.score_confidence` into typed
+    :class:`semantic_search.SemanticMatch` results (lexical/semantic/fused
+    score, threshold, runner-up margin, reason). ONLY ``confident=True``
+    matches are merged into the results — a match that clears the absolute
+    cosine floor but sits too close to the next-best DIFFERENT candidate
+    (``reason="ambiguous_runner_up"``, e.g. a stale record and its fresh
+    replacement scoring near-identically) is deterministic-abstained:
+    excluded rather than guessed, exactly like a sub-floor match
+    (``reason="below_confidence_threshold"``) always was. Every surfaced
+    semantic hit is annotated with its score breakdown for transparency.
+    Project/version/pointer scoping is an upstream hard gate this function
+    never touches: ``_semantic_candidate_corpus`` already scopes every
+    candidate to ``project_id`` before ranking ever runs, so cross-project
+    leakage cannot occur regardless of confidence scoring.
     """
     from meridian import semantic_search
 
@@ -4221,6 +4237,15 @@ async def _maybe_semantic_escalate(
     if not ranked:  # unavailable mid-flight (breaker tripped) or all sub-floor
         return tasks, notes, decisions, sprint_items
 
+    # 3d3ccf2d — typed, confidence-scored verdict per candidate. No lexical
+    # score is supplied: this escalation path only ever fires when keyword
+    # search genuinely found nothing (should_escalate's own precondition), so
+    # every candidate here is semantic-only by construction.
+    matches = semantic_search.score_confidence(ranked)
+    if not matches:
+        return tasks, notes, decisions, sprint_items
+    match_by_id = {m.id: m for m in matches}
+
     # Exclude ids already present in the keyword results (keyword-first dedupe).
     existing: dict[str, set[str]] = {
         "task": {t.get("id") for t in tasks},
@@ -4231,15 +4256,20 @@ async def _maybe_semantic_escalate(
     new_by_type: dict[str, list[str]] = {
         "task": [], "note": [], "decision": [], "sprint_item": []
     }
-    for cid, _score in ranked:
-        mtype = type_by_id.get(cid)
+    for m in matches:
+        if not m.confident:
+            # Deterministic abstention: below the confidence floor or too
+            # close to a runner-up — refuse automatic binding rather than
+            # presenting an ambiguous candidate as a solid match.
+            continue
+        mtype = type_by_id.get(m.id)
         if not mtype or mtype not in new_by_type:
             continue
-        if cid in existing.get(mtype, set()):
+        if m.id in existing.get(mtype, set()):
             continue
         if len(new_by_type[mtype]) >= limit:
             continue
-        new_by_type[mtype].append(cid)
+        new_by_type[mtype].append(m.id)
 
     hydrated = await _hydrate_semantic_rows(db, project_id, new_by_type)
     # Mark provenance so callers/UI can distinguish semantic-augmented rows.
@@ -4250,6 +4280,8 @@ async def _maybe_semantic_escalate(
     # caller must treat these hits as candidates only — never as proof that
     # nothing better exists elsewhere (an authoritative pointer/provenance
     # gate must not be satisfied by a capped semantic escalation alone).
+    # 3d3ccf2d — also attach the full typed confidence-score breakdown for
+    # transparency/debugging.
     row_degraded = semantic_search.is_corpus_capped(len(corpus), _SEMANTIC_CORPUS_CAP)
     embedding_model = semantic_search.model_name()
     for mtype, rows in hydrated.items():
@@ -4257,6 +4289,13 @@ async def _maybe_semantic_escalate(
             r["semantic"] = True
             r["degraded"] = row_degraded
             r["embedding_model"] = embedding_model
+            m = match_by_id.get(r.get("id"))
+            if m is not None:
+                r["semantic_score"] = m.semantic_score
+                r["semantic_fused_score"] = m.fused_score
+                r["semantic_threshold"] = m.threshold
+                r["semantic_margin"] = m.margin
+                r["semantic_reason"] = m.reason
     return (
         tasks + hydrated["task"],
         notes + hydrated["note"],
