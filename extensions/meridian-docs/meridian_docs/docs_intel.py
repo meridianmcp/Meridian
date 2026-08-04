@@ -12970,6 +12970,666 @@ def insert_word_comment(
         **render_info,
     }
 
+
+# ---------------------------------------------------------------------------
+# Public API: locate_anchor / locate_anchors (2271789f)
+#
+# A read-only, fresh-snapshot anchor locator. Every call re-parses the .docx
+# from disk (via document_content_tree + parse_docx_equations_local) rather
+# than trusting any sidecar SQLite index -- there is no staleness window to
+# reason about because nothing is cached between calls. Each resolved anchor
+# is stamped with the SHA-256 fingerprint (_source_fingerprint) of the exact
+# bytes it was resolved against, so a caller holding an OLDER fingerprint can
+# detect drift by passing query["expected_source_fingerprint"] before
+# trusting a previously-returned target_para_id against a document that may
+# have since changed.
+#
+# Query keys (all optional; at least one is required so the query is not a
+# no-op):
+#   para_id           -- direct lookup: a real w14:paraId, the
+#                         document_content_tree/parse_docx synthesized
+#                         "sp<hash>" id, a table id "tbl<index>", a
+#                         table-cell id "tbl<index>:r<row>:c<col>", or an
+#                         equation's own para_id. Short-circuits every other
+#                         key below.
+#   section_path      -- e.g. "3.2.4". Matched against BOTH an explicit
+#                         numeric prefix parsed out of the heading's own
+#                         text (Word's "3.2.4 Title" auto/manual outline
+#                         numbering rendered as literal text) and a
+#                         positional path computed from heading levels/order
+#                         when no explicit prefix is present. NOTE: a
+#                         heading that merely *starts* with a number that
+#                         isn't outline numbering (e.g. "5 Steps to
+#                         Success") is indistinguishable from real section
+#                         numbering by this heuristic -- a known tradeoff.
+#   section_text      -- substring match (casefold unless case_sensitive)
+#                         against heading text; combinable with
+#                         section_path (both must match).
+#   caption_label     -- e.g. "Table 3" / "Figure 2". Matched against the
+#                         caption's SEQ-field cached number, falling back to
+#                         a positional occurrence count when the field was
+#                         never recalculated by Word.
+#   text              -- literal Ctrl+F-style substring (casefold unless
+#                         case_sensitive) searched over paragraph/heading/
+#                         caption text and table cell text, scoped to
+#                         whatever section_path/caption_label already
+#                         narrowed (unscoped text queries also fall back to
+#                         equation flat_text so equations stay findable).
+#   element_types     -- optional list restricting result kinds to any of
+#                         heading | paragraph | table | table_cell |
+#                         figure_caption | table_caption | equation.
+#   case_sensitive    -- bool, default False.
+#   expected_source_fingerprint -- optional; if given and it does not match
+#                         the CURRENT source fingerprint, resolution is
+#                         skipped entirely and {"status": "stale", ...} is
+#                         returned immediately -- never trust stale
+#                         paragraph indices against a document that moved.
+#
+# Every result carries an explicit "candidates" list -- empty when a query
+# resolved uniquely, populated (with status="ambiguous") when more than one
+# element matched -- rather than silently guessing which one was meant.
+# Never mutates document_path.
+# ---------------------------------------------------------------------------
+
+_EXPLICIT_SECTION_NUM_RE = re.compile(r"^\s*(\d+(?:\.\d+){0,8})[.)]?\s+(?=\S)")
+_TABLE_ID_RE = re.compile(r"^tbl(\d+)$")
+_TABLE_CELL_ID_RE = re.compile(r"^tbl(\d+):r(\d+):c(\d+)$")
+_CAPTION_LABEL_QUERY_RE = re.compile(r"^\s*(figure|table)\s+(.+?)\s*$", re.IGNORECASE)
+
+
+def _normalize_preview(text: str, max_words: int = 12) -> str:
+    """Collapse whitespace and take the leading ``max_words`` words.
+
+    Display preview only -- never changes the source text. ``quoted_text``
+    in a locator result always carries the verbatim, un-normalized string.
+    """
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return ""
+    words = normalized.split(" ")
+    preview = " ".join(words[:max_words])
+    return preview + "..." if len(words) > max_words else preview
+
+
+def _heading_numbering(heading_blocks: list[dict[str, Any]]) -> dict[str, dict[str, str | None]]:
+    """Compute both an explicit and a positional section path per heading.
+
+    ``explicit_number`` comes from a leading "N", "N.N", "N.N.N" ... prefix
+    already present in the heading's own text. ``computed_path`` is a
+    positional fallback: per-level counters that increment left to right and
+    reset any deeper level whenever a shallower heading is seen -- the same
+    scheme a generated table of contents would use.
+    """
+    counters: list[int] = []
+    result: dict[str, dict[str, str | None]] = {}
+    for h in heading_blocks:
+        level = max(1, int(h.get("level", 1) or 1))
+        if len(counters) < level:
+            counters.extend([0] * (level - len(counters)))
+        else:
+            counters = counters[:level]
+        counters[level - 1] += 1
+        computed_path = ".".join(str(c) for c in counters[:level])
+        match = _EXPLICIT_SECTION_NUM_RE.match(h.get("text", "") or "")
+        result[h["para_id"]] = {
+            "explicit_number": match.group(1) if match else None,
+            "computed_path": computed_path,
+        }
+    return result
+
+
+def _table_anchor_id(index: int) -> str:
+    return f"tbl{index}"
+
+
+def _iter_anchor_records(
+    source: str | bytes | bytearray,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fresh (never cached) ordered anchor index for one document snapshot.
+
+    Returns ``(records, tree)`` where ``tree`` is the raw
+    :func:`document_content_tree` result (paragraph_count/table_count/
+    heading_count/duplicate_para_ids) and ``records`` is one dict per
+    document_content_tree block, in document order, each augmented with:
+
+      - ``para_id``        -- stable id (table blocks get a synthesized
+                               ``"tbl<index>"`` id; paragraph/heading blocks
+                               already carry document_content_tree's own
+                               w14:paraId / synth-id / positional id).
+      - ``element_kind``    -- heading | paragraph | table | figure_caption
+                               | table_caption.
+      - ``caption_label``   -- "Figure N" / "Table N" for caption
+                               paragraphs, else None.
+      - ``table_ref``       -- for a table_caption paragraph, the ``index``
+                               of the table block it immediately follows.
+      - ``section_path``    -- nearest enclosing heading's path.
+      - ``heading_para_id`` -- nearest enclosing heading's para_id.
+      - ``section_stack``   -- ordered list of ancestor heading para_ids
+                               (root first): subtree membership is simply
+                               ``heading_id in record["section_stack"]``.
+      - ``explicit_number`` / ``computed_path`` -- heading blocks only.
+    """
+    from ._vendored_content_tree import document_content_tree  # noqa: PLC0415
+
+    tree = document_content_tree(source)
+    blocks: list[dict[str, Any]] = tree.get("blocks") or []
+    numbering = _heading_numbering([b for b in blocks if b.get("kind") == "heading"])
+
+    records: list[dict[str, Any]] = []
+    section_stack: list[tuple[int, str, str]] = []
+    last_table_index: int | None = None
+    figure_seq_counter = 0
+    table_seq_counter = 0
+
+    for block in blocks:
+        kind = block.get("kind")
+        record = dict(block)
+        caption_label: str | None = None
+        table_ref: int | None = None
+        element_kind = kind
+
+        if kind == "heading":
+            level = max(1, int(block.get("level", 1) or 1))
+            while section_stack and section_stack[-1][0] >= level:
+                section_stack.pop()
+            info = numbering.get(
+                block["para_id"], {"explicit_number": None, "computed_path": str(level)}
+            )
+            path = info["explicit_number"] or info["computed_path"]
+            section_stack.append((level, block["para_id"], path))
+            record["explicit_number"] = info["explicit_number"]
+            record["computed_path"] = info["computed_path"]
+        elif kind == "table":
+            record["para_id"] = _table_anchor_id(block["index"])
+            rows = block.get("rows") or []
+            record["text"] = " | ".join(", ".join(row) for row in rows[:3])
+            last_table_index = block["index"]
+        elif kind == "paragraph":
+            if _is_figure_caption(block):
+                figure_seq_counter += 1
+                num = _seq_cached_number(block, _SEQ_FIGURE_RE) or str(figure_seq_counter)
+                caption_label = f"Figure {num}"
+                element_kind = "figure_caption"
+            elif _is_table_caption(block):
+                table_seq_counter += 1
+                num = _seq_cached_number(block, _SEQ_TABLE_RE) or str(table_seq_counter)
+                caption_label = f"Table {num}"
+                element_kind = "table_caption"
+                table_ref = last_table_index
+
+        stack_ids = [entry[1] for entry in section_stack]
+        record["section_path"] = section_stack[-1][2] if section_stack else None
+        record["heading_para_id"] = stack_ids[-1] if stack_ids else None
+        record["section_stack"] = stack_ids
+        record["caption_label"] = caption_label
+        record["element_kind"] = element_kind
+        record["table_ref"] = table_ref
+        records.append(record)
+
+    return records, tree
+
+
+def _table_cell_record(table_record: dict[str, Any], row: int, col: int) -> dict[str, Any]:
+    rows = table_record.get("rows") or []
+    return {
+        "element_kind": "table_cell",
+        "index": table_record.get("index"),
+        "para_id": f"{_table_anchor_id(table_record['index'])}:r{row}:c{col}",
+        "text": rows[row][col],
+        "section_path": table_record.get("section_path"),
+        "heading_para_id": table_record.get("heading_para_id"),
+        "section_stack": table_record.get("section_stack", []),
+        "table_index": table_record.get("index"),
+        "row": row,
+        "col": col,
+    }
+
+
+def _match_table_cell_by_id(records: list[dict[str, Any]], target_id: str) -> list[dict[str, Any]]:
+    match = _TABLE_CELL_ID_RE.match(target_id or "")
+    if not match:
+        return []
+    table_index, row, col = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    for record in records:
+        if record.get("element_kind") == "table" and record.get("index") == table_index:
+            rows = record.get("rows") or []
+            if row < len(rows) and col < len(rows[row]):
+                return [_table_cell_record(record, row, col)]
+    return []
+
+
+def _fold(value: str, case_sensitive: bool) -> str:
+    return value if case_sensitive else value.casefold()
+
+
+def _search_text_in_records(
+    scope: list[dict[str, Any]], query_text: str, *, case_sensitive: bool
+) -> list[dict[str, Any]]:
+    needle = _fold(query_text, case_sensitive)
+    matches: list[dict[str, Any]] = []
+    for record in scope:
+        if record.get("element_kind") == "table":
+            for row_idx, row in enumerate(record.get("rows") or []):
+                for col_idx, cell_text in enumerate(row):
+                    if needle in _fold(cell_text, case_sensitive):
+                        matches.append(_table_cell_record(record, row_idx, col_idx))
+        else:
+            text = record.get("text", "") or ""
+            if needle in _fold(text, case_sensitive):
+                matches.append(record)
+    return matches
+
+
+def _parse_caption_label(label: str) -> tuple[str, str] | None:
+    match = _CAPTION_LABEL_QUERY_RE.match(label or "")
+    if not match:
+        return None
+    return match.group(1).casefold(), match.group(2).strip()
+
+
+def _filter_by_element_types(
+    records: list[dict[str, Any]], element_types: list[str] | None
+) -> list[dict[str, Any]]:
+    if not element_types:
+        return records
+    wanted = {str(t).casefold() for t in element_types}
+    return [r for r in records if str(r.get("element_kind", "")).casefold() in wanted]
+
+
+def _anchor_brief(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "target_para_id": record.get("para_id"),
+        "element_type": record.get("element_kind"),
+        "document_order": record.get("index"),
+        "section_path": record.get("section_path"),
+        "leading_text_preview": _normalize_preview(record.get("text", "") or ""),
+    }
+
+
+def _bookmark_and_ref_status(document_path: str, target_para_id: str | None) -> tuple[bool, dict[str, Any]]:
+    """Best-effort bookmark/REF lookup for a resolved anchor's target_para_id.
+
+    Table/table-cell synthetic ids ("tbl<n>" / "tbl<n>:r<n>:c<n>") are never
+    real paragraph ids in the document -- :func:`find_references_to` cannot
+    resolve them, so those are reported as un-checked rather than guessed.
+    """
+    if (
+        not target_para_id
+        or _TABLE_ID_RE.match(target_para_id)
+        or _TABLE_CELL_ID_RE.match(target_para_id)
+    ):
+        return False, {
+            "checked": False,
+            "reason": "synthetic table identifier -- not a real paragraph id",
+        }
+    try:
+        refs = find_references_to(document_path, target_para_id)
+    except (OSError, ValueError, KeyError, ET.ParseError):
+        return False, {"checked": False, "reason": "lookup failed"}
+    if not refs or refs.get("error"):
+        return False, {
+            "checked": True,
+            "reference_count": 0,
+            "references": [],
+            "bookmark_names": [],
+            "note": (refs or {}).get("error"),
+        }
+    return bool(refs.get("bookmark_names")), {
+        "checked": True,
+        "reference_count": refs.get("reference_count", 0),
+        "references": refs.get("references", []),
+        "bookmark_names": refs.get("bookmark_names", []),
+    }
+
+
+def _build_resolved_anchor(
+    record: dict[str, Any],
+    *,
+    document_path: str,
+    source_fingerprint: str,
+    word_search_locator: str | None,
+) -> dict[str, Any]:
+    text = record.get("text", "") or ""
+    preview = _normalize_preview(text)
+    target_para_id = record.get("para_id")
+    bookmark_exists, ref_status = _bookmark_and_ref_status(document_path, target_para_id)
+    return {
+        "status": "resolved",
+        "document_path": document_path,
+        "source_fingerprint": source_fingerprint,
+        "element_type": record.get("element_kind"),
+        "section_path": record.get("section_path"),
+        "heading_para_id": record.get("heading_para_id"),
+        "target_para_id": target_para_id,
+        "document_order": record.get("index"),
+        "quoted_text": text,
+        "leading_text_preview": preview,
+        "first_words": preview,
+        "word_search_locator": word_search_locator or preview,
+        "bookmark_exists": bookmark_exists,
+        "ref_status": ref_status,
+        "candidates": [],
+    }
+
+
+def _ambiguous_anchor_result(
+    candidates: list[dict[str, Any]],
+    *,
+    document_path: str,
+    source_fingerprint: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": "ambiguous",
+        "document_path": document_path,
+        "source_fingerprint": source_fingerprint,
+        "reason": reason or f"{len(candidates)} elements matched this query; narrow it",
+        "candidate_count": len(candidates),
+        "candidates": [_anchor_brief(c) for c in candidates],
+    }
+
+
+def _not_found_anchor_result(
+    reason: str, *, document_path: str, source_fingerprint: str | None
+) -> dict[str, Any]:
+    return {
+        "status": "not_found",
+        "document_path": document_path,
+        "source_fingerprint": source_fingerprint,
+        "reason": reason,
+        "candidates": [],
+    }
+
+
+def _equation_pseudo_record(eq: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "element_kind": "equation",
+        "index": eq.get("ordinal"),
+        "para_id": eq.get("para_id"),
+        "text": eq.get("flat_text", ""),
+        "section_path": None,
+        "heading_para_id": None,
+        "section_stack": [],
+    }
+
+
+def _resolve_anchor_query(
+    records: list[dict[str, Any]],
+    equations: list[dict[str, Any]],
+    query: dict[str, Any],
+    *,
+    document_path: str,
+    source_fingerprint: str,
+) -> dict[str, Any]:
+    query = dict(query or {})
+    case_sensitive = bool(query.get("case_sensitive", False))
+    element_types = query.get("element_types")
+    para_id_query = query.get("para_id")
+    section_path_query = query.get("section_path")
+    section_text_query = query.get("section_text")
+    caption_label_query = query.get("caption_label")
+    text_query = query.get("text")
+
+    if not any(
+        [para_id_query, section_path_query, section_text_query, caption_label_query, text_query]
+    ):
+        return _not_found_anchor_result(
+            "query must set at least one of para_id, section_path, section_text, "
+            "caption_label, or text",
+            document_path=document_path,
+            source_fingerprint=source_fingerprint,
+        )
+
+    def _finish(matches: list[dict[str, Any]], *, locator: str | None = None) -> dict[str, Any]:
+        matches = _filter_by_element_types(matches, element_types)
+        if not matches:
+            return _not_found_anchor_result(
+                "no element matched this query",
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+            )
+        if len(matches) > 1:
+            return _ambiguous_anchor_result(
+                matches, document_path=document_path, source_fingerprint=source_fingerprint
+            )
+        return _build_resolved_anchor(
+            matches[0],
+            document_path=document_path,
+            source_fingerprint=source_fingerprint,
+            word_search_locator=locator,
+        )
+
+    # 1. Direct para_id short-circuits everything else.
+    if para_id_query:
+        direct = [r for r in records if r.get("para_id") == para_id_query]
+        if not direct:
+            direct = _match_table_cell_by_id(records, para_id_query)
+        if not direct:
+            direct = [
+                _equation_pseudo_record(eq)
+                for eq in equations
+                if eq.get("para_id") == para_id_query
+            ]
+        if not direct:
+            return _not_found_anchor_result(
+                f"para_id {para_id_query!r} not found",
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+            )
+        return _finish(direct)
+
+    scope = records
+
+    # 2. Section scoping (heading resolution).
+    heading_target: dict[str, Any] | None = None
+    if section_path_query or section_text_query:
+        wanted_path = str(section_path_query).strip() if section_path_query else None
+        heading_candidates = [
+            r
+            for r in scope
+            if r.get("element_kind") == "heading"
+            and (
+                wanted_path is None
+                or r.get("explicit_number") == wanted_path
+                or r.get("computed_path") == wanted_path
+            )
+            and (
+                not section_text_query
+                or _fold(str(section_text_query), case_sensitive)
+                in _fold(r.get("text") or "", case_sensitive)
+            )
+        ]
+        if not heading_candidates:
+            return _not_found_anchor_result(
+                "no heading matched section_path/section_text",
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+            )
+        if len(heading_candidates) > 1:
+            return _ambiguous_anchor_result(
+                heading_candidates,
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+                reason="multiple headings matched section_path/section_text; narrow the query",
+            )
+        heading_target = heading_candidates[0]
+        if not (caption_label_query or text_query):
+            return _finish([heading_target])
+        scope = [r for r in scope if heading_target["para_id"] in r.get("section_stack", [])]
+
+    # 3. caption_label scoping.
+    caption_target: dict[str, Any] | None = None
+    if caption_label_query:
+        parsed_query = _parse_caption_label(str(caption_label_query))
+        caption_candidates = []
+        for r in scope:
+            if not r.get("caption_label"):
+                continue
+            parsed_candidate = _parse_caption_label(r["caption_label"])
+            if parsed_query and parsed_candidate and parsed_query == parsed_candidate:
+                caption_candidates.append(r)
+        if not caption_candidates:
+            return _not_found_anchor_result(
+                f"no caption matched {caption_label_query!r}",
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+            )
+        if len(caption_candidates) > 1:
+            return _ambiguous_anchor_result(
+                caption_candidates,
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+                reason=f"multiple captions matched {caption_label_query!r}",
+            )
+        caption_target = caption_candidates[0]
+        if not text_query:
+            return _finish([caption_target])
+        if (
+            caption_target.get("element_kind") == "table_caption"
+            and caption_target.get("table_ref") is not None
+        ):
+            scope = [
+                r
+                for r in records
+                if r.get("element_kind") == "table" and r.get("index") == caption_target["table_ref"]
+            ] + [caption_target]
+        else:
+            scope = [caption_target]
+
+    # 4. text (Ctrl+F) search within whatever scope survived steps 2-3.
+    if text_query:
+        text_matches = _search_text_in_records(scope, str(text_query), case_sensitive=case_sensitive)
+        if not text_matches and heading_target is None and caption_target is None:
+            # Fully unscoped text query: also try equation flat_text so
+            # equations stay reachable via plain Ctrl+F-style search.
+            needle = _fold(str(text_query), case_sensitive)
+            text_matches.extend(
+                _equation_pseudo_record(eq)
+                for eq in equations
+                if needle in _fold(eq.get("flat_text", "") or "", case_sensitive)
+            )
+        return _finish(text_matches, locator=str(text_query))
+
+    # section/caption-only queries already returned above.
+    return _not_found_anchor_result(
+        "query did not resolve to any element",
+        document_path=document_path,
+        source_fingerprint=source_fingerprint,
+    )
+
+
+def locate_anchor(document_path: str, query: dict[str, Any]) -> dict[str, Any]:
+    """2271789f -- read-only, fresh-snapshot deterministic anchor locator.
+
+    Re-parses ``document_path`` from disk on every call (no sidecar SQLite
+    index, so there is nothing that can go stale between calls) and resolves
+    ``query`` against sections, paragraphs, captions, tables (incl. cell
+    text), and equations. See the module-level comment above this function
+    for the full query-key contract and the shape of a resolved result:
+    ``{status, section_path, heading_para_id, target_para_id,
+    document_order, element_type, quoted_text, leading_text_preview,
+    first_words, word_search_locator, bookmark_exists, ref_status,
+    candidates, document_path, source_fingerprint}``.
+
+    Pass ``query["expected_source_fingerprint"]`` (a value previously
+    returned as ``source_fingerprint``) to detect the document having
+    changed underneath a stashed locator result before trusting it again --
+    a mismatch short-circuits to ``{"status": "stale", ...}`` without
+    attempting resolution against what may now be the wrong paragraph.
+
+    Never mutates ``document_path``. Returns ``{"error": ...}`` only when
+    the document itself cannot be read or parsed as a .docx.
+    """
+    if not isinstance(query, dict) or not query:
+        return {"error": "query must be a non-empty dict"}
+    try:
+        with open(document_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    source_fingerprint = _source_fingerprint(raw)
+    expected = query.get("expected_source_fingerprint")
+    if expected and expected != source_fingerprint:
+        return {
+            "status": "stale",
+            "document_path": document_path,
+            "reason": "source_fingerprint_mismatch",
+            "expected_source_fingerprint": expected,
+            "source_fingerprint": source_fingerprint,
+            "candidates": [],
+        }
+
+    try:
+        records, _tree = _iter_anchor_records(raw)
+        equations = parse_docx_equations_local(raw)
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return {"error": str(exc)}
+
+    return _resolve_anchor_query(
+        records, equations, query, document_path=document_path, source_fingerprint=source_fingerprint
+    )
+
+
+def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[str, Any]:
+    """2271789f -- resolve multiple independent :func:`locate_anchor` queries
+    against ONE fresh parse of ``document_path`` (one source_fingerprint, one
+    document_content_tree walk) instead of re-reading the file per query.
+
+    Query order is preserved in ``results``; each entry has the exact same
+    shape :func:`locate_anchor` returns for a single query. Returns
+    ``{"document_path", "source_fingerprint", "query_count", "results"}``,
+    or ``{"error": ...}`` if the document itself cannot be read/parsed.
+    """
+    if not isinstance(queries, list) or not queries:
+        return {"error": "queries must be a non-empty list of query dicts"}
+    try:
+        with open(document_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    source_fingerprint = _source_fingerprint(raw)
+    try:
+        records, _tree = _iter_anchor_records(raw)
+        equations = parse_docx_equations_local(raw)
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return {"error": str(exc)}
+
+    results: list[dict[str, Any]] = []
+    for query in queries:
+        if not isinstance(query, dict) or not query:
+            results.append({"error": "query must be a non-empty dict"})
+            continue
+        expected = query.get("expected_source_fingerprint")
+        if expected and expected != source_fingerprint:
+            results.append({
+                "status": "stale",
+                "document_path": document_path,
+                "reason": "source_fingerprint_mismatch",
+                "expected_source_fingerprint": expected,
+                "source_fingerprint": source_fingerprint,
+                "candidates": [],
+            })
+            continue
+        results.append(
+            _resolve_anchor_query(
+                records,
+                equations,
+                query,
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+            )
+        )
+
+    return {
+        "document_path": document_path,
+        "source_fingerprint": source_fingerprint,
+        "query_count": len(queries),
+        "results": results,
+    }
+
+
 def read_document_snapshot(docx_path: str) -> dict[str, Any]:
     """Read the saved DOCX snapshot without writing or requiring a close.
 

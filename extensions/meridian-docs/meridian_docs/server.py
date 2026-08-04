@@ -217,6 +217,41 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def locate_anchor(document_path: str, query: dict[str, Any]) -> dict[str, Any]:
+    """2271789f -- read-only, fresh-snapshot deterministic anchor locator.
+
+    Resolves ``query`` against sections, paragraphs, captions, tables
+    (including cell text), and equations, re-parsing ``document_path`` from
+    disk on every call (never a stale sidecar index). Query keys (all
+    optional; at least one required): ``para_id``, ``section_path`` (e.g.
+    "3.2.4"), ``section_text``, ``caption_label`` (e.g. "Table 3"), ``text``
+    (Ctrl+F-style literal substring), ``element_types``, ``case_sensitive``,
+    and ``expected_source_fingerprint`` (detects the document having
+    changed since a previously-returned ``source_fingerprint``).
+
+    A resolved result includes ``section_path``, ``heading_para_id``,
+    ``target_para_id``, ``document_order``, ``quoted_text``,
+    ``leading_text_preview``/``first_words``, ``word_search_locator``,
+    ``bookmark_exists``, ``ref_status``, and an explicit (empty when
+    unambiguous) ``candidates`` list. ``status`` is one of "resolved",
+    "ambiguous", "not_found", or "stale". Never mutates document_path. See
+    :func:`meridian_docs.docs_intel.locate_anchor` for the full contract.
+    """
+    return docs_intel.locate_anchor(document_path=document_path, query=query)
+
+
+@mcp.tool()
+def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[str, Any]:
+    """2271789f -- resolve multiple independent locate_anchor queries against
+    ONE fresh parse of document_path (one source_fingerprint, one index
+    pass), preserving query order in the returned ``results`` list. See
+    :func:`locate_anchor` for the per-query contract and
+    :func:`meridian_docs.docs_intel.locate_anchors` for full details.
+    """
+    return docs_intel.locate_anchors(document_path=document_path, queries=queries)
+
+
+@mcp.tool()
 def check_render_capability(docx_path: str) -> dict[str, Any]:
     """93cd9798 -- lightweight render-capability detection for visual QA.
 
