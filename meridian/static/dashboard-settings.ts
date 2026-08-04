@@ -2457,6 +2457,22 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
     </div>
 
+    <!-- f7084ed0 — orphan-process-reaper Stop hook toggle. OFF by default;
+         enabling registers a project-scoped Stop hook (meridian/orphan_reaper.py)
+         that reaps dangling pixi/python/node/cmd/uv/conhost processes still
+         rooted in a worktree whose sprint item/session is done, after
+         validating PID + start-time ownership and killing the whole process
+         tree. Saves immediately on change (not batched into "Save defaults")
+         because disabling has an immediate side effect: it deletes any
+         already-written .claude/hooks/orphan_reaper.* files right away
+         instead of waiting for the next generate_handoff. -->
+    <div style="margin-bottom:10px">
+
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:10px;color:var(--muted)"><input type="checkbox" id="exec-orphan-reaper-${projectId}" style="cursor:pointer"> Auto-reap dangling processes from dead worktree sessions <span id="exec-orphan-reaper-status-${projectId}" style="font-size:9px"></span></label>
+      <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Off by default. Registers <code>.claude/hooks/orphan_reaper.sh</code>/<code>.ps1</code>, ownership-validated (PID + start time) before anything is signalled — never touches a process it can't confirm identity for. (Applies on the machine running the tunnel/server.)</span>
+
+    </div>
+
     <!-- b970fe07 — code-intel auto-index dirs (code slot). Add/remove list,
          mirroring Filesystem Roots. Used only when --code-dir is not passed. -->
     <div style="margin-bottom:10px">
@@ -2725,6 +2741,43 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     };
     if (_cdAddBtn) _cdAddBtn.onclick = _addCodeDir;
     if (_cdInput) _cdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); _addCodeDir(); } });
+
+    // f7084ed0 — orphan-process-reaper toggle: independent of the "Save
+    // defaults" button below (it has an immediate server-side effect —
+    // disabling deletes any already-written hook files right away), so it's
+    // wired as its own fetch-on-render / save-on-change control rather than
+    // folding into the batched `cfg` object saveBtn.onclick builds.
+    const _orphanReaperCb = document.getElementById(`exec-orphan-reaper-${projectId}`) as HTMLInputElement | null;
+    const _orphanReaperStatus = document.getElementById(`exec-orphan-reaper-status-${projectId}`);
+    if (_orphanReaperCb) {
+      api(`/projects/${projectId}/orphan_reaper`).then((s: any) => {
+        _orphanReaperCb.checked = !!(s && s.enabled);
+      }).catch(() => { /* best-effort status fetch — leave unchecked (off) on failure */ });
+      _orphanReaperCb.addEventListener('change', async () => {
+        const desired = _orphanReaperCb.checked;
+        _orphanReaperCb.disabled = true;
+        if (_orphanReaperStatus) _orphanReaperStatus.textContent = 'saving…';
+        try {
+          const res = await api(`/projects/${projectId}/orphan_reaper/toggle`, {
+            method: 'POST',
+            body: JSON.stringify({ enabled: desired }),
+          });
+          const removedCount = Array.isArray(res?.removed_files) ? res.removed_files.length : 0;
+          _orphanReaperCb.checked = !!res?.enabled;
+          if (_orphanReaperStatus) {
+            _orphanReaperStatus.textContent = res?.enabled
+              ? '(enabled)'
+              : (removedCount ? `(disabled — removed ${removedCount} hook file${removedCount === 1 ? '' : 's'})` : '(disabled)');
+            setTimeout(() => { if (_orphanReaperStatus) _orphanReaperStatus.textContent = ''; }, 4000);
+          }
+        } catch (e: any) {
+          _orphanReaperCb.checked = !desired;
+          if (_orphanReaperStatus) _orphanReaperStatus.textContent = e?.message || '(failed to save)';
+        } finally {
+          _orphanReaperCb.disabled = false;
+        }
+      });
+    }
 
     saveBtn.onclick = async () => {
 

@@ -2956,6 +2956,80 @@ async def get_project_context(
     }
 
 
+# ---------------------------------------------------------------------------
+# f7084ed0 — orphan-process-reaper dashboard toggle
+# ---------------------------------------------------------------------------
+
+
+@app.get("/projects/{project_id}/orphan_reaper")
+async def get_orphan_reaper_status(project_id: str, request: Request) -> dict[str, Any]:
+    """f7084ed0 — dashboard-facing status for the orphan-process-reaper Stop
+    hook (``meridian/orphan_reaper.py``): whether it's currently enabled for
+    this project. Disabled by default (``orphan_reaper.seed_orphan_reaper_hook``)
+    — read-only and never seeds/creates the hook row itself, so rendering a
+    settings toggle can never have the side effect of silently enabling
+    something a human hasn't opted into.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    from . import orphan_reaper as orphan_reaper_module  # noqa: PLC0415 — avoid import cycle at module load
+
+    hooks = await db_module.get_custom_hooks(db, project_id, event=orphan_reaper_module.HOOK_EVENT)
+    existing = next(
+        (h for h in hooks if h.get("slug") == orphan_reaper_module.HOOK_NAME), None
+    )
+    return {
+        "registered": existing is not None,
+        "enabled": bool(existing.get("enabled")) if existing is not None else False,
+    }
+
+
+@app.post("/projects/{project_id}/orphan_reaper/toggle")
+async def toggle_orphan_reaper(
+    project_id: str, body: dict, request: Request
+) -> dict[str, Any]:
+    """f7084ed0 — dashboard opt-in/opt-out for the orphan-process-reaper Stop
+    hook. Body: ``{"enabled": bool}``. Flips ``custom_hooks.enabled`` via
+    ``orphan_reaper.set_orphan_reaper_enabled`` (seeds the row disabled first
+    if this project has never run ``generate_handoff``). Turning it OFF also
+    immediately deletes any already-written
+    ``.claude/hooks/orphan_reaper.*`` files on the machine running the
+    tunnel/server (when this project has a configured ``repo_path``) rather
+    than waiting for the next handoff to simply stop re-writing them —
+    reported back as ``removed_files``.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    enabled = bool(body.get("enabled"))
+    from . import orphan_reaper as orphan_reaper_module  # noqa: PLC0415 — avoid import cycle at module load
+
+    url = os.environ.get("MERIDIAN_URL") or "http://localhost:7878"
+    hook = await orphan_reaper_module.set_orphan_reaper_enabled(
+        db, project_id, enabled, url=url
+    )
+    removed_files: list[str] = []
+    if not enabled:
+        try:
+            executor_config = await db_module.get_executor_config(db, project_id)
+            repo_path = (executor_config.get("repo_path") or "").strip()
+            if repo_path and (Path(repo_path) / ".claude").exists():
+                hooks_dir = Path(repo_path) / ".claude" / "hooks"
+                removed_files = orphan_reaper_module.remove_orphan_reaper_artifacts(hooks_dir)
+        except Exception:  # noqa: BLE001 — artifact cleanup is best-effort, never fails the toggle
+            import logging as _l
+            _l.getLogger("meridian.server").warning(
+                "orphan_reaper artifact cleanup failed for project %s", project_id, exc_info=True
+            )
+    return {
+        "enabled": bool(hook.get("enabled")) if hook else enabled,
+        "removed_files": removed_files,
+    }
+
+
 # Decisions routes → meridian/routes/decisions.py
 # ---------------------------------------------------------------------------
 # v2.4 — HITL (human-in-the-loop) queue

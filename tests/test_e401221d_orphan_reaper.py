@@ -13,8 +13,31 @@ Covers:
    (a03c0eeb).
 6. ``main()`` -- CLI entry point invoked by the registered hook scripts;
    always exits 0 even when the fetch/reap steps raise.
+
+f7084ed0 -- deterministic, tree-safe, opt-out cleanup. Additional coverage:
+7. ``_identity_matches`` -- pure PID+create_time ownership check.
+8. ``reap_orphans`` ownership revalidation -- PID reuse / already-exited
+   candidates are safe no-ops (mocked process snapshots only, never a real
+   OS process).
+9. Expanded target-name coverage (cmd/uv/uvx/conhost) and the WebView2
+   denylist -- ``_proc_name_is_target``.
+10. ``_psutil_kill_tree`` / ``_psutil_collect_tree`` -- tree-safe kill on
+    both platforms, exercised ONLY against a fake ``psutil`` module injected
+    via ``monkeypatch.setitem(sys.modules, "psutil", ...)`` (the same
+    technique already used for ``tunnel_client``'s equivalent process-kill
+    functions in tests/test_tunnel_client.py) -- never a real, disposable, or
+    otherwise genuine OS process.
+11. ``seed_orphan_reaper_hook`` disabled-by-default + enabled-state
+    preserved across idempotent refresh.
+12. ``set_orphan_reaper_enabled`` / ``remove_orphan_reaper_artifacts`` --
+    the dashboard-toggle backend and its "delete hook files immediately"
+    behavior.
+13. ``GET``/``POST /projects/{id}/orphan_reaper(/toggle)`` -- the dashboard
+    REST routes in ``meridian/server.py``.
 """
 from __future__ import annotations
+
+import sys
 
 import pytest
 
@@ -163,6 +186,343 @@ def test_reap_orphans_kill_fn_exception_is_swallowed_and_skipped():
 
 
 # ---------------------------------------------------------------------------
+# 2a. _identity_matches -- pure PID+create_time ownership check
+# ---------------------------------------------------------------------------
+
+
+def test_identity_matches_current_none_is_always_false():
+    assert orphan_reaper._identity_matches({"name": "pixi.exe"}, None) is False
+
+
+def test_identity_matches_name_mismatch_is_false():
+    candidate = {"name": "pixi.exe", "create_time": 1000.0}
+    current = {"name": "explorer.exe", "create_time": 1000.0}
+    assert orphan_reaper._identity_matches(candidate, current) is False
+
+
+def test_identity_matches_create_time_mismatch_is_false():
+    """Same name, but the pid's start time has changed -- the OS reassigned
+    this pid to a different process (or the original one restarted) since
+    the candidate was first observed."""
+    candidate = {"name": "python.exe", "create_time": 1000.0}
+    current = {"name": "python.exe", "create_time": 5000.0}
+    assert orphan_reaper._identity_matches(candidate, current) is False
+
+
+def test_identity_matches_create_time_within_tolerance_is_true():
+    candidate = {"name": "python.exe", "create_time": 1000.25}
+    current = {"name": "python.exe", "create_time": 1000.4}
+    assert orphan_reaper._identity_matches(candidate, current) is True
+
+
+def test_identity_matches_matching_name_and_create_time_is_true():
+    candidate = {"name": "pixi.exe", "create_time": 42.0}
+    current = {"name": "pixi.exe", "create_time": 42.0}
+    assert orphan_reaper._identity_matches(candidate, current) is True
+
+
+def test_identity_matches_missing_create_time_on_either_side_falls_back_to_name():
+    """Nothing to contradict -- must not reject just because create_time
+    wasn't captured on one (or either) side."""
+    assert orphan_reaper._identity_matches(
+        {"name": "pixi.exe"}, {"name": "pixi.exe", "create_time": 42.0}
+    ) is True
+    assert orphan_reaper._identity_matches(
+        {"name": "pixi.exe", "create_time": 42.0}, {"name": "pixi.exe"}
+    ) is True
+    assert orphan_reaper._identity_matches(
+        {"name": "pixi.exe"}, {"name": "pixi.exe"}
+    ) is True
+
+
+def test_identity_matches_missing_name_on_either_side_falls_back_to_create_time():
+    assert orphan_reaper._identity_matches(
+        {"create_time": 1.0}, {"name": "pixi.exe", "create_time": 1.0}
+    ) is True
+
+
+# ---------------------------------------------------------------------------
+# 2b. reap_orphans ownership revalidation -- PID reuse / already-exited
+#     candidates are safe no-ops. All process snapshots below are plain
+#     dicts fed through the process_iter injection point -- no real OS
+#     process is ever spawned, signalled, or even looked up.
+# ---------------------------------------------------------------------------
+
+
+def test_reap_orphans_skips_pid_reused_by_unrelated_process():
+    """The OS reassigned pid 111 to an unrelated (non-target-name) process
+    between the initial scan and the kill -- must be a safe no-op, not a
+    kill, even though the ORIGINAL scan matched it correctly."""
+    calls = iter([
+        _fake_processes(),  # initial scan (list_orphan_candidates)
+        [  # revalidation snapshot immediately before killing
+            {"pid": 111, "name": "explorer.exe", "cwd": r"C:\Users\someone", "cmdline": "explorer.exe"},
+            {"pid": 222, "name": "python.exe", "cwd": _DEAD_PATH + "\\meridian", "cmdline": "python -m meridian"},
+        ],
+    ])
+    killed_pids: list[int] = []
+
+    def _fake_kill(pid: int) -> bool:
+        killed_pids.append(pid)
+        return True
+
+    result = orphan_reaper.reap_orphans(
+        [_DEAD_PATH], process_iter=lambda: next(calls), kill_fn=_fake_kill
+    )
+    assert 111 not in killed_pids
+    assert 222 in killed_pids
+    mismatch = [s for s in result["skipped"] if s["pid"] == 111]
+    assert len(mismatch) == 1
+    assert mismatch[0]["reason"] == "identity_mismatch"
+
+
+def test_reap_orphans_skips_already_exited_candidate():
+    """pid 222 exited on its own between the scan and the kill -- absent
+    from the revalidation snapshot entirely -- must be recorded as
+    already_gone, never passed to kill_fn."""
+    calls = iter([
+        _fake_processes(),
+        [
+            {"pid": 111, "name": "pixi.exe", "cwd": _DEAD_PATH, "cmdline": "pixi run python -m meridian --mcp"},
+            # pid 222 is simply gone from this snapshot.
+        ],
+    ])
+    killed_pids: list[int] = []
+
+    def _fake_kill(pid: int) -> bool:
+        killed_pids.append(pid)
+        return True
+
+    result = orphan_reaper.reap_orphans(
+        [_DEAD_PATH], process_iter=lambda: next(calls), kill_fn=_fake_kill
+    )
+    assert killed_pids == [111]
+    already_gone = [s for s in result["skipped"] if s["pid"] == 222]
+    assert len(already_gone) == 1
+    assert already_gone[0]["reason"] == "already_gone"
+
+
+def test_reap_orphans_revalidation_failure_fails_closed_never_kills():
+    """If the revalidation snapshot itself can't be taken, every candidate
+    must be treated as unconfirmed -- fail closed, never fall back to
+    killing blindly off the (now possibly stale) initial scan."""
+    calls = iter([_fake_processes()])
+
+    def _iter():
+        try:
+            return next(calls)
+        except StopIteration:
+            raise RuntimeError("psutil exploded on the revalidation pass")
+
+    killed_pids: list[int] = []
+
+    def _fake_kill(pid: int) -> bool:
+        killed_pids.append(pid)
+        return True
+
+    result = orphan_reaper.reap_orphans([_DEAD_PATH], process_iter=_iter, kill_fn=_fake_kill)
+    assert killed_pids == []
+    assert result["killed_count"] == 0
+    assert result["skipped_count"] == 2
+    assert all(s["reason"] == "already_gone" for s in result["skipped"])
+
+
+def test_reap_orphans_dry_run_skips_revalidation_snapshot_entirely():
+    """A dry run must never even attempt the revalidation snapshot -- it
+    signals nothing, so there is nothing to protect against a race for."""
+    calls_made = {"n": 0}
+
+    def _iter():
+        calls_made["n"] += 1
+        return _fake_processes()
+
+    result = orphan_reaper.reap_orphans([_DEAD_PATH], process_iter=_iter, dry_run=True)
+    # Exactly one call: the initial scan inside list_orphan_candidates.
+    assert calls_made["n"] == 1
+    assert result["skipped_count"] == 2
+    assert all(s["reason"] == "dry_run" for s in result["skipped"])
+
+
+# ---------------------------------------------------------------------------
+# 2c. Expanded target-name coverage (cmd/uv/uvx/conhost) + WebView2 denylist
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["cmd.exe", "uv.exe", "uvx.exe", "conhost.exe"])
+def test_proc_name_is_target_covers_expanded_family(name):
+    """f7084ed0 -- previously-missed process families this item's
+    prospecting flagged as coverage gaps."""
+    assert orphan_reaper._proc_name_is_target(name) is True
+
+
+def test_proc_name_is_target_excludes_webview2_even_if_name_matches():
+    # Contrived name containing "node" (a real target substring) to prove
+    # the denylist wins even when a target substring would otherwise match.
+    assert orphan_reaper._proc_name_is_target("msedgewebview2_node_helper.exe") is False
+
+
+def test_list_orphan_candidates_reaps_cmd_and_conhost_rooted_in_dead_path():
+    def _procs():
+        return [
+            {"pid": 555, "name": "cmd.exe", "cwd": _DEAD_PATH, "cmdline": "cmd.exe /c pixi run test"},
+            {"pid": 666, "name": "conhost.exe", "cwd": _DEAD_PATH, "cmdline": "conhost.exe 0x4"},
+            {"pid": 777, "name": "uvx.exe", "cwd": _DEAD_PATH, "cmdline": "uvx run something"},
+        ]
+
+    candidates = orphan_reaper.list_orphan_candidates([_DEAD_PATH], process_iter=_procs)
+    assert {c["pid"] for c in candidates} == {555, 666, 777}
+
+
+# ---------------------------------------------------------------------------
+# 2d. _psutil_kill_tree / _psutil_collect_tree -- tree-safe kill, exercised
+#     ONLY against a fake `psutil` module injected via
+#     monkeypatch.setitem(sys.modules, "psutil", ...) -- the same technique
+#     tests/test_tunnel_client.py already uses for the equivalent real-kill
+#     functions there. NEVER a real, disposable, or otherwise genuine OS
+#     process is spawned or signalled by any test in this file.
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_psutil(monkeypatch, *, children_by_pid=None, alive_pids=None):
+    """Mirrors tests/test_tunnel_client.py::_install_fake_psutil. Returns a
+    dict of call-log lists (terminate/kill per pid) the test can assert on.
+    `alive_pids` (mutable set) lets a test simulate a process actually going
+    away after terminate()/kill() -- pid_exists() consults it live."""
+    import types
+
+    children_by_pid = children_by_pid or {}
+    if alive_pids is None:
+        alive_pids = set(children_by_pid) | {p for kids in children_by_pid.values() for p in kids}
+    calls: dict[str, list[int]] = {"terminate": [], "kill": []}
+
+    fake_psutil = types.ModuleType("psutil")
+
+    class _FakeProc:
+        def __init__(self, pid):
+            if pid not in alive_pids:
+                raise ProcessLookupError(f"no such process: {pid}")
+            self.pid = pid
+
+        def _descendant_pids(self):
+            direct = [p for p in children_by_pid.get(self.pid, []) if p in alive_pids]
+            out = list(direct)
+            for p in direct:
+                out.extend(_FakeProc(p)._descendant_pids())
+            return out
+
+        def children(self, recursive=False):
+            pids = self._descendant_pids() if recursive else [
+                p for p in children_by_pid.get(self.pid, []) if p in alive_pids
+            ]
+            return [_FakeProc(p) for p in pids]
+
+        def terminate(self):
+            calls["terminate"].append(self.pid)
+            alive_pids.discard(self.pid)
+
+        def kill(self):
+            calls["kill"].append(self.pid)
+            alive_pids.discard(self.pid)
+
+    fake_psutil.Process = _FakeProc
+    fake_psutil.pid_exists = lambda pid: pid in alive_pids
+    # Mirrors real psutil.wait_procs: a proc whose pid is no longer alive
+    # (terminate()/kill() already removed it above) is "gone", not "alive" --
+    # so a graceful terminate() that actually worked does NOT force the
+    # kill() escalation path.
+    fake_psutil.wait_procs = lambda procs, timeout=None: (
+        [p for p in procs if p.pid not in alive_pids],
+        [p for p in procs if p.pid in alive_pids],
+    )
+
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    return calls, alive_pids
+
+
+def test_psutil_collect_tree_returns_pid_plus_recursive_children(monkeypatch):
+    _install_fake_psutil(monkeypatch, children_by_pid={100: [101, 102], 101: [103]})
+    tree = orphan_reaper._psutil_collect_tree(100)
+    assert set(tree) == {100, 101, 102, 103}
+
+
+def test_psutil_collect_tree_degrades_to_bare_pid_on_lookup_failure(monkeypatch):
+    _install_fake_psutil(monkeypatch, children_by_pid={})  # pid 999 doesn't exist
+    assert orphan_reaper._psutil_collect_tree(999) == [999]
+
+
+def test_psutil_kill_tree_windows_uses_taskkill_f_t(monkeypatch):
+    monkeypatch.setattr(orphan_reaper.sys, "platform", "win32")
+    _install_fake_psutil(monkeypatch, alive_pids=set())  # pid_exists -> False after kill
+    run_calls = []
+
+    def _fake_run(argv, **kw):
+        run_calls.append(argv)
+        class _R:
+            returncode = 0
+        return _R()
+
+    monkeypatch.setattr(orphan_reaper.subprocess, "run", _fake_run)
+    assert orphan_reaper._psutil_kill_tree(4242) is True
+    assert run_calls == [["taskkill", "/F", "/T", "/PID", "4242"]]
+
+
+def test_psutil_kill_tree_posix_terminates_whole_family(monkeypatch):
+    monkeypatch.setattr(orphan_reaper.sys, "platform", "linux")
+    calls, alive = _install_fake_psutil(monkeypatch, children_by_pid={100: [101, 102]})
+    assert orphan_reaper._psutil_kill_tree(100) is True
+    # All three -- parent and both children -- were terminated (graceful first).
+    assert set(calls["terminate"]) == {100, 101, 102}
+    assert calls["kill"] == []  # graceful termination was enough
+    assert alive == set()
+
+
+def test_psutil_kill_tree_posix_escalates_to_kill_for_stragglers(monkeypatch):
+    monkeypatch.setattr(orphan_reaper.sys, "platform", "linux")
+    import types
+
+    fake_psutil = types.ModuleType("psutil")
+    calls: dict[str, list[int]] = {"terminate": [], "kill": []}
+    alive_after_kill = {200}  # pretend pid 200 never actually dies -- pid_exists still True
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def children(self, recursive=False):
+            return []
+
+        def terminate(self):
+            calls["terminate"].append(self.pid)
+
+        def kill(self):
+            calls["kill"].append(self.pid)
+
+    fake_psutil.Process = _FakeProc
+    # wait_procs always reports everyone still alive -- forces the kill() escalation path.
+    fake_psutil.wait_procs = lambda procs, timeout=None: ([], list(procs))
+    fake_psutil.pid_exists = lambda pid: pid in alive_after_kill
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+
+    assert orphan_reaper._psutil_kill_tree(200) is False  # still alive -> not confirmed gone
+    assert calls["terminate"] == [200]
+    assert calls["kill"] == [200]
+
+
+def test_psutil_kill_tree_missing_psutil_returns_false(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _fail_psutil_import(name, *a, **kw):
+        if name == "psutil":
+            raise ImportError("no psutil")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _fail_psutil_import)
+    assert orphan_reaper._psutil_kill_tree(1) is False
+
+
+# ---------------------------------------------------------------------------
 # 3. fetch_dead_worktree_paths -- mocked HTTP, no real network
 # ---------------------------------------------------------------------------
 
@@ -226,7 +586,9 @@ async def test_seed_orphan_reaper_hook_creates_stop_hook(db):
     assert hook["slug"] == orphan_reaper.HOOK_NAME
     assert hook["event"] == "Stop"
     assert bool(hook["blocking"]) is False
-    assert hook["enabled"]
+    # f7084ed0 -- disabled by default: cleanup is opt-in, never silently
+    # active the moment a project first runs generate_handoff.
+    assert bool(hook["enabled"]) is False
     assert p["id"] in hook["script_sh"]
     assert "http://localhost:9999" in hook["script_sh"]
     assert "meridian.orphan_reaper" in hook["script_sh"]
@@ -250,6 +612,25 @@ async def test_seed_orphan_reaper_hook_is_idempotent_and_refreshes_script(db):
 
 
 @pytest.mark.asyncio
+async def test_seed_orphan_reaper_hook_refresh_preserves_enabled_state(db):
+    """f7084ed0 -- a refresh (script-body update on an already-existing row)
+    must never clobber whatever enabled state a human (or
+    set_orphan_reaper_enabled) previously set. Only set_orphan_reaper_enabled
+    is allowed to change it."""
+    p = await db_module.create_project(db, "orphan-reaper-enabled-preserve-test")
+    first = await orphan_reaper.seed_orphan_reaper_hook(db, p["id"], url="http://localhost:1111")
+    assert bool(first["enabled"]) is False
+
+    # Simulate a human turning it on via the dashboard toggle.
+    await db_module.update_custom_hook(db, p["id"], first["id"], enabled=True)
+
+    refreshed = await orphan_reaper.seed_orphan_reaper_hook(db, p["id"], url="http://localhost:2222")
+    assert refreshed["id"] == first["id"]
+    assert "http://localhost:2222" in refreshed["script_sh"]
+    assert bool(refreshed["enabled"]) is True
+
+
+@pytest.mark.asyncio
 async def test_seed_orphan_reaper_hook_never_uses_reserved_sprint_guard_slug(db):
     """The reserved-slug guard in add_custom_hook must never fire for our
     hook -- it registers under its own 'orphan_reaper' slug, not
@@ -257,6 +638,161 @@ async def test_seed_orphan_reaper_hook_never_uses_reserved_sprint_guard_slug(db)
     p = await db_module.create_project(db, "orphan-reaper-slug-test")
     hook = await orphan_reaper.seed_orphan_reaper_hook(db, p["id"])
     assert hook["slug"] != "sprint_guard"
+
+
+# ---------------------------------------------------------------------------
+# 4a. set_orphan_reaper_enabled -- the ONLY path that flips the hook's
+#     enabled flag; backs the dashboard toggle.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_orphan_reaper_enabled_creates_disabled_row_then_enables(db):
+    p = await db_module.create_project(db, "orphan-reaper-toggle-enable-test")
+    # No hook row exists yet for this project at all.
+    assert await db_module.get_custom_hooks(db, p["id"]) == []
+
+    hook = await orphan_reaper.set_orphan_reaper_enabled(db, p["id"], True)
+    assert bool(hook["enabled"]) is True
+    assert hook["slug"] == orphan_reaper.HOOK_NAME
+
+    all_hooks = await db_module.get_custom_hooks(db, p["id"])
+    assert len(all_hooks) == 1
+    assert bool(all_hooks[0]["enabled"]) is True
+
+
+@pytest.mark.asyncio
+async def test_set_orphan_reaper_enabled_toggles_existing_row_off(db):
+    p = await db_module.create_project(db, "orphan-reaper-toggle-disable-test")
+    await orphan_reaper.set_orphan_reaper_enabled(db, p["id"], True)
+
+    hook = await orphan_reaper.set_orphan_reaper_enabled(db, p["id"], False)
+    assert bool(hook["enabled"]) is False
+
+    all_hooks = await db_module.get_custom_hooks(db, p["id"])
+    assert len(all_hooks) == 1  # still one row -- toggled, not deleted/recreated
+    assert bool(all_hooks[0]["enabled"]) is False
+
+
+@pytest.mark.asyncio
+async def test_set_orphan_reaper_enabled_is_a_noop_when_already_at_desired_state(db):
+    p = await db_module.create_project(db, "orphan-reaper-toggle-noop-test")
+    first = await orphan_reaper.set_orphan_reaper_enabled(db, p["id"], False)
+    second = await orphan_reaper.set_orphan_reaper_enabled(db, p["id"], False)
+    assert first["id"] == second["id"]
+    assert bool(second["enabled"]) is False
+
+
+# ---------------------------------------------------------------------------
+# 4b. remove_orphan_reaper_artifacts -- pure filesystem cleanup, no DB/OS
+#     process involvement at all.
+# ---------------------------------------------------------------------------
+
+
+def test_remove_orphan_reaper_artifacts_deletes_present_files(tmp_path):
+    hooks_dir = tmp_path / ".claude" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "orphan_reaper.sh").write_text("# stub", encoding="utf-8")
+    (hooks_dir / "orphan_reaper.ps1").write_text("# stub", encoding="utf-8")
+    (hooks_dir / "orphan_reaper_body.ps1").write_text("# stub", encoding="utf-8")
+    (hooks_dir / "sprint_guard.sh").write_text("# unrelated -- must survive", encoding="utf-8")
+
+    removed = orphan_reaper.remove_orphan_reaper_artifacts(hooks_dir)
+
+    assert set(removed) == {"orphan_reaper.sh", "orphan_reaper.ps1", "orphan_reaper_body.ps1"}
+    assert not (hooks_dir / "orphan_reaper.sh").exists()
+    assert not (hooks_dir / "orphan_reaper.ps1").exists()
+    assert not (hooks_dir / "orphan_reaper_body.ps1").exists()
+    assert (hooks_dir / "sprint_guard.sh").exists()  # never touched
+
+
+def test_remove_orphan_reaper_artifacts_missing_files_is_safe_noop(tmp_path):
+    hooks_dir = tmp_path / ".claude" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    assert orphan_reaper.remove_orphan_reaper_artifacts(hooks_dir) == []
+
+
+def test_remove_orphan_reaper_artifacts_missing_dir_is_safe_noop(tmp_path):
+    assert orphan_reaper.remove_orphan_reaper_artifacts(tmp_path / "does-not-exist") == []
+
+
+# ---------------------------------------------------------------------------
+# 4c. GET/POST /projects/{id}/orphan_reaper(/toggle) -- dashboard REST routes
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_reaper_status_route_defaults_unregistered_and_disabled(client):
+    project = client.post("/projects", json={"name": "orphan-status-default"}).json()
+    r = client.get(f"/projects/{project['id']}/orphan_reaper")
+    assert r.status_code == 200
+    body = r.json()
+    assert body == {"registered": False, "enabled": False}
+
+
+def test_orphan_reaper_toggle_route_enables_and_status_reflects_it(client):
+    project = client.post("/projects", json={"name": "orphan-toggle-enable"}).json()
+    pid = project["id"]
+
+    r = client.post(f"/projects/{pid}/orphan_reaper/toggle", json={"enabled": True})
+    assert r.status_code == 200
+    assert r.json()["enabled"] is True
+    assert r.json()["removed_files"] == []
+
+    status = client.get(f"/projects/{pid}/orphan_reaper").json()
+    assert status == {"registered": True, "enabled": True}
+
+
+def test_orphan_reaper_toggle_route_disable_without_repo_path_removes_nothing(client):
+    """No executor_config.repo_path configured for this project -- disabling
+    must still succeed (DB flag flips) but there's no known .claude/hooks
+    directory to clean up on this machine."""
+    project = client.post("/projects", json={"name": "orphan-toggle-disable-norepo"}).json()
+    pid = project["id"]
+    client.post(f"/projects/{pid}/orphan_reaper/toggle", json={"enabled": True})
+
+    r = client.post(f"/projects/{pid}/orphan_reaper/toggle", json={"enabled": False})
+    assert r.status_code == 200
+    assert r.json()["enabled"] is False
+    assert r.json()["removed_files"] == []
+
+    status = client.get(f"/projects/{pid}/orphan_reaper").json()
+    assert status == {"registered": True, "enabled": False}
+
+
+def test_orphan_reaper_toggle_route_disable_removes_hook_files_immediately(client, tmp_path):
+    """f7084ed0's core dashboard-toggle promise: disabling deletes the
+    already-written hook files right away, not on the next generate_handoff."""
+    repo_dir = tmp_path / "myrepo"
+    hooks_dir = repo_dir / ".claude" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    (hooks_dir / "orphan_reaper.sh").write_text("# stub", encoding="utf-8")
+    (hooks_dir / "orphan_reaper.ps1").write_text("# stub", encoding="utf-8")
+
+    project = client.post("/projects", json={"name": "orphan-toggle-disable-removes"}).json()
+    pid = project["id"]
+    r = client.patch(f"/projects/{pid}/settings", json={
+        "executor_config": {"repo_path": str(repo_dir)}
+    })
+    assert r.status_code == 200
+    client.post(f"/projects/{pid}/orphan_reaper/toggle", json={"enabled": True})
+
+    r = client.post(f"/projects/{pid}/orphan_reaper/toggle", json={"enabled": False})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["enabled"] is False
+    assert set(body["removed_files"]) == {"orphan_reaper.sh", "orphan_reaper.ps1"}
+    assert not (hooks_dir / "orphan_reaper.sh").exists()
+    assert not (hooks_dir / "orphan_reaper.ps1").exists()
+
+
+def test_orphan_reaper_status_route_404_for_unknown_project(client):
+    r = client.get("/projects/does-not-exist/orphan_reaper")
+    assert r.status_code == 404
+
+
+def test_orphan_reaper_toggle_route_404_for_unknown_project(client):
+    r = client.post("/projects/does-not-exist/orphan_reaper/toggle", json={"enabled": True})
+    assert r.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -375,3 +911,29 @@ def test_main_dry_run_flag_is_forwarded(monkeypatch):
     monkeypatch.setattr(orphan_reaper, "reap_orphans", _fake_reap)
     orphan_reaper.main(["--project-id", "proj1", "--url", "http://x", "--dry-run"])
     assert called["dry_run"] is True
+
+
+def test_main_dry_run_prints_machine_readable_json(monkeypatch, capsys):
+    """f7084ed0 -- a dry run's result must be printed as parseable JSON on
+    stdout (not just a human sentence on stderr like a real run), so a human
+    or the dashboard preview can consume exactly what would have been
+    touched."""
+    monkeypatch.setattr(
+        orphan_reaper, "fetch_dead_worktree_paths", lambda *a, **k: [_DEAD_PATH]
+    )
+    fake_result = {
+        "candidates_count": 1,
+        "killed": [],
+        "skipped": [{"pid": 111, "name": "pixi.exe", "reason": "dry_run"}],
+        "killed_count": 0,
+        "skipped_count": 1,
+    }
+    monkeypatch.setattr(orphan_reaper, "reap_orphans", lambda *a, **k: fake_result)
+
+    rc = orphan_reaper.main(["--project-id", "proj1", "--url", "http://x", "--dry-run"])
+    assert rc == 0
+
+    import json as _json
+    out = capsys.readouterr().out
+    parsed = _json.loads(out)
+    assert parsed == fake_result
