@@ -3433,6 +3433,186 @@ def _save_docx_with_image(
         handle.write(out.getvalue())
 
 
+def _verify_image_insertion_write(
+    docx_path: str,
+    *,
+    image_para_id: str,
+    expected_image_bytes: bytes,
+) -> dict[str, Any] | None:
+    """efa6cb53 -- post-write verification for :func:`insert_image`.
+
+    Re-reads ``docx_path`` FRESH FROM DISK (never the in-memory tree that was
+    just serialized -- that would only re-validate this function's own
+    intent, not the actual write) and confirms, in order: the image
+    paragraph is present and centered (``w:jc w:val="center"``); it still
+    contains a ``<w:drawing>`` whose ``<a:blip>`` references a relationship
+    id that ACTUALLY resolves in the freshly re-read
+    ``word/_rels/document.xml.rels``; that relationship's target names a
+    ``word/media/*`` part that is genuinely present in the freshly re-read
+    ZIP package (not merely referenced); that part's bytes match exactly
+    what was supposed to be written (a real, uncorrupted new media part, not
+    a dangling reference or a truncated/mismatched write); and that
+    ``[Content_Types].xml`` declares a content type for it. Returns ``None``
+    when every check passes, or an ``{"error": ...}`` dict on the first
+    mismatch -- mirroring :func:`_verify_figure_block_write`'s "real error
+    instead of a false success payload" discipline (9907df44), which
+    :func:`insert_image` itself never had until now.
+    """
+    try:
+        raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    w14_para_id = _q(_W14, "paraId")
+    image_para = next(
+        (el for el in body2.iter(_q(_W, "p")) if el.get(w14_para_id) == image_para_id),
+        None,
+    )
+    if image_para is None:
+        return {
+            "error": (
+                f"post-write verification failed: image paragraph "
+                f"{image_para_id!r} not found anywhere in {docx_path} after "
+                "the write"
+            )
+        }
+    if _paragraph_alignment(image_para) != "center":
+        return {
+            "error": (
+                "post-write verification failed: image paragraph "
+                f"{image_para_id!r} is not centered (w:jc=\"center\") after "
+                "the write"
+            )
+        }
+
+    blip = image_para.find(f".//{_q(_A, 'blip')}")
+    relationship_id = blip.get(_q(_IMAGE_REL_NS, "embed")) if blip is not None else None
+    if blip is None or not relationship_id:
+        return {
+            "error": (
+                "post-write verification failed: image paragraph "
+                f"{image_para_id!r} no longer contains a resolvable "
+                "<a:blip r:embed=...> reference after the write"
+            )
+        }
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw2)) as archive:
+            names = set(archive.namelist())
+            rels_bytes = (
+                archive.read("word/_rels/document.xml.rels")
+                if "word/_rels/document.xml.rels" in names
+                else None
+            )
+            content_types_bytes = (
+                archive.read("[Content_Types].xml")
+                if "[Content_Types].xml" in names
+                else None
+            )
+            media_bytes: bytes | None = None
+            media_part_name: str | None = None
+            if rels_bytes is not None:
+                rels_root2 = ET.fromstring(rels_bytes)
+                relationship = next(
+                    (child for child in rels_root2 if child.get("Id") == relationship_id),
+                    None,
+                )
+                if relationship is not None:
+                    target = relationship.get("Target") or ""
+                    if target.startswith("media/"):
+                        media_part_name = f"word/{target}"
+                    elif target.startswith("word/media/"):
+                        media_part_name = target
+                    if media_part_name is not None and media_part_name in names:
+                        media_bytes = archive.read(media_part_name)
+    except zipfile.BadZipFile as exc:
+        return {
+            "error": (
+                f"post-write verification failed: {docx_path} is not a "
+                f"readable ZIP package after the write: {exc}"
+            )
+        }
+
+    if rels_bytes is None:
+        return {
+            "error": (
+                "post-write verification failed: word/_rels/document.xml.rels "
+                f"is missing from {docx_path} after the write"
+            )
+        }
+    if media_part_name is None:
+        return {
+            "error": (
+                "post-write verification failed: relationship "
+                f"{relationship_id!r} referenced by the image is missing (or "
+                f"does not target a word/media/ part) in "
+                f"word/_rels/document.xml.rels of {docx_path} after the write"
+            )
+        }
+    if media_bytes is None:
+        return {
+            "error": (
+                "post-write verification failed: media part "
+                f"{media_part_name!r} referenced by relationship "
+                f"{relationship_id!r} is not actually present in the ZIP "
+                f"package of {docx_path} after the write"
+            )
+        }
+    if hashlib.sha256(media_bytes).hexdigest() != hashlib.sha256(expected_image_bytes).hexdigest():
+        return {
+            "error": (
+                "post-write verification failed: media part "
+                f"{media_part_name!r} in {docx_path} does not match the "
+                "image bytes that were supposed to be written -- the media "
+                "part is present but corrupted or mismatched"
+            )
+        }
+
+    if content_types_bytes is None:
+        return {
+            "error": (
+                "post-write verification failed: [Content_Types].xml is "
+                f"missing from {docx_path} after the write"
+            )
+        }
+    content_types_root2 = ET.fromstring(content_types_bytes)
+    extension = os.path.splitext(media_part_name)[1].lstrip(".").lower()
+    part_name_abs = f"/{media_part_name}"
+    has_content_type = any(
+        child.get("Extension", "").lower() == extension
+        for child in content_types_root2
+        if child.tag.rsplit("}", 1)[-1] == "Default"
+    ) or any(
+        child.get("PartName", "") == part_name_abs
+        for child in content_types_root2
+        if child.tag.rsplit("}", 1)[-1] == "Override"
+    )
+    if not has_content_type:
+        return {
+            "error": (
+                "post-write verification failed: [Content_Types].xml has no "
+                f"Default/Override declaring a content type for "
+                f"{media_part_name!r} in {docx_path} after the write"
+            )
+        }
+
+    return None
+
+
 def insert_image(
     docx_path: str,
     image_path: str,
@@ -3454,17 +3634,22 @@ def insert_image(
     inches; if omitted, dimensions are inferred from the image header when
     possible, with a six-inch default width.
 
-    679c86f4 -- after the write, the file is re-read FRESH FROM DISK and
-    checked against the image-ownership invariant (:func:`_verify_image_ownership`,
-    ``require_immediate_caption=False`` since this function's own contract
-    intentionally leaves the new image uncaptioned -- pair it with
-    :func:`insert_caption` or use :func:`insert_figure_block` for an atomic
-    image+caption insert). A detected duplicate ``r:embed`` relationship
-    (structurally unreachable via this function's own always-fresh
-    relationship id, but checked anyway as defense-in-depth) fails the write
-    closed: the pre-write backup is restored (subject to the same
-    compare-and-swap concurrent-writer safety as every other write in this
-    module) and an error is returned instead of a false success payload.
+    679c86f4/efa6cb53 -- after the write, the file is re-read FRESH FROM DISK
+    and checked two ways: the image-ownership invariant
+    (:func:`_verify_image_ownership`, ``require_immediate_caption=False``
+    since this function's own contract intentionally leaves the new image
+    uncaptioned -- pair it with :func:`insert_caption` or use
+    :func:`insert_figure_block` for an atomic image+caption insert), and
+    that the brand-new relationship+media this call itself created actually
+    landed intact (:func:`_verify_image_insertion_write`: the image
+    paragraph must be present and centered, its relationship must resolve,
+    the referenced media part must genuinely exist in the ZIP package, its
+    bytes must match what was written, and its content type must be
+    declared). Either check failing fails the write closed: the pre-write
+    backup is restored (subject to the same compare-and-swap concurrent-
+    writer safety as every other write in this module, guarded against
+    clobbering a concurrent writer's already-promoted work -- 5988a5bb) and
+    an error is returned instead of a false success payload.
 
     Returns {status, image_para_id, image_name, docx_path}, or
     {error: message} without mutating the document on validation failure or
@@ -3549,14 +3734,18 @@ def insert_image(
     )
     body.insert(insert_at, paragraph)
 
-    # 679c86f4 -- hold docx_path's promotion lock across stage+promote
-    # (_save_docx_with_image is not itself lock-aware) THROUGH the post-write
-    # image-ownership verify and any conditional restore below, matching the
-    # same discipline insert_figure_block already applies to this same save
-    # helper. promoted_sha256 is computed locally right after the write for
-    # the same reason insert_figure_block's own comment gives: this function
-    # is one of _save_docx_with_image's several callers, so the helper
-    # itself cannot return a shared transaction dict.
+    # 679c86f4/efa6cb53 -- hold docx_path's promotion lock across
+    # stage+promote (_save_docx_with_image is not itself lock-aware)
+    # THROUGH both post-write verification passes (image-ownership, then
+    # insertion-write) and any conditional restore below, matching the same
+    # discipline insert_figure_block already applies to this same save
+    # helper (5988a5bb) so a brand-new media part and relationship are
+    # never reported as "inserted" unless a fresh re-read from disk
+    # actually proves it landed intact. promoted_sha256 is computed
+    # locally right after the write for the same reason insert_figure_
+    # block's own comment gives: this function is one of
+    # _save_docx_with_image's several callers, so the helper itself cannot
+    # return a shared transaction dict.
     with _docx_promotion_lock(docx_path):
         try:
             _save_docx_with_image(
@@ -3571,13 +3760,19 @@ def insert_image(
         verify_error = _verify_image_ownership(
             docx_path, require_immediate_caption=False
         )
+        if verify_error is None:
+            verify_error = _verify_image_insertion_write(
+                docx_path,
+                image_para_id=image_para_id,
+                expected_image_bytes=image_bytes,
+            )
         if verify_error is not None:
-            # 5988a5bb-style compare-and-swap gate -- do NOT blindly restore:
-            # a different (concurrent) writer may have already promoted
-            # something newer to docx_path since our own promotion, in which
-            # case this verification "failure" is a false positive and
-            # restoring from our own backup would destroy that writer's
-            # completed, already-promoted work.
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to docx_path
+            # since our own promotion, in which case this verification
+            # "failure" is a false positive and restoring from our own
+            # backup would destroy that writer's completed, already-
+            # promoted work.
             safe_to_restore, restored, concurrent_write_detected = (
                 _safe_restore_after_verification_failure(docx_path, promoted_sha256)
             )
