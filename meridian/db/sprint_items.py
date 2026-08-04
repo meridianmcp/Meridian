@@ -30,10 +30,12 @@ from meridian.db import (  # noqa: PLC0415
     parse_touches_resources,
     _resource_sets_conflict,
     get_executor_config,
+    get_project,
 )
 from .. import tool_requirements as _tool_requirements  # 76dde31f (665 follow-up)
 from .. import artifact_declaration as _artifact_declaration  # 2f9cb288 (665 follow-up)
 from .. import executor_config as _executor_config  # 99c0c1be — parallelism diagnostics
+from .. import continuation_gate as _continuation_gate  # ecc8b280
 
 
 # ---------------------------------------------------------------------------
@@ -2013,6 +2015,28 @@ async def complete_sprint_item(
                 result["evidence_quality_warning"] = _evidence_quality_warning
             if _stored_evidence_warning:
                 result["stored_evidence_warning"] = _stored_evidence_warning
+        # ecc8b280 — machine-readable continuation_required/terminal_ready
+        # state, scoped to this item's own version bucket, so a caller that
+        # only calls complete_sprint_item (never get_sprint_progress) still
+        # gets a structured signal about whether autonomous work remains
+        # instead of having to infer it from prose. Advisory only — never
+        # blocks completion, fails open on any error, same shape as the two
+        # warning fields above.
+        try:
+            _cg_sibling_items = await get_sprint_items_cached(db, project_id)
+            _cg_version = result.get("version")
+            if _cg_version:
+                _cg_sibling_items = [
+                    it for it in _cg_sibling_items if it.get("version") == _cg_version
+                ]
+            _cg_project = await get_project(db, project_id)
+            result = dict(result)
+            result["continuation"] = _continuation_gate.compute_continuation_state(
+                _cg_sibling_items,
+                execution_mode=(_cg_project or {}).get("execution_mode"),
+            )
+        except Exception:  # noqa: BLE001 — advisory only, never block completion
+            pass
     return result
 
 

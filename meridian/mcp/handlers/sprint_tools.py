@@ -26,6 +26,7 @@ import os
 from typing import Any
 
 import meridian.server as _server
+from meridian import continuation_gate as continuation_gate_module
 from meridian import db as db_module
 from meridian import goal_md as goal_md_module
 from meridian._deps import validate_input_size, _hosted_mode
@@ -615,6 +616,19 @@ async def handle_get_sprint_progress(
             )
         except Exception:  # noqa: BLE001
             pass
+    # ecc8b280 — machine-readable continuation_required/terminal_ready state,
+    # scoped exactly like the counts above (version/item_group filtered, same
+    # _all list). Lets a caller decide, without inferring from prose, whether
+    # an autonomous session may treat itself as done. Guarded: a project-
+    # lookup hiccup must never break the progress poll.
+    try:
+        _cg_project = await db_module.get_project(db, args["project_id"])
+        _resp_progress["continuation"] = continuation_gate_module.compute_continuation_state(
+            _all,
+            execution_mode=(_cg_project or {}).get("execution_mode"),
+        )
+    except Exception:  # noqa: BLE001
+        pass
     return _resp_progress
 
 

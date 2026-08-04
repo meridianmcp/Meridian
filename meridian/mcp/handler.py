@@ -2881,6 +2881,14 @@ async def _handle_task_tools(
         # evidence_status above) so the caller can tell "silently already
         # visible" apart from "explicitly rejected, and why".
         _force_include_rejected: list[dict[str, Any]] = []
+        # ecc8b280 — continuation/terminal-ready gate, mirrors strict_evidence's
+        # opt-in shape exactly (same off-by-default contract, same out-param
+        # pattern). checkpoint=True marks this call as a mid-run progress
+        # report rather than a final handoff — see generate_handoff's own
+        # docstring for the full contract.
+        _checkpoint = bool(args.get("checkpoint"))
+        _strict_continuation = bool(args.get("strict_continuation"))
+        _continuation_status: dict[str, Any] = {}
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -2899,6 +2907,9 @@ async def _handle_task_tools(
                     evidence_status=_evidence_status,
                     strict_pointer_evidence=_strict_pointer_evidence,
                     force_include_rejected=_force_include_rejected,
+                    checkpoint=_checkpoint,
+                    strict_continuation=_strict_continuation,
+                    continuation_status=_continuation_status,
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -2926,6 +2937,19 @@ async def _handle_task_tools(
                     "generate_handoff without strict_evidence=true to get "
                     "today's graceful-degrade behavior."
                 ),
+            }
+        except handoff_module_local.HandoffContinuationRequired as exc:
+            # ecc8b280 — strict_continuation=True, this call is NOT
+            # checkpoint=True, and actionable pending/in_progress items
+            # remain with no genuine blocker while execution_mode=autonomous:
+            # fail CLOSED. Nothing was rendered/written/persisted for this
+            # call — surface a structured refusal instead of a handoff that
+            # invites a premature "I'm done" stop.
+            return {
+                "error": "HANDOFF_CONTINUATION_BLOCKED",
+                "project_id": args["project_id"],
+                "continuation_status": exc.continuation_state,
+                "message": str(exc),
             }
         except asyncio.TimeoutError:
             path, content = await handoff_module_local._generate_handoff_l0(
@@ -3078,6 +3102,14 @@ async def _handle_task_tools(
                 "effective_version": _effective_version,
                 "session_id": session_id,
             },
+            # ecc8b280 — machine-readable continuation_required/terminal_ready
+            # state (full/delta modes only; {} for goal/starter/compact/
+            # planner/l0_fallback, which don't compute it — see
+            # generate_handoff's docstring). Pure ADDITION, emitted on every
+            # call regardless of strict_continuation.
+            "continuation_status": _continuation_status,
+            "checkpoint": _checkpoint,
+            "strict_continuation": _strict_continuation,
         }
     if name == "load_handoff":
         # 5efe254b — trusted retrieval of the latest stored handoff for a project

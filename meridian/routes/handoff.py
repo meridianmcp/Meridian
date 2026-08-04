@@ -110,6 +110,11 @@ async def generate_handoff_endpoint(
     # cross-version/not-pending). See handoff.generate_handoff's
     # force_include_rejected docstring.
     _force_include_rejected: list[dict[str, Any]] = []
+    # ecc8b280 — same gap as force_include_ids/strict_evidence above: thread
+    # the continuation-gate args through the REST body too.
+    _checkpoint = bool(body.get("checkpoint"))
+    _strict_continuation = bool(body.get("strict_continuation"))
+    _continuation_status: dict[str, Any] = {}
     skip_summary = not os.environ.get("ANTHROPIC_API_KEY")
     db = await _db(request)
     data_dir = _data_dir(request)
@@ -126,6 +131,9 @@ async def generate_handoff_endpoint(
                 strict_evidence=_strict_evidence,
                 strict_pointer_evidence=_strict_pointer_evidence,
                 force_include_rejected=_force_include_rejected,
+                checkpoint=_checkpoint,
+                strict_continuation=_strict_continuation,
+                continuation_status=_continuation_status,
             ),
             timeout=90.0,
         )
@@ -147,6 +155,19 @@ async def generate_handoff_endpoint(
                 "project_id": project_id,
                 "evidence_status": exc.evidence_status,
                 "evidence_errors": exc.errors,
+                "message": str(exc),
+            },
+        ) from exc
+    except handoff_module.HandoffContinuationRequired as exc:
+        # ecc8b280 — strict_continuation=True, not checkpoint=True, and
+        # actionable work remains: fail CLOSED, mirroring the MCP HTTP
+        # dispatch's structured refusal instead of a generic 500.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "HANDOFF_CONTINUATION_BLOCKED",
+                "project_id": project_id,
+                "continuation_status": exc.continuation_state,
                 "message": str(exc),
             },
         ) from exc
@@ -175,6 +196,7 @@ async def generate_handoff_endpoint(
         "proposal_evidence": proposal_evidence,
         "docx_integrity": docx_integrity,
         "force_include_rejected": _force_include_rejected,
+        "continuation_status": _continuation_status,
     }
 
 

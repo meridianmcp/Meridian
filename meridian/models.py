@@ -358,6 +358,12 @@ class HandoffResult(BaseModel):
     # typed submodel, for the same forward-compat reason as
     # capability_contract above.
     force_include_rejected: list[dict[str, Any]] | None = None
+    # ecc8b280 — machine-readable continuation_required/terminal_ready state
+    # (see meridian.continuation_gate). dict, not a typed submodel, for the
+    # same forward-compat reason as capability_contract above. None for
+    # modes that don't compute it (planner/starter/compact/goal/l0_fallback)
+    # or if generate_handoff's build itself failed before reaching the gate.
+    continuation_status: dict[str, Any] | None = None
 
 
 class TaskUpdate(BaseModel):

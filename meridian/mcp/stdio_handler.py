@@ -537,6 +537,25 @@ def build_mcp_server():
                                 "be present."
                             ),
                         },
+                        "checkpoint": {
+                            "type": "boolean",
+                            "description": (
+                                "(ecc8b280) Mark this call as a mid-run progress "
+                                "report rather than a final, session-ending "
+                                "handoff (full/delta modes only). Never blocked "
+                                "by strict_continuation below."
+                            ),
+                        },
+                        "strict_continuation": {
+                            "type": "boolean",
+                            "description": (
+                                "(ecc8b280) Opt-in fail-closed continuation check. "
+                                "When true and checkpoint is not set, refuses to "
+                                "render/persist a full/delta handoff if actionable "
+                                "pending/in_progress items remain with no "
+                                "blocker_kind while execution_mode=autonomous."
+                            ),
+                        },
                     },
                     "required": [],
                 },
@@ -2315,7 +2334,12 @@ def build_mcp_server():
                 # (unknown/cross-project/cross-version/not-pending). See
                 # handoff.generate_handoff's force_include_rejected docstring.
                 _stdio_force_include_rejected: list[dict[str, Any]] = []
+                # ecc8b280 — mirror handler.py's continuation gate args exactly.
+                _stdio_checkpoint = bool(arguments.get("checkpoint"))
+                _stdio_strict_continuation = bool(arguments.get("strict_continuation"))
+                _stdio_continuation_status: dict[str, Any] = {}
                 _handoff_evidence_blocked = False
+                _handoff_continuation_blocked = False
                 try:
                     path, content, _ = await asyncio.wait_for(
                         handoff_module.generate_handoff(
@@ -2329,6 +2353,9 @@ def build_mcp_server():
                             strict_evidence=_stdio_strict_evidence,
                             strict_pointer_evidence=_stdio_strict_pointer_evidence,
                             force_include_rejected=_stdio_force_include_rejected,
+                            checkpoint=_stdio_checkpoint,
+                            strict_continuation=_stdio_strict_continuation,
+                            continuation_status=_stdio_continuation_status,
                         ),
                         timeout=90.0,
                     )
@@ -2349,7 +2376,17 @@ def build_mcp_server():
                         "message": str(exc),
                     }
                     _handoff_evidence_blocked = True
-                if not _handoff_evidence_blocked:
+                except handoff_module.HandoffContinuationRequired as exc:
+                    # ecc8b280 — mirror handler.py's structured refusal: nothing
+                    # was rendered/persisted for this call.
+                    result = {
+                        "error": "HANDOFF_CONTINUATION_BLOCKED",
+                        "project_id": arguments["project_id"],
+                        "continuation_status": exc.continuation_state,
+                        "message": str(exc),
+                    }
+                    _handoff_continuation_blocked = True
+                if not _handoff_evidence_blocked and not _handoff_continuation_blocked:
                     # a5e8aa74 — return content EXACTLY as generate_handoff rendered
                     # it, via the shared helper meridian/mcp/handler.py and
                     # meridian/routes/handoff.py also use, so all transports emit a
@@ -2364,6 +2401,7 @@ def build_mcp_server():
                         # call; [] when force_include_ids was empty/absent or
                         # the 90s timeout fired before validation ran.
                         "force_include_rejected": _stdio_force_include_rejected,
+                        "continuation_status": _stdio_continuation_status,
                     }
             elif name == "get_context_block":
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.

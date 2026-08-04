@@ -366,7 +366,23 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "if any capability comes back failed/degraded, nothing is rendered or persisted "
         "and the call returns {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, "
         "evidence_errors, message} — default (strict_evidence omitted/false) behavior is "
-        "completely unchanged.",
+        "completely unchanged. "
+        "Also returns continuation_status (ecc8b280) for full/delta modes: a "
+        "{continuation_required, terminal_ready, execution_mode, actionable_count, "
+        "actionable_pending_count, actionable_in_progress_count, actionable_item_ids, "
+        "blocked_count, blocked_item_ids, reason} object reporting whether actionable "
+        "pending/in_progress work remains on the live, version-scoped board with no "
+        "recorded blocker_kind, while execution_mode=autonomous — the machine-readable "
+        "signal that an autonomous session may NOT yet treat itself as finished. Pass "
+        "checkpoint=true when THIS call is a mid-run progress report, not a final "
+        "session-ending handoff — a checkpoint is never blocked by the gate below. Pass "
+        "strict_continuation=true to fail CLOSED instead of just reporting: if "
+        "continuation_required is true and checkpoint is not set, nothing is rendered "
+        "or persisted and the call returns {error: HANDOFF_CONTINUATION_BLOCKED, "
+        "continuation_status, message} — resolve/claim the remaining item(s), record a "
+        "genuine blocker_kind on them, or call again with checkpoint=true. Default "
+        "(strict_continuation omitted/false) behavior never blocks — continuation_status "
+        "is still always returned so a caller can act on it voluntarily.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"]},
@@ -375,7 +391,9 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "force_include_ids": {"type": "array", "items": {"type": "string"}, "description": "(45f519a0, validated by 3cab355a) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming. Every id is validated: it must belong to this project, match the effective version scope (when one applies), and be genuinely todo/pending — an unknown/cross-project/cross-version/not-pending id is rejected (reported in the response's force_include_rejected list, never silently dropped) rather than honoured. Accepted ids are also exempt from the code-pointer enrichment cap, so a requested item always gets prospected regardless of how large the pending board is."},
          "skip_ai_summary": {"type": "boolean", "description": "65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time."},
          "strict_evidence": {"type": "boolean", "description": "(8a883f60) Opt-in, off by default — mirrors complete_sprint_item's strict_evidence shape exactly. When true, a failed/degraded pointer-enrichment/freshness/wave-gate/graph-search capability makes this call refuse to render or persist a handoff at all, returning {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, evidence_errors, message} instead. Leave false/omitted for today's graceful-degrade behavior (handoff_evidence_status is still returned either way)."},
-         "strict_pointer_evidence": {"type": "boolean", "description": "(eb8b6894) Opt-in, off by default, separate from strict_evidence above. When true, the claimable/goal batch's UNPROSPECTED exclusion requires a pending item's durable pointer(s) to have actually RESOLVED (resolve_pointer succeeded), not merely be PRESENT as a row — a structurally-valid-but-unresolved pointer no longer silently satisfies the gate. Never raises/blocks the whole handoff (unlike strict_evidence): an affected item is simply excluded from the claimable batch, the same way today's presence-only UNPROSPECTED gate already excludes items. Every pending item's pointer_resolution_status (structural_valid/target_resolved/provenance_verified/resolution_source/strict_satisfied) is always returned regardless of this flag — it only changes which items make the claimable cut."}},
+         "strict_pointer_evidence": {"type": "boolean", "description": "(eb8b6894) Opt-in, off by default, separate from strict_evidence above. When true, the claimable/goal batch's UNPROSPECTED exclusion requires a pending item's durable pointer(s) to have actually RESOLVED (resolve_pointer succeeded), not merely be PRESENT as a row — a structurally-valid-but-unresolved pointer no longer silently satisfies the gate. Never raises/blocks the whole handoff (unlike strict_evidence): an affected item is simply excluded from the claimable batch, the same way today's presence-only UNPROSPECTED gate already excludes items. Every pending item's pointer_resolution_status (structural_valid/target_resolved/provenance_verified/resolution_source/strict_satisfied) is always returned regardless of this flag — it only changes which items make the claimable cut."},
+         "checkpoint": {"type": "boolean", "description": "(ecc8b280) Mark THIS call as a mid-run progress report rather than a final, session-ending handoff. Applies to full/delta modes only. A checkpoint=true call is never refused by strict_continuation below, regardless of how much actionable work remains — it changes nothing about what gets rendered, only whether the continuation gate can engage."},
+         "strict_continuation": {"type": "boolean", "description": "(ecc8b280) Opt-in, off by default — mirrors strict_evidence's shape. When true and checkpoint is not set, refuses to render/persist this handoff (full/delta modes only) if actionable pending/in_progress items remain on the live board with no recorded blocker_kind while execution_mode=autonomous, returning {error: HANDOFF_CONTINUATION_BLOCKED, continuation_status, message} instead. Leave false/omitted for today's behavior (continuation_status is still always returned either way)."}},
          "required": []}},
     {"name": "load_handoff", "description":
         "Read-only: Return the latest stored handoff for a project as an MCP tool "

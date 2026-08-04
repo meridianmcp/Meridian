@@ -35,6 +35,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from . import artifact_classification as artifact_classification_module
 from . import artifact_declaration as artifact_declaration_module
 from . import capability_contract as capability_contract_module
+from . import continuation_gate as continuation_gate_module
 from . import db as db_module
 from . import docx_integrity_gate as docx_integrity_gate_module
 from . import executor_contract as executor_contract_module
@@ -6490,6 +6491,34 @@ class HandoffEvidenceRequired(ValueError):
         )
 
 
+class HandoffContinuationRequired(ValueError):
+    """Raised by generate_handoff (full/delta modes) when
+    ``strict_continuation=True``, the call is NOT ``checkpoint=True``, and
+    :func:`meridian.continuation_gate.compute_continuation_state` reports
+    ``continuation_required`` — actionable pending/in_progress items remain,
+    none of them carrying a genuine ``blocker_kind``, and the project's
+    ``execution_mode`` is ``autonomous`` (ecc8b280).
+
+    Mirrors :class:`HandoffEvidenceRequired`'s opt-in, fail-closed contract:
+    never engages for a caller that didn't pass ``strict_continuation=True``,
+    and never engages for a call explicitly marked ``checkpoint=True`` (a
+    mid-run progress report is not claiming to be a final handoff). When it
+    does engage, nothing is rendered or persisted for this call — the point
+    is to refuse a premature "I'm done" handoff outright, not to produce one
+    that just happens to also list the leftover work.
+    """
+
+    def __init__(self, continuation_state: dict[str, Any]):
+        self.continuation_state = continuation_state
+        super().__init__(
+            "generate_handoff refused (strict_continuation=True): "
+            f"{continuation_state.get('reason')}. Pass checkpoint=True for a "
+            "mid-run progress report, or finish/record a genuine blocker "
+            "(blocker_kind) on the remaining item(s) first: "
+            f"{continuation_state.get('actionable_item_ids')}"
+        )
+
+
 def _finalize_capability_status(
     capability_status: dict[str, Any],
     evidence_status: "dict[str, Any] | None",
@@ -6673,6 +6702,9 @@ async def generate_handoff(
     related_records: dict[str, Any] | None = None,
     max_content_bytes: "int | None" = _DEFAULT_HANDOFF_MAX_BYTES,
     force_include_rejected: "list[dict[str, Any]] | None" = None,
+    checkpoint: bool = False,
+    strict_continuation: bool = False,
+    continuation_status: dict[str, Any] | None = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -6834,6 +6866,33 @@ async def generate_handoff(
     possibly-stale pasted list. Best-effort: a failure to build the manifest
     degrades to the pre-836ca1d5 delta output (no tag), never a broken
     handoff.
+
+    ``checkpoint`` (ecc8b280) — optional, ``False`` by default. Marks this
+    call as a mid-run progress report rather than a final, session-ending
+    handoff. Applies to the ``full``/``delta`` modes only (``goal`` is
+    already bare-batch and ``starter``/``compact`` are already explicitly
+    non-final). Purely a signal to the ``strict_continuation`` gate below —
+    it changes nothing about what gets rendered.
+
+    ``strict_continuation`` (ecc8b280) — optional, ``False`` by default,
+    mirrors ``strict_evidence``'s opt-in/fail-closed shape. When ``True``
+    and this is NOT a ``checkpoint=True`` call, computes
+    :func:`meridian.continuation_gate.compute_continuation_state` over the
+    version-scoped live board (``full``/``delta`` modes only) and, if it
+    reports ``continuation_required`` — actionable pending/in_progress work
+    remains, none of it carrying a genuine ``blocker_kind``, and the
+    project's ``execution_mode`` is ``autonomous`` — raises
+    :class:`HandoffContinuationRequired` BEFORE anything is rendered or
+    persisted, instead of quietly producing a handoff that invites a
+    premature "I'm done" stop. A caller that never opts in (the default) is
+    completely unaffected.
+
+    ``continuation_status`` (ecc8b280) — optional output dict, populated in
+    place (same shape as ``evidence_status`` above) with the full
+    ``compute_continuation_state`` result for ``full``/``delta`` modes,
+    regardless of ``strict_continuation``/``checkpoint``, so a caller can
+    always read the machine-readable continuation/terminal-ready state
+    without opting into the hard refusal.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -7237,6 +7296,9 @@ async def generate_handoff(
     _freshness_status = "verified"
     _freshness_reason = "sprint-item + session freshness re-query completed"
     _freshness_fallback: str | None = None
+    # ecc8b280 — default to the pre-freshness snapshot so the continuation
+    # gate below always has a scoped item list even if the re-query fails.
+    _fresh_sprint_items = sprint_items_all
     try:
         _fresh_sprint_items = await db_module.get_sprint_items(
             db, project_id, include_human=False, include_deferred=False,
@@ -7292,6 +7354,23 @@ async def generate_handoff(
     _finalize_capability_status(
         _capability_status, evidence_status, strict_evidence=strict_evidence,
     )
+    # ecc8b280 — machine-readable continuation_required/terminal_ready state
+    # over the SAME freshly re-queried, version-scoped board the pending list
+    # above was just finalized against (falls back to the pre-freshness
+    # snapshot if that re-query itself failed). Computed/finalized here —
+    # after the freshness re-query, before anything below is rendered or
+    # persisted — so a strict_continuation=True refusal reflects the live
+    # board, not a stale one, and so nothing is written for a call this gate
+    # refuses (same fail-closed contract as HandoffEvidenceRequired above).
+    _continuation_state = continuation_gate_module.compute_continuation_state(
+        _fresh_sprint_items,
+        execution_mode=project.get("execution_mode"),
+    )
+    if continuation_status is not None:
+        continuation_status.clear()
+        continuation_status.update(_continuation_state)
+    if strict_continuation and not checkpoint and _continuation_state["continuation_required"]:
+        raise HandoffContinuationRequired(_continuation_state)
     # d5849a67 — batch-resolve durable pointer evidence for the pending batch so
     # the excluded_unprospected list below uses the SAME evidence signal
     # claim_sprint_item checks per-item (sprint_item_pointers rows), not the
