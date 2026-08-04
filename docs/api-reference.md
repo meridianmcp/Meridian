@@ -19,7 +19,7 @@ Check server health.
 {
   "status": "ok",
   "service": "meridian",
-  "version": "0.2.6",
+  "version": "0.1.9",
   "git_sha": "a555660ef312"
 }
 ```
@@ -1155,6 +1155,7 @@ No auth required.
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/tunnel/active-repo` | Send a set_active_repo control message to the tenant's extract WebSocket |
+| `GET` | `/tunnel/diagnostics/{tenant_id}` | Layered, read-only tunnel/connector diagnostics for one tenant (f1e0df55) |
 | `DELETE` | `/tunnel/filesystem-roots` | live-fs-roots — remove a served filesystem root and apply it live |
 | `GET` | `/tunnel/filesystem-roots` | Return the directories the tunnel's filesystem connector may read |
 | `POST` | `/tunnel/filesystem-roots` | live-fs-roots — add a served filesystem root and push it live |
