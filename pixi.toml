@@ -1,3 +1,50 @@
+# 15610335 — Pixi environments live OUTSIDE this repo's git worktrees.
+#
+# Every `.claude/worktrees/<session>` checkout otherwise gets its own ~1GB
+# `.pixi/` environment duplicated inside the git-tracked tree (confirmed:
+# 115.6 GB total across this repo's worktrees on 2026-08-04). Fix is Pixi's
+# own `detached-environments` setting — but it is NOT a pixi.toml manifest
+# key (confirmed live, pixi 0.67.0: adding `detached-environments = true` or
+# a path string under `[workspace]` here silently no-ops — `pixi info --json`
+# comes back with `project_info: null`, exit 0, no error). It only exists as
+# a Pixi CONFIG key, set at the machine/user level:
+#
+#   pixi config set --global detached-environments true
+#   # or an explicit external path, e.g.:
+#   pixi config set --global detached-environments "C:/Users/<you>/.pixi/workspace-envs"
+#
+# which Meridian wraps in `meridian.pixi_env_retention.ensure_detached_environments_configured`
+# (`python -m meridian.pixi_env_retention --configure`) so it's one command,
+# not a thing to remember per machine. This is deliberately NOT baked into
+# this shared, cross-platform pixi.toml — a hard-coded Windows path here
+# would silently no-op (or point at the wrong place) on Linux CI runners and
+# every other contributor's machine.
+#
+# GOTCHA (document, don't just fix): each worktree's `pixi.toml` lives at a
+# DIFFERENT path, so even though every worktree shares the project `name`
+# ("meridian"), Pixi keys each detached environment by a hash of the
+# resolved project path — confirmed live via `environments_info[].prefix` in
+# `pixi info --json`: two worktrees resolve to two DIFFERENT directories
+# under the detached-environments root, e.g.
+# `<root>/meridian-9641266968162128105/envs/default`. Deleting a worktree
+# (`git worktree remove`, or this repo's own
+# `meridian.worktree_cleanup.remove_worktree_on_disk`) NEVER touches this
+# external, keyed directory — it only knows about the git-tracked tree. Left
+# alone, detached environments simply accumulate externally forever instead
+# of internally. `meridian/pixi_env_retention.py` + `meridian/orphan_reaper.py`
+# are the retention/reclaim half of this fix: they register (and later
+# discover + reclaim) each worktree's resolved external env root once it's
+# gone, via `meridian/db/worktrees.py`'s `pixi_env_roots` table plus a
+# marker file written into the resolved directory (defense-in-depth, works
+# even without DB access).
+#
+# Also do not store package caches, databases, or other generated artifacts
+# inside a worktree tree — see `meridian.pixi_env_retention.GENERATED_CACHE_DIR_NAMES`
+# / `plan_worktree_cache_cleanup` for the same principle applied to
+# `.pixi`/`node_modules`/test-cache directories that end up inside a
+# worktree despite all this (e.g. a worktree used before detached
+# environments were configured on that machine).
+
 [workspace]
 name = "meridian"
 version = "0.1.0-pre-alpha"

@@ -1130,6 +1130,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_handoffs_invalidation(db)
     await _migrate_handoff_corrections_table(db)
     await _migrate_vector_index_state(db)
+    await _migrate_pixi_env_roots(db)
     return db
 
 
@@ -11482,4 +11483,18 @@ from .vector_index_state import (  # noqa: F401
     list_vector_index_states,
     upsert_vector_index_state,
     record_vector_backend_benchmark,
+)
+
+
+# 15610335 — external Pixi detached-environment registry, per worktree.
+# Records where each worktree's detached environment resolved to on disk
+# (outside the git-tracked tree) so orphan_reaper / pixi_env_retention can
+# reclaim it once the owning worktree is gone. Mirrors the worktree_manifest
+# import above — a single-table, no-state-machine shape.
+from .worktrees import (  # noqa: F401
+    _migrate_pixi_env_roots,
+    register_pixi_env_root,
+    get_pixi_env_root_for_worktree,
+    list_unreclaimed_pixi_env_roots,
+    mark_pixi_env_root_reclaimed,
 )

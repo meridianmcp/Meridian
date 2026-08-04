@@ -2700,6 +2700,46 @@ def _resolve_stable_cache_env() -> "dict[str, str]":
     return _stable_cache_env_cache
 
 
+_stable_pixi_cache_env_cache: "dict[str, str] | None" = None
+
+
+def _resolve_stable_pixi_cache_env() -> "dict[str, str]":
+    """15610335 — explicitly resolve PIXI_CACHE_DIR from the tunnel's OWN
+    process context, mirroring :func:`_resolve_stable_cache_env` immediately
+    above (same AppContainer-virtualization risk, same fix shape).
+
+    Confirmed live (2026-08-04, pixi 0.67.0): ``PIXI_CACHE_DIR`` governs
+    Pixi's ``cache_dir`` (``PIXI_CACHE_DIR=<x> pixi info --json`` reports
+    ``cache_dir`` == ``<x>`` exactly) — and, per Pixi's own directory
+    layout, this is also where a boolean ``detached-environments = true``
+    (see ``meridian.pixi_env_retention``) materializes environments.
+    ``PIXI_HOME`` only controls where the ``pixi`` *binary* installs
+    (``~/.pixi/bin``); it has no effect on this. A grandchild ``pixi run``
+    spawned through a sandboxed ancestor (Claude Desktop's Windows
+    AppContainer — see the docstring above) could otherwise silently
+    resolve a different, virtualized %LOCALAPPDATA%-rooted cache_dir than
+    the tunnel's own trustworthy context.
+
+    Best-effort and memoized: any resolution failure returns ``{}`` (spawned
+    pixi children fall back to resolving their own cache_dir, exactly as
+    before this existed) rather than blocking a spawn.
+    """
+    global _stable_pixi_cache_env_cache
+    if _stable_pixi_cache_env_cache is not None:
+        return _stable_pixi_cache_env_cache
+    try:
+        home = Path.home()
+        if sys.platform == "win32":
+            pixi_cache = home / "AppData" / "Local" / "pixi" / "cache"
+        else:
+            pixi_cache = home / ".cache" / "pixi"
+        pixi_cache.mkdir(parents=True, exist_ok=True)
+        _stable_pixi_cache_env_cache = {"PIXI_CACHE_DIR": str(pixi_cache)}
+    except Exception:  # noqa: BLE001 — never block a spawn over a cache-dir resolve failure
+        _stable_pixi_cache_env_cache = {}
+    return _stable_pixi_cache_env_cache
+
+
 def _spawn_with_cache_retry(
     cmd: "list[str]",
     env: "dict | None",
@@ -2750,9 +2790,12 @@ def _spawn_with_cache_retry(
     # _resolve_stable_cache_env). When env was None (inherit parent), start
     # from a full copy of the parent env so nothing is lost — only the two
     # cache vars are forced on top, not a narrowing to just those two.
+    # 15610335 — PIXI_CACHE_DIR joins the same merge, same rationale (see
+    # _resolve_stable_pixi_cache_env).
     _cache_env = _resolve_stable_cache_env()
-    if _cache_env:
-        env = {**(env if env is not None else dict(os.environ)), **_cache_env}
+    _pixi_cache_env = _resolve_stable_pixi_cache_env()
+    if _cache_env or _pixi_cache_env:
+        env = {**(env if env is not None else dict(os.environ)), **_cache_env, **_pixi_cache_env}
     try:
         proc = subprocess.Popen(cmd, env=env, **kwargs)
     except Exception as first_exc:  # noqa: BLE001

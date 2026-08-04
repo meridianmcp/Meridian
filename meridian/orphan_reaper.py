@@ -1,5 +1,15 @@
 """e401221d — Meridian-side mitigation for Claude Code's dangling-process bug.
 
+15610335 — this module also reclaims stale EXTERNAL Pixi detached
+environments left behind by dead worktrees (see ``meridian.pixi_env_retention``
+for why a registry/marker is needed at all: Pixi's ``detached-environments``
+moves each worktree's ~1GB environment OUTSIDE the git-tracked tree, into a
+directory keyed by a hash of the worktree's own path, so ``git worktree
+remove`` never touches it). ``reclaim_stale_pixi_envs`` below reuses the same
+``dead_paths`` this module already fetches for process-reaping and matches
+them against marker files written under the configured external root — no
+new server route needed, this is pure local-filesystem work.
+
 Root cause is Anthropic's own client lifecycle (a `claude -p ...
 --dangerously-skip-permissions` process, or a spawned pixi/python/node child,
 can outlive its terminal / parent session) -- not fixable from inside
@@ -428,6 +438,54 @@ def reap_orphans(
     }
 
 
+def reclaim_stale_pixi_envs(
+    dead_paths: list[str],
+    pixi_env_root: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Find and (unless *dry_run*) remove external Pixi detached-environment
+    directories whose marker file matches one of *dead_paths* — the
+    external-environment counterpart to :func:`reap_orphans`. Never raises.
+
+    *pixi_env_root* defaults to
+    ``meridian.pixi_env_retention.default_detached_environments_root()``
+    when omitted (``~/.pixi/workspace-envs``); pass it explicitly (or set
+    ``MERIDIAN_PIXI_ENV_ROOT``, wired in :func:`main`) when this machine's
+    global Pixi config points somewhere else.
+    """
+    from . import pixi_env_retention  # noqa: PLC0415 — avoid import cost when unused
+
+    root = Path(pixi_env_root) if pixi_env_root else pixi_env_retention.default_detached_environments_root()
+    try:
+        candidates = pixi_env_retention.find_external_envs_for_dead_worktrees(root, dead_paths)
+    except Exception:  # noqa: BLE001 — discovery failure must never crash the hook
+        logger.warning("orphan_reaper: pixi env discovery failed", exc_info=True)
+        return {"candidates_count": 0, "reclaimed_count": 0, "skipped_count": 0, "reclaimed": [], "skipped": []}
+
+    reclaimed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for c in candidates:
+        if dry_run:
+            skipped.append({**c, "reason": "dry_run"})
+            continue
+        try:
+            outcome = pixi_env_retention.reclaim_external_env(c["path"], root, confirm=True)
+        except Exception:  # noqa: BLE001 — one bad reclaim must not sink the batch
+            skipped.append({**c, "reason": "reclaim_raised"})
+            continue
+        if outcome.get("removed"):
+            reclaimed.append(c)
+        else:
+            skipped.append({**c, "reason": outcome.get("detail", "reclaim_failed")})
+    return {
+        "candidates_count": len(candidates),
+        "reclaimed_count": len(reclaimed),
+        "skipped_count": len(skipped),
+        "reclaimed": reclaimed,
+        "skipped": skipped,
+    }
+
+
 def fetch_dead_worktree_paths(
     base_url: str, project_id: str, timeout: float = 5.0
 ) -> list[str]:
@@ -530,6 +588,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Archive root used only for the --quarantine-outputs dry-run manifest.",
     )
+    parser.add_argument(
+        "--pixi-env-root",
+        default=os.environ.get("MERIDIAN_PIXI_ENV_ROOT"),
+        help="15610335 — external Pixi detached-environments root to sweep for "
+             "stale entries (default: ~/.pixi/workspace-envs via "
+             "meridian.pixi_env_retention.default_detached_environments_root).",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -547,6 +612,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.quarantine_outputs:
             _print_quarantine_dry_run(dead_paths, args.archive_root)
+        env_result = reclaim_stale_pixi_envs(
+            dead_paths, pixi_env_root=args.pixi_env_root, dry_run=args.dry_run,
+        )
+        if env_result["reclaimed_count"]:
+            print(
+                f"Meridian orphan_reaper: reclaimed {env_result['reclaimed_count']} "
+                f"stale external Pixi environment(s).",
+                file=sys.stderr,
+            )
     except Exception:  # noqa: BLE001 — advisory cleanup must never fail the Stop hook
         logger.warning("orphan_reaper: unexpected failure", exc_info=True)
     return 0

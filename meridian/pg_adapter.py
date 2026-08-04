@@ -2638,6 +2638,30 @@ async def _migrate_pg_wave_base_manifests(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_pixi_env_roots(conn: PostgresConnection) -> None:
+    """15610335 — external Pixi detached-environment registry, per worktree.
+
+    Creates pixi_env_roots on existing Postgres DBs. Mirrors
+    db.worktrees._migrate_pixi_env_roots. Not present in the base
+    CREATE_TABLES_CORE literal — this guarded migration is the only
+    creation path on Postgres, matching _migrate_pg_wave_base_manifests.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS pixi_env_roots ("
+        "    id TEXT PRIMARY KEY,"
+        "    worktree_id TEXT NOT NULL REFERENCES active_worktrees(id),"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    root_path TEXT NOT NULL,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    reclaimed_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_pixi_env_roots_worktree "
+        "ON pixi_env_roots(worktree_id);"
+        "CREATE INDEX IF NOT EXISTS idx_pixi_env_roots_project "
+        "ON pixi_env_roots(project_id, reclaimed_at);"
+    )
+
+
 async def _migrate_pg_sprint_batch_claims(conn: PostgresConnection) -> None:
     """22cad9b8 — immutable sprint_batch_claims: atomic parallel-batch claim
     manifests, mirroring wave_base_manifests' immutability pattern.
@@ -4136,4 +4160,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_handoffs_invalidation,
     _migrate_pg_handoff_corrections_table,
     _migrate_pg_vector_index_state,
+    _migrate_pg_pixi_env_roots,
 )
