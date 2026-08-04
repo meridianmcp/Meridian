@@ -60,7 +60,10 @@ import os
 import threading
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .vector_index import IndexMetadata
 
 _log = logging.getLogger(__name__)
 
@@ -660,6 +663,22 @@ def _vectors_enabled() -> bool:
     ``os.environ``.
     """
     return os.environ.get(_ENV_VECTORS, "").strip().lower() in _TRUTHY
+
+
+def _model2vec_version() -> str | None:
+    """Best-effort ``model2vec`` package version, or ``None`` if unimportable.
+
+    Used as the "embedding version" half of :meth:`CodeIndex.describe_vector_index`
+    (e1475682) — ``_EMBED_MODEL_NAME`` alone identifies *which* pretrained
+    model, this identifies *which build of the encoder* produced the
+    vectors, matching ``IndexMetadata.embedding_version``'s intent.
+    """
+    try:
+        import model2vec  # noqa: PLC0415
+
+        return getattr(model2vec, "__version__", None)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class _Embedder:
@@ -1410,6 +1429,33 @@ class CodeIndex:
             except Exception:  # noqa: BLE001 — never crash a caller's write path
                 _log.debug("CodeIndex.index_paths failed", exc_info=True)
                 return {"indexed": 0, "skipped": len(paths or []), "paths": []}
+
+    def describe_vector_index(self) -> "IndexMetadata":
+        """Backend-neutral metadata snapshot of this index's optional VSS leg
+        (e1475682) — see :mod:`meridian_codeindex.vector_index.IndexMetadata`.
+
+        A read-only view of the state :meth:`_rebuild_vss` already tracks
+        (``_vss_ready`` / ``_vss_dim`` / the embedder) — CodeIndex keeps
+        managing its own hybrid search path unchanged; this only exposes
+        that state in the shared contract's shape so a caller can persist or
+        compare it via ``meridian.db.vector_index_state`` /
+        :func:`meridian_codeindex.vector_index.compare_candidates` without
+        CodeIndex importing that module on its hot (search) path.
+        """
+        from .vector_index import IndexMetadata  # local import — keep this an
+        # optional, cold-path integration; code_index.py's search hot path
+        # never imports vector_index.py.
+
+        return IndexMetadata(
+            backend="duckdb_vss" if self._vss_ready else "bm25_lexical",
+            embedding_model=_EMBED_MODEL_NAME if self._embedder.available() else None,
+            embedding_version=_model2vec_version() if self._embedder.available() else None,
+            dimension=self._vss_dim,
+            source_fingerprint=None,
+            project_id=None,
+            scope=self.root_dir,
+            record_count=self.count(),
+        )
 
     def close(self) -> None:
         """Close the owned DuckDB connection (no-op for an injected one)."""

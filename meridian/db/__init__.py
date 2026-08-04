@@ -1129,6 +1129,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_require_strict_evidence(db)
     await _migrate_handoffs_invalidation(db)
     await _migrate_handoff_corrections_table(db)
+    await _migrate_vector_index_state(db)
     return db
 
 
@@ -11463,4 +11464,19 @@ from .verification_runs import (  # noqa: F401
     get_verification_run,
     list_verification_runs,
     complete_verification_run,
+)
+
+
+# e1475682 — durable metadata for the backend-neutral vector-index contract
+# (meridian_codeindex.vector_index): active backend, embedding model/version,
+# dimension, source fingerprint, and the benchmark evidence gating pgvector.
+# Mirrors the verification_runs import immediately above.
+from .vector_index_state import (  # noqa: F401
+    VECTOR_INDEX_BACKENDS,
+    DEFAULT_SCOPE as VECTOR_INDEX_DEFAULT_SCOPE,
+    _migrate_vector_index_state,
+    get_vector_index_state,
+    list_vector_index_states,
+    upsert_vector_index_state,
+    record_vector_backend_benchmark,
 )

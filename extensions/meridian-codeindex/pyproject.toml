@@ -35,6 +35,15 @@ vectors = [
     "model2vec>=0.3",
     "numpy>=1.24",
 ]
+# Optional shared-Postgres (Neon) pgvector backend for the backend-neutral
+# vector-index contract (e1475682, meridian_codeindex.vector_index). OFF by
+# default -- PgVectorBackend never auto-connects, and nothing routes real
+# traffic to it without measured benchmark evidence
+# (vector_index.should_enable_pgvector). Only pulled in when a caller
+# actually constructs a PgVectorBackend.
+pgvector = [
+    "psycopg[binary]>=3.1",
+]
 
 [project.scripts]
 meridian-codeindex = "meridian_codeindex.cli:main"

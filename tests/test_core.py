@@ -7748,10 +7748,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_require_strict_evidence",
         "_migrate_pg_handoffs_invalidation",
         "_migrate_pg_handoff_corrections_table",
+        "_migrate_pg_vector_index_state",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 141
+    assert len(allnames) == len(set(allnames)) == 142
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

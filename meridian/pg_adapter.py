@@ -3998,6 +3998,36 @@ async def _migrate_pg_handoff_corrections_table(conn: PostgresConnection) -> Non
     )
 
 
+async def _migrate_pg_vector_index_state(conn: PostgresConnection) -> None:
+    """e1475682 — vector_index_state (mirrors SQLite).
+
+    One row per (project_id, scope): the backend actually in use
+    (bm25/duckdb_vss/pgvector), the embedding model/version + dimension that
+    produced it, a source_fingerprint for staleness detection, an
+    incrementing revision, and the last benchmark evidence + decision reason
+    behind pgvector_enabled. Mirrors
+    db.vector_index_state._migrate_vector_index_state.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS vector_index_state ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    scope TEXT NOT NULL DEFAULT 'default',"
+        "    backend TEXT NOT NULL DEFAULT 'bm25',"
+        "    embedding_model TEXT,"
+        "    embedding_version TEXT,"
+        "    dimension INTEGER,"
+        "    source_fingerprint TEXT,"
+        "    revision INTEGER NOT NULL DEFAULT 1,"
+        "    pgvector_enabled INTEGER NOT NULL DEFAULT 0,"
+        "    benchmark_evidence TEXT,"
+        "    benchmark_decision_reason TEXT,"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE (project_id, scope)"
+        ");"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -4105,4 +4135,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_require_strict_evidence,
     _migrate_pg_handoffs_invalidation,
     _migrate_pg_handoff_corrections_table,
+    _migrate_pg_vector_index_state,
 )

@@ -580,6 +580,10 @@ def test_maybe_idle_unload_releases_model_after_idle(monkeypatch):
 # All tests run on the default SQLite ``db`` fixture — semantic mocking uses
 # monkeypatch on ``semantic_search.is_available``/``rank`` so no real model is
 # ever loaded (same CI-safety guarantee as the rest of this file).
+#
+# e1475682 — meridian.db.vector_index_state: durable metadata for the
+# backend-neutral vector-index contract (meridian_codeindex.vector_index).
+# Pure DB-layer coverage; no model2vec/duckdb import here at all.
 # ---------------------------------------------------------------------------
 
 
@@ -1072,3 +1076,121 @@ async def test_maybe_semantic_escalate_never_leaks_across_projects(db, monkeypat
     ids = {n["id"] for n in notes}
     assert note_a["id"] in ids
     assert note_b["id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_vector_index_state_upsert_creates_row_at_revision_one(db):
+    p = await db_module.create_project(db, "vec-state-create")
+    state = await db_module.upsert_vector_index_state(
+        db, p["id"],
+        backend="bm25",
+        embedding_model=None,
+        embedding_version=None,
+        dimension=None,
+        source_fingerprint=None,
+    )
+    assert state["backend"] == "bm25"
+    assert state["revision"] == 1
+    assert state["scope"] == db_module.VECTOR_INDEX_DEFAULT_SCOPE
+    assert state["pgvector_enabled"] == 0
+    fetched = await db_module.get_vector_index_state(db, p["id"])
+    assert fetched is not None
+    assert fetched["id"] == state["id"]
+
+
+@pytest.mark.asyncio
+async def test_vector_index_state_upsert_bumps_revision_not_pgvector_flag(db):
+    """Re-indexing on the currently-active backend must never silently flip
+    pgvector_enabled — that flag is owned exclusively by
+    record_vector_backend_benchmark."""
+    p = await db_module.create_project(db, "vec-state-revision")
+    await db_module.upsert_vector_index_state(
+        db, p["id"], backend="duckdb_vss",
+        embedding_model="minishlab/potion-base-8M", dimension=256,
+        source_fingerprint="fp1",
+    )
+    second = await db_module.upsert_vector_index_state(
+        db, p["id"], backend="duckdb_vss",
+        embedding_model="minishlab/potion-base-8M", dimension=256,
+        source_fingerprint="fp2",
+    )
+    assert second["revision"] == 2
+    assert second["source_fingerprint"] == "fp2"
+    assert second["pgvector_enabled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_vector_index_state_rejects_unknown_backend(db):
+    p = await db_module.create_project(db, "vec-state-badbackend")
+    with pytest.raises(ValueError):
+        await db_module.upsert_vector_index_state(db, p["id"], backend="not_a_real_backend")
+
+
+@pytest.mark.asyncio
+async def test_vector_index_state_scopes_are_independent(db):
+    """Two scopes on the same project (e.g. 'code_index' vs 'notes') are
+    tracked as separate rows, never conflated."""
+    p = await db_module.create_project(db, "vec-state-scopes")
+    await db_module.upsert_vector_index_state(db, p["id"], scope="code_index", backend="duckdb_vss")
+    await db_module.upsert_vector_index_state(db, p["id"], scope="notes", backend="bm25")
+    code_state = await db_module.get_vector_index_state(db, p["id"], scope="code_index")
+    notes_state = await db_module.get_vector_index_state(db, p["id"], scope="notes")
+    assert code_state["backend"] == "duckdb_vss"
+    assert notes_state["backend"] == "bm25"
+    scopes = await db_module.list_vector_index_states(db, p["id"])
+    assert {s["scope"] for s in scopes} == {"code_index", "notes"}
+
+
+@pytest.mark.asyncio
+async def test_record_vector_backend_benchmark_requires_existing_state(db):
+    """A benchmark decision needs something to decide about -- recording one
+    for a scope with no active-backend row on file is refused, mirroring
+    complete_verification_run's 'missing evidence' guard."""
+    p = await db_module.create_project(db, "vec-state-nostate")
+    with pytest.raises(ValueError):
+        await db_module.record_vector_backend_benchmark(
+            db, p["id"], evidence={"results": {}}, pgvector_enabled=True,
+            reason="should never get here",
+        )
+
+
+@pytest.mark.asyncio
+async def test_record_vector_backend_benchmark_persists_evidence_and_decision(db):
+    p = await db_module.create_project(db, "vec-state-benchmark")
+    await db_module.upsert_vector_index_state(
+        db, p["id"], backend="duckdb_vss", embedding_model="m", dimension=8,
+        source_fingerprint="fp",
+    )
+    evidence = {
+        "results": {
+            "duckdb_vss": {"backend": "duckdb_vss", "available": True, "recall_at_k": 0.9},
+            "pgvector": {"backend": "pgvector", "available": True, "recall_at_k": 0.95},
+        },
+        "decision": {"pgvector_enabled": True, "reason": "pgvector recall >= duckdb"},
+    }
+    updated = await db_module.record_vector_backend_benchmark(
+        db, p["id"], evidence=evidence, pgvector_enabled=True,
+        reason="pgvector recall 0.95 >= duckdb_vss recall 0.9 - tolerance",
+    )
+    assert updated["pgvector_enabled"] == 1
+    assert updated["revision"] == 2
+    assert "pgvector recall 0.95" in updated["benchmark_decision_reason"]
+    import json as _json
+    stored = _json.loads(updated["benchmark_evidence"])
+    assert stored["decision"]["pgvector_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_record_vector_backend_benchmark_can_keep_gate_closed(db):
+    """A regression (or unavailable pgvector) keeps pgvector_enabled False --
+    the evidence is still recorded so the refusal is auditable."""
+    p = await db_module.create_project(db, "vec-state-refused")
+    await db_module.upsert_vector_index_state(db, p["id"], backend="duckdb_vss")
+    updated = await db_module.record_vector_backend_benchmark(
+        db, p["id"],
+        evidence={"results": {}, "decision": {"pgvector_enabled": False, "reason": "unavailable"}},
+        pgvector_enabled=False,
+        reason="pgvector unavailable: no dsn configured",
+    )
+    assert updated["pgvector_enabled"] == 0
+    assert updated["backend"] == "duckdb_vss"  # active backend untouched by the benchmark call

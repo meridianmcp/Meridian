@@ -885,3 +885,54 @@ def test_search_code_semantic_includes_convergence_and_degraded(tmp_path):
     assert res["degraded"] is False
     assert res["convergence"]["vectors_enabled"] is False
     assert res["convergence"]["converged"] is True
+
+# describe_vector_index — bridge to the backend-neutral vector-index
+# contract (e1475682, meridian_codeindex.vector_index.IndexMetadata)
+# ===========================================================================
+
+
+def test_describe_vector_index_reflects_bm25_only_by_default(tmp_path, monkeypatch):
+    """With the vector leg disabled (the default), describe_vector_index
+    reports the honest degraded backend name and no embedding metadata."""
+    monkeypatch.delenv("MERIDIAN_CODE_INDEX_VECTORS", raising=False)
+    _write(tmp_path / "svc.py", "def hello():\n    return 1\n")
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        idx.reindex()
+        meta = idx.describe_vector_index()
+        assert meta.backend == "bm25_lexical"
+        assert meta.embedding_model is None
+        assert meta.dimension is None
+        assert meta.scope == idx.root_dir
+        assert meta.record_count == idx.count()
+    finally:
+        idx.close()
+
+
+@pytest.mark.skipif(
+    not _vectors_available(),
+    reason="model2vec and/or DuckDB VSS extension not available in this env",
+)
+def test_describe_vector_index_reports_duckdb_vss_when_vectors_ready(tmp_path, monkeypatch):
+    monkeypatch.setenv("MERIDIAN_CODE_INDEX_VECTORS", "1")
+    try:
+        from model2vec import StaticModel
+
+        StaticModel.from_pretrained(ci._EMBED_MODEL_NAME)
+    except BaseException as exc:  # noqa: BLE001
+        _skip_if_model_oom(exc)
+    _write(
+        tmp_path / "math_ops.py",
+        "def add_numbers(a, b):\n    return a + b\n",
+    )
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        idx.reindex()
+        assert idx._vss_ready
+        meta = idx.describe_vector_index()
+        assert meta.backend == "duckdb_vss"
+        assert meta.embedding_model == ci._EMBED_MODEL_NAME
+        assert meta.dimension == idx._vss_dim
+        assert meta.record_count == idx.count()
+    finally:
+        idx.close()
