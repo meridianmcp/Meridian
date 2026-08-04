@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 
 from meridian import db as db_module
+from meridian import handoff as h
 from meridian import server as srv
 from meridian.db.wave_runs import WaveRunFinalizationBlocked
 from meridian.mcp_tools import (
@@ -694,3 +695,332 @@ async def test_mcp_finalize_requires_wave_run_id(db):
 async def test_mcp_start_requires_project(db):
     result = await srv._dispatch_mcp_tool("start_wave_run", {}, db, "/tmp")
     assert "project_id" in result.get("error", "")
+
+
+# ---------------------------------------------------------------------------
+# dcfbe55c — macro-wave projection: separate the visible macro-wave CAP from
+# the conflict-safe internal claim batches get_parallelizable_groups computes.
+#
+# This is a distinct feature from the durable wave-run state machine covered
+# above (sharing the "wave" name only) -- it's a deterministic, PRESENTATION-
+# ONLY packing of get_parallelizable_groups' conflict-free "groups" into at
+# most N (default 3, range 1-3) display waves, so a human/executor reading a
+# /goal isn't confronted with 8-10 confusing "batch" entries when the live
+# board happens to color that many genuinely-parallel-safe groups. It never
+# changes which items are safe to run together -- claim_sprint_item's real
+# resource-lock enforcement (unmodified here) remains the actual safety
+# mechanism regardless of how this projection displays things.
+#
+# Coverage:
+#   1. pack_groups_into_macro_waves: empty input, no-op when within cap,
+#      contiguous-chunk compression when over cap, clamping, and the
+#      never-merge-items-within-a-batch safety invariant.
+#   2. _clamp_macro_wave_count direct unit coverage.
+#   3. get_parallelizable_groups: default cap is 3, cap is configurable and
+#      clamped end-to-end, and "groups" (the authoritative conflict-free
+#      partition) is byte-for-byte identical regardless of the requested cap.
+#   4. handoff._build_quick_start_goal: macro-wave framing renders only when
+#      it genuinely compresses the display; a hand-built dict with no
+#      "macro_waves" key (legacy callers, e.g. test_core.py's existing
+#      coverage) or one that doesn't compress falls straight through to the
+#      original flat per-batch rendering, unchanged; leftover/blocked-item
+#      handling is preserved under the new framing.
+#   5. handoff._requested_macro_wave_count_from_settings: default + clamping.
+# ---------------------------------------------------------------------------
+
+# --- 1. pack_groups_into_macro_waves -----------------------------------------
+
+def test_pack_groups_into_macro_waves_empty_input():
+    assert db_module.sprint_items.pack_groups_into_macro_waves([]) == []
+    assert db_module.sprint_items.pack_groups_into_macro_waves([], 2) == []
+
+
+def test_pack_groups_into_macro_waves_noop_when_within_cap():
+    """len(groups) <= cap: every group already gets its own macro wave — the
+    common small-board case, and a byte-for-byte no-op projection."""
+    groups = [[{"id": "a"}], [{"id": "b"}, {"id": "c"}]]
+    waves = db_module.sprint_items.pack_groups_into_macro_waves(groups, 3)
+    assert len(waves) == 2
+    assert waves[0]["batches"] == [groups[0]]
+    assert waves[1]["batches"] == [groups[1]]
+    assert waves[0]["item_count"] == 1
+    assert waves[1]["item_count"] == 2
+    assert waves[0]["batch_count"] == 1 and waves[1]["batch_count"] == 1
+
+
+def test_pack_groups_into_macro_waves_compresses_when_over_cap():
+    """7 conflict-free groups packed into 3 macro waves via CONTIGUOUS
+    chunking: sizes [3, 2, 2] (divmod(7, 3) = (2, 1), the first `extra`
+    waves get one more group). Order is preserved end to end."""
+    groups = [[{"id": f"g{i}"}] for i in range(7)]
+    waves = db_module.sprint_items.pack_groups_into_macro_waves(groups, 3)
+    assert len(waves) == 3
+    assert [w["batch_count"] for w in waves] == [3, 2, 2]
+    assert [w["item_count"] for w in waves] == [3, 2, 2]
+    # Concatenating each wave's batches in order reproduces `groups` exactly.
+    flattened = [b for w in waves for b in w["batches"]]
+    assert flattened == groups
+
+
+def test_pack_groups_into_macro_waves_never_merges_groups_together():
+    """Claim-safety invariant: packing NEVER merges two distinct
+    conflict-free groups' items into a single flat batch — each original
+    group survives, unmerged, as its own entry in some wave's "batches"."""
+    groups = [[{"id": "a"}, {"id": "b"}], [{"id": "c"}]]
+    waves = db_module.sprint_items.pack_groups_into_macro_waves(groups, 1)
+    assert len(waves) == 1
+    assert waves[0]["batches"] == groups  # both groups preserved, unmerged
+    assert waves[0]["batch_count"] == 2
+    assert waves[0]["item_count"] == 3
+
+
+@pytest.mark.parametrize(
+    "requested,expected_wave_count",
+    [(0, 1), (-5, 1), (1, 1), (2, 2), (3, 3), (4, 3), (100, 3), (None, 3), ("bogus", 3)],
+)
+def test_pack_groups_into_macro_waves_clamps_requested_count(requested, expected_wave_count):
+    groups = [[{"id": f"g{i}"}] for i in range(6)]
+    waves = db_module.sprint_items.pack_groups_into_macro_waves(groups, requested)
+    assert len(waves) == expected_wave_count
+    assert sum(w["item_count"] for w in waves) == 6
+
+
+# --- 2. _clamp_macro_wave_count -----------------------------------------
+
+def test_clamp_macro_wave_count_direct():
+    clamp = db_module.sprint_items._clamp_macro_wave_count
+    assert clamp(None) == 3
+    assert clamp(3) == 3
+    assert clamp(1) == 1
+    assert clamp(0) == 1
+    assert clamp(-1) == 1
+    assert clamp(4) == 3
+    assert clamp(100) == 3
+    assert clamp("2") == 2
+    assert clamp("bogus") == 3
+
+
+# --- 3. get_parallelizable_groups end-to-end (real DB) -----------------------
+
+@pytest.mark.asyncio
+async def test_get_parallelizable_groups_default_macro_wave_cap_is_three(db):
+    pid = await _project(db, "mw-default")
+    # Same shared resource on every item forces one singleton group per item
+    # (they all pairwise conflict) — a simple, deterministic way to produce
+    # many groups for a macro-wave packing test.
+    for i in range(5):
+        await db_module.add_sprint_item(
+            db, pid, "v1", f"FEAT: item {i}", touches_resources=["file:shared.py"],
+            force=True,  # titles differ only by number -- bypass dup detection
+        )
+    res = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert res["group_count"] == 5
+    assert res["requested_macro_wave_count"] == 3
+    assert res["macro_wave_count"] == 3
+    assert sum(w["item_count"] for w in res["macro_waves"]) == 5
+    # The authoritative conflict-free partition is untouched by the cap.
+    assert len(res["groups"]) == res["group_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_get_parallelizable_groups_macro_wave_cap_is_configurable(db):
+    pid = await _project(db, "mw-configurable")
+    for i in range(6):
+        await db_module.add_sprint_item(
+            db, pid, "v1", f"FEAT: item {i}", touches_resources=["file:shared.py"],
+            force=True,  # titles differ only by number -- bypass dup detection
+        )
+    res1 = await db_module.get_parallelizable_groups(
+        db, pid, version="v1", requested_macro_wave_count=1,
+    )
+    assert res1["requested_macro_wave_count"] == 1
+    assert res1["macro_wave_count"] == 1
+    assert res1["macro_waves"][0]["batch_count"] == 6
+
+    res2 = await db_module.get_parallelizable_groups(
+        db, pid, version="v1", requested_macro_wave_count=10,
+    )
+    # Out-of-range request clamps to the [1, 3] ceiling.
+    assert res2["requested_macro_wave_count"] == 3
+    assert res2["macro_wave_count"] == 3
+
+    # dcfbe55c's core contract: the underlying claim-safety partition
+    # ("groups"/"group_count"/"blocked") is IDENTICAL regardless of the
+    # macro-wave cap — this is a presentation layer only, never a
+    # claim-safety waiver.
+    assert res1["groups"] == res2["groups"]
+    assert res1["group_count"] == res2["group_count"] == 6
+    assert res1["blocked"] == res2["blocked"]
+
+
+@pytest.mark.asyncio
+async def test_get_parallelizable_groups_macro_waves_empty_when_no_groups(db):
+    pid = await _project(db, "mw-empty")
+    res = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert res["groups"] == []
+    assert res["macro_waves"] == []
+    assert res["macro_wave_count"] == 0
+    assert res["requested_macro_wave_count"] == 3  # default still reported
+
+
+# --- 4. handoff._build_quick_start_goal macro-wave framing -------------------
+
+def test_build_quick_start_goal_macro_wave_framing_when_compressed():
+    """A hand-built parallel_groups dict whose "macro_waves" genuinely
+    compresses (fewer waves than raw groups) renders "Wave N [...]" framing
+    instead of a flat batch list, and never drops or duplicates an id."""
+    items = [{"id": f"i{n}", "version": None} for n in range(6)]
+    groups = [
+        [{"id": "i0"}, {"id": "i1"}], [{"id": "i2"}], [{"id": "i3"}],
+        [{"id": "i4"}], [{"id": "i5"}],
+    ]
+    macro_waves = [
+        {"batches": groups[0:2], "batch_count": 2, "item_count": 3},
+        {"batches": groups[2:4], "batch_count": 2, "item_count": 2},
+        {"batches": groups[4:5], "batch_count": 1, "item_count": 1},
+    ]
+    parallel_groups = {
+        "group_count": 5, "groups": groups, "macro_waves": macro_waves,
+        "requested_macro_wave_count": 3, "macro_wave_count": 3, "blocked": [],
+    }
+    goal = h._build_quick_start_goal(items, parallel_groups=parallel_groups)
+    assert "macro-wave" in goal
+    assert "presentation only" in goal
+    assert "Wave 1 [batch 1: i0, i1; batch 2: i2]" in goal
+    assert "Wave 2 [batch 3: i3; batch 4: i4]" in goal
+    assert "Wave 3 [batch 5: i5]" in goal
+    for iid in ("i0", "i1", "i2", "i3", "i4", "i5"):
+        assert goal.count(iid) == 1  # each id rendered exactly once
+
+
+def test_build_quick_start_goal_falls_back_to_flat_when_no_compression():
+    """macro_waves present but len(macro_waves) == len(groups) (nothing to
+    compress, e.g. a small board under the cap) must render IDENTICALLY to
+    the pre-existing flat "batch N: ..." format — no "Wave" framing at all."""
+    items = [{"id": "a1", "version": None}, {"id": "b2", "version": None}, {"id": "c3", "version": None}]
+    groups = [[{"id": "a1"}, {"id": "b2"}], [{"id": "c3"}]]
+    macro_waves = [
+        {"batches": [groups[0]], "batch_count": 1, "item_count": 2},
+        {"batches": [groups[1]], "batch_count": 1, "item_count": 1},
+    ]
+    parallel_groups = {
+        "group_count": 2, "groups": groups, "macro_waves": macro_waves,
+        "requested_macro_wave_count": 3, "macro_wave_count": 2, "blocked": [],
+    }
+    goal = h._build_quick_start_goal(items, parallel_groups=parallel_groups)
+    assert "Wave 1" not in goal
+    assert "macro-wave" not in goal
+    assert "resource-conflict-free batches" in goal
+    assert "batch 1: a1, b2" in goal
+    assert "batch 2: c3" in goal
+
+
+def test_build_quick_start_goal_legacy_dict_without_macro_waves_key_unaffected():
+    """No "macro_waves" key at all (e.g. a caller/test built before this
+    feature existed, like test_core.py's pre-existing coverage) must behave
+    exactly as before — the flat rendering, with no crash and no "Wave"
+    framing. Two groups (one with >1 item) so the batches path genuinely
+    engages."""
+    items = [{"id": "a1", "version": None}, {"id": "b2", "version": None}, {"id": "c3", "version": None}]
+    parallel_groups = {
+        "group_count": 2,
+        "groups": [[{"id": "a1"}, {"id": "b2"}], [{"id": "c3"}]],
+        "blocked": [],
+    }
+    goal = h._build_quick_start_goal(items, parallel_groups=parallel_groups)
+    assert "Wave 1" not in goal
+    assert "macro-wave" not in goal
+    assert "batch 1: a1, b2" in goal
+    assert "batch 2: c3" in goal
+
+
+def test_build_quick_start_goal_macro_wave_framing_preserves_leftover_handling():
+    """The leftover/blocked-item cross-reference logic (a1996fbf) must keep
+    working identically whether or not macro-wave framing is engaged."""
+    items = [
+        {"id": "blocked1", "version": None},
+        {"id": "a1", "version": None}, {"id": "b2", "version": None},
+        {"id": "c3", "version": None}, {"id": "d4", "version": None},
+        {"id": "e5", "version": None},
+    ]
+    groups = [
+        [{"id": "a1"}, {"id": "b2"}], [{"id": "c3"}], [{"id": "d4"}], [{"id": "e5"}],
+    ]
+    macro_waves = [
+        {"batches": groups[0:2], "batch_count": 2, "item_count": 3},
+        {"batches": groups[2:4], "batch_count": 2, "item_count": 2},
+    ]
+    parallel_groups = {
+        "group_count": 4, "groups": groups, "macro_waves": macro_waves,
+        "requested_macro_wave_count": 2, "macro_wave_count": 2,
+        "blocked": [
+            {"id": "blocked1", "title": "x", "depends_on": "zzz9999", "blocked_by_status": "pending"},
+        ],
+    }
+    goal = h._build_quick_start_goal(items, parallel_groups=parallel_groups)
+    assert "Wave 1 [batch 1: a1, b2; batch 2: c3]" in goal
+    assert "Wave 2 [batch 3: d4; batch 4: e5]" in goal
+    assert "blocked1 blocked on zzz9999" in goal
+    assert "status: pending" in goal
+
+
+@pytest.mark.asyncio
+async def test_build_quick_start_goal_end_to_end_from_real_db_macro_waves(db):
+    """Full pipeline: get_parallelizable_groups()'s real macro_waves output
+    feeds straight into _build_quick_start_goal() and renders Wave framing,
+    with no item lost or duplicated."""
+    pid = await _project(db, "mw-e2e")
+    # 6 items share one resource (6 singleton groups); one more item touches
+    # a disjoint resource and first-fits into group 0, giving it 2 items so
+    # _has_parallel's "at least one genuinely-parallel group" gate is met.
+    ids = []
+    for i in range(6):
+        it = await db_module.add_sprint_item(
+            db, pid, "v1", f"FEAT: shared {i}", touches_resources=["file:shared.py"],
+            force=True,  # titles differ only by number -- bypass dup detection
+        )
+        ids.append(it["id"])
+    extra = await db_module.add_sprint_item(
+        db, pid, "v1", "FEAT: unique", touches_resources=["file:unique.py"],
+    )
+    ids.append(extra["id"])
+
+    res = await db_module.get_parallelizable_groups(
+        db, pid, version="v1", requested_macro_wave_count=3,
+    )
+    assert res["group_count"] == 6
+    assert res["macro_wave_count"] == 3
+    assert any(len(g) > 1 for g in res["groups"])  # the fan-out condition
+
+    pending_items = [{"id": iid, "version": "v1"} for iid in ids]
+    goal = h._build_quick_start_goal(
+        pending_items, version="v1", parallel_groups=res,
+    )
+    assert "macro-wave" in goal
+    assert "Wave 1" in goal
+    for iid in ids:
+        assert goal.count(iid) == 1
+
+
+# --- 5. _requested_macro_wave_count_from_settings ----------------------------
+
+def test_requested_macro_wave_count_from_settings_default():
+    assert h._requested_macro_wave_count_from_settings(None) == 3
+    assert h._requested_macro_wave_count_from_settings({}) == 3
+    assert h._requested_macro_wave_count_from_settings({"executor_config": {}}) == 3
+    assert h._requested_macro_wave_count_from_settings({"executor_config": None}) == 3
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (1, 1), (2, 2), (3, 3),
+        (0, 1), (-4, 1),
+        (4, 3), (99, 3),
+        ("2", 2), ("bogus", 3),
+        (None, 3),
+    ],
+)
+def test_requested_macro_wave_count_from_settings_clamps(raw, expected):
+    settings = {"executor_config": {"requested_macro_wave_count": raw}}
+    assert h._requested_macro_wave_count_from_settings(settings) == expected

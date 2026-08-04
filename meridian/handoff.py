@@ -1644,6 +1644,33 @@ def _goal_group_style_from_settings(proj_settings: dict[str, Any] | None) -> str
     return "waves" if str(val).lower() == "waves" else "flat"
 
 
+def _requested_macro_wave_count_from_settings(
+    proj_settings: dict[str, Any] | None,
+) -> int:
+    """dcfbe55c — executor_config.requested_macro_wave_count, clamped to [1, 3]
+    (default 3). Threaded into db.get_parallelizable_groups() so its
+    presentation-only "macro_waves" projection (see
+    db.sprint_items.pack_groups_into_macro_waves) packs the live board's
+    conflict-free groups into at most this many display waves. NOT a
+    claim-safety waiver — claim_sprint_item's resource-lock enforcement is
+    entirely independent of this cap. Deliberately self-contained (no call
+    into db.sprint_items) rather than importing the clamp helper across the
+    db->handoff layer boundary, mirroring _is_manual_sprint_item's documented
+    duplication precedent in db/sprint_items.py.
+
+    Missing/non-numeric values fall back to the default (3) rather than
+    raising, matching every other ``_xxx_from_settings`` helper's fail-safe
+    convention in this module.
+    """
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    val = cfg.get("requested_macro_wave_count") if isinstance(cfg, dict) else None
+    try:
+        n = int(val) if val is not None else 3
+    except (TypeError, ValueError):
+        n = 3
+    return max(1, min(3, n))
+
+
 def _loop_enabled_from_settings(
     proj_settings: dict[str, Any] | None,
     workspace_settings: dict[str, Any] | None = None,
@@ -2331,12 +2358,42 @@ def _build_quick_start_goal(
         _item_id_set = set(item_ids)
         _batched: set[str] = set()
         _batches: list[str] = []
-        for _i, _g in enumerate(_pgroups):
-            # Only ids in this /goal's (possibly version-scoped) item list.
-            _gids = [it.get("id") for it in _g if it.get("id") in _item_id_set]
-            _batched.update(_gids)
-            if _gids:
-                _batches.append(f"batch {len(_batches) + 1}: {', '.join(_gids)}")
+        # dcfbe55c — macro-wave projection: get_parallelizable_groups() can
+        # embed a "macro_waves" field (a deterministic packing of the raw
+        # conflict-free "groups" into at most requested_macro_wave_count
+        # display buckets, each an ordered list of the SAME group objects as
+        # "groups" — see db.sprint_items.pack_groups_into_macro_waves). This
+        # is a PRESENTATION layer only: it never merges two groups' items
+        # into one flat parallel set, so it carries zero claim-safety
+        # implications — claim_sprint_item's resource-lock enforcement is
+        # unaffected regardless of how this text renders. Only engage it when
+        # it actually compresses the display (fewer waves than raw groups);
+        # a caller passing a hand-built dict with no "macro_waves" key (or a
+        # small board where nothing needed compressing) falls straight
+        # through to the original flat per-batch rendering, unchanged.
+        _macro_waves = (parallel_groups or {}).get("macro_waves") or []
+        _use_macro_waves = bool(_macro_waves) and len(_macro_waves) < len(_pgroups)
+        _wave_strs: list[str] = []
+        if _use_macro_waves:
+            for _wave in _macro_waves:
+                _wave_batch_labels: list[str] = []
+                for _g in _wave.get("batches") or []:
+                    _gids = [it.get("id") for it in _g if it.get("id") in _item_id_set]
+                    _batched.update(_gids)
+                    if _gids:
+                        _batches.append(f"batch {len(_batches) + 1}: {', '.join(_gids)}")
+                        _wave_batch_labels.append(_batches[-1])
+                if _wave_batch_labels:
+                    _wave_strs.append(
+                        f"Wave {len(_wave_strs) + 1} [{'; '.join(_wave_batch_labels)}]"
+                    )
+        else:
+            for _i, _g in enumerate(_pgroups):
+                # Only ids in this /goal's (possibly version-scoped) item list.
+                _gids = [it.get("id") for it in _g if it.get("id") in _item_id_set]
+                _batched.update(_gids)
+                if _gids:
+                    _batches.append(f"batch {len(_batches) + 1}: {', '.join(_gids)}")
         _leftover = [iid for iid in item_ids if iid not in _batched]
         # a1996fbf — a leftover id can be held back for two structurally
         # different reasons, and the goal text must not conflate them:
@@ -2378,12 +2435,29 @@ def _build_quick_start_goal(
                 f"; blocked on an item outside this goal (not listed above): {_ext_txt}"
             )
         _left_txt = "".join(_left_parts)
-        items_clause = (
-            "Complete sprint items in resource-conflict-free batches — the items "
-            "within a batch touch disjoint resources and are parallel-safe (fan "
-            "them out); finish a batch before starting the next: "
-            f"{'; '.join(_batches)}{_left_txt}. "
-        )
+        if _use_macro_waves and _wave_strs:
+            # dcfbe55c — human/executor-facing macro-wave framing: at most
+            # requested_macro_wave_count waves, each an ORDERED list of the
+            # underlying conflict-free batches (never merged together).
+            # Presentation only — see the note above; the real safety
+            # mechanism is unchanged.
+            items_clause = (
+                f"Complete sprint items in {len(_wave_strs)} resource-conflict-free "
+                f"macro-wave(s) (packed from {len(_pgroups)} conflict-free batches "
+                "for readability — presentation only, not a claim-safety change: "
+                "claim_sprint_item's resource-lock enforcement is unaffected) — "
+                "finish each macro-wave before the next; within a macro-wave, "
+                "finish each numbered batch before the next (a batch's items "
+                "touch disjoint resources and are parallel-safe, fan them out): "
+                f"{'; '.join(_wave_strs)}{_left_txt}. "
+            )
+        else:
+            items_clause = (
+                "Complete sprint items in resource-conflict-free batches — the items "
+                "within a batch touch disjoint resources and are parallel-safe (fan "
+                "them out); finish a batch before starting the next: "
+                f"{'; '.join(_batches)}{_left_txt}. "
+            )
     elif len(waves) > 1 and goal_group_style == "waves":
         # 9f57374b — opt-in wave grouping (default 'flat' per eeee02c6).
         wave_txt = "; ".join(
@@ -6694,7 +6768,12 @@ async def generate_handoff(
     # Guarded + fail-open: any failure degrades to the depends_on wave ordering.
     _parallel_groups = None
     try:
-        _parallel_groups = await db_module.get_parallelizable_groups(db, project_id)
+        _parallel_groups = await db_module.get_parallelizable_groups(
+            db, project_id,
+            requested_macro_wave_count=_requested_macro_wave_count_from_settings(
+                proj_settings
+            ),
+        )
     except Exception:  # noqa: BLE001
         _parallel_groups = None
     # 74a8f420 — feed configured-but-unpassed wave gates into the /goal so a
@@ -7471,7 +7550,12 @@ async def _generate_starter_handoff(
     # e20db0be — parallel batches for the starter /goal too (guarded, fail-open).
     _s_parallel_groups = None
     try:
-        _s_parallel_groups = await db_module.get_parallelizable_groups(db, project["id"])
+        _s_parallel_groups = await db_module.get_parallelizable_groups(
+            db, project["id"],
+            requested_macro_wave_count=_requested_macro_wave_count_from_settings(
+                settings
+            ),
+        )
     except Exception:  # noqa: BLE001
         _s_parallel_groups = None
     # 74a8f420 — see the twin comment in generate_handoff: exclude items gated
@@ -7763,7 +7847,12 @@ async def _generate_goal_only_handoff(
         pass
     _parallel_groups = None
     try:
-        _parallel_groups = await db_module.get_parallelizable_groups(db, project_id)
+        _parallel_groups = await db_module.get_parallelizable_groups(
+            db, project_id,
+            requested_macro_wave_count=_requested_macro_wave_count_from_settings(
+                proj_settings
+            ),
+        )
     except Exception:  # noqa: BLE001
         _parallel_groups = None
     _wave_gate_pending = None

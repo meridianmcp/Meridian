@@ -3807,6 +3807,97 @@ def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
     return (item.get("title") or "").lstrip().upper().startswith("MANUAL")
 
 
+# ---------------------------------------------------------------------------
+# dcfbe55c — macro-wave projection: presentation/orchestration layer ONLY.
+#
+# get_parallelizable_groups' greedy coloring can legitimately produce many
+# conflict-free groups (8-10+ on a busy sprint) — every one of them IS
+# genuinely safe to fan out, but surfacing that many "batch N" waves in a
+# human/executor-facing /goal is confusing to read and easy to lose track of
+# mid-run. pack_groups_into_macro_waves does NOT change what is safe: it
+# never merges two groups' items into one flat parallel set (that would be an
+# unsafe claim-safety waiver), and claim_sprint_item's real resource-lock
+# enforcement is completely independent of this projection and remains the
+# actual safety mechanism regardless of how the /goal chooses to display
+# things. It only decides how many DISPLAY buckets ("macro waves") the
+# already-proven-safe, already-ordered groups are chunked into, preserving
+# each original group as an ordered sub-batch within its macro wave.
+# ---------------------------------------------------------------------------
+
+MACRO_WAVE_COUNT_DEFAULT = 3
+MACRO_WAVE_COUNT_MIN = 1
+MACRO_WAVE_COUNT_MAX = 3
+
+
+def _clamp_macro_wave_count(requested: Any) -> int:
+    """Coerce a requested macro-wave cap into the supported [1, 3] range.
+
+    Never raises: missing/non-numeric/out-of-range values fall back to the
+    default (3) or clamp to the nearest bound, matching every other
+    normalize_*/``_xxx_from_settings`` helper's fail-safe convention
+    elsewhere in this codebase (e.g. ``executor_config.py``).
+    """
+    try:
+        n = int(requested) if requested is not None else MACRO_WAVE_COUNT_DEFAULT
+    except (TypeError, ValueError):
+        return MACRO_WAVE_COUNT_DEFAULT
+    return max(MACRO_WAVE_COUNT_MIN, min(MACRO_WAVE_COUNT_MAX, n))
+
+
+def pack_groups_into_macro_waves(
+    groups: list[list[dict[str, Any]]],
+    requested_macro_wave_count: Any = MACRO_WAVE_COUNT_DEFAULT,
+) -> list[dict[str, Any]]:
+    """dcfbe55c — pack conflict-free ``groups`` into at most N macro-waves.
+
+    ``groups`` is exactly get_parallelizable_groups' own ``"groups"`` list —
+    each element already proven internally conflict-free by the greedy
+    coloring above. This function never inspects or recomputes resource
+    conflicts; it purely chunks the list for display.
+
+    Algorithm: CONTIGUOUS chunking (not round-robin), so the incoming group
+    order — highest-priority-first, see get_parallelizable_groups' e08fee30
+    note — is preserved both within a macro wave and across macro waves. A
+    round-robin scheme would scramble that ordering and could put a
+    high-priority group behind a low-priority one in the rendered sequence.
+
+    When ``len(groups) <= N`` (the common case — most boards don't have more
+    conflict-free groups than the cap), every group already gets its own
+    macro wave: a no-op projection, nothing to compress, and the resulting
+    list is the same length/order as ``groups`` itself.
+
+    Returns a list of ``{"batches": [group, ...], "batch_count": int,
+    "item_count": int}`` dicts, one per non-empty macro wave, at most
+    ``requested_macro_wave_count`` (clamped to [1, 3]) entries long. Each
+    ``batches`` entry IS one of the original ``groups`` elements (same list
+    object, not a copy) so a caller can cross-reference by identity/content
+    without re-deriving anything.
+    """
+    if not groups:
+        return []
+    n = _clamp_macro_wave_count(requested_macro_wave_count)
+    if len(groups) <= n:
+        return [
+            {"batches": [g], "batch_count": 1, "item_count": len(g)}
+            for g in groups
+        ]
+    macro_waves: list[dict[str, Any]] = []
+    base, extra = divmod(len(groups), n)
+    idx = 0
+    for wi in range(n):
+        size = base + (1 if wi < extra else 0)
+        if size <= 0:
+            continue
+        chunk = groups[idx: idx + size]
+        idx += size
+        macro_waves.append({
+            "batches": chunk,
+            "batch_count": len(chunk),
+            "item_count": sum(len(b) for b in chunk),
+        })
+    return macro_waves
+
+
 async def get_parallelizable_groups(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3815,6 +3906,7 @@ async def get_parallelizable_groups(
     configured_target: int | None = None,
     host_limit: int | None = None,
     requested_parallelism: int | None = None,
+    requested_macro_wave_count: Any = MACRO_WAVE_COUNT_DEFAULT,
 ) -> dict[str, Any]:
     """255096d9 — cluster pending sprint items that are safe to run in parallel.
 
@@ -3834,8 +3926,9 @@ async def get_parallelizable_groups(
     Returns ``{"version", "groups": [[item, ...], ...], "group_count",
     "eligible_count", "blocked": [...], "undeclared_count", "requested_parallelism",
     "effective_parallelism", "host_limit", "configured_target",
-    "resource_safe_capacity", "limiting_reason"}``. ``groups`` items are full
-    sprint-item dicts with a derived ``resources`` list attached.
+    "resource_safe_capacity", "limiting_reason", "macro_waves",
+    "macro_wave_count", "requested_macro_wave_count"}``. ``groups`` items
+    are full sprint-item dicts with a derived ``resources`` list attached.
 
     2282a636 — items with ``blocker_kind='manual'`` (blocked on a real-world
     action outside Meridian) are excluded here: they are not executor-claimable,
@@ -3862,6 +3955,15 @@ async def get_parallelizable_groups(
     (the first group's size), ``effective_parallelism`` and ``limiting_reason``.
     This is pure diagnostics: it does not change which items land in which
     ``groups`` — the coloring algorithm below is unchanged.
+
+    ``requested_macro_wave_count`` (dcfbe55c, default 3, clamped to [1, 3])
+    controls ``macro_waves``: a deterministic, PRESENTATION-ONLY packing of
+    ``groups`` into at most that many display waves via
+    :func:`pack_groups_into_macro_waves` — see that function's docstring for
+    the full contract. It is NOT a claim-safety waiver; ``groups`` (the real
+    conflict-free partition) is returned unchanged regardless of this cap,
+    and claim_sprint_item's resource-lock enforcement never consults
+    ``macro_waves`` at all.
     """
     # include_manual_blocker=False: a manual-blocker item is not claimable work,
     # so it must not be offered as a parallelizable batch member.
@@ -3975,6 +4077,11 @@ async def get_parallelizable_groups(
         host_limit=host_limit,
         resource_safe_capacity=_first_group_size,
     )
+    # dcfbe55c — presentation-only macro-wave projection; see the module-level
+    # note above pack_groups_into_macro_waves. Does not affect "groups" above,
+    # which remains the authoritative conflict-free partition.
+    _macro_wave_cap = _clamp_macro_wave_count(requested_macro_wave_count)
+    macro_waves = pack_groups_into_macro_waves(groups, _macro_wave_cap)
     return {
         "version": version,
         "groups": groups,
@@ -3989,6 +4096,9 @@ async def get_parallelizable_groups(
         "configured_target": _parallelism["configured_target"],
         "resource_safe_capacity": _parallelism["resource_safe_capacity"],
         "limiting_reason": _parallelism["limiting_reason"],
+        "macro_waves": macro_waves,
+        "macro_wave_count": len(macro_waves),
+        "requested_macro_wave_count": _macro_wave_cap,
     }
 
 
