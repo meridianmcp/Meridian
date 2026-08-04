@@ -5841,7 +5841,47 @@ async def run_tunnel(
         print("  code-extractor:    disabled (tunnel_plugins config)", flush=True)
     else:
         ext_raw = extract_plugin.get("command")
-        if ext_raw == SERENA_EXTRACT_COMMAND:
+        # ada39096 — resolve any EXPLICIT, non-default override first (still
+        # unexpanded-Serena stays out of this: {repo_path} must survive to the
+        # pool's own per-repo_path expansion, so the SERENA_EXTRACT_COMMAND
+        # comparison below happens before any expand_command() call).
+        ext_override = (
+            None if ext_raw == SERENA_EXTRACT_COMMAND
+            else expand_command(ext_raw, repo_path=repo_path)
+        )
+        if ext_override:
+            cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
+            print(f"  code-extractor:    lazy-spawn on port {extract_port} (custom command)", flush=True)
+            proxy_extract = SlotProxy(cmd_extract, extract_port, "extract", client_id=_client_id)
+            slot_proxies.append(proxy_extract)
+        else:
+            # ada39096 — everything else (the exact-match default case AND any
+            # command that didn't resolve to something usable) spawns the
+            # CURRENT built-in default: Serena. A missing/empty command shows
+            # up for a stale connector manifest too — e.g. an older server's
+            # already-resolved plugin list, predating the Serena default,
+            # sends `command: None` for this slot (see BUILTIN_PLUGINS'
+            # `command: None` semantics: "the client uses its platform-aware
+            # default builder for this slot"). That default is Serena today,
+            # not the deprecated mcp-server-code-extractor — silently falling
+            # back to the old tool here would reintroduce exactly the
+            # stale-substitution bug this branch must avoid. An EXPLICIT
+            # legacy override (e.g. a tenant deliberately reverting to
+            # ``["uvx", "mcp-server-code-extractor"]``) is a non-empty,
+            # resolvable command and is handled by the ``ext_override``
+            # branch above instead — that is the ONLY path allowed to run the
+            # old extractor. _resolve_extractor_inner_cmd /
+            # _build_extractor_proxy_command (the dedicated uvx-or-pip-fallback
+            # resolver for that legacy launcher) are intentionally NOT wired
+            # into this decision as an implicit fallback anymore; they remain
+            # standalone, independently unit-tested helpers.
+            if ext_raw and ext_raw != SERENA_EXTRACT_COMMAND:
+                print(
+                    "  code-extractor:    configured command did not resolve to a "
+                    "usable launcher; using the current default (Serena) instead of "
+                    "silently falling back to the deprecated mcp-server-code-extractor",
+                    flush=True, file=sys.stderr,
+                )
             # 64650cb4 — default Serena: a per-repo_path daemon pool instead of a
             # single fixed --project instance, so executor sessions touching other
             # repos no longer hit Serena's "outside configured workspaces" error.
@@ -5860,23 +5900,6 @@ async def run_tunnel(
                 f"from port {SERENA_POOL_BASE_PORT}",
                 flush=True,
             )
-        elif (ext_override := expand_command(ext_raw, repo_path=repo_path)):
-            cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
-            print(f"  code-extractor:    lazy-spawn on port {extract_port} (custom command)", flush=True)
-            proxy_extract = SlotProxy(cmd_extract, extract_port, "extract", client_id=_client_id)
-            slot_proxies.append(proxy_extract)
-        else:
-            extractor_inner = _resolve_extractor_inner_cmd()
-            if extractor_inner is not None:
-                cmd_extract = _build_extractor_proxy_command(npx, extractor_inner, extract_port)
-                print(f"  code-extractor:    lazy-spawn on port {extract_port}", flush=True)
-                proxy_extract = SlotProxy(cmd_extract, extract_port, "extract", client_id=_client_id)
-                slot_proxies.append(proxy_extract)
-            else:
-                print(
-                    "  code-extractor:    not available (uvx missing and pip install failed)",
-                    flush=True,
-                )
 
     # 4b. Office MCP slots (ppt/word/dc/docs/zotero/outputs/debug). Off by default;
     # enabled via dashboard.
