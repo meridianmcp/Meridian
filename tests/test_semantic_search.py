@@ -17,6 +17,7 @@ import sys
 import pytest
 
 from meridian import db as db_module
+from meridian import handoff as handoff_module
 from meridian import semantic_search as ss
 from meridian.semantic_search import SemanticSearcher, should_escalate
 
@@ -566,3 +567,243 @@ def test_maybe_idle_unload_releases_model_after_idle(monkeypatch):
         assert s._model is not None       # kept
     finally:
         s._model = None                   # don't leak singleton state
+
+
+# ---------------------------------------------------------------------------
+# 2204ce80 — hybrid_candidate_retrieval: exact-filter-first lexical discovery,
+# optional bounded local-semantic rerank, fused scoring, exact-id pinning.
+# All tests run on the default SQLite ``db`` fixture — semantic mocking uses
+# monkeypatch on ``semantic_search.is_available``/``rank`` so no real model is
+# ever loaded (same CI-safety guarantee as the rest of this file).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_applies_exact_version_filter_first(db, monkeypatch):
+    """A sprint_item candidate that matches the query lexically but lives in a
+    DIFFERENT version is excluded before lexical scoring ever runs — the exact
+    filter is applied in the SQL WHERE, not as a post-hoc rank penalty."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-version-filter")
+    v1_item = await db_module.add_sprint_item(db, p["id"], "v1", "rate limiter design")
+    await db_module.add_sprint_item(db, p["id"], "v2", "rate limiter design")
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "rate limiter", source_types=["sprint_item"], version="v1",
+    )
+    ids = [c["id"] for c in result["candidates"]]
+    assert ids == [v1_item["id"]]
+    assert result["filters"]["version"] == "v1"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_applies_exact_status_filter(db, monkeypatch):
+    """An explicit status filter is an exact match, applied before lexical
+    discovery — a completed item is excluded when filtering for 'pending'."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-status-filter")
+    pending = await db_module.add_sprint_item(db, p["id"], "v1", "flush the cache")
+    done = await db_module.add_sprint_item(
+        db, p["id"], "v1", "flush the cache twice", force=True)
+    await db_module.complete_sprint_item(db, p["id"], done["id"])
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "flush cache", source_types=["sprint_item"], status="pending",
+    )
+    ids = {c["id"] for c in result["candidates"]}
+    assert pending["id"] in ids
+    assert done["id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_default_lexical_only_provenance(db, monkeypatch):
+    """DEFAULT (semantic disabled): every candidate is lexical-only — no
+    semantic_score, fused_score == lexical_norm, semantic_used is False."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-default-lexical")
+    await db_module.add_project_note(db, p["id"], "Rate limiting", "token bucket algorithm")
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "rate limiting", source_types=["note"],
+    )
+    assert result["semantic_used"] is False
+    assert len(result["candidates"]) == 1
+    cand = result["candidates"][0]
+    assert cand["provenance"] == "lexical"
+    assert cand["semantic_score"] is None
+    assert cand["fused_score"] == cand["lexical_score"] / cand["lexical_score"]  # normalized to 1.0
+    assert cand["fused_score"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_exact_ids_always_pinned_ahead(db, monkeypatch):
+    """An id passed via ``exact_ids`` is ALWAYS included — even when it does
+    NOT match the query lexically at all — pinned ahead of every lexical/
+    semantic row with provenance='exact' and fused_score=1.0. This is the
+    'never let semantic create or replace a pointer' guarantee: the exact
+    row's identity/rank never depends on any scoring step."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-exact-pin")
+    lexical_hit = await db_module.add_project_note(
+        db, p["id"], "Auth flow", "oauth login handshake")
+    pointer_target = await db_module.add_project_note(
+        db, p["id"], "Completely unrelated", "zzz nothing to do with the query")
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "oauth login", source_types=["note"],
+        exact_ids=[pointer_target["id"]],
+    )
+    assert result["candidates"][0]["id"] == pointer_target["id"]
+    assert result["candidates"][0]["provenance"] == "exact"
+    assert result["candidates"][0]["fused_score"] == 1.0
+    ids = [c["id"] for c in result["candidates"]]
+    assert lexical_hit["id"] in ids  # the genuine lexical hit is still present
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_visibility_other_than_project_yields_nothing(db, monkeypatch):
+    """Only visibility=None/'project' is wired up today; any other explicit
+    value returns zero candidates rather than silently ignoring the filter
+    (workspace-level visibility is a documented follow-up)."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-visibility")
+    await db_module.add_project_note(db, p["id"], "Rate limiting", "token bucket algorithm")
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "rate limiting", visibility="workspace",
+    )
+    assert result["candidates"] == []
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_semantic_rerank_only_scores_lexical_pool(db, monkeypatch):
+    """When semantic is available (mocked), it re-scores rows the lexical pass
+    ALREADY found — it never introduces a candidate lexical search missed. The
+    mocked rank() is asked ONLY about the ids the lexical pool discovered."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-semantic-rerank")
+    strong = await db_module.add_project_note(db, p["id"], "Auth service", "oauth login flow")
+    weak = await db_module.add_project_note(db, p["id"], "Auth docs", "oauth login notes")
+    unrelated = await db_module.add_project_note(db, p["id"], "Deploy", "fly.io config")
+
+    seen_ids: list[str] = []
+
+    def _fake_rank(query, candidates, floor=None):
+        nonlocal seen_ids
+        seen_ids = [cid for cid, _ in candidates]
+        # Only the two lexically-discovered notes should ever be offered here.
+        scores = {f"note:{strong['id']}": 0.9, f"note:{weak['id']}": 0.5}
+        return sorted(
+            ((cid, s) for cid, s in scores.items() if cid in seen_ids),
+            key=lambda pair: pair[1], reverse=True,
+        )
+
+    monkeypatch.setattr(ss, "is_available", lambda: True)
+    monkeypatch.setattr(ss, "rank", _fake_rank)
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "oauth login", source_types=["note"],
+    )
+    assert result["semantic_used"] is True
+    assert f"note:{unrelated['id']}" not in seen_ids  # never offered to rank()
+    by_id = {c["id"]: c for c in result["candidates"]}
+    assert by_id[strong["id"]]["provenance"] == "lexical+semantic"
+    assert by_id[strong["id"]]["semantic_score"] == 0.9
+    assert unrelated["id"] not in by_id  # lexical search never found it either
+    # fused ordering follows the fused_score, not raw insertion order.
+    assert result["candidates"][0]["id"] == strong["id"]
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_blank_query_returns_no_candidates(db, monkeypatch):
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-blank-query")
+    result = await db_module.hybrid_candidate_retrieval(db, p["id"], "   ")
+    assert result["candidates"] == []
+
+
+# ---------------------------------------------------------------------------
+# generate_handoff's optional related_records_query/related_records hook
+# (2204ce80) — a thin, additive wrapper over hybrid_candidate_retrieval. Every
+# pre-existing call site (both args at their default) must see ZERO change.
+# ---------------------------------------------------------------------------
+
+
+def _normalize_nondeterministic_handoff_fields(content: str) -> str:
+    """Strip the per-call nondeterministic fields (the wall-clock
+    ``_Generated at ..._`` line and the freshly-minted single-use
+    ``<goal_token>``) so two handoffs rendered moments apart — otherwise
+    identical — compare equal. Used ONLY to prove the new opt-in
+    related_records args don't alter the rendered content; unrelated to the
+    fields this sprint item's feature actually touches."""
+    import re as _re
+    content = _re.sub(r"_Generated at [^_]+_", "_Generated at TIMESTAMP_", content)
+    content = _re.sub(r"<goal_token>[^<]*</goal_token>", "<goal_token>TOKEN</goal_token>", content)
+    return content
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_related_records_default_off(db, tmp_path, monkeypatch):
+    """Leaving both new args at their default is a complete no-op: same
+    content as a call made before this feature existed."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "handoff-related-off")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+
+    _, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="delta", skip_ai_summary=True,
+    )
+    _, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="delta", skip_ai_summary=True,
+        related_records_query=None, related_records=None,
+    )
+    assert _normalize_nondeterministic_handoff_fields(content_a) == _normalize_nondeterministic_handoff_fields(content_b)
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_related_records_opt_in_populates_dict(db, tmp_path, monkeypatch):
+    """Opting in on both args populates ``related_records`` in place via the
+    shared hybrid retrieval path, WITHOUT altering the rendered content."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "handoff-related-on")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    await db_module.add_project_note(db, p["id"], "Rate limiting", "token bucket algorithm")
+
+    _, baseline_content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="delta", skip_ai_summary=True,
+    )
+    related: dict = {}
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="delta", skip_ai_summary=True,
+        related_records_query="rate limiting", related_records=related,
+    )
+    # rendered output is untouched
+    assert (
+        _normalize_nondeterministic_handoff_fields(content)
+        == _normalize_nondeterministic_handoff_fields(baseline_content)
+    )
+    assert related["candidates"], "expected the matching note to surface"
+    assert any(c["title"] == "Rate limiting" for c in related["candidates"])
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_related_records_lookup_failure_never_breaks_handoff(
+    db, tmp_path, monkeypatch,
+):
+    """A failure inside the related-records lookup must never break the
+    mandatory handoff — it degrades to an empty result."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "handoff-related-error")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+
+    async def _boom(*a, **k):
+        raise RuntimeError("simulated retrieval failure")
+
+    monkeypatch.setattr(db_module, "hybrid_candidate_retrieval", _boom)
+    related: dict = {}
+    path, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="delta", skip_ai_summary=True,
+        related_records_query="rate limiting", related_records=related,
+    )
+    assert path and content  # the handoff itself still succeeded
+    assert related == {"query": "rate limiting", "candidates": []}

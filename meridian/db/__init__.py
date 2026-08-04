@@ -4265,6 +4265,371 @@ async def _maybe_semantic_escalate(
     )
 
 
+# ---------------------------------------------------------------------------
+# 2204ce80 — hybrid candidate retrieval: exact-filter-first lexical discovery
+# with OPTIONAL bounded local semantic reranking. Shared by handoff generation
+# (meridian.handoff._gather_related_planning_records) and available to any
+# future caller needing the same "exact filters -> lexical discovery -> bounded
+# semantic rerank" shape search_all's own semantic escalation (56cd8712)
+# pioneered — but stricter: semantic here ONLY re-scores rows the lexical pass
+# already discovered, it never adds candidates lexical search missed (see
+# ``hybrid_candidate_retrieval`` docstring). No paid LLM call anywhere in this
+# path — the only ML step is the local Model2Vec cosine rerank, itself gated
+# behind ``semantic_search.is_available()`` (OFF unless explicitly enabled).
+# ---------------------------------------------------------------------------
+
+# table/column shape for each source type this path knows how to retrieve.
+# ``status_col``/``version_col`` are ``None`` when the table has no such
+# column (an exact status/version filter for that type is then a no-op).
+_HYBRID_SOURCE_SPECS: dict[str, dict[str, Any]] = {
+    "task": {
+        "table": "task_log",
+        "text_cols": ("description",),
+        "title_col": None,
+        "created_col": "created_at",
+        "status_col": "status",
+        "version_col": None,
+    },
+    "note": {
+        "table": "project_notes",
+        "text_cols": ("title", "body"),
+        "title_col": "title",
+        "created_col": "created_at",
+        "status_col": None,
+        "version_col": None,
+    },
+    "decision": {
+        "table": "decisions_pinned",
+        "text_cols": ("title", "body"),
+        "title_col": "title",
+        "created_col": "created_at",
+        "status_col": "status",
+        "version_col": None,
+    },
+    "sprint_item": {
+        "table": "sprint_items",
+        "text_cols": ("title", "notes"),
+        "title_col": "title",
+        "created_col": "added_at",
+        "status_col": "status",
+        "version_col": "version",
+    },
+}
+_HYBRID_DEFAULT_SOURCE_TYPES: "tuple[str, ...]" = ("task", "note", "decision", "sprint_item")
+# Fusion weights: lexical is the deterministic/trusted signal (substring or
+# FTS/pg_trgm backed); semantic is a best-effort nudge applied only within the
+# already-bounded candidate pool, never the sole basis for a candidate existing.
+_HYBRID_LEXICAL_WEIGHT = 0.6
+_HYBRID_SEMANTIC_WEIGHT = 0.4
+# pg_trgm similarity floor used only to WIDEN the lexical WHERE predicate
+# (alongside the tsvector match) so near-miss keyword phrasing still surfaces
+# as a lexical candidate; ranking itself is driven by the computed score, not
+# this threshold.
+_HYBRID_TRIGRAM_WHERE_FLOOR = 0.05
+
+
+async def _hybrid_lexical_candidates(
+    db: Any,
+    project_id: str,
+    query: str,
+    stype: str,
+    spec: dict[str, Any],
+    *,
+    version: str | None,
+    status_list: "list[str] | None",
+    is_pg: bool,
+    pool: int,
+) -> list[dict[str, Any]]:
+    """Exact-filter-first lexical candidate discovery for one source type.
+
+    Filter order matters: ``project_id`` (always), then the exact ``version``/
+    ``status`` filters (when the table has that column), are ALL applied in
+    the SQL ``WHERE`` before the lexical predicate ever runs — so lexical/
+    semantic scoring only ever sees rows that already passed the exact scope
+    filters, never the reverse.
+    """
+    table = spec["table"]
+    text_cols = spec["text_cols"]
+    title_col = spec["title_col"]
+    created_col = spec["created_col"]
+    status_col = spec["status_col"]
+    version_col = spec["version_col"]
+    text_expr = " || ' ' || ".join(f"coalesce({c}, '')" for c in text_cols)
+    title_select = f"{title_col} AS _title" if title_col else "NULL AS _title"
+
+    where_parts = ["project_id = ?"]
+    where_params: list[Any] = [project_id]
+    if version is not None and version_col is not None:
+        where_parts.append(f"{version_col} = ?")
+        where_params.append(version)
+    if status_list is not None and status_col is not None:
+        placeholders = ", ".join("?" for _ in status_list)
+        where_parts.append(f"{status_col} IN ({placeholders})")
+        where_params.extend(status_list)
+    elif status_list is None and status_col is not None and stype == "decision":
+        # Preserve the convention every other read path in this module uses:
+        # decisions default to active-only unless a status is explicitly given.
+        where_parts.append("status = 'active'")
+
+    if is_pg:
+        tsq = _or_tsquery_source(query)
+        score_sql = f"similarity({text_expr}, ?)"
+        score_params: list[Any] = [query]
+        where_parts.append(
+            f"(to_tsvector('english', {text_expr}) @@ websearch_to_tsquery('english', ?) "
+            f"OR similarity({text_expr}, ?) > {_HYBRID_TRIGRAM_WHERE_FLOOR})"
+        )
+        where_params.extend([tsq, query])
+    else:
+        w, sc, wp, sp = _multiword_or_ranked_clause(list(text_cols), query, op="LIKE")
+        where_parts.append(w)
+        where_params.extend(wp)
+        score_sql = sc
+        score_params = sp
+
+    where_sql = " AND ".join(where_parts)
+    sql = (
+        f"SELECT id, {text_expr} AS _text, {created_col} AS _created, {title_select}, "
+        f"{score_sql} AS _score "
+        f"FROM {table} WHERE {where_sql} "
+        f"ORDER BY _score DESC LIMIT ?"
+    )
+    params = tuple(score_params + where_params + [pool])
+    try:
+        async with db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+    except Exception:  # noqa: BLE001 - one source type's failure must not break the rest
+        _log.warning("hybrid_candidate_retrieval: lexical query failed for %s", stype, exc_info=True)
+        return []
+    out: list[dict[str, Any]] = []
+    for r in rows:  # type: ignore[assignment]
+        d = _row_to_dict(r)  # type: ignore[misc]
+        try:
+            score = float(d.get("_score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        out.append({
+            "id": d.get("id"),
+            "source_type": stype,
+            "title": d.get("_title"),
+            "text": d.get("_text") or "",
+            "freshness": d.get("_created"),
+            "lexical_score": score,
+        })
+    return out
+
+
+async def _hybrid_fetch_exact(
+    db: Any, project_id: str, rid: str, stype: str, spec: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Fetch one row by exact id — bypasses lexical/semantic scoring entirely.
+
+    Used for ``exact_ids`` (e.g. a resolved sprint-item-pointer target): the
+    row is included regardless of whether it would have scored as a lexical
+    or semantic candidate. Returns ``None`` when the id doesn't exist under
+    ``project_id`` for this source type, or on any query error.
+    """
+    table = spec["table"]
+    text_cols = spec["text_cols"]
+    title_col = spec["title_col"]
+    created_col = spec["created_col"]
+    text_expr = " || ' ' || ".join(f"coalesce({c}, '')" for c in text_cols)
+    title_select = f"{title_col} AS _title" if title_col else "NULL AS _title"
+    sql = (
+        f"SELECT id, {text_expr} AS _text, {created_col} AS _created, {title_select} "
+        f"FROM {table} WHERE project_id = ? AND id = ?"
+    )
+    try:
+        async with db.execute(sql, (project_id, rid)) as cur:
+            row = await cur.fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    if row is None:
+        return None
+    d = _row_to_dict(row)  # type: ignore[misc]
+    return {
+        "id": d.get("id"),
+        "source_type": stype,
+        "title": d.get("_title"),
+        "text": d.get("_text") or "",
+        "freshness": d.get("_created"),
+    }
+
+
+async def hybrid_candidate_retrieval(
+    db: Any,
+    project_id: str,
+    query: str,
+    *,
+    source_types: "list[str] | tuple[str, ...] | None" = None,
+    version: str | None = None,
+    status: "str | list[str] | None" = None,
+    visibility: str | None = None,
+    limit: int = 10,
+    candidate_pool: int = 50,
+    exact_ids: "list[str] | set[str] | None" = None,
+    allow_semantic: bool = True,
+) -> dict[str, Any]:
+    """Shared hybrid candidate-retrieval path (2204ce80) for handoffs and
+    other planning-record consumers.
+
+    Pipeline — EXACT filters always run first, before any lexical/semantic
+    step ever touches a row:
+
+    1. **Exact filters.** ``project_id`` (always — this module scopes every
+       query by project, which is also the effective tenant boundary: a
+       project belongs to exactly one tenant and ids are uuid4, so no
+       separate tenant filter is needed on top of it). ``version`` — exact
+       match, ``sprint_item`` only (a no-op for the other source types, which
+       have no version column). ``status`` — exact match against one or more
+       values; when omitted, ``decision`` rows still default to
+       ``status='active'`` (matching every other read path in this module),
+       and every other source type is unfiltered by status. ``visibility`` —
+       only ``None``/``"project"`` is supported today (every wired source
+       table is inherently project-scoped); any other value returns zero
+       candidates rather than silently ignoring the filter — workspace-level
+       visibility is a documented follow-up (see the module docstring above
+       ``hybrid_candidate_retrieval`` in the sprint-item notes).
+    2. **Lexical candidate discovery** over the exactly-filtered rows only:
+       pg_trgm ``similarity`` + tsvector FTS on Postgres, the OR-ranked
+       substring match on SQLite — the same primitives ``search_all`` already
+       uses — bounded to ``candidate_pool`` rows total across the requested
+       ``source_types``.
+    3. **Optional bounded semantic rerank.** When ``allow_semantic`` and
+       :func:`meridian.semantic_search.is_available`, the ALREADY-bounded
+       lexical pool (never the whole corpus) is cosine-ranked via
+       ``semantic_search.rank`` — local Model2Vec only, no paid LLM call.
+       Unlike ``search_all``'s escalation, semantic here can only RE-SCORE a
+       row the lexical pass already found; it never adds a candidate lexical
+       search missed.
+    4. **Fuse.** ``fused_score = 0.6 * lexical_norm + 0.4 * semantic`` when a
+       semantic score exists for that row, else ``fused_score = lexical_norm``
+       (``lexical_norm`` = the row's lexical score divided by the pool's max).
+
+    ``exact_ids`` (e.g. a resolved ``sprint_item_pointers`` target, or any id
+    a caller already knows is the right answer) are ALWAYS included, pinned
+    ahead of every lexical/semantic row, ``provenance="exact"``,
+    ``fused_score=1.0`` — their identity and rank are NEVER touched by the
+    semantic step. Semantic similarity can add a nudge to already-discovered
+    lexical rows; it can never create or replace an executable pointer.
+
+    Returns ``{"query", "source_types", "filters", "semantic_used",
+    "candidates"}`` where each candidate is ``{id, source_type, title,
+    snippet, lexical_score, semantic_score, fused_score, freshness,
+    provenance}``. ``provenance`` is one of ``"exact"`` / ``"lexical"`` /
+    ``"lexical+semantic"``. IDs are the underlying tables' own stable ids
+    (never synthesized), so a candidate's id is always a valid, directly
+    resolvable reference back to its source row.
+    """
+    types = tuple(source_types) if source_types else _HYBRID_DEFAULT_SOURCE_TYPES
+    types = tuple(t for t in types if t in _HYBRID_SOURCE_SPECS)
+    filters = {
+        "project_id": project_id, "version": version,
+        "status": status, "visibility": visibility,
+    }
+    result: dict[str, Any] = {
+        "query": query, "source_types": list(types), "filters": filters,
+        "semantic_used": False, "candidates": [],
+    }
+    if not types or not query or not query.strip():
+        return result
+    # visibility (2204ce80): only project-scoped records are wired into the
+    # corpus today — see the docstring above. Any other explicit value yields
+    # zero candidates rather than silently matching everything.
+    if visibility not in (None, "project"):
+        return result
+
+    is_pg = hasattr(db, "_pool")
+    status_list: "list[str] | None"
+    if status is None:
+        status_list = None
+    elif isinstance(status, str):
+        status_list = [status]
+    else:
+        status_list = list(status)
+
+    exact_id_set = {str(i) for i in exact_ids} if exact_ids else set()
+
+    per_type_pool = max(1, candidate_pool // max(1, len(types)))
+    pooled: list[dict[str, Any]] = []
+    for stype in types:
+        spec = _HYBRID_SOURCE_SPECS[stype]
+        rows = await _hybrid_lexical_candidates(
+            db, project_id, query, stype, spec,
+            version=version, status_list=status_list,
+            is_pg=is_pg, pool=per_type_pool,
+        )
+        pooled.extend(rows)
+
+    pooled_ids = {(r["source_type"], str(r["id"])) for r in pooled}
+    exact_rows: list[dict[str, Any]] = []
+    for rid in exact_id_set:
+        for stype in types:
+            if (stype, rid) in pooled_ids:
+                continue
+            row = await _hybrid_fetch_exact(db, project_id, rid, stype, _HYBRID_SOURCE_SPECS[stype])
+            if row is not None:
+                exact_rows.append(row)
+                pooled_ids.add((stype, rid))
+                break  # ids are unique per-table; stop scanning other types once found
+
+    # Optional bounded semantic rerank — ONLY over the lexical pool. exact_rows
+    # never enter this step (see the "never let semantic touch a pointer" contract).
+    semantic_scores: dict[tuple[str, str], float] = {}
+    if allow_semantic and pooled:
+        from meridian import semantic_search
+        if semantic_search.is_available():
+            cand_pairs = [(f"{r['source_type']}:{r['id']}", r["text"]) for r in pooled]
+            ranked = semantic_search.rank(query, cand_pairs)
+            if ranked:
+                result["semantic_used"] = True
+            for combo_id, score in ranked:
+                stype, _, rid = combo_id.partition(":")
+                semantic_scores[(stype, rid)] = score
+
+    max_lexical = max((r["lexical_score"] for r in pooled), default=0.0) or 1.0
+    scored: list[dict[str, Any]] = []
+    for r in pooled:
+        key = (r["source_type"], str(r["id"]))
+        lex_norm = (r["lexical_score"] / max_lexical) if max_lexical else 0.0
+        sem = semantic_scores.get(key)
+        if sem is not None:
+            fused = _HYBRID_LEXICAL_WEIGHT * lex_norm + _HYBRID_SEMANTIC_WEIGHT * sem
+            provenance = "lexical+semantic"
+        else:
+            fused = lex_norm
+            provenance = "lexical"
+        scored.append({
+            "id": r["id"],
+            "source_type": r["source_type"],
+            "title": r.get("title"),
+            "snippet": _search_snippet(r.get("text"), query),
+            "lexical_score": round(r["lexical_score"], 4),
+            "semantic_score": (round(sem, 4) if sem is not None else None),
+            "fused_score": round(fused, 4),
+            "freshness": r.get("freshness"),
+            "provenance": provenance,
+        })
+    scored.sort(key=lambda c: c["fused_score"], reverse=True)
+
+    candidates: list[dict[str, Any]] = []
+    for r in exact_rows:
+        candidates.append({
+            "id": r["id"],
+            "source_type": r["source_type"],
+            "title": r.get("title"),
+            "snippet": _search_snippet(r.get("text"), query),
+            "lexical_score": None,
+            "semantic_score": None,
+            "fused_score": 1.0,
+            "freshness": r.get("freshness"),
+            "provenance": "exact",
+        })
+    candidates.extend(scored[:limit])
+    result["candidates"] = candidates
+    return result
+
+
 async def search_all(
     db: Any,
     project_id: str,

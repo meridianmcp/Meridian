@@ -5749,6 +5749,53 @@ def _finalize_capability_status(
         raise HandoffEvidenceRequired(dict(capability_status), errors)
 
 
+# ---------------------------------------------------------------------------
+# 2204ce80 — related planning records. A thin, best-effort wrapper around
+# meridian.db.hybrid_candidate_retrieval (the shared exact-filter-first
+# lexical-discovery + optional bounded local-semantic-rerank path) so a
+# handoff caller can ask "what else in this project's notes/decisions/
+# sprint items relates to X" using the SAME retrieval contract search_all
+# uses, scoped to this handoff's own effective sprint version. Purely
+# additive: generate_handoff only calls this when a caller explicitly opts
+# in via ``related_records_query`` (see its docstring) — every pre-existing
+# call site is completely unaffected.
+# ---------------------------------------------------------------------------
+
+
+async def _gather_related_planning_records(
+    db: aiosqlite.Connection,
+    project_id: str,
+    query: str,
+    *,
+    version: str | None,
+    limit: int = 8,
+) -> dict[str, Any]:
+    """Best-effort "related planning records" lookup for a handoff.
+
+    Delegates entirely to :func:`meridian.db.hybrid_candidate_retrieval`,
+    scoped to this handoff's own ``version`` filter (an exact match, applied
+    before any lexical/semantic step — sprint_item rows outside the handoff's
+    own version scope are never considered). No status filter is imposed here
+    beyond that function's own per-source defaults (decisions stay
+    active-only; tasks/sprint items are unfiltered by status) so this
+    surfaces relevant context regardless of whether the matching work is
+    still open.
+
+    NEVER raises — a failure here must not break the mandatory handoff (same
+    guarantee ``_resolve_graph_searcher``/code-pointer enrichment give above).
+    Returns ``{"query": query, "candidates": []}`` on any error or when
+    ``query`` is blank.
+    """
+    if not query or not query.strip():
+        return {"query": query, "candidates": []}
+    try:
+        return await db_module.hybrid_candidate_retrieval(
+            db, project_id, query, version=version, limit=limit,
+        )
+    except Exception:  # noqa: BLE001 - best-effort, must never break generate_handoff
+        return {"query": query, "candidates": []}
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -5767,6 +5814,8 @@ async def generate_handoff(
     strict_evidence: bool = False,
     evidence_status: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
+    related_records_query: str | None = None,
+    related_records: dict[str, Any] | None = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -5860,6 +5909,21 @@ async def generate_handoff(
     are computed exactly as before this parameter existed; only the new,
     purely additive ``pointer_resolution_status`` field appears on every
     item either way.
+
+    ``related_records_query`` / ``related_records`` (2204ce80) — optional,
+    OFF by default, MIRRORS the ``evidence_status`` output-dict pattern
+    above. When ``related_records_query`` is a non-blank string AND
+    ``related_records`` is a dict (typically ``{}``), this call populates
+    ``related_records`` in place with the shared hybrid candidate-retrieval
+    result (:func:`meridian.db.hybrid_candidate_retrieval` — exact
+    project/version filters first, then lexical FTS/pg_trgm discovery, then
+    an OPTIONAL bounded local Model2Vec rerank; no paid LLM call) for
+    ``related_records_query``, scoped to this handoff's own
+    ``_effective_version``. This is a pure ADDITION run best-effort (never
+    raises — see ``_gather_related_planning_records``): a caller that leaves
+    either argument at its default (every pre-existing call site) sees ZERO
+    functional change to ``(path, content, amended)`` or to ``content``
+    itself — this never touches the rendered template.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -5872,6 +5936,14 @@ async def generate_handoff(
     _effective_version = version
     if _effective_version is None:
         _effective_version = await _resolve_session_sprint_version(db, session_id)
+    # 2204ce80 — optional, additive "related planning records" lookup. Runs
+    # only when the caller opted in on BOTH arguments; see the docstring above.
+    if related_records_query is not None and related_records is not None:
+        _related = await _gather_related_planning_records(
+            db, project_id, related_records_query, version=_effective_version,
+        )
+        related_records.clear()
+        related_records.update(_related)
     _project_completion_criteria_override: str | None = None
     try:
         _stored_criteria = await db_module.get_sprint_version_description(
