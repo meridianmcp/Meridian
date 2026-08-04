@@ -56,7 +56,13 @@ reference — those have their own existence semantics, checked at RESOLVE time
 by :func:`resolve_pointer`, not here), :func:`validate_pointer` verifies the
 path is actually present on disk (via an injectable ``path_exists`` checker,
 defaulting to :func:`os.path.exists`) and raises :class:`PointerValidationError`
-if it is not.
+if it is not. This same existence check — and its completion-time sibling in
+:func:`verify_target_readiness` — go through :func:`normalize_local_uri_candidates`
+(ba539706) first: ONE canonical normalization contract for ``file://`` URIs,
+Windows drive letters, ``/``-vs-``\\`` separators, UNC hosts, and WSL
+``/mnt/<drive>`` spellings, so a path recorded under one valid spelling isn't
+reported "missing" purely because a later check ran under a different one.
+See that function's docstring for the full contract.
 
 Selector variants — every selector carries an explicit ``"type"``; the field
 below is the type-specific key it also needs (443d9453):
@@ -98,7 +104,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Awaitable, Callable
+from urllib.parse import unquote, urlsplit
 
 _log = logging.getLogger(__name__)
 
@@ -139,12 +147,166 @@ def _looks_like_local_path(uri: str) -> bool:
     The ``target_kind='existing'`` filesystem check only makes sense for local
     paths; other uri schemes address things that don't live on this machine's
     disk, or that are already verified by their own resolver.
+
+    ``file://`` is the one exception to the generic ``"://" -> not local``
+    rule below (ba539706): a ``file://`` URI IS a local filesystem reference,
+    just spelled as a URI — treating it as non-local would silently SKIP the
+    existence check entirely (see :func:`verify_target_readiness`'s
+    ``"skipped"`` status) instead of actually verifying it via
+    :func:`normalize_local_uri_candidates`.
     """
     if not uri:
         return False
+    if uri.lower().startswith("file://"):
+        return True
     if "://" in uri:
         return False
     return not uri.startswith(_NON_LOCAL_URI_PREFIXES)
+
+
+# ---------------------------------------------------------------------------
+# ba539706 — ONE canonical URI/path normalization contract, shared by the
+# write-time ``target_kind='existing'`` check (:func:`_validate_target`) and
+# the completion-time fail-closed readiness gate
+# (:func:`verify_target_readiness`), so the two can never independently
+# drift on what counts as "the same local file".
+#
+# Bug this fixes: a pointer's ``uri`` can be recorded in one path spelling
+# (e.g. by a tunnel-connected agent running under WSL, or as a ``file://``
+# URI, or with forward slashes) and later checked for existence by a
+# DIFFERENT process on a DIFFERENT OS/shell — a plain ``os.path.exists(uri)``
+# on the literal stored string then reports "missing" even though the SAME
+# file is right there under a different valid spelling, and even though
+# meridian-docs (which resolves paths more permissively before opening them)
+# can open it fine. This is purely about WHICH SPELLING of an already-local
+# uri is accepted; it never widens WHAT counts as present, and non-local
+# uris (http(s)://, zotero:, doc:, finding:, mailto:) are never touched —
+# fail-closed for genuinely unavailable remote targets is unchanged.
+# ---------------------------------------------------------------------------
+
+_WINDOWS_DRIVE_RE = re.compile(r"^([A-Za-z]):[\\/](.*)$")
+_WSL_MOUNT_RE = re.compile(r"^/mnt/([A-Za-z])(?:/(.*))?$")
+
+
+def _strip_file_uri(uri: str) -> "str | None":
+    """Convert a ``file://`` URI to a bare local filesystem path spelling.
+
+    Returns ``None`` when *uri* is not a ``file://`` URI (case-insensitive
+    scheme match). Handles the three shapes a ``file://`` uri can take:
+
+    * POSIX:    ``file:///home/alice/doc.docx``     -> ``/home/alice/doc.docx``
+    * Windows:  ``file:///C:/Users/alice/doc.docx``  -> ``C:/Users/alice/doc.docx``
+      (the leading ``/`` before a drive letter is a URI-path artifact, not
+      part of the Windows path — stripped here)
+    * UNC host: ``file://server/share/doc.docx``    -> ``\\\\server\\share\\doc.docx``
+      (a non-empty, non-``localhost`` netloc names a UNC host/share per the
+      ``file://host/path`` form of the URI)
+
+    Percent-encoded characters (``%20`` etc.) are decoded. Never raises.
+    """
+    if not uri or not uri.lower().startswith("file://"):
+        return None
+    try:
+        parsed = urlsplit(uri)
+    except ValueError:
+        return None
+    path = unquote(parsed.path)
+    netloc = parsed.netloc
+    if netloc and netloc.lower() != "localhost":
+        return f"\\\\{netloc}{path.replace('/', chr(92))}"
+    if len(path) >= 3 and path[0] == "/" and path[2] == ":":
+        path = path[1:]
+    return path or "/"
+
+
+def _windows_path_to_wsl(path: str) -> "str | None":
+    """``C:\\Users\\alice`` / ``C:/Users/alice`` -> ``/mnt/c/Users/alice``
+    (the WSL spelling of a Windows drive). ``None`` when *path* doesn't start
+    with a drive letter."""
+    m = _WINDOWS_DRIVE_RE.match(path)
+    if not m:
+        return None
+    drive = m.group(1).lower()
+    rest = m.group(2).replace("\\", "/")
+    return f"/mnt/{drive}/{rest}" if rest else f"/mnt/{drive}"
+
+
+def _wsl_path_to_windows(path: str) -> "str | None":
+    """``/mnt/c/Users/alice`` -> ``C:\\Users\\alice`` (the inverse of
+    :func:`_windows_path_to_wsl`). ``None`` when *path* isn't a WSL
+    ``/mnt/<drive>`` mount spelling."""
+    m = _WSL_MOUNT_RE.match(path)
+    if not m:
+        return None
+    drive = m.group(1).upper()
+    rest = (m.group(2) or "").replace("/", "\\")
+    return f"{drive}:\\{rest}" if rest else f"{drive}:\\"
+
+
+def normalize_local_uri_candidates(uri: str) -> list[str]:
+    """Return ordered, deduplicated candidate local-filesystem path spellings
+    for *uri* — the canonical normalization contract described above.
+
+    Pure string transforms only — no filesystem I/O, never raises. Tries, in
+    order: the uri as given; its ``file://``-stripped form (if any); that
+    same path with separators normalized both ways (``/`` <-> ``\\``); and,
+    for each of those, the Windows-drive <-> WSL ``/mnt/<drive>`` conversion
+    in whichever direction applies. A relative path (no drive letter, no
+    ``/mnt/`` prefix) or a uri that matches none of these shapes degrades to
+    just ``[uri]`` — no normalization is invented for it, matching prior
+    behavior exactly.
+    """
+    if not uri:
+        return []
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(cand: "str | None") -> None:
+        if cand and cand not in seen:
+            seen.add(cand)
+            candidates.append(cand)
+
+    raw = uri.strip()
+    _add(raw)
+
+    file_path = _strip_file_uri(raw)
+    _add(file_path)
+    base = file_path if file_path is not None else raw
+
+    _add(base)
+    _add(base.replace("/", "\\"))
+    _add(base.replace("\\", "/"))
+
+    for spelling in (base, base.replace("/", "\\"), base.replace("\\", "/")):
+        _add(_windows_path_to_wsl(spelling))
+        _add(_wsl_path_to_windows(spelling))
+
+    return candidates
+
+
+def _resolve_local_existence(
+    uri: str, exists_checker: Callable[[str], bool]
+) -> "tuple[bool, str]":
+    """Try *uri* and its normalized candidate spellings (see
+    :func:`normalize_local_uri_candidates`) against *exists_checker*, in
+    order; return ``(found, path_used)``.
+
+    ``path_used`` is *uri* itself when nothing matched — a caller reporting
+    "missing" reports it against the ORIGINAL uri, never a guessed variant.
+    Fail-closed: this only widens which SPELLING of *uri* is accepted, never
+    what counts as present — a genuinely absent file still fails on every
+    candidate. Never raises: a checker that raises ``OSError`` on one
+    candidate (e.g. an unrepresentable path on this OS) is treated as "not
+    found for that candidate" and the next one is tried.
+    """
+    for candidate in normalize_local_uri_candidates(uri):
+        try:
+            if exists_checker(candidate):
+                return True, candidate
+        except OSError:
+            continue
+    return False, uri
+
 
 # Integer fields an LSP Range carries. start_line/end_line are required; the char
 # offsets are optional (a whole-line span is valid) but must be ints when present.
@@ -330,10 +492,10 @@ def _validate_target(
 
     if kind_explicit and kind == "existing" and _looks_like_local_path(uri):
         checker = path_exists or os.path.exists
-        try:
-            exists = bool(checker(uri))
-        except OSError:
-            exists = False
+        # ba539706 — try uri under every normalized candidate spelling
+        # (file:// stripped, separators flipped, Windows-drive <-> WSL
+        # /mnt/<drive>) before concluding the target is genuinely missing.
+        exists, _matched_path = _resolve_local_existence(uri, checker)
         if not exists:
             raise PointerValidationError(
                 f"target_kind='existing' but no file exists at uri {uri!r} "
@@ -1574,10 +1736,14 @@ async def verify_target_readiness(
 
     exists_checker = path_exists or os.path.exists
     dir_checker = is_dir or os.path.isdir
-    try:
-        exists = bool(exists_checker(uri))
-    except OSError:
-        exists = False
+    # ba539706 — try uri under every normalized candidate spelling (file://
+    # stripped, separators flipped, Windows-drive <-> WSL /mnt/<drive>)
+    # before concluding "missing". matched_path is the spelling that
+    # actually resolved (== uri when nothing needed normalizing, or when
+    # nothing matched at all); it's what subsequent is_dir/figure_resolver/
+    # provenance_getter calls use, while `base["uri"]` keeps reporting the
+    # ORIGINAL stored uri.
+    exists, matched_path = _resolve_local_existence(uri, exists_checker)
 
     if kind == "planned_new":
         if not exists:
@@ -1590,7 +1756,7 @@ async def verify_target_readiness(
                 ),
             }
         try:
-            is_directory = bool(dir_checker(uri))
+            is_directory = bool(dir_checker(matched_path))
         except OSError:
             is_directory = False
         if is_directory:
@@ -1607,7 +1773,7 @@ async def verify_target_readiness(
                 ),
             }
         try:
-            record = await provenance_getter(outputs_dir or "", uri)
+            record = await provenance_getter(outputs_dir or "", matched_path)
         except Exception as exc:  # noqa: BLE001 — degrade, never fake success
             _log.debug(
                 "verify_target_readiness: provenance_getter failed for %r",
@@ -1631,7 +1797,7 @@ async def verify_target_readiness(
         return {**base, "ready": False, "status": "missing",
                 "reason": f"no file exists at {uri!r}"}
     try:
-        is_directory = bool(dir_checker(uri))
+        is_directory = bool(dir_checker(matched_path))
     except OSError:
         is_directory = False
     if is_directory:
@@ -1647,7 +1813,7 @@ async def verify_target_readiness(
             ),
         }
     try:
-        resolved = await figure_resolver(outputs_dir or "", uri)
+        resolved = await figure_resolver(outputs_dir or "", matched_path)
     except Exception as exc:  # noqa: BLE001 — degrade, never fake success
         _log.debug(
             "verify_target_readiness: figure_resolver failed for %r",
