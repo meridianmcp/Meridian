@@ -58,6 +58,45 @@ def resolve_worktree_disk_path(repo_root: Path, wt_path: str) -> Path:
     return (repo_root / p).resolve()
 
 
+def looks_like_worktree_path(repo_root: Path, abs_path: Path) -> bool:
+    """True iff *abs_path* matches this codebase's OWN documented worktree
+    placement convention — the one ``claim_sprint_item`` actually uses (see
+    this module's docstring): either nested under ``repo_root/.claude/
+    worktrees/`` or a sibling of *repo_root* named ``{repo_root.name}-
+    worktree-...``. Never true for *repo_root* itself, and never true for an
+    arbitrary path elsewhere in (or outside) the repo — in particular never
+    true for a real source subdirectory like ``repo_root/meridian``, which
+    matches neither shape.
+
+    Deliberately NOT a ``git worktree list`` membership check: a worktree
+    directory that exists on disk but was never fully registered with git
+    (interrupted `git worktree add`, or hand-created scaffolding) still
+    needs to be reclaimable via the rmtree fallback below — see
+    ``test_remove_worktree_on_disk_falls_back_to_rmtree``. Path SHAPE, not
+    git's own bookkeeping, is what actually distinguishes "somewhere a
+    worktree is allowed to live" from "the repo's own source tree" — the
+    gap that let a test-registered ``path: "meridian"`` row delete this
+    repo's own source package (2026-08-04 incident; see
+    tests/test_a03c0eeb_worktree_disk_cleanup.py's regression coverage for
+    this function).
+    """
+    try:
+        repo_root_resolved = repo_root.resolve()
+    except OSError:
+        return False
+    if abs_path == repo_root_resolved:
+        return False
+    claude_worktrees = repo_root_resolved / ".claude" / "worktrees"
+    try:
+        abs_path.relative_to(claude_worktrees)
+        return True
+    except ValueError:
+        pass
+    if abs_path.parent == repo_root_resolved.parent:
+        return abs_path.name.startswith(f"{repo_root_resolved.name}-worktree-")
+    return False
+
+
 def remove_worktree_on_disk(repo_root: Path, wt_path: str) -> dict[str, Any]:
     """Best-effort REAL disk removal of a git worktree. Never raises.
 
@@ -66,6 +105,12 @@ def remove_worktree_on_disk(repo_root: Path, wt_path: str) -> dict[str, Any]:
     gone (nothing left to clean up on disk, regardless of who removed it —
     the executor may genuinely have run ``git worktree remove`` itself
     already, which is fine).
+
+    Refuses (``attempted=False``) before touching disk at all when
+    *abs_path* does not match this codebase's own worktree placement
+    convention (see :func:`looks_like_worktree_path`) — checked BEFORE the
+    ``git worktree remove`` attempt below, not just as a fallback gate, so
+    a path outside that convention can never reach either removal strategy.
     """
     try:
         abs_path = resolve_worktree_disk_path(repo_root, wt_path)
@@ -78,6 +123,17 @@ def remove_worktree_on_disk(repo_root: Path, wt_path: str) -> dict[str, Any]:
 
     if not abs_path.exists():
         return {"attempted": False, "removed": True, "detail": "already absent on disk"}
+
+    if not looks_like_worktree_path(repo_root, abs_path):
+        logger.warning(
+            "worktree_cleanup: refusing disk removal for %s — does not match "
+            "the worktree placement convention under %s", abs_path, repo_root,
+        )
+        return {
+            "attempted": False,
+            "removed": False,
+            "detail": "NOT_A_WORKTREE_PATH",
+        }
 
     git_error = ""
     removed_by_git = False

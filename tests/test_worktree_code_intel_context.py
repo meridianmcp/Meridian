@@ -401,7 +401,26 @@ def test_dispatch_set_active_repo_legacy_repo_path_error_unchanged():
 # ---------------------------------------------------------------------------
 
 
-def test_delete_worktree_clears_stale_active_repo_cache(client):
+def test_delete_worktree_clears_stale_active_repo_cache(client, monkeypatch, tmp_path):
+    # 2026-08-04 incident: this test previously registered path="meridian" —
+    # a bare source-directory name, not a real worktree path — and hit the
+    # REAL DELETE route with nothing mocked, which resolved that string
+    # against the actual repo root and rmtree'd this repo's own meridian/
+    # package. Mirrors test_a03c0eeb_worktree_disk_cleanup.py's established
+    # safe pattern: redirect _REPO_ROOT to a disposable tmp_path AND mock
+    # the destructive call itself, so this test can never touch real disk
+    # even if a future change weakens worktree_cleanup's own path guard.
+    import meridian.server as srv
+    import meridian.worktree_cleanup as wc_module
+
+    fake_repo_root = tmp_path / "repo"
+    fake_repo_root.mkdir()
+    monkeypatch.setattr(srv, "_REPO_ROOT", fake_repo_root)
+    monkeypatch.setattr(
+        wc_module, "remove_worktree_on_disk",
+        lambda repo_root, wt_path: {"attempted": True, "removed": True, "detail": "faked"},
+    )
+
     proj = client.post("/projects", json={"name": "wcic-http-cleanup"}).json()
     pid = proj["id"]
     sess = client.post(
@@ -412,14 +431,14 @@ def test_delete_worktree_clears_stale_active_repo_cache(client):
     r = client.post(f"/projects/{pid}/worktrees", json={
         "session_id": sid,
         "branch": "worktree/http1",
-        "path": "meridian",
+        "path": ".claude/worktrees/http1",
     })
     assert r.status_code == 201
     wt = r.json()
 
     # Simulate some tenant's tunnel having this worktree's path cached as its
     # active repo (as activate_worktree_code_intel_context would leave it).
-    tn._tenant_active_repo["http-tenant"] = "meridian"
+    tn._tenant_active_repo["http-tenant"] = ".claude/worktrees/http1"
     try:
         r2 = client.delete(f"/projects/{pid}/worktrees/{wt['id']}")
         assert r2.status_code == 204
@@ -428,7 +447,18 @@ def test_delete_worktree_clears_stale_active_repo_cache(client):
         tn._tenant_active_repo.pop("http-tenant", None)
 
 
-def test_delete_worktree_cache_cleanup_does_not_affect_unrelated_tenant(client):
+def test_delete_worktree_cache_cleanup_does_not_affect_unrelated_tenant(client, monkeypatch, tmp_path):
+    import meridian.server as srv
+    import meridian.worktree_cleanup as wc_module
+
+    fake_repo_root = tmp_path / "repo"
+    fake_repo_root.mkdir()
+    monkeypatch.setattr(srv, "_REPO_ROOT", fake_repo_root)
+    monkeypatch.setattr(
+        wc_module, "remove_worktree_on_disk",
+        lambda repo_root, wt_path: {"attempted": True, "removed": True, "detail": "faked"},
+    )
+
     proj = client.post("/projects", json={"name": "wcic-http-cleanup-2"}).json()
     pid = proj["id"]
     sess = client.post(
@@ -439,7 +469,7 @@ def test_delete_worktree_cache_cleanup_does_not_affect_unrelated_tenant(client):
     r = client.post(f"/projects/{pid}/worktrees", json={
         "session_id": sid,
         "branch": "worktree/http2",
-        "path": "meridian",
+        "path": ".claude/worktrees/http2",
     })
     assert r.status_code == 201
     wt = r.json()
