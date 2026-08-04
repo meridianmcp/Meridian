@@ -528,6 +528,30 @@ async def test_get_parallelizable_groups_handler_direct(db, project, sprint_item
     assert "groups" in result
 
 
+@pytest.mark.asyncio
+async def test_get_parallelizable_groups_dispatch_surfaces_parallelism_fields(
+    db, project, sprint_item
+):
+    """99c0c1be — the dispatch-table path must pass through the deterministic
+    parallelism diagnostics (requested/effective/host_limit/configured_target/
+    resource_safe_capacity/limiting_reason), not just groups/blocked/running."""
+    pid = project["id"]
+    result = await mh._handle_sprint_tools(
+        "get_parallelizable_groups",
+        {"project_id": pid},
+        db, _DATA_DIR, None, None
+    )
+    for key in (
+        "requested_parallelism", "effective_parallelism", "host_limit",
+        "configured_target", "resource_safe_capacity", "limiting_reason",
+    ):
+        assert key in result, f"missing {key} in get_parallelizable_groups result"
+    # No executor_config persisted for this project -> the shared default.
+    from meridian import executor_config as ec_mod
+    assert result["configured_target"] == ec_mod.DEFAULT_PARALLELISM_TARGET
+    assert result["host_limit"] is None  # never invented
+
+
 # ---------------------------------------------------------------------------
 # assign_sprint_waves
 # ---------------------------------------------------------------------------

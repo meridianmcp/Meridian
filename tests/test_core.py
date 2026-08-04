@@ -14136,6 +14136,53 @@ def test_mcp_set_executor_config_merges_repo_paths(client):
     assert cfg2["test_cmd"] == "pixi run test"
 
 
+def test_mcp_set_executor_config_parallelism_target_reflected_in_parallelizable_groups(client):
+    """99c0c1be — an executor_config.parallelism_target override set via
+    set_executor_config is reflected in get_parallelizable_groups' effective
+    parallelism, without any per-call override. Covers the target-16
+    scenario and the clamp-at-read-time fail-safe convention."""
+    import json as _json
+    pid = client.post("/projects", json={"name": "mcp-parallelism-target"}).json()["id"]
+
+    # 20 disjoint sprint items so resource_safe_capacity never binds here.
+    # Titles use force=true — "Item N" vs "Item N+1" is a 2-word title whose
+    # word-set overlap ({item} / min 2 = 0.5) sits just under add_sprint_item's
+    # 60% near-duplicate threshold, but force=true keeps this test independent
+    # of that unrelated guard's exact tuning.
+    for i in range(20):
+        _mcp_call(client, "add_sprint_item", {
+            "project_id": pid, "version": "v1", "title": f"Item {i}",
+            "touches_resources": [f"file:par_r{i}.py"], "force": True,
+        })
+
+    def _grp(resp):
+        assert resp.get("result") is not None, resp
+        return _json.loads(resp["result"]["content"][0]["text"])
+
+    baseline = _grp(_mcp_call(client, "get_parallelizable_groups", {"project_id": pid}))
+    assert baseline["configured_target"] == 4          # unconfigured default
+    assert baseline["effective_parallelism"] == 4
+    assert baseline["host_limit"] is None               # never invented
+
+    _mcp_result(_mcp_call(client, "set_executor_config", {
+        "project_id": pid, "parallelism_target": 16,
+    }))
+    raised = _grp(_mcp_call(client, "get_parallelizable_groups", {"project_id": pid}))
+    assert raised["configured_target"] == 16
+    assert raised["effective_parallelism"] == 16
+    assert raised["limiting_reason"] == "configured_target"
+
+    # An out-of-range override is clamped at READ time (never persisted
+    # verbatim into a live effective_parallelism) -- same fail-safe
+    # convention as max_planning_turns.
+    _mcp_result(_mcp_call(client, "set_executor_config", {
+        "project_id": pid, "parallelism_target": 999,
+    }))
+    clamped = _grp(_mcp_call(client, "get_parallelizable_groups", {"project_id": pid}))
+    assert clamped["configured_target"] == 16
+    assert clamped["effective_parallelism"] == 16
+
+
 @pytest.mark.asyncio
 async def test_rollup_parent_all_done(db):
     """Completing all children auto-completes the parent."""

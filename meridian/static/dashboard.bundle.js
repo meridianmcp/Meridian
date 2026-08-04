@@ -2369,6 +2369,8 @@
     return `<input id="exec-${field}-${projectId}" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" value="${esc(String(value))}" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:3px 6px;margin-top:4px;display:block">`;
   }
   window._execTurnsNumberInputHtml = _execTurnsNumberInputHtml;
+  var DEFAULT_PARALLELISM_TARGET = 4;
+  var PARALLELISM_TARGET_CEILING = 16;
   function claudeRcWatcherBlurb() {
     return "For <code>claude --rc</code> (headless) mode, where SessionStart hooks don't fire \u2014 installs a background watcher that fires the hook per session.";
   }
@@ -4121,6 +4123,16 @@ project_id = "${displayPid}"`;
 
     <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
 
+      Parallelism target: <span id="exec-parallelism_target-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.parallelism_target || DEFAULT_PARALLELISM_TARGET))}</span> concurrent workers <span style="font-size:9px;color:var(--muted)">(1\u2013${PARALLELISM_TARGET_CEILING})</span>
+
+      ${_execTurnsNumberInputHtml("parallelism_target", projectId, execCfg.parallelism_target || DEFAULT_PARALLELISM_TARGET, 1, PARALLELISM_TARGET_CEILING, 1)}
+
+      <span style="font-size:9px;color:var(--muted)">How many sprint items the autonomous dispatcher may fan out to at once. The ACTUAL effective parallelism is always min(this target, resource-safe capacity, and any host/client-reported concurrency limit) \u2014 raising this never overrides a lower limit the host itself enforces.</span>
+
+    </label>
+
+    <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
+
       Auto-continue (<code>/loop</code>)
 
       <select id="exec-loop_enabled-${projectId}" style="width:100%;max-width:320px;margin-top:4px;display:block;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
@@ -4182,6 +4194,14 @@ project_id = "${displayPid}"`;
           mtSlider.addEventListener("input", () => {
             mtVal.textContent = mtSlider.value;
             _renderMtWarn(mtSlider.value);
+          });
+        }
+        const ptSlider = document.getElementById(`exec-parallelism_target-${projectId}`);
+        const ptVal = document.getElementById(`exec-parallelism_target-val-${projectId}`);
+        if (ptSlider && ptVal) {
+          ptVal.textContent = ptSlider.value;
+          ptSlider.addEventListener("input", () => {
+            ptVal.textContent = ptSlider.value;
           });
         }
         let _execRepoPaths = Array.isArray(execCfg.repo_paths) ? [...execCfg.repo_paths] : [];
@@ -4333,6 +4353,8 @@ project_id = "${displayPid}"`;
           if (!isNaN(ctxRaw)) cfg.context_threshold = Math.min(200, Math.max(10, ctxRaw));
           const mtRaw = mtSlider ? parseInt(mtSlider.value || "", 10) : NaN;
           if (!isNaN(mtRaw)) cfg.max_turns = Math.min(500, Math.max(40, mtRaw));
+          const ptRaw = ptSlider ? parseInt(ptSlider.value || "", 10) : NaN;
+          if (!isNaN(ptRaw)) cfg.parallelism_target = Math.min(PARALLELISM_TARGET_CEILING, Math.max(1, ptRaw));
           const loopSel = document.getElementById(`exec-loop_enabled-${projectId}`);
           if (loopSel) cfg.loop_enabled = loopSel.value === "true" ? true : loopSel.value === "false" ? false : "workspace";
           const enrichEl = document.getElementById(`exec-enrich_prospect-${projectId}`);
@@ -6109,7 +6131,7 @@ project_id = "${displayPid}"`;
     if (!cmd) return;
     const newer = btn.getAttribute ? btn.getAttribute("data-newer") || "" : "";
     if (!newer) return;
-    cmd.value = newer;
+    cmd.value = "";
     cmd.dispatchEvent(new Event("input", { bubbles: true }));
   }
   window._applyStaleOverrideDefault = _applyStaleOverrideDefault;
@@ -7764,7 +7786,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // ../../../node_modules/preact/dist/preact.module.js
+  // node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -8023,7 +8045,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // ../../../node_modules/preact/hooks/dist/hooks.module.js
+  // node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -8164,7 +8186,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // ../../../node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -9017,7 +9039,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // ../../../node_modules/zustand/esm/vanilla.mjs
+  // node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();

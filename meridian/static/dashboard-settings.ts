@@ -34,6 +34,17 @@ export function _execTurnsNumberInputHtml(
   return `<input id="exec-${field}-${projectId}" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" value="${esc(String(value))}" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:3px 6px;margin-top:4px;display:block">`;
 }
 window._execTurnsNumberInputHtml = _execTurnsNumberInputHtml;
+
+// 99c0c1be — configured PARALLELISM target for the autonomous dispatcher.
+// Mirrors meridian/executor_config.py's DEFAULT_PARALLELISM_TARGET (4) and
+// PARALLELISM_TARGET_CEILING (16) — kept as plain local constants here
+// (rather than a shared window global like DEFAULT_MAX_TURNS) since this is
+// the only place in the dashboard that renders this control. The backend is
+// the source of truth for clamping (executor_config.normalize_parallelism_target);
+// these mirror it so the input's bounds match what the server will actually
+// honor, but the server never trusts the client-side clamp alone.
+const DEFAULT_PARALLELISM_TARGET = 4;
+const PARALLELISM_TARGET_CEILING = 16;
 // ca8c0d56 — condensed one-line blurbs for the Claude Code (rc-watcher) and
 // Codex CLI setup sections. These replaced multi-sentence prose paragraphs so the
 // sections lead with the copy-paste config, not a wall of text. Exported as pure
@@ -2413,6 +2424,16 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
     <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
 
+      Parallelism target: <span id="exec-parallelism_target-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.parallelism_target || DEFAULT_PARALLELISM_TARGET))}</span> concurrent workers <span style="font-size:9px;color:var(--muted)">(1–${PARALLELISM_TARGET_CEILING})</span>
+
+      ${_execTurnsNumberInputHtml('parallelism_target', projectId, execCfg.parallelism_target || DEFAULT_PARALLELISM_TARGET, 1, PARALLELISM_TARGET_CEILING, 1)}
+
+      <span style="font-size:9px;color:var(--muted)">How many sprint items the autonomous dispatcher may fan out to at once. The ACTUAL effective parallelism is always min(this target, resource-safe capacity, and any host/client-reported concurrency limit) — raising this never overrides a lower limit the host itself enforces.</span>
+
+    </label>
+
+    <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
+
       Auto-continue (<code>/loop</code>)
 
       <select id="exec-loop_enabled-${projectId}" style="width:100%;max-width:320px;margin-top:4px;display:block;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:10px;font-family:var(--font-mono);padding:3px 6px">
@@ -2494,6 +2515,15 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       mtVal.textContent = mtSlider.value;
       _renderMtWarn(mtSlider.value);
       mtSlider.addEventListener('input', () => { mtVal.textContent = mtSlider.value; _renderMtWarn(mtSlider.value); });
+    }
+
+    // 99c0c1be — parallelism_target (1-16) live value label, mirroring the
+    // context_threshold/max_turns number-input wiring above.
+    const ptSlider = document.getElementById(`exec-parallelism_target-${projectId}`);
+    const ptVal = document.getElementById(`exec-parallelism_target-val-${projectId}`);
+    if (ptSlider && ptVal) {
+      ptVal.textContent = ptSlider.value;
+      ptSlider.addEventListener('input', () => { ptVal.textContent = ptSlider.value; });
     }
 
     // Wire repo_paths delete/clear in Executor Config section
@@ -2646,6 +2676,10 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       const mtRaw = mtSlider ? parseInt(mtSlider.value || '', 10) : NaN;
 
       if (!isNaN(mtRaw)) cfg.max_turns = Math.min(500, Math.max(40, mtRaw));
+
+      const ptRaw = ptSlider ? parseInt(ptSlider.value || '', 10) : NaN;
+
+      if (!isNaN(ptRaw)) cfg.parallelism_target = Math.min(PARALLELISM_TARGET_CEILING, Math.max(1, ptRaw));
 
       const loopSel = document.getElementById(`exec-loop_enabled-${projectId}`) as HTMLSelectElement | null;
 

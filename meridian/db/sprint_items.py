@@ -29,9 +29,11 @@ from meridian.db import (  # noqa: PLC0415
     serialize_touches_resources,
     parse_touches_resources,
     _resource_sets_conflict,
+    get_executor_config,
 )
 from .. import tool_requirements as _tool_requirements  # 76dde31f (665 follow-up)
 from .. import artifact_declaration as _artifact_declaration  # 2f9cb288 (665 follow-up)
+from .. import executor_config as _executor_config  # 99c0c1be — parallelism diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -3809,6 +3811,10 @@ async def get_parallelizable_groups(
     db: aiosqlite.Connection,
     project_id: str,
     version: str | None = None,
+    *,
+    configured_target: int | None = None,
+    host_limit: int | None = None,
+    requested_parallelism: int | None = None,
 ) -> dict[str, Any]:
     """255096d9 — cluster pending sprint items that are safe to run in parallel.
 
@@ -3826,8 +3832,10 @@ async def get_parallelizable_groups(
          in sequence.
 
     Returns ``{"version", "groups": [[item, ...], ...], "group_count",
-    "eligible_count", "blocked": [...], "undeclared_count"}``. ``groups`` items
-    are full sprint-item dicts with a derived ``resources`` list attached.
+    "eligible_count", "blocked": [...], "undeclared_count", "requested_parallelism",
+    "effective_parallelism", "host_limit", "configured_target",
+    "resource_safe_capacity", "limiting_reason"}``. ``groups`` items are full
+    sprint-item dicts with a derived ``resources`` list attached.
 
     2282a636 — items with ``blocker_kind='manual'`` (blocked on a real-world
     action outside Meridian) are excluded here: they are not executor-claimable,
@@ -3838,6 +3846,22 @@ async def get_parallelizable_groups(
     ``include_manual_blocker``, not on ``milestone_type='human'`` or title prefix.
     e08fee30 — within the safe-parallel ordering, higher-priority eligible items
     are placed first so urgent work colors into the earliest groups.
+
+    99c0c1be — the return dict also carries deterministic PARALLELISM
+    diagnostics computed by :func:`meridian.executor_config.resolve_parallelism`
+    against the first (largest, resource-conflict-free) group:
+    ``requested_parallelism`` (defaults to the first group's size unless the
+    ``requested_parallelism`` kwarg is passed), ``configured_target`` (defaults
+    to this project's persisted ``executor_config.parallelism_target`` unless
+    the ``configured_target`` kwarg overrides it — so callers such as
+    ``handoff.py`` that invoke this function unmodified automatically pick up
+    a project's configured target), ``host_limit`` (``None`` unless the
+    caller explicitly passes one — an unknown host limit is NEVER invented
+    here, so wave planning never serializes disjoint, resource-safe work just
+    because an unrelated vendor UI cap is unreported), ``resource_safe_capacity``
+    (the first group's size), ``effective_parallelism`` and ``limiting_reason``.
+    This is pure diagnostics: it does not change which items land in which
+    ``groups`` — the coloring algorithm below is unchanged.
     """
     # include_manual_blocker=False: a manual-blocker item is not claimable work,
     # so it must not be offered as a parallelizable batch member.
@@ -3926,6 +3950,31 @@ async def get_parallelizable_groups(
     # Each undeclared item is its own sequential group (never co-scheduled).
     for it in undeclared_items:
         groups.append([it])
+
+    # 99c0c1be — deterministic parallelism diagnostics for the first (largest,
+    # resource-conflict-free) group. configured_target defaults to this
+    # project's persisted executor_config.parallelism_target (fetched here) so
+    # callers that invoke this function unmodified — e.g. handoff.py — pick up
+    # a project's configured target automatically. host_limit has NO such
+    # default: an unknown host limit must never be invented (see
+    # executor_config.resolve_parallelism), so it stays None unless the
+    # caller explicitly knows and passes one.
+    if configured_target is None:
+        try:
+            _exec_cfg = await get_executor_config(db, project_id)
+            configured_target = (_exec_cfg or {}).get("parallelism_target")
+        except Exception:  # noqa: BLE001 — diagnostics must never break grouping
+            configured_target = None
+    _first_group_size = len(groups[0]) if groups else 0
+    _requested = (
+        requested_parallelism if requested_parallelism is not None else _first_group_size
+    )
+    _parallelism = _executor_config.resolve_parallelism(
+        _requested,
+        configured_target=configured_target,
+        host_limit=host_limit,
+        resource_safe_capacity=_first_group_size,
+    )
     return {
         "version": version,
         "groups": groups,
@@ -3934,6 +3983,12 @@ async def get_parallelizable_groups(
         "undeclared_count": undeclared,
         "blocked": blocked,
         "running": running,  # df573218 — items currently in flight
+        "requested_parallelism": _parallelism["requested_parallelism"],
+        "effective_parallelism": _parallelism["effective_parallelism"],
+        "host_limit": _parallelism["host_limit"],
+        "configured_target": _parallelism["configured_target"],
+        "resource_safe_capacity": _parallelism["resource_safe_capacity"],
+        "limiting_reason": _parallelism["limiting_reason"],
     }
 
 
