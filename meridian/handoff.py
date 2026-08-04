@@ -1078,6 +1078,289 @@ async def load_handoff_correction(
     return {**row, "new_handoff_content": new_handoff_content}
 
 
+# ---------------------------------------------------------------------------
+# amend_handoff (63b602ff) — explicit, scoped handoff amendment.
+#
+# generate_handoff's own amend-vs-fresh detection (edd9c54b, further below in
+# this module) is IMPLICIT and coarse: it decides "amend the most recent row
+# in place" vs "insert a fresh one" purely from whether pending_goal was
+# popped. It has no notion of WHAT changed (which sprint items were added or
+# removed, which pointer moved, why) and it always targets "the most recent
+# handoffs row" rather than a caller-named source. That is the right
+# behavior for the common case (nothing structured has happened since the
+# last render — just re-render the same scope) but it cannot express a
+# targeted correction: "item X is done, drop it from scope; item Y's pointer
+# moved, repair it; this was blocked on a missing capability."
+#
+# amend_handoff is the explicit counterpart. Given a specific
+# source_handoff_id plus a typed patch (item ids to add/remove/replace,
+# pointer repairs, wave reassignments, a blocker classification, and a
+# free-text rationale), it:
+#   1. validates the source belongs to the caller's own project/session/
+#      version scope (get_handoff_for_scope + _resolve_session_sprint_version),
+#   2. records the patch as an immutable handoff_corrections row — reusing
+#      3af86d28's record_handoff_correction verbatim, no parallel storage,
+#   3. and, only when the patch is MATERIAL (see below), regenerates —
+#      reusing regenerate_handoff_correction verbatim, no parallel rendering
+#      or invalidation logic.
+#
+# Invalidation is conditional, not automatic: a patch that carries no actual
+# change (no item ids, no pointer repairs, no wave changes, and
+# force_regenerate not set) records a pure evidence/audit row and leaves the
+# source handoff live and executable. Only a MATERIAL patch invalidates the
+# old executor payload and produces a new revision — matching the
+# sprint-item spec: "invalidates old executor payload when scope/token/
+# pointers/blockers changed" (an empty patch changes nothing, so nothing is
+# invalidated).
+#
+# Compatibility: the automatic amend-vs-fresh path below (edd9c54b) is left
+# UNCHANGED and continues to serve the "re-render with no structured intent"
+# case. It is deliberately NOT rerouted through record_handoff_correction /
+# regenerate_handoff_correction, because regenerate_handoff_correction itself
+# calls generate_handoff to produce the new body — routing generate_handoff's
+# OWN internal amend decision back through that same regeneration call would
+# recurse. Both paths converge on the same two tables (handoffs /
+# handoff_corrections) as their single source of truth, so a reader never
+# has two disjoint histories to reconcile, and the interaction between them
+# is already handled (regenerate_handoff_correction pops pending_goal before
+# calling generate_handoff specifically so the automatic path can never
+# silently amend the very source row a correction just invalidated — see the
+# comment in regenerate_handoff_correction above). A deeper unification
+# (auto-recording a lightweight correction on every automatic amend) is a
+# reasonable follow-up but is NOT implemented here — it would change the
+# well-tested edd9c54b behavior (tests/test_handoff_amend_vs_fresh.py) for no
+# functional gain in this pass. Likewise, wiring this function onto an MCP
+# tool / REST route is a documented follow-up — out of this sprint item's
+# declared file scope (meridian/handoff.py, meridian/db/__init__.py,
+# tests/test_handoff_amend_vs_fresh.py only).
+# ---------------------------------------------------------------------------
+
+
+class HandoffAmendError(HandoffCorrectionError):
+    """Raised by :func:`amend_handoff` for an invalid scoped-amendment
+    request: unknown source handoff, cross-project/cross-session/
+    cross-version mismatch, or a correction-service error surfaced while
+    recording/regenerating. Subclasses :class:`HandoffCorrectionError`
+    (itself a ``ValueError``) so existing ``except ValueError``/
+    ``except HandoffCorrectionError`` handlers keep working unchanged.
+    """
+
+
+def _normalize_replace_item_ids(
+    replace_item_ids: "dict[str, str] | list[dict[str, str]] | None",
+) -> list[dict[str, str]]:
+    """Normalize the typed patch's item-substitution field into a list of
+    ``{"old_id": ..., "new_id": ...}`` dicts. Accepts either a plain
+    ``{old_id: new_id}`` mapping (the common shape for a caller-built patch)
+    or an already-shaped list of dicts. Malformed entries are dropped rather
+    than raising — this is a convenience shape, not a validation gate; the
+    resulting ids are still run through the live-scope check in
+    :func:`amend_handoff` below."""
+    if not replace_item_ids:
+        return []
+    if isinstance(replace_item_ids, dict):
+        return [
+            {"old_id": old, "new_id": new}
+            for old, new in replace_item_ids.items() if old and new
+        ]
+    out: list[dict[str, str]] = []
+    for entry in replace_item_ids:
+        if isinstance(entry, dict) and entry.get("old_id") and entry.get("new_id"):
+            out.append({"old_id": entry["old_id"], "new_id": entry["new_id"]})
+    return out
+
+
+async def amend_handoff(
+    db: Any,
+    project_id: str,
+    source_handoff_id: str,
+    output_dir: str,
+    *,
+    session_id: "str | None" = None,
+    version: "str | None" = None,
+    add_item_ids: "list[str] | None" = None,
+    remove_item_ids: "list[str] | None" = None,
+    replace_item_ids: "dict[str, str] | list[dict[str, str]] | None" = None,
+    pointer_repairs: "list[dict[str, Any]] | None" = None,
+    removed_pointers: "list[Any] | None" = None,
+    wave_changes: "dict[str, Any] | None" = None,
+    blocker_classification: str = "scope_stale",
+    correction_rationale: "str | None" = None,
+    status: str = "draft",
+    force_regenerate: bool = False,
+    mode: str = "full",
+    idempotency_key: "str | None" = None,
+    **generate_handoff_kwargs: Any,
+) -> dict[str, Any]:
+    """Explicit, scoped handoff amendment (63b602ff).
+
+    The public counterpart to the automatic amend-vs-fresh detection in
+    :func:`generate_handoff` (see the module comment directly above): instead
+    of always targeting "the most recent handoffs row" via an implicit
+    pending_goal signal, this targets a caller-named ``source_handoff_id``
+    with a typed patch describing exactly what changed.
+
+    Validation (fail-closed — raises :class:`HandoffAmendError`, itself a
+    ``ValueError`` subclass):
+      - ``source_handoff_id`` must name a real ``handoffs`` row belonging to
+        ``project_id`` (:func:`meridian.db.get_handoff_for_scope`).
+      - When ``session_id`` is given and the source recorded one, they must
+        match — refuses a cross-session amendment.
+      - When ``version`` is given and ``session_id`` resolves to a
+        DIFFERENT ``sprint_version`` scope, they must agree.
+
+    Typed patch:
+      - ``add_item_ids`` / ``remove_item_ids`` / ``replace_item_ids`` —
+        sprint-item id changes to the handoff's scope. ``replace_item_ids``
+        accepts a ``{old_id: new_id}`` mapping or a pre-shaped list; each
+        substitution expands into the equivalent remove+add pair.
+      - ``pointer_repairs`` / ``removed_pointers`` — forwarded verbatim to
+        :func:`record_handoff_correction`'s ``added_pointers``/
+        ``removed_pointers`` (re-resolved live by
+        :func:`regenerate_handoff_correction` before being trusted).
+      - ``wave_changes`` — free-form wave/parallelism-bucket reassignment,
+        recorded on the correction's ``requested_scope`` for audit.
+        Matching every other field here, this is RECORDED, not applied — it
+        does not itself call ``assign_sprint_waves``; a receiving executor
+        (or a follow-up MCP tool, out of this item's declared file scope)
+        acts on it.
+      - ``blocker_classification`` / ``correction_rationale`` — forwarded to
+        :func:`record_handoff_correction` as the blocker classification and
+        ``investigation_evidence`` respectively.
+
+    Any ``add_item_ids``/``replace_item_ids`` new-ids are checked
+    (best-effort, via :func:`meridian.db.compute_scope_diff`) against the
+    LIVE non-done board for ``(project_id, version)``; ids that do not
+    resolve are surfaced back as ``invalid_add_item_ids`` in the result
+    rather than silently accepted or hard-failing the whole request — a
+    stricter per-id existence gate (e.g. rejecting the request outright) is
+    a documented follow-up, not implemented here.
+
+    Invalidation is conditional: a patch is "material" when it carries any
+    item/pointer/wave change, or when ``force_regenerate=True``. A material
+    patch is recorded (:func:`record_handoff_correction`) and immediately
+    regenerated (:func:`regenerate_handoff_correction`) — which invalidates
+    ``source_handoff_id`` (body untouched, marked non-executable) and mints
+    a fresh revision + token. A non-material patch (pure evidence/rationale
+    — e.g. ``status="blocked"`` with nothing yet to fix) is recorded only —
+    the source stays live and executable.
+
+    ``idempotency_key`` is forwarded to ``record_handoff_correction``
+    unchanged: a retried call with the same key returns the SAME correction
+    row rather than recording a duplicate, and if that prior call already
+    regenerated, the regeneration step below is naturally a no-op too
+    (``regenerate_handoff_correction`` is itself idempotent on
+    ``new_handoff_id``). Reusing an idempotency_key across two requests with
+    genuinely different patches is a caller error — the first request's
+    recorded row wins; use a fresh key per distinct request.
+
+    Returns a dict: ``correction`` (the handoff_corrections row, decoded),
+    ``amended`` (bool — whether a new revision was produced),
+    ``invalidated_source``, ``new_handoff_id``, ``new_handoff_path``,
+    ``new_handoff_content``, ``new_token``, ``invalid_add_item_ids``.
+    """
+    try:
+        await db_module.get_handoff_for_scope(
+            db, project_id, source_handoff_id, session_id=session_id,
+        )
+    except ValueError as exc:
+        raise HandoffAmendError(str(exc)) from exc
+
+    _resolved_version = version
+    if session_id:
+        _session_version = await _resolve_session_sprint_version(db, session_id)
+        if version and _session_version and version != _session_version:
+            raise HandoffAmendError(
+                f"requested version {version!r} does not match session "
+                f"{session_id!r}'s sprint_version scope {_session_version!r}"
+            )
+        _resolved_version = version or _session_version
+
+    replace_pairs = _normalize_replace_item_ids(replace_item_ids)
+    add_ids = sorted(
+        {i for i in (add_item_ids or []) if i}
+        | {p["new_id"] for p in replace_pairs}
+    )
+    remove_ids = sorted(
+        {i for i in (remove_item_ids or []) if i}
+        | {p["old_id"] for p in replace_pairs}
+    )
+
+    invalid_add_item_ids: list[str] = []
+    _scope_check: dict[str, Any] | None = None
+    if add_ids:
+        try:
+            _scope_check = await db_module.compute_scope_diff(
+                db, project_id, add_ids, version=_resolved_version,
+            )
+            invalid_add_item_ids = list(_scope_check.get("dropped_item_ids") or [])
+        except Exception:  # noqa: BLE001 — best-effort validation only
+            _scope_check = None
+
+    material = bool(
+        force_regenerate or add_ids or remove_ids or replace_pairs
+        or pointer_repairs or removed_pointers or wave_changes
+    )
+
+    requested_scope = {
+        "add_item_ids": add_ids,
+        "remove_item_ids": remove_ids,
+        "replace_item_ids": replace_pairs,
+        "wave_changes": wave_changes or {},
+        "live_scope_check": _scope_check,
+    }
+
+    try:
+        correction = await record_handoff_correction(
+            db, project_id,
+            source_handoff_id=source_handoff_id,
+            blocker_classification=blocker_classification,
+            session_id=session_id,
+            investigation_evidence=correction_rationale,
+            added_pointers=pointer_repairs,
+            removed_pointers=removed_pointers,
+            requested_scope=requested_scope,
+            version=_resolved_version,
+            idempotency_key=idempotency_key,
+            status=status,
+        )
+    except HandoffCorrectionError as exc:
+        raise HandoffAmendError(str(exc)) from exc
+
+    if not material:
+        return {
+            "correction": correction,
+            "amended": False,
+            "invalidated_source": None,
+            "new_handoff_id": None,
+            "new_handoff_path": None,
+            "new_handoff_content": None,
+            "new_token": None,
+            "invalid_add_item_ids": invalid_add_item_ids,
+        }
+
+    try:
+        result = await regenerate_handoff_correction(
+            db, project_id, correction["id"], output_dir,
+            session_id=session_id, mode=mode,
+            **generate_handoff_kwargs,
+        )
+    except HandoffCorrectionError as exc:
+        raise HandoffAmendError(str(exc)) from exc
+
+    return {
+        "correction": result["correction"],
+        "amended": True,
+        "invalidated_source": result["invalidated_source"],
+        "new_handoff_id": result["new_handoff_id"],
+        "new_handoff_path": result["new_handoff_path"],
+        "new_handoff_content": result["new_handoff_content"],
+        "new_token": result["new_token"],
+        "pointer_repair_report": result.get("pointer_repair_report"),
+        "invalid_add_item_ids": invalid_add_item_ids,
+    }
+
+
 async def _mint_and_embed_goal_token(
     db: Any, project_id: str, quick_start_goal: str
 ) -> str:
@@ -7206,6 +7489,17 @@ async def generate_handoff(
     # inflating the handoffs table with redundant rows.
     # Detection: pending_goal is NULL after start_session pops it, so non-NULL here
     # unambiguously means the prior handoff was set but never picked up.
+    # 63b602ff — this is the COMPATIBILITY path: implicit, whole-body,
+    # "most recent row" amendment for the no-structured-intent case. A
+    # caller with an explicit, typed patch (add/remove/replace item ids,
+    # pointer repairs, wave changes, a blocker classification) should use
+    # amend_handoff() above instead, which targets a caller-named
+    # source_handoff_id through the same handoffs/handoff_corrections
+    # storage this path writes to — see the module comment above
+    # amend_handoff for why this block is not itself rerouted through that
+    # service (regenerate_handoff_correction calls generate_handoff, so
+    # generate_handoff routing its own amend decision back through
+    # regenerate_handoff_correction would recurse).
     _amended = False
     try:
         _prior_goal = await db_module.get_pending_goal(db, project_id)

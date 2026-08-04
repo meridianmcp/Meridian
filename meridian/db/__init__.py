@@ -10780,6 +10780,50 @@ async def get_latest_handoff(
     return rows[0] if rows else None
 
 
+async def get_handoff_for_scope(
+    db: aiosqlite.Connection,
+    project_id: str,
+    handoff_id: str,
+    *,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """63b602ff — fetch + validate a ``handoffs`` row for an explicit scoped
+    amendment (``meridian.handoff.amend_handoff``).
+
+    A pure ownership check, one level below the version-scope check (which
+    needs the ``sessions.sprint_version`` lookup already implemented in
+    ``meridian.handoff._resolve_session_sprint_version`` — kept there, not
+    duplicated here, since it is a handoff-orchestration concern, not a raw
+    DB-row concern):
+
+    - Raises ``ValueError`` when ``handoff_id`` does not name an existing
+      ``handoffs`` row.
+    - Raises ``ValueError`` when the row belongs to a different project —
+      a correction/amendment must never cross a project boundary.
+    - Raises ``ValueError`` when ``session_id`` is given, the row recorded
+      one, and they differ — refuses a cross-session amendment. A source
+      row with NO recorded session (a project-level render) is not scoped
+      to any one session, so it is never rejected on this check alone.
+
+    Returns the row (same shape as :func:`get_handoff`) on success. Plain
+    ``ValueError`` (not a handoff.py-specific exception type) so this stays
+    import-cycle-free — ``meridian.handoff`` already imports this module and
+    wraps the message in its own error class where a distinct type matters.
+    """
+    source = await get_handoff(db, handoff_id)
+    if source is None:
+        raise ValueError(f"handoff {handoff_id!r} not found")
+    if source.get("project_id") != project_id:
+        raise ValueError(f"handoff {handoff_id!r} belongs to a different project")
+    if session_id and source.get("session_id") and source["session_id"] != session_id:
+        raise ValueError(
+            f"handoff {handoff_id!r} was recorded for session "
+            f"{source['session_id']!r}, not {session_id!r} -- refusing a "
+            "cross-session amendment"
+        )
+    return source
+
+
 # ---------------------------------------------------------------------------
 # validate_assumption (8ec5493b) — one-call assumption validation: stamp the
 # decision's assumption_status, save a code-anchored finding note, and fire a
