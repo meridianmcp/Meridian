@@ -1,0 +1,137 @@
+{
+  "sprint_item_id": "bed1e9e0-7b8a-488d-b616-efde63f64a3a",
+  "title": "QA GATE: render and verify DOCX structure, media ownership, captions, references, and provenance after Wave 2 repair",
+  "audit_timestamp_utc": "2026-08-04T07:46:24Z",
+  "outcome": "no_change_needed",
+  "overall_verdict": "PASS -- all six required checks pass against the current canonical document; two pre-existing informational findings noted but not gating (see informational_findings).",
+
+  "canonical_docx": {
+    "path": "C:\\Users\\13144\\OneDrive\\Dissertation_Staging_REORGANIZED_2026-07-11.docx",
+    "located_via": "Same convention as prior sibling sessions this sprint (e.g. workspace/docx-structural-repair/duplicate_repair_manifest.json, sprint item e5bd2061): canonical_docx_path recorded in that manifest, independently re-confirmed still exists at that path.",
+    "sha256_at_this_audit": "05d38b34a043ff25ac80da143ad845a5d40e05a420f6b5f87d84b2984858fcc2",
+    "size_bytes": 9409353,
+    "zip_part_count": 68,
+    "media_parts_in_zip": 54,
+    "opened_read_only": true,
+    "modified_by_this_session": false,
+    "backup_created": false,
+    "cross_check_against_prior_manifests": {
+      "e5bd2061_recorded_sha256_before_and_after": "842e41cf0a92b2acf743568efdf8822e02579186b286eff48edcfea0c7e6064c",
+      "current_sha256": "05d38b34a043ff25ac80da143ad845a5d40e05a420f6b5f87d84b2984858fcc2",
+      "hashes_differ": true,
+      "interpretation": "Expected and consistent with the sprint's own premise: concurrent sibling sessions actively edited the document after e5bd2061's read-only audit ran (e5bd2061 itself made no changes -- outcome no_change_needed). Document grew from 478 to 518 top-level paragraphs (+40) between that audit and this one, confirming further edits landed in between, not document corruption."
+    }
+  },
+
+  "structure_index_rebuild": {
+    "method": "mcp__meridian-docs__ingest_local_document_structure against the live file (fresh re-index, not a cached read), cross-checked with a direct zipfile+ElementTree parse of word/document.xml for the ownership/orphan-level checks that meridian-docs' structure API does not expose.",
+    "index_db_path": "C:\\Users\\13144\\OneDrive\\.dissertation_staging_index.sqlite",
+    "result": {
+      "heading_count": 37,
+      "figure_count_via_SEQ_fields": 0,
+      "table_count": 12,
+      "source_sha256_reported_by_tool": "05d38b34a043ff25ac80da143ad845a5d40e05a420f6b5f87d84b2984858fcc2"
+    },
+    "note": "figure_count=0 is expected, not a defect: this document uses plaintext 'Figure X.Y:' / 'Table X.Y.' captions throughout, not Word SEQ field codes -- same finding as every prior caption-audit manifest this sprint (e.g. 91f58798, 17c3e424, 4cdc9d29).",
+    "indexing_convention_note": "Two different, non-interchangeable paragraph-index schemes appear in this manifest and across sibling manifests: (1) 'top_level_index' as used here and by e5bd2061 counts ONLY direct-child <w:p> paragraphs (tables consume no slot); (2) mcp__meridian-docs__get_structure_elements/document_outline's 'index' field gives each <w:tbl> its own slot too, so its numbers run higher. Do not compare the two schemes' raw numbers directly -- w14:paraId (a stable per-paragraph GUID unaffected by either scheme or by later insertions elsewhere in the document) was used to cross-reference this audit's findings against e5bd2061's, below."
+  },
+
+  "checks": {
+    "1_zero_orphan_image_paragraphs": {
+      "pass": true,
+      "definition": "A paragraph containing an <a:blip r:embed> or <v:imagedata r:id> reference whose rId either (a) has no matching entry in word/_rels/document.xml.rels, or (b) resolves to a relationship whose target media part is missing from the zip.",
+      "method": "Full recursive walk of every <w:p> in word/document.xml (1513 paragraphs, including table cells), cross-referenced against all 54 image relationships and all 54 word/media/* parts actually present in the zip.",
+      "orphan_count": 0,
+      "dangling_relationship_targets": []
+    },
+    "2_zero_undeclared_duplicate_r_embed_ownership": {
+      "pass": true,
+      "definition": "Any image relationship id (rId) referenced by an <a:blip>/<v:imagedata> in more than one place anywhere in word/document.xml.",
+      "method": "Counted occurrences of every rId across all 1513 recursively-walked paragraphs (52 distinct rIds referenced, out of 54 declared image relationships).",
+      "duplicate_count": 0,
+      "cross_check": "Matches e5bd2061's independent finding on the prior document state ('rIds_referenced_more_than_once_anywhere_in_document: {}') -- zero duplicate ownership held then and still holds now, across the intervening ~40-paragraph edit."
+    },
+    "3_figure_5_21_exactly_one_intended_block": {
+      "pass": true,
+      "caption_occurrences_in_document": 1,
+      "caption_para_id": "2D7FCCD0",
+      "caption_text": "Figure 5.21: Paired advantage over DT for length-weighted width |bias| (no-PCA), companion to Figure 5.20 -- bars show baseline-minus-DT paired differences with bootstrap 95% CI whiskers, all lying entirely above zero, confirming DT's advantage is decisive against every baseline.",
+      "preceding_image_para_id": "73C3A969",
+      "preceding_image_embeds": ["rId31"],
+      "cross_check_against_e5bd2061": "IDENTICAL para_id (2D7FCCD0) for the caption and IDENTICAL para_id (73C3A969) + IDENTICAL single embed (rId31) for the preceding image paragraph, despite the caption's numeric top_level_index shifting 269->282 due to unrelated upstream insertions. This is strong corroborating evidence that this exact paragraph pair is untouched and e5bd2061's 'not present, no repair applied' finding still holds."
+    },
+    "4_figure_a_4_exactly_one_intended_block": {
+      "pass": true,
+      "caption_occurrences_in_document": 1,
+      "caption_para_id": "5865C744",
+      "caption_text": "Figure A.4: Combined Costmap for (a) DT,(b) Depth, (c) Trench + RGB, (d) Combined.",
+      "preceding_image_para_id": "7C41B5E7",
+      "preceding_image_embeds": ["rId36", "rId37", "rId38", "rId39"],
+      "cross_check_against_e5bd2061": "IDENTICAL para_id (5865C744) for the caption and IDENTICAL para_id (7C41B5E7) + IDENTICAL 4-image composite (rId36/37/38/39) for the preceding image paragraph, despite the caption's numeric top_level_index shifting 332->362. Same conclusion as Figure 5.21: unchanged, single intended block, no duplicate ownership."
+    },
+    "5_section_5_2_1_2_chart_captioned_or_dispositioned": {
+      "pass": true,
+      "section_bounds": "Located via live heading text match, not guessed: heading '[§5.2.1, covers §5.2.1.1 Length-weighted + §5.2.1.2 Per-image mean] 5.2.1. ...' through the next heading '[§5.2.2] 5.2.2. Stratified Crack Width Analysis'.",
+      "images_in_section_5_2_1": 7,
+      "images_captioned": 7,
+      "images_uncaptioned_and_undispositioned": 0,
+      "the_5_2_1_2_per_image_mean_charts": [
+        "Figure 5.5: Per-image-mean width MAE by method",
+        "Figure 5.6: Paired advantage over DT for per-image width MAE",
+        "Figure 5.7: Per-image-mean width RMSE by method",
+        "Figure 5.8: Paired advantage over DT for per-image width RMSE",
+        "Figure 5.9: Per-image-mean width |bias| by method",
+        "Figure 5.10: Paired advantage over DT for per-image width |bias|"
+      ],
+      "note": "Figure 5.4 (supplementary overview) also falls in this section and is likewise captioned. All 7 images in Section 5.2.1 -- both the 5.2.1.1 length-weighted context and the 5.2.1.2 per-image-mean charts specifically -- currently carry a caption; none required a disposition note."
+    },
+    "6_ref_pageref_noteref_targets_resolve": {
+      "pass": true,
+      "caveat": "VACUOUS PASS -- reported honestly rather than silently: a full scan of word/document.xml (the only body-text part in this docx; there are no headers/footers/footnotes/endnotes parts in the zip at all) found ZERO REF, PAGEREF, or NOTEREF field codes of any kind (checked both complex fields via w:instrText, count=0, and simple fields via w:fldSimple, count=0). 7 <w:bookmarkStart> elements exist (auto-generated '_Ref100000001'..'_Ref100000008'-style Word bookmarks) but are not targeted by any field in the document. This is consistent with every prior caption-audit manifest this sprint: the document uses manually-typed plaintext cross-references ('see Figure 5.6', 'cross-ref §4.2.1') throughout, not Word's automated field/bookmark mechanism, so there is nothing for this check to find broken.",
+      "total_field_refs_found": 0,
+      "total_bookmarks_present_but_unreferenced": 7
+    }
+  },
+
+  "provenance_pointers": {
+    "method": "For each of the three items above, scanned the +/-8 top-level-paragraph window around the caption/chart for script/output/commit/item-id references (regexes for 'item <hex>', 'commit <hex>', 'temp_scripts/', 'datasets/', 'Outputs[_/]', file extensions .py/.png/.csv).",
+    "figure_5_21": "4 nearby provenance-bearing notes found (Table 5.6/5.7 methodology notes citing decision dd27c59f, item c886abe3, bootstrap seed/N_boot, and a forward-pointer to Appendix C.5d for the coverage-asymmetry mechanism). No dedicated per-figure generation-script note was found immediately adjacent to Figure 5.21 itself, but the length-weighted |bias| series (Figures 5.16-5.21) shares its methodology/provenance note with Figure 5.20 immediately preceding it in the same run of paired-companion figures -- consistent with this document's established pattern of one provenance note covering a figure pair.",
+    "figure_a_4": "2 nearby provenance-bearing notes found, including an explicit output-path citation ('Outputs/metrics_old/_calibration/ablation_rs3_all_rows.csv, 780 rows -- cited explicitly since the live Outputs/metrics copy is empty').",
+    "section_5_2_1_2": "2 nearby provenance-bearing notes found, including an explicit data-source citation ('Outputs/supervision/*/analysis/gt_ablation_midline_metrics.csv') and the B1/B2 evaluation-regime methodology note (item dcf84404).",
+    "scope_caveat": "This check verifies that provenance POINTERS (paths/item-ids/script references) are present in the surrounding text, matching the document's established citation style. It does NOT verify those referenced output files still exist on disk at their cited paths (e.g. the Figure A.4-area note explicitly says the live Outputs/metrics copy is now empty and points at an archived path instead) -- that would require a separate filesystem/registry reconciliation pass against whatever project root produced these outputs, which is outside this worktree's visibility and outside this item's stated scope (workspace/docx-wave2-final-qa/ output only)."
+  },
+
+  "informational_findings": {
+    "unused_image_relationships": {
+      "note": "Declared in word/_rels/document.xml.rels but not referenced by any <w:drawing>/<w:pict> anywhere in the document body. NOT a paragraph-level defect (no paragraph points at a broken/missing reference) and NOT duplicate ownership -- a distinct, non-gating category, reported here for completeness.",
+      "rId50": {
+        "target": "media/image46.png",
+        "cross_check": "Same finding as e5bd2061 ('orphaned/unused relationship, not a duplicated one'). Still unused; unchanged."
+      },
+      "rId51": {
+        "target": "media/image47.png",
+        "cross_check": "Newly observed at this audit (not called out by name in e5bd2061, which was scoped to the sprint item's originally-cited rId50/rId28). Same category as rId50: an unused, non-dangling image relationship. Does not affect any of the six pass/fail checks above."
+      }
+    }
+  },
+
+  "test_verification": {
+    "command_run": "pixi run python -m pytest extensions/meridian-docs/tests/test_docx_render_gate.py tests/test_handoff_docx_integrity_gate.py extensions/meridian-docs/tests/test_retrofit_plaintext_captions.py extensions/meridian-docs/tests/test_relocate_figure.py extensions/meridian-docs/tests/test_relocate_table.py -q --timeout=120 -n auto",
+    "result": "65 passed in 23.89s",
+    "rationale_for_selection": "This item made no meridian source-code changes (it is a read-only content audit of an external OneDrive document); no meridian test file's target logic was touched. The targeted files above are the closest existing coverage to this item's subject matter (DOCX render-capability gating, DOCX-integrity handoff gating, plaintext-caption retrofitting, figure/table relocation) and were run as a sanity check per the sprint's standing instruction to run targeted tests, not the full suite."
+  },
+
+  "methodology_notes": {
+    "tooling_used": [
+      "mcp__meridian-docs__ingest_local_document_structure (fresh structure re-index)",
+      "mcp__meridian-docs__get_structure_elements (headings/tables cross-check)",
+      "mcp__meridian-docs__find_image_paragraph (image-paragraph inventory cross-check)",
+      "direct zipfile + xml.etree.ElementTree parse of word/document.xml and word/_rels/document.xml.rels for the ownership/orphan/field-code checks, run via pixi's python (stdlib only, no external deps)"
+    ],
+    "code_intel_prospecting": "Not applicable -- no meridian source files were read or modified this session (content-only audit of an external document); this project has not been observed to declare the code_intel_prospecting capability, and even if it had, this item touches no code symbols.",
+    "honesty_note": "Per the item's own instruction, this audit assumed nothing about the older manifest-referenced defects and re-verified every check fresh against the CURRENT document state. Where a check's cross-referenced para_id exactly matched a prior sibling manifest's (Figures 5.21 and A.4), that is reported as corroborating evidence, not assumed a priori."
+  },
+
+  "files_changed": [],
+  "canonical_docx_modified": false
+}
