@@ -36,12 +36,13 @@ precedent ``_refresh_claude_md_current_state`` relies on for its
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -293,3 +294,281 @@ async def sweep_stale_worktrees(
         "swept_count": len(swept),
         "skipped_count": len(skipped),
     }
+
+
+# ---------------------------------------------------------------------------
+# 2ae3f011 -- reversible temp-output quarantine (dry-run manifest, archive
+# move, restore, provenance-checked purge).
+#
+# Cleanup so far (this module's ``sweep_stale_worktrees`` /
+# ``remove_worktree_on_disk_guarded`` above) has only ever known how to do
+# ONE thing to a dead worktree directory: remove it wholesale. That is fine
+# for the worktree scaffolding itself, but a dead worktree can also contain
+# genuinely valuable TEMPORARY OUTPUT files (data/figures a script dropped
+# during the run) that ``meridian_outputs``' classification/provenance
+# systems (``extensions/meridian-outputs/meridian_outputs/classify.py``,
+# ``provenance.py``, ``provenance_status.py``) already know how to tell apart
+# from canonical/user files -- but nothing acted on that signal safely.
+# Straight deletion is a one-way door; this adds a REVERSIBLE middle step.
+#
+# Deliberately has NO hard import of ``extensions.meridian_outputs`` --  that
+# package is not on this pixi env's dependency graph (see pixi.toml's
+# 52cbe5d8 comment: its own tests import it straight off sys.path, nothing
+# here pulls it in for the main ``pixi run test`` env). Ownership/provenance
+# confirmation is always an INJECTED callable (``ownership_check`` /
+# ``verify_provenance``), same pattern ``orphan_reaper.py`` already uses for
+# ``process_iter``/``kill_fn`` -- keeps this module importable and testable
+# with zero optional dependencies, while a real caller (the meridian-outputs
+# MCP tool surface, via ``provenance.classify_temp_output_ownership``) can
+# supply the real check. Omitting the callable is NOT "skip the check" --
+# every function below fails closed (nothing is ever quarantined/deleted)
+# when no classifier is supplied, matching this module's existing
+# fail-closed posture (``validate_worktree_cleanup_target`` above).
+#
+# Three operations, each independently safe:
+#   1. build_quarantine_manifest -- DRY-RUN ONLY. Reads file metadata/hashes
+#      it never mutates disk beyond that.
+#   2. quarantine_temp_outputs   -- ARCHIVE MOVE (shutil.move, never
+#      os.remove/unlink) of eligible entries from a manifest into
+#      ``archive_root``. Reversible by construction.
+#   3. restore_quarantined_output / purge_quarantined_output -- the two ways
+#      a quarantined file's story ends: moved back (restore, always
+#      integrity-checked) or actually deleted (purge, the ONLY real delete
+#      in this module, only ever applied to a file already sitting in the
+#      archive, and only after re-verifying BOTH restore-integrity (hash)
+#      AND provenance/ownership immediately before deleting).
+# ---------------------------------------------------------------------------
+
+
+def _sha256_file(path: Path) -> str | None:
+    """Best-effort SHA-256 content hash. Returns ``None`` (never raises) on
+    any read failure -- a hash failure downgrades one manifest row to
+    un-hashed rather than aborting the whole scan/operation."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _default_ownership_check(path: str) -> dict[str, Any]:
+    """Fail-closed default used whenever no real ``ownership_check`` is
+    injected: every path is ineligible. Quarantine must never start moving
+    files just because a caller forgot to wire a real classifier."""
+    return {
+        "eligible": False,
+        "reason": "no ownership_check supplied -- refusing to guess ownership",
+    }
+
+
+def build_quarantine_manifest(
+    paths: Iterable[str],
+    *,
+    archive_root: str | os.PathLike[str],
+    ownership_check: Callable[[str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """DRY-RUN: build one manifest entry per path in *paths* -- never moves,
+    modifies, or deletes anything on disk beyond reading file metadata/bytes
+    to compute a hash.
+
+    Each entry carries: ``path``, ``exists``, ``eligible`` (per
+    *ownership_check*), ``reason``, ``size``, ``content_hash``,
+    ``archive_path`` (where a real ``quarantine_temp_outputs`` call would
+    move it -- hash-prefixed so two same-named files from different
+    directories never collide in the archive), and ``restore_destination``
+    (always the original ``path`` -- what a later ``restore_quarantined_output``
+    would move it back to).
+
+    *ownership_check* is the confirmation gate: given a path, returns
+    ``{"eligible": bool, "reason": str, ...}``. Only an explicit
+    ``eligible=True`` makes an entry a real quarantine candidate --
+    omitting the callable (or it raising) fails an entry closed, never open.
+    Never raises: one bad path or a raising classifier degrades that single
+    entry, the rest of the batch still completes.
+    """
+    archive_root_path = Path(archive_root)
+    check = ownership_check or _default_ownership_check
+    entries: list[dict[str, Any]] = []
+    for raw in paths:
+        p = Path(raw)
+        try:
+            ownership = dict(check(str(p)))
+        except Exception as exc:  # noqa: BLE001 -- one bad classifier call must not sink the scan
+            ownership = {"eligible": False, "reason": f"ownership_check raised: {exc}"}
+        eligible = bool(ownership.get("eligible"))
+        exists = p.is_file()
+        size = p.stat().st_size if exists else None
+        content_hash = _sha256_file(p) if exists else None
+        archive_name = f"{content_hash or 'unhashed'}__{p.name}" if exists else None
+        archive_path = str(archive_root_path / archive_name) if archive_name else None
+        entries.append(
+            {
+                "path": str(p),
+                "exists": exists,
+                "eligible": eligible,
+                "reason": ownership.get("reason", ""),
+                "size": size,
+                "content_hash": content_hash,
+                "archive_path": archive_path,
+                "restore_destination": str(p),
+            }
+        )
+    return {
+        "archive_root": str(archive_root_path),
+        "total": len(entries),
+        "eligible_count": sum(1 for e in entries if e["eligible"]),
+        "entries": entries,
+    }
+
+
+def quarantine_temp_outputs(manifest: dict[str, Any]) -> dict[str, Any]:
+    """ARCHIVE MOVE (``shutil.move`` -- never ``os.remove``/``unlink``): for
+    every ``eligible`` entry in *manifest* (as produced by
+    :func:`build_quarantine_manifest`) whose source file still exists, moves
+    it from its original path into its manifest-computed ``archive_path``,
+    creating the archive directory tree as needed. Reversible by
+    construction -- see :func:`restore_quarantined_output`.
+
+    Re-checks existence/eligibility at call time rather than blindly
+    trusting the (possibly stale) manifest snapshot. Never raises: a single
+    file's move failure is recorded per-entry (``skipped``) and does not
+    abort the batch, same "one bad record doesn't sink the scan" posture as
+    ``orphan_reaper.list_orphan_candidates``.
+    """
+    moved: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for entry in manifest.get("entries", []):
+        if not entry.get("eligible"):
+            skipped.append({**entry, "quarantine_skip_reason": "not eligible"})
+            continue
+        if not entry.get("archive_path"):
+            skipped.append({**entry, "quarantine_skip_reason": "no archive_path computed"})
+            continue
+        src = Path(entry["path"])
+        if not src.is_file():
+            skipped.append({**entry, "quarantine_skip_reason": "source no longer exists"})
+            continue
+        dst = Path(entry["archive_path"])
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+        except OSError as exc:  # noqa: BLE001 -- a single move failure must not abort the batch
+            skipped.append({**entry, "quarantine_skip_reason": f"move failed: {exc}"})
+            continue
+        moved.append({**entry, "archived": dst.is_file()})
+    return {
+        "archive_root": manifest.get("archive_root"),
+        "moved_count": len(moved),
+        "skipped_count": len(skipped),
+        "moved": moved,
+        "skipped": skipped,
+    }
+
+
+def restore_quarantined_output(entry: dict[str, Any]) -> dict[str, Any]:
+    """Reversal of :func:`quarantine_temp_outputs`: moves an archived file
+    (``entry["archive_path"]``) back to ``entry["restore_destination"]``.
+
+    Two safety checks before ever moving anything:
+      1. **Integrity** -- the archived file's current content hash must
+         still match ``entry["content_hash"]`` recorded at quarantine time
+         (catches corruption, or an unrelated file having ended up at that
+         archive path since).
+      2. **No silent overwrite** -- if the restore destination already
+         exists and holds DIFFERENT content, this refuses rather than
+         clobbering whatever now lives there (it may be a new file created
+         since quarantine). A destination that already holds
+         byte-identical content is treated as "already restored", not an
+         error (idempotent re-run after a partial failure).
+
+    Never raises. Returns ``{"restored": bool, "reason": str}``.
+    """
+    archive_path = Path(entry["archive_path"]) if entry.get("archive_path") else None
+    dest = Path(entry["restore_destination"]) if entry.get("restore_destination") else None
+    if archive_path is None or dest is None:
+        return {"restored": False, "reason": "entry missing archive_path/restore_destination"}
+    if not archive_path.is_file():
+        return {"restored": False, "reason": "archived file not found"}
+
+    current_hash = _sha256_file(archive_path)
+    recorded_hash = entry.get("content_hash")
+    if recorded_hash is not None and current_hash != recorded_hash:
+        return {
+            "restored": False,
+            "reason": "content hash mismatch -- archived file may have been altered since quarantine",
+        }
+
+    if dest.exists():
+        dest_hash = _sha256_file(dest) if dest.is_file() else None
+        if dest_hash != current_hash:
+            return {
+                "restored": False,
+                "reason": "restore destination already occupied by a different file -- refusing to overwrite",
+            }
+        return {"restored": True, "reason": "destination already holds identical content"}
+
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(archive_path), str(dest))
+    except OSError as exc:  # noqa: BLE001
+        return {"restored": False, "reason": f"move failed: {exc}"}
+    return {"restored": True, "reason": "restored from archive"}
+
+
+def purge_quarantined_output(
+    entry: dict[str, Any],
+    *,
+    verify_provenance: Callable[[str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The ONLY real delete in this module -- and only ever applied to a
+    file already sitting in the archive (``entry["archive_path"]``), never
+    a live/original path.
+
+    Two re-checks immediately before deletion, BOTH must pass:
+      1. **Integrity** -- same hash check as :func:`restore_quarantined_output`:
+         the archived content must still match what was recorded at
+         quarantine time.
+      2. **Provenance/ownership, re-verified now** -- *verify_provenance* is
+         called with the entry's ORIGINAL ``path`` and must return
+         ``eligible=True`` again. This is deliberately a fresh check, not a
+         re-read of the manifest's stored verdict: a file correctly
+         quarantined earlier may since have been reclassified (e.g. it
+         turned out to be the canonical copy after all, or a human restored
+         and started using it). Omitting *verify_provenance* is NOT "skip
+         the check" -- it fails closed, same as
+         :func:`_default_ownership_check` above.
+
+    Never raises. Returns ``{"purged": bool, "reason": str}``.
+    """
+    archive_path = Path(entry["archive_path"]) if entry.get("archive_path") else None
+    if archive_path is None or not archive_path.is_file():
+        return {"purged": False, "reason": "archived file not found"}
+
+    current_hash = _sha256_file(archive_path)
+    recorded_hash = entry.get("content_hash")
+    if recorded_hash is not None and current_hash != recorded_hash:
+        return {"purged": False, "reason": "content hash mismatch -- refusing to delete"}
+
+    if verify_provenance is None:
+        return {
+            "purged": False,
+            "reason": "no verify_provenance supplied -- refusing to guess ownership before deletion",
+        }
+    try:
+        check = dict(verify_provenance(entry["path"]))
+    except Exception as exc:  # noqa: BLE001 -- a raising classifier must not crash the caller
+        return {"purged": False, "reason": f"verify_provenance raised: {exc}"}
+    if not check.get("eligible"):
+        return {
+            "purged": False,
+            "reason": f"no longer eligible for deletion: {check.get('reason', '')}",
+        }
+
+    try:
+        archive_path.unlink()
+    except OSError as exc:  # noqa: BLE001
+        return {"purged": False, "reason": f"delete failed: {exc}"}
+    return {"purged": True, "reason": "verified restore-integrity and provenance before deletion"}

@@ -73,6 +73,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import urllib.error
@@ -447,6 +448,59 @@ def fetch_dead_worktree_paths(
     return [str(row["path"]) for row in data if isinstance(row, dict) and row.get("path")]
 
 
+# ---------------------------------------------------------------------------
+# 2ae3f011 -- temp-output quarantine discovery for dead worktrees.
+#
+# Dead worktrees (the same `dead_paths` this module already fetches to reap
+# orphaned processes above) can also contain genuinely valuable TEMPORARY
+# OUTPUT files -- data/figures a script dropped during the run -- that a
+# naive `worktree_cleanup.remove_worktree_on_disk` would otherwise wipe
+# along with the rest of the scaffolding. This is the DISCOVERY half of
+# that story: a pure, best-effort filesystem walk for files whose NAME
+# matches a temp/archival-output naming convention. It deliberately mirrors
+# (does NOT import -- extensions/meridian-outputs is not on this pixi env's
+# dependency graph, see pixi.toml's 52cbe5d8 comment) the broader stage-1b
+# suffix conventions in
+# `extensions/meridian-outputs/meridian_outputs/classify.py`.
+#
+# Matching a name pattern here is only a PREFILTER, never a verdict: turning
+# a candidate into an actual quarantine action still requires a real
+# ownership/provenance check (see `worktree_cleanup.build_quarantine_manifest`'s
+# injected `ownership_check` -- a real caller supplies
+# `provenance.classify_temp_output_ownership` from the meridian-outputs
+# extension). `main()`'s own `--quarantine-outputs` flag below only ever
+# prints a DRY-RUN manifest -- it never moves or deletes a file itself.
+# ---------------------------------------------------------------------------
+
+_TEMP_OUTPUT_SUFFIX_RE = re.compile(
+    r"[_-](?:backup|bak|deprecated|mislabeled|wip|copy|stale|archived?|old(?:_\d+)?)"
+    r"(?:[_.]\S*)?$|\.(?:bak|orig|backup)(?:[_.].*)?$|~$",
+    re.IGNORECASE,
+)
+
+
+def find_temp_output_candidates(dead_paths: list[str]) -> list[str]:
+    """Best-effort filesystem walk of *dead_paths* for files whose name
+    matches a temp/archival-output naming convention. Returns absolute-ish
+    file paths as strings (whatever ``os.walk`` yields joined with the
+    filename) -- pure discovery, no filesystem mutation. Never raises: an
+    unreadable/missing directory just contributes nothing, matching every
+    other best-effort scan in this module."""
+    out: list[str] = []
+    for root in dead_paths or []:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    stem = os.path.splitext(name)[0]
+                    if _TEMP_OUTPUT_SUFFIX_RE.search(name) or _TEMP_OUTPUT_SUFFIX_RE.search(stem):
+                        out.append(os.path.join(dirpath, name))
+        except OSError:  # noqa: BLE001 -- best-effort scan, one bad dir must not sink it
+            continue
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for ``python -m meridian.orphan_reaper``, invoked from the
     thin sh/ps1 hook wrappers registered by ``seed_orphan_reaper_hook``.
@@ -461,6 +515,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project-id", required=True)
     parser.add_argument("--url", default=os.environ.get("MERIDIAN_URL") or "http://localhost:7878")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--quarantine-outputs",
+        action="store_true",
+        help=(
+            "Also print a DRY-RUN temp-output quarantine manifest for dead "
+            "worktrees. Advisory only -- this CLI entry point never moves or "
+            "deletes a file itself (no ownership_check is wired here; see "
+            "meridian.worktree_cleanup.build_quarantine_manifest)."
+        ),
+    )
+    parser.add_argument(
+        "--archive-root",
+        default=None,
+        help="Archive root used only for the --quarantine-outputs dry-run manifest.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -476,9 +545,33 @@ def main(argv: list[str] | None = None) -> int:
                 f"process(es) from {len(dead_paths)} dead worktree(s).",
                 file=sys.stderr,
             )
+        if args.quarantine_outputs:
+            _print_quarantine_dry_run(dead_paths, args.archive_root)
     except Exception:  # noqa: BLE001 — advisory cleanup must never fail the Stop hook
         logger.warning("orphan_reaper: unexpected failure", exc_info=True)
     return 0
+
+
+def _print_quarantine_dry_run(dead_paths: list[str], archive_root: str | None) -> None:
+    """Best-effort dry-run manifest print for ``--quarantine-outputs``. Never
+    raises (caught by ``main``'s own broad except regardless, but this stays
+    consistent with every other best-effort step in this module) and never
+    moves/deletes anything -- see the module docstring above ``main``."""
+    from . import worktree_cleanup  # noqa: PLC0415 — avoid import cost when unused
+
+    candidates = find_temp_output_candidates(dead_paths)
+    if not candidates:
+        return
+    root = archive_root or os.path.join(os.getcwd(), ".meridian_quarantine")
+    manifest = worktree_cleanup.build_quarantine_manifest(candidates, archive_root=root)
+    print(
+        f"Meridian orphan_reaper: temp-output quarantine dry-run found "
+        f"{manifest['eligible_count']} eligible file(s) of {manifest['total']} "
+        f"candidate(s) under dead worktree(s) (archive_root={root}). No files "
+        "were moved or deleted -- ownership confirmation must come from the "
+        "meridian-outputs extension.",
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------

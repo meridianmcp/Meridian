@@ -37,12 +37,15 @@ f7084ed0 -- deterministic, tree-safe, opt-out cleanup. Additional coverage:
 """
 from __future__ import annotations
 
+import os
 import sys
+from pathlib import Path
 
 import pytest
 
 from meridian import db as db_module
 from meridian import orphan_reaper
+from meridian import worktree_cleanup
 
 
 # ---------------------------------------------------------------------------
@@ -937,3 +940,347 @@ def test_main_dry_run_prints_machine_readable_json(monkeypatch, capsys):
     out = capsys.readouterr().out
     parsed = _json.loads(out)
     assert parsed == fake_result
+
+
+# ---------------------------------------------------------------------------
+# 7. find_temp_output_candidates -- pure filesystem walk / naming prefilter
+# ---------------------------------------------------------------------------
+
+
+def test_find_temp_output_candidates_matches_naming_conventions(tmp_path):
+    root = tmp_path / "deadwt"
+    root.mkdir()
+    (root / "results.csv").write_text("keep")
+    (root / "results_backup.csv").write_text("candidate")
+    (root / "data.csv.bak").write_text("candidate")
+    (root / "notes.txt~").write_text("candidate")
+    (root / "run_old_2.json").write_text("candidate")
+    nested = root / "nested"
+    nested.mkdir()
+    (nested / "figure_stale.png").write_text("candidate")
+    (nested / "figure.png").write_text("keep")
+
+    candidates = orphan_reaper.find_temp_output_candidates([str(root)])
+    names = {os.path.basename(p) for p in candidates}
+    assert names == {
+        "results_backup.csv",
+        "data.csv.bak",
+        "notes.txt~",
+        "run_old_2.json",
+        "figure_stale.png",
+    }
+
+
+def test_find_temp_output_candidates_missing_dir_contributes_nothing():
+    assert orphan_reaper.find_temp_output_candidates([r"C:\does\not\exist"]) == []
+
+
+def test_find_temp_output_candidates_empty_dead_paths():
+    assert orphan_reaper.find_temp_output_candidates([]) == []
+
+
+# ---------------------------------------------------------------------------
+# 8. worktree_cleanup quarantine engine -- manifest / archive / restore / purge
+# ---------------------------------------------------------------------------
+
+
+def _eligible_if_backup(path: str) -> dict:
+    """Fake ownership_check: only "*_backup.*" paths are eligible -- mirrors
+    the shape ``provenance.classify_temp_output_ownership`` returns."""
+    if "backup" in os.path.basename(path):
+        return {"eligible": True, "reason": "looks like a backup copy"}
+    return {"eligible": False, "reason": "not a backup copy"}
+
+
+def test_build_quarantine_manifest_fails_closed_without_ownership_check(tmp_path):
+    f = tmp_path / "results_backup.csv"
+    f.write_text("hello")
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(f)], archive_root=str(tmp_path / "archive")
+    )
+    assert manifest["eligible_count"] == 0
+    assert manifest["entries"][0]["eligible"] is False
+    assert "no ownership_check supplied" in manifest["entries"][0]["reason"]
+
+
+def test_build_quarantine_manifest_computes_hash_size_and_archive_path(tmp_path):
+    f = tmp_path / "results_backup.csv"
+    f.write_text("hello world")
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(f)], archive_root=str(tmp_path / "archive"), ownership_check=_eligible_if_backup
+    )
+    entry = manifest["entries"][0]
+    assert entry["eligible"] is True
+    assert entry["exists"] is True
+    assert entry["size"] == len("hello world")
+    assert entry["content_hash"] is not None
+    assert entry["archive_path"].startswith(str(tmp_path / "archive"))
+    assert entry["archive_path"].endswith("results_backup.csv")
+    assert entry["restore_destination"] == str(f)
+    # Dry-run: nothing on disk actually moved.
+    assert f.is_file()
+
+
+def test_build_quarantine_manifest_missing_file_has_no_hash(tmp_path):
+    missing = tmp_path / "gone_backup.csv"
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(missing)], archive_root=str(tmp_path / "archive"), ownership_check=_eligible_if_backup
+    )
+    entry = manifest["entries"][0]
+    assert entry["exists"] is False
+    assert entry["content_hash"] is None
+    assert entry["archive_path"] is None
+
+
+def test_build_quarantine_manifest_rejects_canonical_files(tmp_path):
+    f = tmp_path / "results.csv"
+    f.write_text("hello")
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(f)], archive_root=str(tmp_path / "archive"), ownership_check=_eligible_if_backup
+    )
+    assert manifest["entries"][0]["eligible"] is False
+
+
+def test_quarantine_temp_outputs_moves_only_eligible_existing_entries(tmp_path):
+    keep = tmp_path / "results.csv"
+    keep.write_text("canonical")
+    backup = tmp_path / "results_backup.csv"
+    backup.write_text("archival copy")
+    archive_root = tmp_path / "archive"
+
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(keep), str(backup)], archive_root=str(archive_root), ownership_check=_eligible_if_backup
+    )
+    result = worktree_cleanup.quarantine_temp_outputs(manifest)
+
+    assert result["moved_count"] == 1
+    assert result["skipped_count"] == 1
+    assert not backup.exists()  # moved out, reversible via restore -- never deleted
+    assert keep.exists()  # canonical file untouched
+    moved_entry = result["moved"][0]
+    assert moved_entry["archived"] is True
+    assert Path(moved_entry["archive_path"]).read_text() == "archival copy"
+
+
+def test_quarantine_temp_outputs_skips_source_that_no_longer_exists(tmp_path):
+    backup = tmp_path / "results_backup.csv"
+    backup.write_text("archival copy")
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(backup)], archive_root=str(tmp_path / "archive"), ownership_check=_eligible_if_backup
+    )
+    backup.unlink()  # vanished between dry-run and the real move
+
+    result = worktree_cleanup.quarantine_temp_outputs(manifest)
+    assert result["moved_count"] == 0
+    assert result["skipped_count"] == 1
+    assert result["skipped"][0]["quarantine_skip_reason"] == "source no longer exists"
+
+
+def test_restore_quarantined_output_round_trips(tmp_path):
+    backup = tmp_path / "results_backup.csv"
+    backup.write_text("archival copy")
+    archive_root = tmp_path / "archive"
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(backup)], archive_root=str(archive_root), ownership_check=_eligible_if_backup
+    )
+    quarantined = worktree_cleanup.quarantine_temp_outputs(manifest)
+    entry = quarantined["moved"][0]
+    assert not backup.exists()
+
+    outcome = worktree_cleanup.restore_quarantined_output(entry)
+    assert outcome["restored"] is True
+    assert backup.is_file()
+    assert backup.read_text() == "archival copy"
+    assert not Path(entry["archive_path"]).exists()
+
+
+def test_restore_quarantined_output_refuses_on_hash_mismatch(tmp_path):
+    backup = tmp_path / "results_backup.csv"
+    backup.write_text("archival copy")
+    archive_root = tmp_path / "archive"
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(backup)], archive_root=str(archive_root), ownership_check=_eligible_if_backup
+    )
+    quarantined = worktree_cleanup.quarantine_temp_outputs(manifest)
+    entry = quarantined["moved"][0]
+
+    # Simulate corruption/tampering of the archived file after quarantine.
+    Path(entry["archive_path"]).write_text("tampered content")
+
+    outcome = worktree_cleanup.restore_quarantined_output(entry)
+    assert outcome["restored"] is False
+    assert "hash mismatch" in outcome["reason"]
+    assert Path(entry["archive_path"]).exists()  # never moved on a failed check
+
+
+def test_restore_quarantined_output_refuses_to_overwrite_different_file(tmp_path):
+    backup = tmp_path / "results_backup.csv"
+    backup.write_text("archival copy")
+    archive_root = tmp_path / "archive"
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(backup)], archive_root=str(archive_root), ownership_check=_eligible_if_backup
+    )
+    quarantined = worktree_cleanup.quarantine_temp_outputs(manifest)
+    entry = quarantined["moved"][0]
+
+    # A different file has since appeared at the original location.
+    backup.write_text("an unrelated new file")
+
+    outcome = worktree_cleanup.restore_quarantined_output(entry)
+    assert outcome["restored"] is False
+    assert "refusing to overwrite" in outcome["reason"]
+    assert backup.read_text() == "an unrelated new file"
+
+
+def test_purge_quarantined_output_fails_closed_without_verify_provenance(tmp_path):
+    backup = tmp_path / "results_backup.csv"
+    backup.write_text("archival copy")
+    archive_root = tmp_path / "archive"
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(backup)], archive_root=str(archive_root), ownership_check=_eligible_if_backup
+    )
+    quarantined = worktree_cleanup.quarantine_temp_outputs(manifest)
+    entry = quarantined["moved"][0]
+
+    outcome = worktree_cleanup.purge_quarantined_output(entry)
+    assert outcome["purged"] is False
+    assert "verify_provenance" in outcome["reason"]
+    assert Path(entry["archive_path"]).exists()
+
+
+def test_purge_quarantined_output_deletes_when_reverified_eligible(tmp_path):
+    backup = tmp_path / "results_backup.csv"
+    backup.write_text("archival copy")
+    archive_root = tmp_path / "archive"
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(backup)], archive_root=str(archive_root), ownership_check=_eligible_if_backup
+    )
+    quarantined = worktree_cleanup.quarantine_temp_outputs(manifest)
+    entry = quarantined["moved"][0]
+
+    outcome = worktree_cleanup.purge_quarantined_output(
+        entry, verify_provenance=_eligible_if_backup
+    )
+    assert outcome["purged"] is True
+    assert not Path(entry["archive_path"]).exists()
+
+
+def test_purge_quarantined_output_refuses_when_reverification_says_ineligible(tmp_path):
+    backup = tmp_path / "results_backup.csv"
+    backup.write_text("archival copy")
+    archive_root = tmp_path / "archive"
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(backup)], archive_root=str(archive_root), ownership_check=_eligible_if_backup
+    )
+    quarantined = worktree_cleanup.quarantine_temp_outputs(manifest)
+    entry = quarantined["moved"][0]
+
+    outcome = worktree_cleanup.purge_quarantined_output(
+        entry, verify_provenance=lambda p: {"eligible": False, "reason": "reclassified as canonical"}
+    )
+    assert outcome["purged"] is False
+    assert "no longer eligible" in outcome["reason"]
+    assert Path(entry["archive_path"]).exists()  # never deleted
+
+
+def test_purge_quarantined_output_refuses_on_hash_mismatch(tmp_path):
+    backup = tmp_path / "results_backup.csv"
+    backup.write_text("archival copy")
+    archive_root = tmp_path / "archive"
+    manifest = worktree_cleanup.build_quarantine_manifest(
+        [str(backup)], archive_root=str(archive_root), ownership_check=_eligible_if_backup
+    )
+    quarantined = worktree_cleanup.quarantine_temp_outputs(manifest)
+    entry = quarantined["moved"][0]
+    Path(entry["archive_path"]).write_text("tampered content")
+
+    outcome = worktree_cleanup.purge_quarantined_output(
+        entry, verify_provenance=_eligible_if_backup
+    )
+    assert outcome["purged"] is False
+    assert "hash mismatch" in outcome["reason"]
+
+
+# ---------------------------------------------------------------------------
+# 9. main() --quarantine-outputs wiring -- advisory dry-run only, never moves
+# ---------------------------------------------------------------------------
+
+
+def test_main_quarantine_outputs_flag_prints_dry_run_manifest(monkeypatch, tmp_path, capsys):
+    dead_root = tmp_path / "deadwt"
+    dead_root.mkdir()
+    (dead_root / "results_backup.csv").write_text("candidate")
+    (dead_root / "results.csv").write_text("keep")
+
+    monkeypatch.setattr(
+        orphan_reaper, "fetch_dead_worktree_paths", lambda *a, **k: [str(dead_root)]
+    )
+    monkeypatch.setattr(
+        orphan_reaper,
+        "reap_orphans",
+        lambda *a, **k: {"killed_count": 0, "skipped_count": 0, "candidates_count": 0, "killed": [], "skipped": []},
+    )
+
+    rc = orphan_reaper.main(
+        [
+            "--project-id", "proj1",
+            "--url", "http://x",
+            "--quarantine-outputs",
+            "--archive-root", str(tmp_path / "archive"),
+        ]
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "temp-output quarantine dry-run" in err
+    # No ownership_check is wired at the CLI level -- fail-closed default
+    # means the dry-run always reports 0 eligible, matching the module's
+    # "never guess ownership" contract.
+    assert "found 0 eligible file(s) of 1 candidate(s)" in err
+    # Never actually moves anything from this CLI entry point.
+    assert (dead_root / "results_backup.csv").is_file()
+
+
+def test_main_quarantine_outputs_flag_silent_when_no_candidates(monkeypatch, tmp_path, capsys):
+    dead_root = tmp_path / "deadwt"
+    dead_root.mkdir()
+    (dead_root / "results.csv").write_text("keep")
+
+    monkeypatch.setattr(
+        orphan_reaper, "fetch_dead_worktree_paths", lambda *a, **k: [str(dead_root)]
+    )
+    monkeypatch.setattr(
+        orphan_reaper,
+        "reap_orphans",
+        lambda *a, **k: {"killed_count": 0, "skipped_count": 0, "candidates_count": 0, "killed": [], "skipped": []},
+    )
+
+    rc = orphan_reaper.main(
+        ["--project-id", "proj1", "--url", "http://x", "--quarantine-outputs"]
+    )
+    assert rc == 0
+    assert "quarantine" not in capsys.readouterr().err
+
+
+def test_main_without_quarantine_flag_never_calls_worktree_cleanup(monkeypatch, tmp_path):
+    dead_root = tmp_path / "deadwt"
+    dead_root.mkdir()
+    (dead_root / "results_backup.csv").write_text("candidate")
+
+    monkeypatch.setattr(
+        orphan_reaper, "fetch_dead_worktree_paths", lambda *a, **k: [str(dead_root)]
+    )
+    monkeypatch.setattr(
+        orphan_reaper,
+        "reap_orphans",
+        lambda *a, **k: {"killed_count": 0, "skipped_count": 0, "candidates_count": 0, "killed": [], "skipped": []},
+    )
+    calls = []
+    monkeypatch.setattr(
+        worktree_cleanup,
+        "build_quarantine_manifest",
+        lambda *a, **k: calls.append((a, k)),
+    )
+
+    rc = orphan_reaper.main(["--project-id", "proj1", "--url", "http://x"])
+    assert rc == 0
+    assert calls == []
