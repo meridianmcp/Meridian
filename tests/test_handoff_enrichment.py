@@ -777,3 +777,224 @@ def test_build_item_briefing_omits_artifact_pointer_policy_when_sufficient_evide
     }
     briefing = handoff_module.build_item_briefing(item)
     assert "<artifact_pointer_policy>" not in briefing
+
+
+# ---------------------------------------------------------------------------
+# 3cab355a — _annotate_code_pointers(priority_ids=...): force_include_ids
+# must be exempt from the _MAX_ENRICHED_ITEMS cap entirely, regardless of
+# where they land in the pending list.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_annotate_priority_ids_bypass_cap_even_at_end_of_list():
+    """A priority id appended at the END of an already-over-cap list must
+    still be prospected — not marked skipped_cap like an ordinary overflow
+    item would be."""
+    cap = handoff_module._MAX_ENRICHED_ITEMS
+    items = [
+        {"id": f"i{n}", "title": f"pending item {n}", "status": "pending"}
+        for n in range(cap + 5)
+    ]
+    # The priority item sits at the very end — worst case for the old
+    # slice-based cap (pending_items[:cap]), which would never reach it.
+    items.append({"id": "forced-1", "title": "force-included item", "status": "pending"})
+
+    def searcher(query):
+        return [{"file": "f.py", "function": "g", "qualified_name": "g"}]
+
+    out = await handoff_module._annotate_code_pointers(
+        items, searcher, priority_ids=frozenset({"forced-1"}),
+    )
+    forced = next(it for it in out if it["id"] == "forced-1")
+    assert forced["prospect_status"] == "prospected"
+    assert forced["code_pointers"][0]["file"] == "f.py"
+
+
+@pytest.mark.asyncio
+async def test_annotate_priority_ids_do_not_expand_the_ordinary_cap():
+    """Priority ids are exempt from the cap, but the cap still applies,
+    unchanged, to the remaining ordinary items — priority ids must not push
+    the ordinary cap count up by their own count."""
+    cap = handoff_module._MAX_ENRICHED_ITEMS
+    ordinary = [
+        {"id": f"i{n}", "title": f"pending item {n}", "status": "pending"}
+        for n in range(cap + 3)
+    ]
+    items = [{"id": "forced-1", "title": "force-included item", "status": "pending"}] + ordinary
+
+    def searcher(query):
+        return [{"file": "f.py", "function": "g", "qualified_name": "g"}]
+
+    out = await handoff_module._annotate_code_pointers(
+        items, searcher, priority_ids=frozenset({"forced-1"}),
+    )
+    ordinary_out = [it for it in out if it["id"] != "forced-1"]
+    capped = [it for it in ordinary_out if it.get("prospect_status") == "skipped_cap"]
+    prospected = [it for it in ordinary_out if it.get("prospect_status") == "prospected"]
+    assert len(capped) == 3
+    assert len(prospected) == cap
+    forced = next(it for it in out if it["id"] == "forced-1")
+    assert forced["prospect_status"] == "prospected"
+
+
+@pytest.mark.asyncio
+async def test_annotate_priority_ids_none_is_backward_compatible():
+    """priority_ids=None (every pre-existing call site) reduces to the
+    original pending_items[:cap] slice behaviour byte-for-byte."""
+    cap = handoff_module._MAX_ENRICHED_ITEMS
+    items = [
+        {"id": f"i{n}", "title": f"pending item {n}", "status": "pending"}
+        for n in range(cap + 2)
+    ]
+
+    def searcher(query):
+        return [{"file": "f.py", "function": "g", "qualified_name": "g"}]
+
+    out = await handoff_module._annotate_code_pointers(list(items), searcher)
+    assert all(it.get("prospect_status") == "skipped_cap" for it in out[cap:])
+    assert all(it.get("prospect_status") == "prospected" for it in out[:cap])
+
+
+# ---------------------------------------------------------------------------
+# 3cab355a — _resolve_force_included_items: validation + rejection
+# reporting for force_include_ids (project/version/status scope).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_force_included_accepts_valid_in_scope_item(db):
+    p = await db_module.create_project(db, "fii-accept")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Do the thing")
+    rejected: list = []
+    out = await handoff_module._resolve_force_included_items(
+        db, p["id"], [item["id"]], [], effective_version=None, rejected=rejected,
+    )
+    assert [it["id"] for it in out] == [item["id"]]
+    assert rejected == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_force_included_rejects_unknown_id(db):
+    p = await db_module.create_project(db, "fii-unknown")
+    rejected: list = []
+    out = await handoff_module._resolve_force_included_items(
+        db, p["id"], ["does-not-exist"], [], effective_version=None, rejected=rejected,
+    )
+    assert out == []
+    assert rejected == [{"id": "does-not-exist", "reason": "not_found"}]
+
+
+@pytest.mark.asyncio
+async def test_resolve_force_included_rejects_cross_project_id(db):
+    p1 = await db_module.create_project(db, "fii-proj-a")
+    p2 = await db_module.create_project(db, "fii-proj-b")
+    other_item = await db_module.add_sprint_item(db, p2["id"], "v1", "Belongs to project B")
+    rejected: list = []
+    out = await handoff_module._resolve_force_included_items(
+        db, p1["id"], [other_item["id"]], [], effective_version=None, rejected=rejected,
+    )
+    assert out == []
+    assert rejected == [{"id": other_item["id"], "reason": "wrong_project"}]
+
+
+@pytest.mark.asyncio
+async def test_resolve_force_included_rejects_wrong_version_when_scoped(db):
+    p = await db_module.create_project(db, "fii-version")
+    item = await db_module.add_sprint_item(db, p["id"], "v0.2.5", "Old-version item")
+    rejected: list = []
+    out = await handoff_module._resolve_force_included_items(
+        db, p["id"], [item["id"]], [], effective_version="v0.2.6", rejected=rejected,
+    )
+    assert out == []
+    assert rejected == [{
+        "id": item["id"], "reason": "wrong_version",
+        "item_version": "v0.2.5", "requested_version": "v0.2.6",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_resolve_force_included_accepts_matching_version_when_scoped(db):
+    p = await db_module.create_project(db, "fii-version-match")
+    item = await db_module.add_sprint_item(db, p["id"], "v0.2.6", "Current-version item")
+    rejected: list = []
+    out = await handoff_module._resolve_force_included_items(
+        db, p["id"], [item["id"]], [], effective_version="v0.2.6", rejected=rejected,
+    )
+    assert [it["id"] for it in out] == [item["id"]]
+    assert rejected == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_force_included_unscoped_ignores_version_mismatch(db):
+    """effective_version=None (no scope in effect) preserves the original,
+    pre-validation unscoped behaviour — no version-based rejection."""
+    p = await db_module.create_project(db, "fii-unscoped")
+    item = await db_module.add_sprint_item(db, p["id"], "v9.9.9", "Any-version item")
+    rejected: list = []
+    out = await handoff_module._resolve_force_included_items(
+        db, p["id"], [item["id"]], [], effective_version=None, rejected=rejected,
+    )
+    assert [it["id"] for it in out] == [item["id"]]
+    assert rejected == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_force_included_rejects_done_item(db):
+    p = await db_module.create_project(db, "fii-done")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Already finished")
+    await db_module.complete_sprint_item(db, p["id"], item["id"])
+    rejected: list = []
+    out = await handoff_module._resolve_force_included_items(
+        db, p["id"], [item["id"]], [], effective_version=None, rejected=rejected,
+    )
+    assert out == []
+    assert rejected == [{"id": item["id"], "reason": "not_pending", "status": "done"}]
+
+
+@pytest.mark.asyncio
+async def test_resolve_force_included_skips_already_visible_item_without_rejecting(db):
+    """An id already present in pending_sprint_items is left alone — no
+    re-validation, no rejection entry (it was already genuinely visible)."""
+    p = await db_module.create_project(db, "fii-already-visible")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Already pending")
+    rejected: list = []
+    out = await handoff_module._resolve_force_included_items(
+        db, p["id"], [item["id"]], [dict(item)], effective_version=None, rejected=rejected,
+    )
+    assert len(out) == 1
+    assert rejected == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_force_included_no_ids_is_noop(db):
+    p = await db_module.create_project(db, "fii-noop")
+    rejected: list = []
+    out = await handoff_module._resolve_force_included_items(
+        db, p["id"], None, [], effective_version=None, rejected=rejected,
+    )
+    assert out == []
+    assert rejected == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_force_included_rejected_none_is_safe():
+    """rejected=None (the default) must not raise — pure best-effort
+    reporting, never required by the caller."""
+    import meridian.db as _db_mod
+
+    class _StubDB:
+        pass
+
+    async def _fake_get_sprint_item(db, item_id):
+        return None
+
+    orig = _db_mod.get_sprint_item
+    _db_mod.get_sprint_item = _fake_get_sprint_item
+    try:
+        out = await handoff_module._resolve_force_included_items(
+            _StubDB(), "proj", ["missing"], [], effective_version=None,
+        )
+    finally:
+        _db_mod.get_sprint_item = orig
+    assert out == []

@@ -2874,6 +2874,13 @@ async def _handle_task_tools(
         # handoff.generate_handoff's own strict_pointer_evidence docstring.
         _strict_pointer_evidence = bool(args.get("strict_pointer_evidence"))
         _evidence_status: dict[str, Any] = {}
+        # 3cab355a — out-param populated with one entry per force_include_ids
+        # id that failed validation (unknown/cross-project/cross-version/not-
+        # pending); see handoff.generate_handoff's own force_include_rejected
+        # docstring. Always passed (pure addition, same shape as
+        # evidence_status above) so the caller can tell "silently already
+        # visible" apart from "explicitly rejected, and why".
+        _force_include_rejected: list[dict[str, Any]] = []
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -2891,6 +2898,7 @@ async def _handle_task_tools(
                     strict_evidence=_strict_evidence,
                     evidence_status=_evidence_status,
                     strict_pointer_evidence=_strict_pointer_evidence,
+                    force_include_rejected=_force_include_rejected,
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -3039,6 +3047,12 @@ async def _handle_task_tools(
             # 180s timeout fired before generate_handoff reached its own
             # finalize step (see the l0_fallback/degraded handling above).
             "handoff_evidence_status": _evidence_status,
+            # 3cab355a — one entry per requested force_include_ids id that
+            # failed validation, with a machine-readable reason (see
+            # handoff.generate_handoff's force_include_rejected docstring).
+            # Pure ADDITION — [] when force_include_ids was empty/absent, or
+            # when the 180s timeout fired before validation ran.
+            "force_include_rejected": _force_include_rejected,
             # 8a883f60 — echoes the strict_evidence flag this call actually
             # used, so a caller never has to re-derive it from args.
             "strict_evidence": _strict_evidence,

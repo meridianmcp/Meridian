@@ -2310,6 +2310,11 @@ def build_mcp_server():
                 _stdio_strict_pointer_evidence = bool(
                     arguments.get("strict_pointer_evidence")
                 )
+                # 3cab355a — mirror handler.py's out-param: one entry per
+                # requested force_include_ids id that failed validation
+                # (unknown/cross-project/cross-version/not-pending). See
+                # handoff.generate_handoff's force_include_rejected docstring.
+                _stdio_force_include_rejected: list[dict[str, Any]] = []
                 _handoff_evidence_blocked = False
                 try:
                     path, content, _ = await asyncio.wait_for(
@@ -2323,6 +2328,7 @@ def build_mcp_server():
                             force_include_ids=_stdio_force_include_ids,
                             strict_evidence=_stdio_strict_evidence,
                             strict_pointer_evidence=_stdio_strict_pointer_evidence,
+                            force_include_rejected=_stdio_force_include_rejected,
                         ),
                         timeout=90.0,
                     )
@@ -2354,6 +2360,10 @@ def build_mcp_server():
                         "path": path,
                         "content": handoff_module.format_handoff_mcp_content(content),
                         "mode": mode,
+                        # 3cab355a — see the comment above the generate_handoff
+                        # call; [] when force_include_ids was empty/absent or
+                        # the 90s timeout fired before validation ran.
+                        "force_include_rejected": _stdio_force_include_rejected,
                     }
             elif name == "get_context_block":
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.

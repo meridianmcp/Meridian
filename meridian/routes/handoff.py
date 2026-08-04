@@ -105,6 +105,11 @@ async def generate_handoff_endpoint(
         _force_include_ids = [str(x) for x in _raw_fii if x]
     _strict_evidence = bool(body.get("strict_evidence"))
     _strict_pointer_evidence = bool(body.get("strict_pointer_evidence"))
+    # 3cab355a — mirror handler.py's out-param: one entry per requested
+    # force_include_ids id that failed validation (unknown/cross-project/
+    # cross-version/not-pending). See handoff.generate_handoff's
+    # force_include_rejected docstring.
+    _force_include_rejected: list[dict[str, Any]] = []
     skip_summary = not os.environ.get("ANTHROPIC_API_KEY")
     db = await _db(request)
     data_dir = _data_dir(request)
@@ -120,6 +125,7 @@ async def generate_handoff_endpoint(
                 force_include_ids=_force_include_ids,
                 strict_evidence=_strict_evidence,
                 strict_pointer_evidence=_strict_pointer_evidence,
+                force_include_rejected=_force_include_rejected,
             ),
             timeout=90.0,
         )
@@ -168,6 +174,7 @@ async def generate_handoff_endpoint(
         "capability_contract": capability_contract,
         "proposal_evidence": proposal_evidence,
         "docx_integrity": docx_integrity,
+        "force_include_rejected": _force_include_rejected,
     }
 
 

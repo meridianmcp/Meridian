@@ -4186,6 +4186,7 @@ async def _annotate_code_pointers(
     *,
     prospectors: dict[str, Callable[[str], Any]] | None = None,
     reprospect: bool = False,
+    priority_ids: "frozenset[str] | set[str] | None" = None,
 ) -> list[dict[str, Any]]:
     """Prospect a pointer for each NON-MANUAL pending item, by fitting source_type.
 
@@ -4206,6 +4207,19 @@ async def _annotate_code_pointers(
     ``searcher`` / prospectors may be sync or coroutine callables; results may be a
     list, a ``{results|matches: [...]}`` dict, or a single match dict.
 
+    ``priority_ids`` (3cab355a) — item ids that are EXEMPT from the
+    ``_MAX_ENRICHED_ITEMS`` cap entirely, regardless of their position in
+    ``pending_items``. This closes the gap where a caller's own
+    ``force_include_ids`` override (45f519a0 Part 2) appended a specifically
+    requested item to the END of the pending list — past a board that
+    already had >= ``_MAX_ENRICHED_ITEMS`` items — so the very item a caller
+    explicitly asked to bring into scope silently came back
+    ``prospect_status="skipped_cap"``, indistinguishable from any other
+    capacity-dropped item. The cap still applies, unchanged, to every
+    non-priority item; priority ids never count against it and never push
+    a non-priority item out of its slot (the cap is computed over the
+    non-priority items only).
+
     Robustness contract: this must NEVER raise. All failures degrade to no pointer for
     that item — generate_handoff is mandatory and breaking it is unacceptable.
     """
@@ -4214,13 +4228,27 @@ async def _annotate_code_pointers(
         registry.setdefault("code", searcher)
     if not registry:
         return pending_items
+    _priority = priority_ids or frozenset()
+    # 3cab355a — the cap is computed over NON-priority items only: split first,
+    # then take the tail of that ordinary-item subsequence as the capped-out
+    # set. A priority item is never in this set no matter where it sits in
+    # ``pending_items``. When ``priority_ids`` is empty (every pre-existing
+    # call site), ``_ordinary`` is exactly ``pending_items`` and this reduces
+    # to the original ``pending_items[_MAX_ENRICHED_ITEMS:]`` slice — zero
+    # behavior change for callers that don't pass it.
+    _ordinary = [it for it in pending_items if it.get("id") not in _priority]
+    _capped_ids = {
+        it.get("id") for it in _ordinary[_MAX_ENRICHED_ITEMS:] if it.get("id")
+    }
     # 182468a6 — surface the cap instead of silently dropping items past it: any
     # non-manual item beyond the enrichment cap is marked skipped_cap so the caller
     # / handoff can tell "not prospected for capacity" apart from "no match found".
-    for item in pending_items[_MAX_ENRICHED_ITEMS:]:
-        if not _is_manual_sprint_item(item):
+    for item in pending_items:
+        if item.get("id") in _capped_ids and not _is_manual_sprint_item(item):
             item.setdefault("prospect_status", "skipped_cap")
-    for item in pending_items[:_MAX_ENRICHED_ITEMS]:
+    for item in pending_items:
+        if item.get("id") in _capped_ids:
+            continue
         if _is_manual_sprint_item(item):
             item["prospect_status"] = "skipped_manual"  # 10bfe531 — never prospect
             continue
@@ -6542,6 +6570,87 @@ async def _gather_related_planning_records(
         return {"query": query, "candidates": []}
 
 
+async def _resolve_force_included_items(
+    db: Any,
+    project_id: str,
+    force_include_ids: "list[str] | None",
+    pending_sprint_items: list[dict[str, Any]],
+    *,
+    effective_version: "str | None",
+    rejected: "list[dict[str, Any]] | None" = None,
+) -> list[dict[str, Any]]:
+    """3cab355a — validate + apply a ``force_include_ids`` override.
+
+    Shared by ``generate_handoff``'s full/delta branch and
+    ``_generate_goal_only_handoff`` so the two don't drift. Appends each
+    requested id's sprint item to ``pending_sprint_items`` (in place, and
+    also returned) for THIS call only when the id is a genuine, in-scope
+    candidate; every id that fails validation is recorded in ``rejected``
+    (when given — same purely-additive out-param shape as
+    ``evidence_status``) with a machine-readable ``reason`` instead of
+    silently vanishing, so a caller can tell "not honoured because X" apart
+    from "already visible, nothing to do":
+
+    - ``not_found`` — no sprint item exists with this id at all.
+    - ``wrong_project`` — the id is real but belongs to a DIFFERENT project.
+      Never let a cross-project id leak into this project's /goal just
+      because a caller happened to pass its id.
+    - ``wrong_version`` — ``effective_version`` is set (this handoff call is
+      scoped to one sprint-version bucket — see ``generate_handoff``'s own
+      ``version`` docstring) and the requested item belongs to a different
+      version. ``force_include_ids`` is a visibility override for the
+      DEFERRED gate only (45f519a0 Part 2); it must never double as a way to
+      smuggle a different version's item into a version-scoped handoff —
+      that would silently break the scoping guarantee ``b8f89491`` built.
+      ``effective_version is None`` (no scope in effect) never rejects on
+      this basis, matching the pre-existing unscoped behaviour.
+    - ``not_pending`` — the item exists, is in-project and in-version, but
+      its status is neither ``todo`` nor ``pending`` (e.g. ``done``,
+      ``blocked``, or already ``in_progress`` elsewhere) — force-including a
+      non-pending item as a NEW pending item would misrepresent its real
+      state.
+
+    An id already present in ``pending_sprint_items`` is left alone (no
+    validation re-run, no rejection entry) — it was already genuinely
+    visible before the override, exactly as before this validation existed.
+    """
+    if not force_include_ids:
+        return pending_sprint_items
+    _pending_id_set = {it["id"] for it in pending_sprint_items if it.get("id")}
+    for _fid in force_include_ids:
+        if not _fid or _fid in _pending_id_set:
+            continue  # already visible (not deferred, or already force-included)
+        _forced = await db_module.get_sprint_item(db, _fid)
+        if _forced is None:
+            if rejected is not None:
+                rejected.append({"id": _fid, "reason": "not_found"})
+            continue
+        if _forced.get("project_id") != project_id:
+            if rejected is not None:
+                rejected.append({"id": _fid, "reason": "wrong_project"})
+            continue
+        if effective_version is not None and _forced.get("version") != effective_version:
+            if rejected is not None:
+                rejected.append({
+                    "id": _fid,
+                    "reason": "wrong_version",
+                    "item_version": _forced.get("version"),
+                    "requested_version": effective_version,
+                })
+            continue
+        if _forced.get("status") not in ("todo", "pending"):
+            if rejected is not None:
+                rejected.append({
+                    "id": _fid,
+                    "reason": "not_pending",
+                    "status": _forced.get("status"),
+                })
+            continue
+        pending_sprint_items.append(_forced)
+        _pending_id_set.add(_fid)
+    return pending_sprint_items
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -6563,6 +6672,7 @@ async def generate_handoff(
     related_records_query: str | None = None,
     related_records: dict[str, Any] | None = None,
     max_content_bytes: "int | None" = _DEFAULT_HANDOFF_MAX_BYTES,
+    force_include_rejected: "list[dict[str, Any]] | None" = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -6600,6 +6710,30 @@ async def generate_handoff(
     is NOT cleared, so ``claim_sprint_item``'s own deferral gate is unaffected.
     Use when a human genuinely wants a backburnered item back in scope for one
     planning run without permanently re-enabling claiming.
+
+    3cab355a — every requested id is now VALIDATED (see
+    ``_resolve_force_included_items``) rather than silently accepted or
+    silently dropped: it must resolve to a real sprint item belonging to
+    THIS project, in the effective version scope (when one is in effect),
+    and genuinely ``todo``/``pending`` — an unknown, cross-project, cross-
+    version, or already-done/blocked id is rejected and recorded in
+    ``force_include_rejected`` (below) instead. Every accepted id is also now
+    exempt from the ``_MAX_ENRICHED_ITEMS`` code-pointer enrichment cap (see
+    ``_annotate_code_pointers``'s ``priority_ids``) — previously an id could
+    be validly force-included yet still land past the cap purely because it
+    was appended to the end of an already-large pending list, coming back
+    ``prospect_status="skipped_cap"`` despite being the one item the caller
+    explicitly asked to bring into scope.
+
+    ``force_include_rejected`` (3cab355a) — optional output list, same
+    purely-additive out-param shape as ``evidence_status``: when given (any
+    list, typically ``[]``), each requested id that failed validation is
+    appended as ``{"id": ..., "reason": ...}`` (reasons: ``not_found``,
+    ``wrong_project``, ``wrong_version``, ``not_pending`` — see
+    ``_resolve_force_included_items``'s docstring for the exact meaning of
+    each). A caller that passes ``None`` (the default) sees zero functional
+    change to the returned ``(path, content, amended)`` or to ``content``
+    itself.
 
     ``version`` (efaa918a, extended by b8f89491) — optional explicit sprint-
     version bucket. Resolved ONCE, up front, and threaded through EVERY
@@ -6766,6 +6900,7 @@ async def generate_handoff(
             strict_evidence=strict_evidence,
             evidence_status=evidence_status,
             strict_pointer_evidence=strict_pointer_evidence,
+            force_include_rejected=force_include_rejected,
         )
         return (
             _g_path,
@@ -6854,19 +6989,14 @@ async def generate_handoff(
     # 45f519a0 Part 2 — force_include_ids override: re-add specifically requested
     # deferred items into the pending list for this handoff call only. deferred_until
     # on the item is NOT touched, so claim_sprint_item's own gate stays intact.
-    if force_include_ids:
-        _pending_id_set = {it["id"] for it in pending_sprint_items}
-        for _fid in force_include_ids:
-            if _fid in _pending_id_set:
-                continue  # already in list (not deferred or already visible)
-            _forced = await db_module.get_sprint_item(db, _fid)
-            if (
-                _forced is not None
-                and _forced.get("project_id") == project_id
-                and _forced.get("status") in ("todo", "pending")
-            ):
-                pending_sprint_items.append(_forced)
-                _pending_id_set.add(_fid)
+    # 3cab355a — validated via the shared helper: rejects (rather than silently
+    # dropping) any id that's unknown, cross-project, cross-version, or not
+    # genuinely todo/pending — see _resolve_force_included_items's docstring.
+    pending_sprint_items = await _resolve_force_included_items(
+        db, project_id, force_include_ids, pending_sprint_items,
+        effective_version=_effective_version,
+        rejected=force_include_rejected,
+    )
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
     # Flag items that may already be done based on recent task descriptions or commits
     pending_sprint_items = _annotate_possibly_done(pending_sprint_items, tasks, commit_messages)
@@ -6901,7 +7031,13 @@ async def generate_handoff(
             )
             try:
                 pending_sprint_items = await _annotate_code_pointers(
-                    pending_sprint_items, searcher
+                    pending_sprint_items, searcher,
+                    # 3cab355a — force_include_ids never gets skipped_cap: a
+                    # caller who specifically asked for these ids expects
+                    # enrichment for them regardless of the ordinary 25-item cap.
+                    priority_ids=(
+                        frozenset(force_include_ids) if force_include_ids else None
+                    ),
                 )
                 # 182468a6 — surface the enrichment cap so a partially-prospected
                 # board reads honestly instead of looking fully covered.
@@ -7967,6 +8103,7 @@ async def _generate_goal_only_handoff(
     strict_evidence: bool = False,
     evidence_status: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
+    force_include_rejected: "list[dict[str, Any]] | None" = None,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
 
@@ -8021,19 +8158,15 @@ async def _generate_goal_only_handoff(
         it for it in sprint_items_all
         if it.get("status") in ("todo", "pending")
     ]
-    if force_include_ids:
-        _pending_id_set = {it["id"] for it in pending_sprint_items}
-        for _fid in force_include_ids:
-            if _fid in _pending_id_set:
-                continue
-            _forced = await db_module.get_sprint_item(db, _fid)
-            if (
-                _forced is not None
-                and _forced.get("project_id") == project_id
-                and _forced.get("status") in ("todo", "pending")
-            ):
-                pending_sprint_items.append(_forced)
-                _pending_id_set.add(_fid)
+    # 3cab355a — same validated helper generate_handoff's full/delta branch
+    # uses (see _resolve_force_included_items's docstring): rejects unknown/
+    # cross-project/cross-version/non-pending ids instead of silently
+    # dropping them.
+    pending_sprint_items = await _resolve_force_included_items(
+        db, project_id, force_include_ids, pending_sprint_items,
+        effective_version=version,
+        rejected=force_include_rejected,
+    )
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
 
     # 91ac0199 — same code-pointer enrichment gate generate_handoff's full/
@@ -8066,7 +8199,12 @@ async def _generate_goal_only_handoff(
             )
             try:
                 pending_sprint_items = await _annotate_code_pointers(
-                    pending_sprint_items, searcher
+                    pending_sprint_items, searcher,
+                    # 3cab355a — same cap-bypass generate_handoff's full/delta
+                    # branch uses; see that call site's comment.
+                    priority_ids=(
+                        frozenset(force_include_ids) if force_include_ids else None
+                    ),
                 )
                 # 8a883f60 — see the twin comment in generate_handoff:
                 # _annotate_code_pointers never raises for a per-item search
