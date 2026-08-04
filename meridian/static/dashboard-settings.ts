@@ -1,3 +1,85 @@
+// 02dbd8b4 — runtime configuration generation status (tunnel/executor
+// settings). Pure formatter for the `config_generation` record the server
+// attaches to GET/PUT /tunnel/plugins, POST/DELETE /tunnel/plugins/custom, and
+// GET /tunnel/status responses:
+//   {generation, config_hash, source_timestamp, restart_required}
+// Exported (+ attached to window, matching this file's other cross-module
+// helpers) so any renderer of tunnel/connector state shares one label/tone
+// rule instead of re-deriving it inline — the point of the sprint item is
+// exactly that settings UI, tunnel runtime, and connector cache must never
+// independently guess whether they agree with each other.
+export interface TunnelConfigGenerationInfo {
+  generation?: number;
+  config_hash?: string;
+  source_timestamp?: number;
+  restart_required?: boolean;
+}
+
+export function formatTunnelConfigGenerationStatus(
+  info: TunnelConfigGenerationInfo | null | undefined,
+): { label: string; tone: 'ok' | 'warn' | 'unknown'; detail: string } {
+  if (!info || typeof info !== 'object' || info.generation == null) {
+    return {
+      label: 'Unknown',
+      tone: 'unknown',
+      detail: 'No runtime configuration generation has been reported for this tunnel yet.',
+    };
+  }
+  const gen = info.generation;
+  const hash = info.config_hash ? String(info.config_hash).slice(0, 8) : 'unknown';
+  if (info.restart_required) {
+    return {
+      label: `Restart required (generation ${gen})`,
+      tone: 'warn',
+      detail: `Settings changed to generation ${gen} (config ${hash}) while a tunnel was actively connected. Restart "meridian --tunnel" to apply it — the running process is still serving the previous configuration.`,
+    };
+  }
+  return {
+    label: `Applied (generation ${gen})`,
+    tone: 'ok',
+    detail: `Runtime configuration generation ${gen} (config ${hash}) is the latest saved configuration and is what the next tunnel connection will load.`,
+  };
+}
+window.formatTunnelConfigGenerationStatus = formatTunnelConfigGenerationStatus;
+
+// Renders a small warning banner above the Tunnel Plugins card when the
+// tenant-default runtime config generation comes back restart_required — i.e.
+// a settings save happened while a tunnel was actively connected, so the
+// running process is serving a stale (pre-change) configuration. Fully
+// self-owned: creates/updates/removes its own element by a fixed id and never
+// reaches into the Tunnel Plugins section's own DOM (dashboard-plugins.ts
+// re-renders that section asynchronously and would clobber anything injected
+// into it — see loadTunnelPluginsSection). Best-effort: any fetch failure
+// just means no banner, never a visible error.
+export async function _renderTunnelConfigGenerationBanner(projectId: any): Promise<void> {
+  const host = document.getElementById(`settings-body-${projectId}`);
+  if (!host) return;
+  const bannerId = `tunnel-config-gen-banner-${projectId}`;
+  const existing = document.getElementById(bannerId);
+  if (existing) existing.remove();
+  let status: any;
+  try {
+    status = await api(`/tunnel/status/${projectId}`);
+  } catch (e: any) {
+    return;
+  }
+  const info = status && status.config_generation && status.config_generation.default;
+  const formatted = formatTunnelConfigGenerationStatus(info);
+  if (formatted.tone !== 'warn') return; // only surface when action is actually needed
+  const esc = (window as any).escapeHtml || String;
+  const banner = document.createElement('div');
+  banner.id = bannerId;
+  banner.style.cssText = 'margin-top:18px;padding:8px 10px;border-radius:4px;font-size:10px;line-height:1.5;background:#f59e0b1a;border:1px solid #f59e0b55';
+  banner.innerHTML = `<strong style="color:#f59e0b">${esc(formatted.label)}</strong><div style="margin-top:3px;color:var(--muted)">${esc(formatted.detail)}</div>`;
+  const section = document.getElementById(`tunnel-plugins-section-${projectId}`);
+  if (section && section.parentElement === host) {
+    host.insertBefore(banner, section);
+  } else {
+    host.appendChild(banner);
+  }
+}
+window._renderTunnelConfigGenerationBanner = _renderTunnelConfigGenerationBanner;
+
 export function suggestNtfyTopic(projectId: any) {
 
   const proj = (window.state?.projects || []).find((p: any) => p.id === projectId);
@@ -3961,6 +4043,11 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
   // Tunnel Plugins section (per-account tunnel config) — also defined in
   // dashboard.js, appended below Executor Rules.
   try { (window.loadTunnelPluginsSection as any)?.(projectId); } catch (e: any) {}
+  // 02dbd8b4 — runtime-config-generation banner: warns when the last settings
+  // save happened while a tunnel was actively connected (restart required to
+  // apply it). Independent of loadTunnelPluginsSection's own render cycle —
+  // see _renderTunnelConfigGenerationBanner for why it owns its own element.
+  try { _renderTunnelConfigGenerationBanner(projectId).catch(() => {}); } catch (e: any) {}
 
   if (isDemoMode()) hideDemoAdminControls();
 

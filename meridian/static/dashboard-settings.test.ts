@@ -8,7 +8,7 @@
 // single-liners leading with the copy-paste config.
 // 00a1e56a — the settings CARD renderers extracted from loadSettingsTab still
 // emit the same canonical DOM ids/structure they produced inline.
-import { describe, it, expect, beforeAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
@@ -19,6 +19,8 @@ import {
   _settingsBrowserConnectorCardHtml,
   _settingsNotificationsCardHtml,
   _settingsNotificationPrefsHtml,
+  formatTunnelConfigGenerationStatus,
+  _renderTunnelConfigGenerationBanner,
 } from "./dashboard-settings";
 
 // Vitest runs with cwd = repo root, so resolve the source module from there.
@@ -280,5 +282,87 @@ describe("_settingsNotificationPrefsHtml", () => {
   it("emits nothing when prefs are null but mcp is available (self-host)", () => {
     const html = _settingsNotificationPrefsHtml(PID, null, PREFS, { base_url: "x" });
     expect(html).toBe("");
+  });
+});
+
+// 02dbd8b4 — runtime configuration generation status (tunnel/executor settings).
+describe("formatTunnelConfigGenerationStatus", () => {
+  it("reports 'Unknown' when no generation info is present", () => {
+    expect(formatTunnelConfigGenerationStatus(undefined).tone).toBe("unknown");
+    expect(formatTunnelConfigGenerationStatus(null).tone).toBe("unknown");
+    expect(formatTunnelConfigGenerationStatus({}).tone).toBe("unknown");
+  });
+
+  it("reports 'warn' + names the generation when restart_required is true", () => {
+    const r = formatTunnelConfigGenerationStatus({
+      generation: 3, config_hash: "abcdef0123456789", restart_required: true,
+    });
+    expect(r.tone).toBe("warn");
+    expect(r.label).toContain("Restart required");
+    expect(r.label).toContain("3");
+    expect(r.detail).toContain("meridian --tunnel");
+  });
+
+  it("reports 'ok' + names the generation when restart_required is false", () => {
+    const r = formatTunnelConfigGenerationStatus({
+      generation: 5, config_hash: "abcdef0123456789", restart_required: false,
+    });
+    expect(r.tone).toBe("ok");
+    expect(r.label).toContain("Applied");
+    expect(r.label).toContain("5");
+  });
+
+  it("truncates a long config hash for display but not identity", () => {
+    const full = "abcdef0123456789fedcba9876543210";
+    const r = formatTunnelConfigGenerationStatus({ generation: 1, config_hash: full, restart_required: false });
+    expect(r.detail).toContain(full.slice(0, 8));
+    expect(r.detail).not.toContain(full);
+  });
+});
+
+describe("_renderTunnelConfigGenerationBanner", () => {
+  const HOST_ID = `settings-body-${PID}`;
+
+  beforeEach(() => {
+    document.body.innerHTML = `<div id="${HOST_ID}"><div id="tunnel-plugins-section-${PID}"></div></div>`;
+  });
+
+  it("inserts a warning banner before the tunnel plugins section when restart_required", async () => {
+    (window as any).api = async (_path: string) => ({
+      config_generation: { default: { generation: 2, config_hash: "aaaaaaaa1111", restart_required: true } },
+    });
+    await _renderTunnelConfigGenerationBanner(PID);
+    const banner = document.getElementById(`tunnel-config-gen-banner-${PID}`);
+    expect(banner).not.toBeNull();
+    expect(banner!.textContent).toContain("Restart required");
+    // Banner must precede the tunnel plugins section, not be nested inside it
+    // (loadTunnelPluginsSection re-renders that section's innerHTML async and
+    // would otherwise wipe anything injected as a child of it).
+    const section = document.getElementById(`tunnel-plugins-section-${PID}`);
+    expect(banner!.compareDocumentPosition(section!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("renders no banner when the generation is applied (no restart needed)", async () => {
+    (window as any).api = async (_path: string) => ({
+      config_generation: { default: { generation: 4, config_hash: "bbbbbbbb2222", restart_required: false } },
+    });
+    await _renderTunnelConfigGenerationBanner(PID);
+    expect(document.getElementById(`tunnel-config-gen-banner-${PID}`)).toBeNull();
+  });
+
+  it("renders no banner and does not throw when the status fetch fails", async () => {
+    (window as any).api = async (_path: string) => { throw new Error("network error"); };
+    await expect(_renderTunnelConfigGenerationBanner(PID)).resolves.toBeUndefined();
+    expect(document.getElementById(`tunnel-config-gen-banner-${PID}`)).toBeNull();
+  });
+
+  it("is idempotent: re-rendering replaces the previous banner instead of duplicating it", async () => {
+    (window as any).api = async (_path: string) => ({
+      config_generation: { default: { generation: 2, config_hash: "aaaaaaaa1111", restart_required: true } },
+    });
+    await _renderTunnelConfigGenerationBanner(PID);
+    await _renderTunnelConfigGenerationBanner(PID);
+    const banners = document.querySelectorAll(`#${HOST_ID} [id="tunnel-config-gen-banner-${PID}"]`);
+    expect(banners.length).toBe(1);
   });
 });

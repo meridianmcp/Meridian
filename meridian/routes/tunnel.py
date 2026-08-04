@@ -28,6 +28,7 @@ import logging
 import os
 import time
 import uuid
+from collections import defaultdict
 from typing import Any
 
 import httpx
@@ -38,7 +39,7 @@ from .. import db as db_module
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
-    migrate_retired_overrides,
+    migrate_retired_overrides, config_fingerprint,
 )
 
 router = APIRouter()
@@ -324,6 +325,176 @@ def consume_tools_list_changed(tenant_id: str) -> bool:
         _tools_list_changed_pending.discard(tenant_id)
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Runtime configuration generation — sprint item 02dbd8b4
+#
+# Every tenant-scoped tunnel/executor settings write (tunnel plugin config,
+# per-host overrides) is stamped with a monotonically increasing generation
+# number, the effective config's content hash (tunnel_plugins.config_fingerprint),
+# and the server wall-clock time it was persisted. Config-bearing responses
+# (GET/PUT /tunnel/plugins, POST /tunnel/plugins/custom, DELETE
+# /tunnel/plugins/custom, GET /tunnel/status) echo this record back so the
+# dashboard, a connected tunnel client (best-effort, see tunnel_client.py's
+# startup config-generation fetch), and the connector cache can all be checked
+# against the same source of truth instead of silently drifting.
+#
+# Scope of this "highest-value core" pass (documented per the sprint item's own
+# escape hatch — the full item is substantial):
+#   * The generation registry is in-memory and per-process: it resets on a
+#     server restart and is NOT shared across Fly.io instances. A cold read
+#     after a reset re-seeds generation 1 from whatever is currently persisted
+#     (see get_runtime_config_generation) rather than reporting nothing, but a
+#     multi-instance-consistent counter would need a durable, shared store
+#     (e.g. a tenants column + migration) — out of scope for the files this
+#     item is allowed to touch. Follow-up: promote this to a DB-backed counter.
+#   * restart_required is decided at WRITE time from has_active_tunnel(): True
+#     iff some tunnel socket for the tenant was connected when the config
+#     changed (an already-spawned slot subprocess was launched from the OLD
+#     config and cannot safely absorb a slot-definition change without a
+#     coordinated restart — 02dbd8b4: "do not silently restart a tunnel while
+#     actively serving requests"). It does NOT automatically clear itself on a
+#     later reconnect (the registry does not currently track per-connection
+#     "loaded generation" handshakes) — a stale True after a legitimate
+#     reconnect is a known, documented false-positive; clearing it precisely
+#     would need the client to report back the generation it actually loaded
+#     (tunnel_client.py's fetch is currently read-only/diagnostic, not fed back
+#     over the WebSocket — see the module docstring note there). No active
+#     tunnel at write time ⇒ False: nothing is running against the stale
+#     config, so the very next connect simply loads the new generation.
+#   * We never restart or kill a client process from here — there is no safe
+#     way to do that over the current wire protocol without dropping whatever
+#     that process is mid-serving. "Coordinate drain/restart safely" is
+#     implemented as *visibility* (config_generation + inflight counts + the
+#     resulting restart_required signal) an operator or a future automated
+#     drain-then-restart flow can act on, not as an auto-restart trigger.
+# ---------------------------------------------------------------------------
+
+# tenant_id -> hostname (None = tenant-default scope) -> generation record:
+#   {"generation": int, "config_hash": str, "source_timestamp": float,
+#    "restart_required": bool}
+_config_generations: "dict[str, dict[str | None, dict]]" = defaultdict(dict)
+
+# tenant_id -> asyncio.Lock. Serializes read-modify-write of a tenant's
+# generation counter so two concurrent settings writes (even across two
+# different hostnames of the same tenant — the counter is tenant-wide) can
+# never observe/assign a duplicate generation number or silently drop one
+# write's bump. Never shared across tenants (project/tenant isolation).
+_config_generation_locks: "dict[str, asyncio.Lock]" = defaultdict(asyncio.Lock)
+
+# tenant_id -> slot label -> count of requests currently in flight on that
+# slot. Maintained by _do_proxy (the single low-level chokepoint every HTTP
+# proxy route AND the MCP/jsonrpc bridge funnel through) purely so a restart
+# decision can answer "is this tenant's tunnel actively serving right now" —
+# never used for the existing per-slot admission-control semaphore, which
+# already has its own independent bookkeeping.
+_inflight_count: "dict[str, dict[str, int]]" = defaultdict(lambda: defaultdict(int))
+
+
+def _mark_inflight(tenant_id: str, label: str, delta: int) -> None:
+    """Adjust the (tenant, slot) in-flight counter, pruning empty entries."""
+    per_tenant = _inflight_count[tenant_id]
+    new_val = per_tenant.get(label, 0) + delta
+    if new_val <= 0:
+        per_tenant.pop(label, None)
+        if not per_tenant:
+            _inflight_count.pop(tenant_id, None)
+    else:
+        per_tenant[label] = new_val
+
+
+def tenant_inflight_counts(tenant_id: str) -> "dict[str, int]":
+    """Current per-slot in-flight request counts for a tenant (read-only)."""
+    return dict(_inflight_count.get(tenant_id, {}))
+
+
+def _seed_runtime_config_generation(
+    tenant_id: str, hostname: "str | None", current_config: Any,
+) -> dict:
+    """First-touch snapshot for a (tenant, host) scope with no recorded generation.
+
+    A fresh server process (or the first-ever read for this scope) has no
+    generation history yet. Rather than reporting "unknown" forever until the
+    next write, seed generation 1 for whatever is CURRENTLY persisted so a
+    cold read establishes a coherent baseline. This is pure discovery — it
+    never sets restart_required, since nothing changed as a result of reading.
+    """
+    record = {
+        "generation": 1,
+        "config_hash": config_fingerprint(current_config),
+        "source_timestamp": time.time(),
+        "restart_required": False,
+    }
+    _config_generations[tenant_id][hostname] = record
+    return dict(record)
+
+
+def get_runtime_config_generation(
+    tenant_id: str, hostname: "str | None", current_config: Any,
+) -> dict:
+    """Read-only: the latest known generation record for (tenant, hostname).
+
+    Seeds one from *current_config* on first read (see
+    _seed_runtime_config_generation) instead of returning nothing. Never
+    mutates restart_required and never bumps the generation number — only
+    bump_runtime_config_generation does that, and only after an actual write.
+    """
+    record = _config_generations[tenant_id].get(hostname)
+    if record is None:
+        return _seed_runtime_config_generation(tenant_id, hostname, current_config)
+    return dict(record)
+
+
+def all_runtime_config_generations(tenant_id: str) -> "dict[str, dict]":
+    """Every recorded (hostname -> generation record) for a tenant, JSON-safe.
+
+    Used by /tunnel/status so the dashboard can cross-check EVERY machine's
+    config generation from one call. The tenant-default scope (hostname=None)
+    is reported under the key ``"default"``. Does not seed missing entries —
+    only scopes that have actually been read/written via GET|PUT /tunnel/plugins
+    show up here (avoids fabricating per-host entries for hosts nobody asked
+    about yet).
+    """
+    return {
+        (host or "default"): dict(record)
+        for host, record in _config_generations.get(tenant_id, {}).items()
+    }
+
+
+async def bump_runtime_config_generation(
+    tenant_id: str, hostname: "str | None", normalized_config: Any,
+) -> dict:
+    """Advance (tenant, hostname)'s runtime config generation after a settings
+    write, and decide hot-reload vs restart-required.
+
+    Concurrency-safe: serialized per tenant via _config_generation_locks so two
+    overlapping writes for the same tenant can't assign/observe a duplicate
+    generation number or clobber each other's bump.
+
+    A write that doesn't actually change the effective config (identical hash
+    to the last recorded generation for this scope) is a no-op: the generation
+    number does NOT advance and restart_required is NOT touched — resaving
+    identical settings must never manufacture a fake pending restart.
+    """
+    lock = _config_generation_locks[tenant_id]
+    async with lock:
+        scope = _config_generations[tenant_id]
+        prev = scope.get(hostname)
+        new_hash = config_fingerprint(normalized_config)
+        if prev is not None and prev.get("config_hash") == new_hash:
+            return dict(prev)
+        next_gen = (prev.get("generation") if prev else 0) + 1
+        record = {
+            "generation": next_gen,
+            "config_hash": new_hash,
+            "source_timestamp": time.time(),
+            # has_active_tunnel is defined further down in this module; resolved
+            # at call time (module-level function lookup), not at def time.
+            "restart_required": has_active_tunnel(tenant_id),
+        }
+        scope[hostname] = record
+        return dict(record)
 
 
 def _record_slot_health(
@@ -1094,6 +1265,11 @@ async def _do_proxy(
             status_code=503,
             media_type="application/json",
         )
+    # 02dbd8b4 — mark this (tenant, slot) as actively serving so a runtime-config
+    # restart decision can see it (see tenant_inflight_counts / _mark_inflight
+    # above). Mirrors the semaphore's own acquire/release lifecycle 1:1 but is
+    # independent bookkeeping, not a substitute for the admission-control semaphore.
+    _mark_inflight(tenant_id, label, 1)
 
     req_id = str(uuid.uuid4())
     loop = asyncio.get_event_loop()
@@ -1168,6 +1344,7 @@ async def _do_proxy(
     finally:
         pending.pop(req_id, None)
         sem.release()
+        _mark_inflight(tenant_id, label, -1)
 
     status = int(resp_msg.get("status", 502))
     resp_headers = resp_msg.get("headers") or {}
@@ -1573,6 +1750,15 @@ async def tunnel_status(tenant_id: str) -> dict:
         "slot_status": {
             k: dict(v) for k, v in _slot_status_detail.get(tenant_id, {}).items()
         },
+        # 02dbd8b4 — runtime configuration generation per machine (hostname ->
+        # {generation, config_hash, source_timestamp, restart_required}), plus
+        # in-flight request counts and the resulting drain-safety verdict, so the
+        # dashboard's connection panel can show "settings changed — restart
+        # required" without a second round trip, and never silently claims a
+        # tunnel is in-sync with the latest saved config when it isn't.
+        "config_generation": all_runtime_config_generations(tenant_id),
+        "inflight": tenant_inflight_counts(tenant_id),
+        "safe_to_restart": not any(tenant_inflight_counts(tenant_id).values()),
     }
 
 
@@ -1686,6 +1872,11 @@ async def get_tunnel_plugins(request: Request) -> Response:
         "slot_status": {
             k: dict(v) for k, v in _slot_status_detail.get(tid, {}).items()
         },
+        # 02dbd8b4 — the generation currently in effect for THIS scope (default
+        # or ?hostname=X), so the settings UI can render "you're on generation N"
+        # / a restart-required banner without a second call, and a tunnel client
+        # can compare what it loaded at startup against this to detect drift.
+        "config_generation": get_runtime_config_generation(tid, hostname, parsed),
     })
 
 
@@ -1695,7 +1886,13 @@ async def put_tunnel_plugins(request: Request) -> Response:
 
     Accepts ``{"config": <overrides>}`` or a bare overrides dict/list. The config
     is normalized before storage; an empty result clears overrides (NULL → the
-    built-in defaults). Takes effect the next time `meridian --tunnel` (re)starts.
+    built-in defaults).
+
+    Every write bumps the tenant/hostname-scoped runtime configuration
+    generation (02dbd8b4) and reports back whether it is safe to treat as
+    already-applied or whether a running tunnel needs a restart to pick it up
+    — see ``config_generation`` in the response. A no-op save (identical
+    effective config) does not advance the generation or flag a restart.
     """
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
@@ -1732,11 +1929,13 @@ async def put_tunnel_plugins(request: Request) -> Response:
         stored = json.dumps(normalized) if normalized else None
         await db_module.update_tenant(
             request.app.state.db, tenant["id"], tunnel_plugins=stored)
+    gen_record = await bump_runtime_config_generation(tenant["id"], hostname, normalized)
     return _json_response({
         "ok": True,
         "hostname": hostname,
         "plugins": resolve_plugins(normalized),
         "config": normalized,
+        "config_generation": gen_record,
     })
 
 
@@ -1770,12 +1969,15 @@ def _config_as_entry_list(parsed: Any) -> list[dict]:
 
 
 async def _store_tunnel_config(request: Request, tenant: dict, hostname: str | None,
-                               entries: list[dict]) -> Any:
+                               entries: list[dict]) -> "tuple[Any, dict]":
     """Persist a full tunnel-plugins config (list of entries) for a tenant/machine.
 
     Mirrors put_tunnel_plugins' storage: with ``hostname`` it writes that
     machine's slice of ``tunnel_plugins_by_host``; otherwise the per-tenant
-    ``tunnel_plugins`` default. Returns the normalized config that was stored.
+    ``tunnel_plugins`` default. Also bumps the (tenant, hostname) runtime
+    config generation (02dbd8b4) exactly like put_tunnel_plugins, since a
+    custom-plugin add/remove changes the same effective config. Returns
+    ``(normalized_config, generation_record)``.
     """
     normalized = normalize_plugins_config(entries)
     if hostname:
@@ -1792,7 +1994,8 @@ async def _store_tunnel_config(request: Request, tenant: dict, hostname: str | N
         stored = json.dumps(normalized) if normalized else None
         await db_module.update_tenant(
             request.app.state.db, tenant["id"], tunnel_plugins=stored)
-    return normalized
+    gen_record = await bump_runtime_config_generation(tenant["id"], hostname, normalized)
+    return normalized, gen_record
 
 
 def _current_tunnel_config(tenant: dict, hostname: str | None) -> Any:
@@ -1848,7 +2051,7 @@ async def add_custom_plugin(request: Request) -> Response:
         return _json_response({"error": err}, status_code=400)
 
     entries.append(entry)
-    await _store_tunnel_config(request, tenant, hostname, entries)
+    _, gen_record = await _store_tunnel_config(request, tenant, hostname, entries)
     # Re-read the stored config so the returned custom list reflects exactly what
     # persisted (and would resolve at tunnel spawn). force_refresh=True bypasses
     # the 20889f40 request.state memoization, which would otherwise still hold
@@ -1860,6 +2063,7 @@ async def add_custom_plugin(request: Request) -> Response:
         "hostname": hostname,
         "added": entry,
         "custom": resolve_custom_plugins(stored),
+        "config_generation": gen_record,
     })
 
 
@@ -1911,7 +2115,7 @@ async def remove_custom_plugin(request: Request) -> Response:
         return _json_response(
             {"error": f"no custom plugin named '{name}'"}, status_code=404)
 
-    await _store_tunnel_config(request, tenant, hostname, kept)
+    _, gen_record = await _store_tunnel_config(request, tenant, hostname, kept)
     # force_refresh=True -- see add_custom_plugin above for why this can't use
     # the memoized 20889f40 tenant snapshot.
     stored = _current_tunnel_config(
@@ -1921,6 +2125,7 @@ async def remove_custom_plugin(request: Request) -> Response:
         "hostname": hostname,
         "removed": name,
         "custom": resolve_custom_plugins(stored),
+        "config_generation": gen_record,
     })
 
 

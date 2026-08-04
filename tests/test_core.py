@@ -1074,7 +1074,9 @@ def test_websocket_receives_task_event(client):
 def test_tunnel_status_returns_inactive_for_unknown_tenant(client):
     r = client.get("/tunnel/status/no-such-tenant")
     assert r.status_code == 200
-    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "docs_active": False, "zotero_active": False, "outputs_active": False, "debug_active": False, "slot_health": {}, "slot_status": {}}
+    # 02dbd8b4 — config_generation/inflight/safe_to_restart are always present
+    # (empty/True for a tenant with no recorded runtime config generation yet).
+    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "docs_active": False, "zotero_active": False, "outputs_active": False, "debug_active": False, "slot_health": {}, "slot_status": {}, "config_generation": {}, "inflight": {}, "safe_to_restart": True}
 
 
 def test_fs_mcp_proxy_returns_503_when_not_hosted(client):

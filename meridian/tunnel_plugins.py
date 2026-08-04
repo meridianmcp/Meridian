@@ -19,6 +19,8 @@ Both the tunnel client (``tunnel_client.run_tunnel``) and the dashboard consume
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -883,6 +885,37 @@ def normalize_plugins_config(raw: Any) -> dict[str, dict]:
             ov["pool"] = pool
         out[name] = ov
     return out
+
+
+# 02dbd8b4 — runtime configuration generation: every settings write is stamped
+# with a monotonically increasing generation number, a content hash of the
+# EFFECTIVE config, and a source timestamp (see routes/tunnel.py's
+# ``bump_runtime_config_generation`` / ``get_runtime_config_generation``). The
+# hash lives here, next to ``normalize_plugins_config``, so it stays a pure,
+# dependency-free function the tunnel client can also import without pulling
+# in the server's DB/WebSocket machinery.
+def config_fingerprint(raw_config: Any) -> str:
+    """Stable content hash of a tunnel plugin config.
+
+    Normalizes *raw_config* first (:func:`normalize_plugins_config`) so
+    cosmetically different but semantically identical configs — list vs
+    dict-keyed form, key order, an explicit ``{}`` vs ``None`` vs ``[]`` —
+    fingerprint identically. This is the "effective configuration hash"
+    reported alongside the runtime config generation: the dashboard, a
+    connected tunnel client, and the connector cache can all compare hashes
+    instead of deep-diffing JSON blobs to answer "are we looking at the same
+    configuration?", and a settings write that doesn't actually change
+    anything (identical hash) does not need to advance the generation counter
+    or demand a restart.
+
+    Pure — no I/O, no randomness: the same input always yields the same
+    16-hex-char digest (truncated sha256; short enough to log/display, long
+    enough that an accidental collision between two genuinely different
+    configs is not a practical concern for this change-detection use case).
+    """
+    normalized = normalize_plugins_config(raw_config)
+    canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def _normalize_pool_override(raw: Any) -> "dict | None":

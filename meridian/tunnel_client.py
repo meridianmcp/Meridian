@@ -4787,6 +4787,46 @@ async def _fetch_filesystem_roots(
     return [], [], "", []
 
 
+async def _fetch_config_generation(
+    base_url: str, token: str, hostname: "str | None",
+) -> "dict | None":
+    """GET /tunnel/plugins — read-only fetch of the runtime config generation
+    record for this machine (02dbd8b4: "every tunnel process ... must report
+    the generation loaded").
+
+    This is a diagnostic/reporting value only, fetched once at startup and
+    printed alongside the rest of the startup banner (see run_tunnel) — it does
+    NOT change what actually spawns (the ``/me``-sourced ``tunnel_plugins``/
+    ``tunnel_plugins_config`` fields resolved above remain authoritative for
+    that), and it is not fed back to the server over the WebSocket. A live,
+    continuously-updated staleness check (the process noticing MID-RUN that a
+    newer generation now exists) would need either a background poll loop or a
+    new server->client push message — both real additions to the wire
+    protocol, deliberately left as follow-up rather than risked here (see the
+    generation-tracking module note in routes/tunnel.py for the parallel
+    server-side scope note).
+
+    Best-effort: returns ``None`` on any failure (older server without this
+    field, network hiccup, non-200) so it can never block or fail startup.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{base_url}/tunnel/plugins",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"hostname": hostname} if hostname else None,
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+    except Exception:  # noqa: BLE001 — best-effort, never blocks startup
+        return None
+    gen = data.get("config_generation") if isinstance(data, dict) else None
+    return gen if isinstance(gen, dict) else None
+
+
 # ---------------------------------------------------------------------------
 # Auto-index helper (calls index_repository on codebase-memory-mcp proxy)
 # ---------------------------------------------------------------------------
@@ -5957,6 +5997,29 @@ async def run_tunnel(
     fs_roots, known_repo_paths, cfg_serena_repo_path, cfg_code_dirs = (
         await _fetch_filesystem_roots(base_url, token)
     )
+    # 02dbd8b4 — best-effort report of the runtime config generation this
+    # process is loading (see _fetch_config_generation's docstring for exactly
+    # what this does and does not cover). Purely informational: printed once at
+    # startup so an operator can compare it against the dashboard's Settings →
+    # Tunnel Plugins generation and see at a glance whether this running
+    # process is current or is serving a stale (pre-change) generation.
+    try:
+        import socket as _socket  # noqa: PLC0415 — stdlib, local import keeps module import light
+        _gen_hostname = _socket.gethostname() or ""
+    except Exception:  # noqa: BLE001
+        _gen_hostname = ""
+    loaded_config_generation = await _fetch_config_generation(
+        base_url, token, _gen_hostname or None)
+    if loaded_config_generation:
+        _gen_no = loaded_config_generation.get("generation")
+        _gen_hash = loaded_config_generation.get("config_hash")
+        _gen_restart = loaded_config_generation.get("restart_required")
+        print(
+            f"  config generation: {_gen_no} (hash {_gen_hash})"
+            + ("  [server shows this tenant needs a restart to apply a NEWER "
+               "change made while a tunnel was connected]" if _gen_restart else ""),
+            flush=True,
+        )
     # b970fe07 — Serena's default --project. The CLI --repo always wins; only when
     # it was absent (repo_path defaulted to cwd) does a configured serena_repo_path
     # take over. Unset config → serena_repo_path stays == repo_path (today's cwd

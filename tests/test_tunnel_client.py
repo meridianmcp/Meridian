@@ -4761,3 +4761,140 @@ def test_staleness_alert_loop_survives_probe_exception(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "has been updated" not in captured.err
     assert state["n"] >= 3
+
+
+# ---------------------------------------------------------------------------
+# _fetch_config_generation — sprint item 02dbd8b4
+#
+# GET /tunnel/plugins purely to learn the runtime config generation record the
+# server has for this (tenant, hostname) — a best-effort, read-only diagnostic
+# fetch the client reports at startup (see run_tunnel). Must never raise and
+# must never block startup on a slow/broken/pre-feature server.
+# ---------------------------------------------------------------------------
+
+def test_fetch_config_generation_returns_the_record(monkeypatch):
+    """A 200 response with a config_generation object is returned verbatim."""
+    calls = []
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {
+                "plugins": [], "config": {},
+                "config_generation": {
+                    "generation": 3, "config_hash": "abc123", "source_timestamp": 1.0,
+                    "restart_required": True,
+                },
+            }
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw):
+            calls.append((url, kw))
+            return FakeResp()
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(tc._fetch_config_generation("https://x.test", "tok", "myhost"))
+    assert result == {
+        "generation": 3, "config_hash": "abc123", "source_timestamp": 1.0,
+        "restart_required": True,
+    }
+    # Hits GET /tunnel/plugins with the hostname scoped as a query param and an
+    # Authorization header carrying the token (mirrors _fetch_filesystem_roots).
+    url, kw = calls[0]
+    assert url == "https://x.test/tunnel/plugins"
+    assert kw["headers"]["Authorization"] == "Bearer tok"
+    assert kw["params"] == {"hostname": "myhost"}
+
+
+def test_fetch_config_generation_omits_hostname_param_when_none(monkeypatch):
+    calls = []
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {"config_generation": {"generation": 1, "config_hash": "h", "restart_required": False}}
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw):
+            calls.append(kw)
+            return FakeResp()
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+
+    asyncio.run(tc._fetch_config_generation("https://x.test", "tok", None))
+    assert calls[0]["params"] is None
+
+
+def test_fetch_config_generation_none_on_non_200(monkeypatch):
+    class FakeResp:
+        status_code = 401
+        def json(self):
+            raise AssertionError("must not parse body of a non-200 response")
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, *a, **kw): return FakeResp()
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+
+    assert asyncio.run(tc._fetch_config_generation("https://x.test", "tok", None)) is None
+
+
+def test_fetch_config_generation_none_on_network_error(monkeypatch):
+    """Best-effort: a transport error must never raise out of the helper."""
+    class ErrorClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, *a, **kw): raise Exception("connection refused")
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", ErrorClient)
+
+    assert asyncio.run(tc._fetch_config_generation("https://x.test", "tok", None)) is None
+
+
+def test_fetch_config_generation_none_when_field_absent_or_wrong_type(monkeypatch):
+    """An older server's /tunnel/plugins response has no config_generation key —
+    must degrade to None, not KeyError/AttributeError, so a pre-02dbd8b4 server
+    never breaks tunnel startup."""
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, *a, **kw):
+            return self
+
+    class FakeRespNoField:
+        status_code = 200
+        def json(self):
+            return {"plugins": []}  # no config_generation at all
+
+    class FakeRespWrongType:
+        status_code = 200
+        def json(self):
+            return {"config_generation": "not-a-dict"}
+
+    import httpx as _httpx
+
+    class Client1(FakeClient):
+        async def get(self, *a, **kw): return FakeRespNoField()
+    monkeypatch.setattr(_httpx, "AsyncClient", Client1)
+    assert asyncio.run(tc._fetch_config_generation("https://x.test", "tok", None)) is None
+
+    class Client2(FakeClient):
+        async def get(self, *a, **kw): return FakeRespWrongType()
+    monkeypatch.setattr(_httpx, "AsyncClient", Client2)
+    assert asyncio.run(tc._fetch_config_generation("https://x.test", "tok", None)) is None
