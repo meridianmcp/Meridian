@@ -30,6 +30,31 @@ if _EXT_PATH not in sys.path:
 from meridian_docs import docs_intel  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _default_render_capability(monkeypatch):
+    """016015e1/ddd79188 -- insert_equation_local, insert_caption, and
+    insert_highlighted_note (mode="inline") now invoke the real
+    render-capability gate (render_gate.check_render_capability) AFTER
+    structural verification passes. Every test in this file exercises
+    STRUCTURAL correctness and must not depend on -- or be slowed/blocked
+    by -- whichever render backends (LibreOffice, Word COM) happen to be
+    installed on the machine running the suite. Stub a successful
+    'rendered' result by default, mirroring
+    test_19be1551_insert_figure_block.py's fixture of the same name. Tests
+    that specifically exercise the render gate's own contract override this
+    stub explicitly (see test_docx_word_com_regression.py).
+    """
+    monkeypatch.setattr(
+        docs_intel.render_gate,
+        "check_render_capability",
+        lambda docx_path, **kwargs: {
+            "status": "rendered",
+            "backend": "test-stub",
+            "detail": {"stub": True},
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Shared constants and helpers
 # ---------------------------------------------------------------------------

@@ -562,6 +562,8 @@ def insert_caption(
     section_heading: str | None = None,
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real Word Caption paragraph into a .docx file.
@@ -577,6 +579,20 @@ def insert_caption(
     4efc63fd — style_policy["caption_centered"] (default False) controls
     whether the new caption gets w:jc w:val="center".
 
+    ddd79188 — AFTER the write is staged, structurally verified, and
+    promoted, a real render-capability check (check_render_capability) also
+    runs against the just-written file: structural re-parse alone can never
+    prove the document actually opens/renders in Word. "rendered" continues
+    normally with render evidence attached. "failed" (a render backend was
+    available but errored on this document) restores the pre-write backup
+    and returns an error, same as a structural verification failure.
+    "unavailable-with-reason" (no render backend in this environment) ALSO
+    fails closed by default — never reported as verified — unless
+    allow_degraded_render=True is passed together with a non-empty
+    degraded_render_reason, an audited opt-in that keeps the write but
+    stamps render_verified=False / render_degraded=True on the result
+    instead of silently treating "could not check" as "passed".
+
     Args:
       docx_path:       Absolute path to the .docx file (mutated in place).
       anchor_para_id:  w14:paraId or p{N} of the paragraph/table to anchor on.
@@ -590,6 +606,17 @@ def insert_caption(
                        next read auto-reindexes (keeps metadata in sync).
       style_policy:    Optional style policy overrides (see
                        resolve_style_policy / audit_equation_style).
+      allow_degraded_render: ddd79188 — explicit, audited opt-in to accept
+                       this write when no render backend is available in
+                       this environment (render status
+                       "unavailable-with-reason"). Requires
+                       degraded_render_reason. Never bypasses a real render
+                       "failed" status.
+      degraded_render_reason: Required, non-empty when allow_degraded_render
+                       is True; carried onto the result as an audit trail
+                       (this stdlib-only, DB-free extension does not persist
+                       it itself — a caller with DB access, e.g. Meridian
+                       core, is responsible for logging/pinning it).
       session_id:      273df573 — identifies the calling Meridian session to
                        the tunnel-layer DOCX region-claim guard
                        (check_docs_write_conflict in meridian/routes/
@@ -598,8 +625,12 @@ def insert_caption(
                        (e.g. standalone `uvx meridian-docs`).
 
     Returns:
-      {status, kind, seq_number, label_text, section_heading, docx_path}
-      or {error: <message>} on failure (file NOT mutated on error).
+      {status, kind, seq_number, label_text, section_heading, ref_bookmark,
+      docx_path, render_status, render_verified, render_backend,
+      render_detail}
+      or {error: <message>} on failure (file NOT left mutated on validation
+      failure; restored from backup on a structural- or render-verification
+      failure).
     """
     return docs_intel.insert_caption(
         docx_path=docx_path,
@@ -610,6 +641,8 @@ def insert_caption(
         section_heading=section_heading,
         index_db_path=index_db_path,
         style_policy=style_policy,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 
@@ -980,6 +1013,8 @@ def insert_equation(
     position: str = "after",
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Insert an equation into a .docx file.
@@ -998,6 +1033,20 @@ def insert_equation(
     left indentation (body_indent_twips, default 0). Not consulted for
     position="append".
 
+    ddd79188 — AFTER the write is staged, structurally verified, and
+    promoted, a real render-capability check (check_render_capability) also
+    runs against the just-written file: structural re-parse alone can never
+    prove the document actually opens/renders in Word. "rendered" continues
+    normally with render evidence attached. "failed" (a render backend was
+    available but errored on this document) restores the pre-write backup
+    and returns an error, same as a structural verification failure.
+    "unavailable-with-reason" (no render backend in this environment) ALSO
+    fails closed by default — never reported as verified — unless
+    allow_degraded_render=True is passed together with a non-empty
+    degraded_render_reason, an audited opt-in that keeps the write but
+    stamps render_verified=False / render_degraded=True on the result
+    instead of silently treating "could not check" as "passed".
+
     Args:
       docx_path:       Absolute path to the .docx file (mutated in place).
       anchor_para_id:  w14:paraId or p{N}/tbl{N} to anchor the insertion.
@@ -1006,6 +1055,11 @@ def insert_equation(
       index_db_path:   If supplied, sidecar is invalidated after write.
       style_policy:    Optional style policy overrides (see
                        resolve_style_policy / audit_equation_style).
+      allow_degraded_render: ddd79188 — explicit, audited opt-in to accept
+                       this write when no render backend is available in
+                       this environment. Requires degraded_render_reason.
+      degraded_render_reason: Required, non-empty when allow_degraded_render
+                       is True; carried onto the result as an audit trail.
       session_id:      273df573 — identifies the calling Meridian session to
                        the tunnel-layer DOCX region-claim guard
                        (check_docs_write_conflict in meridian/routes/
@@ -1014,8 +1068,11 @@ def insert_equation(
                        (e.g. standalone `uvx meridian-docs`).
 
     Returns:
-      {status, position, para_id, omml, docx_path}
-      or {error: <message>} on failure (file NOT mutated on error).
+      {status, position, para_id, omml, docx_path, render_status,
+      render_verified, render_backend, render_detail}
+      or {error: <message>} on failure (file NOT left mutated on validation
+      failure; restored from backup on a structural- or render-verification
+      failure).
     """
     return docs_intel.insert_equation_local(
         docx_path=docx_path,
@@ -1024,6 +1081,8 @@ def insert_equation(
         position=position,
         index_db_path=index_db_path,
         style_policy=style_policy,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 
@@ -1488,6 +1547,8 @@ def insert_highlighted_note(
     author: str = "Meridian",
     initials: str = "M",
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert an internal note inline or as a native Word comment.
@@ -1501,6 +1562,23 @@ def insert_highlighted_note(
     consulted for mode="comment". Distinct from the `style` parameter above,
     which selects the note's category (only "internal_note" is supported),
     not its rendering.
+
+    ddd79188 — for mode="inline", AFTER the write is staged, structurally
+    verified, and promoted, a real render-capability check
+    (check_render_capability) also runs against the just-written file:
+    structural re-parse alone can never prove the document actually
+    opens/renders in Word. "rendered" continues normally with render
+    evidence attached. "failed" restores the pre-write backup and returns an
+    error. "unavailable-with-reason" (no render backend in this environment)
+    ALSO fails closed by default — never reported as verified — unless
+    allow_degraded_render=True is passed together with a non-empty
+    degraded_render_reason. For mode="comment", these two params are
+    forwarded to insert_word_comment, which already enforces this same gate.
+
+    allow_degraded_render / degraded_render_reason: explicit, audited opt-in
+      to accept a write when no render backend is available in this
+      environment; degraded_render_reason is required and must be non-empty
+      whenever allow_degraded_render=True.
 
     session_id: 273df573 — identifies the calling Meridian session to the
       tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
@@ -1519,6 +1597,8 @@ def insert_highlighted_note(
         author=author,
         initials=initials,
         style_policy=style_policy,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 

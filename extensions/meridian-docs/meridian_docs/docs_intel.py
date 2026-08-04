@@ -4156,6 +4156,103 @@ def find_image_paragraph(
 # Public caption API: insert / edit / remove
 # ---------------------------------------------------------------------------
 
+def _verify_caption_write(
+    docx_path: str,
+    *,
+    ref_bookmark: str,
+    kind: str,
+    expected_seq_number: int,
+    expected_label_text: str,
+) -> dict[str, Any] | None:
+    """9d749639 follow-up (ddd79188) — post-write verification for
+    :func:`insert_caption`, mirroring :func:`_verify_figure_block_write`'s
+    "brand new content, no prior on-disk baseline to diff against" style
+    (:func:`_verify_docx_write`'s count/hash comparison has nothing to diff
+    a freshly inserted caption against).
+
+    Re-reads ``docx_path`` FRESH FROM DISK and locates the caption paragraph
+    by its unique ``ref_bookmark`` (1c59cb90's ``_Ref<digits>`` bookmark,
+    document-unique and assigned before the write) rather than by position —
+    positions shift, bookmarks don't. Confirms that paragraph still carries a
+    ``SEQ <kind>`` field with the expected cached number and the expected
+    label text. Returns ``None`` when every check passes, or an
+    ``{"error": ...}`` dict on the first mismatch.
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    w_bookmark_start = _q(_W, "bookmarkStart")
+    w_p = _q(_W, "p")
+    caption_para = next(
+        (
+            child
+            for child in body2
+            if child.tag == w_p
+            and any(
+                bm.get(_q(_W, "name")) == ref_bookmark
+                for bm in child.findall(w_bookmark_start)
+            )
+        ),
+        None,
+    )
+    if caption_para is None:
+        return {
+            "error": (
+                "post-write verification failed: no caption paragraph "
+                f"carrying bookmark {ref_bookmark!r} was found in "
+                f"{docx_path} after the write"
+            )
+        }
+
+    fld = caption_para.find(_q(_W, "fldSimple"))
+    instr = fld.get(_q(_W, "instr")) if fld is not None else None
+    if fld is None or f"SEQ {kind}" not in (instr or ""):
+        return {
+            "error": (
+                "post-write verification failed: caption paragraph "
+                f"(bookmark {ref_bookmark!r}) does not contain a SEQ {kind} "
+                "field after the write"
+            )
+        }
+    seq_text_el = fld.find(f".//{_q(_W, 't')}")
+    seq_text = seq_text_el.text if seq_text_el is not None else None
+    if seq_text != str(expected_seq_number):
+        return {
+            "error": (
+                "post-write verification failed: caption SEQ number "
+                f"mismatch (expected {expected_seq_number!r}, got "
+                f"{seq_text!r})"
+            )
+        }
+
+    caption_text = "".join(t.text or "" for t in caption_para.iter(_q(_W, "t")))
+    if expected_label_text not in caption_text:
+        return {
+            "error": (
+                "post-write verification failed: caption label text "
+                f"mismatch (expected to contain {expected_label_text!r}, "
+                f"got {caption_text!r})"
+            )
+        }
+    return None
+
+
 def insert_caption(
     docx_path: str,
     anchor_para_id: str,
@@ -4165,6 +4262,8 @@ def insert_caption(
     section_heading: str | None = None,
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real Word Caption paragraph into a .docx file.
 
@@ -4179,6 +4278,23 @@ def insert_caption(
     4efc63fd — ``style_policy["caption_centered"]`` (default ``False``, via
     :func:`resolve_style_policy`) controls whether the new caption paragraph
     gets ``w:jc w:val="center"``.
+
+    ddd79188 — AFTER the write is staged, structurally verified (see
+    :func:`_verify_caption_write`), and promoted, a real Word/COM (or
+    LibreOffice) render-capability check also runs against the just-written
+    file (:func:`_enforce_render_verification`), mirroring the same gate
+    :func:`insert_figure_block` already enforces: structural XML re-parse
+    alone can never prove the document actually opens/renders in Word.
+    ``"rendered"`` continues normally with render evidence attached to the
+    success payload. ``"failed"`` (a render backend WAS available but errored
+    on this document) restores ``docx_path`` from the pre-write backup and
+    returns an error — exactly like a structural verification failure.
+    ``"unavailable-with-reason"`` (no render backend in this environment)
+    ALSO fails closed by default — never reported as verified — unless the
+    caller explicitly passes ``allow_degraded_render=True`` with a non-empty
+    ``degraded_render_reason``, an audited opt-in that keeps the write but
+    stamps ``render_verified=False`` / ``render_degraded=True`` on the
+    payload rather than silently treating "could not check" as "passed".
 
     Args:
         docx_path:       Absolute path to the .docx file (mutated in place).
@@ -4198,14 +4314,29 @@ def insert_caption(
                          after the write so the next read auto-reindexes.
         style_policy:    Optional overrides merged via
                          :func:`resolve_style_policy`.
+        allow_degraded_render: ddd79188 — explicit, audited opt-in to accept
+                         this write when no render backend is available in
+                         this environment (render status
+                         "unavailable-with-reason"). Requires
+                         degraded_render_reason. Never bypasses a real render
+                         "failed" status.
+        degraded_render_reason: Required, non-empty when
+                         allow_degraded_render is True; carried onto the
+                         result as an audit trail (this stdlib-only, DB-free
+                         extension does not persist it itself — a caller with
+                         DB access, e.g. Meridian core, is responsible for
+                         logging/pinning it).
 
     Returns:
         ``{status, kind, seq_number, label_text, section_heading, ref_bookmark,
-        docx_path}`` or ``{"error": <message>}`` on failure (file is NOT
-        mutated on error).  ``ref_bookmark`` (1c59cb90) is the ``_Ref<digits>``
-        bookmark name wrapping the caption's "<Kind> <N>" text — pass it as
-        ``bookmark_name`` to :func:`insert_cross_reference` to insert a live
-        "Figure N" prose reference elsewhere that survives reordering.
+        docx_path, render_status, render_verified, render_backend,
+        render_detail}`` or ``{"error": <message>}`` on failure (file NOT
+        left mutated on validation failure; restored from backup on a
+        structural- or render-verification failure).  ``ref_bookmark``
+        (1c59cb90) is the ``_Ref<digits>`` bookmark name wrapping the
+        caption's "<Kind> <N>" text — pass it as ``bookmark_name`` to
+        :func:`insert_cross_reference` to insert a live "Figure N" prose
+        reference elsewhere that survives reordering.
     """
     kind = str(kind).strip()
     if kind not in ("Figure", "Table"):
@@ -4226,6 +4357,16 @@ def insert_caption(
         }
     if not label_text or not str(label_text).strip():
         return {"error": "label_text must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
 
     try:
         policy = resolve_style_policy(style_policy)
@@ -4247,10 +4388,11 @@ def insert_caption(
 
     seq_number = _count_seq_captions(root, kind) + 1
     ref_bookmark = _next_ref_bookmark_name(root)
+    label_text_clean = label_text.strip()
 
     caption_p = _build_caption_paragraph(
         kind=kind,
-        label_text=label_text.strip(),
+        label_text=label_text_clean,
         seq_cached=str(seq_number),
         ref_bookmark=ref_bookmark,
         centered=policy["caption_centered"],
@@ -4259,10 +4401,78 @@ def insert_caption(
     insert_at = child_idx if position == "before" else child_idx + 1
     body.insert(insert_at, caption_p)
 
-    try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    # ddd79188 -- hold docx_path's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write structural verify, any conditional restore, and
+    # the real render-capability gate below -- closing the same-process
+    # window between promotion and verify/restore entirely (see
+    # _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_caption_write(
+            docx_path,
+            ref_bookmark=ref_bookmark,
+            kind=kind,
+            expected_seq_number=seq_number,
+            expected_label_text=label_text_clean,
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to docx_path
+            # since our own promotion, in which case this verification
+            # "failure" is a false positive and restoring from our own
+            # backup would destroy that writer's completed, already-
+            # promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["kind"] = kind
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        # ddd79188 -- structural verification alone (above) can never prove
+        # the document actually renders in Word; run the real render-
+        # capability gate now, still inside the promotion lock so a
+        # fail-closed restore has the same CAS safety a structural failure
+        # gets. Must run AFTER structural verification, not instead of it.
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["kind"] = kind
+            render_error["docx_path"] = docx_path
+            return render_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
@@ -4272,7 +4482,7 @@ def insert_caption(
             kind=kind,
             para_id=None,  # newly inserted para has no w14:paraId yet
             seq_number=str(seq_number),
-            caption_text=f"{kind} {seq_number}. {label_text.strip()}",
+            caption_text=f"{kind} {seq_number}. {label_text_clean}",
             section_heading=section_heading,
             ref_bookmark=ref_bookmark,
         )
@@ -4281,10 +4491,11 @@ def insert_caption(
         "status": "inserted",
         "kind": kind,
         "seq_number": seq_number,
-        "label_text": label_text.strip(),
+        "label_text": label_text_clean,
         "section_heading": section_heading,
         "ref_bookmark": ref_bookmark,
         "docx_path": docx_path,
+        **render_info,
     }
 
 
@@ -6232,6 +6443,107 @@ def _build_omath_paragraph(
     return p
 
 
+def _verify_equation_write(
+    docx_path: str,
+    *,
+    position: str,
+    anchor_para_id: str,
+    insert_at: int | None,
+    expected_flat_text: str,
+) -> dict[str, Any] | None:
+    """a80af3a0 follow-up (ddd79188) — post-write verification for
+    :func:`insert_equation_local`, mirroring :func:`_verify_figure_block_write`'s
+    "brand new content, no prior on-disk baseline to diff against" style.
+
+    Re-reads ``docx_path`` FRESH FROM DISK. For ``position="append"``, the
+    anchor paragraph itself was mutated (nothing new was inserted at the body
+    level) so it is re-resolved via :func:`_find_para_by_id` using the SAME
+    ``anchor_para_id`` the caller was given. For ``position="before"``/
+    ``"after"``, a brand-new paragraph carries no bookmark or native id of
+    its own (unlike :func:`insert_caption`/:func:`insert_highlighted_note`'s
+    paragraphs) — it is located by the exact body index (``insert_at``) it
+    was spliced into, still inside the SAME promotion-lock critical section
+    as our own promotion, mirroring :func:`_verify_docx_write`'s
+    ``expected_range`` positional check.
+
+    Either way, confirms the located paragraph contains an ``<m:oMath>``
+    whose flattened ``<m:t>`` text content (:func:`_omml_flatten_text_local`)
+    matches ``expected_flat_text``. Returns ``None`` when every check
+    passes, or an ``{"error": ...}`` dict on the first mismatch.
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    if position == "append":
+        located = _find_para_by_id(root2, anchor_para_id)
+        if located is None:
+            return {
+                "error": (
+                    "post-write verification failed: anchor paragraph "
+                    f"{anchor_para_id!r} not found in {docx_path} after "
+                    "the write"
+                )
+            }
+        _abody, para_elem, _acidx = located
+        where = f"anchor paragraph {anchor_para_id!r}"
+    else:
+        body_list = list(body2)
+        if insert_at is None or insert_at >= len(body_list):
+            return {
+                "error": (
+                    "post-write verification failed: expected a new "
+                    f"equation paragraph at body index {insert_at!r} in "
+                    f"{docx_path} after the write, but the document only "
+                    f"has {len(body_list)} top-level element(s)"
+                )
+            }
+        para_elem = body_list[insert_at]
+        if para_elem.tag != _q(_W, "p"):
+            return {
+                "error": (
+                    "post-write verification failed: body index "
+                    f"{insert_at!r} is not a paragraph in {docx_path} after "
+                    "the write"
+                )
+            }
+        where = f"new equation paragraph at body index {insert_at!r}"
+
+    omath_els = para_elem.findall(f".//{_qm('oMath')}")
+    if not omath_els:
+        return {
+            "error": (
+                f"post-write verification failed: {where} does not contain "
+                f"an <m:oMath> element in {docx_path} after the write"
+            )
+        }
+    actual_flat_text = "".join(t.text or "" for t in omath_els[-1].iter(_qm("t")))
+    if actual_flat_text != expected_flat_text:
+        return {
+            "error": (
+                f"post-write verification failed: equation content "
+                f"mismatch in {where} (expected flattened text "
+                f"{expected_flat_text!r}, got {actual_flat_text!r})"
+            )
+        }
+    return None
+
+
 def insert_equation_local(
     docx_path: str,
     anchor_para_id: str,
@@ -6239,6 +6551,8 @@ def insert_equation_local(
     position: str = "after",
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Insert an equation into a .docx file.
 
@@ -6261,6 +6575,19 @@ def insert_equation_local(
     default 0 / no indent). Not consulted for ``position="append"`` (inline
     equations have no paragraph of their own to style).
 
+    ddd79188 — AFTER the write is staged, structurally verified (see
+    :func:`_verify_equation_write`), and promoted, a real Word/COM (or
+    LibreOffice) render-capability check also runs against the just-written
+    file (:func:`_enforce_render_verification`), mirroring the same gate
+    :func:`insert_figure_block` already enforces: structural XML re-parse
+    alone can never prove the document actually opens/renders in Word.
+    ``"rendered"`` continues normally with render evidence attached to the
+    success payload. ``"failed"`` restores ``docx_path`` from the pre-write
+    backup and returns an error. ``"unavailable-with-reason"`` (no render
+    backend in this environment) ALSO fails closed by default — never
+    reported as verified — unless the caller explicitly passes
+    ``allow_degraded_render=True`` with a non-empty ``degraded_render_reason``.
+
     Args:
         docx_path:       Absolute path to the .docx file (mutated in place).
         anchor_para_id:  ``w14:paraId`` or ``p{N}`` / ``tbl{N}`` of the
@@ -6273,15 +6600,34 @@ def insert_equation_local(
         style_policy:    Optional overrides merged via
                          :func:`resolve_style_policy`; see that function's
                          docstring for keys.
+        allow_degraded_render: ddd79188 — explicit, audited opt-in to accept
+                         this write when no render backend is available in
+                         this environment. Requires degraded_render_reason.
+        degraded_render_reason: Required, non-empty when
+                         allow_degraded_render is True; carried onto the
+                         result as an audit trail.
 
     Returns:
-        ``{status, position, para_id, omml, docx_path}``
-        or ``{"error": <message>}`` on failure (file NOT mutated on error).
+        ``{status, position, para_id, omml, docx_path, render_status,
+        render_verified, render_backend, render_detail}``
+        or ``{"error": <message>}`` on failure (file NOT left mutated on
+        validation failure; restored from backup on a structural- or
+        render-verification failure).
     """
     if position not in ("before", "after", "append"):
         return {"error": f"position must be 'before', 'after', or 'append', got {position!r}"}
     if not payload or not str(payload).strip():
         return {"error": "payload must be a non-empty string (OMML XML or LaTeX)"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
 
     try:
         policy = resolve_style_policy(style_policy)
@@ -6309,6 +6655,7 @@ def insert_equation_local(
 
     body, anchor_elem, child_idx = result
 
+    insert_at: int | None = None
     if position == "append":
         # Inline: append <m:oMath> directly to the anchor paragraph.
         omath_el = ET.fromstring(omml)
@@ -6323,10 +6670,82 @@ def insert_equation_local(
         insert_at = child_idx if position == "before" else child_idx + 1
         body.insert(insert_at, new_p)
 
-    try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    expected_flat_text = _omml_flatten_text_local(omml)
+
+    # ddd79188 -- hold docx_path's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write structural verify, any conditional restore, and
+    # the real render-capability gate below -- closing the same-process
+    # window between promotion and verify/restore entirely (see
+    # _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_equation_write(
+            docx_path,
+            position=position,
+            anchor_para_id=anchor_para_id,
+            insert_at=insert_at,
+            expected_flat_text=expected_flat_text,
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to docx_path
+            # since our own promotion, in which case this verification
+            # "failure" is a false positive and restoring from our own
+            # backup would destroy that writer's completed, already-
+            # promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["position"] = position
+            verify_error["para_id"] = anchor_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        # ddd79188 -- structural verification alone (above) can never prove
+        # the document actually renders in Word; run the real render-
+        # capability gate now, still inside the promotion lock so a
+        # fail-closed restore has the same CAS safety a structural failure
+        # gets. Must run AFTER structural verification, not instead of it.
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["position"] = position
+            render_error["para_id"] = anchor_para_id
+            render_error["docx_path"] = docx_path
+            return render_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
@@ -6336,6 +6755,7 @@ def insert_equation_local(
         "para_id": anchor_para_id,
         "omml": omml,
         "docx_path": docx_path,
+        **render_info,
     }
 
 
@@ -8649,6 +9069,78 @@ def renumber_sequences(docx_path: str, index_db_path: str | None = None) -> dict
 # Public API 5/9: insert_highlighted_note + list_internal_notes (65c8eb31)
 # ---------------------------------------------------------------------------
 
+def _verify_note_write(
+    docx_path: str,
+    *,
+    note_id: str,
+    expected_text: str,
+) -> dict[str, Any] | None:
+    """65c8eb31 follow-up (ddd79188) — post-write verification for
+    :func:`insert_highlighted_note`'s ``mode="inline"`` path, mirroring
+    :func:`_verify_figure_block_write`'s "brand new content, no prior
+    on-disk baseline to diff against" style.
+
+    Re-reads ``docx_path`` FRESH FROM DISK and locates the note paragraph by
+    its unique ``_MNote<digits>`` bookmark (assigned before the write via
+    :func:`_next_note_bookmark_name`) rather than by position — positions
+    shift, bookmarks don't. Confirms that paragraph's full text matches
+    ``expected_text`` exactly. Returns ``None`` when every check passes, or
+    an ``{"error": ...}`` dict on the first mismatch.
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    w_bookmark_start = _q(_W, "bookmarkStart")
+    w_p = _q(_W, "p")
+    note_para = next(
+        (
+            child
+            for child in body2
+            if child.tag == w_p
+            and any(
+                bm.get(_q(_W, "name")) == note_id
+                for bm in child.findall(w_bookmark_start)
+            )
+        ),
+        None,
+    )
+    if note_para is None:
+        return {
+            "error": (
+                "post-write verification failed: no internal-note "
+                f"paragraph carrying bookmark {note_id!r} was found in "
+                f"{docx_path} after the write"
+            )
+        }
+
+    actual_text = "".join(t.text or "" for t in note_para.iter(_q(_W, "t")))
+    if actual_text != expected_text:
+        return {
+            "error": (
+                "post-write verification failed: internal-note text "
+                f"mismatch in paragraph (bookmark {note_id!r}) (expected "
+                f"{expected_text!r}, got {actual_text!r})"
+            )
+        }
+    return None
+
+
 def insert_highlighted_note(
     docx_path: str,
     text: str,
@@ -8660,6 +9152,8 @@ def insert_highlighted_note(
     author: str = "Meridian",
     initials: str = "M",
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """Insert an internal note inline or as a native Word comment.
 
@@ -8677,6 +9171,20 @@ def insert_highlighted_note(
     the existing ``style`` parameter above, which selects the note's
     *category* (currently only ``"internal_note"`` is supported), not its
     OOXML rendering.
+
+    ddd79188 — for ``mode="inline"``, AFTER the write is staged, structurally
+    verified (see :func:`_verify_note_write`), and promoted, a real Word/COM
+    (or LibreOffice) render-capability check also runs against the
+    just-written file (:func:`_enforce_render_verification`), mirroring the
+    same gate :func:`insert_figure_block` already enforces. ``"rendered"``
+    continues normally with render evidence attached. ``"failed"`` restores
+    ``docx_path`` from the pre-write backup and returns an error.
+    ``"unavailable-with-reason"`` (no render backend in this environment)
+    ALSO fails closed by default unless the caller explicitly passes
+    ``allow_degraded_render=True`` with a non-empty ``degraded_render_reason``.
+    For ``mode="comment"``, ``allow_degraded_render``/``degraded_render_reason``
+    are forwarded verbatim to :func:`insert_word_comment`, which already
+    enforces this same gate (5bab074/W2-C) for its own comments.xml write.
     """
     if not text or not str(text).strip():
         return {"error": "text must be a non-empty string"}
@@ -8691,6 +9199,16 @@ def insert_highlighted_note(
         }
     if mode not in ("inline", "comment"):
         return {"error": f"mode must be 'inline' or 'comment', got {mode!r}"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
 
     try:
         policy = resolve_style_policy(style_policy)
@@ -8704,6 +9222,8 @@ def insert_highlighted_note(
             anchor_para_id=anchor_para_id,
             author=author,
             initials=initials,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
         )
         if result.get("status") == "inserted":
             comment_id = result["comment_id"]
@@ -8728,32 +9248,100 @@ def insert_highlighted_note(
     body, _anchor_elem, child_idx = result
 
     note_id = _next_note_bookmark_name(root)
+    text_clean = text.strip()
     note_p = _build_internal_note_paragraph(
-        text.strip(), note_id, policy["note_style"], policy["note_highlight_color"]
+        text_clean, note_id, policy["note_style"], policy["note_highlight_color"]
     )
 
     insert_at = child_idx if position == "before" else child_idx + 1
     body.insert(insert_at, note_p)
 
-    try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    # ddd79188 -- hold docx_path's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write structural verify, any conditional restore, and
+    # the real render-capability gate below -- closing the same-process
+    # window between promotion and verify/restore entirely (see
+    # _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_note_write(
+            docx_path,
+            note_id=note_id,
+            expected_text=text_clean,
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to docx_path
+            # since our own promotion, in which case this verification
+            # "failure" is a false positive and restoring from our own
+            # backup would destroy that writer's completed, already-
+            # promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["note_id"] = note_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        # ddd79188 -- structural verification alone (above) can never prove
+        # the document actually renders in Word; run the real render-
+        # capability gate now, still inside the promotion lock so a
+        # fail-closed restore has the same CAS safety a structural failure
+        # gets. Must run AFTER structural verification, not instead of it.
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["note_id"] = note_id
+            render_error["docx_path"] = docx_path
+            return render_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
     if index_db_path and os.path.exists(index_db_path):
-        _upsert_sidecar_note(index_db_path, note_id, text.strip(), anchor_para_id)
+        _upsert_sidecar_note(index_db_path, note_id, text_clean, anchor_para_id)
 
     return {
         "status": "inserted",
         "mode": "inline",
         "note_id": note_id,
-        "text": text.strip(),
+        "text": text_clean,
         "anchor_para_id": anchor_para_id,
         "position": position,
         "style": policy["note_style"],
         "docx_path": docx_path,
+        **render_info,
     }
 
 
