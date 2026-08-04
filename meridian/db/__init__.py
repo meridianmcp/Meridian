@@ -1127,6 +1127,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_batch_claims(db)
     await _migrate_verification_runs(db)
     await _migrate_sprint_item_require_strict_evidence(db)
+    await _migrate_handoffs_invalidation(db)
+    await _migrate_handoff_corrections_table(db)
     return db
 
 
@@ -10756,6 +10758,7 @@ from .board_snapshot import (  # noqa: F401
     canonical_json,
     build_board_snapshot,
     diff_board_snapshots,
+    compute_scope_diff,
     get_latest_board_snapshot_revision,
     record_board_snapshot_revision,
 )

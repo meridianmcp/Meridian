@@ -38,6 +38,7 @@ from . import capability_contract as capability_contract_module
 from . import db as db_module
 from . import docx_integrity_gate as docx_integrity_gate_module
 from . import executor_contract as executor_contract_module
+from . import pointers as pointers_module
 from . import tool_requirements as tool_requirements_module
 from .db.sprint_items import (
     _is_deferred,
@@ -388,6 +389,555 @@ async def verify_handoff_token(
     entry["consumed"] = True
     entry["consumed_at"] = now
     return {"valid": True, "reason": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# 3af86d28 — corrective handoffs.
+#
+# What this is for: an executor that received a handoff (a /goal, a full
+# render, a wave manifest — anything generate_handoff produced) sometimes
+# reaches a wall mid-session — the evidence it was handed no longer holds, a
+# pointer stopped resolving, the requested scope moved out from under it, or
+# a required capability went away. Today that only produces narrative
+# (a log_task entry, a note, a HITL question) — nothing links "this specific
+# handoff was wrong" to "here is exactly what was wrong, here is the new
+# handoff that fixes it" in a form a RECEIVING session can load directly and
+# act on without re-deriving intent from prose.
+#
+# A correction is a first-class row (``handoff_corrections``, see
+# db.migrations._migrate_handoff_corrections_table) that:
+#   - links to the immutable ``source_handoff_id`` (never mutated — see
+#     invalidate_handoff below) plus session/project/version/scope,
+#   - classifies the blocker (``_BLOCKER_CLASSIFICATIONS``),
+#   - carries investigation evidence, added/removed/superseded pointers, and
+#     changed resources — all structured, all machine-readable,
+#   - can invalidate the source handoff (mark it non-executable WITHOUT
+#     touching its body — the original stays available for audit),
+#   - and can drive a NEW deterministic handoff revision (a fresh body hash +
+#     provenance token) once its evidence has been repaired/re-resolved.
+#
+# Explicit status (draft/verified/superseded/blocked), idempotent retries
+# (an ``idempotency_key`` collision returns the existing row; a correction
+# that already produced a new revision returns that same result again rather
+# than regenerating), and pointer repair (pointers.repair_pointer_set,
+# re-resolving evidence against the LIVE project before it is trusted) are
+# all first-class here, not narrative add-ons.
+#
+# No DOCX or canonical project mutation is implied by recording a
+# correction — regenerate_handoff_correction's only side effects are:
+# invalidation columns on the source handoffs row, a new handoffs row (via
+# the existing generate_handoff), a new handoff_tokens row, and updates to
+# the correction row itself.
+# ---------------------------------------------------------------------------
+
+# Controlled vocabulary for why a handoff needed correcting — fail-closed
+# (record_handoff_correction rejects anything outside this set) so a
+# receiving session can branch on the reason without parsing prose.
+_BLOCKER_CLASSIFICATIONS = frozenset({
+    "evidence_invalid",        # the handoff's evidence (pointers, capability
+                                # contract) no longer holds
+    "scope_stale",              # the requested version/sprint scope moved
+                                 # since the handoff was rendered
+    "pointer_unresolved",       # a pointer the handoff relied on no longer
+                                 # resolves
+    "dependency_missing",       # a required tool/capability is unavailable,
+                                 # no fallback
+    "environment_blocked",      # local environment (creds/network/fs)
+                                 # prevents progress
+    "capability_unavailable",   # a manifest-declared required capability is
+                                 # down (see capability_manifest.py)
+    "other",
+})
+
+# Explicit correction status machine — see the module-level docstring above.
+_CORRECTION_STATUSES = frozenset({"draft", "verified", "superseded", "blocked"})
+
+
+class HandoffCorrectionError(ValueError):
+    """Raised for an invalid corrective-handoff request: unknown correction
+    id, unknown/cross-project source handoff, an invalid status or blocker
+    classification, or an attempt to regenerate from a terminal
+    (superseded/blocked) correction. Subclasses ``ValueError`` so the
+    existing MCP-handler ``except ValueError`` convention (see
+    ``WaveResumeStale``'s own docstring in db/wave_resume.py) keeps working
+    unchanged.
+    """
+
+
+def _dump_json_list(value: Any) -> str:
+    """Canonical JSON for a list-shaped correction field. ``None``/non-list
+    input degrades to ``'[]'`` rather than raising — these columns are
+    NOT NULL DEFAULT '[]'."""
+    return json.dumps(value if isinstance(value, list) else [], sort_keys=True, default=str)
+
+
+def _dump_json_or_none(value: Any) -> str | None:
+    """Canonical JSON for a nullable correction field, or None to store SQL NULL."""
+    if value is None:
+        return None
+    return json.dumps(value, sort_keys=True, default=str)
+
+
+def _load_json_or_default(raw: Any, default: Any) -> Any:
+    """Decode a stored correction JSON column; already-decoded (dict/list,
+    e.g. a Postgres JSONB-mapped driver) passes through unchanged. Malformed
+    or missing input degrades to ``default`` rather than raising — this is a
+    read path, never a validation gate."""
+    if raw is None:
+        return default
+    if isinstance(raw, (list, dict)):
+        return raw
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _deserialize_correction_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Decode every JSON-shaped column on a raw ``handoff_corrections`` row."""
+    if row is None:
+        return None
+    out = dict(row)
+    for field, default in (
+        ("requested_scope", None),
+        ("investigation_evidence", None),
+        ("added_pointers", []),
+        ("removed_pointers", []),
+        ("superseded_pointers", []),
+        ("changed_resources", []),
+        ("pointer_repair_report", None),
+    ):
+        out[field] = _load_json_or_default(out.get(field), default)
+    return out
+
+
+async def get_handoff_correction(db: Any, correction_id: str) -> dict[str, Any] | None:
+    """Fetch a single ``handoff_corrections`` row by id, JSON fields decoded."""
+    async with db.execute(
+        "SELECT * FROM handoff_corrections WHERE id = ?", (correction_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    return _deserialize_correction_row(db_module._row_to_dict(row))
+
+
+async def list_handoff_corrections(
+    db: Any,
+    project_id: str,
+    *,
+    source_handoff_id: str | None = None,
+    status: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """List corrections for a project, newest first (JSON fields decoded).
+
+    Optionally scoped to one ``source_handoff_id`` and/or one ``status``.
+    Every status is included by default (superseded/blocked too) — matching
+    the AGENTS.md b763d2ba guidance to never silently narrow to a "live-only"
+    view when a caller hasn't explicitly asked for one.
+    """
+    limit = max(1, min(int(limit or 20), 200))
+    clauses = ["project_id = ?"]
+    params: list[Any] = [project_id]
+    if source_handoff_id:
+        clauses.append("source_handoff_id = ?")
+        params.append(source_handoff_id)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    params.append(limit)
+    sql = (
+        f"SELECT * FROM handoff_corrections WHERE {' AND '.join(clauses)} "
+        "ORDER BY created_at DESC, id DESC LIMIT ?"
+    )
+    async with db.execute(sql, tuple(params)) as cur:
+        rows = await cur.fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = _deserialize_correction_row(db_module._row_to_dict(r))
+        if d is not None:
+            out.append(d)
+    return out
+
+
+async def invalidate_handoff(
+    db: Any,
+    handoff_id: str,
+    *,
+    reason: str,
+    correction_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Mark a ``handoffs`` row invalidated/non-executable WITHOUT mutating its body.
+
+    The original ``body`` (and every other column except the four
+    invalidation columns added by ``_migrate_handoffs_invalidation``) is left
+    exactly as rendered — invalidation is metadata, not a rewrite, so the
+    source stays available for audit even after a correction supersedes it.
+    Idempotent-ish: calling this again on an already-invalidated row simply
+    overwrites the reason/correction_id/timestamp with the latest call's
+    values. Returns the updated row, or ``None`` if ``handoff_id`` doesn't
+    exist.
+    """
+    now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
+    await db.execute(
+        f"UPDATE handoffs SET invalidated = 1, invalidated_reason = ?, "
+        f"invalidated_at = {now_expr}, superseded_by_correction_id = ? WHERE id = ?",
+        (reason, correction_id, handoff_id),
+    )
+    await db.commit()
+    return await db_module.get_handoff(db, handoff_id)
+
+
+async def record_handoff_correction(
+    db: Any,
+    project_id: str,
+    *,
+    source_handoff_id: str,
+    blocker_classification: str,
+    session_id: str | None = None,
+    investigation_evidence: Any = None,
+    added_pointers: "list[dict[str, Any]] | None" = None,
+    removed_pointers: "list[Any] | None" = None,
+    superseded_pointers: "list[Any] | None" = None,
+    changed_resources: "list[str] | None" = None,
+    requested_scope: Any = None,
+    version: str | None = None,
+    source_token: str | None = None,
+    idempotency_key: str | None = None,
+    status: str = "draft",
+) -> dict[str, Any]:
+    """Record a corrective handoff linked to an immutable source handoff.
+
+    This is the data-structure half of the feature: it records the
+    correction (blocker classification, investigation evidence, pointer
+    diffs, changed resources, requested scope) but does NOT by itself
+    invalidate the source or produce a new revision — call
+    :func:`regenerate_handoff_correction` next for that (a separate,
+    idempotently-retryable step, so a caller can record evidence first and
+    decide to regenerate later, or never, e.g. for a ``status="blocked"``
+    correction that has no fix yet).
+
+    ``idempotency_key`` — when given and a PRIOR call already recorded a
+    correction with the same ``(project_id, idempotency_key)`` pair (see the
+    unique partial index in the migration), that existing row is returned
+    UNCHANGED — no duplicate row, no re-superseding of siblings. Safe to
+    retry after a network blip.
+
+    Auto-supersede: any other still-open (``draft``/``verified``) correction
+    already recorded against the SAME ``source_handoff_id`` is marked
+    ``superseded`` the instant this new one is inserted, so at most one
+    correction chain is ever "live" per immutable source — a reader walking
+    ``source_handoff_id -> latest correction`` never has to disambiguate
+    between two simultaneously-open corrections for the same handoff.
+
+    Raises :class:`HandoffCorrectionError` for an unknown
+    ``blocker_classification``/``status``, or when ``source_handoff_id``
+    does not name an existing ``handoffs`` row (a correction must link to a
+    REAL immutable source — this is not optional per the sprint-item spec).
+    """
+    if blocker_classification not in _BLOCKER_CLASSIFICATIONS:
+        raise HandoffCorrectionError(
+            f"blocker_classification {blocker_classification!r} is not one "
+            f"of {sorted(_BLOCKER_CLASSIFICATIONS)}"
+        )
+    if status not in _CORRECTION_STATUSES:
+        raise HandoffCorrectionError(
+            f"status {status!r} is not one of {sorted(_CORRECTION_STATUSES)}"
+        )
+
+    if idempotency_key:
+        async with db.execute(
+            "SELECT * FROM handoff_corrections WHERE project_id = ? AND idempotency_key = ?",
+            (project_id, idempotency_key),
+        ) as cur:
+            existing = await cur.fetchone()
+        if existing is not None:
+            return _deserialize_correction_row(db_module._row_to_dict(existing))
+
+    source = await db_module.get_handoff(db, source_handoff_id)
+    if source is None:
+        raise HandoffCorrectionError(
+            f"source handoff {source_handoff_id!r} not found — a correction "
+            "must link to a real, immutable handoffs row"
+        )
+    source_body_hash = _hash_goal_body(source.get("body") or "")
+
+    now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
+    await db.execute(
+        f"UPDATE handoff_corrections SET status = 'superseded', updated_at = {now_expr} "
+        "WHERE project_id = ? AND source_handoff_id = ? AND status IN ('draft','verified')",
+        (project_id, source_handoff_id),
+    )
+
+    cid = db_module._new_id()
+    await db.execute(
+        "INSERT INTO handoff_corrections ("
+        "id, project_id, session_id, source_handoff_id, source_token, "
+        "source_body_hash, version, requested_scope, blocker_classification, "
+        "investigation_evidence, added_pointers, removed_pointers, "
+        "superseded_pointers, changed_resources, status, idempotency_key"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            cid, project_id, session_id, source_handoff_id, source_token,
+            source_body_hash, version, _dump_json_or_none(requested_scope),
+            blocker_classification, _dump_json_or_none(investigation_evidence),
+            _dump_json_list(added_pointers), _dump_json_list(removed_pointers),
+            _dump_json_list(superseded_pointers), _dump_json_list(changed_resources),
+            status, idempotency_key,
+        ),
+    )
+    await db.commit()
+    return await get_handoff_correction(db, cid)
+
+
+async def update_handoff_correction_status(
+    db: Any,
+    correction_id: str,
+    status: str,
+    *,
+    reason: str | None = None,
+) -> dict[str, Any] | None:
+    """Explicit status transition for a recorded correction.
+
+    Any of the four statuses may be set directly (draft/verified/superseded/
+    blocked) — this is a deliberately unopinionated setter, not a state
+    machine with disallowed transitions, because a human/planner may need to
+    revive a ``blocked`` correction once its dependency comes back, or
+    manually mark one ``superseded`` outside the auto-supersede path above.
+    ``reason`` (optional) is stored on ``status_reason`` for audit. Returns
+    the updated row, or ``None`` if ``correction_id`` doesn't exist.
+    """
+    if status not in _CORRECTION_STATUSES:
+        raise HandoffCorrectionError(
+            f"status {status!r} is not one of {sorted(_CORRECTION_STATUSES)}"
+        )
+    now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
+    await db.execute(
+        f"UPDATE handoff_corrections SET status = ?, status_reason = ?, "
+        f"updated_at = {now_expr} WHERE id = ?",
+        (status, reason, correction_id),
+    )
+    await db.commit()
+    return await get_handoff_correction(db, correction_id)
+
+
+async def regenerate_handoff_correction(
+    db: Any,
+    project_id: str,
+    correction_id: str,
+    output_dir: str,
+    *,
+    session_id: str | None = None,
+    mode: str = "full",
+    **generate_handoff_kwargs: Any,
+) -> dict[str, Any]:
+    """Repair pointers, invalidate the source, and produce a new deterministic revision.
+
+    This is the "generate-new-revision path": the ONE function that turns a
+    recorded correction into something a receiving executor can act on.
+
+    Steps (in order):
+      1. Load the correction; refuse (raise :class:`HandoffCorrectionError`)
+         if it doesn't exist, belongs to a different project, or has a
+         terminal status (``superseded``/``blocked`` — record a fresh
+         correction or call :func:`update_handoff_correction_status` first).
+      2. **Idempotent retry**: if this correction ALREADY produced a new
+         revision (``new_handoff_id`` set), return that same result again
+         without regenerating or re-invalidating anything a second time.
+      3. **Pointer repair**: re-resolve every ``added_pointers`` entry live
+         (:func:`meridian.pointers.repair_pointer_set`) and persist the
+         report on the correction row — evidence is re-resolved, never
+         merely re-validated for shape, before it is trusted.
+      4. **Invalidate the source**: mark ``source_handoff_id`` non-executable
+         (:func:`invalidate_handoff`) — its body is untouched, only the
+         invalidation metadata is set.
+      5. **Regenerate**: call :func:`generate_handoff` (the SAME renderer
+         every other handoff path uses — no parallel rendering logic here)
+         scoped to the correction's own ``version``, producing a fresh body.
+      6. Mint a new provenance token bound to that exact body
+         (:func:`mint_handoff_token`) and record ``new_handoff_id``/
+         ``new_token``/``new_body_hash`` on the correction, advancing
+         ``status`` from ``draft`` to ``verified`` (a correction recorded
+         directly as ``verified`` stays ``verified``).
+
+    ``**generate_handoff_kwargs`` are forwarded to ``generate_handoff``
+    verbatim (e.g. ``skip_ai_summary``, ``force_include_ids``,
+    ``strict_evidence``) — do NOT pass ``mode``/``session_id``/``version``
+    through it; those are explicit parameters here so they can be resolved
+    from the correction's own scope first.
+    """
+    correction = await get_handoff_correction(db, correction_id)
+    if correction is None:
+        raise HandoffCorrectionError(f"handoff correction {correction_id!r} not found")
+    if correction["project_id"] != project_id:
+        raise HandoffCorrectionError(
+            f"handoff correction {correction_id!r} belongs to a different project"
+        )
+
+    if correction.get("new_handoff_id"):
+        new_handoff = await db_module.get_handoff(db, correction["new_handoff_id"])
+        return {
+            "correction": correction,
+            "regenerated": False,
+            "already_regenerated": True,
+            "new_handoff_id": correction.get("new_handoff_id"),
+            "new_handoff_path": None,
+            "new_handoff_content": new_handoff.get("body") if new_handoff else None,
+            "new_token": correction.get("new_token"),
+            "new_body_hash": correction.get("new_body_hash"),
+            "amended": None,
+            "invalidated_source": None,
+            "pointer_repair_report": correction.get("pointer_repair_report"),
+        }
+
+    if correction["status"] in ("superseded", "blocked"):
+        raise HandoffCorrectionError(
+            f"handoff correction {correction_id!r} has status "
+            f"{correction['status']!r} — cannot regenerate from a superseded "
+            "or blocked correction; record a fresh correction, or call "
+            "update_handoff_correction_status to un-block it first"
+        )
+
+    repair_report = await pointers_module.repair_pointer_set(
+        db, project_id, correction.get("added_pointers") or [],
+    )
+    now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
+    await db.execute(
+        f"UPDATE handoff_corrections SET pointer_repair_report = ?, "
+        f"updated_at = {now_expr} WHERE id = ?",
+        (_dump_json_or_none(repair_report), correction_id),
+    )
+    await db.commit()
+
+    invalidated_source = await invalidate_handoff(
+        db, correction["source_handoff_id"],
+        reason=(
+            f"superseded by handoff correction {correction_id} "
+            f"(blocker: {correction['blocker_classification']})"
+        ),
+        correction_id=correction_id,
+    )
+
+    # edd9c54b interaction (discovered while building this feature): generate_
+    # handoff has its own amend-vs-fresh detection — when the project's
+    # pending_goal is still set (unconsumed by any start_session), it AMENDS
+    # the most recent handoffs row IN PLACE rather than inserting a new one.
+    # Left alone, that would silently overwrite the body of the very row we
+    # just invalidated above (it IS the most recent row), destroying the
+    # "preserve the original content ... for audit" guarantee this feature
+    # exists to provide. Popping pending_goal first — the SAME signal
+    # start_session uses to mean "the prior handoff was consumed" — forces
+    # generate_handoff onto its fresh-insert path, so the new revision always
+    # lands in a NEW handoffs row and the invalidated source's body is never
+    # touched. Best-effort/guarded: a pre-migration DB missing the column
+    # must not break regeneration (amend is merely a redundant-row nicety,
+    # not a correctness requirement, on such a DB).
+    try:
+        await db_module.pop_pending_goal(db, project_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # b7f41c73-family gotcha: handoffs.created_at is only SECOND-granularity
+    # on SQLite (datetime('now')), so two rows inserted within the same
+    # second tie on created_at and get_handoffs' ORDER BY falls back to `id
+    # DESC` — a random-looking UUID comparison, NOT insertion order. Simply
+    # re-querying "the latest handoff" after generate_handoff can therefore
+    # return the WRONG row (even the just-invalidated source itself) when a
+    # correction is recorded and regenerated within the same wall-clock
+    # second — a realistic case for an automated/scripted caller. Snapshot
+    # the id set BEFORE the call and diff against the id set AFTER instead —
+    # correct regardless of timestamp collisions, since ids are always
+    # unique.
+    _before_ids = {
+        r["id"] for r in await db_module.get_handoffs(db, project_id, limit=10)
+    }
+
+    path, content, amended = await generate_handoff(
+        db, project_id, output_dir,
+        session_id=session_id or correction.get("session_id"),
+        mode=mode,
+        version=correction.get("version"),
+        **generate_handoff_kwargs,
+    )
+
+    _after_rows = await db_module.get_handoffs(db, project_id, limit=10)
+    new_handoff = next(
+        (r for r in _after_rows if r["id"] not in _before_ids),
+        _after_rows[0] if _after_rows else None,
+    )
+    new_handoff_id = new_handoff.get("id") if new_handoff else None
+    new_body_hash = _hash_goal_body(content)
+    new_token = await mint_handoff_token(db, project_id, body=content)
+
+    _new_status = "verified" if correction["status"] == "draft" else correction["status"]
+    await db.execute(
+        f"UPDATE handoff_corrections SET new_handoff_id = ?, new_token = ?, "
+        f"new_body_hash = ?, status = ?, updated_at = {now_expr} WHERE id = ?",
+        (new_handoff_id, new_token, new_body_hash, _new_status, correction_id),
+    )
+    await db.commit()
+
+    return {
+        "correction": await get_handoff_correction(db, correction_id),
+        "regenerated": True,
+        "already_regenerated": False,
+        "new_handoff_id": new_handoff_id,
+        "new_handoff_path": path,
+        "new_handoff_content": content,
+        "new_token": new_token,
+        "new_body_hash": new_body_hash,
+        "amended": amended,
+        "invalidated_source": invalidated_source,
+        "pointer_repair_report": repair_report,
+    }
+
+
+async def load_handoff_correction(
+    db: Any,
+    project_id: str,
+    *,
+    correction_id: str | None = None,
+    source_handoff_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Load a corrective handoff DIRECTLY — the receiving-executor entry point.
+
+    Per the sprint-item spec: "The receiving executor must be able to load
+    the corrective revision directly; it must not reconstruct corrections
+    from narrative notes." This returns the actual ``handoff_corrections``
+    row (JSON fields decoded) plus, once the correction has been regenerated,
+    the new handoff's body verbatim (``new_handoff_content``) — a receiving
+    executor never has to infer a correction from a log_task/note entry.
+
+    Resolution order:
+      1. ``correction_id`` given — load that exact row (raises
+         :class:`HandoffCorrectionError` if it belongs to a different
+         project).
+      2. Else ``source_handoff_id`` given — load the latest correction
+         recorded against that specific source handoff (any status).
+      3. Else — load the single latest correction for the project across
+         ANY status, newest first.
+
+    Returns ``None`` when nothing matches — not an error; a project with no
+    open blocker legitimately has no corrections.
+    """
+    if correction_id:
+        row = await get_handoff_correction(db, correction_id)
+        if row is not None and row.get("project_id") != project_id:
+            raise HandoffCorrectionError(
+                f"handoff correction {correction_id!r} belongs to a different project"
+            )
+    else:
+        rows = await list_handoff_corrections(
+            db, project_id, source_handoff_id=source_handoff_id, limit=1,
+        )
+        row = rows[0] if rows else None
+    if row is None:
+        return None
+    new_handoff_content = None
+    if row.get("new_handoff_id"):
+        new_handoff = await db_module.get_handoff(db, row["new_handoff_id"])
+        if new_handoff is not None:
+            new_handoff_content = new_handoff.get("body")
+    return {**row, "new_handoff_content": new_handoff_content}
 
 
 async def _mint_and_embed_goal_token(

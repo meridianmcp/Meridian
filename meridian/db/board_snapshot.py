@@ -283,6 +283,50 @@ def diff_board_snapshots(previous: dict[str, Any], current: dict[str, Any]) -> d
     }
 
 
+async def compute_scope_diff(
+    db: aiosqlite.Connection,
+    project_id: str,
+    requested_item_ids: "list[str] | None",
+    *,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """3af86d28 — requested-vs-emitted scope diff for a corrective handoff.
+
+    Given the item ids a handoff's ORIGINAL /goal block requested (captured
+    at generation time, or reconstructed from the pasted block), compares
+    them against the LIVE non-done board for the same ``(project_id,
+    version)`` bucket via :func:`build_board_snapshot` — the same canonical
+    snapshot every other resume/staleness primitive in this module uses, so
+    this can never disagree with e.g. :func:`meridian.db.wave_resume.check_wave_resume`
+    about what's actually live.
+
+    Returns:
+      - ``requested_item_ids`` — the input, deduped and sorted.
+      - ``emitted_item_ids`` — requested ids still present on the live
+        non-done board (the handoff's scope is still valid for these).
+      - ``dropped_item_ids`` — requested ids no longer on the live non-done
+        board (completed, deleted, or otherwise resolved since the source
+        handoff was rendered — the scope drifted for these).
+      - ``live_revision_hash`` — the live snapshot's revision hash, echoed
+        back for the caller's own bookkeeping.
+
+    Pure read, no DB writes. This is a convenience for computing the
+    ``requested_scope``/``emitted`` comparison a corrective handoff records
+    (see ``meridian.handoff.record_handoff_correction``'s ``requested_scope``
+    parameter) — callers may pass this dict straight through, or compute
+    their own shape; nothing here is mandatory.
+    """
+    live = await build_board_snapshot(db, project_id, version=version)
+    live_ids = {it["id"] for it in (live.get("items") or []) if it.get("id")}
+    requested = {i for i in (requested_item_ids or []) if i}
+    return {
+        "requested_item_ids": sorted(requested),
+        "emitted_item_ids": sorted(requested & live_ids),
+        "dropped_item_ids": sorted(requested - live_ids),
+        "live_revision_hash": live.get("revision_hash"),
+    }
+
+
 async def get_latest_board_snapshot_revision(
     db: aiosqlite.Connection,
     project_id: str,

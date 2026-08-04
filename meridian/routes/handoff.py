@@ -169,3 +169,93 @@ async def generate_handoff_endpoint(
         "proposal_evidence": proposal_evidence,
         "docx_integrity": docx_integrity,
     }
+
+
+@router.post("/projects/{project_id}/handoff/corrections")
+async def record_handoff_correction_endpoint(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """3af86d28 — record a corrective handoff for a blocked executor session.
+
+    REST mirror of the MCP ``record_handoff_correction`` tool — see
+    ``meridian.handoff.record_handoff_correction`` /
+    ``regenerate_handoff_correction`` for the full contract. Pass
+    ``regenerate: true`` in the body to also repair pointers, invalidate the
+    source handoff, and produce a new deterministic revision in this same
+    call.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+    source_handoff_id = body.get("source_handoff_id")
+    blocker_classification = body.get("blocker_classification")
+    if not source_handoff_id or not blocker_classification:
+        raise HTTPException(
+            status_code=422,
+            detail="source_handoff_id and blocker_classification are required",
+        )
+    try:
+        correction = await handoff_module.record_handoff_correction(
+            db, project_id,
+            source_handoff_id=source_handoff_id,
+            blocker_classification=blocker_classification,
+            session_id=body.get("session_id"),
+            investigation_evidence=body.get("investigation_evidence"),
+            added_pointers=body.get("added_pointers"),
+            removed_pointers=body.get("removed_pointers"),
+            superseded_pointers=body.get("superseded_pointers"),
+            changed_resources=body.get("changed_resources"),
+            requested_scope=body.get("requested_scope"),
+            version=body.get("version"),
+            source_token=body.get("source_token"),
+            idempotency_key=body.get("idempotency_key"),
+            status=body.get("status") or "draft",
+        )
+    except handoff_module.HandoffCorrectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not body.get("regenerate"):
+        return {"correction": correction, "regenerated": False}
+    data_dir = _data_dir(request)
+    try:
+        return await handoff_module.regenerate_handoff_correction(
+            db, project_id, correction["id"], body.get("output_dir") or data_dir,
+            session_id=body.get("session_id"),
+            mode=body.get("mode") or "full",
+        )
+    except handoff_module.HandoffCorrectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/projects/{project_id}/handoff/corrections/latest")
+async def load_handoff_correction_endpoint(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """3af86d28 — load a corrective handoff directly (never reconstruct from notes).
+
+    REST mirror of ``meridian.handoff.load_handoff_correction``. Optional
+    query params ``correction_id`` / ``source_handoff_id`` scope the lookup;
+    with neither, returns the project's single latest correction (any
+    status). ``{correction: null}`` when the project has no corrections.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    correction_id = request.query_params.get("correction_id")
+    source_handoff_id = request.query_params.get("source_handoff_id")
+    try:
+        correction = await handoff_module.load_handoff_correction(
+            db, project_id,
+            correction_id=correction_id,
+            source_handoff_id=source_handoff_id,
+        )
+    except handoff_module.HandoffCorrectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"correction": correction}

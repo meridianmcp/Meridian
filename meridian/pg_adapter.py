@@ -3936,6 +3936,68 @@ async def _migrate_pg_sprint_item_require_strict_evidence(conn: PostgresConnecti
     )
 
 
+async def _migrate_pg_handoffs_invalidation(conn: PostgresConnection) -> None:
+    """3af86d28 — invalidation/non-executable marking for a ``handoffs`` row
+    (mirrors db.migrations._migrate_handoffs_invalidation).
+
+    Four additive columns. ADD COLUMN IF NOT EXISTS is idempotent.
+    """
+    await conn.executescript(
+        "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS "
+        "invalidated INTEGER NOT NULL DEFAULT 0;"
+        "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS invalidated_reason TEXT;"
+        "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS invalidated_at TEXT;"
+        "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS "
+        "superseded_by_correction_id TEXT;"
+    )
+
+
+async def _migrate_pg_handoff_corrections_table(conn: PostgresConnection) -> None:
+    """3af86d28 — handoff_corrections: corrective-handoff data structure
+    (mirrors db.migrations._migrate_handoff_corrections_table — see that
+    function's docstring for the full field-by-field rationale).
+
+    CREATE TABLE / INDEX IF NOT EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS handoff_corrections (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            session_id TEXT,
+            source_handoff_id TEXT NOT NULL,
+            source_token TEXT,
+            source_body_hash TEXT,
+            version TEXT,
+            requested_scope TEXT,
+            blocker_classification TEXT NOT NULL,
+            investigation_evidence TEXT,
+            added_pointers TEXT NOT NULL DEFAULT '[]',
+            removed_pointers TEXT NOT NULL DEFAULT '[]',
+            superseded_pointers TEXT NOT NULL DEFAULT '[]',
+            changed_resources TEXT NOT NULL DEFAULT '[]',
+            pointer_repair_report TEXT,
+            status TEXT NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft','verified','superseded','blocked')),
+            status_reason TEXT,
+            idempotency_key TEXT,
+            new_handoff_id TEXT,
+            new_token TEXT,
+            new_body_hash TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_handoff_corrections_project
+            ON handoff_corrections(project_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_handoff_corrections_source
+            ON handoff_corrections(source_handoff_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_handoff_corrections_idempotency
+            ON handoff_corrections(project_id, idempotency_key)
+            WHERE idempotency_key IS NOT NULL;
+        """
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -4041,4 +4103,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_batch_claims,
     _migrate_pg_verification_runs,
     _migrate_pg_sprint_item_require_strict_evidence,
+    _migrate_pg_handoffs_invalidation,
+    _migrate_pg_handoff_corrections_table,
 )

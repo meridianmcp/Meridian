@@ -83,6 +83,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "start_wave_run": 'start_wave_run(project_id="abc-123", version="v0.2.5", wave_label="wave-2", item_ids=["item-uuid-a", "item-uuid-b"], failure_modes={"item-uuid-a": "stop"})',
     "finalize_wave_run": 'finalize_wave_run(wave_run_id="run-uuid", evidence={"status": "ok", "exit_code": 0, "passed": 1780, "failed": 0}, expected_revision_hash="sha256:...")',
     "resume_wave": 'resume_wave(wave_run_id="run-uuid", goal_token="a1b2c3d4e5f6a7b8", presented_body="/goal\\n<sprint_items>...</sprint_items>")',
+    "record_handoff_correction": 'record_handoff_correction(project_id="abc-123", source_handoff_id="handoff-uuid", blocker_classification="pointer_unresolved", investigation_evidence={"finding": "the file was renamed since the handoff was rendered"}, regenerate=True)',
     "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
     "configure_wave_gate": 'configure_wave_gate(project_id="abc-123", wave_end="wave-3", actions=[{"type": "push_dev"}, {"type": "run_verification"}, {"type": "push_main"}, {"type": "deploy"}])',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
@@ -414,6 +415,46 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "presented_body": {"type": "string",
              "description": "Optional: the full pasted /goal block (token + SECURITY banner included) to check against the token's stored body_hash, if any. Closes the 2ee0000c body-integrity gap — see description."}},
          "required": ["token"]}},
+    {"name": "record_handoff_correction", "description":
+        "3af86d28 — record a corrective handoff when a blocked executor session "
+        "reaches a wall after receiving a handoff (its evidence/scope no longer "
+        "holds, a pointer stopped resolving, a required capability went away, "
+        "etc.). Links to the immutable source_handoff_id (never mutated), "
+        "classifies the blocker, and carries structured investigation evidence, "
+        "added/removed/superseded pointers, and changed resources. Records "
+        "status='draft' by default (or pass status explicitly). Pass "
+        "idempotency_key to make retries safe — a repeat call with the same "
+        "key returns the existing correction unchanged rather than duplicating "
+        "it. Pass regenerate=true to ALSO, in this same call: re-resolve every "
+        "added pointer live (repair), mark the source handoff invalidated/"
+        "non-executable (its body is left untouched, for audit), and produce a "
+        "new deterministic handoff revision (new body hash + provenance token) "
+        "via the normal generate_handoff renderer. Idempotent: a correction "
+        "that already produced a revision returns that same result again "
+        "instead of regenerating a second time. A receiving executor should "
+        "load the result via load_handoff (its 'correction' field) or a "
+        "direct get_sprint — not by reconstructing the correction from "
+        "log_task/note text. No DOCX or canonical project mutation is implied "
+        "by recording a correction.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "source_handoff_id": {"type": "string", "description": "The immutable handoffs.id row this correction is for (e.g. load_handoff's handoff.id is NOT the row id directly — use a handoff id you have from generate_handoff/get_handoffs)."},
+         "blocker_classification": {"type": "string", "enum": ["evidence_invalid", "scope_stale", "pointer_unresolved", "dependency_missing", "environment_blocked", "capability_unavailable", "other"], "description": "Controlled vocabulary for why the handoff needed correcting."},
+         "session_id": {"type": "string", "description": "The blocked executor session recording this correction."},
+         "investigation_evidence": {"description": "Free-form JSON: what you found during investigation."},
+         "added_pointers": {"type": "array", "items": {"type": "object"}, "description": "Pointer dicts (same shape as add_sprint_item_pointer's source_type/targets/label) asserting new evidence. Re-resolved live when regenerate=true."},
+         "removed_pointers": {"type": "array", "items": {}, "description": "Pointer dicts or ids being removed as evidence."},
+         "superseded_pointers": {"type": "array", "items": {}, "description": "Pointer dicts or ids whose premise was replaced."},
+         "changed_resources": {"type": "array", "items": {"type": "string"}, "description": "File/resource paths that changed since the source handoff was rendered."},
+         "requested_scope": {"description": "Free-form JSON describing the scope the ORIGINAL handoff asked for, for comparison against what actually got emitted."},
+         "version": {"type": "string", "description": "Sprint-version bucket in scope, if any — also used to scope the regenerated revision when regenerate=true."},
+         "source_token": {"type": "string", "description": "Optional: the <goal_token> value from the original /goal block, preserved for audit only (not re-verified by this call)."},
+         "idempotency_key": {"type": "string", "description": "Optional caller-supplied dedup key so a retried call returns the existing correction instead of duplicating it."},
+         "status": {"type": "string", "enum": ["draft", "verified", "superseded", "blocked"], "description": "Initial status. Default draft."},
+         "regenerate": {"type": "boolean", "description": "When true, also repairs pointers, invalidates the source handoff, and produces a new deterministic revision in this SAME call. Default false (record only)."},
+         "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"], "description": "Only used when regenerate=true — forwarded to generate_handoff."},
+         "output_dir": {"type": "string", "description": "Only used when regenerate=true; defaults to the server's data directory."}},
+         "required": ["source_handoff_id", "blocker_classification"]}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact project context block (north star, sprint, "
         "pending sprint items, recent tasks, recent decisions, active sessions) "
@@ -2766,6 +2807,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "log_task":                "session",
     "generate_handoff":        "session",
     "load_handoff":            "session",
+    "record_handoff_correction": "session",
     "verify_handoff_token":    "session",
     "checkpoint":              "session",
     "get_session_brief":       "session",
@@ -2967,6 +3009,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "annotate_outputs":          "executor",
     "log_task":                  "executor",
     "generate_handoff":          "executor",
+    "record_handoff_correction": "executor",
     "checkpoint":                "executor",
     "add_sprint_note":           "executor",
     "heartbeat":                 "executor",
@@ -3267,6 +3310,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "list_sessions":              "maintenance-only",
     "heartbeat":                  "maintenance-only",
     "load_handoff":               "maintenance-only",
+    "record_handoff_correction":  "maintenance-only",
     "verify_handoff_token":       "maintenance-only",
     # sprint item pointer cleanup
     "delete_sprint_item_pointer": "maintenance-only",
@@ -3369,6 +3413,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "start_wave_run": "Start Wave Run",
     "finalize_wave_run": "Finalize Wave Run",
     "resume_wave": "Resume Wave",
+    "record_handoff_correction": "Record Handoff Correction",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",

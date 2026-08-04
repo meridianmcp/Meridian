@@ -2765,7 +2765,7 @@ async def _handle_task_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, verify_handoff_token."""
+    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         _log_sid = args.get("session_id", "")
@@ -3068,6 +3068,17 @@ async def _handle_task_tools(
             _pending = await db_module.get_pending_goal(db, _pid)
         except Exception:  # noqa: BLE001
             _pending = None
+        # 3af86d28 — surface the latest corrective handoff (any status)
+        # directly, so a receiving executor never has to reconstruct a
+        # correction from narrative notes. None when the project has no
+        # recorded corrections. Best-effort: never breaks the mandatory
+        # load_handoff read on a pre-migration DB.
+        from .. import handoff as handoff_module_local  # noqa: PLC0415
+        _correction = None
+        try:
+            _correction = await handoff_module_local.load_handoff_correction(db, _pid)
+        except Exception:  # noqa: BLE001
+            _correction = None
         return {
             "pending_goal": _pending,
             "handoff": (
@@ -3076,11 +3087,62 @@ async def _handle_task_tools(
                     "mode": _latest.get("mode"),
                     "session_id": _latest.get("session_id"),
                     "created_at": _latest.get("created_at"),
+                    # 3af86d28 — an invalidated handoff (superseded by a
+                    # corrective handoff) is non-executable: a receiving
+                    # executor must not act on `content` above without
+                    # first checking this. The body itself is left verbatim
+                    # for audit — only these three columns change.
+                    "invalidated": bool(_latest.get("invalidated")),
+                    "invalidated_reason": _latest.get("invalidated_reason"),
+                    "superseded_by_correction_id": _latest.get("superseded_by_correction_id"),
                 }
                 if _latest else None
             ),
             "has_handoff": bool(_latest) or bool(_pending),
+            "correction": _correction,
         }
+    if name == "record_handoff_correction":
+        # 3af86d28 — corrective handoff for a blocked executor session. See
+        # meridian.handoff's module docstring above _mint_and_embed_goal_token
+        # for the full design. Records the correction; when regenerate=true,
+        # also repairs pointers, invalidates the source handoff, and produces
+        # a new deterministic revision in this SAME call.
+        from .. import handoff as handoff_module_local  # noqa: PLC0415
+        _pid = args["project_id"]
+        try:
+            _correction = await handoff_module_local.record_handoff_correction(
+                db, _pid,
+                source_handoff_id=args["source_handoff_id"],
+                blocker_classification=args["blocker_classification"],
+                session_id=args.get("session_id"),
+                investigation_evidence=args.get("investigation_evidence"),
+                added_pointers=args.get("added_pointers"),
+                removed_pointers=args.get("removed_pointers"),
+                superseded_pointers=args.get("superseded_pointers"),
+                changed_resources=args.get("changed_resources"),
+                requested_scope=args.get("requested_scope"),
+                version=args.get("version"),
+                source_token=args.get("source_token"),
+                idempotency_key=args.get("idempotency_key"),
+                status=args.get("status") or "draft",
+            )
+        except handoff_module_local.HandoffCorrectionError as exc:
+            return {"error": "HANDOFF_CORRECTION_INVALID", "message": str(exc)}
+        if not args.get("regenerate"):
+            return {"correction": _correction, "regenerated": False}
+        _out_dir = args.get("output_dir") or data_dir
+        try:
+            return await handoff_module_local.regenerate_handoff_correction(
+                db, _pid, _correction["id"], _out_dir,
+                session_id=args.get("session_id"),
+                mode=args.get("mode") or "full",
+            )
+        except handoff_module_local.HandoffCorrectionError as exc:
+            return {
+                "correction": _correction, "regenerated": False,
+                "error": "HANDOFF_CORRECTION_REGENERATE_FAILED",
+                "message": str(exc),
+            }
     if name == "verify_handoff_token":
         # cb8e7c0f — verify a provenance token extracted from a pasted /goal block.
         # Delegates to DB-backed token store in handoff.py (shared across machines).

@@ -1785,6 +1785,110 @@ async def compute_pointer_readiness_for_record(
 
 
 # ---------------------------------------------------------------------------
+# 3af86d28 — pointer REPAIR: re-resolution before a corrective handoff
+# regeneration.
+#
+# A corrective handoff (meridian.handoff.record_handoff_correction /
+# regenerate_handoff_correction) carries an ``added_pointers`` list — the
+# evidence pointers the blocked executor found during its investigation.
+# Before that evidence is trusted enough to invalidate the source handoff and
+# generate a new revision, every added pointer must be independently
+# RE-resolved (not merely re-validated for shape) against the live project —
+# the whole point of the correction is that the world moved since the
+# original handoff was rendered, so a pointer that looked fine when written
+# may no longer resolve. :func:`repair_pointer_set` is that re-resolution
+# pass: pure composition of the existing primitives above
+# (:func:`validate_pointer` for shape, :func:`resolve_pointer` for live
+# resolution) — it invents no new resolution logic of its own, so it can
+# never drift from what a normal pointer-resolution call would find.
+# ---------------------------------------------------------------------------
+
+
+async def repair_pointer_set(
+    db: Any,
+    project_id: str,
+    pointers: "list[dict[str, Any]] | None",
+    **resolver_kwargs: Any,
+) -> dict[str, Any]:
+    """Re-resolve every pointer in ``pointers`` against the LIVE project.
+
+    Used by a corrective handoff's regeneration step to repair the evidence
+    pointers a blocked executor is asserting (``added_pointers``) before that
+    evidence is trusted enough to invalidate the source handoff. Each pointer
+    is first shape-validated (:func:`validate_pointer`) and then, if
+    structurally valid, resolved live (:func:`resolve_pointer`) — the SAME
+    resolver dispatch every other caller in this module uses, so a pointer
+    that "repairs" here is resolved exactly as strictly as it would be
+    anywhere else.
+
+    ``resolver_kwargs`` are forwarded to :func:`resolve_pointer` verbatim
+    (``symbol_resolver``, ``citation_resolver``, ``web_fetcher``, etc.) so
+    callers/tests can inject stubs — no network or live Zotero touched by
+    default, matching every other resolver call in this module.
+
+    Never raises: a malformed or unresolvable pointer is sorted into
+    ``unresolved`` with an explicit ``reason`` rather than aborting the whole
+    repair pass (mirrors :func:`resolve_pointer`'s own never-raise contract).
+
+    Returns::
+
+        {
+          "repaired": [<pointer dict, with a "resolution" key attached>, ...],
+          "unresolved": [{"pointer": <original>, "reason": <str>}, ...],
+          "repaired_count": int,
+          "unresolved_count": int,
+        }
+
+    A pointer is "repaired" iff it is structurally valid AND every one of its
+    targets resolved (``resolved: True``) — a pointer with even one
+    unresolved target is NOT considered repaired (fail-closed: partial
+    resolution is not evidence a receiving executor should trust silently).
+    """
+    repaired: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+
+    for raw in pointers or []:
+        if not isinstance(raw, dict):
+            unresolved.append(
+                {"pointer": raw, "reason": "malformed pointer entry (not an object)"}
+            )
+            continue
+        try:
+            validate_pointer(raw)
+        except PointerValidationError as exc:
+            unresolved.append({"pointer": raw, "reason": f"validation failed: {exc}"})
+            continue
+        try:
+            resolution = await resolve_pointer(
+                db, raw, project_id=project_id, **resolver_kwargs
+            )
+        except Exception as exc:  # noqa: BLE001 — never abort the whole pass
+            _log.debug("repair_pointer_set: resolve_pointer failed", exc_info=True)
+            unresolved.append({"pointer": raw, "reason": f"resolve error: {exc}"})
+            continue
+        targets = resolution.get("targets") or []
+        fully_resolved = bool(targets) and all(
+            isinstance(t, dict) and t.get("resolved") for t in targets
+        )
+        entry = {**raw, "resolution": resolution}
+        if fully_resolved:
+            repaired.append(entry)
+        else:
+            unresolved.append({
+                "pointer": entry,
+                "reason": "one or more targets did not resolve" if targets
+                else "pointer has no targets",
+            })
+
+    return {
+        "repaired": repaired,
+        "unresolved": unresolved,
+        "repaired_count": len(repaired),
+        "unresolved_count": len(unresolved),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Warn/strict artifact-pointer POLICY evaluator (88f82c15 — b730 follow-up)
 # ---------------------------------------------------------------------------
 #

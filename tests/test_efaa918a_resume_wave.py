@@ -480,3 +480,78 @@ async def test_mcp_resume_wave_token_already_consumed_hint(db):
     assert result["token_check"]["reason"] == "already_consumed"
     # b763d2ba framing: not an automatic spoofing verdict.
     assert "sibling" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# 3af86d28 — board_snapshot.compute_scope_diff: requested-vs-emitted scope
+# for a corrective handoff (meridian.handoff.record_handoff_correction's
+# requested_scope parameter). Same board_snapshot module family as the
+# staleness primitives above, so it lives in this file.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compute_scope_diff_all_requested_still_emitted(db):
+    pid = await _project(db, "scope-diff-all-live")
+    a = await db_module.add_sprint_item(db, pid, "v1", "item A")
+    b = await db_module.add_sprint_item(db, pid, "v1", "item B")
+
+    out = await db_module.compute_scope_diff(db, pid, [a["id"], b["id"]])
+    assert out["requested_item_ids"] == sorted([a["id"], b["id"]])
+    assert out["emitted_item_ids"] == sorted([a["id"], b["id"]])
+    assert out["dropped_item_ids"] == []
+    assert out["live_revision_hash"]
+
+
+@pytest.mark.asyncio
+async def test_compute_scope_diff_reports_dropped_when_item_completes(db):
+    pid = await _project(db, "scope-diff-dropped")
+    a = await db_module.add_sprint_item(db, pid, "v1", "item A")
+    b = await db_module.add_sprint_item(db, pid, "v1", "item B")
+    await db_module.complete_sprint_item(db, pid, a["id"])
+
+    out = await db_module.compute_scope_diff(db, pid, [a["id"], b["id"]])
+    assert out["emitted_item_ids"] == [b["id"]]
+    assert out["dropped_item_ids"] == [a["id"]]
+
+
+@pytest.mark.asyncio
+async def test_compute_scope_diff_version_scoped(db):
+    pid = await _project(db, "scope-diff-version")
+    v1_item = await db_module.add_sprint_item(db, pid, "v1", "v1 item")
+    v2_item = await db_module.add_sprint_item(db, pid, "v2", "v2 item")
+
+    out = await db_module.compute_scope_diff(
+        db, pid, [v1_item["id"], v2_item["id"]], version="v1",
+    )
+    assert out["emitted_item_ids"] == [v1_item["id"]]
+    assert out["dropped_item_ids"] == [v2_item["id"]]
+
+
+@pytest.mark.asyncio
+async def test_compute_scope_diff_empty_and_none_requested(db):
+    pid = await _project(db, "scope-diff-empty")
+    assert (await db_module.compute_scope_diff(db, pid, []))["requested_item_ids"] == []
+    assert (await db_module.compute_scope_diff(db, pid, None))["requested_item_ids"] == []
+
+
+# ---------------------------------------------------------------------------
+# 3af86d28 — record_handoff_correction MCP registration (same completeness
+# checklist as resume_wave's own registration test above).
+# ---------------------------------------------------------------------------
+
+def test_record_handoff_correction_registered_with_full_metadata():
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    assert "record_handoff_correction" in by_name
+
+    tool = by_name["record_handoff_correction"]
+    assert tool["description"]
+    assert tool["inputSchema"]["type"] == "object"
+    assert set(tool["inputSchema"]["required"]) == {"source_handoff_id", "blocker_classification"}
+    assert "added_pointers" in tool["inputSchema"]["properties"]
+    assert "regenerate" in tool["inputSchema"]["properties"]
+    assert "record_handoff_correction" in _TOOL_EXAMPLES
+    assert "record_handoff_correction(" in _TOOL_EXAMPLES["record_handoff_correction"]
+    assert _TOOL_CATEGORY.get("record_handoff_correction") == "session"
+    assert _TOOL_ROLE_RELEVANCE.get("record_handoff_correction") == "executor"
+    assert _TITLE_OVERRIDES.get("record_handoff_correction") == "Record Handoff Correction"

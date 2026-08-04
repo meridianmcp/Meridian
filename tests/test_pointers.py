@@ -24,6 +24,7 @@ from meridian.pointers import (
     serialize_targets,
     deserialize_targets,
     resolve_pointer,
+    repair_pointer_set,
 )
 
 
@@ -509,6 +510,103 @@ async def test_resolve_symbol_resolver_exception_is_guarded():
                                 symbol_resolver=_boom,
                                 citation_resolver=_stub_citation_resolver)
     assert out["targets"][0]["resolved"] is False
+
+
+# ---------------------------------------------------------------------------
+# repair_pointer_set (3af86d28) — re-resolution before a corrective handoff
+# regeneration trusts a set of "added_pointers" evidence.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_range_always_repairs():
+    """A range selector IS the location — no lookup, always resolves."""
+    ptrs = [{
+        "source_type": "code",
+        "targets": [{"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+    }]
+    out = await repair_pointer_set(None, "pid", ptrs)
+    assert out["repaired_count"] == 1
+    assert out["unresolved_count"] == 0
+    assert out["repaired"][0]["resolution"]["targets"][0]["resolved"] is True
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_symbol_resolves_with_injected_resolver():
+    ptrs = [{
+        "source_type": "code",
+        "targets": [{"uri": "found.py", "selector": {"type": "symbol", "qualified_name": "found.symbol"}}],
+    }]
+    out = await repair_pointer_set(
+        None, "pid", ptrs,
+        symbol_resolver=_stub_symbol_resolver,
+        citation_resolver=_stub_citation_resolver,
+    )
+    assert out["repaired_count"] == 1
+    assert out["unresolved_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_symbol_unresolved_without_match():
+    """No injected resolver matches -> the default resolver finds nothing ->
+    unresolved, with an explicit reason (never silently dropped)."""
+    ptrs = [{
+        "source_type": "code",
+        "targets": [{"uri": "gone.py", "selector": {"type": "symbol", "qualified_name": "vanished.symbol"}}],
+    }]
+    out = await repair_pointer_set(
+        None, "pid", ptrs,
+        symbol_resolver=_stub_symbol_resolver,
+        citation_resolver=_stub_citation_resolver,
+    )
+    assert out["repaired_count"] == 0
+    assert out["unresolved_count"] == 1
+    assert out["unresolved"][0]["pointer"]["source_type"] == "code"
+    assert "did not resolve" in out["unresolved"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_malformed_pointer_entry_sorted_unresolved():
+    out = await repair_pointer_set(None, "pid", ["not-a-dict", 42])
+    assert out["repaired_count"] == 0
+    assert out["unresolved_count"] == 2
+    assert all("malformed" in u["reason"] for u in out["unresolved"])
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_validation_failure_sorted_unresolved():
+    """A structurally invalid pointer (empty targets) never reaches
+    resolve_pointer — validate_pointer's own PointerValidationError is
+    caught and surfaced with a 'validation failed' reason."""
+    out = await repair_pointer_set(None, "pid", [{"source_type": "code", "targets": []}])
+    assert out["repaired_count"] == 0
+    assert out["unresolved_count"] == 1
+    assert "validation failed" in out["unresolved"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_empty_and_none_input():
+    assert await repair_pointer_set(None, "pid", []) == {
+        "repaired": [], "unresolved": [], "repaired_count": 0, "unresolved_count": 0,
+    }
+    assert await repair_pointer_set(None, "pid", None) == {
+        "repaired": [], "unresolved": [], "repaired_count": 0, "unresolved_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_mixed_batch_counts_both():
+    ptrs = [
+        {"source_type": "code", "targets": [{"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 1}}]},
+        {"source_type": "code", "targets": [{"uri": "gone.py", "selector": {"type": "symbol", "qualified_name": "vanished"}}]},
+    ]
+    out = await repair_pointer_set(
+        None, "pid", ptrs,
+        symbol_resolver=_stub_symbol_resolver,
+        citation_resolver=_stub_citation_resolver,
+    )
+    assert out["repaired_count"] == 1
+    assert out["unresolved_count"] == 1
 
 
 # ---------------------------------------------------------------------------
