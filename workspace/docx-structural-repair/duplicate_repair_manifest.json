@@ -1,0 +1,51 @@
+{
+  "sprint_item_id": "e5bd2061-ce3e-486d-9c3c-c6f45f248308",
+  "audit_timestamp_utc": "2026-08-04T04:31:14.156971Z",
+  "canonical_docx_path": "C:\\Users\\13144\\OneDrive\\Dissertation_Staging_REORGANIZED_2026-07-11.docx",
+  "canonical_docx_sha256_before": "842e41cf0a92b2acf743568efdf8822e02579186b286eff48edcfea0c7e6064c",
+  "canonical_docx_sha256_after": "842e41cf0a92b2acf743568efdf8822e02579186b286eff48edcfea0c7e6064c",
+  "canonical_docx_modified": false,
+  "outcome": "no_change_needed",
+  "reason": "Fresh byte-level re-verification against the CURRENT canonical document does not reproduce the duplicate-ownership defect described in the sprint item. The item's cited paragraph indices (1048/1049/1052 for Figure 5.21 / rId50, and 1192/1193/1194 for Figure A.4 / rId28) do not correspond to any position in the current document body (top-level <w:p> count is 478; even a fully recursive count including table-cell paragraphs is only 1473, and neither indexing scheme places the cited rIds at the cited positions). A whole-document scan of every <w:blip r:embed> and <v:imagedata r:id> reference in word/document.xml finds ZERO rIds referenced more than once anywhere in the file -- i.e. there is currently no duplicate XML drawing/reference ownership of any kind, for these two figures or any other image.",
+  "fresh_findings": {
+    "total_relationships_pointing_at_media": 53,
+    "total_media_parts_in_zip": 53,
+    "media_parts_duplicated_by_sha256": {},
+    "rIds_referenced_more_than_once_anywhere_in_document": {},
+    "rId50": {
+      "relationship_target": "media/image46.png",
+      "reference_count_in_document": 0,
+      "referencing_paragraphs": [],
+      "note": "rId50 -> word/media/image46.png is present in word/_rels/document.xml.rels but is NOT referenced by any <w:drawing>/<w:pict> element anywhere in word/document.xml (0 occurrences, not 2). It is an orphaned/unused relationship, not a duplicated one. The paragraph that actually precedes the 'Figure 5.21' caption (top_level_index=269, para_id=2D7FCCD0) is top_level_index=268 (para_id=73C3A969), which embeds rId31 -> media/image27.png -- a single reference, adjacency intact, nothing to remove."
+    },
+    "rId28": {
+      "relationship_target": "media/image24.png",
+      "reference_count_in_document": 1,
+      "referencing_paragraphs": [
+        {
+          "top_level_index": 254,
+          "para_id": "6AF75B71"
+        }
+      ],
+      "note": "rId28 -> word/media/image24.png is referenced exactly ONCE in the current document (not twice), in an isolated single-image paragraph unrelated to Figure A.4 (para_id=6AF75B71). The paragraph that actually precedes the 'Figure A.4' caption (top_level_index=332, para_id=5865C744) is top_level_index=331 (para_id=7C41B5E7), a four-image composite referencing rId36/rId37/rId38/rId39 -> media/image32-35.png -- none of which is rId28. The composite is intact and adjacency to its caption is intact; there is no stray duplicate paragraph immediately before/after it."
+    },
+    "figure_5_21_caption": {
+      "top_level_index": 269,
+      "para_id": "2D7FCCD0",
+      "label": "Figure 5.21"
+    },
+    "figure_A_4_caption": {
+      "top_level_index": 332,
+      "para_id": "5865C744",
+      "label": "Figure A.4"
+    },
+    "top_level_paragraph_count": 478,
+    "table_count_top_level": 12
+  },
+  "action_taken": [
+    "None. No backup copy was created, no XML was rewritten, and the canonical file was opened strictly read-only for this audit. Per the sprint item's own fail-closed gate ('fail closed if any undeclared drawing reference changes or Figure A.4/5.21 ownership remains ambiguous') and the explicit instruction not to fabricate a repair, no write was performed because fresh evidence does not confirm the described defect. Also note the document appears to have been substantially reorganised since the item's evidence was captured (file name/path itself: 'Dissertation_Staging_REORGANIZED_2026-07-11.docx'; the workspace/ directory shows several other sprint sessions actively auditing/editing the same document's figures and captions on the same day) -- the most likely explanation is that the described duplicate ownership was already resolved (or the figures renumbered/relocated) by other concurrent work before this session ran, rather than the original evidence having been fabricated."
+  ],
+  "backup_path": null,
+  "staged_repair_path": null,
+  "pdf_render_hash": null
+}
