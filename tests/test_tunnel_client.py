@@ -2443,6 +2443,106 @@ def test_kill_all_previously_spawned_pids_skips_pid_reused_entry(tmp_path, monke
     assert killed == {}
 
 
+def test_kill_all_previously_spawned_pids_spares_daemon_leased_by_live_sibling(tmp_path, monkeypatch):
+    """92aaedb7: a Serena daemon's ORIGINAL spawning tunnel can be dead while a
+    DIFFERENT, still-running sibling tunnel currently leases it via the
+    host-local broker (meridian.serena_pool) -- the once-per-startup orphan
+    sweep must not kill it out from under that sibling."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    registry = tc._all_spawned_registry_path()
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps([
+        {"pid": 777, "label": "extract", "create_time": 1000.0,
+         "owner_tunnel_pid": 111, "owner_tunnel_create_time": 2000.0},
+    ]))
+
+    # Broker registry: a sibling (tunnel_pid=333, still alive) currently
+    # leases the daemon recorded at pid 777, even though the tunnel that
+    # originally spawned it (owner_tunnel_pid=111 above) is dead.
+    from meridian import serena_pool as sp
+    broker_dir = sp.default_broker_dir()
+    key_dir = broker_dir / "somekey"
+    key_dir.mkdir(parents=True)
+    (key_dir / "daemon.json").write_text(json.dumps({"pid": 777, "port": 8700}))
+    (key_dir / "lease-sibling.json").write_text(
+        json.dumps({"owner_id": "sibling", "tunnel_pid": 333})
+    )
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    killed = {}
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            if self.pid == 777:
+                return 1000.0  # matches -- genuine child, not PID-reused
+            raise Exception("owner tunnel pid no longer exists")  # 111 is dead
+
+        def terminate(self):
+            killed.setdefault("terminate", []).append(self.pid)
+
+        def wait(self, timeout=None):
+            pass
+
+    fake_psutil.Process = _FakeProc
+    # Backs serena_pool._default_pid_alive's liveness check of tunnel_pid=333.
+    fake_psutil.pid_exists = lambda pid: pid == 333
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    tc._kill_all_previously_spawned_pids()
+
+    assert killed == {}, "a daemon still leased by a live sibling must not be killed"
+    # Registry still cleared -- this generation starts recording from empty.
+    assert json.loads(registry.read_text()) == []
+
+
+def test_kill_all_previously_spawned_pids_kills_orphan_with_no_broker_lease(tmp_path, monkeypatch):
+    """Sibling-lease guard is a narrowing, not a blanket skip: an entry with
+    no matching broker descriptor at all (the common case -- most spawned
+    pids are never Serena daemons) is killed exactly as before."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    registry = tc._all_spawned_registry_path()
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps([
+        {"pid": 555, "label": "extract", "create_time": 1000.0,
+         "owner_tunnel_pid": 111, "owner_tunnel_create_time": 2000.0},
+    ]))
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    killed = {}
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            if self.pid == 555:
+                return 1000.0
+            raise Exception("owner tunnel pid no longer exists")
+
+        def terminate(self):
+            killed.setdefault("terminate", []).append(self.pid)
+
+        def wait(self, timeout=None):
+            pass
+
+    fake_psutil.Process = _FakeProc
+    fake_psutil.pid_exists = lambda pid: False
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    tc._kill_all_previously_spawned_pids()
+
+    assert killed.get("terminate") == [555]
+
+
 def test_kill_all_previously_spawned_pids_survives_missing_file(tmp_path, monkeypatch):
     monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
     tc._kill_all_previously_spawned_pids()  # must not raise
@@ -2521,6 +2621,19 @@ def test_serena_daemon_pool_wired_via_serena_pool_spawn_in_run_tunnel():
     source = inspect.getsource(tc.run_tunnel)
     assert "spawn=_serena_pool_spawn" in source
     assert "spawn=lambda cmd: subprocess.Popen(cmd" not in source
+
+
+def test_serena_daemon_pool_wired_with_host_local_broker_in_run_tunnel():
+    """92aaedb7: run_tunnel must opt the pool into the host-local broker
+    (broker_dir + owner_id) so sibling tunnel_client processes on this
+    machine can share a repo's Serena daemon instead of each spawning their
+    own duplicate. Guards against a future regression silently dropping the
+    wiring and reverting to fully-isolated, unshared pools."""
+    import inspect
+
+    source = inspect.getsource(tc.run_tunnel)
+    assert "broker_dir=_serena_pool.default_broker_dir()" in source
+    assert "owner_id=_client_id" in source
 
 
 def test_kill_stale_port_occupant_spares_live_client_process(tmp_path, monkeypatch):

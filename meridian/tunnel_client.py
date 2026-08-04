@@ -2983,6 +2983,20 @@ def _kill_all_previously_spawned_pids(label: str = "startup") -> None:
                             continue  # owning tunnel still alive -- not our orphan to kill
                     except Exception:  # noqa: BLE001 — owner process gone -- genuine orphan
                         pass
+                # 92aaedb7 — host-local broker liveness guard: the owner-tunnel
+                # check above only knows about the ORIGINAL spawning tunnel. A
+                # shared Serena daemon (see serena_pool.SerenaDaemonPool) can
+                # legitimately outlive the tunnel that spawned it, as long as a
+                # DIFFERENT, still-running sibling tunnel currently leases it —
+                # killing it here would pull it out from under that sibling.
+                # No-op (returns False fast) for any entry that never went
+                # through the broker (every other slot label, and "extract"
+                # entries from before this feature existed).
+                try:
+                    if _serena_pool.has_live_lease(_serena_pool.default_broker_dir(), pid):
+                        continue
+                except Exception:  # noqa: BLE001 — best-effort, never block the sweep
+                    pass
             print(
                 f"tunnel:{label}: killing previously-spawned orphan "
                 f"(pid {pid}, {entry.get('label', '?')}) from a prior generation",
@@ -5948,6 +5962,13 @@ async def run_tunnel(
                 # by _kill_all_previously_spawned_pids on the next startup
                 # (see _serena_pool_spawn's docstring for the full gap).
                 spawn=_serena_pool_spawn,
+                # 92aaedb7 — host-local broker: share a repo's Serena daemon
+                # with sibling tunnel_client processes on this machine instead
+                # of each spawning its own duplicate. owner_id=_client_id ties
+                # every lease this pool writes to THIS tunnel invocation, the
+                # same identity already used for slot claim files above.
+                broker_dir=_serena_pool.default_broker_dir(),
+                owner_id=_client_id,
             )
             print(
                 f"  code-extractor:    Serena daemon pool (lazy, per repo_path) "
