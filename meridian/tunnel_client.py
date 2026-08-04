@@ -4645,38 +4645,13 @@ def _extract_status_failure(obj: Any) -> "str | None":
     return None
 
 
-def _extract_jsonrpc_error(body: bytes) -> "str | None":
-    """Extract a JSON-RPC or MCP tool-level error message from a response body.
+def _extract_jsonrpc_error_from_obj(data: Any) -> "str | None":
+    """Apply the JSON-RPC/MCP error-detection rules to an already-parsed object.
 
-    codebase-memory-mcp returns HTTP 200 even when ``index_repository`` fails
-    internally (e.g. a partial scan, a missing path, or a silently-aborted
-    pass). The failure surfaces only in the JSON-RPC body:
-
-    * A top-level ``"error"`` key  — a JSON-RPC error response.
-    * ``result.content[*].isError = true`` — an MCP-convention tool error
-      whose text is in ``result.content[0].text``.
-    * ``result.isError = true`` — older MCP tool-error convention.
-    * ``result.status`` (or a nested ``content[*].text`` JSON blob) reading
-      an error-like value (e.g. ``"error"``), optionally with a ``workers``
-      list reporting ``status: "worker_failed"`` / non-zero ``exit_code``
-      entries — codebase-memory-mcp's own application-level failure signal,
-      which does *not* set ``isError`` (cd28b329: this shape previously slid
-      through as a false "indexed" success).
-
-    Returns a short error string if any of these patterns is detected, or
-    ``None`` when the response looks clean. Best-effort: any parse failure
-    returns ``None`` (we log the happy path as before).
-
-    This is the in-repo half of the staleness/coverage gap: the HTTP-only
-    success check (``status < 400``) was the silent-failure path that allowed
-    a broken or partial index to look identical to a successful one.
+    Shared by ``_extract_jsonrpc_error`` for both a bare JSON body and each
+    individually-parsed SSE ``data:`` frame. Returns ``None`` for anything
+    that isn't a dict, or a dict that carries no recognized error signal.
     """
-    if not body:
-        return None
-    try:
-        data = json.loads(body.decode("utf-8", "replace"))
-    except Exception:  # noqa: BLE001 — non-JSON body (SSE, plain text)
-        return None
     if not isinstance(data, dict):
         return None
     # JSON-RPC error response.
@@ -4707,6 +4682,85 @@ def _extract_jsonrpc_error(body: bytes) -> "str | None":
         status_detail = _extract_status_failure(result)
         if status_detail:
             return status_detail
+    return None
+
+
+def _iter_sse_data_frames(text: str) -> "list[str]":
+    """Extract each SSE event's ``data:`` payload from *text*.
+
+    Per the SSE wire format, events are separated by a blank line and an
+    individual event may carry multiple ``data:`` lines, which are joined
+    with ``\\n`` into one field value. Input with no ``data:`` lines at all
+    (plain text, a bare JSON document) yields an empty list.
+    """
+    frames: list[str] = []
+    for event_block in text.replace("\r\n", "\n").split("\n\n"):
+        data_lines = [
+            line[len("data:"):].lstrip(" ")
+            for line in event_block.split("\n")
+            if line.startswith("data:")
+        ]
+        if data_lines:
+            frames.append("\n".join(data_lines))
+    return frames
+
+
+def _extract_jsonrpc_error(body: bytes) -> "str | None":
+    """Extract a JSON-RPC or MCP tool-level error message from a response body.
+
+    codebase-memory-mcp returns HTTP 200 even when ``index_repository`` fails
+    internally (e.g. a partial scan, a missing path, or a silently-aborted
+    pass). The failure surfaces only in the JSON-RPC body:
+
+    * A top-level ``"error"`` key  — a JSON-RPC error response.
+    * ``result.content[*].isError = true`` — an MCP-convention tool error
+      whose text is in ``result.content[0].text``.
+    * ``result.isError = true`` — older MCP tool-error convention.
+    * ``result.status`` (or a nested ``content[*].text`` JSON blob) reading
+      an error-like value (e.g. ``"error"``), optionally with a ``workers``
+      list reporting ``status: "worker_failed"`` / non-zero ``exit_code``
+      entries — codebase-memory-mcp's own application-level failure signal,
+      which does *not* set ``isError`` (cd28b329: this shape previously slid
+      through as a false "indexed" success).
+
+    The body may be a bare JSON document, or an SSE (``text/event-stream``)
+    response — mcp-proxy's Streamable HTTP transport can reply to a single
+    ``tools/call`` POST with ``Content-Type: text/event-stream`` framing
+    instead of a plain JSON body. When a bare ``json.loads`` fails, each SSE
+    ``data:`` frame is parsed and checked in turn so an error carried inside
+    an SSE-wrapped response is not mistaken for "not JSON, nothing to check"
+    (previously this SSE case fell straight through to the happy-path log —
+    see the false "indexed" success this produced before this fix).
+
+    Returns a short error string if any of these patterns is detected, or
+    ``None`` when the response looks clean. Best-effort: any parse failure
+    returns ``None`` (we log the happy path as before).
+
+    This is the in-repo half of the staleness/coverage gap: the HTTP-only
+    success check (``status < 400``) was the silent-failure path that allowed
+    a broken or partial index to look identical to a successful one.
+    """
+    if not body:
+        return None
+    text = body.decode("utf-8", "replace")
+    try:
+        data = json.loads(text)
+    except Exception:  # noqa: BLE001 — not a bare JSON document; try SSE framing
+        data = None
+    if isinstance(data, dict):
+        return _extract_jsonrpc_error_from_obj(data)
+    # Either not JSON at all, or valid JSON that wasn't a dict (e.g. a bare
+    # array) — in both cases, look for SSE `data:` frames and check each one
+    # that parses as JSON-RPC. Ignores frames that aren't valid JSON (e.g. a
+    # genuinely malformed/truncated event) rather than raising.
+    for frame in _iter_sse_data_frames(text):
+        try:
+            frame_data = json.loads(frame)
+        except Exception:  # noqa: BLE001 — malformed frame, skip it
+            continue
+        detail = _extract_jsonrpc_error_from_obj(frame_data)
+        if detail:
+            return detail
     return None
 
 

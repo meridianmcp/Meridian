@@ -554,8 +554,64 @@ def test_extract_jsonrpc_error_mcp_content_item_is_error():
 
 
 def test_extract_jsonrpc_error_non_json_body_returns_none():
-    """A non-JSON body (plain text, SSE) is silently ignored."""
+    """A body that is not JSON and not a parseable SSE data frame is silently ignored."""
     assert tc._extract_jsonrpc_error(b"event: message\ndata: {bad json}\n\n") is None
+    assert tc._extract_jsonrpc_error(b"plain text, not JSON, not SSE") is None
+
+
+def test_extract_jsonrpc_error_sse_wrapped_tool_error_is_detected():
+    """An SSE-framed (text/event-stream) body carrying result.isError must be
+    detected, not silently treated as a clean response (d786ca46: mcp-proxy's
+    Streamable HTTP transport can wrap the tools/call response in
+    ``data: {...}\\n\\n`` SSE framing even for a single-shot POST; a bare
+    ``json.loads`` on the whole body fails for this shape, and previously
+    that parse failure was indistinguishable from "no error to report").
+    """
+    body = (
+        b"event: message\n"
+        b'data: {"jsonrpc":"2.0","id":"idx","result":{"isError":true,'
+        b'"content":[{"type":"text","text":"index scan aborted"}]}}\n\n'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "index scan aborted" in result
+
+
+def test_extract_jsonrpc_error_sse_wrapped_status_failure_is_detected():
+    """An SSE-framed body carrying the nested status/worker-failure shape
+    (cd28b329) — no isError anywhere — is still detected through SSE framing.
+    """
+    body = (
+        b"event: message\n"
+        b'data: {"jsonrpc":"2.0","id":"idx","result":{"status":"error","workers":['
+        b'{"status":"worker_failed","exit_code":1}]}}\n\n'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "status=error" in result
+    assert "1 worker(s) failed" in result
+
+
+def test_extract_jsonrpc_error_sse_wrapped_clean_response_returns_none():
+    """An SSE-framed body with no error signal still returns None (no false positive)."""
+    body = (
+        b"event: message\n"
+        b'data: {"jsonrpc":"2.0","id":"idx","result":{"content":[{"type":"text","text":"ok"}]}}\n\n'
+    )
+    assert tc._extract_jsonrpc_error(body) is None
+
+
+def test_extract_jsonrpc_error_sse_multiple_data_lines_joined():
+    """Multiple `data:` lines within one SSE event are newline-joined per spec
+    before being parsed as a single JSON document."""
+    body = (
+        b"event: message\n"
+        b'data: {"jsonrpc":"2.0","id":"idx","error":\n'
+        b'data: {"code":-32603,"message":"split across lines"}}\n\n'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "split across lines" in result
 
 
 def test_extract_jsonrpc_error_empty_body_returns_none():
@@ -712,6 +768,47 @@ def test_index_code_dir_logs_jsonrpc_error_body(monkeypatch, capsys):
     # Must warn on stderr, not silently print "indexed"
     assert "scan partial" in captured.err
     assert "indexed" not in captured.out
+
+
+def test_index_code_dir_logs_sse_wrapped_jsonrpc_error_body(monkeypatch, capsys):
+    """_index_code_dir must not log a false 'indexed' success when
+    index_repository's HTTP-200 response is SSE-wrapped (d786ca46).
+
+    Before this fix, ``_extract_jsonrpc_error`` called ``json.loads`` on the
+    whole body; an SSE (``text/event-stream``) response failed that parse and
+    fell through to the "clean" branch, so a genuine index failure delivered
+    via SSE framing printed 'code-intel: indexed' instead of a warning.
+    """
+    import httpx as _httpx
+
+    _call_count = [0]
+
+    class FakeResp:
+        def __init__(self, body: bytes):
+            self.status_code = 200
+            self.content = body
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, url, **kw):
+            _call_count[0] += 1
+            if _call_count[0] == 1:
+                return FakeResp(b'{"jsonrpc":"2.0","id":"probe","result":{"tools":[]}}')
+            # index_repository call: HTTP 200, SSE-framed, MCP isError=true.
+            return FakeResp(
+                b"event: message\n"
+                b'data: {"jsonrpc":"2.0","id":"idx","result":{"isError":true,'
+                b'"content":[{"type":"text","text":"index scan aborted"}]}}\n\n'
+            )
+
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+    asyncio.run(tc._index_code_dir(8809, "/repo"))
+
+    captured = capsys.readouterr()
+    assert "index scan aborted" in captured.err
+    assert "code-intel: indexed" not in captured.out
 
 
 # ---------------------------------------------------------------------------
