@@ -38,6 +38,7 @@ from enum import Enum
 from pathlib import Path
 
 from . import __version__
+from . import process_lifecycle as _process_lifecycle
 from . import serena_pool as _serena_pool
 from .serena_pool import SerenaDaemonPool, SERENA_POOL_BASE_PORT
 
@@ -2745,6 +2746,7 @@ def _spawn_with_cache_retry(
     env: "dict | None",
     label: str,
     diagnostics: "SlotDiagnostics | None" = None,
+    extra_popen_kwargs: "dict | None" = None,
 ) -> "subprocess.Popen":
     """Spawn *cmd* via ``subprocess.Popen``; on failure, do a scoped cache clear and retry once.
 
@@ -2783,8 +2785,18 @@ def _spawn_with_cache_retry(
     :func:`_probe_tar_entry_error`'s own behaviour. The classification is
     recorded on *diagnostics* as a side effect; the return value/retry
     behaviour of this function is unaffected either way.
+
+    3c4ed79d — *extra_popen_kwargs* is optional and purely additive, same
+    contract as *diagnostics* above: every existing caller passes nothing
+    and sees byte-identical behaviour (an empty dict merges in nothing).
+    When given, its entries are merged OVER ``_spawn_kwargs()``'s own for
+    EVERY ``Popen`` call in this function (initial attempt and both retry
+    paths) — e.g. so :func:`_spawn_owned_with_cache_retry` can add
+    ``start_new_session=True`` on POSIX without losing the Windows
+    ``CREATE_NEW_PROCESS_GROUP`` flag ``_spawn_kwargs()`` already applies
+    there.
     """
-    kwargs = _spawn_kwargs()
+    kwargs = {**_spawn_kwargs(), **(extra_popen_kwargs or {})}
     # 2026-07-19 — merge in explicitly-resolved, sandbox-immune cache-dir vars
     # for every spawn through this central choke point (see
     # _resolve_stable_cache_env). When env was None (inherit parent), start
@@ -2918,6 +2930,79 @@ def _spawn_with_cache_retry(
             raise retry_exc from None
 
     return proc
+
+
+# ---------------------------------------------------------------------------
+# 3c4ed79d — portable owned-process lifecycle integration (additive; see
+# meridian/process_lifecycle.py for the backends themselves). This wires ONE
+# new spawn/teardown pair on top of the existing _spawn_with_cache_retry /
+# _terminate_proc_tree machinery WITHOUT changing either of those functions'
+# default behaviour for any existing caller — _spawn_kwargs() and
+# _terminate_proc_tree() are untouched, so ownership semantics for every
+# process already spawned through them (every current slot) do not change.
+# Adopting a new spawn site into the owned-tracking path (job-object on
+# Windows / process-group on POSIX) is opt-in per call site.
+# ---------------------------------------------------------------------------
+
+
+def _owned_process_backend() -> "_process_lifecycle.PosixProcessGroupBackend | _process_lifecycle.WindowsJobObjectBackend":
+    """Return the portable owned-process lifecycle backend for this platform.
+    A fresh instance per call — both backends are stateless aside from the
+    (lazily-invoked) Windows job-API loader, so there is nothing to cache."""
+    return _process_lifecycle.get_default_backend()
+
+
+def _spawn_owned_with_cache_retry(
+    cmd: "list[str]",
+    env: "dict | None",
+    label: str,
+    diagnostics: "SlotDiagnostics | None" = None,
+) -> "tuple[subprocess.Popen, _process_lifecycle.OwnedProcessHandle | None]":
+    """Spawn *cmd* exactly like :func:`_spawn_with_cache_retry` (identical
+    cache-retry / TAR_ENTRY_ERROR / diagnostics behaviour — this is a NEW,
+    additive entry point, not a replacement for the existing one or any of
+    its callers), and additionally hand back a portable
+    :class:`process_lifecycle.OwnedProcessHandle` so a caller that opts in
+    can tear down the WHOLE owned tree via :func:`_close_owned_process`
+    instead of only the root PID.
+
+    On POSIX, requests ``start_new_session=True`` (via
+    :func:`_spawn_with_cache_retry`'s additive *extra_popen_kwargs*) so the
+    spawned tree gets its own process group from the moment it starts — the
+    retry/diagnostics machinery itself is untouched. On Windows, the
+    already-running process is adopted into a fresh Job Object right after
+    the retry machinery settles on a working ``Popen`` (see
+    :meth:`process_lifecycle.WindowsJobObjectBackend.adopt` for the
+    documented race window this implies vs. that backend's own
+    :meth:`spawn`).
+
+    Best-effort: a handle-construction/job-assignment failure never unwinds
+    or fails the spawn itself — ``proc`` is always returned on success,
+    ``handle`` degrades to ``None`` instead (matching *diagnostics*'s own
+    "purely additive" contract).
+    """
+    posix_extra = {} if sys.platform == "win32" else {"start_new_session": True}
+    proc = _spawn_with_cache_retry(
+        cmd, env, label, diagnostics=diagnostics, extra_popen_kwargs=posix_extra,
+    )
+    try:
+        handle = _owned_process_backend().adopt(proc, cmd=cmd)
+    except Exception:  # noqa: BLE001 — best-effort; the spawn itself already succeeded
+        handle = None
+    return proc, handle
+
+
+def _close_owned_process(
+    handle: "_process_lifecycle.OwnedProcessHandle | None", *, grace_seconds: float = 5.0
+) -> bool:
+    """Tear down an owned process tree via the portable lifecycle backend
+    (3c4ed79d). ``None`` — a slot that never built a handle, or whose
+    :func:`_spawn_owned_with_cache_retry` call degraded — is a no-op
+    success, mirroring :func:`_terminate_proc_tree`'s own ``None``-is-a-
+    no-op contract so callers can pass either interchangeably."""
+    if handle is None:
+        return True
+    return _owned_process_backend().close(handle, grace_seconds=grace_seconds)
 
 
 def _plugin_spawn_env(env: object) -> "dict[str, str] | None":

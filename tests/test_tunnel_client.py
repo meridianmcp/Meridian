@@ -5042,3 +5042,192 @@ def test_fetch_config_generation_none_when_field_absent_or_wrong_type(monkeypatc
         async def get(self, *a, **kw): return FakeRespWrongType()
     monkeypatch.setattr(_httpx, "AsyncClient", Client2)
     assert asyncio.run(tc._fetch_config_generation("https://x.test", "tok", None)) is None
+
+
+# ---------------------------------------------------------------------------
+# 3c4ed79d — portable owned-process lifecycle integration
+# (_spawn_owned_with_cache_retry / _close_owned_process / the additive
+# extra_popen_kwargs on _spawn_with_cache_retry). See
+# meridian/process_lifecycle.py + tests/test_process_lifecycle.py for the
+# backends themselves.
+# ---------------------------------------------------------------------------
+
+
+class _OwnedFakeProc:
+    def __init__(self, pid=321):
+        self.pid = pid
+
+    def poll(self):
+        return None  # alive — _spawn_with_cache_retry's fast-exit check passes through
+
+
+def test_spawn_with_cache_retry_extra_popen_kwargs_merged(monkeypatch):
+    """3c4ed79d — the new *extra_popen_kwargs* param merges OVER _spawn_kwargs()
+    for every Popen call in the function."""
+    captured = []
+
+    def fake_popen(cmd, env=None, **kwargs):
+        captured.append(kwargs)
+        return _OwnedFakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    tc._spawn_with_cache_retry(
+        ["node"], None, "test", extra_popen_kwargs={"start_new_session": True},
+    )
+    assert captured[0].get("start_new_session") is True
+
+
+def test_spawn_with_cache_retry_omitted_extra_kwargs_unchanged(monkeypatch):
+    """3c4ed79d — omitting *extra_popen_kwargs* is byte-identical to before:
+    on POSIX, _spawn_kwargs() alone contributes nothing."""
+    captured = []
+
+    def fake_popen(cmd, env=None, **kwargs):
+        captured.append(kwargs)
+        return _OwnedFakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    tc._spawn_with_cache_retry(["node"], None, "test")
+    assert captured[0] == {}
+
+
+def test_spawn_owned_with_cache_retry_posix_gets_new_session(monkeypatch):
+    captured = []
+
+    def fake_popen(cmd, env=None, **kwargs):
+        captured.append(kwargs)
+        return _OwnedFakeProc(pid=654)
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    proc, handle = tc._spawn_owned_with_cache_retry(["node", "x.js"], None, "test")
+    assert proc.pid == 654
+    assert captured[0].get("start_new_session") is True
+    assert handle is not None
+    assert handle.pid == 654
+    assert handle.group_id == 654
+    assert handle.cmdline == ["node", "x.js"]
+
+
+class _FakeWin32JobAPIForTunnel:
+    """Minimal fake job API, mirrors test_process_lifecycle.py's fake — kept
+    local so this file has no cross-test-module import dependency."""
+
+    def __init__(self):
+        self.calls = []
+        self._next = 5000
+
+    def _h(self):
+        self._next += 1
+        return self._next
+
+    def create_job(self):
+        h = self._h()
+        self.calls.append(("create_job", h))
+        return h
+
+    def set_kill_on_close(self, job_handle):
+        self.calls.append(("set_kill_on_close", job_handle))
+        return True
+
+    def open_process(self, pid):
+        h = self._h()
+        self.calls.append(("open_process", pid, h))
+        return h
+
+    def assign_process(self, job_handle, process_handle):
+        self.calls.append(("assign_process", job_handle, process_handle))
+        return True
+
+    def terminate_job(self, job_handle, exit_code=1):
+        self.calls.append(("terminate_job", job_handle, exit_code))
+        return True
+
+    def close_handle(self, handle):
+        self.calls.append(("close_handle", handle))
+        return True
+
+
+def test_spawn_owned_with_cache_retry_windows_assigns_job(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _OwnedFakeProc(pid=999))
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+
+    from meridian import process_lifecycle as pl
+
+    fake_api = _FakeWin32JobAPIForTunnel()
+    monkeypatch.setattr(
+        tc._process_lifecycle, "get_default_backend",
+        lambda: pl.WindowsJobObjectBackend(api_loader=lambda: fake_api),
+    )
+
+    proc, handle = tc._spawn_owned_with_cache_retry(["node.exe"], None, "test")
+    assert proc.pid == 999
+    assert handle is not None
+    assert handle.job_id is not None
+    kinds = [c[0] for c in fake_api.calls]
+    assert kinds == ["create_job", "set_kill_on_close", "open_process", "assign_process"]
+
+
+def test_spawn_owned_with_cache_retry_degrades_to_none_on_adopt_failure(monkeypatch):
+    """A handle-construction failure never fails the spawn — proc is still
+    returned, handle degrades to None."""
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _OwnedFakeProc(pid=1))
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+
+    class _BoomBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _BoomBackend())
+
+    proc, handle = tc._spawn_owned_with_cache_retry(["node"], None, "test")
+    assert proc.pid == 1
+    assert handle is None
+
+
+def test_close_owned_process_none_is_noop():
+    assert tc._close_owned_process(None) is True
+
+
+def test_close_owned_process_delegates_to_backend(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    calls = []
+
+    class _FakeBackend:
+        def close(self, handle, *, grace_seconds=5.0):
+            calls.append((handle, grace_seconds))
+            return True
+
+    handle = pl.OwnedProcessHandle(run_id="r", pid=1, executable="x", cwd=None, cmdline=["x"])
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+
+    ok = tc._close_owned_process(handle, grace_seconds=2.0)
+
+    assert ok is True
+    assert calls == [(handle, 2.0)]
+
+
+def test_owned_process_backend_selects_by_platform(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    assert isinstance(tc._owned_process_backend(), pl.WindowsJobObjectBackend)
+
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    assert isinstance(tc._owned_process_backend(), pl.PosixProcessGroupBackend)
