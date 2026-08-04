@@ -225,3 +225,208 @@ def test_outputs_indexer_start_creates_missing_outputs_dir(tmp_path):
         assert target.is_dir()
     finally:
         idx.stop()
+
+
+# ---------------------------------------------------------------------------
+# OutputsFtsIndex / search_outputs — large-tree convergence authoritative
+# (5b897ad3): a cold/large tree can legitimately take several rebuild() calls
+# to finish. Before this fix, `search_outputs()` here only ever exposed a
+# bare `partial` boolean (no pending count, no error surfaced, no loud
+# zero-hit warning) — the exact "is this genuinely empty, or just not
+# finished yet" ambiguity already fixed for the sibling
+# extensions/meridian-outputs package (see its ConvergenceState /
+# zero_hits_warning contract). These tests use small synthetic tmp_path
+# trees with an artificially SLOWED per-file analysis step (monkeypatching
+# oi.file_fingerprint to sleep) — never a real/large on-disk tree, and every
+# OutputsFtsIndex here uses the class default `:memory:` DuckDB connection,
+# so nothing is ever persisted to (or rebuilt from) any real cache on disk.
+# ---------------------------------------------------------------------------
+
+try:
+    import duckdb  # noqa: F401
+    _DUCKDB_AVAILABLE = True
+except ImportError:
+    _DUCKDB_AVAILABLE = False
+
+duckdb_required = pytest.mark.skipif(
+    not _DUCKDB_AVAILABLE, reason="duckdb not installed"
+)
+
+
+class TestOutputsFtsIndexConvergence:
+    @staticmethod
+    def _install_slow_fingerprint(monkeypatch, delay: float) -> None:
+        real_fp = oi.file_fingerprint
+
+        def slow_fp(path):
+            time.sleep(delay)
+            return real_fp(path)
+
+        monkeypatch.setattr(oi, "file_fingerprint", slow_fp)
+
+    @duckdb_required
+    def test_healthy_rebuild_leaves_pending_count_at_zero(self, tmp_path):
+        (tmp_path / "a.csv").write_text("col\n1\n", encoding="utf-8")
+        idx = oi.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.last_rebuild_partial is False
+            assert idx.last_pending_count == 0
+            assert idx.last_db_write_error is None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_partial_rebuild_reports_real_pending_backlog(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """A tight budget that cuts the stale-file loop short must leave a
+        REAL, non-zero pending_count — not just the bare partial=True flag —
+        so a caller can tell how much work is still queued."""
+        n = 20
+        for i in range(n):
+            (tmp_path / f"r{i:03d}.csv").write_text(
+                f"col\nvalue={i}\n", encoding="utf-8",
+            )
+        self._install_slow_fingerprint(monkeypatch, 0.02)
+
+        idx = oi.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild(max_seconds=0.05)
+            assert idx.last_rebuild_partial is True
+            assert idx.last_pending_count > 0
+            assert idx.last_pending_count < n, (
+                "test setup didn't actually leave a partial backlog -- "
+                f"pending={idx.last_pending_count}"
+            )
+
+            # Repeated calls with a generous budget must converge: every
+            # stale file eventually processed, backlog drained to zero.
+            for _ in range(20):
+                idx.rebuild(max_seconds=2.0)
+                if idx.last_pending_count == 0 and not idx.last_rebuild_partial:
+                    break
+            assert idx.last_rebuild_partial is False
+            assert idx.last_pending_count == 0
+            assert len(idx._row_cache) == n
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_search_outputs_surfaces_pending_count_and_zero_hits_warning(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """The module-level search_outputs() (the real MCP-tool-facing entry
+        point) must surface the same signals, and a zero-hit result on an
+        unfinished index must carry zero_hits_warning -- never look identical
+        to a confirmed miss."""
+        n = 15
+        for i in range(n):
+            (tmp_path / f"s{i:03d}.csv").write_text(
+                f"col\nvalue={i}\n", encoding="utf-8",
+            )
+        self._install_slow_fingerprint(monkeypatch, 0.02)
+        key = oi._cache_key(str(tmp_path))
+        try:
+            result = oi.search_outputs(
+                str(tmp_path), "no-such-term-zzz", max_seconds=0.05,
+            )
+            assert result["partial"] is True
+            assert result["pending_count"] > 0
+            assert result["hits"] == []
+            assert "zero_hits_warning" in result, (
+                "a zero-hit result on an unfinished index must be loudly "
+                "flagged as non-authoritative -- got "
+                f"{result}"
+            )
+        finally:
+            with oi._index_cache_lock:
+                evicted = oi._index_cache.pop(key, None)
+            if evicted is not None:
+                evicted.close()
+
+    @duckdb_required
+    def test_search_outputs_no_warning_once_fully_converged(
+        self, tmp_path,
+    ) -> None:
+        """Once the index is genuinely fully converged (no slow-down, no
+        budget pressure), a real zero-hit search must NOT carry
+        zero_hits_warning/partial/pending_count -- those fields exist to flag
+        an INCOMPLETE index, not to editorialize a confirmed miss."""
+        (tmp_path / "t.csv").write_text("col\n1\n", encoding="utf-8")
+        key = oi._cache_key(str(tmp_path))
+        try:
+            result = oi.search_outputs(str(tmp_path), "no-such-term-zzz")
+            assert result["hits"] == []
+            assert "partial" not in result
+            assert "pending_count" not in result
+            assert "zero_hits_warning" not in result
+        finally:
+            with oi._index_cache_lock:
+                evicted = oi._index_cache.pop(key, None)
+            if evicted is not None:
+                evicted.close()
+
+    @duckdb_required
+    def test_rebuild_surfaces_db_write_error_instead_of_silent_debug_log(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Before this fix, a Phase-2 DB-write failure was swallowed at DEBUG
+        level only, while total_indexed/row_cache kept looking like a
+        healthy, growing index -- a real persistence failure was
+        indistinguishable from success. last_db_write_error must now surface
+        it, and clear on a subsequent successful call."""
+        (tmp_path / "a.csv").write_text("term_one,1\n", encoding="utf-8")
+
+        idx = oi.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx.last_db_write_error is None
+
+            def _boom(self, con):  # noqa: ANN001 -- matches _ensure_schema's signature
+                raise RuntimeError("simulated disk-full / connection failure")
+
+            monkeypatch.setattr(oi.OutputsFtsIndex, "_ensure_schema", _boom)
+            total_indexed = idx.rebuild()
+
+            # The misleading part of the original bug: the in-memory count
+            # still looks like a healthy, progressing index...
+            assert total_indexed >= 1
+            assert len(idx._row_cache) >= 1
+            # ...but the write genuinely failed, and that must now be visible.
+            assert idx.last_db_write_error is not None
+            assert "simulated disk-full" in idx.last_db_write_error
+
+            # A subsequent successful call clears the error (per-call
+            # semantics -- last_db_write_error reflects only the most recent
+            # rebuild() call).
+            monkeypatch.undo()
+            idx.rebuild()
+            assert idx.last_db_write_error is None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_search_outputs_surfaces_db_write_error_in_result_dict(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        (tmp_path / "b.csv").write_text("term_two,1\n", encoding="utf-8")
+
+        def _boom(self, con):  # noqa: ANN001
+            raise RuntimeError("simulated write failure")
+
+        monkeypatch.setattr(oi.OutputsFtsIndex, "_ensure_schema", _boom)
+        key = oi._cache_key(str(tmp_path))
+        try:
+            result = oi.search_outputs(str(tmp_path), "term_two")
+            assert result["total_indexed"] >= 1, (
+                "the in-memory count still looks like a healthy index -- "
+                "this is exactly the deceptive state db_write_error exists "
+                "to make visible"
+            )
+            assert result.get("db_write_error") is not None
+            assert "simulated write failure" in result["db_write_error"]
+        finally:
+            with oi._index_cache_lock:
+                evicted = oi._index_cache.pop(key, None)
+            if evicted is not None:
+                evicted.close()
