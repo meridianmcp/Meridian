@@ -5,8 +5,12 @@ handoff view lag the live board — a session pasted an old sprint-item list,
 another session had already changed statuses, and there was no way to tell
 "is this handoff manifest current" from "is it stale" without ambiguity.
 
-This module gives callers (``generate_handoff`` today; a future ``resume_wave``
-tool per the sprint-item spec) three primitives:
+This module gives callers three primitives -- originally consumed only by
+``start_wave_run``/``resume_wave`` (2a654cb0/efaa918a); ``generate_handoff``
+(mode='delta') and its ``build_continuation_manifest`` helper (836ca1d5) are
+now a second consumer, reusing the SAME revision ledger (one canonical
+staleness timeline per ``(project_id, version)`` bucket, regardless of which
+feature is asking) rather than standing up a parallel one:
 
   1. :func:`build_board_snapshot` — a canonical, byte-stable, expanded snapshot
      of the NON-DONE sprint board (every item whose ``status`` is not

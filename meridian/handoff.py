@@ -4593,12 +4593,18 @@ def _render_delta_handoff(
     quick_start_goal: str,
     identity: str | None = None,
     diagnostic_tasks: list[dict[str, Any]] | None = None,
+    continuation_manifest: dict[str, Any] | None = None,
 ) -> str:
     """Return a compact handoff for back-to-back goal runs in one session.
 
     ``identity`` (bdc251ec), when known, pre-fills the start_session ``human_id``.
     ``diagnostic_tasks`` (77a29c8b), when non-empty, surfaces recent blocked/found
     entries so repeated gate failures are not silently dropped from delta mode.
+    ``continuation_manifest`` (836ca1d5), when given, is embedded verbatim as a
+    compact JSON block inside a ``<continuation_manifest>`` tag — see
+    :func:`build_continuation_manifest`. ``None`` (e.g. the manifest build
+    failed and the caller degraded gracefully) omits the tag entirely, so this
+    stays byte-for-byte the pre-836ca1d5 output for that call.
     """
     # bc834237 — cap the pending list so a large backlog never bloats the delta
     # payload. Delta is richer than starter (session-continuity context), so the
@@ -4694,6 +4700,22 @@ def _render_delta_handoff(
             desc = (t.get("description") or "").strip()[:200]
             lines.append(f"- [{kind}] {desc}")
     lines += ["", "Next:", quick_start_goal]
+    if continuation_manifest is not None:
+        # 836ca1d5 — durable continuation manifest: canonical revision_hash/
+        # counter (board_snapshot.py) so a resuming session (or load_handoff,
+        # which returns this body verbatim) can detect a stale manifest
+        # against the LIVE board instead of trusting a possibly-stale pasted
+        # one. Compact/sorted-keys JSON, matching canonical_json's own
+        # discipline in board_snapshot.py, so the tag's content is
+        # deterministic for a given manifest.
+        lines += [
+            "",
+            "<continuation_manifest>",
+            json.dumps(
+                continuation_manifest, sort_keys=True, separators=(",", ":"),
+            ),
+            "</continuation_manifest>",
+        ]
     return "\n".join(lines) + "\n"
 
 
@@ -5652,6 +5674,155 @@ async def _resolve_session_sprint_version(
         return None
 
 
+# 836ca1d5 — schema version for build_continuation_manifest's returned shape.
+# Bump only when a field is removed/renamed in a way a consuming session must
+# react to; adding a new optional field is not a breaking change.
+_CONTINUATION_MANIFEST_SCHEMA_VERSION = 1
+
+# Same cap discipline _render_delta_handoff already applies to its own
+# "Pending:" section (bc834237) — the manifest is meant to stay small (it is
+# embedded INSIDE the compact delta body, whose entire purpose per 00dbeed0
+# is to not bloat), so it carries bounded id lists, not full item payloads.
+_CONTINUATION_MANIFEST_ID_CAP = 20
+
+
+async def build_continuation_manifest(
+    db: Any,
+    project_id: str,
+    *,
+    session_id: str | None = None,
+    version: str | None = None,
+    source: str | None = None,
+    record_revision: bool = True,
+) -> dict[str, Any]:
+    """836ca1d5 — the shared, deterministic continuation-manifest serializer.
+
+    This is the canonical shape a resuming session needs to (a) know what's
+    still pending and (b) tell whether ITS OWN view of the board has gone
+    stale relative to what the server sees right now — built on the same
+    canonical, byte-stable board snapshot (:func:`board_snapshot.build_board_snapshot`)
+    and durable monotonic revision ledger
+    (:func:`board_snapshot.record_board_snapshot_revision`) that
+    ``start_wave_run``/``resume_wave`` already established for wave runs
+    (ef665ef8/2a654cb0) — deliberately the SAME revision bucket, keyed by the
+    same ``(project_id, version)``, so a project has one canonical staleness
+    timeline shared across every feature that asks, rather than a
+    per-feature copy that can silently drift out of sync with the others.
+
+    Intended as the ONE implementation both ``generate_handoff(mode='delta')``
+    (wired in below) and ``start_session(mode='continue')``
+    (``meridian/server.py``'s ``_build_continue_payload``) build their resume
+    payload from, so the two "just continue" entry points can't structurally
+    diverge in what scope they report. Also the shape ``load_handoff``
+    surfaces automatically: it returns the latest stored handoff's body
+    verbatim, and this manifest is embedded IN that body (see
+    ``_render_delta_handoff``), so no separate wiring is needed there.
+
+    ``version`` resolves exactly like ``generate_handoff``'s own
+    ``_effective_version`` (b8f89491): an explicit ``version`` wins;
+    otherwise, when ``session_id`` is given, falls back to that session's own
+    stored ``sprint_version``. ``None`` (no explicit version, no session, or a
+    session with no stored scope) means unscoped — every non-done item across
+    every version.
+
+    ``record_revision`` (default True) persists the snapshot's hash to the
+    durable ``board_snapshot_revisions`` ledger so ``revision_counter`` is a
+    genuine monotonic "newer than" signal (see
+    ``board_snapshot.record_board_snapshot_revision``'s own docstring for why
+    a monotonic counter needs storage, not just a hash). The call is
+    idempotent — repeated calls with no intervening board change never grow
+    the ledger. Pass ``False`` for a pure read (peek the latest already-
+    recorded revision without creating one); falls back to
+    ``revision_counter=None`` when nothing has ever been recorded for this
+    ``(project_id, version)`` bucket yet.
+
+    Returns a JSON-serializable dict:
+      - ``schema_version`` — see ``_CONTINUATION_MANIFEST_SCHEMA_VERSION``.
+      - ``project_id``, ``session_id``, ``sprint_version`` (the resolved
+        effective version, may be ``None``), ``source`` (caller-supplied
+        free-text tag, e.g. ``"generate_handoff:delta"`` — informational
+        only, never affects the manifest's content or its revision hash).
+      - ``revision_hash`` / ``revision_counter`` — from the canonical board-
+        snapshot ledger; ``revision_counter`` is ``None`` when
+        ``record_revision=False`` and nothing has ever been recorded.
+      - ``item_count`` — size of the FULL non-done snapshot (board_snapshot's
+        own definition: every status except 'done' — so a resuming session
+        can see how a dependency chain actually resolved, e.g. a failed or
+        skipped parent, not just what remains claimable).
+      - ``pending_count`` — how many of those are actually claimable
+        (status in ('pending', 'todo')).
+      - ``pending_item_ids`` — up to :data:`_CONTINUATION_MANIFEST_ID_CAP`
+        pending/todo item ids, in the snapshot's own deterministic order
+        (version, added_at, id — see ``board_snapshot.build_board_snapshot``).
+        Ids only, not full item dicts: titles/status/etc. for the same items
+        are already rendered in the delta body's own "Pending:" section:
+        duplicating them here would defeat the point of a compact delta.
+
+    Best-effort by convention (matches every other enrichment step in
+    ``generate_handoff``): callers should wrap this in try/except and treat a
+    failure as "no manifest for this call" rather than letting it break
+    handoff generation — this function itself does not swallow errors, so
+    the caller's failure mode is explicit.
+
+    NOT YET DONE (documented follow-up, deliberately out of scope here):
+      - Wiring ``meridian/server.py``'s ``_build_continue_payload`` to call
+        this function instead of assembling its own ad hoc payload is a
+        purely mechanical follow-up (same fields, same semantics) — deferred
+        because server.py is a high-contention file outside this change's
+        file scope (AGENTS.md: sequential-only under this repo's parallel-
+        worktree protocol), not because of any design gap.
+      - Supersession metadata for corrective handoff revisions (a later
+        manifest that explicitly marks an earlier one superseded) was meant
+        to reuse 3af86d28's ``handoff_corrections`` data structure. That work
+        exists only on an orphaned, never-merged branch (commits
+        ca4673e/c38b7be) — there is no ``handoff_corrections`` table or
+        module on this branch to reuse. Re-landing that branch (the same
+        "re-land <sha>" pattern already used elsewhere in this repo for
+        orphaned work) is a prerequisite; reinventing a parallel mechanism
+        here was deliberately avoided since the whole point was to reuse it,
+        not fork it.
+      - Overflow/reference-section handling for a scope too large to inline
+        (thousands of pending items) — ``pending_item_ids`` is capped, not
+        paginated; a caller needing the full list still has
+        ``get_sprint_items``.
+    """
+    effective_version = version
+    if effective_version is None:
+        effective_version = await _resolve_session_sprint_version(db, session_id)
+
+    snapshot = await db_module.build_board_snapshot(
+        db, project_id, version=effective_version,
+    )
+    if record_revision:
+        _revision = await db_module.record_board_snapshot_revision(
+            db, project_id, snapshot,
+        )
+        revision_counter = _revision.get("revision_counter")
+    else:
+        _latest = await db_module.get_latest_board_snapshot_revision(
+            db, project_id, version=effective_version,
+        )
+        revision_counter = _latest.get("revision_counter") if _latest else None
+
+    pending_ids = [
+        it.get("id") for it in snapshot["items"]
+        if (it.get("status") or "") in ("pending", "todo")
+    ]
+
+    return {
+        "schema_version": _CONTINUATION_MANIFEST_SCHEMA_VERSION,
+        "project_id": project_id,
+        "session_id": session_id,
+        "sprint_version": effective_version,
+        "source": source,
+        "revision_hash": snapshot["revision_hash"],
+        "revision_counter": revision_counter,
+        "item_count": snapshot["item_count"],
+        "pending_count": len(pending_ids),
+        "pending_item_ids": pending_ids[:_CONTINUATION_MANIFEST_ID_CAP],
+    }
+
+
 async def build_effective_capability_contract(
     db: Any, project_id: str, *, board_stale: bool = False,
     version: "str | None" = None, items: "list[dict[str, Any]] | None" = None,
@@ -6161,6 +6332,17 @@ async def generate_handoff(
     either argument at its default (every pre-existing call site) sees ZERO
     functional change to ``(path, content, amended)`` or to ``content``
     itself — this never touches the rendered template.
+
+    ``mode='delta'`` (836ca1d5) additionally embeds a durable continuation
+    manifest — see :func:`build_continuation_manifest` — as a
+    ``<continuation_manifest>`` JSON tag in the rendered body: the same
+    canonical, byte-stable board-snapshot revision_hash/counter
+    ``start_wave_run``/``resume_wave`` already use for wave runs, so a
+    resuming session (or ``load_handoff``, which returns this body verbatim)
+    can tell a stale manifest from a current one instead of trusting a
+    possibly-stale pasted list. Best-effort: a failure to build the manifest
+    degrades to the pre-836ca1d5 delta output (no tag), never a broken
+    handoff.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -6781,6 +6963,22 @@ async def generate_handoff(
         # 77a29c8b — collect diagnostic tasks from the full task list so gate
         # failures are visible even in the compact delta path.
         delta_diagnostic = _collect_diagnostic_tasks(tasks)
+        # 836ca1d5 — durable continuation manifest (see
+        # build_continuation_manifest's docstring): the canonical board-
+        # snapshot revision_hash/counter, embedded in the rendered body so
+        # delta becomes a genuine continuation manifest, not just a compact
+        # summary + /goal. Best-effort — matches every other enrichment step
+        # in this function; a failure degrades to the pre-836ca1d5 output
+        # (no tag) rather than breaking delta generation.
+        try:
+            _continuation_manifest = await build_continuation_manifest(
+                db, project_id,
+                session_id=session_id,
+                version=_effective_version,
+                source="generate_handoff:delta",
+            )
+        except Exception:  # noqa: BLE001 — manifest is best-effort, never fatal
+            _continuation_manifest = None
         content = _render_delta_handoff(
             project,
             generated_at=generated_at,
@@ -6790,6 +6988,7 @@ async def generate_handoff(
             quick_start_goal=quick_start_goal,
             identity=identity,
             diagnostic_tasks=delta_diagnostic,
+            continuation_manifest=_continuation_manifest,
         )
     else:
         # v1.1 — per-user handoff template. When workspace_settings.handoff_template
