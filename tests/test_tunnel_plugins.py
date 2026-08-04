@@ -196,6 +196,48 @@ def test_expand_command_missing_repo_path_blanks_placeholder():
 
 
 # ---------------------------------------------------------------------------
+# e99b09e9 — expand_command forces headless on ANY Serena-shaped command, not
+# just the built-in default. This is the funnel a stale extract-slot override
+# and every custom-plugin command pass through at spawn time.
+# ---------------------------------------------------------------------------
+
+_PRE_HEADLESS_SERENA_CMD = [
+    "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+    "--context", "ide-assistant",
+    "--project", "{repo_path}",
+]
+
+
+def test_expand_command_forces_headless_on_stale_serena_override():
+    """A tenant's saved override that predates the --open-web-dashboard flag
+    (pre-344dd5e) must still end up headless at spawn time, not just flagged
+    stale on the dashboard."""
+    out = tp.expand_command(_PRE_HEADLESS_SERENA_CMD, repo_path="/repo/x")
+    assert out[out.index("--open-web-dashboard") + 1] == "false"
+    assert out[out.index("--project") + 1] == "/repo/x"
+    # Input untouched.
+    assert "--open-web-dashboard" not in _PRE_HEADLESS_SERENA_CMD
+
+
+def test_expand_command_forces_headless_on_custom_slot_pointed_at_serena():
+    """Detection is content-based, not slot-based: a custom (non-builtin) slot's
+    command that happens to be a Serena launch gets the same enforcement as the
+    extract slot's default."""
+    custom = [
+        "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+        "--project", "{repo_path}",
+    ]
+    out = tp.expand_command(custom, repo_path="/other/repo")
+    assert out[out.index("--open-web-dashboard") + 1] == "false"
+
+
+def test_expand_command_leaves_non_serena_custom_commands_untouched():
+    out = tp.expand_command(["codegraph", "--root", "{repo_path}"], repo_path="/r")
+    assert out == ["codegraph", "--root", "/r"]
+    assert "--open-web-dashboard" not in out
+
+
+# ---------------------------------------------------------------------------
 # Command override — the headline use case (code-intel → codegraph)
 # ---------------------------------------------------------------------------
 
@@ -347,6 +389,64 @@ def test_resolve_plugins_no_stale_flag_for_default_or_custom():
     cfg = {"code-extractor": {"command": ["uvx", "my-own-extractor"]}}
     ext_custom = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["extract"]
     assert "stale_override" not in ext_custom
+
+
+# ---------------------------------------------------------------------------
+# e99b09e9 — headless enforcement + staleness badge for historical Serena
+# command shapes (a tenant who saved an override while an older default,
+# predating the headless flag, was live).
+# ---------------------------------------------------------------------------
+
+def test_resolve_plugins_flags_and_forces_headless_on_pre_headless_serena_override():
+    """A saved override matching the pre-344dd5e default (no
+    --open-web-dashboard flag at all — would have popped the GUI dashboard on
+    every tunnel start) gets BOTH the stale badge AND hard headless
+    enforcement — the badge is advisory, ensure_serena_headless is not."""
+    old = [
+        "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+        "--context", "ide-assistant",
+        "--project", "{repo_path}",
+    ]
+    cfg = {"code-extractor": {"command": list(old)}}
+    ext = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["extract"]
+    assert ext.get("stale_override") is True
+    assert ext["newer_default_command"] == list(tp.SERENA_EXTRACT_COMMAND)
+    cmd = ext["command"]
+    assert cmd[cmd.index("--open-web-dashboard") + 1] == "false"
+
+
+def test_resolve_plugins_flags_stale_serena_override_with_old_context_name():
+    """post-344dd5e / pre-744d191 shape: headless flag already present, but the
+    deprecated --context ide-assistant name. Still flagged stale (context
+    rename), and headless stays enforced (it already was)."""
+    old = [
+        "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+        "--context", "ide-assistant",
+        "--open-web-dashboard", "false",
+        "--project", "{repo_path}",
+    ]
+    cfg = {"code-extractor": {"command": list(old)}}
+    ext = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["extract"]
+    assert ext.get("stale_override") is True
+    cmd = ext["command"]
+    assert cmd[cmd.index("--open-web-dashboard") + 1] == "false"
+
+
+def test_resolve_plugins_forces_headless_on_wrong_flag_value_without_staleness_match():
+    """A hand-edited override that isn't a recognized historical shape (so it
+    does NOT trip the stale_override badge) still gets headless forced —
+    ensure_serena_headless doesn't depend on the previous_defaults list."""
+    hand_edited = [
+        "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+        "--context", "claude-code",
+        "--open-web-dashboard", "true",  # someone flipped it back on
+        "--project", "{repo_path}",
+    ]
+    cfg = {"code-extractor": {"command": list(hand_edited)}}
+    ext = {p["slot"]: p for p in tp.resolve_plugins(cfg)}["extract"]
+    assert "stale_override" not in ext  # not a recognized historical shape
+    cmd = ext["command"]
+    assert cmd[cmd.index("--open-web-dashboard") + 1] == "false"
 
 
 def test_resolve_plugins_flags_stale_word_docx_mcp_server_override():

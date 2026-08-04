@@ -1381,6 +1381,39 @@ def _classify_serena_failure(err: object) -> "tuple[str, str] | None":
     return None
 
 
+# e99b09e9 — structured launch/terminate diagnostics for the Serena daemon
+# pool. Wired as the ``on_launch``/``on_terminate`` hooks on
+# SerenaDaemonPool.get_or_spawn/reap_idle/shutdown (serena_pool.py stays pure
+# — these callbacks are how the tunnel client opts into logging them). Never
+# prints the raw command (only its hash, via serena_pool._command_hash) so a
+# tenant-customized command that happens to embed a pasted secret never
+# reaches stdout/logs. One line per event, greppable, consistent with this
+# module's existing ``tunnel:<label>: ...`` print convention.
+#
+# get_or_spawn's hook fires on BOTH reuse and fresh-spawn (every relayed
+# request touches the pool), but only a fresh spawn is print-worthy here —
+# logging every reused-daemon request would flood stdout on every single
+# tools/list or find_symbol call. Reuse info is still available to any other
+# caller of the pool that wants it (the hook itself is unfiltered).
+def _print_serena_launch_diag(info: dict) -> None:
+    if info.get("reused"):
+        return
+    print(
+        f"tunnel:extract: serena_launch event=spawn repo={info.get('repo_path')} "
+        f"port={info.get('port')} pid={info.get('pid')} "
+        f"dashboard={info.get('dashboard')} cmd_hash={info.get('command_hash')}",
+        flush=True,
+    )
+
+
+def _print_serena_terminate_diag(info: dict) -> None:
+    print(
+        f"tunnel:extract: serena_terminate repo={info.get('repo_path')} "
+        f"port={info.get('port')} pid={info.get('pid')} reason={info.get('reason')}",
+        flush=True,
+    )
+
+
 # 089a936a — human-readable hint per slot when its first-spawn pre-flight probe
 # fails (the proxy accepted the Popen but never answered a `tools/list`). The
 # dc/office hint is specific (cold npx download); everything else gets a generic
@@ -2029,7 +2062,7 @@ async def _run_extract_pool_connection(
                     daemon = None
                     _spawn_exc: object = None
                     try:
-                        daemon = pool.get_or_spawn(repo_path)
+                        daemon = pool.get_or_spawn(repo_path, on_launch=_print_serena_launch_diag)
                     except Exception as exc:  # noqa: BLE001 — spawn failure → 503
                         _spawn_exc = exc
                         print(
@@ -2129,7 +2162,7 @@ async def _pool_idle_reaper(
     poll_interval = max(60.0, idle_seconds / 6)
     while True:
         await asyncio.sleep(poll_interval)
-        reaped = pool.reap_idle()
+        reaped = pool.reap_idle(on_terminate=_print_serena_terminate_diag)
         for repo_path in reaped:
             print(
                 f"tunnel:extract: Serena for {repo_path} idle >"
@@ -6299,7 +6332,7 @@ async def run_tunnel(
             sp.kill()
         # 64650cb4 — tear down every pooled Serena daemon.
         if serena_pool is not None:
-            serena_pool.shutdown()
+            serena_pool.shutdown(on_terminate=_print_serena_terminate_diag)
         # Kill custom (eager) plugin processes.
         for holder in proc_holders:
             _terminate_proc_tree(holder.get("proc"))

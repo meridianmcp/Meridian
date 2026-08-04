@@ -6,11 +6,18 @@ from __future__ import annotations
 
 import itertools
 import json
+from pathlib import Path
 
 import pytest
 
 from meridian import serena_pool as sp
-from meridian.serena_pool import SerenaDaemonPool, build_serena_command, resolve_repo_path
+from meridian.serena_pool import (
+    SerenaDaemonPool,
+    build_serena_command,
+    ensure_serena_headless,
+    is_serena_command,
+    resolve_repo_path,
+)
 
 # Distinct, deterministic-enough fake OS pids for every FakeProc spawned across
 # the whole module, so two sibling pools' spawned daemons never collide.
@@ -114,6 +121,78 @@ def test_resolve_repo_path_header_case_insensitive():
     assert resolve_repo_path(None, "/def") == "/def"
 
 
+# ── canonical headless enforcement (e99b09e9) ───────────────────────────────
+
+_PRE_HEADLESS_SERENA_CMD = [
+    "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+    "--context", "ide-assistant",
+    "--project", "{repo_path}",
+]
+
+
+def test_is_serena_command_detects_regardless_of_flags():
+    assert is_serena_command(_PRE_HEADLESS_SERENA_CMD) is True
+    assert is_serena_command(build_serena_command("/repo", 8825)) is True
+
+
+def test_is_serena_command_rejects_other_shapes():
+    assert is_serena_command(["uvx", "mcp-server-code-extractor"]) is False
+    assert is_serena_command(["npx", "-y", "@modelcontextprotocol/server-filesystem"]) is False
+    assert is_serena_command(None) is False
+    assert is_serena_command("uvx serena-agent start-mcp-server") is False  # not a list/tuple
+
+
+def test_ensure_serena_headless_inserts_missing_flag():
+    """A command saved before the headless flag existed (pre-344dd5e) gets it
+    forced on, regardless of where it came from (stale override, hand-edit)."""
+    out = ensure_serena_headless(_PRE_HEADLESS_SERENA_CMD)
+    assert out[out.index("--open-web-dashboard") + 1] == "false"
+    # Original input is untouched (fresh list returned).
+    assert "--open-web-dashboard" not in _PRE_HEADLESS_SERENA_CMD
+
+
+def test_ensure_serena_headless_fixes_wrong_value():
+    cmd = [
+        "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+        "--open-web-dashboard", "true",
+        "--project", "/x",
+    ]
+    out = ensure_serena_headless(cmd)
+    assert out[out.index("--open-web-dashboard") + 1] == "false"
+
+
+def test_ensure_serena_headless_idempotent_on_correct_command():
+    cmd = build_serena_command("/repo", 8825)
+    assert ensure_serena_headless(cmd) == cmd
+
+
+def test_ensure_serena_headless_leaves_non_serena_commands_untouched():
+    cmd = ["uvx", "mcp-server-fetch"]
+    assert ensure_serena_headless(cmd) == cmd
+    cmd2 = ["npx", "-y", "@wonderwhy-er/desktop-commander"]
+    assert ensure_serena_headless(cmd2) == cmd2
+
+
+def test_ensure_serena_headless_respects_local_opt_in_env(monkeypatch):
+    """The MERIDIAN_SERENA_DASHBOARD escape hatch is off by default (forces
+    headless); when set truthy on this machine, the command is left as
+    authored so a developer can debug against the real dashboard."""
+    monkeypatch.delenv(sp.SERENA_DASHBOARD_OPT_IN_ENV, raising=False)
+    assert ensure_serena_headless(_PRE_HEADLESS_SERENA_CMD)[
+        ensure_serena_headless(_PRE_HEADLESS_SERENA_CMD).index("--open-web-dashboard") + 1
+    ] == "false"
+
+    monkeypatch.setenv(sp.SERENA_DASHBOARD_OPT_IN_ENV, "1")
+    out = ensure_serena_headless(_PRE_HEADLESS_SERENA_CMD)
+    assert "--open-web-dashboard" not in out  # left exactly as authored
+
+
+def test_build_serena_command_still_headless_by_default(monkeypatch):
+    monkeypatch.delenv(sp.SERENA_DASHBOARD_OPT_IN_ENV, raising=False)
+    cmd = build_serena_command("/repo/x", 8825)
+    assert cmd[cmd.index("--open-web-dashboard") + 1] == "false"
+
+
 # ── pool spawn / reuse / routing ────────────────────────────────────────────
 
 def test_get_or_spawn_spawns_once_and_reuses(tmp_path):
@@ -178,6 +257,61 @@ def test_daemon_for_does_not_spawn(tmp_path):
     assert pool.daemon_for(str(tmp_path)) is not None
 
 
+# ── structured launch/terminate diagnostics (e99b09e9) ──────────────────────
+
+def test_get_or_spawn_on_launch_reports_new_spawn(tmp_path, monkeypatch):
+    monkeypatch.delenv(sp.SERENA_DASHBOARD_OPT_IN_ENV, raising=False)
+    pool, procs, _ = _pool()
+    seen = []
+    d = pool.get_or_spawn(str(tmp_path), on_launch=seen.append)
+    assert len(seen) == 1
+    info = seen[0]
+    assert info["reused"] is False
+    assert info["port"] == d.port
+    assert info["pid"] == d.proc.pid
+    assert info["dashboard"] == "headless"
+    assert isinstance(info["command_hash"], str) and len(info["command_hash"]) == 12
+    assert Path(info["repo_path"]) == Path(str(tmp_path)).resolve()
+
+
+def test_get_or_spawn_on_launch_reports_reuse(tmp_path):
+    pool, procs, _ = _pool()
+    seen = []
+    d1 = pool.get_or_spawn(str(tmp_path))
+    d2 = pool.get_or_spawn(str(tmp_path), on_launch=seen.append)
+    assert d2 is d1
+    assert len(seen) == 1
+    assert seen[0]["reused"] is True
+    assert seen[0]["pid"] == d1.proc.pid
+
+
+def test_get_or_spawn_on_launch_never_leaks_raw_command(tmp_path):
+    """Diagnostics carry a hash, never the literal command tokens (a
+    tenant-customized command_builder could embed a pasted secret)."""
+    pool, procs, _ = _pool()
+    seen = []
+    pool.get_or_spawn(str(tmp_path), on_launch=seen.append)
+    assert set(seen[0].keys()) == {
+        "repo_path", "port", "pid", "reused", "dashboard", "command_hash",
+    }
+
+
+def test_get_or_spawn_on_launch_dashboard_field_reflects_opt_in(tmp_path, monkeypatch):
+    monkeypatch.setenv(sp.SERENA_DASHBOARD_OPT_IN_ENV, "true")
+    pool, procs, _ = _pool()
+    seen = []
+    pool.get_or_spawn(str(tmp_path), on_launch=seen.append)
+    assert seen[0]["dashboard"] == "gui"
+
+
+def test_get_or_spawn_without_on_launch_unchanged_behavior(tmp_path):
+    """on_launch is fully optional — omitting it changes nothing."""
+    pool, procs, _ = _pool()
+    d = pool.get_or_spawn(str(tmp_path))
+    assert d.is_alive
+    assert len(procs) == 1
+
+
 # ── idle reaping + shutdown ─────────────────────────────────────────────────
 
 def test_reap_idle_kills_only_idle(tmp_path):
@@ -194,6 +328,20 @@ def test_reap_idle_kills_only_idle(tmp_path):
     assert da.proc.terminated is True
 
 
+def test_reap_idle_on_terminate_reports_idle_timeout_reason(tmp_path):
+    pool, procs, clock = _pool(idle_kill_seconds=600)
+    a = tmp_path / "a"; a.mkdir()
+    da = pool.get_or_spawn(str(a))
+    clock.advance(700)
+    seen = []
+    pool.reap_idle(on_terminate=seen.append)
+    assert len(seen) == 1
+    assert seen[0] == {
+        "repo_path": da.repo_path, "port": da.port,
+        "pid": da.proc.pid, "reason": "idle_timeout",
+    }
+
+
 def test_shutdown_kills_all(tmp_path):
     pool, procs, _ = _pool()
     a = tmp_path / "a"; a.mkdir()
@@ -203,6 +351,19 @@ def test_shutdown_kills_all(tmp_path):
     pool.shutdown()
     assert len(pool) == 0
     assert all(p.terminated for p in procs)
+
+
+def test_shutdown_on_terminate_reports_tunnel_shutdown_reason(tmp_path):
+    pool, procs, _ = _pool()
+    a = tmp_path / "a"; a.mkdir()
+    b = tmp_path / "b"; b.mkdir()
+    da = pool.get_or_spawn(str(a))
+    db = pool.get_or_spawn(str(b))
+    seen = []
+    pool.shutdown(on_terminate=seen.append)
+    assert {info["repo_path"] for info in seen} == {da.repo_path, db.repo_path}
+    assert all(info["reason"] == "tunnel_shutdown" for info in seen)
+    assert {info["pid"] for info in seen} == {da.proc.pid, db.proc.pid}
 
 
 def test_idle_seconds_and_touch(tmp_path):

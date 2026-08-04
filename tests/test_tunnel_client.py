@@ -2636,6 +2636,63 @@ def test_serena_daemon_pool_wired_with_host_local_broker_in_run_tunnel():
     assert "owner_id=_client_id" in source
 
 
+def test_serena_launch_diag_wired_into_run_tunnel_shutdown():
+    """e99b09e9: the pool's shutdown() must be called with the structured
+    terminate-diagnostic callback, not bare — guards a future regression
+    silently dropping the shutdown_reason diagnostic."""
+    import inspect
+
+    source = inspect.getsource(tc.run_tunnel)
+    assert "serena_pool.shutdown(on_terminate=_print_serena_terminate_diag)" in source
+
+
+def test_serena_launch_diag_wired_into_pool_idle_reaper():
+    import inspect
+
+    source = inspect.getsource(tc._pool_idle_reaper)
+    assert "on_terminate=_print_serena_terminate_diag" in source
+
+
+def test_serena_launch_diag_wired_into_extract_pool_connection():
+    import inspect
+
+    source = inspect.getsource(tc._run_extract_pool_connection)
+    assert "on_launch=_print_serena_launch_diag" in source
+
+
+def test_print_serena_launch_diag_logs_only_new_spawn_not_reuse(capsys):
+    """A reused daemon must not spam a log line on every relayed request; only
+    a genuine new spawn is print-worthy."""
+    tc._print_serena_launch_diag({
+        "repo_path": "/repo", "port": 8700, "pid": 123, "reused": False,
+        "dashboard": "headless", "command_hash": "abc123def456",
+    })
+    out = capsys.readouterr().out
+    assert "serena_launch" in out
+    assert "event=spawn" in out
+    assert "port=8700" in out
+    assert "pid=123" in out
+    assert "dashboard=headless" in out
+    assert "abc123def456" in out
+
+    tc._print_serena_launch_diag({
+        "repo_path": "/repo", "port": 8700, "pid": 123, "reused": True,
+        "dashboard": "headless", "command_hash": "abc123def456",
+    })
+    assert capsys.readouterr().out == ""  # reuse is silent
+
+
+def test_print_serena_terminate_diag_reports_reason(capsys):
+    tc._print_serena_terminate_diag({
+        "repo_path": "/repo", "port": 8700, "pid": 123, "reason": "idle_timeout",
+    })
+    out = capsys.readouterr().out
+    assert "serena_terminate" in out
+    assert "reason=idle_timeout" in out
+    assert "port=8700" in out
+    assert "pid=123" in out
+
+
 def test_kill_stale_port_occupant_spares_live_client_process(tmp_path, monkeypatch):
     """aaddb273 scenario 1: a live second client's process is NOT killed.
 

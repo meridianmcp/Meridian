@@ -168,7 +168,31 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         # an old default → the dashboard shows a "newer default available" badge.
         # The extract slot defaulted to `uvx mcp-server-code-extractor` (command
         # None → that builder) before Serena (commit 1428f1b).
-        "previous_defaults": [["uvx", "mcp-server-code-extractor"]],
+        #
+        # e99b09e9 — also backfilled the two historical Serena command shapes
+        # so a tenant who saved an override while either was the live default
+        # gets the "newer default available" badge too (not just silent
+        # headless enforcement via ensure_serena_headless, which already
+        # covers the actual behavior regardless of this list):
+        #   - pre-344dd5e: no --open-web-dashboard flag at all (would have
+        #     popped the GUI dashboard on every tunnel start).
+        #   - post-344dd5e / pre-744d191: headless flag present, but
+        #     --context ide-assistant (deprecated name, since renamed to
+        #     claude-code).
+        "previous_defaults": [
+            ["uvx", "mcp-server-code-extractor"],
+            [
+                "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+                "--context", "ide-assistant",
+                "--project", "{repo_path}",
+            ],
+            [
+                "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
+                "--context", "ide-assistant",
+                "--open-web-dashboard", "false",
+                "--project", "{repo_path}",
+            ],
+        ],
         # MUST stay None — the server bridge namespaces extract-slot tools as
         # "extractor__find_symbol" via SLOT_DISPLAY_NAMES. A client prefix here
         # would double them to "extractor__Serena__find_symbol". (49905647)
@@ -764,12 +788,26 @@ def expand_command(value: Any, *, repo_path: str | None = None) -> list[str] | N
     ``{...}`` placeholders are left untouched. Accepts the same shapes as
     :func:`_coerce_command`; ``None``/empty in yields ``None``. Returns a fresh
     list, so module-level command constants are never mutated.
+
+    e99b09e9 — this is the funnel every non-default Serena invocation passes
+    through before spawn: the extract slot's tenant-saved/stale override (see
+    ``tunnel_client.run_tunnel``'s ``elif expand_command(ext_raw, ...)``
+    branch) AND any custom plugin/slot (``resolve_custom_plugins`` command
+    expansion at spawn time), both here and nowhere else. Routing the result
+    through :func:`meridian.serena_pool.ensure_serena_headless` here — rather
+    than only at the one built-in default — means a command that merely
+    *looks like* Serena (matches on content, not on which slot it rides)
+    always gets the headless flag forced, independent of staleness or which
+    slot it's bound to. Non-Serena commands pass through byte-for-byte.
     """
     cmd = _coerce_command(value)
     if cmd is None:
         return None
     rp = repo_path or ""
-    return [tok.replace("{repo_path}", rp) for tok in cmd]
+    expanded = [tok.replace("{repo_path}", rp) for tok in cmd]
+    from .serena_pool import ensure_serena_headless  # noqa: PLC0415 — avoid import cycle risk
+
+    return ensure_serena_headless(expanded)
 
 
 def _iter_plugin_items(raw: Any) -> list[dict]:
@@ -1192,6 +1230,23 @@ def resolve_plugins(raw_config: Any, detected_slots: Any = frozenset()) -> list[
         # slot / url_prefix are immutable for built-ins.
         merged["slot"] = base["slot"]
         merged["url_prefix"] = base["url_prefix"]
+        # e99b09e9 — force headless on any resolved command that looks like a
+        # Serena launch: the built-in "extract" default, a tenant override, a
+        # stale snapshot from before the headless flag existed, or (since
+        # detection is content-based, not slot-based) a tenant who pointed a
+        # DIFFERENT built-in slot's command override at Serena. Custom
+        # (non-builtin-named) plugins aren't looped over here — they're
+        # normalized at spawn time by expand_command instead (see its
+        # docstring). This runs BEFORE the staleness check below, which
+        # compares the RAW ov_cmd / base_cmd, so normalizing here never masks
+        # a genuinely stale override from the "newer default available"
+        # badge. Keeps what the dashboard displays/returns as "the command"
+        # already headless-safe, not just what the tunnel client resolves at
+        # spawn time via expand_command.
+        if isinstance(merged.get("command"), list):
+            from .serena_pool import ensure_serena_headless  # noqa: PLC0415
+
+            merged["command"] = ensure_serena_headless(merged["command"])
         # cc904bfe — flag a stale custom command override: the tenant saved a
         # `command` that matches a *previous* built-in default for this slot (so
         # it was a copy of the old default, now superseded by a new one). The

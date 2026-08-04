@@ -103,6 +103,103 @@ from typing import Any, Callable
 # in; the server forwards it and the tunnel relay uses it to pick the daemon.
 REPO_PATH_HEADER = "x-meridian-repo-path"
 
+# e99b09e9 — local-machine opt-in escape hatch for Serena's web dashboard.
+# Headless is the enforced default everywhere a Serena command is built or
+# normalized (see :func:`ensure_serena_headless`); this env var is the ONE way
+# to get the GUI back, and it is deliberately an environment variable rather
+# than a `tunnel_plugins` config field: that config is project-shared and
+# synced across every machine/tenant using it (see AGENTS.md's capability-
+# manifest provenance rules — no machine-local settings belong there), so a
+# "show the dashboard" toggle stored there would pop a browser tab on every
+# OTHER machine sharing the config too. An env var is inherently local to the
+# one machine that sets it, and — unlike a Claude Desktop / MCP config entry —
+# it is never written into a generated config file (Meridian's local
+# `.mcp.json` writer only ever emits `http://127.0.0.1:<port>` proxy URLs for
+# the extract slot, never Serena's raw launch command).
+SERENA_DASHBOARD_OPT_IN_ENV = "MERIDIAN_SERENA_DASHBOARD"
+
+
+def _dashboard_opt_in() -> bool:
+    """True when the local-machine dev escape hatch is set (see the env var
+    docs above). Off by default — headless always wins unless explicitly
+    opted out of on THIS machine."""
+    return os.environ.get(SERENA_DASHBOARD_OPT_IN_ENV, "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
+
+def is_serena_command(cmd: Any) -> bool:
+    """True if *cmd* looks like a Serena MCP server launch.
+
+    Detected by the presence of both the ``serena-agent`` package marker and
+    the ``start-mcp-server`` subcommand — the two tokens every Serena launch
+    (the pool's own :func:`build_serena_command`, the tunnel-plugin
+    registry's default, and any tenant-saved override, stale snapshot, or
+    custom slot pointed at Serena) shares regardless of ``--context``/
+    ``--project``/transport values. This is intentionally loose (order- and
+    flag-independent) so it still recognizes a hand-edited or historical
+    command that predates a later flag rename.
+    """
+    if not isinstance(cmd, (list, tuple)):
+        return False
+    tokens = [str(t) for t in cmd]
+    return "serena-agent" in tokens and "start-mcp-server" in tokens
+
+
+def ensure_serena_headless(cmd: Any) -> Any:
+    """Force ``--open-web-dashboard false`` onto a Serena command (e99b09e9).
+
+    This is the single canonical enforcement point for "headless by default":
+    every place a Serena command is built or resolved — this module's own
+    :func:`build_serena_command`, ``tunnel_plugins.SERENA_EXTRACT_COMMAND``,
+    a tenant's saved/stale extract-slot override, or a custom tunnel slot
+    pointed at Serena (all routed through it via
+    ``tunnel_plugins.expand_command`` / ``tunnel_plugins.resolve_plugins``)
+    — funnels through here before spawn. That way a missing or stale flag
+    (e.g. an override saved before this flag existed, or a hand-edited
+    command) can never pop a browser tab as a side effect of a tools/list,
+    initialize, reconnect, or pool spawn.
+
+    Non-Serena commands are returned unchanged (a copy, for list inputs).
+    Idempotent — an already-correct command round-trips unchanged, modulo
+    normalizing the flag's value to the literal ``"false"``.
+
+    Respects :data:`SERENA_DASHBOARD_OPT_IN_ENV` — when set truthy on this
+    machine, the command is left exactly as authored (dashboard mode
+    preserved) so a developer can debug against the real Serena UI locally.
+    """
+    if not is_serena_command(cmd):
+        return list(cmd) if isinstance(cmd, (list, tuple)) else cmd
+    out = [str(t) for t in cmd]
+    if _dashboard_opt_in():
+        return out
+    flag = "--open-web-dashboard"
+    if flag in out:
+        idx = out.index(flag)
+        if idx + 1 < len(out):
+            out[idx + 1] = "false"
+        else:
+            out.append("false")
+    else:
+        try:
+            insert_at = out.index("start-mcp-server") + 1
+        except ValueError:
+            insert_at = len(out)
+        out[insert_at:insert_at] = [flag, "false"]
+    return out
+
+
+def _command_hash(cmd: Any) -> str:
+    """Short, non-reversible digest of a command for diagnostics.
+
+    Launch diagnostics log a hash instead of the raw command so a
+    tenant-customized override that happens to embed a pasted secret (e.g. an
+    API key in a custom slot's command) never reaches stdout/logs.
+    """
+    tokens = cmd if isinstance(cmd, (list, tuple)) else []
+    joined = " ".join(str(t) for t in tokens)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:12]
+
 # Serena HTTP daemons are allocated sequential ports starting here.
 #
 # a1a870d5 (2026-07-19) — this was 8820, IDENTICAL to
@@ -152,16 +249,20 @@ def build_serena_command(repo_path: str, port: int) -> list[str]:
     Uses ``--transport streamable-http --port`` so Serena serves HTTP directly
     (no mcp-proxy bridge needed) and ``--project`` to scope it to ``repo_path``.
     Mirrors the flags in :data:`meridian.tunnel_plugins.SERENA_EXTRACT_COMMAND`
-    (headless, claude-code context) plus the per-instance transport/port.
+    (claude-code context) plus the per-instance transport/port. Routed through
+    :func:`ensure_serena_headless` — the same canonical enforcement point
+    every other Serena command (defaults, overrides, custom slots) goes
+    through — rather than inlining the flag here, so this builder can never
+    silently drift from the shared headless-by-default guarantee.
     """
-    return [
+    cmd = [
         "uvx", "--from", "serena-agent", "serena", "start-mcp-server",
         "--context", "claude-code",
-        "--open-web-dashboard", "false",
         "--transport", "streamable-http",
         "--port", str(port),
         "--project", repo_path,
     ]
+    return ensure_serena_headless(cmd)
 
 
 def resolve_repo_path(headers: dict[str, Any] | None, default_repo_path: str) -> str:
@@ -656,7 +757,12 @@ class SerenaDaemonPool:
         self._write_lease(key)
         return daemon
 
-    def get_or_spawn(self, repo_path: str) -> SerenaDaemon:
+    def get_or_spawn(
+        self,
+        repo_path: str,
+        *,
+        on_launch: Callable[[dict[str, Any]], None] | None = None,
+    ) -> SerenaDaemon:
         """Return the live daemon for ``repo_path``, spawning one if needed.
 
         With no broker configured this is unchanged from the original pool:
@@ -668,6 +774,16 @@ class SerenaDaemonPool:
         running for this repo_path before spawning a duplicate — this is the
         actual cross-session sharing. The returned daemon's idle timer is
         reset either way.
+
+        ``on_launch`` (e99b09e9), if given, is called with a structured
+        diagnostics dict — ``repo_path``, ``port``, ``pid``, ``reused``
+        (bool), ``dashboard`` (``"headless"``/``"gui"``), ``command_hash``
+        (never the raw command — see :func:`_command_hash`) — on both the
+        reuse and fresh-spawn paths (not on the adoption path, which is
+        diagnosed separately via :meth:`diagnostics`). Optional and injected
+        (same pattern as ``spawn``/``now``/``terminate``) so the pool stays
+        pure and callers (the tunnel client) own how/whether diagnostics are
+        logged.
         """
         key = self._normalize(repo_path)
         now = self._now()
@@ -678,6 +794,8 @@ class SerenaDaemonPool:
                 self._touch_lease(key)
                 if not existing.owned:
                     self._adopt_failures.pop(key, None)
+            if on_launch is not None:
+                on_launch(self._launch_diagnostics(key, existing, reused=True))
             return existing
         if existing is not None:
             # Locally-tracked entry died: either our own owned process
@@ -712,7 +830,32 @@ class SerenaDaemonPool:
             self._enforce_max_daemons()
         elif self.max_daemons is not None:
             self._enforce_max_daemons()
+        if on_launch is not None:
+            on_launch(self._launch_diagnostics(key, daemon, reused=False, cmd=cmd))
         return daemon
+
+    def _launch_diagnostics(
+        self, repo_path: str, daemon: SerenaDaemon, *, reused: bool, cmd: Any = None,
+    ) -> dict[str, Any]:
+        """Structured launch info for ``on_launch`` (see :meth:`get_or_spawn`).
+
+        On the reuse path no command was (re)built, so one is recomputed here
+        purely for the diagnostic hash — :func:`build_serena_command`-shaped
+        builders are pure/cheap, and nothing is spawned by this call.
+        """
+        if cmd is None:
+            try:
+                cmd = self._command_builder(repo_path, daemon.port)
+            except Exception:  # noqa: BLE001 — diagnostics must never break spawn
+                cmd = None
+        return {
+            "repo_path": repo_path,
+            "port": daemon.port,
+            "pid": getattr(daemon.proc, "pid", None),
+            "reused": reused,
+            "dashboard": "gui" if _dashboard_opt_in() else "headless",
+            "command_hash": _command_hash(cmd),
+        }
 
     def daemon_for(self, repo_path: str) -> SerenaDaemon | None:
         """Return the registered daemon for ``repo_path`` without spawning."""
@@ -758,24 +901,55 @@ class SerenaDaemonPool:
         self._remove_descriptor(key)
         return True
 
-    def reap_idle(self, now: float | None = None) -> list[str]:
+    def reap_idle(
+        self,
+        now: float | None = None,
+        *,
+        on_terminate: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[str]:
         """Release daemons idle longer than the TTL. Returns the repo_paths
         this pool released (which may still be alive if a sibling pool still
-        leases them — see :meth:`_release_daemon`)."""
+        leases them — see :meth:`_release_daemon`).
+
+        ``on_terminate`` (e99b09e9), if given, is called once per daemon this
+        pool actually terminates (not one merely released while a sibling
+        still leases it — see :meth:`_release_daemon`'s return value) with
+        ``{repo_path, port, pid, reason: "idle_timeout"}``.
+        """
         when = self._now() if now is None else now
         reaped: list[str] = []
         for key, daemon in list(self._daemons.items()):
             if daemon.idle_seconds(when) >= self.idle_kill_seconds:
+                pid = getattr(daemon.proc, "pid", None)
                 del self._daemons[key]
-                self._release_daemon(key, daemon)
+                terminated = self._release_daemon(key, daemon)
                 reaped.append(key)
+                if on_terminate is not None and terminated:
+                    on_terminate({
+                        "repo_path": key, "port": daemon.port, "pid": pid,
+                        "reason": "idle_timeout",
+                    })
         return reaped
 
-    def shutdown(self) -> None:
+    def shutdown(
+        self, *, on_terminate: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         """Release every daemon this pool tracks (tunnel exit). A daemon is
-        only actually terminated if no sibling pool still leases it."""
+        only actually terminated if no sibling pool still leases it.
+
+        ``on_terminate`` (e99b09e9), if given, is called once per daemon this
+        pool actually terminates (not one left running because a sibling
+        still leases it — see :meth:`_release_daemon`'s return value) with
+        ``{repo_path, port, pid, reason: "tunnel_shutdown"}``.
+        """
         for key, daemon in list(self._daemons.items()):
-            self._release_daemon(key, daemon)
+            pid = getattr(daemon.proc, "pid", None)
+            terminated = self._release_daemon(key, daemon)
+            if on_terminate is not None and terminated:
+                on_terminate({
+                    "repo_path": key, "port": daemon.port, "pid": pid,
+                    "reason": "tunnel_shutdown",
+                })
         self._daemons.clear()
 
     def repo_paths(self) -> list[str]:
