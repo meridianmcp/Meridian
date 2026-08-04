@@ -3852,3 +3852,46 @@ async def test_mcp_dispatch_load_handoff_correction_null_when_none_recorded(db, 
         tenant=None, _mcp_tenant_id=None,
     )
     assert result["correction"] is None
+
+
+# ---------------------------------------------------------------------------
+# f46372e8 — load_handoff now routes its stored `content` through the SAME
+# format_handoff_mcp_content() helper every generate_handoff transport uses,
+# so the "one canonical serializer" guarantee actually covers every
+# content-returning handoff surface, not "every one except load_handoff".
+# ---------------------------------------------------------------------------
+
+
+async def test_load_handoff_content_routed_through_format_handoff_mcp_content(
+    db, tmp_path,
+):
+    p = await db_module.create_project(db, "load-handoff-canonical-serializer")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    await db_module.add_sprint_item(db, p["id"], "v1", "do the thing")
+
+    _path, generated_content, _amended = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+
+    result = await mcp_handler._handle_task_tools(
+        "load_handoff", {"project_id": p["id"]}, db, str(tmp_path), None, None,
+    )
+    assert result is not mcp_handler._MISS
+    assert result["handoff"]["content"] == handoff_module.format_handoff_mcp_content(
+        generated_content
+    )
+    # Sanity: with format_handoff_mcp_content currently an identity function,
+    # this also equals the raw generated content exactly.
+    assert result["handoff"]["content"] == generated_content
+
+
+async def test_load_handoff_returns_none_handoff_when_none_stored(db, tmp_path):
+    """No prior generate_handoff call for this project — handoff is None and
+    format_handoff_mcp_content is never reached (no crash on a missing row)."""
+    p = await db_module.create_project(db, "load-handoff-no-prior-handoff")
+    result = await mcp_handler._handle_task_tools(
+        "load_handoff", {"project_id": p["id"]}, db, str(tmp_path), None, None,
+    )
+    assert result is not mcp_handler._MISS
+    assert result["handoff"] is None
+    assert result["has_handoff"] is False

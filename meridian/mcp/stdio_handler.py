@@ -541,6 +541,25 @@ def build_mcp_server():
                     "required": [],
                 },
             ),
+            # f46372e8 — load_handoff and verify_handoff_token were never
+            # advertised OR dispatched on the stdio transport: this file's
+            # list_tools()/call_tool() are the actual implementation behind
+            # build_mcp_server() (meridian/server.py re-exports it directly),
+            # and neither tool name appeared anywhere in either function, so a
+            # self-hosted stdio MCP client (the "Self-hosted (from source)"
+            # config in AGENTS.md) could not call either one — every call
+            # fell through call_tool()'s final `else` and returned
+            # {"error": "unknown tool: ..."}. This silently broke the entire
+            # trusted-handoff-channel and token-verification security model
+            # (AGENTS.md's "Handoff delivery & trust" section) for anyone on
+            # this transport, forcing them to skip verification entirely —
+            # exactly the failure mode implicated in the 2026-08-04 incident
+            # this sprint item traces back to. _shared_tool() pulls the exact
+            # same schema HTTP/MCP already advertises (meridian/mcp_tools.py's
+            # _MCP_TOOLS_LIST) so the three transports can never advertise
+            # divergent schemas for these tools going forward.
+            _shared_tool("load_handoff"),
+            _shared_tool("verify_handoff_token"),
             Tool(
                 name="get_context_block",
                 description=(
@@ -2340,6 +2359,16 @@ def build_mcp_server():
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.
                 result = await _dispatch_mcp_tool(
                     "get_context_block", arguments, db, state["data_dir"]
+                )
+            elif name in ("load_handoff", "verify_handoff_token"):
+                # f46372e8 — these two were advertised nowhere and dispatched
+                # nowhere on the stdio transport (see the list_tools() comment
+                # above _shared_tool("load_handoff")); route through the same
+                # _dispatch_mcp_tool -> _handle_task_tools path the HTTP MCP
+                # transport uses so all three transports share one
+                # implementation and can't drift out of sync with each other.
+                result = await _dispatch_mcp_tool(
+                    name, arguments, db, state["data_dir"]
                 )
             elif name in (
                 "pin_decision", "update_decision", "get_pinned_decisions",

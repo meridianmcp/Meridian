@@ -404,7 +404,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "strips those back out and checks the remaining text against the body hash "
         "bound at mint time. A genuine token re-attached to a DIFFERENT (edited) body "
         "now returns 'body_mismatch' instead of a false 'ok'. Omitting presented_body "
-        "preserves the exact prior token-only provenance check.",
+        "preserves the exact prior token-only provenance check. "
+        "f46372e8: every non-'ok' result also carries a structured recovery object "
+        "{signal, message, next_step, next_step_hint} telling you what to do next — "
+        "next_step is 'load_handoff' (fetch the canonical stored handoff; not_found/ "
+        "wrong_project/body_mismatch) or 'cross_check_live_board' (re-derive the task "
+        "list from get_sprint_items across all non-done statuses; already_consumed/ "
+        "expired) — so you don't have to improvise a recovery path per failure reason.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string",
              "description": "The project_id the /goal block claims to be for."},

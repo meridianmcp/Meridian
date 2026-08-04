@@ -3056,6 +3056,7 @@ async def _handle_task_tools(
         # start_session's pending_goal delivery. Read-only — it does NOT clear
         # pending_goal (start_session's pop owns read-once consumption), so it is
         # safe to call repeatedly.
+        from .. import handoff as handoff_module_local  # noqa: PLC0415
         _pid = args["project_id"]
         _latest = None
         try:
@@ -3083,7 +3084,23 @@ async def _handle_task_tools(
             "pending_goal": _pending,
             "handoff": (
                 {
-                    "content": _latest.get("body"),
+                    # f46372e8 — route the stored body through the SAME
+                    # format_handoff_mcp_content helper every generate_handoff
+                    # transport (HTTP route, MCP handler, stdio handler) uses
+                    # for its own `content` field (see that function's
+                    # docstring). Previously this was the one content-bearing
+                    # handoff surface that returned the raw DB column
+                    # unwrapped — harmless today only because that helper is
+                    # currently an identity function, but it meant
+                    # load_handoff could silently drift from the other
+                    # transports' wire contract the moment format_handoff_mcp_
+                    # content ever became non-trivial. This makes the ONE
+                    # canonical serializer genuinely canonical: every
+                    # content-returning path funnels through it, not "every
+                    # path except this one."
+                    "content": handoff_module_local.format_handoff_mcp_content(
+                        _latest.get("body")
+                    ),
                     "mode": _latest.get("mode"),
                     "session_id": _latest.get("session_id"),
                     "created_at": _latest.get("created_at"),
