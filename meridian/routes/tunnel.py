@@ -29,6 +29,7 @@ import os
 import time
 import uuid
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -311,7 +312,7 @@ def notify_tools_list_changed(tenant_id: str) -> None:
     that wasn't actually a recovery simply re-marks a tenant that will re-list to
     the same tool set).
     """
-    _tunnel_tool_routes.pop(tenant_id, None)
+    _invalidate_tunnel_manifest(tenant_id)  # 49d8244d — routes + manifest timestamp together
     _tools_list_changed_pending.add(tenant_id)
 
 
@@ -672,7 +673,7 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
 
     _tunnel_sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, "fs")
-    _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd — reconnect: rebuild tool routes
+    _invalidate_tunnel_manifest(tenant_id)  # 4331f9cd / 49d8244d — reconnect: rebuild tool routes
     # af5b5739 — record THIS Fly instance as the socket owner so a request that
     # lands on a sibling instance can Fly-replay to us (no-op off Fly).
     owner_instance = record_tenant_owner_instance(tenant_id)
@@ -741,7 +742,7 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
         # connection on another instance may already have re-claimed the tenant).
         clear_tenant_owner_instance(tenant_id, owner_instance)
         if not has_active_tunnel(tenant_id):
-            _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd
+            _invalidate_tunnel_manifest(tenant_id)  # 4331f9cd / 49d8244d
         # Cancel any in-flight proxy requests for this tenant
         for fut in list(_pending_reqs.values()):
             if not fut.done():
@@ -990,9 +991,10 @@ async def _serve_tunnel_ws(
 
     sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, label)
-    # 4331f9cd — a (re)connect may change the slot's tool set; drop the cached
-    # routes so the next tools/list rebuilds them for this tenant.
-    _tunnel_tool_routes.pop(tenant_id, None)
+    # 4331f9cd / 49d8244d — a (re)connect may change the slot's tool set; drop the
+    # cached routes (+ manifest timestamp, atomically) so the next tools/list
+    # rebuilds them for this tenant.
+    _invalidate_tunnel_manifest(tenant_id)
     # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
     # instance that gets a request for this slot can Fly-replay to us. af5b5739
     # only wired this for the FS slot (tunnel_ws); _serve_tunnel_ws covers ppt,
@@ -1042,10 +1044,10 @@ async def _serve_tunnel_ws(
         sockets.pop(tenant_id, None)
         _clear_tunnel_mcp_session(tenant_id, label, socket=ws)
         _clear_slot_health(tenant_id, label)
-        # 4331f9cd — slot dropped; if no tunnel remains, drop cached routes so the
-        # next tools/list rebuilds cleanly.
+        # 4331f9cd / 49d8244d — slot dropped; if no tunnel remains, drop cached
+        # routes (+ manifest timestamp) so the next tools/list rebuilds cleanly.
         if not has_active_tunnel(tenant_id):
-            _tunnel_tool_routes.pop(tenant_id, None)
+            _invalidate_tunnel_manifest(tenant_id)
         # af5b5739 / 5f02a21c — release ownership only if still ours.
         clear_tenant_owner_instance(tenant_id, owner_instance)
         for fut in list(pending.values()):
@@ -1217,6 +1219,76 @@ async def send_active_repo_control(tenant_id: str, repo_path: str) -> dict[str, 
         return {"status": "ok", "repo_path": repo_path}
     except Exception as exc:  # noqa: BLE001
         return {"status": "error", "message": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# /tunnel/refresh  — explicit refresh/re-list operation (49d8244d)
+# ---------------------------------------------------------------------------
+
+@router.post("/tunnel/refresh")
+async def refresh_tunnel_tools_route(request: Request) -> Response:
+    """Force a synchronous tunnel-tool re-aggregation and return the manifest.
+
+    The explicit refresh operation the dashboard (Settings → Tunnel Plugins
+    status card) and any HTTP-capable connector can call instead of guessing
+    at a TTL: it atomically invalidates the routing cache, re-fetches every
+    healthy slot's tools, and returns the resulting
+    :func:`tunnel_manifest_snapshot` — the same shape surfaced by
+    ``GET /tunnel/status/{tenant_id}`` and the MCP ``tools/list`` ``_meta``
+    block, so a caller can diff ``manifest_hash`` against what it last saw.
+
+    No tunnel connected is not an error here — it returns a snapshot with
+    ``has_active_tunnel: false`` and a null ``manifest_hash`` (nothing to
+    aggregate), same as any other read of tunnel state.
+    """
+    if not _hosted_mode():
+        return _json_response({"error": "tunnel requires hosted mode"}, status_code=503)
+
+    auth_header = request.headers.get("authorization", "")
+    raw_token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else auth_header
+    if not raw_token:
+        raw_token = request.query_params.get("token", "")
+    auth_db = request.app.state.db
+    tenant = await _resolve_tenant_from_token(auth_db, raw_token)
+    if tenant is None:
+        return _json_response({"error": "invalid token"}, status_code=401)
+    if not _is_tunnel_allowed(tenant):
+        return _json_response({"error": "tunnel requires Pro plan"}, status_code=403)
+
+    tenant_id = tenant["id"]
+    snapshot = await refresh_tunnel_manifest(tenant_id)
+    return _json_response({"ok": True, "tenant_id": tenant_id, **snapshot})
+
+
+@router.get("/tunnel/manifest")
+async def get_tunnel_manifest_route(request: Request) -> Response:
+    """Read-only tools/list manifest snapshot for this tenant (49d8244d).
+
+    Unlike ``POST /tunnel/refresh``, this never forces a rebuild — it reports
+    whatever the last ``list_tunnel_tools``/``refresh_tunnel_manifest`` call
+    left behind (see :func:`tunnel_manifest_snapshot`). Safe to poll cheaply
+    and often (a startup diagnostic, a dashboard auto-refresh, a connector
+    health check) without paying the fan-out cost of a real slot
+    re-aggregation on every call — use ``POST /tunnel/refresh`` when a forced
+    rebuild is actually wanted.
+    """
+    if not _hosted_mode():
+        return _json_response({"error": "tunnel requires hosted mode"}, status_code=503)
+
+    auth_header = request.headers.get("authorization", "")
+    raw_token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else auth_header
+    if not raw_token:
+        raw_token = request.query_params.get("token", "")
+    auth_db = request.app.state.db
+    tenant = await _resolve_tenant_from_token(auth_db, raw_token)
+    if tenant is None:
+        return _json_response({"error": "invalid token"}, status_code=401)
+    if not _is_tunnel_allowed(tenant):
+        return _json_response({"error": "tunnel requires Pro plan"}, status_code=403)
+
+    tenant_id = tenant["id"]
+    snapshot = tunnel_manifest_snapshot(tenant_id)
+    return _json_response({"ok": True, "tenant_id": tenant_id, **snapshot})
 
 
 # ---------------------------------------------------------------------------
@@ -2847,6 +2919,116 @@ def _namespace_source_title(title: Any, src: str) -> "str | None":
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
 _tunnel_tool_routes: dict[str, dict[str, str]] = {}
 
+# ---------------------------------------------------------------------------
+# Generation-aware tools/list manifest — sprint item 49d8244d
+#
+# Builds on the runtime-config generation registry above (02dbd8b4) to give
+# every aggregated tools/list a deterministic, checkable fingerprint of the
+# TUNNEL half of the tool surface: a content hash of the current routing
+# table (``_tunnel_tool_routes``), a live slot-health snapshot, the config
+# generation record, and cache-freshness metadata (``generated_at`` /
+# ``age_seconds``) so a client can tell "fresh this call" apart from "served
+# from a routing table that hasn't been rebuilt in N seconds".
+#
+# Four distinct caches are in play here, and this pass only ever touches the
+# first two directly:
+#   1. server route cache   — ``_tunnel_tool_routes`` (this module): which
+#      tunnel slot a prefixed tool name forwards to. Invalidated atomically
+#      with #2 by ``_invalidate_tunnel_manifest`` below.
+#   2. tunnel slot cache    — ``_slot_health`` / ``_tools_list_changed_pending``
+#      (this module): which slots are currently healthy/advertised. Always
+#      read LIVE by ``tunnel_manifest_snapshot`` — never itself "stale" the way
+#      the routing table can be, so it is not part of the invalidation helper.
+#   3. client discovery cache — the connected MCP client's own remembered
+#      tools/list result (claude.ai, Claude Desktop, a stdio client). This
+#      server cannot reach into that cache; the closest thing to "invalidate"
+#      it is ``notifications/tools/list_changed`` (unreliable — see
+#      ``notify_tools_list_changed``) or the explicit ``refresh_tool_manifest``
+#      tool call, which forces a synchronous rebuild the client can compare
+#      hashes against.
+#   4. connector manifest cache — an intermediary (mcp-remote, a proxy) that
+#      caches the raw tools/list JSON-RPC response itself. Also out of this
+#      server's reach; ``POST /tunnel/refresh`` exists so a connector/dashboard
+#      that DOES control its own cache has an explicit, idempotent operation to
+#      call before re-issuing tools/list, instead of guessing at a TTL.
+#
+# Scope of this "highest-value core" pass (mirrors 02dbd8b4's own escape
+# hatch — the full item is substantial):
+#   * generated_at/age_seconds describe the ROUTING TABLE (#1) only — the exact
+#     same distinction the runtime-config registry draws between "config
+#     generation" (a fact about persisted settings) and "restart_required" (a
+#     fact about a running process). slot_health / list_changed_pending are
+#     always current as of the call, so they carry no separate age.
+#   * This is still per-process, in-memory, single-Fly-instance state — same
+#     documented limitation as ``_config_generations``. A multi-instance-
+#     consistent manifest would need the same durable/shared-store follow-up.
+#   * "Ensure recovered tools become visible without a full chat restart" is
+#     satisfied for the ONE mechanism a stateless `/mcp` transport actually
+#     offers: a plain tool CALL (``refresh_tool_manifest``) that synchronously
+#     forces the rebuild and returns the new hash, so a session can detect drift
+#     and re-list without disconnecting. It is NOT a server-push guarantee —
+#     no transport-level push exists here (see ``notify_tools_list_changed``).
+# ---------------------------------------------------------------------------
+
+# tenant_id → wall-clock time.time() the routing cache (_tunnel_tool_routes)
+# was last (re)built by list_tunnel_tools. Powers generated_at/age_seconds.
+_tunnel_manifest_generated_at: dict[str, float] = {}
+
+
+def _invalidate_tunnel_manifest(tenant_id: str) -> None:
+    """Atomically drop the routing cache AND its manifest timestamp (49d8244d).
+
+    Every call site that used to do a bare
+    ``_tunnel_tool_routes.pop(tenant_id, None)`` on a slot connect/disconnect/
+    recovery now routes through here, so the two caches can never disagree
+    about whether a rebuild is pending — a stale ``age_seconds`` surviving a
+    routing-cache drop (or vice versa) would silently mislead a caller.
+    """
+    _tunnel_tool_routes.pop(tenant_id, None)
+    _tunnel_manifest_generated_at.pop(tenant_id, None)
+
+
+def _tunnel_manifest_hash(tenant_id: str) -> "str | None":
+    """Deterministic sha256 over the tenant's current tool-routing cache.
+
+    ``None`` when there is no cached route table for this tenant (no active
+    tunnel, or the cache was invalidated and not yet rebuilt) — distinguishing
+    "no manifest yet" from a real (possibly empty) one lets a caller decide
+    whether an explicit refresh is worth triggering.
+    """
+    routes = _tunnel_tool_routes.get(tenant_id)
+    if routes is None:
+        return None
+    canonical = json.dumps(sorted(routes.items()), separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def tunnel_manifest_snapshot(tenant_id: str) -> dict:
+    """Point-in-time manifest snapshot for a tenant's tunnel tool surface.
+
+    The shared shape returned by ``GET /tunnel/status``, ``POST
+    /tunnel/refresh``, and the aggregated MCP ``tools/list`` ``_meta`` block
+    (see ``meridian/mcp/handler.py``) so all three surfaces describe the exact
+    same underlying state instead of drifting relative to each other.
+    """
+    generated = _tunnel_manifest_generated_at.get(tenant_id)
+    now = time.time()
+    return {
+        "manifest_hash": _tunnel_manifest_hash(tenant_id),
+        "tool_count": len(_tunnel_tool_routes.get(tenant_id) or {}),
+        # Always live — see the module note above on why these carry no age.
+        "slot_health": dict(_slot_health.get(tenant_id, {})),
+        "config_generation": all_runtime_config_generations(tenant_id),
+        "generated_at": (
+            datetime.fromtimestamp(generated, tz=timezone.utc).isoformat()
+            if generated is not None else None
+        ),
+        "age_seconds": (round(now - generated, 3) if generated is not None else None),
+        "list_changed_pending": tenant_id in _tools_list_changed_pending,
+        "has_active_tunnel": has_active_tunnel(tenant_id),
+    }
+
+
 # Phase 3 — server-side tool-description rewriting. When the bridge aggregates a
 # tenant's tunneled tools, the raw filesystem read tools (read_file /
 # read_multiple_files) get a code-intel-first directive prepended to their
@@ -3492,13 +3674,47 @@ async def list_tunnel_tools(
             aggregated.append(_rewrite_tool_description(tool_copy))
     if routes:
         _tunnel_tool_routes[tenant_id] = routes
+        _tunnel_manifest_generated_at[tenant_id] = time.time()  # 49d8244d
     elif not has_active_tunnel(tenant_id):
-        _tunnel_tool_routes.pop(tenant_id, None)
+        _invalidate_tunnel_manifest(tenant_id)  # 49d8244d
+    else:
+        # 49d8244d — active tunnel, zero tools aggregated this pass (e.g. every
+        # slot currently unhealthy). The existing _tunnel_tool_routes entry (if
+        # any) is deliberately left untouched so call_tunnel_tool can keep
+        # routing by it, but stamp the manifest timestamp anyway so
+        # tunnel_manifest_snapshot's age_seconds reflects "a fetch was just
+        # attempted" rather than silently reporting a growing staleness for a
+        # cache that in fact just got re-checked (and confirmed unchanged).
+        _tunnel_manifest_generated_at[tenant_id] = time.time()
     # 54ddd609 — this (re)aggregation reflects the current live slot health, so a
     # pending tools/list_changed marker (set on a slot recovery) is now satisfied:
     # the caller is observing the recovered tools. Drain it so it fires only once.
     _tools_list_changed_pending.discard(tenant_id)
     return aggregated
+
+
+async def refresh_tunnel_manifest(
+    tenant_id: str, reserved_names: "frozenset[str] | set[str]" = frozenset(),
+) -> dict:
+    """Explicit refresh/re-list operation (49d8244d).
+
+    Forces a synchronous re-aggregation of every currently-healthy tunnel
+    slot's tools — stronger than :func:`notify_tools_list_changed`, which only
+    arms a pending flag consumed by the NEXT caller-initiated ``tools/list``.
+    This makes the rebuild happen NOW, so the manifest this call returns
+    already reflects a recovered/newly-configured slot rather than requiring a
+    second round trip.
+
+    Callers: the ``refresh_tool_manifest`` MCP tool (meridian/mcp/handler.py)
+    and ``POST /tunnel/refresh`` below (dashboard + any HTTP-capable
+    connector). Invalidates the routing cache first (atomically, via
+    :func:`_invalidate_tunnel_manifest`) so a concurrent reader never observes
+    a route table that's half-old/half-new, then rebuilds it via
+    :func:`list_tunnel_tools` and returns the resulting snapshot.
+    """
+    _invalidate_tunnel_manifest(tenant_id)
+    await list_tunnel_tools(tenant_id, reserved_names)
+    return tunnel_manifest_snapshot(tenant_id)
 
 
 # ---------------------------------------------------------------------------

@@ -588,6 +588,7 @@ No auth required.
 | `POST` | `/.well-known/agent.json` | Support POST discovery per A2A spec |
 | `GET` | `/.well-known/oauth-authorization-server` |  |
 | `GET` | `/.well-known/oauth-protected-resource` |  |
+| `GET` | `/.well-known/openid-configuration` | OIDC discovery alias for clients that probe this path before OAuth AS metadata |
 
 
 ### `/__gate__`
@@ -1155,12 +1156,14 @@ No auth required.
 | `DELETE` | `/tunnel/filesystem-roots` | live-fs-roots — remove a served filesystem root and apply it live |
 | `GET` | `/tunnel/filesystem-roots` | Return the directories the tunnel's filesystem connector may read |
 | `POST` | `/tunnel/filesystem-roots` | live-fs-roots — add a served filesystem root and push it live |
+| `GET` | `/tunnel/manifest` | Read-only tools/list manifest snapshot for this tenant (49d8244d) |
 | `GET` | `/tunnel/plugins` | Return the current tenant's resolved tunnel plugins + raw override config |
 | `PUT` | `/tunnel/plugins` | Persist the tenant's tunnel plugin overrides (Settings → Tunnel Plugins) |
 | `GET` | `/tunnel/plugins/check` | Check whether a plugin binary is available on the server's PATH |
 | `DELETE` | `/tunnel/plugins/custom` | 9811d04c — remove a persisted custom plugin by name |
 | `POST` | `/tunnel/plugins/custom` | 9811d04c — persist a chosen custom plugin into the tenant's tunnel config |
 | `POST` | `/tunnel/plugins/install` | Run a plugin install command on the server machine (self-hosted deployments) |
+| `POST` | `/tunnel/refresh` | Force a synchronous tunnel-tool re-aggregation and return the manifest |
 | `GET` | `/tunnel/registry` | Proxy the official MCP Registry API to avoid browser CORS restrictions |
 | `GET` | `/tunnel/status/{tenant_id}` | Return whether the tenant currently has an active tunnel socket |
 

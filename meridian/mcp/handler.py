@@ -1245,13 +1245,28 @@ async def _handle_mcp_request(
                     }
         from ..tool_manifest import build_tool_manifest  # noqa: PLC0415
         manifest = build_tool_manifest(tools)
+        manifest_meta: dict = {
+            "revision": manifest["revision"],
+            "count": manifest["count"],
+        }
+        # 49d8244d — generation-aware manifest: layer the runtime config
+        # generation registry (02dbd8b4), a live tunnel slot-health snapshot,
+        # and cache generated_at/age metadata onto the SAME `_meta` block, so a
+        # client/connector/dashboard can tell "freshly rebuilt this call" apart
+        # from "served from a routing cache that hasn't refreshed in N seconds"
+        # without a second round trip. `revision`/`count` above already cover
+        # the full aggregated tool set (native + GitHub + tunnel); `tunnel`
+        # below adds the tunnel-specific generation/health facts that a bare
+        # content hash can't express (see routes/tunnel.py's
+        # tunnel_manifest_snapshot for the shared shape — also returned by
+        # GET /tunnel/status and POST /tunnel/refresh).
+        if tenant and tenant.get("id"):
+            from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+            manifest_meta["tunnel"] = _tunnel_mod.tunnel_manifest_snapshot(tenant["id"])
         result: dict = {
             "tools": tools,
             "_meta": {
-                "meridian/toolManifest": {
-                    "revision": manifest["revision"],
-                    "count": manifest["count"],
-                },
+                "meridian/toolManifest": manifest_meta,
             },
         }
         if tunnel_health is not None:
@@ -4575,20 +4590,36 @@ async def _handle_plugin_tools(
     """
     if name == "refresh_tool_manifest":
         # 142808f3 — plain tool CALL to re-discover the built-in tool set, for
-        # clients that ignore notifications/tools/list_changed. Best-effort re-fire
-        # of the signal too, so a client that DOES honour it also re-lists.
+        # clients that ignore notifications/tools/list_changed.
+        # 49d8244d — extended into the explicit refresh/re-list operation for
+        # the TUNNEL half of the tool surface too: when a tenant is connected,
+        # this now forces a SYNCHRONOUS re-aggregation of every healthy tunnel
+        # slot (routes/tunnel.py's refresh_tunnel_manifest) instead of only
+        # arming the best-effort notifications/tools/list_changed pending flag
+        # — so a session that suspects a recovered/newly-configured slot is
+        # invisible can call this once and get back a fresh manifest_hash to
+        # compare, without needing a second tools/list round trip or a
+        # reconnect. Bounded to 5s (same outer bound as tools/list's own
+        # tunnel-tools fetch) so a cold/wedged slot can't hang this tool call.
         from ..mcp_tools import _MCP_TOOLS_LIST  # noqa: PLC0415
         from ..tool_manifest import build_tool_manifest  # noqa: PLC0415
 
         manifest = build_tool_manifest(_MCP_TOOLS_LIST)
         _tid = tenant.get("id") if tenant else None
         if _tid:
+            from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
             try:
-                from ..routes.tunnel import (  # noqa: PLC0415
-                    notify_tools_list_changed as _notify_tlc,
+                import asyncio as _asyncio  # noqa: PLC0415
+                manifest["tunnel"] = await _asyncio.wait_for(
+                    _tunnel_mod.refresh_tunnel_manifest(_tid), timeout=5.0,
                 )
-                _notify_tlc(_tid)
                 manifest["list_changed_refired"] = True
+            except _asyncio.TimeoutError:
+                # Refresh abandoned past the outer bound — report the last-known
+                # snapshot (still atomic/consistent, just not freshly rebuilt)
+                # rather than block the tool call on a wedged slot.
+                manifest["tunnel"] = _tunnel_mod.tunnel_manifest_snapshot(_tid)
+                manifest["list_changed_refired"] = False
             except Exception:  # noqa: BLE001 — signal is a bonus, manifest is the point
                 manifest["list_changed_refired"] = False
         return manifest

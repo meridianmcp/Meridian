@@ -4827,6 +4827,46 @@ async def _fetch_config_generation(
     return gen if isinstance(gen, dict) else None
 
 
+async def _fetch_tunnel_manifest(base_url: str, token: str) -> "dict | None":
+    """GET /tunnel/manifest — read-only fetch of this tenant's current
+    tools/list manifest snapshot (49d8244d: "every tunnel process ... should
+    be able to report the manifest state the server currently has for it").
+
+    Companion diagnostic to :func:`_fetch_config_generation` — same shape of
+    guarantee: fetched once at startup, printed alongside the rest of the
+    startup banner (see ``run_tunnel``), read-only (no rebuild forced; use the
+    ``refresh_tool_manifest`` MCP tool or ``POST /tunnel/refresh`` for that),
+    and best-effort. Called BEFORE this process's own tunnel WebSocket(s)
+    connect, so on a cold start it will typically report
+    ``has_active_tunnel: false`` / an empty manifest for THIS run — its value
+    here is confirming the endpoint is reachable and reporting whatever state
+    (if any) the server already has for this tenant (e.g. a prior connection
+    not yet evicted), not this process's own post-connect tool set. A genuine
+    post-connect trigger — re-fetching once every slot WebSocket is actually
+    established — would need threading a call through ``run_tunnel``'s
+    already-substantial slot-spawn control flow; deliberately left as
+    follow-up rather than risked here, mirroring ``_fetch_config_generation``'s
+    own documented scope limit.
+
+    Best-effort: returns ``None`` on any failure (older server without this
+    route, network hiccup, non-200) so it can never block or fail startup.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{base_url}/tunnel/manifest",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+    except Exception:  # noqa: BLE001 — best-effort, never blocks startup
+        return None
+    return data if isinstance(data, dict) else None
+
+
 # ---------------------------------------------------------------------------
 # Auto-index helper (calls index_repository on codebase-memory-mcp proxy)
 # ---------------------------------------------------------------------------
@@ -6020,6 +6060,15 @@ async def run_tunnel(
                "change made while a tunnel was connected]" if _gen_restart else ""),
             flush=True,
         )
+    # 49d8244d — companion best-effort report of the server's CURRENT tools/list
+    # manifest snapshot for this tenant (see _fetch_tunnel_manifest's docstring
+    # for what this call is and is not confirming at this point in startup).
+    loaded_tunnel_manifest = await _fetch_tunnel_manifest(base_url, token)
+    if loaded_tunnel_manifest:
+        _man_hash = loaded_tunnel_manifest.get("manifest_hash")
+        _man_count = loaded_tunnel_manifest.get("tool_count")
+        if _man_hash is not None:
+            print(f"  tool manifest:     {_man_count} tools (hash {_man_hash})", flush=True)
     # b970fe07 — Serena's default --project. The CLI --repo always wins; only when
     # it was absent (repo_path defaulted to cwd) does a configured serena_repo_path
     # take over. Unset config → serena_repo_path stays == repo_path (today's cwd

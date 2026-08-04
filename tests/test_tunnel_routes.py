@@ -17,6 +17,8 @@ Two layers are covered:
 from __future__ import annotations
 
 import asyncio
+import json
+import types
 import uuid
 
 import pytest
@@ -425,3 +427,478 @@ def test_tunnel_plugins_config_generation_isolated_per_tenant_over_http(monkeypa
 
         r_a_get = client.get("/tunnel/plugins", headers=hdr_a)
         assert r_a_get.json()["config_generation"]["generation"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Generation-aware tools/list manifest — sprint item 49d8244d
+#
+# Builds on the config-generation registry above (02dbd8b4). Covers:
+#   * ``_invalidate_tunnel_manifest`` — atomic routing-cache + manifest-
+#     timestamp invalidation, the single chokepoint every reconnect/recovery
+#     path now uses.
+#   * ``_tunnel_manifest_hash`` / ``tunnel_manifest_snapshot`` — deterministic
+#     content hash + combined generation/health/freshness snapshot.
+#   * ``refresh_tunnel_manifest`` — the explicit refresh/re-list operation,
+#     and its two HTTP surfaces: ``POST /tunnel/refresh`` (forces a rebuild)
+#     and ``GET /tunnel/manifest`` (read-only).
+#   * ``list_tunnel_tools`` stamping ``_tunnel_manifest_generated_at`` so
+#     ``age_seconds`` reflects real cache staleness.
+#
+# Pure in-process unit tests — no real WebSocket, no network, no sleeps
+# (clock is monkeypatched where "age" needs to move).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _clean_manifest_state():
+    """Reset the manifest-specific registries this section exercises."""
+    def _reset():
+        tn._tunnel_code_sockets.clear()
+        tn._slot_health.clear()
+        tn._slot_status_detail.clear()
+        tn._tunnel_tool_routes.clear()
+        tn._tunnel_manifest_generated_at.clear()
+        tn._tools_list_changed_pending.clear()
+    _reset()
+    yield
+    _reset()
+
+
+def _fake_fetch_slot_tools(per_slot: dict[str, list[dict]]):
+    """Build a fake ``_fetch_slot_tools(tenant_id, label)`` returning canned tools."""
+    async def _fetch(tenant_id: str, label: str):
+        return label, list(per_slot.get(label, []))
+    return _fetch
+
+
+# ---------------------------------------------------------------------------
+# _invalidate_tunnel_manifest — atomic cache invalidation
+# ---------------------------------------------------------------------------
+
+def test_invalidate_tunnel_manifest_clears_both_caches():
+    tid = _tid()
+    tn._tunnel_tool_routes[tid] = {"filesystem__read_file": "fs"}
+    tn._tunnel_manifest_generated_at[tid] = 12345.0
+
+    tn._invalidate_tunnel_manifest(tid)
+
+    assert tid not in tn._tunnel_tool_routes
+    assert tid not in tn._tunnel_manifest_generated_at
+
+
+def test_invalidate_tunnel_manifest_noop_when_nothing_cached():
+    """Invalidating a tenant with no cache entries must not raise."""
+    tn._invalidate_tunnel_manifest(_tid())
+
+
+def test_notify_tools_list_changed_invalidates_atomically():
+    """54ddd609's recovery signal now routes through the atomic helper (49d8244d)."""
+    tid = _tid()
+    tn._tunnel_tool_routes[tid] = {"filesystem__read_file": "fs"}
+    tn._tunnel_manifest_generated_at[tid] = 999.0
+
+    tn.notify_tools_list_changed(tid)
+
+    assert tid not in tn._tunnel_tool_routes
+    assert tid not in tn._tunnel_manifest_generated_at
+    assert tn.consume_tools_list_changed(tid) is True
+
+
+# ---------------------------------------------------------------------------
+# _tunnel_manifest_hash — deterministic, order-independent
+# ---------------------------------------------------------------------------
+
+def test_manifest_hash_none_when_no_cache():
+    assert tn._tunnel_manifest_hash(_tid()) is None
+
+
+def test_manifest_hash_deterministic_and_order_independent():
+    tid = _tid()
+    tn._tunnel_tool_routes[tid] = {"b__tool": "code", "a__tool": "fs"}
+    h1 = tn._tunnel_manifest_hash(tid)
+
+    tn._tunnel_tool_routes[tid] = {"a__tool": "fs", "b__tool": "code"}
+    h2 = tn._tunnel_manifest_hash(tid)
+
+    assert h1 == h2
+    assert len(h1) == 64  # sha256 hex digest
+
+
+def test_manifest_hash_changes_when_routes_change():
+    tid = _tid()
+    tn._tunnel_tool_routes[tid] = {"a__tool": "fs"}
+    h1 = tn._tunnel_manifest_hash(tid)
+
+    tn._tunnel_tool_routes[tid] = {"a__tool": "fs", "b__tool": "code"}
+    h2 = tn._tunnel_manifest_hash(tid)
+
+    assert h1 != h2
+
+
+def test_manifest_hash_empty_dict_is_not_none():
+    """An explicitly-empty (but present) route table is a REAL empty manifest,
+    distinct from 'no manifest built yet' (None)."""
+    tid = _tid()
+    tn._tunnel_tool_routes[tid] = {}
+    assert tn._tunnel_manifest_hash(tid) is not None
+
+
+# ---------------------------------------------------------------------------
+# tunnel_manifest_snapshot — combined shape
+# ---------------------------------------------------------------------------
+
+def test_snapshot_shape_when_no_tunnel():
+    snap = tn.tunnel_manifest_snapshot(_tid())
+    assert snap["manifest_hash"] is None
+    assert snap["tool_count"] == 0
+    assert snap["slot_health"] == {}
+    assert snap["generated_at"] is None
+    assert snap["age_seconds"] is None
+    assert snap["list_changed_pending"] is False
+    assert snap["has_active_tunnel"] is False
+    assert isinstance(snap["config_generation"], dict)
+
+
+def test_snapshot_reflects_live_slot_health_without_a_stamped_timestamp():
+    """slot_health is always LIVE — present even with no manifest generation yet."""
+    tid = _tid()
+    tn._record_slot_health(tid, "fs", False, reason="boom")
+    snap = tn.tunnel_manifest_snapshot(tid)
+    assert snap["slot_health"] == {"fs": False}
+    # No routing-cache build has happened — freshness fields stay null.
+    assert snap["generated_at"] is None
+    assert snap["age_seconds"] is None
+
+
+def test_snapshot_age_seconds_grows_with_clock(monkeypatch):
+    tid = _tid()
+    fake_now = [1_000_000.0]
+    monkeypatch.setattr(tn.time, "time", lambda: fake_now[0])
+
+    tn._tunnel_tool_routes[tid] = {"a__tool": "fs"}
+    tn._tunnel_manifest_generated_at[tid] = fake_now[0]
+
+    snap0 = tn.tunnel_manifest_snapshot(tid)
+    assert snap0["age_seconds"] == 0
+
+    fake_now[0] += 42.5
+    snap1 = tn.tunnel_manifest_snapshot(tid)
+    assert snap1["age_seconds"] == pytest.approx(42.5)
+    # generated_at itself does not move — only age relative to "now" does.
+    assert snap1["generated_at"] == snap0["generated_at"]
+
+
+# ---------------------------------------------------------------------------
+# list_tunnel_tools — stamps generated_at, handles partial-slot aggregation
+# ---------------------------------------------------------------------------
+
+def test_list_tunnel_tools_stamps_generated_at(monkeypatch):
+    tid = _tid()
+    monkeypatch.setattr(
+        tn, "_fetch_slot_tools",
+        _fake_fetch_slot_tools({"fs": [{"name": "read_file", "description": "d"}]}),
+    )
+    assert tid not in tn._tunnel_manifest_generated_at
+
+    asyncio.run(tn.list_tunnel_tools(tid))
+
+    assert tid in tn._tunnel_manifest_generated_at
+    snap = tn.tunnel_manifest_snapshot(tid)
+    assert snap["manifest_hash"] is not None
+    assert snap["tool_count"] == 1
+    assert snap["age_seconds"] == pytest.approx(0, abs=1.0)
+
+
+def test_list_tunnel_tools_partial_slot_aggregation(monkeypatch):
+    """One healthy slot returns tools, another returns none — both still
+    aggregate correctly and the manifest reflects only the real tools."""
+    tid = _tid()
+    monkeypatch.setattr(
+        tn, "_fetch_slot_tools",
+        _fake_fetch_slot_tools({
+            "fs": [{"name": "read_file", "description": "d"}],
+            "code": [],  # slot healthy but advertises nothing this pass
+        }),
+    )
+    tools = asyncio.run(tn.list_tunnel_tools(tid))
+    names = {t["name"] for t in tools}
+    assert names == {"filesystem__read_file"}
+    snap = tn.tunnel_manifest_snapshot(tid)
+    assert snap["tool_count"] == 1
+
+
+def test_list_tunnel_tools_partial_slot_skips_unhealthy(monkeypatch):
+    """An unhealthy slot is excluded from aggregation entirely (d71ba2e7),
+    and never even gets fetched (let alone counted in the manifest)."""
+    tid = _tid()
+    tn._record_slot_health(tid, "code", False, reason="down")
+    fetch_calls: list[str] = []
+
+    async def _fetch(tenant_id, label):
+        fetch_calls.append(label)
+        if label == "code":
+            return label, [{"name": "trace_path", "description": "d"}]
+        return label, []
+
+    monkeypatch.setattr(tn, "_fetch_slot_tools", _fetch)
+    asyncio.run(tn.list_tunnel_tools(tid))
+    assert "code" not in fetch_calls  # never fetched — filtered before the fan-out
+
+
+def test_list_tunnel_tools_zero_tools_active_tunnel_still_stamps_timestamp(monkeypatch):
+    """Active tunnel, but every slot returned nothing this pass — the existing
+    routing cache (if any) is preserved (existing behavior) while the manifest
+    timestamp is still refreshed so age_seconds reflects a real, recent attempt."""
+    tid = _tid()
+    tn._tunnel_sockets[tid] = object()  # has_active_tunnel() -> True
+    tn._tunnel_tool_routes[tid] = {"stale__tool": "fs"}  # pre-existing cache
+    monkeypatch.setattr(tn, "_fetch_slot_tools", _fake_fetch_slot_tools({}))
+
+    asyncio.run(tn.list_tunnel_tools(tid))
+
+    # Old routing cache untouched (existing semantics — call_tunnel_tool can
+    # still route by it) ...
+    assert tn._tunnel_tool_routes.get(tid) == {"stale__tool": "fs"}
+    # ...but the manifest timestamp WAS refreshed (49d8244d).
+    assert tid in tn._tunnel_manifest_generated_at
+
+
+# ---------------------------------------------------------------------------
+# refresh_tunnel_manifest — the explicit refresh/re-list operation
+# ---------------------------------------------------------------------------
+
+def test_refresh_tunnel_manifest_forces_rebuild(monkeypatch):
+    tid = _tid()
+    calls = {"n": 0}
+
+    async def _fetch(tenant_id, label):
+        calls["n"] += 1
+        if label == "fs":
+            return label, [{"name": "read_file", "description": "d"}]
+        return label, []
+
+    monkeypatch.setattr(tn, "_fetch_slot_tools", _fetch)
+
+    snap = asyncio.run(tn.refresh_tunnel_manifest(tid))
+    first_call_count = calls["n"]
+
+    assert snap["tool_count"] == 1
+    assert snap["manifest_hash"] is not None
+    assert first_call_count == len(tn._TUNNEL_LABELS)
+
+    # Calling again re-fetches EVERY slot again (a real rebuild, not a cache hit).
+    snap2 = asyncio.run(tn.refresh_tunnel_manifest(tid))
+    assert calls["n"] == first_call_count * 2
+    assert snap2["manifest_hash"] == snap["manifest_hash"]
+
+
+def test_refresh_tunnel_manifest_invalidates_before_rebuilding(monkeypatch):
+    """A stale cache from a DIFFERENT (now-gone) tool set must never leak into
+    the refreshed snapshot even transiently."""
+    tid = _tid()
+    tn._tunnel_tool_routes[tid] = {"removed__tool": "fs"}
+    tn._tunnel_manifest_generated_at[tid] = 1.0
+
+    monkeypatch.setattr(
+        tn, "_fetch_slot_tools",
+        _fake_fetch_slot_tools({"fs": [{"name": "new_tool", "description": "d"}]}),
+    )
+    snap = asyncio.run(tn.refresh_tunnel_manifest(tid))
+    assert tn._tunnel_tool_routes[tid] == {"filesystem__new_tool": "fs"}
+    assert "removed__tool" not in tn._tunnel_tool_routes[tid]
+    assert snap["tool_count"] == 1
+
+
+def test_refresh_tunnel_manifest_no_tunnel_returns_empty_snapshot(monkeypatch):
+    tid = _tid()
+    monkeypatch.setattr(tn, "_fetch_slot_tools", _fake_fetch_slot_tools({}))
+    snap = asyncio.run(tn.refresh_tunnel_manifest(tid))
+    assert snap["has_active_tunnel"] is False
+    assert snap["manifest_hash"] is None
+    assert snap["tool_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Reconnect — a fresh connect invalidates the manifest (simulated via the same
+# atomic helper the real WS handlers call on connect/disconnect).
+# ---------------------------------------------------------------------------
+
+def test_reconnect_invalidates_stale_manifest(monkeypatch):
+    tid = _tid()
+    monkeypatch.setattr(
+        tn, "_fetch_slot_tools",
+        _fake_fetch_slot_tools({"fs": [{"name": "read_file", "description": "d"}]}),
+    )
+    asyncio.run(tn.list_tunnel_tools(tid))
+    assert tn.tunnel_manifest_snapshot(tid)["manifest_hash"] is not None
+
+    # Simulate a (re)connect — every real WS handler does exactly this on
+    # connect (see tunnel_ws / _serve_tunnel_ws).
+    tn._invalidate_tunnel_manifest(tid)
+
+    snap = tn.tunnel_manifest_snapshot(tid)
+    assert snap["manifest_hash"] is None
+    assert snap["generated_at"] is None
+
+    # The very next aggregation (what a real tools/list triggers) rebuilds it.
+    asyncio.run(tn.list_tunnel_tools(tid))
+    assert tn.tunnel_manifest_snapshot(tid)["manifest_hash"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Concurrent tools/list — two overlapping aggregations for the same tenant
+# must not corrupt shared state.
+# ---------------------------------------------------------------------------
+
+def test_concurrent_list_tunnel_tools_stays_consistent(monkeypatch):
+    tid = _tid()
+
+    async def _fetch(tenant_id, label):
+        await asyncio.sleep(0)  # yield, encouraging interleaving
+        if label == "fs":
+            return label, [{"name": "read_file", "description": "d"}]
+        return label, []
+
+    monkeypatch.setattr(tn, "_fetch_slot_tools", _fetch)
+
+    async def _run_concurrent():
+        return await asyncio.gather(
+            tn.list_tunnel_tools(tid),
+            tn.list_tunnel_tools(tid),
+        )
+
+    results = asyncio.run(_run_concurrent())
+    for tools in results:
+        assert {t["name"] for t in tools} == {"filesystem__read_file"}
+    # Final shared state is the (identical, deterministic) aggregation from
+    # whichever call wrote last — never a half-updated/mixed table.
+    assert tn._tunnel_tool_routes[tid] == {"filesystem__read_file": "fs"}
+    assert tn.tunnel_manifest_snapshot(tid)["manifest_hash"] is not None
+
+
+# ---------------------------------------------------------------------------
+# HTTP routes — POST /tunnel/refresh and GET /tunnel/manifest
+# ---------------------------------------------------------------------------
+
+class _FakeManifestRequest:
+    """Minimal Starlette-Request stand-in (mirrors _FakeActiveRepoReq in
+    test_tunnel_bridge.py)."""
+
+    def __init__(self, token="sk_meridian_manifest_token"):
+        self.headers = {"authorization": f"Bearer {token}"} if token else {}
+        self.query_params = {}
+        self.app = types.SimpleNamespace(state=types.SimpleNamespace(db=None))
+
+
+def _patch_manifest_auth(monkeypatch, tenant_id=None, plan="pro"):
+    tenant_id = tenant_id or _tid()
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+
+    async def fake_resolve(auth_db, token):
+        return {"id": tenant_id, "plan": plan} if token else None
+
+    monkeypatch.setattr(tn, "_resolve_tenant_from_token", fake_resolve)
+    return tenant_id
+
+
+def test_refresh_route_requires_hosted_mode(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: False)
+    resp = asyncio.run(tn.refresh_tunnel_tools_route(_FakeManifestRequest()))
+    assert resp.status_code == 503
+
+
+def test_refresh_route_requires_auth(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+
+    async def fake_resolve(auth_db, token):
+        return None
+
+    monkeypatch.setattr(tn, "_resolve_tenant_from_token", fake_resolve)
+    resp = asyncio.run(tn.refresh_tunnel_tools_route(_FakeManifestRequest()))
+    assert resp.status_code == 401
+
+
+def test_refresh_route_requires_pro_plan(monkeypatch):
+    _patch_manifest_auth(monkeypatch, plan="free")
+    resp = asyncio.run(tn.refresh_tunnel_tools_route(_FakeManifestRequest()))
+    assert resp.status_code == 403
+
+
+def test_refresh_route_success_no_tunnel(monkeypatch):
+    tenant_id = _patch_manifest_auth(monkeypatch)
+    monkeypatch.setattr(tn, "_fetch_slot_tools", _fake_fetch_slot_tools({}))
+
+    resp = asyncio.run(tn.refresh_tunnel_tools_route(_FakeManifestRequest()))
+
+    assert resp.status_code == 200
+    body = json.loads(resp.body)
+    assert body["ok"] is True
+    assert body["tenant_id"] == tenant_id
+    assert body["has_active_tunnel"] is False
+    assert body["manifest_hash"] is None
+
+
+def test_refresh_route_success_with_tunnel(monkeypatch):
+    tenant_id = _patch_manifest_auth(monkeypatch)
+    tn._tunnel_sockets[tenant_id] = object()
+    monkeypatch.setattr(
+        tn, "_fetch_slot_tools",
+        _fake_fetch_slot_tools({"fs": [{"name": "read_file", "description": "d"}]}),
+    )
+
+    resp = asyncio.run(tn.refresh_tunnel_tools_route(_FakeManifestRequest()))
+
+    body = json.loads(resp.body)
+    assert resp.status_code == 200
+    assert body["tool_count"] == 1
+    assert body["manifest_hash"] is not None
+    assert body["has_active_tunnel"] is True
+
+
+def test_manifest_route_is_read_only(monkeypatch):
+    """GET /tunnel/manifest never triggers a slot fetch — only reports whatever
+    was last built (distinguishing it from POST /tunnel/refresh)."""
+    tenant_id = _patch_manifest_auth(monkeypatch)
+    fetch_called = {"n": 0}
+
+    async def _fetch(tenant_id_, label):
+        fetch_called["n"] += 1
+        return label, []
+
+    monkeypatch.setattr(tn, "_fetch_slot_tools", _fetch)
+
+    resp = asyncio.run(tn.get_tunnel_manifest_route(_FakeManifestRequest()))
+
+    assert resp.status_code == 200
+    assert fetch_called["n"] == 0
+
+    body = json.loads(resp.body)
+    assert body["manifest_hash"] is None
+    assert body["tenant_id"] == tenant_id
+
+
+def test_manifest_route_reports_previously_built_manifest(monkeypatch):
+    tenant_id = _patch_manifest_auth(monkeypatch)
+    tn._tunnel_tool_routes[tenant_id] = {"filesystem__read_file": "fs"}
+    tn._tunnel_manifest_generated_at[tenant_id] = tn.time.time()
+
+    resp = asyncio.run(tn.get_tunnel_manifest_route(_FakeManifestRequest()))
+    body = json.loads(resp.body)
+    assert body["tool_count"] == 1
+    assert body["manifest_hash"] == tn._tunnel_manifest_hash(tenant_id)
+
+
+def test_manifest_route_requires_hosted_mode(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: False)
+    resp = asyncio.run(tn.get_tunnel_manifest_route(_FakeManifestRequest()))
+    assert resp.status_code == 503
+
+
+def test_manifest_route_requires_auth(monkeypatch):
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+
+    async def fake_resolve(auth_db, token):
+        return None
+
+    monkeypatch.setattr(tn, "_resolve_tenant_from_token", fake_resolve)
+    resp = asyncio.run(tn.get_tunnel_manifest_route(_FakeManifestRequest()))
+    assert resp.status_code == 401

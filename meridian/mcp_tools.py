@@ -2567,10 +2567,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "your client's tool schema went stale ('I nuked the schema', a tool you "
         "expected is suddenly 'not found', or right after a /compact) — it is a "
         "plain tool CALL, so it works even on clients that ignore the "
-        "notifications/tools/list_changed signal (e.g. Claude Desktop). Best-effort "
-        "also re-fires list_changed for your tenant so a client that DOES honour it "
-        "re-lists. Names returned here are canonical: a name present here but absent "
-        "from your tool list is a stale-schema artifact, not a removed tool.",
+        "notifications/tools/list_changed signal (e.g. Claude Desktop). Names "
+        "returned here are canonical: a name present here but absent from your "
+        "tool list is a stale-schema artifact, not a removed tool. If you're "
+        "tunnel-connected, this also forces a synchronous re-aggregation of your "
+        "tunnel's plugin tools (filesystem/code-intel/office/etc.) — the returned "
+        "`tunnel` object carries a manifest_hash + slot_health + config_generation "
+        "snapshot so you can tell a recovered/newly-configured slot is now visible "
+        "without a reconnect.",
      "inputSchema": {"type": "object", "properties": {},
          "required": []}},
     {"name": "get_graph_diff", "description":
