@@ -19,7 +19,7 @@ Check server health.
 {
   "status": "ok",
   "service": "meridian",
-  "version": "0.1.9",
+  "version": "0.2.6",
   "git_sha": "a555660ef312"
 }
 ```
@@ -1029,6 +1029,8 @@ No auth required.
 | `GET` | `/projects/{project_id}/ntfy` | Return the current notification settings for this project |
 | `PATCH` | `/projects/{project_id}/ntfy` | Save (or clear) the notify URL and/or notify_email for this project |
 | `PATCH` | `/projects/{project_id}/organization` | 8db00fcb — set a project's status (active\|parked\|archived) and/or |
+| `GET` | `/projects/{project_id}/orphan_reaper` | f7084ed0 — dashboard-facing status for the orphan-process-reaper Stop |
+| `POST` | `/projects/{project_id}/orphan_reaper/toggle` | f7084ed0 — dashboard opt-in/opt-out for the orphan-process-reaper Stop |
 | `POST` | `/projects/{project_id}/parent` | 0fed6a42 — set / change / clear a project's parent (subproject hierarchy) |
 | `POST` | `/projects/{project_id}/queue-session` | Queue the next /goal string; it's appended to the next handoff and then |
 | `GET` | `/projects/{project_id}/queued-session` | Return the currently queued next-session goal, or null |

@@ -399,10 +399,24 @@ async def test_delta_freshness_requery_strict_evidence_blocks_on_failure(
 
 
 @pytest.mark.asyncio
-async def test_delta_mode_renders_configured_test_cmd_not_stale_default(db, tmp_path):
+async def test_delta_mode_renders_configured_test_cmd_not_stale_default(db, tmp_path, monkeypatch):
     """A project with an explicit set_executor_config(test_cmd=...) must see
     THAT exact command (and its derived parallelism) in a delta handoff --
-    never the old hardcoded "-n 3" fallback."""
+    never the old hardcoded "-n 3" fallback.
+
+    generate_handoff's _annotate_touches_files shells out to a live
+    `git diff --name-only HEAD~3` (see test_cov_handoff.py's
+    test_annotate_touches_files_writes_touches_resources for the same
+    pattern) -- this item's title contains the word "test", which can
+    collide with real recently-changed files in this repo (e.g.
+    .github/workflows/test.yml) and spuriously populate touches_resources,
+    tripping the unprospected-exclusion gate and short-circuiting the whole
+    quick-start-goal render this test is asserting on. Stub it out so the
+    test's outcome depends only on the executor_config under test, not on
+    the ambient git history at run time."""
+    import subprocess as _subprocess
+    monkeypatch.setattr(_subprocess, "run", lambda *a, **k: type("_R", (), {"stdout": ""})())
+
     p = await db_module.create_project(db, "delta-test-cmd-scope")
     await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
     await db_module.set_executor_config(

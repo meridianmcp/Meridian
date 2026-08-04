@@ -263,24 +263,35 @@ async def test_body_bound_token_verified_without_presenting_body_still_ok(db):
 @pytest.mark.asyncio
 async def test_four_preexisting_token_outcomes_unchanged_with_body_param_present(db):
     """The pre-existing not_found/expired/already_consumed/wrong_project
-    distinctions must survive the body-hash extension untouched."""
+    distinctions must survive the body-hash extension untouched.
+
+    f46372e8 added a structured ``recovery`` payload to every non-"ok" result
+    (see ``_handoff_token_failure``) — assert on ``valid``/``reason`` (the
+    pre-existing outcomes this test is about) and merely require ``recovery``
+    to be present on failures, rather than pinning its exact prose."""
     pid = await _project(db, "rw-four-outcomes")
     other_pid = await _project(db, "rw-four-outcomes-other")
 
     # not_found
     result = await handoff_module.verify_handoff_token(db, "never-issued-token", pid)
-    assert result == {"valid": False, "reason": "not_found"}
+    assert result["valid"] is False
+    assert result["reason"] == "not_found"
+    assert "recovery" in result
 
     # wrong_project
     token = await handoff_module.mint_handoff_token(db, pid, body="body")
     result = await handoff_module.verify_handoff_token(db, token, other_pid, body="body")
-    assert result == {"valid": False, "reason": "wrong_project"}
+    assert result["valid"] is False
+    assert result["reason"] == "wrong_project"
+    assert "recovery" in result
 
     # already_consumed — the SAME token, now verified for the right project.
     result = await handoff_module.verify_handoff_token(db, token, pid, body="body")
     assert result == {"valid": True, "reason": "ok"}
     result = await handoff_module.verify_handoff_token(db, token, pid, body="body")
-    assert result == {"valid": False, "reason": "already_consumed"}
+    assert result["valid"] is False
+    assert result["reason"] == "already_consumed"
+    assert "recovery" in result
 
 
 # ---------------------------------------------------------------------------
