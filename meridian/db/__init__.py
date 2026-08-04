@@ -4190,6 +4190,15 @@ async def _maybe_semantic_escalate(
     Semantic hits are ranked by cosine (floor-filtered) and appended AFTER the
     keyword rows, deduped by id, keyword-first — so existing behavior is a strict
     prefix of the augmented result and the return shape is identical.
+
+    e631d54f — every semantically-augmented row carries ``semantic: True``
+    (unchanged) plus two additive fields: ``embedding_model`` (the model
+    that produced the ranking, :func:`semantic_search.model_name`) and
+    ``degraded`` (:func:`semantic_search.is_corpus_capped` against
+    :data:`_SEMANTIC_CORPUS_CAP`). ``degraded=True`` means the candidate
+    corpus hit the cap — these rows are real matches within that bounded
+    window, but the window is not exhaustive, so callers must not treat a
+    capped escalation as an authoritative "nothing else matches" answer.
     """
     from meridian import semantic_search
 
@@ -4232,9 +4241,20 @@ async def _maybe_semantic_escalate(
 
     hydrated = await _hydrate_semantic_rows(db, project_id, new_by_type)
     # Mark provenance so callers/UI can distinguish semantic-augmented rows.
+    # e631d54f (follow-up to 56cd8712) — also mark `degraded` + the embedding
+    # model that produced the ranking whenever the candidate corpus hit the
+    # cap: semantic_search.is_corpus_capped() means ranking only considered a
+    # bounded WINDOW of the project's rows, never an exhaustive pass, so a
+    # caller must treat these hits as candidates only — never as proof that
+    # nothing better exists elsewhere (an authoritative pointer/provenance
+    # gate must not be satisfied by a capped semantic escalation alone).
+    row_degraded = semantic_search.is_corpus_capped(len(corpus), _SEMANTIC_CORPUS_CAP)
+    embedding_model = semantic_search.model_name()
     for mtype, rows in hydrated.items():
         for r in rows:
             r["semantic"] = True
+            r["degraded"] = row_degraded
+            r["embedding_model"] = embedding_model
     return (
         tasks + hydrated["task"],
         notes + hydrated["note"],

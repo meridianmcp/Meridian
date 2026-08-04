@@ -136,6 +136,50 @@ def should_escalate(pure_fts_count: int, trigram_top: float) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Embedding freshness / degraded-candidate labeling (e631d54f, follow-up to
+# 56cd8712). This searcher never persists an index — every escalation embeds
+# a freshly-fetched corpus live, so there's no "stale on-disk vector index"
+# risk the way meridian_codeindex.CodeIndex or a hypothetical cached
+# corpus would have. The one real freshness gap here is different: the
+# corpus a caller fetches for ranking is DELIBERATELY bounded (a cap on how
+# many rows get embedded per escalation, e.g. db._SEMANTIC_CORPUS_CAP), so a
+# "no result above the cosine floor" answer is only ever a statement about
+# the rows INSIDE that window — never proof that no better match exists
+# project-wide. These two pure, DB-free helpers make that distinction
+# checkable by callers (mirroring should_escalate's pure-function style)
+# instead of leaving it as prose only.
+# ---------------------------------------------------------------------------
+
+
+def model_name() -> str:
+    """The embedding model identifier this module's searches would use.
+
+    A stable "embedding model/version" marker a caller can stamp onto
+    semantically-ranked rows (see ``meridian.db._maybe_semantic_escalate``)
+    so a later reader can tell which model produced a given match — useful
+    once a model upgrade is possible, since this module has no persisted
+    index to version-check against (embeddings are always computed live).
+    """
+    return _MODEL_NAME
+
+
+def is_corpus_capped(corpus_size: int, cap: int) -> bool:
+    """True when ``corpus_size`` hit (or exceeded) the per-escalation cap.
+
+    A capped corpus means semantic ranking only ever considered a bounded
+    WINDOW of the project's candidates — real matches, but never a
+    project-wide exhaustive answer. Callers must label any row surfaced
+    from a capped ranking pass as degraded (candidates only) and must never
+    treat "nothing above the cosine floor in this window" as proof nothing
+    better exists elsewhere — i.e. a capped semantic escalation must never
+    by itself satisfy an authoritative pointer/provenance gate.
+    """
+    if cap <= 0:
+        return corpus_size > 0
+    return corpus_size >= cap
+
+
+# ---------------------------------------------------------------------------
 # RSS reader — portable, best-effort. Returns None if it can't measure.
 # ---------------------------------------------------------------------------
 

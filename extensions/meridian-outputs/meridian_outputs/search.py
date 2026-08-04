@@ -126,8 +126,9 @@ def search_outputs(
 
     Returns:
       Identical shape to ``outputs_local.search_outputs``'s return value
-      (``{outputs_dir, query, hits, total_indexed, total_in_index, ...}``
-      plus optional ``partial``/``pending_stale_count``/``fts_pending``/
+      (``{outputs_dir, query, hits, total_indexed, total_in_index,
+      convergence, degraded, ...}`` plus optional
+      ``partial``/``pending_stale_count``/``fts_pending``/
       ``tantivy_lock_warning``/``db_write_error``/``zero_hits_warning``/
       ``error``), except every hit dict gains a
       ``literal_match: bool``
@@ -138,7 +139,12 @@ def search_outputs(
       re-ranking is attempted, and (per ``outputs_local.search_outputs``'s
       contract) a zero-hit response carries ``zero_hits_warning`` whenever
       the index isn't fully converged, so this passthrough must never be
-      mistaken for a confirmed "not found".
+      mistaken for a confirmed "not found". The top-level ``degraded``
+      field (item e631d54f) passes through UNCHANGED from
+      ``outputs_local.search_outputs`` -- reordering hits never changes
+      whether the underlying index has converged, so a caller doing an
+      authoritative existence/dedup check must still honor ``degraded``
+      here exactly as it would on the undecorated call.
     """
     result = outputs_local.search_outputs(
         outputs_dir,

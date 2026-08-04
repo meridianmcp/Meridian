@@ -69,6 +69,35 @@ def test_should_escalate_handles_none_inputs():
 
 
 # ---------------------------------------------------------------------------
+# is_corpus_capped / model_name — embedding-freshness helpers (e631d54f,
+# follow-up to 56cd8712). Pure, DB-free — same style as should_escalate.
+# ---------------------------------------------------------------------------
+
+
+def test_is_corpus_capped_true_at_and_above_cap():
+    assert ss.is_corpus_capped(200, 200) is True
+    assert ss.is_corpus_capped(250, 200) is True
+
+
+def test_is_corpus_capped_false_below_cap():
+    assert ss.is_corpus_capped(199, 200) is False
+    assert ss.is_corpus_capped(0, 200) is False
+
+
+def test_is_corpus_capped_degenerate_cap_treats_any_nonempty_corpus_as_capped():
+    """A cap of 0 (or negative — misconfiguration) means NO corpus size is
+    provably exhaustive, so any non-empty corpus is conservatively capped."""
+    assert ss.is_corpus_capped(5, 0) is True
+    assert ss.is_corpus_capped(0, 0) is False
+    assert ss.is_corpus_capped(1, -1) is True
+
+
+def test_model_name_returns_the_configured_model():
+    assert ss.model_name() == ss._MODEL_NAME
+    assert isinstance(ss.model_name(), str) and ss.model_name()
+
+
+# ---------------------------------------------------------------------------
 # cosine floor — rank() drops sub-floor hits, keeps floor-and-above sorted desc.
 # Uses a stubbed embed via injected vectors — NO real model.
 # ---------------------------------------------------------------------------
@@ -385,6 +414,64 @@ async def test_search_all_pg_no_escalate_when_gate_false(db_pg, monkeypatch):
     # No error, and no semantic rows.
     result = await db_module.search_all(db, p["id"], "oauth")
     assert not any(n.get("semantic") for n in result["notes"])
+
+
+@pytest.mark.asyncio
+async def test_search_all_pg_escalation_tags_embedding_model_not_degraded_below_cap(
+    db_pg, monkeypatch
+):
+    """e631d54f — a semantically-augmented row carries `embedding_model` and,
+    when the candidate corpus is well under `_SEMANTIC_CORPUS_CAP`,
+    `degraded=False` (the ranking pass was exhaustive over the whole
+    corpus, not a truncated window)."""
+    db = db_pg
+    p = await db_module.create_project(db, "sem-pg-model-tag")
+    note = await db_module.add_project_note(
+        db, p["id"], "Vector database", "embeddings and nearest-neighbor lookup")
+    q = "similarity retrieval xyzzy"
+
+    from meridian import semantic_search
+
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank", lambda query, cands, floor=None: [(note["id"], 0.72)])
+
+    result = await db_module.search_all(db, p["id"], q)
+    matched = next(n for n in result["notes"] if n["id"] == note["id"])
+    assert matched["semantic"] is True
+    assert matched["embedding_model"] == semantic_search.model_name()
+    assert matched["degraded"] is False
+
+
+@pytest.mark.asyncio
+async def test_search_all_pg_escalation_marks_degraded_when_corpus_capped(
+    db_pg, monkeypatch
+):
+    """When the candidate corpus hits `_SEMANTIC_CORPUS_CAP`, augmented rows
+    must be labeled `degraded=True` — the ranking pass only saw a bounded
+    window, so it must never be read as an authoritative 'nothing else
+    matches' answer."""
+    db = db_pg
+    p = await db_module.create_project(db, "sem-pg-capped")
+    note = await db_module.add_project_note(
+        db, p["id"], "Vector database", "embeddings and nearest-neighbor lookup")
+    q = "similarity retrieval xyzzy"
+
+    # Force the single real candidate row to exactly hit the (monkeypatched,
+    # tiny) cap so is_corpus_capped(len(corpus), cap) is True.
+    monkeypatch.setattr(db_module, "_SEMANTIC_CORPUS_CAP", 1)
+
+    from meridian import semantic_search
+
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank", lambda query, cands, floor=None: [(note["id"], 0.72)])
+
+    result = await db_module.search_all(db, p["id"], q)
+    matched = next(n for n in result["notes"] if n["id"] == note["id"])
+    assert matched["degraded"] is True
 
 
 # ---------------------------------------------------------------------------

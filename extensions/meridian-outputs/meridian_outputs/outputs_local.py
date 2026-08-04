@@ -4293,6 +4293,18 @@ def search_outputs(
     # was given, `index` is already the subtree-scoped instance, so this
     # describes the SUBTREE's own convergence, not the whole root's.
     result["convergence"] = index.get_convergence_state().to_dict()
+    # e631d54f (follow-up to 6af1518d) -- a single, explicit `degraded` flag
+    # mirroring `convergence["converged"]`, computed regardless of whether
+    # `hits` is empty. The `zero_hits_warning` below only ever fires for a
+    # ZERO-hit response; a NON-empty `hits` list from a not-yet-converged
+    # index was previously indistinguishable from a complete answer unless a
+    # caller cross-referenced `convergence["converged"]` itself. That gap is
+    # exactly what makes a partial/stale index unsafe as an authoritative
+    # pointer/provenance signal (e.g. "does an output matching X already
+    # exist anywhere in the tree") -- a caller doing an existence/dedup check
+    # must see `degraded=True` and treat these hits as candidates only, never
+    # as proof nothing else matches.
+    result["degraded"] = not result["convergence"]["converged"]
     if not hits and (
         result.get("partial") or result.get("fts_pending")
         or result.get("db_write_error")
@@ -4427,6 +4439,46 @@ def get_indexed_output(outputs_dir: str, file_path: str) -> dict[str, Any] | Non
         return None
     index = _get_cached_index(outputs_dir)
     return index.resolve_output(file_path)
+
+
+def get_indexed_output_status(outputs_dir: str, file_path: str) -> dict[str, Any]:
+    """The authoritative-gate-safe sibling of :func:`get_indexed_output`
+    (item e631d54f, follow-up to 6af1518d).
+
+    :func:`get_indexed_output` returning ``None`` is ambiguous on a
+    not-yet-converged index: it cannot distinguish "confirmed absent" from
+    "the ambient walk simply hasn't reached this path yet". A caller that
+    needs an AUTHORITATIVE absence answer (e.g. composing a
+    provenance-status verdict, or a dedup/existence check before writing a
+    new output) must consult ``degraded`` before trusting a ``None``/empty
+    ``row`` here as confirmed absence -- when ``degraded`` is ``True``, the
+    correct read is "unknown, index still catching up", never "absent".
+
+    Never triggers a rebuild (same read-only contract as
+    :func:`get_indexed_output`) -- this only adds the convergence context a
+    caller needs to interpret the (unchanged) membership answer correctly.
+
+    Returns:
+      ``{"row": <dict|None>, "degraded": bool, "convergence": {...}}`` where
+      ``row`` is identical to what :func:`get_indexed_output` returns, and
+      ``convergence`` is :meth:`OutputsFtsIndex.get_convergence_state`'s
+      dict (whole-``outputs_dir`` convergence -- this is a membership check
+      against the full tree, not a subtree-scoped one). ``outputs_dir``/
+      ``file_path`` missing or invalid returns ``row=None`` with
+      ``degraded=True`` (never a confident "absent").
+    """
+    if not file_path or not str(file_path).strip():
+        return {"row": None, "degraded": True, "convergence": None}
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        return {"row": None, "degraded": True, "convergence": None}
+    index = _get_cached_index(outputs_dir)
+    row = index.resolve_output(file_path)
+    convergence = index.get_convergence_state().to_dict()
+    return {
+        "row": row,
+        "degraded": not convergence["converged"],
+        "convergence": convergence,
+    }
 
 
 def get_path_annotations(outputs_dir: str, path: str) -> list[dict[str, Any]]:
