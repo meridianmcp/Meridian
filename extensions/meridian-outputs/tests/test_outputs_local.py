@@ -3622,10 +3622,21 @@ class TestWalkBatchDefaultUnbounded:
     longer cap the walk at an arbitrary file count (2000) -- the walk should
     be time-primary by default, stopping only on `deadline` (or true
     exhaustion), while an explicit override still works for anyone who
-    deliberately wants a count cap."""
+    deliberately wants a count cap.
 
-    def test_class_default_is_bounded_fairness_window(self) -> None:
-        assert OL._ResumableFileWalk._MAX_BATCH == 4_096
+    b85394bd -- REGRESSION FIX: an intervening perf change (47a1c53) had
+    quietly dropped this class default from 1_000_000_000 back down to
+    4_096 (and this one assertion was updated to match, silently narrowing
+    what this test class actually proves) while wiring
+    OutputsFtsIndex._adaptive_batch_limit() in as rebuild()'s walk cap
+    instead -- reintroducing the exact count-primary-walk behaviour this
+    class exists to guard against, just one level up. Restored to the
+    original >= 1_000_000 assertion; see the _MAX_BATCH docstring in
+    outputs_local.py for the full history.
+    """
+
+    def test_class_default_is_effectively_unbounded(self) -> None:
+        assert OL._ResumableFileWalk._MAX_BATCH >= 1_000_000
 
     def test_default_walk_not_capped_at_old_2000_default(
         self, tmp_path: Path,
@@ -3806,6 +3817,263 @@ class TestAdaptiveBatchPolicy:
             assert idx.rebuild(max_seconds=60) == n
             assert not delete_sql_seen
             assert len(idx._row_cache) == n
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
+# b85394bd -- deterministic memory probe backing the adaptive batch default
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveBatchMemoryProbe:
+    """_initial_adaptive_batch must resolve deterministically from whatever
+    memory probe is actually available: a real, declared psutil dependency
+    on a normal install, or the proven 4k floor when it's genuinely missing
+    (standalone uvx without the dependency) -- never a silent guess that
+    differs between environments for the same physical machine."""
+
+    def test_missing_psutil_falls_back_to_floor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "psutil", None)
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._adaptive_batch == OL.OutputsFtsIndex._ADAPTIVE_MIN_BATCH
+        finally:
+            idx.close()
+
+    @staticmethod
+    def _fake_psutil(available_bytes: int) -> MagicMock:
+        # cpu_count(logical=False) also gets consulted (by the unrelated
+        # _physical_core_count() Phase-1-worker-count probe) during
+        # OutputsFtsIndex.__init__ -- give it a real int so that unrelated
+        # code path doesn't blow up on a bare, unconfigured MagicMock.
+        fake = MagicMock()
+        fake.virtual_memory.return_value = MagicMock(available=available_bytes)
+        fake.cpu_count.return_value = 4
+        return fake
+
+    def test_healthy_memory_targets_32768(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(8 * 1024**3))
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._adaptive_batch == OL.OutputsFtsIndex._ADAPTIVE_MAX_BATCH // 2
+            assert idx._adaptive_batch == 32_768
+        finally:
+            idx.close()
+
+    def test_low_memory_uses_floor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(1 * 1024**3))
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._adaptive_batch == OL.OutputsFtsIndex._ADAPTIVE_MIN_BATCH
+        finally:
+            idx.close()
+
+    def test_medium_memory_uses_double_floor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(3 * 1024**3))
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx._adaptive_batch == OL.OutputsFtsIndex._ADAPTIVE_MIN_BATCH * 2
+        finally:
+            idx.close()
+
+    def test_explicit_override_ignores_memory_probe_entirely(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An explicit max_batch must win regardless of what psutil (or its
+        absence) would otherwise resolve to."""
+        monkeypatch.setitem(sys.modules, "psutil", None)
+        idx = OL.OutputsFtsIndex(str(tmp_path), max_batch=777)
+        try:
+            assert idx._adaptive_batch == 777
+        finally:
+            idx.close()
+
+    def test_psutil_declared_as_explicit_pyproject_dependency(self) -> None:
+        """b85394bd -- the memory probe must be declared, not merely lazily
+        imported, so a standalone `uvx --from <path> meridian-outputs-mcp`
+        install (no Pixi environment to transitively supply it) resolves
+        the SAME adaptive-batch code path as a normal install instead of
+        silently taking the 4k-floor fallback."""
+        import tomllib  # noqa: PLC0415 -- test-only, stdlib on 3.11+
+
+        pyproject_path = Path(__file__).parent.parent / "pyproject.toml"
+        with open(pyproject_path, "rb") as f:
+            data = tomllib.load(f)
+        deps = data["project"]["dependencies"]
+        assert any(d.strip().lower().startswith("psutil") for d in deps), (
+            f"psutil is not declared as an explicit dependency in "
+            f"{pyproject_path} -- standalone uvx installs may silently "
+            f"diverge from Pixi installs on the adaptive-batch default. "
+            f"dependencies={deps!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# b85394bd -- discovery capacity vs. adaptive analysis capacity separation
+# ---------------------------------------------------------------------------
+
+class TestDiscoveryVsAnalysisCapacitySeparation:
+    """rebuild() must use TWO independent caps: the walk's own discovery
+    capacity (self._max_batch, effectively unbounded by default, time-
+    primary) for how many paths a drain() call may pull off the filesystem,
+    and the memory-adaptive analysis capacity (_adaptive_batch_limit()) to
+    bound how much of the pending-stale backlog Phase 1/2 take on in a
+    single call. Before this fix both concerns were the same number, so a
+    small adaptive limit (e.g. the psutil-missing 4k floor) silently capped
+    RAW DISCOVERY too, and the entire backlog (however large the walk let it
+    grow) was submitted to ThreadPoolExecutor in one shot."""
+
+    @duckdb_required
+    def test_discovery_is_not_capped_by_a_small_adaptive_limit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        n = 50
+        for i in range(n):
+            (tmp_path / f"f{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        monkeypatch.setattr(idx, "_adaptive_batch_limit", lambda: 5)
+        try:
+            idx.rebuild(max_seconds=60)
+            # Discovery must have found ALL 50 files this call even though
+            # the adaptive (analysis) limit was artificially tiny -- proves
+            # the walk's own cap, not the adaptive limit, governs discovery.
+            assert idx.last_rebuild_metrics["discovered_total"] == n
+            assert idx.last_rebuild_metrics["walk_complete"] is True
+            assert idx.last_rebuild_metrics["walk_batch_limit"] == idx._max_batch
+            assert idx.last_rebuild_metrics["analysis_batch_limit"] == 5
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_analysis_intake_never_submits_the_whole_backlog_at_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        n = 50
+        for i in range(n):
+            (tmp_path / f"g{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        monkeypatch.setattr(idx, "_adaptive_batch_limit", lambda: 5)
+        submit_calls: list[int] = []
+        real_submit = OL.concurrent.futures.ThreadPoolExecutor.submit
+
+        def _spy_submit(self, *args, **kwargs):
+            submit_calls.append(1)
+            return real_submit(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            OL.concurrent.futures.ThreadPoolExecutor, "submit", _spy_submit,
+        )
+        try:
+            count = idx.rebuild(max_seconds=60)
+            assert len(submit_calls) == 5, (
+                f"ThreadPoolExecutor.submit was called {len(submit_calls)} "
+                f"times for a backlog of {n} with an analysis limit of 5 -- "
+                "the whole pending backlog was still submitted at once "
+                "instead of a bounded slice"
+            )
+            assert count == 5, (
+                "one rebuild() call processed more than the bounded "
+                "analysis intake -- the whole pending backlog was still "
+                "processed at once"
+            )
+            assert idx.last_rebuild_metrics["analysis_batch_limit"] == 5
+            assert idx.last_rebuild_metrics["analysis_backlog_deferred"] == n - 5
+            assert len(idx._pending_stale) == n - 5
+            assert idx.last_rebuild_partial is True, (
+                "a genuinely deferred backlog must still mark the rebuild "
+                "as partial so search_outputs()'s partial/pending_stale_"
+                "count contract keeps firing"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_bounded_intake_still_fully_converges_across_calls(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Resumable/durable convergence must be preserved: a backlog
+        deferred by the analysis-intake bound is picked up on later calls,
+        not lost."""
+        n = 23
+        for i in range(n):
+            (tmp_path / f"h{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        monkeypatch.setattr(idx, "_adaptive_batch_limit", lambda: 7)
+        try:
+            last_count = 0
+            calls = 0
+            for _ in range(10):
+                calls += 1
+                # rebuild() returns the CUMULATIVE row count (all_rows), not
+                # a per-call delta -- assert on its final value, not a sum.
+                last_count = idx.rebuild(max_seconds=60)
+                if not idx._pending_stale and idx._walk_state is None:
+                    break
+            assert calls > 1, (
+                "bounded analysis intake (limit=7 on a 23-file tree) should "
+                "have required more than one rebuild() call to converge -- "
+                "if it converged in one call, this test isn't exercising "
+                "the deferred-backlog path at all"
+            )
+            assert last_count == n
+            assert idx._pending_stale == {}
+            state = idx.get_convergence_state()
+            assert state.converged is True
+            hits = idx.search("col", limit=n)
+            assert len(hits) == n
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_search_outputs_surfaces_deferred_backlog_metrics(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        n = 20
+        for i in range(n):
+            (tmp_path / f"k{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        idx = OL._get_cached_index(str(tmp_path))
+        monkeypatch.setattr(idx, "_adaptive_batch_limit", lambda: 4)
+        try:
+            result = OL.search_outputs(str(tmp_path), "col")
+            discovery = result["discovery"]
+            for key in (
+                "walk_batch_limit", "analysis_batch_limit",
+                "analysis_batch_source", "analysis_backlog_deferred",
+            ):
+                assert key in discovery, f"{key!r} missing from discovery metrics"
+            assert discovery["analysis_batch_limit"] == 4
+            assert discovery["analysis_batch_source"] == "adaptive"
+            # discovered_total may exceed `n` (e.g. a .gitignore auto-added
+            # to the cache directory by ensure_gitignored, itself now a
+            # discoverable file) -- assert the relationship between fields,
+            # not a hardcoded count.
+            assert discovery["discovered_total"] >= n
+            assert (
+                discovery["analysis_backlog_deferred"]
+                == discovery["discovered_total"] - 4
+            )
+            assert result["partial"] is True
+            assert result["pending_stale_count"] == discovery["analysis_backlog_deferred"]
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_analysis_batch_source_reports_override(
+        self, tmp_path: Path,
+    ) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), max_batch=9)
+        try:
+            idx.rebuild(max_seconds=10)
+            assert idx.last_rebuild_metrics["analysis_batch_source"] == "override"
+            assert idx.last_rebuild_metrics["analysis_batch_limit"] == 9
         finally:
             idx.close()
 
@@ -4533,6 +4801,85 @@ class TestProvenanceTriggeredRegistration:
         result = AN.record_provenance(str(tmp_path), str(missing))
         assert "error" not in result
         assert result["content_hash"] is None
+
+
+# ---------------------------------------------------------------------------
+# b85394bd -- direct register_output_paths coverage for exact known files
+# ---------------------------------------------------------------------------
+
+class TestRegisterOutputPaths:
+    """Module-level bulk registration primitive (the direct MCP-tool-level
+    counterpart to OutputsFtsIndex.index_paths / register_priority_path)."""
+
+    @duckdb_required
+    def test_registers_and_indexes_multiple_exact_files_immediately(
+        self, tmp_path: Path,
+    ) -> None:
+        for i in range(30):
+            (tmp_path / f"noise_{i:03d}.csv").write_text(
+                f"col\nvalue={i}\n", encoding="utf-8",
+            )
+        a = tmp_path / "exact_a.csv"
+        b = tmp_path / "exact_b.csv"
+        a.write_text("col\nvalue=alpha\n", encoding="utf-8")
+        b.write_text("col\nvalue=bravo\n", encoding="utf-8")
+
+        # Cripple the ambient walk so it provably could not have organically
+        # reached these two files within a single call on its own.
+        idx = OL._get_cached_index(str(tmp_path))
+        idx._max_batch = 1
+        idx._max_batch_overridden = True
+
+        result = OL.register_output_paths(str(tmp_path), [str(a), str(b)])
+        assert result["registered"] is True
+        assert result["indexed"] == 2
+        assert result["queued"] == 0
+        assert os.path.normpath(str(a)) in idx._priority_registered
+        assert os.path.normpath(str(b)) in idx._priority_registered
+
+        hits = idx.search("alpha")
+        assert any("exact_a.csv" in h["path"] for h in hits)
+        hits = idx.search("bravo")
+        assert any("exact_b.csv" in h["path"] for h in hits)
+
+    @duckdb_required
+    def test_queues_paths_that_do_not_exist_yet(self, tmp_path: Path) -> None:
+        missing_a = tmp_path / "not_written_a.csv"
+        missing_b = tmp_path / "not_written_b.csv"
+        result = OL.register_output_paths(
+            str(tmp_path), [str(missing_a), str(missing_b)],
+        )
+        assert result["registered"] is True
+        assert result["indexed"] == 0
+        assert result["queued"] == 2
+
+    def test_missing_outputs_dir_is_reported_not_raised(self) -> None:
+        result = OL.register_output_paths("/definitely/not/a/real/dir", ["x.csv"])
+        assert result["registered"] is False
+        assert "reason" in result
+
+    def test_empty_paths_list_is_reported_not_raised(self, tmp_path: Path) -> None:
+        result = OL.register_output_paths(str(tmp_path), [])
+        assert result["registered"] is False
+        assert "reason" in result
+
+    @duckdb_required
+    def test_secret_paths_are_skipped(self, tmp_path: Path) -> None:
+        secret = tmp_path / ".env"
+        secret.write_text("SECRET=x", encoding="utf-8")
+        result = OL.register_output_paths(str(tmp_path), [str(secret)])
+        assert result["registered"] is True
+        assert result["indexed"] == 0
+        assert result["paths"] == []
+
+    def test_mcp_tool_is_registered(self) -> None:
+        """The MCP tool wrapper in server.py must exist and delegate
+        straight through to outputs_local.register_output_paths."""
+        from meridian_outputs import server as srv
+
+        assert "register_output_paths" in [
+            t.name for t in srv.mcp._tool_manager.list_tools()
+        ]
 
 
 # ---------------------------------------------------------------------------

@@ -43,6 +43,20 @@ dependencies = [
     # non-optional dependency here so a normal install always gets the
     # fast path -- same policy as xxhash above.
     "pyarrow>=14.0",
+    # b85394bd -- psutil backs the adaptive Phase-1 batch-size probe
+    # (OutputsFtsIndex._initial_adaptive_batch/_adaptive_batch_limit) and the
+    # physical-core-count default for the analysis worker pool
+    # (_physical_core_count). Both call sites already lazily import it and
+    # degrade gracefully (the 4k safety-floor batch, os.cpu_count() workers)
+    # when it's missing at runtime, but leaving it undeclared here meant a
+    # `pixi run` install (which happens to pull psutil in transitively via an
+    # unrelated dependency) and a standalone `uvx --from <path>
+    # meridian-outputs-mcp` install (which does NOT) silently diverged in
+    # which code path ran -- the exact non-determinism this item exists to
+    # close. Declared as a real, non-optional dependency here so a normal
+    # install always gets the memory-adaptive path, same policy as xxhash/
+    # pyarrow above.
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
