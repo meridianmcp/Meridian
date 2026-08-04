@@ -2709,7 +2709,7 @@ async def _annotate_touches_files(
 _ENRICH_CODE_POINTERS_DEFAULT = True
 # Cap on items enriched per handoff — keeps a large backlog from issuing dozens
 # of graph queries on every handoff.
-_MAX_ENRICHED_ITEMS = 25
+_MAX_ENRICHED_ITEMS = 100
 
 
 def _code_pointers_enabled(settings: dict[str, Any] | None) -> bool:
