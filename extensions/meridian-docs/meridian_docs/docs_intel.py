@@ -2024,6 +2024,12 @@ def _atomic_write_docx_bytes(
        fail-closed verification failure: :class:`DocxWriteVerificationError`
        is raised, the staged file is discarded, and ``dest`` is left
        byte-for-byte untouched (never a partially-written or corrupted file).
+       Independently of ``pre_manifest``, when ``changed_parts`` is given,
+       every changed ``.xml``/``.rels`` member is also re-read from that SAME
+       staged-and-flushed file and checked for XML well-formedness — a
+       malformed member is a ZIP-valid but corrupt .docx that the structural
+       manifest counts alone would not necessarily catch (see the inline
+       comment above the check), and is rejected the same fail-closed way.
     3. PROMOTE — the ONLY point at which the live file changes is inside
        :func:`_docx_promotion_lock`'s single serialized canonical-merge
        point for this destination — an ``os.replace`` (atomic on the same
@@ -2099,6 +2105,71 @@ def _atomic_write_docx_bytes(
                         "count_mismatches": mismatches,
                     },
                 )
+
+        # dccc2311 follow-up -- verify every CHANGED part that claims to be
+        # XML (``.xml``/``.rels``, which also covers the un-suffixed-but-XML
+        # ``[Content_Types].xml``) is actually well-formed, re-read from the
+        # STAGED file fresh off disk (never the in-memory ``changed_parts``
+        # values, which would only re-validate the build step's own intent --
+        # same "verify from disk" discipline as the structural-manifest check
+        # above). Multi-part writers like
+        # :func:`_save_docx_with_new_parts_stdlib` build some parts via raw
+        # text splicing (:func:`_insert_before_closing_tag`) rather than an
+        # ElementTree round-trip, so -- unlike a ``word/document.xml``
+        # rewrite that always emits valid XML straight out of
+        # ``ET.tostring`` -- a splice bug CAN produce a byte sequence that is
+        # not well-formed XML. Nothing upstream of this point catches that: a
+        # malformed member does not fail the ZIP-container check the
+        # ``BadZipFile`` branch above performs, and the structural-manifest
+        # counts silently treat an unparsable part as "0 elements" (see
+        # ``_docx_style_count`` / ``_docx_equation_count`` /
+        # ``_docx_relationship_count``) rather than raising -- so without
+        # this check a corrupted-but-still-a-valid-ZIP write would be
+        # promoted and reported as success.
+        if changed_parts:
+            xml_changed_names = [
+                name for name in changed_parts
+                if name.endswith(".xml") or name.endswith(".rels")
+            ]
+            if xml_changed_names:
+                try:
+                    with zipfile.ZipFile(io.BytesIO(staged_bytes)) as staged_zip:
+                        staged_names = set(staged_zip.namelist())
+                        xml_parse_errors: dict[str, str] = {}
+                        for part_name in xml_changed_names:
+                            if part_name not in staged_names:
+                                xml_parse_errors[part_name] = (
+                                    "part missing from staged archive"
+                                )
+                                continue
+                            try:
+                                ET.fromstring(staged_zip.read(part_name))
+                            except ET.ParseError as exc:
+                                xml_parse_errors[part_name] = str(exc)
+                except zipfile.BadZipFile as exc:
+                    # Already reported above when pre_manifest is supplied;
+                    # when it is not, this is the first (and only) chance to
+                    # catch it.
+                    raise DocxWriteVerificationError(
+                        "post-write verification failed: the staged artifact "
+                        f"for {dest} is not a valid .docx after being "
+                        f"flushed to disk: {exc} — discarding it, {dest} is "
+                        "untouched",
+                        manifest={"pre_counts": pre_manifest, "post_counts": post_counts},
+                    ) from exc
+                if xml_parse_errors:
+                    raise DocxWriteVerificationError(
+                        "post-write verification failed: one or more parts "
+                        f"this write changed in {dest} are not well-formed "
+                        "XML after being flushed to disk — discarding the "
+                        "staged artifact instead of promoting a corrupted "
+                        f"write; {dest} is untouched",
+                        manifest={
+                            "pre_counts": pre_manifest,
+                            "post_counts": post_counts,
+                            "xml_parse_errors": xml_parse_errors,
+                        },
+                    )
 
         # --- PROMOTE: the single serialized canonical-merge point ----------
         with _docx_promotion_lock(dest):
@@ -11175,8 +11246,23 @@ def _set_page_header_or_footer(
     kind: str,
     header_footer_type: str,
     index_db_path: str | None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Shared implementation for :func:`set_page_header` / :func:`set_page_footer`."""
+    """Shared implementation for :func:`set_page_header` / :func:`set_page_footer`.
+
+    ddd79188 follow-up -- holds ``docx_path``'s promotion lock across the
+    multi-part write (:func:`_save_docx_with_new_parts_stdlib`) THROUGH a
+    real Word/COM (or LibreOffice) render-capability check
+    (:func:`_enforce_render_verification`), mirroring the same gate
+    :func:`insert_figure_block` / :func:`merge_draft_into_canonical` already
+    enforce: structural ZIP/XML/relationship verification alone can never
+    prove the document actually opens/renders in Word. ``allow_degraded_render``
+    / ``degraded_render_reason`` are the same audited opt-in those functions
+    expose for the "no render backend available in this environment" case --
+    see :func:`_enforce_render_verification` for the full three-state
+    contract.
+    """
     if not text or not str(text).strip():
         return {"error": "text must be a non-empty string"}
     if header_footer_type not in _HDR_FTR_VALID_TYPES:
@@ -11184,6 +11270,16 @@ def _set_page_header_or_footer(
             "error": (
                 f"type must be one of {sorted(_HDR_FTR_VALID_TYPES)}, "
                 f"got {header_footer_type!r}"
+            )
+        }
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
             )
         }
     if not os.path.exists(docx_path):
@@ -11292,10 +11388,24 @@ def _set_page_header_or_footer(
     finally:
         src.close()
 
-    try:
-        _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = _docx_file_sha256(docx_path)
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["kind"] = kind
+            render_error["type"] = header_footer_type
+            render_error["docx_path"] = docx_path
+            return render_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
@@ -11307,6 +11417,7 @@ def _set_page_header_or_footer(
         "relationship_id": rel_id,
         "text": text.strip(),
         "docx_path": docx_path,
+        **render_info,
     }
 
 
@@ -11315,6 +11426,8 @@ def set_page_header(
     text: str,
     header_type: str = "default",
     index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """f1185012 -- Add or replace a page header on ``docx_path``.
 
@@ -11324,6 +11437,16 @@ def set_page_header(
     final ``<w:sectPr>`` -- OR, if a header of this exact ``header_type``
     already exists, overwrites that SAME part's content in place (no new
     part/relationship/override, no sectPr change).
+
+    ddd79188 follow-up -- after the write is staged, verified (ZIP/XML/
+    relationship/media integrity), and promoted, a real Word/COM (or
+    LibreOffice) render-capability check also runs against the just-written
+    file (see :func:`_enforce_render_verification`). ``"rendered"`` continues
+    normally with render evidence attached to the result. ``"failed"``
+    restores the pre-write backup and returns an error. ``"unavailable-with-
+    reason"`` (no render backend in this environment) ALSO fails closed by
+    default -- never reported as verified -- unless ``allow_degraded_render``
+    and a non-empty ``degraded_render_reason`` are both supplied.
 
     Args:
         docx_path:    Absolute path to the .docx file (mutated in place).
@@ -11335,12 +11458,29 @@ def set_page_header(
                       a section's ``<w:titlePg>`` -- not set by this function.
         index_db_path: If supplied, invalidates that sidecar's cached mtime
                       so the next read re-parses the document.
+        allow_degraded_render: Explicit, audited opt-in to accept this write
+                      when no render backend is available in this
+                      environment. Requires ``degraded_render_reason``.
+        degraded_render_reason: Required, non-empty when
+                      ``allow_degraded_render`` is True; carried onto the
+                      result as an audit trail.
 
     Returns:
-        ``{status, kind, type, part_name, relationship_id, text, docx_path}``
-        or ``{"error": <message>}`` on failure (file NOT mutated on error).
+        ``{status, kind, type, part_name, relationship_id, text, docx_path,
+        render_status, render_verified, ...}``
+        or ``{"error": <message>}`` on failure (file NOT left mutated on
+        validation failure; restored from backup on a structural- or
+        render-verification failure).
     """
-    return _set_page_header_or_footer(docx_path, text, "header", header_type, index_db_path)
+    return _set_page_header_or_footer(
+        docx_path,
+        text,
+        "header",
+        header_type,
+        index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
 
 
 def set_page_footer(
@@ -11348,15 +11488,26 @@ def set_page_footer(
     text: str,
     footer_type: str = "default",
     index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """f1185012 -- Add or replace a page footer on ``docx_path``.
 
     Mirrors :func:`set_page_header` exactly (same allocation-vs-overwrite
-    "set" semantics, same part/relationship/content-type plumbing) for
-    ``<w:footerReference>`` / ``word/footer<N>.xml`` instead. See its
-    docstring for the full parameter/return contract.
+    "set" semantics, same part/relationship/content-type plumbing, same
+    fail-closed render-verification gate) for ``<w:footerReference>`` /
+    ``word/footer<N>.xml`` instead. See its docstring for the full
+    parameter/return contract.
     """
-    return _set_page_header_or_footer(docx_path, text, "footer", footer_type, index_db_path)
+    return _set_page_header_or_footer(
+        docx_path,
+        text,
+        "footer",
+        footer_type,
+        index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
 
 # ---------------------------------------------------------------------------
 # 7c5e0e9a — document-wide XML search and native Word-comment write-back.
@@ -11740,6 +11891,8 @@ def highlight_document_matches(
     element_types: list[str] | None = None,
     color: str = "yellow",
     limit: int = 100,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """Apply native w:highlight to matching text runs in a DOCX.
 
@@ -11747,6 +11900,16 @@ def highlight_document_matches(
     Matching runs retain their original content and formatting; a run is
     highlighted when it contains at least one query term. The operation is
     idempotent and returns the matched result records.
+
+    ddd79188 follow-up -- once the highlighted parts are staged, verified
+    (ZIP/XML/relationship/media integrity via
+    :func:`_save_docx_with_new_parts_stdlib`), and promoted, a real Word/COM
+    (or LibreOffice) render-capability check also runs against the
+    just-written file (:func:`_enforce_render_verification`), mirroring the
+    same gate :func:`insert_figure_block` / :func:`merge_draft_into_canonical`
+    already enforce. ``allow_degraded_render`` / ``degraded_render_reason``
+    are the same audited opt-in those functions expose for the "no render
+    backend available in this environment" case.
     """
     if color not in {
         "yellow", "brightGreen", "turquoise", "pink", "blue", "red",
@@ -11756,6 +11919,16 @@ def highlight_document_matches(
         return {"error": f"unsupported highlight color: {color!r}"}
     if not query or not str(query).strip():
         return {"error": "query must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
     try:
         raw, _root = _load_docx_xml_stdlib(docx_path)
     except (OSError, ValueError) as exc:
@@ -11790,13 +11963,33 @@ def highlight_document_matches(
                 break
     if not updated_parts:
         return {"status": "no_matches", "matched_runs": 0, "matches": matches}
-    _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = _docx_file_sha256(docx_path)
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["matches"] = matches
+            render_error["docx_path"] = docx_path
+            return render_error
+
     return {
         "status": "highlighted",
         "matched_runs": matched_runs,
         "match_count": len(matches),
         "matches": matches,
         "color": color,
+        "docx_path": docx_path,
+        **render_info,
     }
 
 
@@ -11827,12 +12020,35 @@ def insert_word_comment(
     anchor_para_id: str,
     author: str = "Meridian",
     initials: str = "M",
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Insert a real Word comment anchored to an existing paragraph."""
+    """Insert a real Word comment anchored to an existing paragraph.
+
+    ddd79188 follow-up -- once the comment parts are staged, verified
+    (ZIP/XML/relationship/media integrity via
+    :func:`_save_docx_with_new_parts_stdlib`), and promoted, a real Word/COM
+    (or LibreOffice) render-capability check also runs against the
+    just-written file (:func:`_enforce_render_verification`), mirroring the
+    same gate :func:`insert_figure_block` / :func:`merge_draft_into_canonical`
+    already enforce. ``allow_degraded_render`` / ``degraded_render_reason``
+    are the same audited opt-in those functions expose for the "no render
+    backend available in this environment" case.
+    """
     if not text or not str(text).strip():
         return {"error": "text must be a non-empty string"}
     if not author or not str(author).strip():
         return {"error": "author must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
     except (OSError, ValueError) as exc:
@@ -11940,7 +12156,25 @@ def insert_word_comment(
             b'<?xml version="1.0" encoding="UTF-8"?>\n'
             + ET.tostring(content_types_root, encoding="utf-8")
         )
-    _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = _docx_file_sha256(docx_path)
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["comment_id"] = comment_id
+            render_error["anchor_para_id"] = anchor_para_id
+            render_error["docx_path"] = docx_path
+            return render_error
+
     return {
         "status": "inserted",
         "mode": "comment",
@@ -11950,6 +12184,7 @@ def insert_word_comment(
         "author": str(author).strip(),
         "initials": str(initials or "").strip()[:9],
         "docx_path": docx_path,
+        **render_info,
     }
 
 def read_document_snapshot(docx_path: str) -> dict[str, Any]:

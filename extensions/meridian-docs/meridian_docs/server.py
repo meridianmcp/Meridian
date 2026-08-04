@@ -157,10 +157,31 @@ def highlight_document(
     element_types: list[str] | None = None,
     color: str = "yellow",
     limit: int = 100,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply native Word highlighting to structural XML search matches.
 
+    ddd79188 follow-up -- once the highlighted parts are staged, verified
+    (ZIP/XML/relationship/media integrity), and promoted, a real Word/COM
+    (or LibreOffice) render-capability check also runs against the
+    just-written file, mirroring insert_figure_block / merge_docx_draft.
+    "rendered" continues normally with render evidence attached to the
+    result. "failed" (a render backend was available but errored on this
+    document) restores the pre-write backup and returns an error, same as a
+    structural verification failure. "unavailable-with-reason" (no render
+    backend in this environment) ALSO fails closed by default -- never
+    reported as verified -- unless allow_degraded_render=True is passed
+    together with a non-empty degraded_render_reason, an audited opt-in that
+    keeps the write but stamps render_verified=False / render_degraded=True
+    on the result instead of silently treating "could not check" as
+    "passed".
+
+    allow_degraded_render: see insert_figure_block's docstring for the full
+      contract. Requires degraded_render_reason.
+    degraded_render_reason: required, non-empty when allow_degraded_render is
+      True; carried onto the result as an audit trail.
     session_id: 273df573 — identifies the calling Meridian session to the
       tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
       meridian/routes/tunnel.py). Not forwarded to docs_intel; has no effect
@@ -173,6 +194,8 @@ def highlight_document(
         element_types=element_types,
         color=color,
         limit=limit,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 @mcp.tool()
