@@ -1495,7 +1495,9 @@ def get_section_content(docx_path: str, heading_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
+def find_references_to(
+    docx_path: str, target_id: str, include_literal: bool = True
+) -> dict[str, Any]:
     """fea654f9 — Find everything that points AT a figure/table/heading id.
 
     The missing inverse of insert_cross_reference: given a target (a
@@ -1504,15 +1506,29 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
     NOTEREF fields whose instruction targets that same bookmark. Needed for
     safe renumbering/moving without breaking references elsewhere.
 
+    b2035fb4 — when the target resolves to a Figure/Table caption and
+    include_literal is True (default), also scans plain-text paragraphs
+    (never fielded ones) for literal mentions such as "Figure 5.21" or
+    "Table 11" that no REF field backs, classifying each as exact/ambiguous/
+    stale against the caption's CURRENT cached number. Review the combined
+    field + literal closure before calling renumber_sequences so a stale
+    literal mention can be triaged while the pre-renumber numbers are still
+    visible in the report.
+
     Args:
       docx_path: Absolute path to the .docx file.
       target_id: A caption/heading para_id, or an existing bookmark name.
+      include_literal: Also run the literal-text scan described above
+        (default True). Pass False to reproduce the field-only behavior.
 
     Returns:
       {target_id, target_kind, bookmark_names, references, reference_count,
-      docx_path} or {error: <message>}.
+      literal_references, literal_reference_count, combined_references,
+      combined_reference_count, docx_path} or {error: <message>}.
     """
-    return docs_intel.find_references_to(docx_path=docx_path, target_id=target_id)
+    return docs_intel.find_references_to(
+        docx_path=docx_path, target_id=target_id, include_literal=include_literal
+    )
 
 
 @mcp.tool()

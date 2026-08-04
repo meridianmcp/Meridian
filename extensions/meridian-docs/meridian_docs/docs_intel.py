@@ -8897,10 +8897,91 @@ def get_section_content(docx_path: str, heading_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# b2035fb4 -- literal-text reference profiles for find_references_to.
+#
+# The field-based scan below only ever sees REF/PAGEREF/NOTEREF fields --
+# nothing in OOXML distinguishes an intentional literal mention ("as shown in
+# Figure 5.21") from any other prose, so a caption referenced only by typed-in
+# text is invisible to it. Each "profile" is just the alias words + number
+# shape for one caption kind (deliberately named like
+# :func:`resolve_style_policy`'s vocabulary even though this scan is
+# read-only and has no policy to persist).  Figure/Table are the only kinds
+# find_references_to can currently resolve a "current number" for (via
+# :func:`_caption_kind_and_seq`, which reads SEQ Figure / SEQ Table fields);
+# Equation is included in the profile table for symmetry with any future
+# SEQ-Equation-backed caption support, but is inert until a target actually
+# resolves to that kind.
+# ---------------------------------------------------------------------------
+_LITERAL_REF_ALIASES: dict[str, tuple[str, ...]] = {
+    "Figure": ("Figure", r"Fig\."),
+    "Table": ("Table", r"Tab\."),
+    "Equation": ("Equation", r"Eq\."),
+}
+_LITERAL_REF_NUMBER = r"(\d+(?:\.\d+)*)"
+_FIELD_DRIVEN_TYPES = frozenset({"REF", "PAGEREF", "NOTEREF", "SEQ"})
+
+
+def _literal_reference_pattern(kind: str) -> re.Pattern[str] | None:
+    """Compile the literal-text reference regex for ``kind`` (``None`` if
+    ``kind`` has no registered profile)."""
+    aliases = _LITERAL_REF_ALIASES.get(kind)
+    if not aliases:
+        return None
+    alt = "|".join(aliases)
+    return re.compile(rf"\b(?:{alt})\s+{_LITERAL_REF_NUMBER}", re.IGNORECASE)
+
+
+_LITERAL_REF_PATTERNS: dict[str, re.Pattern[str]] = {
+    kind: _literal_reference_pattern(kind) for kind in _LITERAL_REF_ALIASES
+}
+
+
+def _block_has_field_driven_text(block: dict[str, Any]) -> bool:
+    """True when ``block`` contains a REF/PAGEREF/NOTEREF/SEQ field.
+
+    Such a block's ``text`` is (at least partly) a field's CACHED rendering
+    (e.g. a REF field's cached display text is literally ``"Figure 1"``, and
+    a caption paragraph's own text embeds its SEQ number) rather than
+    typed-in prose -- scanning it for literal references would either
+    double-count a reference the field-based scan already found, or flag a
+    caption's own number against itself. Literal scanning skips these blocks
+    entirely so ``literal_references`` only ever reports genuine plain text.
+    """
+    return any(
+        fld.get("field_type") in _FIELD_DRIVEN_TYPES for fld in block.get("fields", [])
+    )
+
+
+def _current_kind_number_counts(blocks: list[dict[str, Any]], kind: str) -> dict[str, int]:
+    """Count how many live captions of ``kind`` (``"Figure"``/``"Table"``)
+    currently cache each SEQ number, across ``blocks`` from
+    :func:`document_content_tree`.
+
+    Mirrors :func:`renumber_sequences`'s own collision bookkeeping so a
+    literal match against a number two DIFFERENT captions currently share is
+    reported ``"ambiguous"`` rather than a false-confident ``"exact"``.
+    """
+    is_caption = _is_figure_caption if kind == "Figure" else _is_table_caption
+    seq_re = _SEQ_FIGURE_RE if kind == "Figure" else _SEQ_TABLE_RE
+    counts: dict[str, int] = {}
+    for block in blocks:
+        if not is_caption(block):
+            continue
+        num = _seq_cached_number(block, seq_re)
+        if num:
+            counts[num] = counts.get(num, 0) + 1
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # Public API 2/9: find_references_to (fea654f9)
 # ---------------------------------------------------------------------------
 
-def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
+def find_references_to(
+    docx_path: str,
+    target_id: str,
+    include_literal: bool = True,
+) -> dict[str, Any]:
     """fea654f9 -- find everything that points AT a figure/table/heading id.
 
     The missing inverse of :func:`insert_cross_reference`: given a target
@@ -8921,6 +9002,32 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
         (covers manually-bookmarked headings; there is no automatic
         heading-bookmark mechanism elsewhere in this module).
 
+    b2035fb4 -- when the target resolves to a Figure/Table caption (so its
+    CURRENT cached SEQ number is known) and ``include_literal`` is True
+    (the default), a second, independent scan runs over every plain-text
+    paragraph/table cell -- excluding any block that itself carries a
+    REF/PAGEREF/NOTEREF/SEQ field, see :func:`_block_has_field_driven_text`
+    -- for literal mentions like ``"Figure 5.21"`` or ``"Table 11"`` using
+    the alias/number profile in ``_LITERAL_REF_ALIASES``. Each hit is
+    classified:
+      - ``"exact"``: the matched number equals the target's current cached
+        number, and no OTHER live caption of the same kind currently shares
+        that number.
+      - ``"ambiguous"``: the matched number equals the target's current
+        cached number, but at least one other live caption of the same kind
+        ALSO currently caches that number (a numbering collision), so the
+        literal text cannot be confidently attributed to this target alone.
+      - ``"stale"``: the matched number does not equal the target's current
+        cached number -- almost always a manually-typed reference that
+        predates a renumbering and was never updated by hand (this is the
+        motivating gap: :func:`renumber_sequences` fixes REF field caches
+        automatically, but has no way to find or fix literal prose).
+    These never mutate the document and never suppress the field-based
+    ``references`` list -- ``combined_references`` is the closure of both,
+    meant to be reviewed BEFORE calling :func:`renumber_sequences` so any
+    ``"stale"``/``"ambiguous"`` literal mention can be triaged by a human
+    while the pre-renumber numbers are still visible in the report.
+
     This is read-only -- it never mutates ``docx_path`` and never retrofits a
     missing bookmark (unlike :func:`insert_cross_reference`, which creates
     one when the target caption predates cross-reference support).
@@ -8928,12 +9035,20 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
     Args:
         docx_path: Absolute path to the .docx file.
         target_id: A caption/heading para_id, or an existing bookmark name.
+        include_literal: When True (default), also run the literal-text scan
+            described above. Set False to reproduce the pre-b2035fb4,
+            field-only behavior exactly.
 
     Returns:
         ``{target_id, target_kind, bookmark_names, references,
-        reference_count, docx_path}`` where each entry in ``references`` is
-        ``{para_id, index, field_type, bookmark_name, display_text,
-        paragraph_text}``.
+        reference_count, literal_references, literal_reference_count,
+        combined_references, combined_reference_count, docx_path}``.
+        Each entry in ``references`` is ``{para_id, index, field_type,
+        bookmark_name, display_text, paragraph_text, match_kind="field"}``.
+        Each entry in ``literal_references`` is ``{para_id, index,
+        match_kind="literal", field_type=None, matched_text, matched_number,
+        status, paragraph_text}``. ``combined_references`` is simply
+        ``references + literal_references``.
 
         ``{"error": <message>}`` when ``docx_path`` cannot be read, or
         ``target_id`` cannot be resolved to anything in the document.
@@ -8951,6 +9066,8 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
 
     bookmark_names: list[str] = []
     target_kind = "bookmark"
+    kind_seq: tuple[str, str] | None = None
+    own_body_idx: int | None = None
 
     if _REF_BOOKMARK_RE.match(target_id) or target_id.startswith(_BIBKEY_BOOKMARK_PREFIX) \
             or _INTERNAL_NOTE_BOOKMARK_RE.match(target_id):
@@ -8960,11 +9077,21 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
         if not found_directly:
             return {"error": f"bookmark {target_id!r} not found in {docx_path}"}
         bookmark_names.append(target_id)
+
+        if _REF_BOOKMARK_RE.match(target_id):
+            caption_hit = _find_caption_by_ref_bookmark(root, target_id)
+            if caption_hit is not None:
+                caption_elem, kind_seq = caption_hit
+                target_kind = kind_seq[0]
+                body_children = list(body)
+                if caption_elem in body_children:
+                    own_body_idx = body_children.index(caption_elem)
     else:
         result = _find_para_by_id(root, target_id)
         if result is None:
             return {"error": f"para_id {target_id!r} not found in {docx_path}"}
         _body, target_elem, _idx = result
+        own_body_idx = _idx
 
         kind_seq = _caption_kind_and_seq(target_elem)
         if kind_seq is not None:
@@ -8985,6 +9112,10 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
             "bookmark_names": [],
             "references": [],
             "reference_count": 0,
+            "literal_references": [],
+            "literal_reference_count": 0,
+            "combined_references": [],
+            "combined_reference_count": 0,
             "note": (
                 "target paragraph carries no bookmark, so no REF/PAGEREF field "
                 "could possibly point at it yet -- nothing to find. If this is "
@@ -9016,7 +9147,45 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
                     "bookmark_name": bm_target,
                     "display_text": fld.get("cached_result"),
                     "paragraph_text": block.get("text", ""),
+                    "match_kind": "field",
                 })
+
+    own_para_id = (
+        blocks[own_body_idx].get("para_id")
+        if own_body_idx is not None and 0 <= own_body_idx < len(blocks)
+        else None
+    )
+
+    literal_references: list[dict[str, Any]] = []
+    if include_literal and kind_seq is not None:
+        literal_kind, current_number = kind_seq
+        pattern = _LITERAL_REF_PATTERNS.get(literal_kind)
+        if pattern is not None:
+            number_counts = _current_kind_number_counts(blocks, literal_kind)
+            for block in blocks:
+                if own_para_id is not None and block.get("para_id") == own_para_id:
+                    continue
+                if _block_has_field_driven_text(block):
+                    continue
+                text = block.get("text") or ""
+                for m in pattern.finditer(text):
+                    matched_number = m.group(1)
+                    if matched_number == current_number:
+                        status = (
+                            "ambiguous" if number_counts.get(matched_number, 0) > 1 else "exact"
+                        )
+                    else:
+                        status = "stale"
+                    literal_references.append({
+                        "para_id": block.get("para_id"),
+                        "index": block.get("index"),
+                        "match_kind": "literal",
+                        "field_type": None,
+                        "matched_text": m.group(0),
+                        "matched_number": matched_number,
+                        "status": status,
+                        "paragraph_text": text,
+                    })
 
     return {
         "target_id": target_id,
@@ -9024,6 +9193,10 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
         "bookmark_names": bookmark_names,
         "references": references,
         "reference_count": len(references),
+        "literal_references": literal_references,
+        "literal_reference_count": len(literal_references),
+        "combined_references": references + literal_references,
+        "combined_reference_count": len(references) + len(literal_references),
         "docx_path": docx_path,
     }
 
