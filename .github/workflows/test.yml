@@ -166,6 +166,42 @@ jobs:
         run: pixi run python -m playwright install chromium --with-deps
       - run: pixi run python -m pytest tests/test_demo_ux.py -n 3 -q --tb=short
 
+  meridian-docs:
+    # 9a817fce (W2-D) -- extensions/meridian-docs is a separate, stdlib-only
+    # distribution that is NOT wired into pixi.toml's pypi-dependencies (see
+    # tests/test_meridian_docs_equations.py's own sys.path-insertion workaround,
+    # which exists precisely because the extension lives outside the main
+    # dependency graph), so its full test suite -- including the real Word/COM
+    # DOCX regression coverage this item adds in
+    # extensions/meridian-docs/tests/test_docx_word_com_regression.py -- never
+    # ran in CI at all before this job existed. LibreOffice gives ubuntu-latest
+    # a REAL, cross-platform render backend
+    # (render_gate.check_render_capability's default backend chain already
+    # tries "soffice"/"libreoffice" before the Windows-only Word COM backend),
+    # so the regression suite's "rendered" branch gets genuine backend-verified
+    # evidence here, not just its structural-validation fallback. Word COM
+    # itself (render_gate._word_com_unavailable_reason) is Windows-only and is
+    # only ever exercised on a Windows box with Word actually installed; the
+    # regression tests fall back to independent structural validation whenever
+    # NO render backend is available at all (e.g. if this job's LibreOffice
+    # install step ever regresses) -- that fallback path is real, asserted
+    # coverage, never a silent skip, so this job stays a meaningful blocking
+    # gate either way.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install LibreOffice Writer (real cross-platform render backend)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libreoffice-writer
+      - name: Install meridian-docs (editable) + test deps
+        run: |
+          pip install -e extensions/meridian-docs
+          pip install pytest pytest-timeout
+      - run: python -m pytest extensions/meridian-docs/tests -q --tb=short --timeout=60
+
   lint:
     runs-on: ubuntu-latest
     steps:

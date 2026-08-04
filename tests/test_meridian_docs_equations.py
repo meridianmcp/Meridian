@@ -29,6 +29,14 @@ if _EXT_PATH not in sys.path:
 
 from meridian_docs import docs_intel  # noqa: E402
 
+# Captured at import time, before the autouse fixture below ever monkeypatches
+# docs_intel.render_gate.check_render_capability -- the one test in this file
+# that needs the GENUINE implementation (see
+# test_insert_equation_local_real_render_gate_or_structural_fallback) cannot
+# recover it from docs_intel.render_gate afterwards, since monkeypatch.setattr
+# mutates that shared module object's namespace directly.
+_REAL_CHECK_RENDER_CAPABILITY = docs_intel.render_gate.check_render_capability
+
 
 @pytest.fixture(autouse=True)
 def _default_render_capability(monkeypatch):
@@ -990,3 +998,75 @@ def test_audit_equation_style_smoke_on_table_numbered_fixture(tmp_path):
 def test_audit_equation_style_unknown_file_returns_error():
     result = docs_intel.audit_equation_style("/no/such/file.docx")
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# Real render-gate CI evidence for insert_equation_local (W2-D, 9a817fce).
+#
+# Every test above this point runs under this module's autouse
+# ``_default_render_capability`` fixture, which stubs check_render_capability
+# so structural correctness can be tested independently of whatever render
+# backends happen to be installed. That is deliberate for THIS module (per
+# its own docstring), but it also means none of it is real evidence that the
+# actual _word_com_render / _soffice_render backends behave correctly --
+# extensions/meridian-docs/tests/test_docx_word_com_regression.py owns that
+# in depth, but that suite lived entirely outside CI until this item wired
+# it into a new .github/workflows/test.yml job (extensions/meridian-docs is
+# not a pixi.toml dependency, so it never ran in `pixi run test` before).
+#
+# This one test un-stubs the autouse fixture and drives the REAL
+# render_gate.check_render_capability end to end, right inside the SAME
+# `tests/` suite pixi.toml/test-core has always run -- so this file alone
+# (regardless of whether the new extensions/meridian-docs CI job is ever
+# skipped or misconfigured) is independent, always-on CI evidence that
+# insert_equation_local's render-gate integration still works for real: it
+# is not skipped when no backend is installed (this test-core runner has
+# neither LibreOffice nor Word/COM by default) -- it falls back to the same
+# "structural validation" the item title calls for, verified independently
+# here rather than trusting docs_intel's own internal verification helpers.
+# ---------------------------------------------------------------------------
+
+
+def test_insert_equation_local_real_render_gate_or_structural_fallback(tmp_path, monkeypatch):
+    # Undo this module's autouse stub for this one test only -- restores the
+    # genuine render_gate.check_render_capability implementation captured at
+    # import time (see _REAL_CHECK_RENDER_CAPABILITY above).
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability", _REAL_CHECK_RENDER_CAPABILITY,
+    )
+
+    path = _write_docx(tmp_path, _WRITE_XML)
+    before = _read_docx_xml(path)
+    status = docs_intel.render_gate.check_render_capability(path)["status"]
+
+    if status == docs_intel.render_gate.RENDERED:
+        result = docs_intel.insert_equation_local(path, "0000C003", _SIMPLE_OMATH, "append")
+        assert result["status"] == "inserted"
+        assert result["render_status"] == docs_intel.render_gate.RENDERED
+        assert result["render_verified"] is True
+    elif status == docs_intel.render_gate.UNAVAILABLE_WITH_REASON:
+        result = docs_intel.insert_equation_local(
+            path, "0000C003", _SIMPLE_OMATH, "append",
+            allow_degraded_render=True,
+            degraded_render_reason="no render backend available in this CI/dev environment",
+        )
+        assert result["status"] == "inserted"
+        assert result["render_status"] == docs_intel.render_gate.UNAVAILABLE_WITH_REASON
+        assert result["render_verified"] is False
+        assert result["render_degraded"] is True
+        # Structural validation fallback: an independent re-parse (not the
+        # writer's own internal verification helper) confirms the equation
+        # genuinely landed in a well-formed document. _WRITE_XML starts with
+        # exactly one oMath (paragraph 0000C002); this appends a second into
+        # 0000C003.
+        assert _count_omath(path) == 2
+        with open(path, "rb") as handle:
+            paragraphs = docs_intel.parse_docx(handle.read())
+        assert paragraphs
+    else:
+        assert status == docs_intel.render_gate.FAILED
+        result = docs_intel.insert_equation_local(path, "0000C003", _SIMPLE_OMATH, "append")
+        assert "error" in result
+        assert result["render_status"] == docs_intel.render_gate.FAILED
+        assert result["file_restored"] is True
+        assert _read_docx_xml(path) == before
