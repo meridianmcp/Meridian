@@ -171,6 +171,21 @@ async def generate_handoff_endpoint(
                 "message": str(exc),
             },
         ) from exc
+    except handoff_module.HandoffStaleReferenceError as exc:
+        # ee8a6af1 — unconditional fail-closed: a depends_on edge on the live
+        # board points at an id that doesn't resolve for this project/version
+        # scope. Mirrors the MCP HTTP dispatch's structured refusal instead
+        # of a generic 500.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "STALE_REFERENCE",
+                "project_id": exc.project_id,
+                "version": exc.version,
+                "stale_references": exc.stale_references,
+                "message": str(exc),
+            },
+        ) from exc
     # 98aaccf4 — machine-readable effective capability contract; best-effort,
     # never breaks the mandatory handoff.
     capability_contract = await handoff_module.build_effective_capability_contract(

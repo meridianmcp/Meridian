@@ -6559,6 +6559,52 @@ class HandoffContinuationRequired(ValueError):
         )
 
 
+class HandoffStaleReferenceError(ValueError):
+    """Raised by generate_handoff BEFORE any mode (starter/compact, goal,
+    full, delta) renders, persists, or mints a goal_token, when the live
+    board contains a ``depends_on`` edge pointing at a sprint-item id that
+    does not resolve for this project+version scope — it never existed,
+    belongs to a different project, or was folded away by
+    ``merge_sprint_items`` (see ``board_snapshot.find_stale_reference_ids``).
+
+    Unlike :class:`HandoffEvidenceRequired` (opt-in via ``strict_evidence``),
+    this check is UNCONDITIONAL — it runs for every call, every mode, with no
+    flag to disable it — because a stale reference in a token-bound handoff
+    body is not a degraded-but-usable output the way a missing code pointer
+    is; it is a body a caller cannot trust and a token binds that body
+    permanently once minted. This is the ee8a6af1 fix for the 2026-08-04
+    incident: a canonical goal handoff serialized dependency references
+    (``addc47eb-0da9-407f-95cc-79fe8b0fda03``,
+    ``d092d2a4-7d3e-40c4-a463-33ceed570b44``) absent from the live v0.2.6
+    board. Nothing is rendered, written to disk, or persisted for a call that
+    raises this — fail closed, same contract as ``HandoffEvidenceRequired``.
+
+    ``stale_references`` is the machine-readable list from
+    :func:`board_snapshot.find_stale_reference_ids` — each entry has
+    ``item_id`` (the item whose ``depends_on`` is broken), ``depends_on``
+    (the unresolved target id), ``reason`` (``"missing"`` or
+    ``"merged_away"``), and — for ``"merged_away"`` — ``merged_into`` (the
+    live survivor id).
+    """
+
+    def __init__(
+        self,
+        project_id: str,
+        version: str | None,
+        stale_references: list[dict[str, Any]],
+    ):
+        self.project_id = project_id
+        self.version = version
+        self.stale_references = stale_references
+        self.code = "STALE_REFERENCE"
+        ids = ", ".join(sorted({s["depends_on"] for s in stale_references}))
+        super().__init__(
+            f"generate_handoff refused for project {project_id!r} "
+            f"(version={version!r}): {len(stale_references)} stale "
+            f"dependency reference(s) not present on the live board: {ids}"
+        )
+
+
 def _finalize_capability_status(
     capability_status: dict[str, Any],
     evidence_status: "dict[str, Any] | None",
@@ -6949,6 +6995,19 @@ async def generate_handoff(
     _effective_version = version
     if _effective_version is None:
         _effective_version = await _resolve_session_sprint_version(db, session_id)
+    # ee8a6af1 — fail closed on stale sprint/dependency references BEFORE any
+    # remaining mode (starter/compact, goal, full, delta) renders, persists,
+    # or mints a token-bound body. Validated against ONE fresh
+    # project+version board snapshot (board_snapshot.get_project_item_index),
+    # covering every status including 'done' — a completed dependency is
+    # resolved, not stale. See HandoffStaleReferenceError above for the
+    # incident this closes.
+    _stale_item_index = await db_module.get_project_item_index(
+        db, project_id, version=_effective_version
+    )
+    _stale_references = db_module.find_stale_reference_ids(_stale_item_index)
+    if _stale_references:
+        raise HandoffStaleReferenceError(project_id, _effective_version, _stale_references)
     # 2204ce80 — optional, additive "related planning records" lookup. Runs
     # only when the caller opted in on BOTH arguments; see the docstring above.
     if related_records_query is not None and related_records is not None:

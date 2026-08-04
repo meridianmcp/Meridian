@@ -2340,6 +2340,7 @@ def build_mcp_server():
                 _stdio_continuation_status: dict[str, Any] = {}
                 _handoff_evidence_blocked = False
                 _handoff_continuation_blocked = False
+                _handoff_stale_reference_blocked = False
                 try:
                     path, content, _ = await asyncio.wait_for(
                         handoff_module.generate_handoff(
@@ -2386,7 +2387,23 @@ def build_mcp_server():
                         "message": str(exc),
                     }
                     _handoff_continuation_blocked = True
-                if not _handoff_evidence_blocked and not _handoff_continuation_blocked:
+                except handoff_module.HandoffStaleReferenceError as exc:
+                    # ee8a6af1 — mirror handler.py's structured refusal: nothing
+                    # was rendered/persisted, so surface that instead of falling
+                    # through to the generic error string.
+                    result = {
+                        "error": "STALE_REFERENCE",
+                        "project_id": exc.project_id,
+                        "version": exc.version,
+                        "stale_references": exc.stale_references,
+                        "message": str(exc),
+                    }
+                    _handoff_stale_reference_blocked = True
+                if (
+                    not _handoff_evidence_blocked
+                    and not _handoff_continuation_blocked
+                    and not _handoff_stale_reference_blocked
+                ):
                     # a5e8aa74 — return content EXACTLY as generate_handoff rendered
                     # it, via the shared helper meridian/mcp/handler.py and
                     # meridian/routes/handoff.py also use, so all transports emit a

@@ -11212,7 +11212,9 @@ from .board_snapshot import (  # noqa: F401
     build_board_snapshot,
     diff_board_snapshots,
     compute_scope_diff,
+    find_stale_reference_ids,
     get_latest_board_snapshot_revision,
+    get_project_item_index,
     record_board_snapshot_revision,
 )
 

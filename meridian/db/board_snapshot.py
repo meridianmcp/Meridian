@@ -5,12 +5,13 @@ handoff view lag the live board — a session pasted an old sprint-item list,
 another session had already changed statuses, and there was no way to tell
 "is this handoff manifest current" from "is it stale" without ambiguity.
 
-This module gives callers three primitives -- originally consumed only by
+This module gives callers five primitives -- originally consumed only by
 ``start_wave_run``/``resume_wave`` (2a654cb0/efaa918a); ``generate_handoff``
 (mode='delta') and its ``build_continuation_manifest`` helper (836ca1d5) are
-now a second consumer, reusing the SAME revision ledger (one canonical
-staleness timeline per ``(project_id, version)`` bucket, regardless of which
-feature is asking) rather than standing up a parallel one:
+a second consumer, reusing the SAME revision ledger (one canonical staleness
+timeline per ``(project_id, version)`` bucket, regardless of which feature is
+asking) rather than standing up a parallel one; ``generate_handoff``'s own
+stale-reference fail-closed gate (ee8a6af1) is a third:
 
   1. :func:`build_board_snapshot` — a canonical, byte-stable, expanded snapshot
      of the NON-DONE sprint board (every item whose ``status`` is not
@@ -31,6 +32,18 @@ feature is asking) rather than standing up a parallel one:
      ``pointers``). This is the "resume delta" a paused/resumed session (or a
      future ``resume_wave`` tool) needs to reconcile a stale manifest against
      the live board.
+  4. :func:`get_project_item_index` — a flat, ALL-statuses (including
+     ``'done'``) existence index of every sprint item for a project (optionally
+     narrowed to one ``version`` bucket). Unlike :func:`build_board_snapshot`
+     this is deliberately NOT non-done-filtered: it exists so a caller can
+     answer "does id X currently exist for this project/version" for ANY
+     status, not just the resumable subset.
+  5. :func:`find_stale_reference_ids` — pure-Python classification of every
+     ``depends_on`` edge in a :func:`get_project_item_index` result as live or
+     stale (see its own docstring). This is the primitive ``generate_handoff``
+     (ee8a6af1) uses to fail closed BEFORE rendering or token-binding any
+     handoff body that would otherwise serialize a dependency id absent from
+     the live board — the 2026-08-04 incident this sprint item fixed.
 
 Design decisions (documented per the sprint-item spec):
 
@@ -419,3 +432,99 @@ async def record_board_snapshot_revision(
         "revision_hash": revision_hash,
         "is_new": True,
     }
+
+
+async def get_project_item_index(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    version: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Flat existence + dependency-edge index of every sprint item for ``project_id``.
+
+    Returns ``{item_id: {"status": str, "depends_on": str | None,
+    "merged_into": str | None}}`` for EVERY row belonging to ``project_id``
+    (optionally narrowed to a single ``version`` bucket), across ALL
+    statuses — deliberately including ``'done'``, unlike
+    :func:`build_board_snapshot`.
+
+    This is the "does id X currently exist for this project/version" primitive:
+    a single cheap query gives a caller both a live-id existence check and
+    every item's own ``depends_on`` edge, without a second table scan. See
+    :func:`find_stale_reference_ids`, the pure-Python consumer of this index.
+
+    Scoping to ``version`` (when given) means an id belonging to this SAME
+    project but a DIFFERENT version bucket will NOT appear in the index — by
+    design: ``generate_handoff`` validates a version-scoped board against its
+    own version's live snapshot (ee8a6af1), so a genuinely cross-version
+    ``depends_on`` edge is treated the same as a missing one (fail closed
+    rather than silently trusting an edge outside the scoped board).
+    """
+    clauses = ["project_id = ?"]
+    params: list[Any] = [project_id]
+    if version is not None:
+        clauses.append("version = ?")
+        params.append(version)
+    query = (
+        "SELECT id, status, depends_on, merged_into FROM sprint_items "
+        f"WHERE {' AND '.join(clauses)}"
+    )
+    async with db.execute(query, tuple(params)) as cur:
+        rows = await cur.fetchall()
+    index: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        d = _row_to_dict(row)
+        item_id = d.get("id")
+        if not item_id:
+            continue
+        index[item_id] = {
+            "status": d.get("status"),
+            "depends_on": d.get("depends_on"),
+            "merged_into": d.get("merged_into"),
+        }
+    return index
+
+
+def find_stale_reference_ids(item_index: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Classify every non-null ``depends_on`` edge in ``item_index`` as live or stale.
+
+    ``item_index`` is a :func:`get_project_item_index` result (or an
+    equivalent hand-built dict in tests). For every item that declares a
+    ``depends_on`` target, the target id is:
+
+    * **live** (not reported) when it has an entry in ``item_index`` whose
+      ``merged_into`` is unset — this covers EVERY status including
+      ``'done'``: a dependency that already completed is a resolved
+      reference, not a stale one.
+    * **stale, reason "missing"** when it has no entry in ``item_index`` at
+      all — it never existed for this project/version scope, was deleted, or
+      belongs to a different project entirely (``item_index`` is always
+      scoped to one project, so a foreign-project id is indistinguishable
+      from — and correctly treated the same as — a nonexistent one).
+    * **stale, reason "merged_away"** when it DOES have an entry, but that
+      entry's ``merged_into`` is set — :func:`meridian.db.sprint_items.
+      merge_sprint_items` folded it into a survivor. The row still exists
+      for audit purposes, but the id is no longer an independently
+      referenceable board entry; the live identity is ``merged_into``.
+
+    Returns a list of ``{"item_id": ..., "depends_on": ..., "reason": ...}``
+    (plus ``"merged_into"`` for the merged_away reason), sorted by
+    ``(item_id, depends_on)`` for deterministic error messages. Empty list
+    means every dependency edge in ``item_index`` resolves.
+    """
+    stale: list[dict[str, Any]] = []
+    for item_id, entry in item_index.items():
+        target = entry.get("depends_on")
+        if not target:
+            continue
+        target_entry = item_index.get(target)
+        if target_entry is None:
+            stale.append({"item_id": item_id, "depends_on": target, "reason": "missing"})
+        elif target_entry.get("merged_into"):
+            stale.append({
+                "item_id": item_id,
+                "depends_on": target,
+                "reason": "merged_away",
+                "merged_into": target_entry["merged_into"],
+            })
+    return sorted(stale, key=lambda s: (s["item_id"], s["depends_on"]))

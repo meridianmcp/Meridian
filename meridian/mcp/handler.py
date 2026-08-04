@@ -2951,6 +2951,28 @@ async def _handle_task_tools(
                 "continuation_status": exc.continuation_state,
                 "message": str(exc),
             }
+        except handoff_module_local.HandoffStaleReferenceError as exc:
+            # ee8a6af1 — unconditional (not opt-in) fail-closed: a depends_on
+            # edge on the live board points at an id that doesn't resolve for
+            # this project+version scope. Nothing was rendered/written/
+            # persisted for this call — surface a structured refusal so a
+            # caller can reconcile the dangling reference (e.g. via
+            # update_sprint_item / merge_sprint_items) instead of silently
+            # getting a handoff body with an unresolved dependency id.
+            return {
+                "error": "STALE_REFERENCE",
+                "project_id": exc.project_id,
+                "version": exc.version,
+                "stale_references": exc.stale_references,
+                "message": (
+                    "Refusing to generate handoff: "
+                    f"{len(exc.stale_references)} depends_on reference(s) on "
+                    "the live board do not resolve for this project/version "
+                    "scope. This handoff was NOT rendered or persisted. "
+                    "Resolve each stale depends_on (retarget or clear it via "
+                    "update_sprint_item) and retry."
+                ),
+            }
         except asyncio.TimeoutError:
             path, content = await handoff_module_local._generate_handoff_l0(
                 db, args["project_id"], data_dir
