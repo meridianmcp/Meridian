@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -2078,6 +2079,281 @@ def _current_tunnel_config(tenant: dict, hostname: str | None) -> Any:
         tenant.get("tunnel_plugins_by_host"),
         hostname,
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /tunnel/diagnostics/{tenant_id} — layered read-only diagnostics (f1e0df55)
+#
+# ONE aggregated, read-only snapshot across every source of truth this module
+# already tracks SEPARATELY (dashboard-persisted config, live per-slot socket
+# state, client-reported per-slot health/lifecycle, the server-side tool
+# routing cache, and the tools/list discovery-changed marker) so a caller
+# never has to reconcile them by hand and — the specific failure mode this
+# item calls out — never mistakes "saved in the dashboard" for "actually
+# running". Multi-tenant safe: scoped to one resolved tenant and redacted
+# before it leaves the process.
+# ---------------------------------------------------------------------------
+
+# ``_slot_status_detail[...]["state"]`` values (mirrors tunnel_client.SlotState,
+# see ddd46cc8) that mean "serving, but something is currently wrong" as
+# opposed to "not serving at all" or "deliberately paused".
+_DIAG_DEGRADED_STATES = frozenset({
+    "degraded", "transport_closed", "tools_list_timeout",
+    "startup_timeout", "child_crashed", "dependency_missing",
+})
+# States that mean the client intentionally tore the slot down. Reported as
+# "restart_required" (not "degraded") ONLY when the dashboard still has the
+# slot enabled — i.e. persisted config and last-known runtime state disagree.
+_DIAG_RESTART_STATES = frozenset({"idle_killed", "stopped"})
+
+# Field-name substrings that mark a value as credential-shaped and therefore
+# always redacted, regardless of what state/slot it appears under.
+_DIAG_REDACT_KEY_HINTS = (
+    "token", "secret", "key", "password", "credential", "authorization", "bearer",
+)
+# Catches an inline secret embedded in a free-text value (e.g. a custom
+# plugin's command-line args) even when the surrounding field's *name* gives
+# no hint — "--api-key=sk_live_xxx" is redacted whether or not the key is
+# literally called "env".
+_DIAG_INLINE_SECRET_RE = re.compile(
+    r"(?i)\b(token|secret|api[_-]?key|password|credential|bearer)\b\s*[:=]\s*\S+"
+)
+
+
+def _diag_redact(value: Any, field_name: str = "") -> Any:
+    """Recursively strip anything credential-shaped before it leaves the process.
+
+    Applied to every per-slot record the diagnostics view assembles. A dict
+    value is redacted per-key (by that key's own name); a string value is
+    redacted wholesale when its OWN field name looks like a credential, and
+    otherwise scrubbed for an inline ``key=value``-shaped secret so a custom
+    plugin's raw command string can't leak one either."""
+    if isinstance(value, dict):
+        return {k: _diag_redact(v, k) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_diag_redact(v, field_name) for v in value]
+    if isinstance(value, str):
+        if any(hint in field_name.lower() for hint in _DIAG_REDACT_KEY_HINTS):
+            return "[redacted]"
+        return _DIAG_INLINE_SECRET_RE.sub(lambda m: f"{m.group(1)}=[redacted]", value)
+    return value
+
+
+def _diag_slot_label(
+    *, dashboard_enabled: bool, process_active: bool,
+    healthy_flag: bool, detail: "dict | None",
+) -> str:
+    """Classify one connector slot into exactly ONE of five distinct states.
+
+    Precedence (most to least specific) — matches sprint item f1e0df55's
+    requirement to "show restart-required, stale, degraded, quarantined, and
+    healthy states distinctly" and to never call a dashboard-only setting
+    "active":
+
+    1. ``quarantined``       — the client gave up retrying after a
+                                deterministic failure (SlotState.QUARANTINED).
+    2. ``restart_required``   (lifecycle-state case) — the client explicitly
+                                reported an intentional teardown
+                                (idle-killed/stopped, SlotState) while the
+                                dashboard still has the slot enabled. Checked
+                                before "degraded" because these are normal
+                                lifecycle events, not failures, even though
+                                the accompanying report may also carry
+                                ``healthy=false``.
+    3. ``degraded``           — serving, but the last probe/report was bad
+                                (a specific known-bad SlotState, or a bare
+                                ``healthy=false`` with no more specific
+                                state attached).
+    4. ``stale`` / ``restart_required`` (split-brain case) — the
+                                dashboard-persisted setting no longer matches
+                                the last-observed runtime. If the dashboard
+                                has the slot enabled, nothing is running, AND
+                                we have NO diagnostic history at all (never
+                                connected from this vantage point, or simply
+                                hasn't started yet) — that's ``stale``: we
+                                genuinely don't know why. Every other
+                                mismatch (a process running that the
+                                dashboard has disabled, or an enabled slot
+                                that has some diagnostic history showing it
+                                is down) is ``restart_required``: restart the
+                                tunnel to reconcile.
+    5. ``healthy``            — consistently and correctly off (disabled in
+                                the dashboard AND nothing running), or
+                                consistently on with no adverse signal.
+    """
+    state = (detail or {}).get("state")
+    if state == "quarantined" or (detail or {}).get("quarantine_reason"):
+        return "quarantined"
+    if state in _DIAG_RESTART_STATES and dashboard_enabled:
+        return "restart_required"
+    if state in _DIAG_DEGRADED_STATES or not healthy_flag:
+        return "degraded"
+    if dashboard_enabled != process_active:
+        if dashboard_enabled and detail is None:
+            return "stale"  # enabled, not running, and no history at all
+        return "restart_required"
+    return "healthy"  # consistently off, or consistently on with no issues
+
+
+def _diag_remediation(label: str, detail: "dict | None") -> str:
+    """Exact, human-actionable remediation text for one slot's diagnostic label."""
+    if label == "healthy":
+        return "No action needed."
+    if label == "quarantined":
+        reason = (detail or {}).get("quarantine_reason") or (detail or {}).get("reason") or "a deterministic failure"
+        return (
+            f"Slot quarantined after {reason}. Fix the underlying dependency/config "
+            "on your machine, then restart `meridian --tunnel` to clear the "
+            "quarantine and retry."
+        )
+    if label == "degraded":
+        why = (detail or {}).get("detail") or (detail or {}).get("reason") or "the last health probe failed"
+        return f"Slot is serving in a degraded state ({why}). Check the local tunnel client's logs."
+    if label == "restart_required":
+        return (
+            "The dashboard-persisted setting for this slot does not match what is "
+            "currently running. Restart `meridian --tunnel` (or resave the setting "
+            "and restart) to pick up the change."
+        )
+    if label == "stale":
+        return "No recent health signal for this slot. Reconnect or restart the tunnel to refresh its status."
+    return "Unknown state — treat as needing investigation."
+
+
+def _config_generation(config: Any) -> int:
+    """Deterministic small integer 'generation' for a persisted plugin config.
+
+    Not a monotonic counter — nothing increments it across restarts — it is a
+    stable hash-derived number so two reads of the SAME persisted config agree,
+    and any edit changes it. Lets a caller detect "the persisted config changed
+    since I last looked" with a cheap equality check instead of a deep diff."""
+    blob = json.dumps(config, sort_keys=True, default=str) if config else ""
+    return int(hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def _config_manifest_hash(config: Any) -> str:
+    """sha256 hex digest of the normalized persisted plugin config.
+
+    Pure equality-comparison fingerprint (dashboard-persisted config vs. what a
+    connected tunnel client last acted on) — never reversed. ``config`` here is
+    the plugin enable/command/port shape (already redacted downstream by
+    ``_diag_redact`` wherever it is echoed back), not raw tenant credentials."""
+    blob = json.dumps(config, sort_keys=True, default=str) if config else ""
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = None) -> dict:
+    """Assemble the full layered diagnostic snapshot for one tenant (f1e0df55).
+
+    Shared by the ``GET /tunnel/diagnostics/{tenant_id}`` HTTP route and the
+    ``get_tunnel_diagnostics`` MCP tool so both surfaces report identically.
+    Returns an unauthenticated-shaped stub (empty slots, no tenant) when
+    ``tenant`` is None, mirroring ``get_tunnel_plugins``'s existing contract."""
+    run_id = uuid.uuid4().hex
+    generated_at = time.time()
+    if tenant is None:
+        return {
+            "run_id": run_id,
+            "generated_at": generated_at,
+            "tenant_id": None,
+            "authenticated": False,
+            "hostname": hostname,
+            "tunnel_process": {"any_active": False, "cross_instance_owner": None, "cross_instance_miss": False},
+            "slots": {},
+            "server_routing_cache": {"routed_tool_count": 0, "cache_populated": False},
+            "connector_manifest": {
+                "config_generation": _config_generation(None),
+                "manifest_hash": _config_manifest_hash(None),
+                "tools_list_stale": False,
+            },
+        }
+
+    tid = tenant.get("id")
+    parsed = _current_tunnel_config(tenant, hostname)
+    resolved = resolve_plugins(parsed)
+
+    slots: dict[str, dict] = {}
+    for p in resolved:
+        slot = p["slot"]
+        sockets, _ = _label_maps(slot)
+        process_active = tid in sockets
+        healthy_flag = _slot_health.get(tid, {}).get(slot, True)
+        detail = _slot_status_detail.get(tid, {}).get(slot)
+        dashboard_enabled = bool(p.get("enabled"))
+        label = _diag_slot_label(
+            dashboard_enabled=dashboard_enabled,
+            process_active=process_active,
+            healthy_flag=healthy_flag,
+            detail=detail,
+        )
+        slots[slot] = _diag_redact({
+            # Persisted-in-dashboard state — NEVER reported as "active" here,
+            # only as what is saved.
+            "dashboard_configured": {
+                "enabled": dashboard_enabled,
+                "command": p.get("command"),
+                "description": p.get("description"),
+            },
+            # Live server-side tunnel-process state for this slot.
+            "process_active": process_active,
+            # External child (the client's spawned MCP server subprocess) state,
+            # as last reported by a plugin_status message — None if never reported.
+            "external_child_state": (detail or {}).get("state"),
+            "healthy_reported": healthy_flag,
+            "retry_count": (detail or {}).get("retry_count"),
+            "quarantine_reason": (detail or {}).get("quarantine_reason"),
+            "last_error": (detail or {}).get("detail") or (detail or {}).get("reason"),
+            "state": label,
+            "remediation": _diag_remediation(label, detail),
+        })
+
+    routing_cache = dict(_tunnel_tool_routes.get(tid, {}))
+
+    return {
+        "run_id": run_id,
+        "generated_at": generated_at,
+        "tenant_id": tid,
+        "authenticated": True,
+        "hostname": hostname,
+        "tunnel_process": {
+            "any_active": has_active_tunnel(tid),
+            # Fly.io multi-instance: which instance (if any) is known to own
+            # this tenant's socket, and whether THIS instance has a miss.
+            "cross_instance_owner": tenant_owner_instance(tid),
+            "cross_instance_miss": tunnel_cross_instance_miss(tenant),
+        },
+        "slots": slots,
+        # Server-side tool-name -> slot routing cache (``_tunnel_tool_routes``):
+        # what the LAST tools/list discovery aggregated, not what's configured.
+        "server_routing_cache": {
+            "routed_tool_count": len(routing_cache),
+            "cache_populated": bool(routing_cache),
+        },
+        # Connector discovery/manifest state: a config fingerprint (for drift
+        # detection) plus whether a slot recovery is pending re-advertisement.
+        "connector_manifest": {
+            "config_generation": _config_generation(parsed),
+            "manifest_hash": _config_manifest_hash(parsed),
+            "tools_list_stale": tid in _tools_list_changed_pending,
+        },
+    }
+
+
+@router.get("/tunnel/diagnostics/{tenant_id}")
+async def tunnel_diagnostics(tenant_id: str, request: Request) -> Response:
+    """Layered, read-only tunnel/connector diagnostics for one tenant (f1e0df55).
+
+    Aggregates dashboard-persisted config, live per-slot process state,
+    client-reported per-slot health, the server routing cache, and the
+    tools/list discovery-changed marker into ONE snapshot — see
+    :func:`build_tunnel_diagnostics` for the full field-by-field contract.
+    ``tenant_id`` in the path is documentary only (matches the sibling
+    ``/tunnel/status/{tenant_id}`` route's shape); the actual tenant is
+    resolved from the request's own auth, same as ``/tunnel/plugins``.
+    """
+    tenant = await _get_tenant_from_request(request)
+    hostname = (request.query_params.get("hostname") or "").strip() or None
+    return _json_response(build_tunnel_diagnostics(tenant, hostname))
 
 
 @router.post("/tunnel/plugins/custom")

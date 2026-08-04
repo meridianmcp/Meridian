@@ -2579,6 +2579,25 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "slot": {"type": "string", "description": "Plugin slot or name to reset (e.g. 'docs', 'outputs', or the plugin's 'name' field from list_plugins)."},
          "hostname": {"type": "string", "description": "Optional: reset only this machine's override (tunnel_plugins_by_host) instead of the per-tenant default."}},
          "required": ["slot"]}},
+    {"name": "get_tunnel_diagnostics", "description":
+        "f1e0df55 — Read-only: ONE layered diagnostic snapshot of your tunnel/"
+        "connectors, separating what's SAVED in the dashboard from what's "
+        "ACTUALLY running so a saved-but-not-yet-applied setting is never "
+        "reported as active. Per slot (fs/code/extract/ppt/word/dc/docs/zotero/"
+        "outputs/debug): dashboard_configured (persisted), process_active (live "
+        "server-side socket), external_child_state (last client-reported "
+        "lifecycle state), last_error, and exact remediation text — plus one of "
+        "five distinct states: healthy, stale, degraded, quarantined, or "
+        "restart_required (persisted config and observed runtime disagree). "
+        "Also reports the server-side tool routing cache size, a config "
+        "generation + manifest_hash fingerprint for drift detection, and whether "
+        "a tools/list re-discovery is pending. Includes a run_id + timestamp for "
+        "correlating with support requests. Tokens/credentials are redacted. "
+        "Requires an authenticated hosted tenant (tunnel mode) — self-hosted "
+        "callers with no tenant get an empty, unauthenticated-shaped snapshot.",
+     "inputSchema": {"type": "object", "properties": {
+         "hostname": {"type": "string", "description": "Optional: report only this machine's per-host config override instead of the per-tenant default (mirrors get_tunnel_plugins's ?hostname=)."}},
+         "required": []}},
     {"name": "refresh_tool_manifest", "description":
         "Read-only: return the authoritative, compact manifest of ALL built-in "
         "Meridian MCP tools (name + one-line summary). Call this when you suspect "
@@ -2777,6 +2796,7 @@ _READ_ONLY_TOOLS = {
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",
     "list_plugins", "get_plugin_details", "refresh_tool_manifest",
+    "get_tunnel_diagnostics",
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "get_citation_edges",
     "find_similar_equation", "find_symbol_usages",
@@ -2984,6 +3004,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "list_plugins":      "plugin",
     "get_plugin_details": "plugin",
     "reset_plugin_override": "plugin",
+    "get_tunnel_diagnostics": "plugin",
     # config / infra
     "set_executor_config": "config",
     "get_capability_manifest": "config",
@@ -3158,6 +3179,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "list_plugins":              "both",
     "get_plugin_details":        "both",
     "reset_plugin_override":     "both",
+    "get_tunnel_diagnostics":    "both",
     "refresh_tool_manifest":     "both",
     "ingest_document":           "both",
     "fan_out_sprint_items":      "both",  # orchestrators also use it; keep "both"
@@ -3385,6 +3407,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "list_plugins":               "maintenance-only",
     "get_plugin_details":         "maintenance-only",
     "reset_plugin_override":      "maintenance-only",
+    "get_tunnel_diagnostics":     "maintenance-only",
     "refresh_tool_manifest":      "maintenance-only",
     # analysis / graph
     "analyze_model_efficiency":   "maintenance-only",
@@ -3448,6 +3471,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "list_plugins": "List Plugins",
     "get_plugin_details": "Get Plugin Details",
     "reset_plugin_override": "Reset Plugin Override",
+    "get_tunnel_diagnostics": "Get Tunnel Diagnostics",
     "refresh_tool_manifest": "Refresh Tool Manifest",
     "set_active_repo": "Set Active Repo",
     "analyze_model_efficiency": "Analyze Model Efficiency",

@@ -5143,7 +5143,8 @@ async def _handle_tunnel_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: set_active_repo (tunnel control), run_verification (0e973e52)."""
+    """Dispatch group: set_active_repo (tunnel control), run_verification (0e973e52),
+    get_tunnel_diagnostics (f1e0df55, read-only)."""
     if name == "set_active_repo":
         # 32ba4125 — worktree_id is the validated, fail-closed activation path:
         # it can only ever resolve to a path a session actually registered via
@@ -5291,6 +5292,15 @@ async def _handle_tunnel_tools(
             result["cwd"] = repo_path
         result["verification_run_id"] = completed_run["id"]
         return result
+
+    if name == "get_tunnel_diagnostics":
+        # f1e0df55 — ONE layered, read-only diagnostic snapshot; the MCP tool
+        # and the GET /tunnel/diagnostics/{tenant_id} HTTP route share the
+        # exact same builder so both surfaces report identically.
+        from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+
+        hostname = (args.get("hostname") or "").strip() or None
+        return _tunnel_mod.build_tunnel_diagnostics(tenant, hostname)
 
     return _MISS
 
