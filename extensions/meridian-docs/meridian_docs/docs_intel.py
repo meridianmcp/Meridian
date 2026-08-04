@@ -2829,6 +2829,20 @@ def _build_caption_paragraph(
     ``"Figure 3"`` and stays correct across reordering/renumbering on Word's
     next field refresh, instead of hand-typed prose text going stale.
 
+    5b2ce3fb — the bookmark pair's numeric ``w:id`` is derived from
+    ``ref_bookmark``'s own digit suffix (every caller sources ``ref_bookmark``
+    from :func:`_next_ref_bookmark_name`, or a local seed reserved from it, so
+    that suffix is always both present and already document-unique) rather
+    than a hardcoded constant.  A previous hardcoded ``w:id="0"`` meant every
+    caption inserted into the same document produced ANOTHER bookmarkStart/
+    bookmarkEnd pair sharing that same id -- Word-invalid duplicate ``w:id``
+    markers that make bookmarkStart/bookmarkEnd pairing ambiguous the moment
+    more than one caption (or an internal note, see
+    :func:`_build_internal_note_paragraph`) exists in the file. The
+    ``w:name`` stays the sole human-readable identifier; ``w:id`` is now just
+    as unique, satisfying OOXML's per-document ``w:id`` uniqueness
+    requirement for bookmarks.
+
     4efc63fd — ``centered`` (from ``style_policy["caption_centered"]`` via
     :func:`resolve_style_policy`) adds ``w:jc w:val="center"`` to the
     paragraph; default ``False`` preserves this function's original output.
@@ -2848,8 +2862,13 @@ def _build_caption_paragraph(
         ET.SubElement(pPr, _q(_W, "jc"), {_q(_W, "val"): "center"})
 
     if ref_bookmark:
+        # 5b2ce3fb -- reuse ref_bookmark's own digit suffix as the numeric
+        # w:id (see docstring above) instead of a hardcoded "0" that
+        # collided across every caption in the same document.
+        bm_id_match = _REF_BOOKMARK_RE.match(ref_bookmark)
+        bm_id = bm_id_match.group(1) if bm_id_match else ref_bookmark
         bm_start = ET.SubElement(p, _q(_W, "bookmarkStart"))
-        bm_start.set(_q(_W, "id"), "0")
+        bm_start.set(_q(_W, "id"), bm_id)
         bm_start.set(_q(_W, "name"), ref_bookmark)
 
     # Run: "<kind> " prefix.
@@ -2867,7 +2886,7 @@ def _build_caption_paragraph(
 
     if ref_bookmark:
         bm_end = ET.SubElement(p, _q(_W, "bookmarkEnd"))
-        bm_end.set(_q(_W, "id"), "0")
+        bm_end.set(_q(_W, "id"), bm_id)
 
     # Run: ". <label_text>".
     r_label = ET.SubElement(p, _q(_W, "r"))
@@ -7567,8 +7586,20 @@ def _next_note_bookmark_name(root: ET.Element) -> str:
     Mirrors :func:`_next_ref_bookmark_name` but with its own numbering track
     so internal-note bookmarks never collide with caption cross-reference
     bookmarks even though both live in the same w:bookmarkStart namespace.
+
+    5b2ce3fb -- seeded at 200000000 (mirroring :func:`_next_ref_bookmark_name`'s
+    own 100000000 baseline for the identical reason): :func:`_build_internal_note_paragraph`
+    reuses this name's digit suffix verbatim as the paragraph's numeric
+    ``w:bookmarkStart``/``w:bookmarkEnd`` ``w:id`` (see that function), so the
+    number must stay clear of the small sequential ids (0, 1, 2, ...) Word
+    itself assigns to bookmarks a human author creates -- a low seed like the
+    previous ``0`` would reliably collide with those on any document that
+    already has real bookmarks, producing Word-invalid duplicate ``w:id``
+    markers. Distinct from the ``_Ref`` range (100000000-199999999) so the
+    two schemes stay visually and numerically separate, matching this
+    function's own "never collide" docstring claim above.
     """
-    max_seen = 0
+    max_seen = 200000000 - 1
     for bm in root.iter(_q(_W, "bookmarkStart")):
         name = bm.get(_q(_W, "name")) or ""
         m = _INTERNAL_NOTE_BOOKMARK_RE.match(name)
@@ -7594,14 +7625,28 @@ def _build_internal_note_paragraph(
     4efc63fd -- ``highlight_color`` (from
     ``style_policy["note_highlight_color"]`` via :func:`resolve_style_policy`)
     defaults to the original hardcoded ``"yellow"``.
+
+    5b2ce3fb -- the bookmark pair's numeric ``w:id`` is derived from
+    ``note_id``'s own digit suffix (the sole caller sources ``note_id`` from
+    :func:`_next_note_bookmark_name`, so that suffix is always present and
+    already document-unique) instead of a hardcoded constant. A previous
+    hardcoded ``w:id="0"`` meant every internal note (and every caption, see
+    :func:`_build_caption_paragraph`) inserted into the same document
+    produced ANOTHER bookmarkStart/bookmarkEnd pair sharing that id --
+    Word-invalid duplicate ``w:id`` markers that make bookmarkStart/
+    bookmarkEnd pairing ambiguous the moment more than one such element
+    exists in the file.
     """
     p = ET.Element(_q(_W, "p"))
     pPr = ET.SubElement(p, _q(_W, "pPr"))
     pStyle = ET.SubElement(pPr, _q(_W, "pStyle"))
     pStyle.set(_q(_W, "val"), style)
 
+    bm_id_match = _INTERNAL_NOTE_BOOKMARK_RE.match(note_id)
+    bm_id = bm_id_match.group(1) if bm_id_match else note_id
+
     bm_start = ET.SubElement(p, _q(_W, "bookmarkStart"))
-    bm_start.set(_q(_W, "id"), "0")
+    bm_start.set(_q(_W, "id"), bm_id)
     bm_start.set(_q(_W, "name"), note_id)
 
     r = ET.SubElement(p, _q(_W, "r"))
@@ -7613,7 +7658,7 @@ def _build_internal_note_paragraph(
     t.text = text
 
     bm_end = ET.SubElement(p, _q(_W, "bookmarkEnd"))
-    bm_end.set(_q(_W, "id"), "0")
+    bm_end.set(_q(_W, "id"), bm_id)
     return p
 
 
