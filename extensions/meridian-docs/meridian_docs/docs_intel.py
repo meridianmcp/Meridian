@@ -2436,6 +2436,225 @@ def _verify_docx_write(
     return None
 
 
+# ---------------------------------------------------------------------------
+# 679c86f4 -- post-write image-ownership invariant (orphan image paragraphs +
+# duplicate drawing references).
+#
+# _verify_docx_write (9907df44, above) confirms a move/copy landed the
+# EXPECTED structural counts and content hash -- but it has no notion of
+# image *ownership*: a bug that detaches an image paragraph from its Figure
+# caption (leaving an orphan image with no caption immediately after it), or
+# that duplicates an image paragraph without also duplicating its underlying
+# media relationship (leaving two independent figure blocks pointing at the
+# SAME r:embed id -- confirmed live for copy_section, whose deep-copy pass
+# renames every w14:paraId and bookmark name but never touches a drawing's
+# r:embed attribute), can still produce structurally-consistent counts and a
+# perfectly-matching content hash for the range that moved/copied, because
+# neither check ever looks at drawing/relationship identity.
+#
+# _verify_image_ownership re-reads the file FRESH FROM DISK (same discipline
+# as _verify_docx_write) and enforces, for every DIRECT body image paragraph:
+#
+#   (a) it is immediately followed by a body paragraph carrying a SEQ Figure
+#       field (its caption), OR
+#   (b) it is part of a run of CONSECUTIVE direct-body image paragraphs (a
+#       multi-image composite -- OOXML's own idiom for side-by-side figures
+#       sharing one caption) whose LAST member is immediately followed by a
+#       shared SEQ Figure caption. A composite is recognised by physical
+#       adjacency in body order; nothing but more images may sit between its
+#       members.
+#
+# and, independently, that no r:embed relationship id is referenced by more
+# than one such image/composite block -- a duplicate is a strong signal that
+# a copy/duplicate operation forgot to mint a fresh media relationship for
+# the paragraph it duplicated (rather than the writer's own intentional
+# same-image reuse), so it is rejected fail-closed unless the caller
+# explicitly opts in via ``allow_relationship_reuse`` (the narrow,
+# caller-declared stand-in this hardening item scopes for "the manifest
+# declares intentional reuse" -- the full claim/manifest pipeline described
+# in fe989980 is a separate, larger sprint item).
+#
+# insert_image intentionally creates an image paragraph with no caption yet
+# (the documented insert_image -> insert_caption two-step composition
+# insert_figure_block's own docstring calls out as still-supported), so its
+# caller passes ``require_immediate_caption=False`` -- it still gets the
+# duplicate-relationship half of the invariant (structurally unreachable via
+# insert_image's own always-fresh relationship id, but real defense-in-depth
+# against a future id-collision bug) plus its first-ever post-write
+# verification.
+# ---------------------------------------------------------------------------
+
+def _direct_body_image_paragraphs(body: ET.Element) -> list[tuple[int, ET.Element]]:
+    """``(body_child_index, paragraph)`` for every DIRECT body child paragraph
+    that contains an embedded image (DrawingML ``<w:drawing>`` or legacy VML
+    ``<w:pict>``).
+
+    Restricted to direct body children (not table-cell paragraphs) -- "the
+    caption immediately follows the image" is a body-sibling-order relation,
+    the same restriction :func:`relocate_figure` already applies when
+    selecting a figure block to move.
+    """
+    w_p = _q(_W, "p")
+    w_drawing = _q(_W, "drawing")
+    w_pict = _q(_W, "pict")
+    return [
+        (idx, child)
+        for idx, child in enumerate(body)
+        if child.tag == w_p
+        and (
+            child.find(f".//{w_drawing}") is not None
+            or child.find(f".//{w_pict}") is not None
+        )
+    ]
+
+
+def _has_figure_seq_field(paragraph: ET.Element) -> bool:
+    """True when ``paragraph`` carries a ``SEQ Figure`` field (simple or complex)."""
+    w_fld_simple = _q(_W, "fldSimple")
+    w_instr = _q(_W, "instr")
+    w_instr_text = _q(_W, "instrText")
+    for field in paragraph.iter(w_fld_simple):
+        if _SEQ_FIGURE_RE.search(field.get(w_instr) or ""):
+            return True
+    for instr in paragraph.iter(w_instr_text):
+        if _SEQ_FIGURE_RE.search("".join(instr.itertext())):
+            return True
+    return False
+
+
+def _image_paragraph_relationship_ids(paragraph: ET.Element) -> list[str]:
+    """Every ``r:embed`` relationship id referenced by drawings inside ``paragraph``."""
+    embed_attr = _q(_IMAGE_REL_NS, "embed")
+    return [
+        blip.get(embed_attr)
+        for blip in paragraph.iter(_q(_A, "blip"))
+        if blip.get(embed_attr)
+    ]
+
+
+def _verify_image_ownership(
+    docx_path: str,
+    *,
+    require_immediate_caption: bool = True,
+    allow_relationship_reuse: bool = False,
+) -> dict[str, Any] | None:
+    """679c86f4 -- mandatory post-write image-ownership verification.
+
+    Re-reads ``docx_path`` FRESH FROM DISK -- mirrors :func:`_verify_docx_write`'s
+    "never trust the in-memory tree that was just serialized" discipline.
+    Returns ``None`` when the on-disk document satisfies the image-ownership
+    invariant, or an ``{"error": ..., "orphan_image_paragraphs": [...],
+    "duplicate_relationships": {...}}`` dict on the first violation -- never a
+    false success payload.
+
+    ``require_immediate_caption`` (default ``True``) toggles rule (a)/(b)
+    above; pass ``False`` for a write whose OWN contract intentionally leaves
+    an image paragraph uncaptioned (see :func:`insert_image`). The duplicate
+    ``r:embed`` check always runs regardless of this flag.
+
+    ``allow_relationship_reuse`` (default ``False``, fail closed) is the
+    caller's explicit declaration that a detected relationship reuse is
+    intentional; when set, a detected duplicate is not reported as a
+    violation.
+    """
+    try:
+        raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write image-ownership verification failed: could not "
+                f"re-read {docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write image-ownership verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    body_list = list(body2)
+    w_p = _q(_W, "p")
+    w14_para_id = _q(_W14, "paraId")
+    image_paras = _direct_body_image_paragraphs(body2)
+
+    orphans: list[dict[str, Any]] = []
+    relationship_owners: dict[str, list[str]] = {}
+
+    pos = 0
+    while pos < len(image_paras):
+        # Group a run of CONSECUTIVE direct-body image paragraphs together --
+        # OOXML's own idiom for a multi-image composite (side-by-side images
+        # sharing one caption) is physical adjacency with nothing but more
+        # images in between; a run of length 1 is an ordinary single-image
+        # figure.
+        group_start = pos
+        while (
+            pos + 1 < len(image_paras)
+            and image_paras[pos + 1][0] == image_paras[pos][0] + 1
+        ):
+            pos += 1
+        group = image_paras[group_start:pos + 1]
+        pos += 1
+
+        last_idx = group[-1][0]
+        next_idx = last_idx + 1
+        has_caption = (
+            next_idx < len(body_list)
+            and body_list[next_idx].tag == w_p
+            and _has_figure_seq_field(body_list[next_idx])
+        )
+
+        if require_immediate_caption and not has_caption:
+            for member_idx, member_el in group:
+                orphans.append(
+                    {
+                        "para_id": member_el.get(w14_para_id)
+                        or f"body-index-{member_idx}",
+                        "body_index": member_idx,
+                        "composite_size": len(group),
+                        "reason": (
+                            "image paragraph is not immediately followed by a "
+                            "SEQ Figure caption, and is not declared as part "
+                            "of a multi-image composite that is"
+                            if len(group) == 1
+                            else "multi-image composite (adjacent image "
+                            "paragraphs) is not immediately followed by a "
+                            "shared SEQ Figure caption"
+                        ),
+                    }
+                )
+
+        block_key = group[0][1].get(w14_para_id) or f"body-index-{group[0][0]}"
+        for _member_idx, member_el in group:
+            for rel_id in _image_paragraph_relationship_ids(member_el):
+                relationship_owners.setdefault(rel_id, []).append(block_key)
+
+    duplicate_relationships = {
+        rel_id: sorted(set(owners))
+        for rel_id, owners in relationship_owners.items()
+        if len(set(owners)) > 1
+    }
+    if allow_relationship_reuse:
+        duplicate_relationships = {}
+
+    if orphans or duplicate_relationships:
+        return {
+            "error": (
+                "post-write image-ownership verification failed: the "
+                f"on-disk document at {docx_path} violates the image-"
+                "ownership invariant -- returning an error instead of a "
+                "false success payload"
+            ),
+            "orphan_image_paragraphs": orphans,
+            "duplicate_relationships": duplicate_relationships,
+        }
+    return None
+
+
 def _find_para_by_id(
     root: ET.Element, para_id: str
 ) -> tuple[ET.Element, ET.Element, int] | None:
@@ -2994,8 +3213,21 @@ def insert_image(
     inches; if omitted, dimensions are inferred from the image header when
     possible, with a six-inch default width.
 
+    679c86f4 -- after the write, the file is re-read FRESH FROM DISK and
+    checked against the image-ownership invariant (:func:`_verify_image_ownership`,
+    ``require_immediate_caption=False`` since this function's own contract
+    intentionally leaves the new image uncaptioned -- pair it with
+    :func:`insert_caption` or use :func:`insert_figure_block` for an atomic
+    image+caption insert). A detected duplicate ``r:embed`` relationship
+    (structurally unreachable via this function's own always-fresh
+    relationship id, but checked anyway as defense-in-depth) fails the write
+    closed: the pre-write backup is restored (subject to the same
+    compare-and-swap concurrent-writer safety as every other write in this
+    module) and an error is returned instead of a false success payload.
+
     Returns {status, image_para_id, image_name, docx_path}, or
-    {error: message} without mutating the document on validation failure.
+    {error: message} without mutating the document on validation failure or
+    a post-write verification failure that could not be cleanly restored.
     """
     if not isinstance(docx_path, str) or not docx_path:
         return {"error": "docx_path must be a non-empty string"}
@@ -3075,13 +3307,65 @@ def insert_image(
         )
     )
     body.insert(insert_at, paragraph)
-    try:
-        _save_docx_with_image(
-            raw, root, image_bytes, image_name, relationship_id,
-            image_type[1], docx_path
+
+    # 679c86f4 -- hold docx_path's promotion lock across stage+promote
+    # (_save_docx_with_image is not itself lock-aware) THROUGH the post-write
+    # image-ownership verify and any conditional restore below, matching the
+    # same discipline insert_figure_block already applies to this same save
+    # helper. promoted_sha256 is computed locally right after the write for
+    # the same reason insert_figure_block's own comment gives: this function
+    # is one of _save_docx_with_image's several callers, so the helper
+    # itself cannot return a shared transaction dict.
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_image(
+                raw, root, image_bytes, image_name, relationship_id,
+                image_type[1], docx_path
+            )
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = _docx_file_sha256(docx_path)
+
+        verify_error = _verify_image_ownership(
+            docx_path, require_immediate_caption=False
         )
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+        if verify_error is not None:
+            # 5988a5bb-style compare-and-swap gate -- do NOT blindly restore:
+            # a different (concurrent) writer may have already promoted
+            # something newer to docx_path since our own promotion, in which
+            # case this verification "failure" is a false positive and
+            # restoring from our own backup would destroy that writer's
+            # completed, already-promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["image_para_id"] = image_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
     _invalidate_sidecar_mtime(index_db_path)
     return {
         "status": "inserted",
@@ -9242,6 +9526,7 @@ def copy_section(
     trim_original_to: str | None = None,
     draft_output_path: str | None = None,
     wave_run_id: str | None = None,
+    allow_relationship_reuse: bool = False,
 ) -> dict[str, Any]:
     """8213050a -- duplicate an existing section (heading + its content) to a
     new location in the document, leaving the original untouched (unless
@@ -9271,6 +9556,24 @@ def copy_section(
         self-consistent. A field targeting a bookmark OUTSIDE the copied
         range is left pointing at the original (shared) target, since that
         target was not duplicated.
+
+    679c86f4 -- what this deep copy does NOT do: rewrite a copied image
+    paragraph's ``r:embed`` relationship id, or duplicate its underlying
+    ``word/media/*`` part. A section whose copied range contains a Figure
+    (an image paragraph immediately followed by its SEQ Figure caption) ends
+    up with TWO independent figure blocks -- the original and the copy --
+    both pointing at the SAME image relationship. After the write, the
+    on-disk document is re-read and checked against the image-ownership
+    invariant (:func:`_verify_image_ownership`); a detected relationship
+    reuse fails the copy closed (the pre-write backup is restored, subject
+    to the same compare-and-swap concurrent-writer safety as the rest of
+    this module) UNLESS ``allow_relationship_reuse=True`` -- the caller's
+    explicit declaration that duplicating the reference (rather than the
+    underlying image) is intentional. This is a narrower, caller-declared
+    stand-in for "the manifest declares intentional reuse"; actually
+    duplicating the media part and minting a fresh relationship is out of
+    scope here (a separate, larger change -- see fe989980's broader
+    claim/manifest integration).
 
     48daaf66 -- ``destination_position="after"`` onto a HEADING anchor
     resolves to after that heading's ENTIRE section (own body + subsections),
@@ -9340,6 +9643,13 @@ def copy_section(
         wave_run_id:                  fe989980 -- required together with
                                       ``draft_output_path``; see
                                       :func:`move_section`.
+        allow_relationship_reuse:    679c86f4 -- ``False`` (default, fail
+                                      closed) rejects a copy that leaves an
+                                      image's ``r:embed`` relationship shared
+                                      between the original and the copy;
+                                      ``True`` is the caller's explicit
+                                      declaration that this specific reuse is
+                                      intentional.
 
     Returns:
         ``{status, section_id, heading_text, new_heading_para_id,
@@ -9638,6 +9948,56 @@ def copy_section(
             verify_error["copied_block_count"] = len(copied_elements)
             return verify_error
 
+        # 679c86f4 -- additionally, the copy must satisfy the image-ownership
+        # invariant post-write: every image paragraph in the WHOLE document
+        # (original section, its copy, and anything else) must still be
+        # immediately followed by its SEQ Figure caption (or be part of a
+        # composite whose last member is), and no r:embed relationship may
+        # be shared between two independent figure blocks. copy_section's
+        # deep-copy pass mints fresh paraIds/bookmark names for the copied
+        # range but never rewrites a drawing's r:embed attribute, so copying
+        # a section that contains a Figure leaves the original and the copy
+        # pointing at the SAME underlying image relationship -- exactly the
+        # violation this check exists to catch. Fails closed (pre-write
+        # backup restored, subject to the same compare-and-swap
+        # concurrent-writer safety as above) unless the caller passed
+        # allow_relationship_reuse=True to explicitly declare the reuse
+        # intentional.
+        ownership_error = _verify_image_ownership(
+            dest, allow_relationship_reuse=allow_relationship_reuse
+        )
+        if ownership_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            ownership_error["file_restored"] = restored
+            ownership_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    ownership_error["error"] = (
+                        ownership_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    ownership_error["error"] = (
+                        ownership_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            ownership_error["section_id"] = section_id
+            ownership_error["copied_block_count"] = len(copied_elements)
+            return ownership_error
+
     # fe989980 -- in draft mode, docx_path was never touched; its sidecar
     # index is still accurate, so skip invalidating it.
     if not draft_output_path:
@@ -9701,6 +10061,16 @@ def relocate_figure(
     splits before writing, verifies the saved document from disk, invalidates
     the local structure sidecar, and runs renumber_sequences so Figure
     SEQ caches and REF display text remain correct after the reorder.
+
+    679c86f4 -- after :func:`_verify_docx_write`'s structural-count/content-hash
+    check passes, the saved document is additionally re-read and checked
+    against the image-ownership invariant (:func:`_verify_image_ownership`):
+    the moved image paragraph must still be immediately followed by its SEQ
+    Figure caption, and its ``r:embed`` relationship must not be shared with
+    an independent figure block elsewhere in the document. On either check's
+    failure the pre-write backup is restored (subject to the same
+    compare-and-swap concurrent-writer safety as the rest of this module)
+    and an error is returned instead of a false success payload.
 
     Returns {status, figure_index, moved_block_count, image_para_id,
     caption_para_id, new_body_index, renumber_sequences, docx_path,
@@ -9922,6 +10292,50 @@ def relocate_figure(
             verify_error["figure_index"] = figure_index
             verify_error["moved_block_count"] = removed_count
             return verify_error
+
+        # 679c86f4 -- additionally, the moved figure block must still satisfy
+        # the image-ownership invariant post-write: the image paragraph must
+        # remain immediately followed by its SEQ Figure caption (or be part
+        # of a composite whose last member is), and no r:embed relationship
+        # may now be shared with an independent figure block elsewhere in
+        # the document. relocate_figure moves the SAME live elements as one
+        # atomic pair rather than duplicating them, so a legitimate move can
+        # never itself introduce a relationship duplicate or detach the
+        # caption -- a violation here means the move produced a genuinely
+        # broken document, not an expected/allowed shape, so no
+        # allow_relationship_reuse escape hatch is offered.
+        ownership_error = _verify_image_ownership(dest)
+        if ownership_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            ownership_error["file_restored"] = restored
+            ownership_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    ownership_error["error"] = (
+                        ownership_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    ownership_error["error"] = (
+                        ownership_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            ownership_error["figure_index"] = figure_index
+            ownership_error["moved_block_count"] = removed_count
+            return ownership_error
 
     # fe989980 -- in draft mode, docx_path was never touched; its sidecar
     # index is still accurate, so skip invalidating it.
