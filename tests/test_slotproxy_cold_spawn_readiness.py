@@ -222,3 +222,116 @@ def test_ensure_running_generic_launch_exception_is_child_crashed(monkeypatch):
 
     assert sp.diagnostics.state is tc.SlotState.CHILD_CRASHED
     assert sp.diagnostics.state in tc._DETERMINISTIC_STATES
+
+
+# ---------------------------------------------------------------------------
+# e0f7bd72 — filesystem mcp-proxy cold spawn with an incomplete npx cache
+# (missing npm-cache/_npx/.../node_modules/ajv/dist/ajv.js). End-to-end
+# through SlotProxy.ensure_running(), covering both outcomes of the
+# repair/retry: cache-clear genuinely fixes it (recovers to HEALTHY) and
+# cache-clear does NOT fix it (stays DEPENDENCY_MISSING — never claimed
+# ready off the back of a process merely staying alive).
+# ---------------------------------------------------------------------------
+
+class _FakeDeadProc:
+    """A proc that has already exited by the time poll() is first checked —
+    simulates the cold-spawn's first Popen dying on a missing dependency
+    file before it can ever answer tools/list."""
+    def __init__(self, cmd=None, *a, **k):
+        self.cmd = cmd
+        self.pid = 4243
+        self.returncode = 1
+
+    def poll(self):
+        return 1
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 1
+
+    def kill(self):
+        pass
+
+
+_FS_AJV_DETAIL = {
+    "missing_file": "C:\\npm-cache\\_npx\\abc123\\node_modules\\ajv\\dist\\ajv.js",
+    "cache_path": "C:\\npm-cache\\_npx\\abc123",
+    "package": "ajv",
+    "stderr": "Error: Cannot find module '...ajv.js'\n  code: 'MODULE_NOT_FOUND'\n",
+}
+
+
+def _patch_dependency_integrity_repair(monkeypatch, spawn_calls):
+    """Shared plumbing for the two dependency-integrity-repair tests below:
+    the first Popen dies immediately with the ajv.js signature, every
+    subsequent Popen stays alive (the retry's process-level outcome — real
+    *readiness* is controlled separately via _probe_slot_health)."""
+    def _popen(cmd, *a, **k):
+        spawn_calls.append(cmd)
+        if len(spawn_calls) == 1:
+            return _FakeDeadProc(cmd)
+        return _FakeProc(cmd)
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+    monkeypatch.setattr(tc.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(tc, "_probe_tar_entry_error", lambda *a, **k: False)
+    monkeypatch.setattr(tc, "_probe_fast_exit_stderr", lambda *a, **k: None)
+    monkeypatch.setattr(
+        tc, "_probe_missing_dependency_file",
+        lambda *a, **k: dict(_FS_AJV_DETAIL),
+    )
+    _thorough_called = []
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear_thorough",
+        lambda cmd, label="": _thorough_called.append(cmd),
+    )
+    return _thorough_called
+
+
+def test_ensure_running_dependency_missing_cache_repair_recovers_to_healthy(monkeypatch):
+    """When the thorough cache clear + retry genuinely fixes the cache (the
+    retried process comes up AND answers tools/list), the slot recovers to
+    HEALTHY exactly like any other successful cold-spawn — the repair path
+    is not a dead end."""
+    spawn_calls = []
+    thorough_called = _patch_dependency_integrity_repair(monkeypatch, spawn_calls)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    sp = tc.SlotProxy(["npx", "-y", "mcp-proxy", "--", "npx", "-y",
+                        "@modelcontextprotocol/server-filesystem"], 8814, "fs")
+    asyncio.run(sp.ensure_running())
+
+    assert len(spawn_calls) == 2, "must retry exactly once after the cache repair"
+    assert len(thorough_called) == 1
+    assert sp.diagnostics.state is tc.SlotState.HEALTHY
+    assert sp.diagnostics.last_healthy_at is not None
+
+
+def test_ensure_running_dependency_missing_cache_repair_never_claims_ready_if_still_broken(
+    monkeypatch,
+):
+    """When the repair does NOT fix it (retried process starts but still
+    never answers tools/list — e.g. the underlying corruption needs a human
+    to look at disk space / AV exclusions), the slot must stay classified as
+    DEPENDENCY_MISSING (deterministic) and must NEVER be reported HEALTHY —
+    this is the 'without claiming the slot is ready' contract the item asks
+    for. dependency_missing/root_cause still carry the package + cache path
+    for the operator to act on."""
+    spawn_calls = []
+    thorough_called = _patch_dependency_integrity_repair(monkeypatch, spawn_calls)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=False))
+
+    sp = tc.SlotProxy(["npx", "-y", "mcp-proxy", "--", "npx", "-y",
+                        "@modelcontextprotocol/server-filesystem"], 8815, "fs")
+    asyncio.run(sp.ensure_running())
+
+    assert len(spawn_calls) == 2
+    assert len(thorough_called) == 1
+    assert sp.diagnostics.state is tc.SlotState.DEPENDENCY_MISSING
+    assert sp.diagnostics.state in tc._DETERMINISTIC_STATES
+    assert sp.diagnostics.state is not tc.SlotState.HEALTHY
+    assert sp.diagnostics.dependency_missing == "ajv"
+    assert "ajv" in sp.diagnostics.root_cause
+    assert "cache path" in sp.diagnostics.root_cause

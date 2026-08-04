@@ -2510,6 +2510,137 @@ def _probe_tar_entry_error(
         return False
 
 
+# ---------------------------------------------------------------------------
+# Missing npx-cache dependency-file detection + bounded integrity check
+# (e0f7bd72) — prospected from an attached fs trace: the failure lives inside
+# the npx mcp-proxy dependency cache. The TOP-LEVEL package (mcp-proxy /
+# @modelcontextprotocol/server-filesystem) extracts and its own entry point is
+# present, but a TRANSITIVE dependency's file underneath it is missing (e.g.
+# npm-cache/_npx/<hash>/node_modules/ajv/dist/ajv.js absent), so the proxy
+# dies on Node's own CommonJS resolver error before it can ever answer
+# tools/list. This is a DISTINCT signature from TAR_ENTRY_ERROR (which npm
+# itself reports during extraction) — here extraction reported success, but
+# the resulting tree is incomplete underneath it — yet it needs the same
+# thorough remedy: a partial/corrupted _npx entry can be re-derived from a
+# clean fetch, but only once _npx (and, if that alone doesn't help, the
+# _cacache CAS store) is actually cleared.
+# ---------------------------------------------------------------------------
+
+# Node's CommonJS resolver error for a require() target that isn't on disk.
+# Distinct from _MODULE_NOT_FOUND_RE above (that one matches Python's
+# ModuleNotFoundError/ImportError wording) — this is Node's own wording, and
+# it always quotes the absolute path it tried (and failed) to resolve.
+_NODE_MODULE_NOT_FOUND_RE = re.compile(r"Cannot find module ['\"]([^'\"]+)['\"]")
+
+
+def _npm_cache_dependency_detail(stderr_text: "str | None") -> "dict | None":
+    """Parse a Node ``Cannot find module`` error into cache/package detail.
+
+    Returns ``{"missing_file": <abs path>, "cache_path": <...>, "package": <...>}``
+    when *stderr_text* names a missing file living inside a ``node_modules``
+    tree, else ``None`` — no match, or the missing specifier isn't a
+    filesystem path at all (a bare ``require('lodash')``-style specifier with
+    no ``node_modules`` segment means the dependency was never declared in
+    the first place; clearing the cache cannot fix that, so it is
+    deliberately NOT treated as this failure class). Pure, side-effect-free,
+    never raises. (e0f7bd72)
+
+    ``cache_path`` is the path up to (not including) the FIRST
+    ``node_modules`` segment — for an npx-cached tool this lands on the
+    per-install hash directory (``.../_npx/<hash>``), which is exactly the
+    directory :func:`_scoped_cache_clear` / :func:`_scoped_cache_clear_thorough`
+    remove. ``package`` is the module name immediately following the LAST
+    ``node_modules`` segment (handles scoped packages like ``@scope/name`` and
+    nested transitive installs like ``mcp-proxy/node_modules/ajv``).
+    """
+    if not stderr_text:
+        return None
+    m = _NODE_MODULE_NOT_FOUND_RE.search(stderr_text)
+    if not m:
+        return None
+    missing_file = m.group(1).strip()
+    if not missing_file or "node_modules" not in missing_file:
+        return None
+    # Normalise slash style so the split works for Windows-style paths too.
+    normalized = missing_file.replace("\\", "/")
+    parts = normalized.split("/node_modules/")
+    if len(parts) < 2 or not parts[0]:
+        return None
+    cache_path = parts[0]
+    tail_parts = [p for p in parts[-1].split("/") if p]
+    if not tail_parts:
+        return None
+    if tail_parts[0].startswith("@") and len(tail_parts) > 1:
+        package = "/".join(tail_parts[:2])  # scoped package: @scope/name
+    else:
+        package = tail_parts[0]
+    return {"missing_file": missing_file, "cache_path": cache_path, "package": package}
+
+
+def _dependency_file_confirmed_missing(missing_file: str) -> bool:
+    """Bounded, single-stat confirmation that *missing_file* really is absent.
+
+    Guards a stderr regex match against a stale/misleading log line (or a
+    file that reappeared between the failure and this check) before trusting
+    it enough to trigger a cache wipe. One ``os.path.exists`` call — never a
+    directory scan or a retry loop. Never raises: a stat failure (permission
+    error, WinError on a virtualized path, ...) is treated as "could not
+    confirm", so the caller falls back to the generic scoped-clear path
+    instead of over-escalating on uncertain data. (e0f7bd72)
+    """
+    try:
+        return not os.path.exists(missing_file)
+    except Exception:  # noqa: BLE001 — never block classification on a stat error
+        return False
+
+
+def _probe_missing_dependency_file(
+    cmd: "list[str]",
+    env: "dict | None",
+    label: str,
+    wait_seconds: float = 5.0,
+) -> "dict | None":
+    """Probe whether *cmd* fails on a missing npx-cache dependency file.
+
+    Mirrors :func:`_probe_tar_entry_error`'s shape exactly (a short, bounded
+    diagnostic spawn with stderr captured) but classifies for the DISTINCT
+    failure class this addresses — see the module comment above. Returns the
+    detail dict from :func:`_npm_cache_dependency_detail` (plus a ``stderr``
+    key holding the full captured text, for reporting) only when BOTH the
+    stderr signature matches AND :func:`_dependency_file_confirmed_missing`
+    confirms the named file is still actually absent on disk; else ``None``.
+
+    Never raises — exceptions from ``Popen`` / ``communicate`` are swallowed
+    so a failing probe can never block the normal retry path. (e0f7bd72)
+    """
+    try:
+        # Note: no _spawn_kwargs() here, matching _probe_tar_entry_error — this
+        # is a short diagnostic spawn we immediately wait on, not the live server.
+        probe = subprocess.Popen(
+            cmd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            _, stderr_bytes = probe.communicate(timeout=wait_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                probe.kill()
+                probe.communicate()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        stderr_text = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+    except Exception:  # noqa: BLE001 — probe failed entirely; nothing to classify
+        return None
+    detail = _npm_cache_dependency_detail(stderr_text)
+    if detail is None:
+        return None
+    if not _dependency_file_confirmed_missing(detail["missing_file"]):
+        return None
+    detail["stderr"] = stderr_text
+    return detail
+
+
 _stable_cache_env_cache: "dict[str, str] | None" = None
 
 
@@ -2684,13 +2815,58 @@ def _spawn_with_cache_retry(
             )
             _scoped_cache_clear_thorough(cmd, label)
         else:
-            # Fast exit but no TAR signature — fall back to the generic scoped clear.
-            print(
-                f"tunnel:{label}: process exited immediately (code {proc.returncode}); "
-                "applying scoped cache-clear + one retry",
-                file=sys.stderr, flush=True,
-            )
-            _scoped_cache_clear(cmd, label)
+            # e0f7bd72 — bounded dependency-integrity check: distinct from
+            # TAR_ENTRY_ERROR, this catches an npx cache whose top-level
+            # package extracted fine but a TRANSITIVE dependency's file is
+            # missing underneath it (e.g.
+            # npm-cache/_npx/<hash>/node_modules/ajv/dist/ajv.js absent), so
+            # the child dies on Node's own "Cannot find module" error before
+            # it can ever answer tools/list. Bounded: one short diagnostic
+            # spawn (wait_seconds=5.0, same budget as the TAR probe above)
+            # plus a single filesystem stat to confirm the named file really
+            # is missing — never an unbounded scan or retry loop.
+            _dep_detail = _probe_missing_dependency_file(cmd, env, label, wait_seconds=5.0)
+            if _dep_detail is not None:
+                _dep_stderr_final = (_dep_detail.get("stderr") or "")[:500]
+                print(
+                    f"tunnel:{label}: missing dependency file in npm cache "
+                    f"(package={_dep_detail['package']!r}, "
+                    f"cache_path={_dep_detail['cache_path']!r}, "
+                    f"missing_file={_dep_detail['missing_file']!r}); applying "
+                    f"thorough cache clear + retry (final stderr: {_dep_stderr_final!r})",
+                    file=sys.stderr, flush=True,
+                )
+                if diagnostics is not None:
+                    # DEPENDENCY_MISSING (deterministic) so a retry that STILL
+                    # doesn't answer tools/list is re-affirmed as such by
+                    # ensure_running's _fast_exit_state handling below, rather
+                    # than being downgraded to a generic STARTUP_TIMEOUT — the
+                    # slot must never be reported ready off the back of this
+                    # failure alone; only a real _probe_slot_health success
+                    # clears it back to HEALTHY.
+                    diagnostics.set(
+                        SlotState.DEPENDENCY_MISSING, phase="fast_exit",
+                        root_cause=(
+                            f"npm cache missing dependency file for package "
+                            f"{_dep_detail['package']!r} under cache path "
+                            f"{_dep_detail['cache_path']!r} "
+                            f"({_dep_detail['missing_file']!r}) — a thorough "
+                            "cache clear + retry was attempted"
+                        ),
+                        dependency_missing=_dep_detail["package"],
+                        exit_code=proc.returncode,
+                        stderr_summary=_dep_stderr_final or None,
+                    )
+                _scoped_cache_clear_thorough(cmd, label)
+            else:
+                # Fast exit but no TAR / dependency-integrity signature — fall
+                # back to the generic scoped clear.
+                print(
+                    f"tunnel:{label}: process exited immediately (code {proc.returncode}); "
+                    "applying scoped cache-clear + one retry",
+                    file=sys.stderr, flush=True,
+                )
+                _scoped_cache_clear(cmd, label)
         try:
             retried = subprocess.Popen(cmd, env=env, **kwargs)
             _record_spawned_pid(retried, label)  # 6884a668

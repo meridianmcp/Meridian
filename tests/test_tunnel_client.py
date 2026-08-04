@@ -4178,6 +4178,14 @@ def test_spawn_with_cache_retry_tar_error_uses_thorough_clear(monkeypatch):
         tc, "_probe_tar_entry_error",
         lambda cmd, env, label, wait_seconds=5.0: True,
     )
+    # e0f7bd72 — TAR detection short-circuits before the dependency-integrity
+    # check runs, but mock it anyway so an accidental real invocation (which
+    # would consume an extra Popen call from the counted sequence below) can
+    # never silently pass.
+    monkeypatch.setattr(
+        tc, "_probe_missing_dependency_file",
+        lambda cmd, env, label, wait_seconds=5.0: None,
+    )
     # Patch time.sleep to avoid a real 100ms pause in the test.
     monkeypatch.setattr(tc.time, "sleep", lambda n: None)
 
@@ -4250,6 +4258,12 @@ def test_spawn_with_cache_retry_fast_exit_non_tar_uses_scoped_clear(monkeypatch)
         tc, "_probe_tar_entry_error",
         lambda cmd, env, label, wait_seconds=5.0: False,  # not a TAR error
     )
+    # e0f7bd72 — also not a missing-dependency-file signature, so this must
+    # still fall all the way through to the generic scoped clear.
+    monkeypatch.setattr(
+        tc, "_probe_missing_dependency_file",
+        lambda cmd, env, label, wait_seconds=5.0: None,
+    )
     monkeypatch.setattr(tc.time, "sleep", lambda n: None)
 
     spawn_count = [0]
@@ -4269,6 +4283,283 @@ def test_spawn_with_cache_retry_fast_exit_non_tar_uses_scoped_clear(monkeypatch)
     assert spawn_count[0] == 2
     assert len(scoped_called) == 1, "scoped clear used for non-TAR fast-exit"
     assert len(thorough_called) == 0
+
+
+# ---------------------------------------------------------------------------
+# e0f7bd72 — bounded npx-cache dependency-integrity check + repair/retry.
+# ---------------------------------------------------------------------------
+
+_AJV_STDERR = (
+    "internal/modules/cjs/loader.js:888\n"
+    "  throw err;\n"
+    "  ^\n\n"
+    "Error: Cannot find module "
+    "'C:\\Users\\me\\AppData\\Local\\npm-cache\\_npx\\abc123\\node_modules\\"
+    "mcp-proxy\\node_modules\\ajv\\dist\\ajv.js'\n"
+    "Require stack:\n"
+    "- C:\\Users\\me\\AppData\\Local\\npm-cache\\_npx\\abc123\\node_modules\\"
+    "mcp-proxy\\dist\\index.js\n"
+    "    at Module._resolveFilename (node:internal/modules/cjs/loader:1234:15)\n"
+    "  code: 'MODULE_NOT_FOUND'\n"
+)
+
+
+# --- _npm_cache_dependency_detail -------------------------------------------
+
+def test_npm_cache_dependency_detail_parses_windows_path():
+    detail = tc._npm_cache_dependency_detail(_AJV_STDERR)
+    assert detail is not None
+    assert detail["package"] == "ajv"
+    assert detail["cache_path"] == "C:/Users/me/AppData/Local/npm-cache/_npx/abc123"
+    assert detail["missing_file"].endswith("ajv/dist/ajv.js".replace("/", "\\"))
+
+
+def test_npm_cache_dependency_detail_parses_posix_path_and_scoped_package():
+    stderr = (
+        "Error: Cannot find module "
+        "'/home/me/.npm/_npx/def456/node_modules/@modelcontextprotocol/"
+        "server-filesystem/dist/index.js'\n"
+        "  code: 'MODULE_NOT_FOUND'\n"
+    )
+    detail = tc._npm_cache_dependency_detail(stderr)
+    assert detail is not None
+    assert detail["package"] == "@modelcontextprotocol/server-filesystem"
+    assert detail["cache_path"] == "/home/me/.npm/_npx/def456"
+
+
+def test_npm_cache_dependency_detail_none_for_bare_specifier():
+    """A bare require('lodash')-style specifier (no node_modules path) means
+    the dependency was never declared — clearing the cache cannot fix that,
+    so it must NOT be classified as this failure class."""
+    assert tc._npm_cache_dependency_detail(
+        "Error: Cannot find module 'lodash'\n  code: 'MODULE_NOT_FOUND'\n"
+    ) is None
+
+
+def test_npm_cache_dependency_detail_none_for_clean_output():
+    assert tc._npm_cache_dependency_detail("Server started on port 3000") is None
+
+
+def test_npm_cache_dependency_detail_none_for_empty():
+    assert tc._npm_cache_dependency_detail("") is None
+    assert tc._npm_cache_dependency_detail(None) is None  # type: ignore[arg-type]
+
+
+# --- _dependency_file_confirmed_missing -------------------------------------
+
+def test_dependency_file_confirmed_missing_true_when_absent(tmp_path):
+    missing = tmp_path / "node_modules" / "ajv" / "dist" / "ajv.js"
+    assert tc._dependency_file_confirmed_missing(str(missing)) is True
+
+
+def test_dependency_file_confirmed_missing_false_when_present(tmp_path):
+    present = tmp_path / "ajv.js"
+    present.write_text("module.exports = {};")
+    assert tc._dependency_file_confirmed_missing(str(present)) is False
+
+
+def test_dependency_file_confirmed_missing_never_raises(monkeypatch):
+    def _boom(path):
+        raise OSError("access denied")
+    monkeypatch.setattr(tc.os.path, "exists", _boom)
+    assert tc._dependency_file_confirmed_missing("C:\\some\\path\\ajv.js") is False
+
+
+# --- _probe_missing_dependency_file -----------------------------------------
+
+def test_probe_missing_dependency_file_detects_and_confirms(monkeypatch, tmp_path):
+    """Detects the signature AND confirms the named file is really missing on
+    disk before returning a detail dict."""
+    missing_file = str(tmp_path / "node_modules" / "ajv" / "dist" / "ajv.js")
+    stderr = f"Error: Cannot find module '{missing_file}'\n  code: 'MODULE_NOT_FOUND'\n"
+
+    class _Proc:
+        returncode = 1
+        def communicate(self, timeout=None):
+            return b"", stderr.encode()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _Proc())
+
+    detail = tc._probe_missing_dependency_file(["npx", "-y", "mcp-proxy"], None, "fs")
+    assert detail is not None
+    assert detail["package"] == "ajv"
+    assert detail["missing_file"] == missing_file
+    assert "MODULE_NOT_FOUND" in detail["stderr"]
+
+
+def test_probe_missing_dependency_file_none_when_file_actually_present(monkeypatch, tmp_path):
+    """A stderr line matching the pattern but pointing at a file that DOES
+    exist on disk (stale/misleading log line) must not trigger a repair."""
+    present_file = tmp_path / "ajv.js"
+    present_file.write_text("module.exports = {};")
+    stderr = f"Error: Cannot find module '{present_file}'\n  code: 'MODULE_NOT_FOUND'\n"
+
+    class _Proc:
+        returncode = 1
+        def communicate(self, timeout=None):
+            return b"", stderr.encode()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _Proc())
+
+    assert tc._probe_missing_dependency_file(["npx", "-y", "mcp-proxy"], None, "fs") is None
+
+
+def test_probe_missing_dependency_file_none_on_clean_output(monkeypatch):
+    class _Proc:
+        returncode = 0
+        def communicate(self, timeout=None):
+            return b"listening on port 8808", b""
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _Proc())
+    assert tc._probe_missing_dependency_file(["npx", "-y", "mcp-proxy"], None, "fs") is None
+
+
+def test_probe_missing_dependency_file_none_for_long_running_process(monkeypatch):
+    import subprocess as _sp
+
+    class _LongRunningProc:
+        returncode = None
+        def communicate(self, timeout=None):
+            raise _sp.TimeoutExpired(cmd=["npx"], timeout=timeout)
+        def kill(self): pass
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _LongRunningProc())
+    assert tc._probe_missing_dependency_file(
+        ["npx", "-y", "mcp-proxy"], None, "fs", wait_seconds=0.01,
+    ) is None
+
+
+def test_probe_missing_dependency_file_none_on_popen_exception(monkeypatch):
+    def _boom(cmd, env=None, **kw):
+        raise OSError("cannot spawn")
+    monkeypatch.setattr(tc.subprocess, "Popen", _boom)
+    assert tc._probe_missing_dependency_file(["npx", "-y", "mcp-proxy"], None, "fs") is None
+
+
+# --- _spawn_with_cache_retry dependency-integrity repair path ---------------
+
+def test_spawn_with_cache_retry_dependency_missing_uses_thorough_clear_and_reports(
+    monkeypatch, tmp_path,
+):
+    """A fast-exit process that fails on a missing npx-cache dependency file
+    gets the THOROUGH clear (same remedy as TAR_ENTRY_ERROR), and the final
+    diagnostics report the cache path, package, and final stderr — without
+    ever marking anything ready (that stays _probe_slot_health's job)."""
+    missing_file = str(tmp_path / "node_modules" / "ajv" / "dist" / "ajv.js")
+    dep_detail = {
+        "missing_file": missing_file,
+        "cache_path": str(tmp_path),
+        "package": "ajv",
+        "stderr": f"Error: Cannot find module '{missing_file}'\n  code: 'MODULE_NOT_FOUND'\n",
+    }
+    thorough_called = []
+    scoped_called = []
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear_thorough",
+        lambda cmd, label="": thorough_called.append(cmd),
+    )
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear",
+        lambda cmd, label="": scoped_called.append(cmd) or True,
+    )
+    monkeypatch.setattr(
+        tc, "_probe_tar_entry_error",
+        lambda cmd, env, label, wait_seconds=5.0: False,
+    )
+    monkeypatch.setattr(
+        tc, "_probe_missing_dependency_file",
+        lambda cmd, env, label, wait_seconds=5.0: dict(dep_detail),
+    )
+    # ddd46cc8's diagnostics side-channel runs its OWN separate stderr probe
+    # (_probe_fast_exit_stderr) before the TAR/dependency checks below — mock
+    # it too so it doesn't consume one of the two counted Popen calls below.
+    monkeypatch.setattr(
+        tc, "_probe_fast_exit_stderr",
+        lambda cmd, env, wait_seconds=2.0: None,
+    )
+    monkeypatch.setattr(tc.time, "sleep", lambda n: None)
+
+    spawn_count = [0]
+    fake_proc_dead = _FakeProc2(exit_code=1)
+    fake_proc_alive = _FakeProc2(exit_code=None)
+
+    def _popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        if spawn_count[0] == 1:
+            return fake_proc_dead
+        return fake_proc_alive
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+
+    diagnostics = tc.SlotDiagnostics(slot="fs")
+    result = tc._spawn_with_cache_retry(
+        ["npx", "-y", "mcp-proxy", "--", "npx", "-y",
+         "@modelcontextprotocol/server-filesystem"],
+        None, "fs", diagnostics,
+    )
+
+    assert result is fake_proc_alive
+    assert spawn_count[0] == 2
+    assert len(thorough_called) == 1, "thorough clear must be used for a cache-integrity miss"
+    assert len(scoped_called) == 0
+
+    # Reports cache path, package, and final stderr onto diagnostics — but
+    # never claims the slot is ready (that is _probe_slot_health's exclusive
+    # job downstream in ensure_running).
+    assert diagnostics.state is tc.SlotState.DEPENDENCY_MISSING
+    assert diagnostics.state in tc._DETERMINISTIC_STATES
+    assert diagnostics.dependency_missing == "ajv"
+    # root_cause embeds the cache path via !r (repr), which escapes backslashes
+    # on Windows — compare the path's last (backslash-free) component instead
+    # of the raw str(tmp_path) to stay platform-agnostic.
+    assert tmp_path.name in diagnostics.root_cause
+    assert "cache path" in diagnostics.root_cause
+    assert "ajv" in diagnostics.root_cause
+    assert "MODULE_NOT_FOUND" in (diagnostics.stderr_summary or "")
+    assert diagnostics.state is not tc.SlotState.HEALTHY
+
+
+def test_spawn_with_cache_retry_dependency_missing_without_diagnostics_still_repairs(
+    monkeypatch, tmp_path,
+):
+    """diagnostics=None (legacy callers / earlier tests) must still get the
+    thorough-clear repair — the diagnostics side-channel is purely additive."""
+    missing_file = str(tmp_path / "node_modules" / "ajv" / "dist" / "ajv.js")
+    dep_detail = {
+        "missing_file": missing_file,
+        "cache_path": str(tmp_path),
+        "package": "ajv",
+        "stderr": "Error: Cannot find module ... code: 'MODULE_NOT_FOUND'",
+    }
+    thorough_called = []
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear_thorough",
+        lambda cmd, label="": thorough_called.append(cmd),
+    )
+    monkeypatch.setattr(tc, "_scoped_cache_clear", lambda cmd, label="": True)
+    monkeypatch.setattr(
+        tc, "_probe_tar_entry_error",
+        lambda cmd, env, label, wait_seconds=5.0: False,
+    )
+    monkeypatch.setattr(
+        tc, "_probe_missing_dependency_file",
+        lambda cmd, env, label, wait_seconds=5.0: dict(dep_detail),
+    )
+    monkeypatch.setattr(tc.time, "sleep", lambda n: None)
+
+    spawn_count = [0]
+    fake_proc_dead = _FakeProc2(exit_code=1)
+    fake_proc_alive = _FakeProc2(exit_code=None)
+
+    def _popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        return fake_proc_dead if spawn_count[0] == 1 else fake_proc_alive
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+
+    result = tc._spawn_with_cache_retry(["npx", "-y", "mcp-proxy"], None, "fs")
+    assert result is fake_proc_alive
+    assert len(thorough_called) == 1
 
 
 # ---------------------------------------------------------------------------
