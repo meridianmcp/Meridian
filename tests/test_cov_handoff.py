@@ -2717,6 +2717,55 @@ async def test_generate_handoff_capability_contract_deterministic_across_repeate
     assert _strip_goal_token(result_a["content"]) == _strip_goal_token(result_b["content"])
 
 
+async def test_generate_handoff_surfaces_blocker_policy_for_empty_critical_item(
+    db, tmp_path,
+):
+    """b108f2e0 — acceptance case 1, through the REAL MCP generate_handoff
+    dispatch: an empty-scope CRITICAL item is quarantined (not a run stop),
+    appears in the handoff's blocker_policy field as non-executable, while
+    an independent well-scoped item stays eligible.
+    """
+    p = await db_module.create_project(db, "blocker-policy-handoff")
+    empty_item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "CRITICAL tenant isolation breach",
+        notes="", priority="urgent",
+    )
+    good_item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "unrelated well-scoped fix", notes="clear repro + fix plan",
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    decision = result["blocker_policy"]
+    assert decision is not None
+    assert decision["policy"] == "quarantine_continue"
+    assert decision["run_stop"] is False
+    assert empty_item["id"] in decision["blocked_item_ids"]
+    assert decision["classifications"][empty_item["id"]] == "needs_scope"
+    assert good_item["id"] in decision["eligible_item_ids"]
+
+
+async def test_generate_handoff_blocker_policy_run_stop_when_configured(db, tmp_path):
+    """An explicit project-level run_stop policy makes even a single
+    under-scoped item halt the whole run, surfaced through the same
+    generate_handoff field.
+    """
+    p = await db_module.create_project(db, "blocker-policy-run-stop")
+    await db_module.set_project_blocker_policy(db, p["id"], "run_stop")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "under-scoped item", notes="", priority="urgent",
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    decision = result["blocker_policy"]
+    assert decision is not None
+    assert decision["run_stop"] is True
+    assert decision["eligible_item_ids"] == []
+
+
 # ---------------------------------------------------------------------------
 # (3) XML/JSON projection parity — the /goal text's typed clauses must carry
 # the SAME canonical JSON as the sibling capability_contract field, for the

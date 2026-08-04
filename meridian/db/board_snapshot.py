@@ -92,7 +92,9 @@ from meridian.db import (  # noqa: PLC0415
     get_sprint_items,
     get_sprint_item_pointers,
     parse_touches_resources,
+    get_project_blocker_policy,
 )
+from .. import blocker_policy as _blocker_policy  # b108f2e0 (typed blocker triage)
 
 
 # Fields whose change is (a) what the revision hash is sensitive to and
@@ -159,6 +161,22 @@ async def build_board_snapshot(
         ordering), wave, blocker_kind, milestone_type, track,
         prospect_bypass,
       - ``revision_hash`` — see :func:`_compute_revision_hash`.
+      - ``blocker_summary`` (b108f2e0) — the typed blocker-triage decision
+        for this same non-done item set: ``policy``, ``blocked_item_ids``,
+        ``classifications``, ``skipped_dependents``, ``eligible_item_ids``,
+        ``run_stop``/``run_stop_reason``, ``continuation_rationale`` — see
+        ``meridian.blocker_policy.classify_and_evaluate``. Derived entirely
+        from already-stored item fields (notes/touches_resources/
+        tool_requirements/depends_on/milestone_type) plus the project's
+        persisted ``executor_blocker_policy`` — no wall-clock input, so this
+        is as byte-stable as the rest of the snapshot for an unchanged board.
+        Deliberately NOT folded into ``revision_hash``/the tracked-field diff
+        above: a notes-only edit (the common case that clears a
+        ``needs_scope`` quarantine) is cosmetic by THAT hash's own design
+        (see module docstring), so ``blocker_summary`` is always freshly
+        recomputed here rather than gated behind a hash that wouldn't move
+        for the edit that matters most (acceptance case 6: resume after
+        pointer/notes repair clears quarantine deterministically).
 
     No field in the returned structure is derived from "now" at call time, so
     two calls with no intervening board change produce byte-identical
@@ -166,6 +184,14 @@ async def build_board_snapshot(
     """
     raw_items = await get_sprint_items(db, project_id, version=version)
     raw_items = [it for it in raw_items if (it.get("status") or "") != "done"]
+    try:
+        _policy_row = await get_project_blocker_policy(db, project_id, version=version)
+        blocker_summary = _blocker_policy.classify_and_evaluate(
+            raw_items, policy=_policy_row.get("policy"),
+        )
+        blocker_summary["policy_source"] = _policy_row.get("source")
+    except Exception:  # noqa: BLE001 — blocker_summary is best-effort enrichment
+        blocker_summary = None
     raw_items.sort(
         key=lambda it: (
             str(it.get("version") or ""),
@@ -210,6 +236,7 @@ async def build_board_snapshot(
         "item_count": len(items),
         "items": items,
         "revision_hash": _compute_revision_hash(items),
+        "blocker_summary": blocker_summary,
     }
 
 

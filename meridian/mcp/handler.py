@@ -3048,6 +3048,13 @@ async def _handle_task_tools(
         _docx_integrity = await handoff_module_local.build_docx_integrity_gate_for_handoff(
             db, args["project_id"], proposal_evidence=_proposal_evidence,
         )
+        # b108f2e0 — typed blocker-triage decision, emitted on every
+        # generate_handoff mode alongside the three fields above. Fully
+        # guarded — a failure degrades to no field rather than breaking the
+        # mandatory handoff.
+        _blocker_policy_decision = await handoff_module_local.build_blocker_policy_for_handoff(
+            db, args["project_id"], version=_effective_version,
+        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -3091,6 +3098,11 @@ async def _handle_task_tools(
             # artifacts this handoff covers, plus the executable/executable_reasons
             # readiness signal (see meridian.docx_integrity_gate).
             "docx_integrity": _docx_integrity,
+            # b108f2e0 — typed blocker triage: which items are quarantined/
+            # non-executable this run, why, their dependency closure, and
+            # whether the whole run must fail closed (see
+            # meridian.blocker_policy / db.evaluate_board_blockers).
+            "blocker_policy": _blocker_policy_decision,
             # b8f89491 — machine-readable scope: which sprint-version bucket
             # this handoff actually resolved to, and why (explicit argument vs.
             # session-derived vs. unscoped). effective_version is None when the

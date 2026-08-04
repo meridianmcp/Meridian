@@ -6241,6 +6241,46 @@ async def build_effective_capability_contract(
         return None
 
 
+async def build_blocker_policy_for_handoff(
+    db: Any, project_id: str, *,
+    version: "str | None" = None,
+    pending_items: "list[dict[str, Any]] | None" = None,
+) -> "dict[str, Any] | None":
+    """b108f2e0 — thin, fully-guarded wrapper over
+    ``db.evaluate_board_blockers``, mirroring
+    :func:`build_effective_capability_contract`'s wrapper style so this is
+    emitted alongside every ``generate_handoff`` mode the same way that
+    field and the docx-integrity/proposal-evidence fields already are.
+
+    Surfaces the typed blocker-triage decision (``policy``,
+    ``blocked_item_ids``, ``classifications``, ``evidence_status``,
+    ``skipped_dependents``, ``quarantined_item_ids``, ``eligible_item_ids``,
+    ``run_stop``/``run_stop_reason``, ``continuation_rationale``) so a
+    receiving session (or a corrective handoff) can see WHICH items are
+    non-executable and WHY without re-deriving it from prose — directly
+    answers acceptance case 1 of the sprint-item spec ("appears in the
+    handoff as non-executable").
+
+    ``pending_items`` lets a caller that already fetched the live item list
+    for this request (e.g. the SAME pending-item fetch capability_contract's
+    ``item_tool_requirements`` section uses) pass it straight through
+    instead of a second DB round-trip — mirrors
+    ``capability_contract.build_capability_contract``'s own ``items`` kwarg.
+    When omitted, ``evaluate_board_blockers`` self-fetches every non-``done``
+    item, scoped to ``version``.
+
+    Returns ``None`` on any failure (missing project, DB error, corrupted
+    stored policy already degrades internally rather than raising) — a
+    generate_handoff call must never break over this best-effort field.
+    """
+    try:
+        return await db_module.evaluate_board_blockers(
+            db, project_id, version=version, items=pending_items,
+        )
+    except Exception:  # noqa: BLE001 — blocker policy is best-effort enrichment
+        return None
+
+
 async def build_proposal_evidence_for_handoff(
     db: Any, project_id: str, *, limit: int = 10,
 ) -> "list[dict[str, Any]] | None":

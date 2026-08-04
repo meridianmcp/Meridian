@@ -117,6 +117,7 @@ class Dispatcher:
         version: str | None = None,
         enqueue_fn: EnqueueFn | None = None,
         get_groups_fn: Callable[..., Awaitable[dict[str, Any]]] | None = None,
+        evaluate_blockers_fn: Callable[..., Awaitable[dict[str, Any]]] | None = None,
     ) -> None:
         self.db = db
         self.project_id = project_id
@@ -153,6 +154,10 @@ class Dispatcher:
         # Injectable seams for testing — default to the real primitives.
         self._enqueue = enqueue_fn or enqueue_module.enqueue_claude_task
         self._get_groups = get_groups_fn or db_module.get_parallelizable_groups
+        # b108f2e0 — typed blocker triage seam: default to the real DB-backed
+        # evaluator. Injectable so tests can assert dispatch_once's
+        # quarantine/run-stop behavior without a real board.
+        self._evaluate_blockers = evaluate_blockers_fn or db_module.evaluate_board_blockers
         # Event the loop awaits with a timeout; set() forces an immediate pass.
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -168,6 +173,9 @@ class Dispatcher:
         # configured_target, resource_safe_capacity, limiting_reason). None
         # until the first dispatch_once() pass with a non-empty board.
         self.last_parallelism: dict[str, Any] | None = None
+        # b108f2e0 — last blocker-triage decision this dispatcher observed,
+        # for introspection/tests. None until the first dispatch_once pass.
+        self.last_blocker_decision: dict[str, Any] | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -241,7 +249,44 @@ class Dispatcher:
         dispatched in this process, and stops once the pass's deterministic
         ``effective_parallelism`` (see ``executor_config.resolve_parallelism``)
         is reached so the number of live workers stays bounded.
+
+        b108f2e0 — typed blocker triage runs BEFORE any enqueue this pass:
+
+        * A fail-closed blocker (``run_stop=True`` — verified_security /
+          integrity_corruption / run_global_blocker, or an explicit
+          project ``run_stop`` policy) stops this dispatcher entirely
+          (``self._stopped = True``) and enqueues nothing, mirroring the
+          spec's "preserve explicit fail-closed stops" requirement.
+        * Otherwise, any item in ``quarantined_item_ids`` is SKIPPED (never
+          enqueued) but does NOT stop the pass — other, disjoint items in
+          the same group still dispatch normally. This is the actual fix
+          for the incident this module exists for: one under-scoped item
+          no longer halts an otherwise-executable autonomous run.
+
+        Best-effort: a failure evaluating blockers degrades to "no
+        quarantine this pass" (dispatch proceeds unfiltered) rather than
+        ever silently stopping the dispatcher over an enrichment failure —
+        only an ACTUAL fail-closed classification stops it.
         """
+        try:
+            decision = await self._evaluate_blockers(
+                self.db, self.project_id, version=self.version,
+            )
+        except Exception:  # noqa: BLE001 — blocker triage must never break dispatch
+            logger.exception("blocker-policy evaluation failed; dispatching unfiltered")
+            decision = None
+        self.last_blocker_decision = decision
+
+        if decision and decision.get("run_stop"):
+            logger.warning(
+                "dispatcher halted by fail-closed blocker policy: %s",
+                decision.get("run_stop_reason"),
+            )
+            self._stopped = True
+            return []
+
+        quarantined = set((decision or {}).get("quarantined_item_ids") or [])
+
         result = await self._get_groups(self.db, self.project_id, self.version)
         groups = (result or {}).get("groups") or []
         if not groups:
@@ -280,6 +325,10 @@ class Dispatcher:
         for item in first_group:
             item_id = item.get("id")
             if not item_id or item_id in self._dispatched:
+                continue
+            if item_id in quarantined:
+                # Quarantined — skip THIS item only; other disjoint items in
+                # the group keep dispatching normally (quarantine_continue).
                 continue
             if in_flight >= cap:
                 break

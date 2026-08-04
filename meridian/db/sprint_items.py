@@ -31,11 +31,13 @@ from meridian.db import (  # noqa: PLC0415
     _resource_sets_conflict,
     get_executor_config,
     get_project,
+    set_executor_config,
 )
 from .. import tool_requirements as _tool_requirements  # 76dde31f (665 follow-up)
 from .. import artifact_declaration as _artifact_declaration  # 2f9cb288 (665 follow-up)
 from .. import executor_config as _executor_config  # 99c0c1be — parallelism diagnostics
 from .. import continuation_gate as _continuation_gate  # ecc8b280
+from .. import blocker_policy as _blocker_policy  # b108f2e0 (typed blocker triage)
 
 
 # ---------------------------------------------------------------------------
@@ -5583,3 +5585,167 @@ async def _get_blocking_wave_gate(
             _blocking = _cfg
             _blocking_num = _cfg_num
     return _blocking
+
+
+# ---------------------------------------------------------------------------
+# b108f2e0 — typed blocker triage: project-configurable executor_blocker_policy
+# persistence + DB-backed evaluation, layered on the pure meridian.blocker_policy
+# module. Stored inside the EXISTING executor_config JSON blob (no new table /
+# migration needed — mirrors how test_cmd and other free-form executor knobs
+# already persist) under the "blocker_policy" key, shaped as either a plain
+# string (project-wide default) or {"default": str, "by_version": {v: str}}
+# once a caller sets a version-scoped override. Auditable via the EXISTING
+# append-only action_audit_log table (record_action_audit_event) — no new
+# audit storage either.
+# ---------------------------------------------------------------------------
+
+_BLOCKER_POLICY_CONFIG_KEY = "blocker_policy"
+
+
+def _resolve_stored_blocker_policy(raw: Any, *, version: "str | None") -> tuple[Any, str]:
+    """Resolve the raw ``executor_config["blocker_policy"]`` value for one
+    ``version`` bucket. Returns ``(value, source)`` where ``source`` is
+    ``"version"`` (an explicit per-version override matched), ``"default"``
+    (the project-wide default applied), or ``"unset"`` (nothing stored at
+    all — caller falls back to ``blocker_policy.DEFAULT_POLICY``).
+    """
+    if isinstance(raw, dict):
+        by_version = raw.get("by_version")
+        if version and isinstance(by_version, dict) and version in by_version:
+            return by_version[version], "version"
+        if "default" in raw:
+            return raw.get("default"), "default"
+        return None, "unset"
+    if isinstance(raw, str):
+        return raw, "default"
+    return None, "unset"
+
+
+async def get_project_blocker_policy(
+    db: aiosqlite.Connection, project_id: str, *, version: "str | None" = None
+) -> dict[str, Any]:
+    """Return the effective ``executor_blocker_policy`` for a project (b108f2e0).
+
+    A project that never configured one gets :data:`blocker_policy.DEFAULT_POLICY`
+    back, never an error — mirrors ``get_project_capability_manifest``'s "no
+    manifest -> empty profile" contract. A corrupted/invalid stored value
+    (should not happen — ``set_project_blocker_policy`` validates at write
+    time — but defends against a hand-edited DB row) degrades to the safe
+    default rather than raising, since this is a READ path other mandatory
+    calls (board snapshots, handoffs) depend on.
+    """
+    cfg = await get_executor_config(db, project_id)
+    raw = cfg.get(_BLOCKER_POLICY_CONFIG_KEY)
+    value, source = _resolve_stored_blocker_policy(raw, version=version)
+    try:
+        normalized = _blocker_policy.normalize_policy(value)
+    except _blocker_policy.BlockerPolicyError:
+        normalized = _blocker_policy.DEFAULT_POLICY
+        source = "unset"
+    if value is None:
+        source = "unset"
+    return {
+        "project_id": project_id,
+        "version": version,
+        "policy": normalized,
+        "source": source,
+    }
+
+
+async def set_project_blocker_policy(
+    db: aiosqlite.Connection,
+    project_id: str,
+    policy: str,
+    *,
+    version: "str | None" = None,
+    actor: "str | None" = None,
+) -> dict[str, Any]:
+    """Validate, persist, and audit-log a project's ``executor_blocker_policy``
+    (b108f2e0). Raises ``blocker_policy.BlockerPolicyError`` for an invalid
+    policy value, ``ValueError`` if the project does not exist (surfaced by
+    the underlying ``set_executor_config`` -> ``update_project_settings``
+    call).
+
+    ``version`` (optional) scopes the override to one sprint-version bucket,
+    leaving the project-wide default (and any OTHER version's override)
+    untouched — the executor_config blob is READ, merged, and WRITTEN BACK
+    whole (``set_executor_config`` replaces the entire blob, so a naive write
+    here would silently drop unrelated keys like ``test_cmd``).
+    """
+    normalized = _blocker_policy.normalize_policy(policy)
+    cfg = await get_executor_config(db, project_id)
+    raw = cfg.get(_BLOCKER_POLICY_CONFIG_KEY)
+    stored: dict[str, Any] = dict(raw) if isinstance(raw, dict) else (
+        {"default": raw} if isinstance(raw, str) else {}
+    )
+    if version:
+        by_version = dict(stored.get("by_version") or {})
+        by_version[version] = normalized
+        stored["by_version"] = by_version
+    else:
+        stored["default"] = normalized
+    new_cfg = dict(cfg)
+    new_cfg[_BLOCKER_POLICY_CONFIG_KEY] = stored
+    await set_executor_config(db, project_id, new_cfg)
+    try:
+        # Lazy import: record_action_audit_event lives in .workspace, which
+        # itself imports names FROM this module (_sprint_item_slug_base /
+        # _sprint_item_nickname_base) — a top-level import here would be
+        # circular at package-init time. Safe at call time, long after both
+        # modules have finished loading (mirrors capability_contract.py's own
+        # lazy `from . import executor_contract` pattern).
+        from . import workspace as _workspace_module  # noqa: PLC0415
+
+        await _workspace_module.record_action_audit_event(
+            db,
+            "blocker_policy_set",
+            project_id=project_id,
+            actor=actor,
+            detail=json.dumps({"policy": normalized, "version": version}),
+        )
+    except Exception:  # noqa: BLE001 — a dropped audit entry must not break the write
+        pass
+    return await get_project_blocker_policy(db, project_id, version=version)
+
+
+async def evaluate_board_blockers(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    version: "str | None" = None,
+    items: "list[dict[str, Any]] | None" = None,
+    signals: "dict[str, dict[str, Any]] | None" = None,
+) -> dict[str, Any]:
+    """DB-backed whole-run blocker decision for a project (b108f2e0):
+    fetches the live (non-done) board, the project's configured
+    ``executor_blocker_policy``, and combines them via the pure
+    ``blocker_policy.classify_and_evaluate`` combinator.
+
+    ``items`` lets a caller that already fetched the SAME live-item list
+    (e.g. ``build_board_snapshot``'s own ``raw_items``, or a handoff's
+    pending-item fetch) pass it straight through instead of this function
+    re-querying — the strongest identical-data guarantee, mirroring
+    ``capability_contract.build_capability_contract``'s own ``items`` kwarg.
+    When omitted, self-fetches every non-``done`` item for ``project_id``
+    (optionally scoped to ``version``), matching
+    ``board_snapshot.build_board_snapshot``'s own "non-done is deliberately
+    literal" filter so the two agree on what's "live" for the same board.
+
+    ``signals`` is passed straight through to
+    ``blocker_policy.classify_and_evaluate`` — per-item classification
+    overrides (dependency/tool/security/etc. signals) a caller has already
+    verified. Never raises: a malformed stored policy degrades to the safe
+    default (see :func:`get_project_blocker_policy`); this function itself
+    has no additional failure mode beyond the DB fetch, which callers should
+    still guard per this codebase's "best-effort enrichment" convention.
+    """
+    live_items = items
+    if live_items is None:
+        raw_items = await get_sprint_items(db, project_id, version=version)
+        live_items = [it for it in raw_items if (it.get("status") or "") != "done"]
+    policy_row = await get_project_blocker_policy(db, project_id, version=version)
+    decision = _blocker_policy.classify_and_evaluate(
+        live_items, signals=signals, policy=policy_row["policy"]
+    )
+    decision["policy_source"] = policy_row.get("source")
+    return decision
