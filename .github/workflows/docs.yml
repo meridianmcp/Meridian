@@ -9,6 +9,16 @@ on:
       - 'mkdocs.yml'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
+    inputs:
+      sha:
+        description: >-
+          Exact commit SHA to build and deploy. Set by deploy.yml's
+          post-promotion dispatch (see auto-promote/merge-to-main jobs there)
+          so docs always publish the precise merged commit, never a
+          possibly-since-advanced main tip. Leave blank for an ad-hoc manual
+          run (builds whatever is currently at the tip of the selected ref).
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -22,8 +32,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.sha || github.ref }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Confirm exact commit when a SHA was pinned
+        # Only meaningful for the workflow_dispatch(sha=...) path deploy.yml
+        # uses after a dev->main promotion; a no-op on the normal `push`
+        # trigger (inputs.sha is empty there). Guards against a race where
+        # main advanced between the merge and this dispatch actually running.
+        if: inputs.sha != ''
+        run: |
+          ACTUAL=$(git rev-parse HEAD)
+          if [ "$ACTUAL" != "${{ inputs.sha }}" ]; then
+            echo "::error::Checked out $ACTUAL but was asked to build exact SHA ${{ inputs.sha }}"
+            exit 1
+          fi
+          echo "Building docs for exact SHA $ACTUAL (pinned by deploy.yml dispatch)"
 
       - name: Set up Python
         uses: actions/setup-python@v5
