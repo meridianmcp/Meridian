@@ -17642,37 +17642,46 @@ async def test_list_plugins_enabled_reflects_tenant_config(db, tmp_path):
     """3751af82 — list_plugins.enabled must match the tenant's resolved plugin
     config, not the static BUILTIN_PLUGINS default.
 
-    Opt-in slots (word, powerpoint) have enabled=False in the static defaults.
-    A tenant who has enabled them in tunnel_plugins should see enabled=True —
-    consistent with active/invocable which are derived from live WebSocket state.
-    This test uses no tunnel (so active/invocable stay False), but verifies that
-    enabled reflects the tenant's override rather than the static default.
+    Opt-in slots (desktop-commander, powerpoint) have enabled=False in the
+    static defaults. A tenant who has enabled one in tunnel_plugins should see
+    enabled=True — consistent with active/invocable which are derived from live
+    WebSocket state. This test uses no tunnel (so active/invocable stay False),
+    but verifies that enabled reflects the tenant's override rather than the
+    static default.
+
+    4b26c2ef — this originally used the `word` slot as its subject; word is now
+    RETIRED (resolve_plugins forces its enabled to False unconditionally, even
+    with an explicit tenant override — see
+    test_word_stays_off_despite_explicit_enable_override in
+    tests/test_tunnel_plugins.py for that dedicated regression coverage), so it
+    can no longer demonstrate "override wins over static default". Swapped to
+    desktop-commander, an opt-in slot that is not retired.
     """
     import json
     from meridian.mcp.handler import _dispatch_mcp_tool
 
-    # Tenant with word slot explicitly enabled in their tunnel_plugins config
-    tenant_with_word_enabled = {
+    # Tenant with desktop-commander slot explicitly enabled in their tunnel_plugins config
+    tenant_with_dc_enabled = {
         "id": "test-tenant-3751af82",
-        "tunnel_plugins": json.dumps({"word": {"enabled": True}}),
+        "tunnel_plugins": json.dumps({"desktop-commander": {"enabled": True}}),
         "tunnel_active": 0,
     }
 
     result = await _dispatch_mcp_tool(
-        "list_plugins", {}, db, str(tmp_path), tenant=tenant_with_word_enabled
+        "list_plugins", {}, db, str(tmp_path), tenant=tenant_with_dc_enabled
     )
     plugins = result["plugins"]
-    word_entry = next((p for p in plugins if p["name"] == "word"), None)
-    assert word_entry is not None, "word plugin entry missing from list_plugins"
+    dc_entry = next((p for p in plugins if p["name"] == "desktop-commander"), None)
+    assert dc_entry is not None, "desktop-commander plugin entry missing from list_plugins"
 
     # enabled must reflect the tenant's override (True), not the static default (False)
-    assert word_entry["enabled"] is True, (
-        "word plugin enabled should be True (tenant override) but got "
-        f"{word_entry['enabled']!r} — static BUILTIN_PLUGINS default was used instead"
+    assert dc_entry["enabled"] is True, (
+        "desktop-commander plugin enabled should be True (tenant override) but got "
+        f"{dc_entry['enabled']!r} — static BUILTIN_PLUGINS default was used instead"
     )
     # active/invocable stay False since no tunnel is connected in this test
-    assert word_entry["active"] is False
-    assert word_entry["invocable"] is False
+    assert dc_entry["active"] is False
+    assert dc_entry["invocable"] is False
 
 
 @pytest.mark.asyncio
@@ -17727,21 +17736,27 @@ async def test_list_plugins_enabled_consistent_with_active_invocable(db, tmp_pat
 async def test_get_plugin_details_enabled_reflects_tenant_config(db, tmp_path):
     """4c61ae81 — get_plugin_details.enabled must match the tenant's resolved
     plugin config, not the static BUILTIN_PLUGINS default (the same bug
-    3751af82 fixed for list_plugins only)."""
+    3751af82 fixed for list_plugins only).
+
+    4b26c2ef — swapped subject from `word` (now RETIRED — forced enabled=False
+    unconditionally, see tests/test_tunnel_plugins.py) to desktop-commander, a
+    still-overridable opt-in slot, so this keeps demonstrating the general
+    "override wins over static default" invariant.
+    """
     import json
     from meridian.mcp.handler import _dispatch_mcp_tool
 
-    tenant_with_word_enabled = {
+    tenant_with_dc_enabled = {
         "id": "test-tenant-4c61ae81-gpd",
-        "tunnel_plugins": json.dumps({"word": {"enabled": True}}),
+        "tunnel_plugins": json.dumps({"desktop-commander": {"enabled": True}}),
         "tunnel_active": 0,
     }
     result = await _dispatch_mcp_tool(
-        "get_plugin_details", {"name": "word"}, db, str(tmp_path),
-        tenant=tenant_with_word_enabled,
+        "get_plugin_details", {"name": "desktop-commander"}, db, str(tmp_path),
+        tenant=tenant_with_dc_enabled,
     )
     assert result["enabled"] is True, (
-        "word plugin enabled should be True (tenant override) but got "
+        "desktop-commander plugin enabled should be True (tenant override) but got "
         f"{result['enabled']!r} — static BUILTIN_PLUGINS default was used instead"
     )
 

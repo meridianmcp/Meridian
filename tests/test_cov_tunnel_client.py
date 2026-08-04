@@ -2516,10 +2516,19 @@ def test_office_slot_spawn_env_encoding_survives_nonascii_log_line(monkeypatch):
         chinese_log.encode("cp1252")
 
 
-def test_run_tunnel_word_slot_child_gets_utf8_stdio_env(monkeypatch, tmp_path):
-    """End-to-end: enabling the `word` slot spawns docx-mcp with PYTHONIOENCODING=
-    utf-8:replace + PYTHONUTF8=1 in the child env (2b04a361). The office spawn env
-    must carry the UTF-8 override alongside the plugin's own MCP_AUTHOR env."""
+def test_run_tunnel_office_slot_child_gets_utf8_stdio_env(monkeypatch, tmp_path):
+    """End-to-end: enabling the `powerpoint` slot spawns powerpoint-mcp with
+    PYTHONIOENCODING=utf-8:replace + PYTHONUTF8=1 in the child env (2b04a361).
+    The office spawn env must carry the UTF-8 override alongside the plugin's
+    own env vars.
+
+    4b26c2ef — this used to exercise the `word` slot (docx-mcp), but word is
+    now RETIRED: resolve_plugins() forces its `enabled` to False
+    unconditionally, so it can no longer be lazy-spawned via config at all —
+    swapped to `powerpoint`, a still-overridable office slot, to keep this
+    end-to-end UTF-8-env coverage alive. The tenant config below also keeps a
+    `word: {enabled: true}` entry alongside it, asserting the companion
+    regression: even with an explicit enable, word must NOT spawn."""
     _stub_run_tunnel_spawn(monkeypatch)
 
     # Capture the env each Popen is handed (FakeProc only records cmd).
@@ -2543,6 +2552,8 @@ def test_run_tunnel_word_slot_child_gets_utf8_stdio_env(monkeypatch, tmp_path):
         AsyncMock(return_value={
             "tenant_id": "tid-word", "plan": "pro",
             "tunnel_plugins_config": [
+                {"name": "powerpoint", "enabled": True},
+                # 4b26c2ef — retired: must be ignored even though explicitly enabled.
                 {"name": "word", "enabled": True},
             ],
         }),
@@ -2552,18 +2563,24 @@ def test_run_tunnel_word_slot_child_gets_utf8_stdio_env(monkeypatch, tmp_path):
     rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
     assert rc == 0
 
-    # Find the docx-mcp (word slot) spawn and inspect its env.
+    # Find the powerpoint-mcp (powerpoint slot) spawn and inspect its env.
+    ppt_spawns = [
+        s for s in spawned
+        if any("powerpoint-mcp" in str(t) for t in s["cmd"])
+    ]
+    assert ppt_spawns, "powerpoint slot (powerpoint-mcp) was not spawned"
+    env = ppt_spawns[0]["env"]
+    assert env is not None, "powerpoint slot spawned with inherited env — UTF-8 not forced"
+    assert env.get("PYTHONIOENCODING") == "utf-8:replace"
+    assert env.get("PYTHONUTF8") == "1"
+
+    # 4b26c2ef — word is RETIRED: forced off regardless of the explicit
+    # `enabled: true` above, so docx-mcp must never spawn at all.
     word_spawns = [
         s for s in spawned
         if any("docx-mcp" in str(t) for t in s["cmd"])
     ]
-    assert word_spawns, "word slot (docx-mcp) was not spawned"
-    env = word_spawns[0]["env"]
-    assert env is not None, "word slot spawned with inherited env — UTF-8 not forced"
-    assert env.get("PYTHONIOENCODING") == "utf-8:replace"
-    assert env.get("PYTHONUTF8") == "1"
-    # The plugin's own env is preserved alongside the encoding override.
-    assert env.get("MCP_AUTHOR") == "Adam"
+    assert not word_spawns, "retired word slot (docx-mcp) was spawned despite being retired"
 
 
 def test_run_tunnel_command_overrides_and_index(monkeypatch, tmp_path):

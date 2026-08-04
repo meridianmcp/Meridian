@@ -226,6 +226,18 @@ BUILTIN_PLUGINS: list[dict[str, Any]] = [
         "enabled": False,
         "builtin": True,
         "core": False,
+        # 4b26c2ef (2026-07-29 trace) — RETIRED: resolve_plugins() forces this
+        # slot's resolved `enabled` to False unconditionally — even when a
+        # tenant's stored tunnel_plugins override explicitly sets
+        # `enabled: true`, and even when detect_office_binaries() finds
+        # docx-mcp on PATH. The descriptor is kept here (command/port/env/etc.
+        # still resolve normally) purely for route/backward compatibility —
+        # routes/tunnel.py still serves the fixed /word route rather than
+        # 404ing an old client — it is just never spawned. Use the `docs` slot
+        # (meridian-docs) for Meridian-aware DOCX work instead. See
+        # migrate_retired_overrides() below for the accompanying cleanup of
+        # stale per-tenant/per-host `word: {enabled: true}` overrides.
+        "retired": True,
         # ba02a1f7 — swapped word-mcp-live -> docx-mcp-server. 5b065c2e —
         # swapped docx-mcp-server -> docx-mcp: the `uvx docx-mcp` package spawns a
         # real MCP stdio server (self-reports name "FinalCompleteDocxProcessor"
@@ -1227,6 +1239,15 @@ def resolve_plugins(raw_config: Any, detected_slots: Any = frozenset()) -> list[
         # Auto-enable a detected slot unless the user explicitly chose enabled.
         if base["slot"] in detected_slots and "enabled" not in ov:
             merged["enabled"] = True
+        # 4b26c2ef — a built-in marked `"retired": True` (currently just
+        # `word`/docx-mcp) is forced OFF here, last — after both the tenant
+        # override merge above and the detected_slots auto-enable — so neither
+        # an explicit `enabled: true` override nor detect_office_binaries()
+        # finding docx-mcp on PATH can re-activate it. Everything else about
+        # the resolved descriptor (command/port/env/stale_override flag/etc.)
+        # still resolves normally; only `enabled` is pinned.
+        if base.get("retired"):
+            merged["enabled"] = False
         # slot / url_prefix are immutable for built-ins.
         merged["slot"] = base["slot"]
         merged["url_prefix"] = base["url_prefix"]
@@ -1271,6 +1292,72 @@ def resolve_plugins(raw_config: Any, detected_slots: Any = frozenset()) -> list[
         merged.pop("previous_defaults", None)  # internal — don't leak to clients
         resolved.append(merged)
     return resolved
+
+
+def retired_plugin_names() -> "frozenset[str]":
+    """4b26c2ef — names of built-ins marked ``"retired": True`` in
+    :data:`BUILTIN_PLUGINS` — forced permanently OFF by :func:`resolve_plugins`
+    regardless of tenant override or PATH-based auto-detection. Currently just
+    ``word`` (docx-mcp). Derived from the registry (not a hardcoded literal) so a
+    future retirement extends :func:`migrate_retired_overrides` automatically.
+    """
+    return frozenset(p["name"] for p in BUILTIN_PLUGINS if p.get("retired"))
+
+
+def migrate_retired_overrides(raw_config: Any) -> "tuple[Any, bool]":
+    """4b26c2ef — clean a stale ``enabled: true`` override for a RETIRED built-in
+    slot (currently just ``word``) out of a stored tenant/per-host config.
+
+    :func:`resolve_plugins` already force-disables :func:`retired_plugin_names`
+    unconditionally, so an old ``{"word": {"enabled": true}}`` override sitting in
+    a tenant's persisted ``tunnel_plugins`` / ``tunnel_plugins_by_host`` blob is
+    inert — it never takes effect — but nothing removes it, so it round-trips
+    through the dashboard (and gets re-persisted) forever. This does that at the
+    source:
+
+    * Any retired-slot entry with a truthy ``enabled`` has it flipped to
+      ``False`` — the entry itself is kept (not dropped), so a saved
+      ``command``/``env`` survives in case the slot is ever un-retired.
+    * If that flip fires and the config has no explicit ``meridian-docs`` entry
+      yet, an ``{"enabled": true}`` entry for it is appended — carrying the
+      tenant's original intent ("I wanted DOCX tooling on") over to the slot
+      that replaces word for Meridian-aware DOCX work.
+    * Anything else (no retired-slot entry present, or one already
+      ``enabled: false``/unset) is returned completely unchanged.
+
+    Returns ``(migrated_config, changed)``. ``migrated_config`` preserves the
+    caller's original shape (list-of-dicts vs. dict-keyed) so it can be persisted
+    back verbatim in place of the input; ``changed`` is ``False`` whenever
+    nothing needed migrating, so a call site can skip a no-op DB write. Pure — no
+    I/O, no subprocess.
+    """
+    items = _iter_plugin_items(raw_config)
+    if not items:
+        return raw_config, False
+
+    retired = retired_plugin_names()
+    changed = False
+    out_items: list[dict] = []
+    names_seen: set[str] = set()
+    for it in items:
+        name = str(it.get("name") or "").strip()
+        names_seen.add(name)
+        if name in retired and bool(it.get("enabled")):
+            it = {**it, "enabled": False}
+            changed = True
+        out_items.append(it)
+
+    if changed and "meridian-docs" not in names_seen:
+        out_items.append({"name": "meridian-docs", "enabled": True})
+
+    if isinstance(raw_config, list):
+        return out_items, changed
+    # Dict-keyed shape in -> dict-keyed shape out ({name: {..without "name"..}}).
+    out_dict: dict[str, Any] = {}
+    for it in out_items:
+        nm = it["name"]
+        out_dict[nm] = {k: v for k, v in it.items() if k != "name"}
+    return out_dict, changed
 
 
 def parse_plugins_by_host(raw: Any) -> dict[str, Any]:
@@ -1325,7 +1412,13 @@ def detect_office_binaries(which: Any = None) -> set[str]:
 
 
 def active_plugins(raw_config: Any, detected_slots: Any = frozenset()) -> list[dict]:
-    """:func:`resolve_plugins` filtered to the enabled entries."""
+    """:func:`resolve_plugins` filtered to the enabled entries.
+
+    4b26c2ef — a retired built-in (currently ``word``) can never appear here:
+    :func:`resolve_plugins` forces its resolved ``enabled`` to ``False``
+    unconditionally before this filter ever runs, regardless of ``raw_config``
+    or ``detected_slots``.
+    """
     return [p for p in resolve_plugins(raw_config, detected_slots) if p.get("enabled")]
 
 

@@ -136,10 +136,13 @@ def test_active_plugins_filters_disabled():
     assert [p["name"] for p in tp.active_plugins(None)] == default_on
     # Sanity: the default-on set is precisely the three core code/fs slots today.
     assert default_on == ["filesystem", "code-intel", "code-extractor"]
-    # Disabling another slot drops it; enabling word adds it (order preserved).
-    cfg = {"code-extractor": {"enabled": False}, "word": {"enabled": True}}
+    # Disabling another slot drops it; enabling powerpoint adds it (order
+    # preserved). (4b26c2ef: this used to exercise `word`, but word is now
+    # RETIRED and can never appear here — see test_active_plugins_never_
+    # includes_retired_word below for that dedicated coverage.)
+    cfg = {"code-extractor": {"enabled": False}, "powerpoint": {"enabled": True}}
     assert [p["name"] for p in tp.active_plugins(cfg)] == [
-        "filesystem", "code-intel", "word"
+        "filesystem", "code-intel", "powerpoint"
     ]
 
 
@@ -326,7 +329,12 @@ def test_office_plugins_enableable_and_overridable():
     ppt = tp.plugin_by_slot(cfg, "ppt")
     word = tp.plugin_by_slot(cfg, "word")
     assert ppt["enabled"] is True and ppt["port"] == 9000
-    assert word["enabled"] is True and word["command"] == ["uvx", "word-mcp-live", "--debug"]
+    # 4b26c2ef — word is RETIRED: `enabled` is forced False unconditionally even
+    # with an explicit `enabled: true` override (see the dedicated "Retired slot"
+    # test section below for full coverage). Non-enabled override fields (like
+    # `command`) still merge normally — only `enabled` is pinned.
+    assert word["enabled"] is False
+    assert word["command"] == ["uvx", "word-mcp-live", "--debug"]
     # word keeps its default env unless overridden.
     assert word["env"] == {"MCP_AUTHOR": "Adam", "MCP_AUTHOR_INITIALS": "AC"}
 
@@ -359,9 +367,137 @@ def test_resolve_detection_respects_explicit_disable():
 
 
 def test_resolve_detection_keeps_explicit_enable_without_binary():
-    cfg = {"word": {"enabled": True}}
+    # 4b26c2ef: this used to exercise `word`, but word is now RETIRED and stays
+    # off even with an explicit enable (see the "Retired slot" section below) —
+    # ppt exercises the same "explicit enable persists without detection"
+    # behavior on a non-retired opt-in slot.
+    cfg = {"powerpoint": {"enabled": True}}
     by_slot = {p["slot"]: p for p in tp.resolve_plugins(cfg, detected_slots=set())}
-    assert by_slot["word"]["enabled"] is True
+    assert by_slot["ppt"]["enabled"] is True
+
+
+# ---------------------------------------------------------------------------
+# 4b26c2ef — retired word slot: force-disabled + stale-override cleanup
+# ---------------------------------------------------------------------------
+
+def test_word_marked_retired_in_registry():
+    """The BUILTIN_PLUGINS descriptor itself carries the retirement marker, and
+    is discoverable via retired_plugin_names()."""
+    word_base = next(p for p in tp.BUILTIN_PLUGINS if p["name"] == "word")
+    assert word_base.get("retired") is True
+    assert tp.retired_plugin_names() == frozenset({"word"})
+    # No other built-in is (yet) retired.
+    for p in tp.BUILTIN_PLUGINS:
+        if p["name"] != "word":
+            assert not p.get("retired")
+
+
+def test_word_stays_off_despite_explicit_enable_override():
+    """resolve_plugins() forces the retired word slot's `enabled` to False even
+    when a tenant's stored override explicitly requests `enabled: true` — the
+    descriptor is otherwise kept intact (route/backward compatibility)."""
+    by_slot = {p["slot"]: p for p in tp.resolve_plugins({"word": {"enabled": True}})}
+    assert by_slot["word"]["enabled"] is False
+    assert by_slot["word"]["retired"] is True
+    # The rest of the descriptor still resolves normally.
+    assert by_slot["word"]["name"] == "word"
+    assert by_slot["word"]["url_prefix"] == "/word"
+    assert by_slot["word"]["port"] == tp.DEFAULT_WORD_PORT
+
+
+def test_word_stays_off_even_when_docx_mcp_detected_on_path():
+    """Retirement also overrides the PATH-based auto-enable: even when
+    detect_office_binaries() would report `word` as detected, resolve_plugins()
+    keeps it off — while an unrelated, non-retired sibling slot (ppt) still
+    auto-enables normally from the same detected_slots set."""
+    by_slot = {
+        p["slot"]: p for p in tp.resolve_plugins(None, detected_slots={"word", "ppt"})
+    }
+    assert by_slot["word"]["enabled"] is False
+    assert by_slot["ppt"]["enabled"] is True
+
+
+def test_word_stays_off_with_both_override_and_detection():
+    """Belt-and-suspenders: explicit enable override AND PATH detection
+    together still cannot re-activate a retired slot."""
+    cfg = {"word": {"enabled": True}}
+    by_slot = {p["slot"]: p for p in tp.resolve_plugins(cfg, detected_slots={"word"})}
+    assert by_slot["word"]["enabled"] is False
+
+
+def test_active_plugins_never_includes_retired_word():
+    cfg = {"word": {"enabled": True}}
+    names = [p["name"] for p in tp.active_plugins(cfg, detected_slots={"word"})]
+    assert "word" not in names
+
+
+def test_migrate_retired_overrides_noop_when_nothing_stale():
+    # No config at all.
+    assert tp.migrate_retired_overrides(None) == (None, False)
+    assert tp.migrate_retired_overrides({}) == ({}, False)
+    assert tp.migrate_retired_overrides([]) == ([], False)
+    # A word override that is already disabled (or has no `enabled` key at all)
+    # needs no migration.
+    cfg = {"word": {"enabled": False}}
+    assert tp.migrate_retired_overrides(cfg) == (cfg, False)
+    cfg2 = {"word": {"command": ["uvx", "docx-mcp"]}}
+    assert tp.migrate_retired_overrides(cfg2) == (cfg2, False)
+    # An unrelated override is untouched.
+    cfg3 = {"powerpoint": {"enabled": True}}
+    assert tp.migrate_retired_overrides(cfg3) == (cfg3, False)
+
+
+def test_migrate_retired_overrides_dict_form_flips_enabled_and_adds_docs():
+    cfg = {"word": {"enabled": True, "command": ["uvx", "docx-mcp"]}}
+    migrated, changed = tp.migrate_retired_overrides(cfg)
+    assert changed is True
+    assert migrated["word"]["enabled"] is False
+    # The rest of the retired entry's fields survive the flip.
+    assert migrated["word"]["command"] == ["uvx", "docx-mcp"]
+    # Intent carried over to meridian-docs.
+    assert migrated["meridian-docs"]["enabled"] is True
+    assert isinstance(migrated, dict)
+
+
+def test_migrate_retired_overrides_list_form_preserves_shape():
+    cfg = [
+        {"name": "word", "enabled": True},
+        {"name": "code-intel", "command": ["codegraph", "--stdio"]},
+    ]
+    migrated, changed = tp.migrate_retired_overrides(cfg)
+    assert changed is True
+    assert isinstance(migrated, list)
+    by_name = {it["name"]: it for it in migrated}
+    assert by_name["word"]["enabled"] is False
+    assert by_name["code-intel"]["command"] == ["codegraph", "--stdio"]
+    assert by_name["meridian-docs"]["enabled"] is True
+
+
+def test_migrate_retired_overrides_does_not_duplicate_existing_docs_entry():
+    """If the tenant already has an explicit meridian-docs override, migration
+    must not clobber or duplicate it — it only flips the retired slot's
+    `enabled`."""
+    cfg = {
+        "word": {"enabled": True},
+        "meridian-docs": {"enabled": False, "port": 9999},
+    }
+    migrated, changed = tp.migrate_retired_overrides(cfg)
+    assert changed is True
+    assert migrated["word"]["enabled"] is False
+    # Existing meridian-docs override is left exactly as the tenant set it —
+    # migration does not override an explicit choice.
+    assert migrated["meridian-docs"] == {"enabled": False, "port": 9999}
+
+
+def test_migrate_retired_overrides_output_feeds_back_into_resolve_plugins_as_off():
+    """End-to-end: migrating a stale config and re-resolving it still reports
+    word as disabled (it always would have, since resolve_plugins forces it —
+    this just confirms migrate_retired_overrides doesn't produce a shape
+    resolve_plugins chokes on)."""
+    cfg = {"word": {"enabled": True}}
+    migrated, _ = tp.migrate_retired_overrides(cfg)
+    by_slot = {p["slot"]: p for p in tp.resolve_plugins(migrated)}
+    assert by_slot["word"]["enabled"] is False
 
 
 # ---------------------------------------------------------------------------

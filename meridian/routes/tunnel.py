@@ -38,6 +38,7 @@ from .. import db as db_module
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
+    migrate_retired_overrides,
 )
 
 router = APIRouter()
@@ -1609,12 +1610,34 @@ async def get_tunnel_plugins(request: Request) -> Response:
     # hostname → the default config (back-compat with the single-machine dashboard).
     from ..tunnel_plugins import select_host_config, parse_plugins_by_host
     hostname = (request.query_params.get("hostname") or "").strip() or None
+
+    default_cfg = _parse_plugins_json(tenant.get("tunnel_plugins"))
     by_host = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
-    parsed = select_host_config(
-        _parse_plugins_json(tenant.get("tunnel_plugins")),
-        tenant.get("tunnel_plugins_by_host"),
-        hostname,
-    )
+
+    # 4b26c2ef — self-heal a stale `word: {enabled: true}` override left over
+    # from before the word slot was retired. Covers BOTH the tenant's default
+    # config AND every per-host slice (not just the ?hostname= currently being
+    # viewed), so a stale override on some other registered machine doesn't
+    # linger unnoticed just because nobody happens to view that machine's tab.
+    default_cfg, default_changed = migrate_retired_overrides(default_cfg)
+    by_host_changed = False
+    for host_key, host_cfg in list(by_host.items()):
+        migrated_host, host_changed = migrate_retired_overrides(host_cfg)
+        if host_changed:
+            by_host[host_key] = migrated_host
+            by_host_changed = True
+    if default_changed or by_host_changed:
+        _update_fields: dict[str, Any] = {}
+        if default_changed:
+            _update_fields["tunnel_plugins"] = json.dumps(default_cfg) if default_cfg else None
+        if by_host_changed:
+            _update_fields["tunnel_plugins_by_host"] = json.dumps(by_host) if by_host else None
+        try:
+            await db_module.update_tenant(request.app.state.db, tenant["id"], **_update_fields)
+        except Exception:  # noqa: BLE001 — self-heal is best-effort, never blocks the GET
+            pass
+
+    parsed = select_host_config(default_cfg, by_host, hostname)
     tid = tenant.get("id")
     # Machines the dashboard can offer per-machine config for: those with a saved
     # per-host config + machines that registered hook tokens (registered_hostnames).
@@ -1683,6 +1706,12 @@ async def put_tunnel_plugins(request: Request) -> Response:
         return _json_response({"error": "invalid JSON body"}, status_code=400)
     raw = body.get("config") if isinstance(body, dict) and "config" in body else body
     normalized = normalize_plugins_config(raw)
+    # 4b26c2ef — sanitize a client-submitted `enabled: true` override for the
+    # now-retired word slot before it ever reaches storage — resolve_plugins()
+    # would force it back off regardless, but this stops a stale dashboard tab
+    # (or any other client still offering the old word toggle) from re-persisting
+    # the inert override on every save. Migrates the intent onto meridian-docs.
+    normalized, _ = migrate_retired_overrides(normalized)
     # 8660d701 — ?hostname=X persists this config for that machine only
     # (tunnel_plugins_by_host); without a hostname it writes the per-tenant default
     # (tunnel_plugins), preserving the legacy single-machine behaviour.
