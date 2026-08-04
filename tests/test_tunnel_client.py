@@ -378,6 +378,150 @@ def test_resolve_extractor_inner_returns_none_on_install_failure(monkeypatch):
     assert tc._resolve_extractor_inner_cmd() is None
 
 
+# ---------------------------------------------------------------------------
+# 9d9a92cc — _resolve_extract_slot_command / diagnostics: correct Claude
+# Desktop/Code/Cursor runtime configuration for the code-extractor slot. A
+# missing/empty/malformed command must resolve to the CURRENT default
+# (Serena), never the obsolete mcp-server-code-extractor PyPI package that
+# this slot's "no command" case used to fall back to before the built-in
+# default moved to Serena (1428f1b).
+# ---------------------------------------------------------------------------
+
+def test_resolve_extract_slot_command_no_override_is_serena_default():
+    kind, override = tc._resolve_extract_slot_command(None, "/repo")
+    assert kind == "serena-default"
+    assert override is None
+
+
+def test_resolve_extract_slot_command_empty_list_is_serena_default():
+    # A stored config with an explicitly empty command (e.g. a cleared
+    # dashboard override, or an older/legacy resolved plugin list) must NOT
+    # fall back to the obsolete extractor package.
+    kind, override = tc._resolve_extract_slot_command([], "/repo")
+    assert kind == "serena-default"
+    assert override is None
+
+
+def test_resolve_extract_slot_command_explicit_default_copy_is_serena_default():
+    # A config that stores an exact (value-equal) copy of the current
+    # built-in default is indistinguishable from "no override" and must
+    # resolve the same way.
+    from meridian.tunnel_plugins import SERENA_EXTRACT_COMMAND
+
+    copy_of_default = list(SERENA_EXTRACT_COMMAND)
+    kind, override = tc._resolve_extract_slot_command(copy_of_default, "/repo")
+    assert kind == "serena-default"
+    assert override is None
+
+
+def test_resolve_extract_slot_command_malformed_is_serena_default():
+    # A truthy but un-coercible override (can't become a runnable list) must
+    # also repair to the current default rather than silently trying the
+    # legacy extractor fallback.
+    kind, override = tc._resolve_extract_slot_command({"not": "a command"}, "/repo")
+    assert kind == "serena-default"
+    assert override is None
+
+
+def test_resolve_extract_slot_command_custom_override_expands_repo_path():
+    kind, override = tc._resolve_extract_slot_command(
+        ["my-tool", "--project", "{repo_path}"], "/repo/path",
+    )
+    assert kind == "custom"
+    assert override == ["my-tool", "--project", "/repo/path"]
+
+
+def test_resolve_extract_slot_command_explicit_legacy_extractor_is_custom():
+    # A tenant who deliberately kept the legacy package as an explicit
+    # override still gets it — this function does not second-guess an
+    # EXPLICIT, valid choice; resolve_plugins' stale_override flag (surfaced
+    # separately) is what tells the caller to warn about it.
+    legacy = ["uvx", "mcp-server-code-extractor"]
+    kind, override = tc._resolve_extract_slot_command(legacy, "/repo")
+    assert kind == "custom"
+    assert override == legacy
+
+
+def test_extract_slot_package_name_serena_from_flag():
+    assert tc._extract_slot_package_name(
+        ["uvx", "--from", "serena-agent", "serena", "start-mcp-server"]
+    ) == "serena-agent"
+
+
+def test_extract_slot_package_name_uvx_second_token_fallback():
+    assert tc._extract_slot_package_name(["uvx", "mcp-server-code-extractor"]) == "mcp-server-code-extractor"
+
+
+def test_extract_slot_package_name_empty_is_unknown():
+    assert tc._extract_slot_package_name(None) == "unknown"
+    assert tc._extract_slot_package_name([]) == "unknown"
+
+
+def test_extract_slot_diagnostics_serena_default_never_leaks_custom_argv(monkeypatch):
+    monkeypatch.setattr(tc, "_find_uvx", lambda: "/usr/local/bin/uvx")
+    monkeypatch.setattr(tc.sys, "executable", "/env/bin/python")
+    diag = tc._extract_slot_diagnostics("serena-default", None, "/repo")
+    assert diag == {
+        "kind": "serena-default",
+        "package": "serena-agent",
+        "python_runtime": "/env/bin/python",
+        "cwd": "/repo",
+        "uvx_available": True,
+    }
+
+
+def test_extract_slot_diagnostics_custom_reports_resolved_package_not_raw_argv(monkeypatch):
+    monkeypatch.setattr(tc, "_find_uvx", lambda: None)
+    monkeypatch.setattr(tc.sys, "executable", "/env/bin/python")
+    override = ["uvx", "--from", "some-secret-tool==1.0", "some-secret-tool", "--token", "sk_live_abc"]
+    diag = tc._extract_slot_diagnostics("custom", override, "/repo")
+    # Only the resolved PACKAGE name appears — never the raw argv (which may
+    # embed a secret in a bespoke custom-slot override).
+    assert diag["package"] == "some-secret-tool==1.0"
+    assert diag["uvx_available"] is False
+    assert "sk_live_abc" not in str(diag)
+
+
+# ---------------------------------------------------------------------------
+# 9d9a92cc — _serena_pool_spawn platform-aware uvx resolution
+# ---------------------------------------------------------------------------
+
+def test_serena_pool_spawn_resolves_bare_uvx_to_full_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc, "_find_uvx", lambda: "/opt/uv/uvx")
+    captured = {}
+
+    class _FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    result = tc._serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert result.pid == 4242
+    assert captured["cmd"] == ["/opt/uv/uvx", "--from", "serena-agent", "serena"]
+
+
+def test_serena_pool_spawn_keeps_bare_uvx_when_unresolvable(tmp_path, monkeypatch):
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc, "_find_uvx", lambda: None)
+    captured = {}
+
+    class _FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    tc._serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    # Unresolvable → falls back to the bare token unchanged (no regression).
+    assert captured["cmd"] == ["uvx", "--from", "serena-agent", "serena"]
+
+
 def test_build_code_proxy_command_uses_shell_for_cmd_shim_on_windows(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "win32")
     shim = r"C:\Users\13144\AppData\Roaming\npm\codebase-memory-mcp.cmd"

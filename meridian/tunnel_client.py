@@ -3125,7 +3125,23 @@ def _serena_pool_spawn(cmd: "list[str]") -> "subprocess.Popen":
     are allocated dynamically per repo_path, not a single fixed port checked
     at startup. Recording here closes that gap the same way every other spawn
     path already does.
+
+    9d9a92cc — platform-aware launcher resolution: *cmd*'s first token is the
+    literal string ``"uvx"`` (see ``serena_pool.build_serena_command``).
+    ``subprocess.Popen`` resolves a bare launcher name via PATH itself, which
+    is fine when ``uvx`` is on PATH — but uv's own standalone installer drops
+    ``uvx`` in ``~/.local/bin`` on every platform (see :func:`_find_uvx`)
+    without necessarily adding it to PATH, the exact gap
+    :func:`_resolve_extractor_inner_cmd` already guards against for the
+    legacy extractor launcher. Resolve a bare ``"uvx"`` first token to its
+    full path when :func:`_find_uvx` can find it; a machine where it truly
+    can't be found keeps the original bare token, so the OS's own error
+    surfaces exactly as before rather than this function inventing one.
     """
+    if cmd and cmd[0] == "uvx":
+        _resolved_uvx = _find_uvx()
+        if _resolved_uvx:
+            cmd = [_resolved_uvx, *cmd[1:]]
     proc = subprocess.Popen(cmd, **_spawn_kwargs())
     _record_spawned_pid(proc, "extract")
     return proc
@@ -3802,8 +3818,112 @@ def _find_uvx() -> "str | None":
     return None
 
 
+def _resolve_extract_slot_command(
+    ext_raw: Any, repo_path: str,
+) -> "tuple[str, list[str] | None]":
+    """Deterministically classify the code-extractor slot's configured
+    ``command`` into what should actually launch (9d9a92cc).
+
+    Returns ``(kind, override)``:
+
+    * ``("serena-default", None)`` — no command configured (``None``/empty),
+      an explicit copy of the CURRENT built-in default
+      (:data:`meridian.tunnel_plugins.SERENA_EXTRACT_COMMAND`), or a
+      configured command that could not be coerced into a runnable list at
+      all (a malformed/stale override — e.g. a non-string/non-list value).
+      The caller must spawn the CURRENT default (Serena, via
+      :class:`~meridian.serena_pool.SerenaDaemonPool`) for every one of
+      these cases. Before this fix, the "no command configured" case fell
+      through to :func:`_resolve_extractor_inner_cmd`, which launches the
+      now-**obsolete** ``mcp-server-code-extractor`` PyPI package — correct
+      when that was the slot's only default, stale ever since the built-in
+      default moved to Serena (1428f1b) and never updated at this call
+      site. A config with no explicit override (the overwhelming common
+      case: a fresh tenant, or one who cleared a prior override) must track
+      the CURRENT default, not a historical one.
+    * ``("custom", override)`` — an explicit, valid override — the
+      ``{repo_path}``-expanded command list — including, deliberately, an
+      explicit copy of the legacy extractor command a tenant chose to keep
+      running. :func:`meridian.tunnel_plugins.resolve_plugins` already
+      flags a command matching a superseded default as ``stale_override``
+      (dashboard's "newer default available" badge, cc904bfe); this
+      function does not duplicate that detection — callers wanting the flag
+      read it off the resolved plugin dict (``extract_plugin.get(
+      "stale_override")``) and decide what, if anything, to warn about.
+
+    Pure — no I/O, no subprocess/uvx resolution — so it is fully
+    unit-testable independent of :func:`run_tunnel`'s network/process
+    orchestration.
+    """
+    # Deferred import (matches run_tunnel's own import of tunnel_plugins) —
+    # avoids a circular import at module load time; see run_tunnel's comment
+    # at its own `from .tunnel_plugins import (...)` line for the full story.
+    from .tunnel_plugins import SERENA_EXTRACT_COMMAND, expand_command
+
+    if ext_raw and ext_raw != SERENA_EXTRACT_COMMAND:
+        override = expand_command(ext_raw, repo_path=repo_path)
+        if override:
+            return "custom", override
+    return "serena-default", None
+
+
+def _extract_slot_package_name(command: "list[str] | None") -> str:
+    """Best-effort PACKAGE name for a resolved extract-slot launch command,
+    for non-secret diagnostics (9d9a92cc) — never the raw command/argv,
+    which may embed a secret in a bespoke custom-slot override (mirrors
+    :func:`meridian.serena_pool._command_hash`'s identical
+    non-reversible-diagnostics rationale). Recognizes Serena's own
+    ``uvx --from <package> ...`` shape and falls back to the second token
+    (``uvx <package>`` / ``npx <package>``); ``"unknown"`` for anything
+    shorter or empty.
+    """
+    if not command:
+        return "unknown"
+    if "--from" in command:
+        idx = command.index("--from")
+        if idx + 1 < len(command):
+            return command[idx + 1]
+    return command[1] if len(command) > 1 else command[0]
+
+
+def _extract_slot_diagnostics(
+    kind: str, override: "list[str] | None", repo_path: str,
+) -> dict:
+    """Non-secret diagnostic summary of what the code-extractor slot will
+    actually launch (9d9a92cc) — the exact generated command's resolved
+    PACKAGE (see :func:`_extract_slot_package_name`), the Python runtime
+    running this tunnel process, the effective cwd (``--project``), and a
+    dependency preflight signal (whether ``uvx`` is resolvable on this
+    machine at all — see :func:`_find_uvx`). Intended for the startup
+    banner and a future dashboard "repair" panel. Pure aside from the
+    ``uvx`` PATH/well-known-location probe, so it never spawns anything and
+    never prints anything sensitive.
+    """
+    from .tunnel_plugins import SERENA_EXTRACT_COMMAND  # deferred — see _resolve_extract_slot_command
+
+    resolved = override if kind == "custom" else list(SERENA_EXTRACT_COMMAND)
+    return {
+        "kind": kind,
+        "package": _extract_slot_package_name(resolved),
+        "python_runtime": sys.executable,
+        "cwd": repo_path,
+        "uvx_available": _find_uvx() is not None,
+    }
+
+
 def _resolve_extractor_inner_cmd() -> "list[str] | None":
-    """Resolve the launcher for mcp-server-code-extractor (a **PyPI** package).
+    """Resolve the launcher for the LEGACY ``mcp-server-code-extractor``
+    PyPI package.
+
+    9d9a92cc — this is no longer the code-extractor slot's "no command
+    configured" fallback in :func:`run_tunnel` (see
+    :func:`_resolve_extract_slot_command`'s docstring for the history and
+    the defect this fixed): a missing/empty/malformed override now resolves
+    to the CURRENT default (Serena) instead. This resolver is kept only for
+    an explicit, valid tenant override that names this package by hand
+    (``expand_command`` succeeds → the ``"custom"`` branch handles it via
+    :func:`_build_proxy_for_inner`, not this function) and for direct
+    external/test use; it is otherwise unreachable from ``run_tunnel``.
 
     It is published on PyPI, not npm. Preferred: ``uvx mcp-server-code-extractor``
     (zero install, ephemeral). Fallback: pip-install the package into the current
@@ -6232,43 +6352,53 @@ async def run_tunnel(
         ext_raw = extract_plugin.get("command")
         # ada39096 — resolve any EXPLICIT, non-default override first (still
         # unexpanded-Serena stays out of this: {repo_path} must survive to the
-        # pool's own per-repo_path expansion, so the SERENA_EXTRACT_COMMAND
-        # comparison below happens before any expand_command() call).
-        ext_override = (
-            None if ext_raw == SERENA_EXTRACT_COMMAND
-            else expand_command(ext_raw, repo_path=repo_path)
+        # pool's own per-repo_path expansion). An EXPLICIT legacy override
+        # (e.g. a tenant deliberately reverting to
+        # ["uvx", "mcp-server-code-extractor"]) is a non-empty, resolvable
+        # command and is the ONLY path allowed to run the old extractor.
+        #
+        # 9d9a92cc — see _resolve_extract_slot_command's docstring: a missing/
+        # empty/malformed command now resolves to "serena-default" (the CURRENT
+        # built-in), never the obsolete mcp-server-code-extractor fallback this
+        # call site used before the built-in default moved to Serena (1428f1b).
+        _ext_kind, ext_override = _resolve_extract_slot_command(ext_raw, repo_path)
+        _ext_diag = _extract_slot_diagnostics(_ext_kind, ext_override, repo_path)
+        print(
+            f"  code-extractor:    diagnostics: package={_ext_diag['package']} "
+            f"python={_ext_diag['python_runtime']} cwd={_ext_diag['cwd']} "
+            f"uvx_available={_ext_diag['uvx_available']}",
+            flush=True,
         )
-        if ext_override:
+        if _ext_kind == "custom":
+            if extract_plugin.get("stale_override"):
+                _newer = extract_plugin.get("newer_default_label") or "the current default"
+                print(
+                    f"  code-extractor:    WARNING configured command matches a "
+                    f"superseded default ({_newer} is now current) — clear the "
+                    f"override in the dashboard to switch to Serena",
+                    flush=True, file=sys.stderr,
+                )
             cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
             print(f"  code-extractor:    lazy-spawn on port {extract_port} (custom command)", flush=True)
             proxy_extract = SlotProxy(cmd_extract, extract_port, "extract", client_id=_client_id)
             slot_proxies.append(proxy_extract)
         else:
-            # ada39096 — everything else (the exact-match default case AND any
-            # command that didn't resolve to something usable) spawns the
-            # CURRENT built-in default: Serena. A missing/empty command shows
-            # up for a stale connector manifest too — e.g. an older server's
-            # already-resolved plugin list, predating the Serena default,
-            # sends `command: None` for this slot (see BUILTIN_PLUGINS'
-            # `command: None` semantics: "the client uses its platform-aware
-            # default builder for this slot"). That default is Serena today,
-            # not the deprecated mcp-server-code-extractor — silently falling
-            # back to the old tool here would reintroduce exactly the
-            # stale-substitution bug this branch must avoid. An EXPLICIT
-            # legacy override (e.g. a tenant deliberately reverting to
-            # ``["uvx", "mcp-server-code-extractor"]``) is a non-empty,
-            # resolvable command and is handled by the ``ext_override``
-            # branch above instead — that is the ONLY path allowed to run the
-            # old extractor. _resolve_extractor_inner_cmd /
+            # ada39096/9d9a92cc — everything else (the exact-match default case
+            # AND any command that didn't resolve to something usable) spawns
+            # the CURRENT built-in default: Serena, never the deprecated
+            # mcp-server-code-extractor. _resolve_extractor_inner_cmd /
             # _build_extractor_proxy_command (the dedicated uvx-or-pip-fallback
             # resolver for that legacy launcher) are intentionally NOT wired
             # into this decision as an implicit fallback anymore; they remain
             # standalone, independently unit-tested helpers.
             if ext_raw and ext_raw != SERENA_EXTRACT_COMMAND:
+                # A command WAS configured but could not be coerced into a
+                # runnable list (malformed/stale override) — repaired to the
+                # current default rather than silently attempted via the
+                # legacy _resolve_extractor_inner_cmd fallback.
                 print(
-                    "  code-extractor:    configured command did not resolve to a "
-                    "usable launcher; using the current default (Serena) instead of "
-                    "silently falling back to the deprecated mcp-server-code-extractor",
+                    "  code-extractor:    WARNING configured command was invalid "
+                    "or empty — repaired to the current default (Serena)",
                     flush=True, file=sys.stderr,
                 )
             # 64650cb4 — default Serena: a per-repo_path daemon pool instead of a

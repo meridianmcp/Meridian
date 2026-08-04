@@ -2771,19 +2771,21 @@ def test_run_tunnel_code_unavailable_and_extract_disabled(monkeypatch, tmp_path)
     assert len(procs) == 1
 
 
-def test_run_tunnel_legacy_resolved_list_extract_none_defaults_to_serena(monkeypatch, tmp_path):
-    """ada39096 — backward-compat: an older server sends an already-resolved
-    plugin list with code-extractor command=None (a stale connector manifest
-    predating the Serena default). The extract slot must default to the
-    CURRENT built-in default (Serena) instead of silently substituting the
-    deprecated mcp-server-code-extractor — and must not even call
-    _resolve_extractor_inner_cmd for this ambiguous case."""
+def test_run_tunnel_legacy_resolved_list_extract_none_falls_back_to_serena_default(
+    monkeypatch, tmp_path,
+):
+    """9d9a92cc: Backward-compat — an older server sends an already-resolved
+    plugin list with code-extractor command=None. This must now fall back to
+    the CURRENT default (Serena, via the SerenaDaemonPool), NOT skip the slot
+    (the old behavior, which routed a None command through the now-obsolete
+    _resolve_extractor_inner_cmd/mcp-server-code-extractor fallback and
+    treated a None resolver result as "unavailable"). See
+    _resolve_extract_slot_command's docstring for the full history."""
     procs = _stub_run_tunnel_spawn(monkeypatch, code_binary=None)
-    legacy_extractor_calls = []
-    monkeypatch.setattr(
-        tc, "_resolve_extractor_inner_cmd",
-        lambda: legacy_extractor_calls.append(1) or ["uvx", "mcp-server-code-extractor"],
-    )
+    # The legacy extractor resolver must NOT be consulted anymore for a
+    # missing command — if it were, this stub returning None would still
+    # incorrectly skip the slot, defeating the point of this test.
+    monkeypatch.setattr(tc, "_resolve_extractor_inner_cmd", lambda: None)
     legacy_plugins = [
         {"name": "filesystem", "slot": "fs", "enabled": True, "command": None, "port": 8808},
         {"name": "code-extractor", "slot": "extract", "enabled": True, "command": None, "port": 8810},
@@ -2795,14 +2797,16 @@ def test_run_tunnel_legacy_resolved_list_extract_none_defaults_to_serena(monkeyp
     monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
 
     rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
-    # fs + the Serena pool's lazy per-repo daemon spawn (via
-    # fake_reconnect_extract_pool -> pool.get_or_spawn) — the extract slot no
-    # longer skips, and it never falls back to the deprecated extractor.
+    # fs spawns; extract command=None now resolves to the Serena pool default
+    # instead of skipping → 2 procs (fs + the pool-spawned Serena daemon).
     assert rc == 0
     assert len(procs) == 2
-    assert any("serena-agent" in p.cmd for p in procs), [p.cmd for p in procs]
-    assert not any("mcp-server-code-extractor" in p.cmd for p in procs)
-    assert legacy_extractor_calls == []
+    assert any(
+        "serena-agent" in str(t) for p in procs for t in p.cmd
+    ), "extract slot did not fall back to the current Serena default"
+    assert not any(
+        "mcp-server-code-extractor" in str(t) for p in procs for t in p.cmd
+    ), "extract slot must never silently launch the obsolete extractor package"
 
 
 def test_run_tunnel_explicit_legacy_extractor_override_still_honored(monkeypatch, tmp_path):

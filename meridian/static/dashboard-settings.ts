@@ -2435,7 +2435,12 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     </div>
 
     <!-- b970fe07 — Serena default repo path (code-extractor slot). Single value;
-         used at tunnel start only when --repo is not passed on the CLI. -->
+         used at tunnel start only when --repo is not passed on the CLI.
+         9d9a92cc — this same slot feeds Claude Desktop/Code/Cursor uniformly
+         (they all reach it through the tunnel's local proxy port, see
+         docs/mcp-tool-surface.md); a missing/cleared command override now
+         correctly falls back to the current default (Serena), never the
+         retired mcp-server-code-extractor package. -->
     <div style="margin-bottom:10px">
 
       <div style="font-size:10px;color:var(--muted);margin-bottom:4px">Serena Repo Path<br><span style="font-size:9px;color:var(--muted)">Default <code>--project</code> for the tunnel's code-extractor (Serena). Used only when <code>--repo</code> is not passed at tunnel start.</span></div>
