@@ -3082,6 +3082,221 @@ async def test_unavailable_required_tool_fails_visibly_across_all_three_projecti
 
 
 # ---------------------------------------------------------------------------
+# cb00889c — bounded handoff profiles with on-demand executor contracts.
+#
+# Two independent pieces:
+#   (a) executor_contract.render_xml_clause(contract, compact=True) — a
+#       bounded per-item projection (item_id/title/scope/contract_hash/
+#       pointer_ids/executable only), with the pre-existing full projection
+#       still available on demand via the unchanged compact=False default.
+#   (b) handoff.format_handoff_mcp_content's/generate_handoff's own
+#       max_bytes/max_content_bytes budget — an integrity-first backstop that
+#       never touches disk/DB persistence and never cuts through an embedded
+#       <goal_token>/SECURITY banner.
+# ---------------------------------------------------------------------------
+
+
+def test_render_xml_clause_compact_default_unchanged():
+    """The function-level default stays compact=False — byte-for-byte the
+    same full projection every existing caller already depends on."""
+    contract = {
+        "item_id": "abc123", "mode": "autonomous", "executable": False,
+        "contract_hash": "deadbeef",
+        "executable_reasons": ["missing_required_tools:Serena: find_symbol"],
+        "allowed_tools": [],
+        "forbidden_tools": [{"name": "find_symbol", "server_or_namespace": "Serena"}],
+        "steps": [],
+        "gate_after": None,
+    }
+    full = ec.render_xml_clause(contract)
+    assert "compact" not in full
+    assert "<forbidden_tool>Serena: find_symbol</forbidden_tool>" in full
+
+
+def test_render_xml_clause_compact_embeds_only_bounded_fields():
+    contract = {
+        "item_id": "item-42",
+        "title": "Refactor the payments module",
+        "scope": {
+            "project_id": "proj-1", "requested_version": "v3", "wave": "2",
+            "track": "backend", "milestone_type": "feature", "priority": "high",
+        },
+        "contract_hash": "cafef00d",
+        "executable": True,
+        "executable_reasons": [],
+        "allowed_tools": [{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "availability_status": "available",
+        }],
+        "forbidden_tools": [],
+        "steps": [{"order": 1, "kind": "finish", "description": "Call complete_sprint_item."}],
+        "gate_after": {"wave_end": "wave-2", "gate_passed": True},
+        "pointers": {
+            "item_id": "item-42",
+            "pointers": [
+                {"id": "ptr-1", "source_type": "code", "targets": []},
+                {"id": "ptr-2", "source_type": "code", "targets": []},
+                {"source_type": "code", "targets": []},  # no id — must be skipped
+            ],
+        },
+    }
+    compact = ec.render_xml_clause(contract, compact=True)
+    assert compact == (
+        '<executor_contract compact="true" item_id="item-42" '
+        'title="Refactor the payments module" executable="true" '
+        'contract_hash="cafef00d" requested_version="v3" wave="2" '
+        'track="backend" milestone_type="feature" priority="high" '
+        'pointer_ids="ptr-1,ptr-2" />'
+    )
+    # Bounded: none of the full projection's tool/step/gate detail leaks in.
+    assert "find_symbol" not in compact
+    assert "complete_sprint_item" not in compact
+    assert "gate_after" not in compact
+    # The SAME information remains available on demand via the full/JSON/text
+    # projections of this identical, already-built contract — no re-fetch.
+    full = ec.render_xml_clause(contract, compact=False)
+    assert "find_symbol" in full
+    as_json = json.loads(ec.to_json(contract))
+    assert as_json["item_id"] == "item-42"
+
+
+def test_render_xml_clause_compact_handles_missing_pointers_title_scope():
+    """A minimal/degraded contract (no pointers, no title, no scope) still
+    renders a valid, well-formed compact element — never raises."""
+    contract = {"item_id": "item-99", "contract_hash": "h", "executable": False}
+    compact = ec.render_xml_clause(contract, compact=True)
+    assert compact.startswith('<executor_contract compact="true"')
+    assert compact.endswith("/>")
+    assert 'pointer_ids=""' in compact
+    assert 'title=""' in compact
+    assert 'executable="false"' in compact
+
+
+async def test_build_executor_contract_carries_title_for_compact_projection(db):
+    """build_executor_contract now carries the item's title (cheap, always
+    available on ``item``) so the compact projection can name the item
+    without any re-fetch — proven end-to-end against a real built contract,
+    not just a static fixture."""
+    p = await db_module.create_project(db, "ec-title")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Refactor the parser")
+    contract = await ec.build_executor_contract(db, p["id"], item)
+    assert contract["title"] == "Refactor the parser"
+    compact = ec.render_xml_clause(contract, compact=True)
+    assert 'title="Refactor the parser"' in compact
+    assert f'item_id="{item["id"]}"' in compact
+
+
+# ---------------------------------------------------------------------------
+# format_handoff_mcp_content's byte budget.
+# ---------------------------------------------------------------------------
+
+
+def test_format_handoff_mcp_content_identity_under_budget():
+    """Content at/under the default budget is returned byte-identical — zero
+    functional change for the overwhelming common case (every existing
+    caller's content)."""
+    small = "/goal\nstart_session()\n<sprint_items>a, b, c</sprint_items>"
+    assert handoff_module.format_handoff_mcp_content(small) == small
+
+
+def test_format_handoff_mcp_content_disabled_via_none_or_nonpositive():
+    huge = "X" * 5000
+    assert handoff_module.format_handoff_mcp_content(huge, max_bytes=None) == huge
+    assert handoff_module.format_handoff_mcp_content(huge, max_bytes=0) == huge
+    assert handoff_module.format_handoff_mcp_content(huge, max_bytes=-1) == huge
+
+
+def test_format_handoff_mcp_content_truncates_oversized_content():
+    huge = "Y" * 5000
+    out = handoff_module.format_handoff_mcp_content(huge, max_bytes=1000)
+    assert len(out.encode("utf-8")) < 5000
+    assert "TRUNCATED" in out
+    assert "limit=1000 bytes" in out
+
+
+async def test_format_handoff_mcp_content_never_truncates_goal_token_banner(db):
+    """Even a budget far smaller than the protected region still keeps the
+    <goal_token>/SECURITY banner (and everything before it) byte-for-byte —
+    integrity-first over strict budget compliance."""
+    p = await db_module.create_project(db, "budget-token-protect")
+    body = '/goal\nstart_session(project_name="x")'
+    embedded = await handoff_module._mint_and_embed_goal_token(db, p["id"], body)
+    assert "<goal_token>" in embedded  # sanity: mint actually worked
+    padded = embedded + "\n<sprint_items>" + ("z" * 5000) + "</sprint_items>"
+    out = handoff_module.format_handoff_mcp_content(padded, max_bytes=10)
+    banner_match = handoff_module._GOAL_TOKEN_BANNER_RE.search(embedded)
+    assert banner_match is not None
+    protected_prefix = embedded[: banner_match.end()]
+    assert out.startswith(protected_prefix)
+    assert "TRUNCATED" in out
+    assert len(out.encode("utf-8")) < len(padded.encode("utf-8"))
+
+
+def test_format_handoff_mcp_content_non_string_passthrough():
+    assert handoff_module.format_handoff_mcp_content(None) is None  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# generate_handoff's own max_content_bytes threading — bounds the RETURNED
+# content only; disk/DB persistence always keeps the full render.
+# ---------------------------------------------------------------------------
+
+
+async def test_generate_handoff_default_budget_noop_for_typical_content(db, tmp_path):
+    p = await db_module.create_project(db, "budget-genhandoff-default")
+    await db_module.set_goal(db, p["id"], "ship", sprint="s1")
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+    )
+    assert "TRUNCATED" not in content
+
+
+async def test_generate_handoff_default_budget_truncates_pathologically_large_content(
+    db, tmp_path,
+):
+    """A pathologically large handoff (simulated via extra_narrative, the
+    fastest deterministic way to exceed the default budget without hundreds
+    of DB writes) is bounded in the RETURNED content, while the on-disk file
+    and the DB-persisted pending_goal both keep the complete render."""
+    p = await db_module.create_project(db, "budget-genhandoff-huge")
+    await db_module.set_goal(db, p["id"], "ship", sprint="s1")
+    huge_narrative = "N" * 400_000
+    path, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        extra_narrative=huge_narrative,
+    )
+    assert len(content.encode("utf-8")) < 400_000
+    assert "TRUNCATED" in content
+    on_disk = Path(path).read_text(encoding="utf-8")
+    assert huge_narrative in on_disk  # disk keeps the full, untruncated render
+
+
+async def test_generate_handoff_max_content_bytes_none_disables_budget(db, tmp_path):
+    p = await db_module.create_project(db, "budget-genhandoff-disable")
+    await db_module.set_goal(db, p["id"], "ship", sprint="s1")
+    huge_narrative = "M" * 400_000
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        extra_narrative=huge_narrative, max_content_bytes=None,
+    )
+    assert huge_narrative in content
+    assert "TRUNCATED" not in content
+
+
+async def test_generate_handoff_max_content_bytes_explicit_override(db, tmp_path):
+    """An explicit, smaller max_content_bytes bounds even ordinarily-small
+    content, proving the parameter is genuinely threaded through (not just
+    inert plumbing that happens to never trigger)."""
+    p = await db_module.create_project(db, "budget-genhandoff-explicit")
+    await db_module.set_goal(db, p["id"], "ship", sprint="s1")
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, max_content_bytes=50,
+    )
+    assert "TRUNCATED" in content
+    assert len(content.encode("utf-8")) < 5000
+
+
+# ---------------------------------------------------------------------------
 # (6) A fresh session's /goal block alone must be sufficient to start — no
 # missing context a human would need to fill in by hand.
 # ---------------------------------------------------------------------------

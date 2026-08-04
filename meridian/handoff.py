@@ -1277,7 +1277,22 @@ def _format_content(content) -> str:
     return json.dumps(content, indent=2)
 
 
-def format_handoff_mcp_content(content: str) -> str:
+# cb00889c — bounded handoff profiles (FOLLOW-UP to efaa918a/3af86d28's
+# body-hash binding). A conservative backstop far above any legitimately-
+# sized profile (2d6d8677's own bulk-content regression test treats ~60K
+# chars as "comfortably under" the existing MCP result cap) but far below
+# what an UNBOUNDED render can reach once a board grows large — this
+# project's own board has exceeded 1800 sprint items, and
+# get_parallelizable_groups/get_sprint_items responses have repeatedly
+# exceeded token limits at that size. Applied by format_handoff_mcp_content
+# (the one shared wire-contract helper every transport already calls) and,
+# via that same helper, by generate_handoff itself — see both docstrings.
+_DEFAULT_HANDOFF_MAX_BYTES = 300_000
+
+
+def format_handoff_mcp_content(
+    content: str, *, max_bytes: "int | None" = _DEFAULT_HANDOFF_MAX_BYTES,
+) -> str:
     """Return the exact ``content`` string every MCP transport must emit.
 
     a5e8aa74 — ``generate_handoff`` already renders raw, correct text; the
@@ -1292,12 +1307,77 @@ def format_handoff_mcp_content(content: str) -> str:
     Both transports (and the HTTP route in ``meridian/routes/handoff.py``,
     which never wrapped to begin with) now call this ONE helper so there is
     exactly one place that defines the wire contract: the ``content`` field
-    is byte-identical to what ``generate_handoff`` rendered — no code fence,
-    no header, no blockquote, no other wrapping added on the way out. Any
-    future transport must call this helper too rather than re-implementing
-    (or re-breaking) the contract independently.
+    is byte-identical to what ``generate_handoff`` rendered, UP TO the
+    ``max_bytes`` budget below — no code fence, no header, no blockquote, no
+    other wrapping added on the way out. Any future transport must call this
+    helper too rather than re-implementing (or re-breaking) the contract
+    independently.
+
+    ``max_bytes`` (cb00889c, bounded handoff profiles) — an explicit byte
+    budget so a huge board can never silently balloon a handoff response past
+    a calling MCP client's own max-tool-output-size limit. This is the SAME
+    class of fix bc834237 (delta's pending-item cap) and de4d4293
+    (capability_contract's ``max_executor_contracts`` cap) already shipped
+    for specific hot spots — applied here ONCE, generically, at the single
+    wire-contract choke point every transport already funnels through, so it
+    catches any bloat source (present or future) rather than only the spots
+    already known about.
+
+    Content at or under ``max_bytes`` — the overwhelming common case, and
+    every existing caller's content — is returned BYTE-IDENTICAL: zero
+    functional change. ``None`` or a non-positive value disables the budget
+    entirely (opt out, e.g. a caller that deliberately wants the full raw
+    text regardless of size).
+
+    When ``content`` exceeds the budget, truncation is INTEGRITY-FIRST, never
+    blind: this function locates any embedded ``<goal_token>...</goal_token>``
+    plus SECURITY banner (``_mint_and_embed_goal_token``'s own marker,
+    matched via ``_GOAL_TOKEN_BANNER_RE``) and NEVER cuts through or before
+    the end of that banner, even if honoring that means exceeding
+    ``max_bytes`` — the provenance token and its verification instructions
+    are the one thing a truncated handoff must never silently lose or
+    corrupt (the "preserve... body-integrity metadata" half of the cb00889c
+    contract; see ``mint_handoff_token``'s ``body`` param /
+    ``verify_handoff_token`` for the binding itself). Truncation removes only
+    trailing bytes AFTER that protected point (or from the very start when no
+    banner is present, e.g. planner-mode content) and appends an explicit,
+    machine-readable marker naming exactly how many bytes were omitted —
+    never a silent drop. A receiving session that runs
+    ``verify_handoff_token(body=...)`` against truncated content correctly
+    gets ``reason="body_mismatch"`` (the presented body genuinely is not the
+    exact one that was minted) rather than a falsely-reassuring match; the
+    ``<goal_token>`` value itself remains valid for plain provenance
+    verification (``verify_handoff_token(project_id, token)`` with no
+    ``body``) regardless.
     """
-    return content
+    if not isinstance(content, str):
+        return content
+    if max_bytes is None or max_bytes <= 0:
+        return content
+    _raw = content.encode("utf-8")
+    if len(_raw) <= max_bytes:
+        return content
+    _protected_end = 0
+    _banner_match = _GOAL_TOKEN_BANNER_RE.search(content)
+    if _banner_match:
+        _protected_end = len(content[: _banner_match.end()].encode("utf-8"))
+    _cut = max(max_bytes, _protected_end)
+    _kept_raw = _raw[:_cut]
+    # errors="ignore" — never split a multi-byte UTF-8 sequence into an
+    # invalid trailing fragment; at most drops the final incomplete char.
+    _kept_text = _kept_raw.decode("utf-8", errors="ignore")
+    _omitted = len(_raw) - len(_kept_raw)
+    _marker = (
+        "\n\n<!-- TRUNCATED (cb00889c bounded handoff profile): "
+        f"{_omitted} of {len(_raw)} total bytes omitted to satisfy the "
+        f"handoff response-size budget (limit={max_bytes} bytes). Everything "
+        "up to and including any <goal_token>/SECURITY banner above is "
+        "complete and byte-identical to the original render. "
+        "Narrative/context beyond this point was trimmed to fit the budget "
+        "-- request mode='goal' for the minimal bounded executable profile, "
+        "or a narrower version scope, to see it in full. -->"
+    )
+    return _kept_text + _marker
 
 
 # 08c355c2 — staleness threshold for the legacy goal_states.sprint free-text
@@ -5954,6 +6034,7 @@ async def generate_handoff(
     strict_pointer_evidence: bool = False,
     related_records_query: str | None = None,
     related_records: dict[str, Any] | None = None,
+    max_content_bytes: "int | None" = _DEFAULT_HANDOFF_MAX_BYTES,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -5961,6 +6042,24 @@ async def generate_handoff(
     the rendered file on disk and ``amended`` is True when the prior handoff was
     still unconsumed (pending_goal never popped by start_session) so this call
     amended the existing record in-place rather than creating a new one.
+
+    ``max_content_bytes`` (cb00889c, bounded handoff profiles) — applies
+    :func:`format_handoff_mcp_content`'s own integrity-first byte budget (see
+    its docstring for the truncation contract) to the RETURNED ``content``
+    only, uniformly across every mode (planner/starter/goal/full/delta) —
+    never to what is written to disk (``out_path.write_text``) or persisted
+    to the ``handoffs`` table / ``pending_goal``, both of which always keep
+    the complete, untruncated render. Every existing MCP transport already
+    applies this exact same budget downstream via
+    ``format_handoff_mcp_content(content)`` (default ``max_bytes``
+    unchanged), so this makes a direct/programmatic caller of
+    ``generate_handoff`` — a test, another module, a future on-demand
+    fetch — see the SAME bounded result a transport-mediated caller does,
+    instead of only the wire layer being protected. Defaults to the same
+    generous, empirically-safe budget as ``format_handoff_mcp_content``
+    (comfortably above every legitimately-sized profile, far below what an
+    unbounded render reaches on a large board); pass ``None`` to opt out and
+    get the exact prior (unbounded) return value.
 
     Set ``skip_ai_summary=True`` for hot-path / test code that shouldn't
     burn a Haiku call. Pass ``summarizer`` to inject a stub for either
@@ -6068,7 +6167,11 @@ async def generate_handoff(
         raise ValueError(f"project not found: {project_id}")
     if mode == "planner":
         _pl_path, _pl_content = await _generate_planner_handoff(db, project_id, output_dir)
-        return _pl_path, _pl_content, False
+        return (
+            _pl_path,
+            format_handoff_mcp_content(_pl_content, max_bytes=max_content_bytes),
+            False,
+        )
     # b8f89491 — resolve the effective sprint-version scope ONCE, for every
     # remaining executable mode. See the ``version`` docstring above.
     _effective_version = version
@@ -6103,7 +6206,11 @@ async def generate_handoff(
             evidence_status=evidence_status,
             strict_pointer_evidence=strict_pointer_evidence,
         )
-        return _st_path, _st_content, False
+        return (
+            _st_path,
+            format_handoff_mcp_content(_st_content, max_bytes=max_content_bytes),
+            False,
+        )
     if mode == "goal":
         # 682005f4 — bare-/goal-only mode: no readiness header, no workspace
         # decisions/notes, no L0/L1/L2 context. Returns immediately, before any
@@ -6121,7 +6228,11 @@ async def generate_handoff(
             evidence_status=evidence_status,
             strict_pointer_evidence=strict_pointer_evidence,
         )
-        return _g_path, _g_content, False
+        return (
+            _g_path,
+            format_handoff_mcp_content(_g_content, max_bytes=max_content_bytes),
+            False,
+        )
     if mode not in {"full", "delta"}:
         raise ValueError(
             "mode must be 'full', 'delta', 'planner', 'starter', 'compact', or 'goal'"
@@ -6882,7 +6993,13 @@ async def generate_handoff(
     # c0d2356d — refresh the repo's Stop-hook sprint guard with this project's ID
     # (self-guarded; never breaks handoff).
     await _write_sprint_guard_hooks(db, project_id)
-    return str(out_path.resolve()), content, _amended
+    # cb00889c — bound the RETURNED content only; everything above (disk file,
+    # handoffs table, pending_goal) already persisted the complete render.
+    return (
+        str(out_path.resolve()),
+        format_handoff_mcp_content(content, max_bytes=max_content_bytes),
+        _amended,
+    )
 
 
 async def _generate_planner_handoff(

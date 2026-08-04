@@ -846,6 +846,11 @@ async def build_executor_contract(
     contract: dict[str, Any] = {
         "schema_version": EXECUTOR_CONTRACT_SCHEMA_VERSION,
         "item_id": item_id,
+        # cb00889c (bounded handoff profiles) — carried on the contract itself
+        # (cheap, always available on `item`) so render_xml_clause's compact
+        # projection can name the item without re-fetching/re-deriving
+        # anything — every projection stays a PURE function of this object.
+        "title": item.get("title"),
         "version": item.get("version"),
         "scope": {
             "project_id": project_id,
@@ -902,10 +907,51 @@ def to_json(contract: dict[str, Any]) -> str:
     return _canonical_json(contract)
 
 
-def render_xml_clause(contract: dict[str, Any]) -> str:
+def render_xml_clause(contract: dict[str, Any], *, compact: bool = False) -> str:
     """A ``<executor_contract>`` XML clause suitable for embedding in a
-    rendered /goal, built ONLY from fields already present on ``contract``."""
+    rendered /goal, built ONLY from fields already present on ``contract``.
+
+    ``compact`` (cb00889c, bounded handoff profiles) — when True, renders a
+    single self-closing element carrying ONLY the bounded, budget-safe
+    surface: ``item_id``, ``title``, scope (``requested_version``/``wave``/
+    ``track``/``milestone_type``/``priority``), ``contract_hash``, durable
+    pointer ids, and ``executable`` status — the "is this item executable and
+    what does it durably point at" summary a batch /goal can embed per item
+    without the size risk of the full tool/step/gate detail below (the exact
+    per-item bloat class 23e20656/de4d4293 already had to cap elsewhere via
+    ``max_executor_contracts``). It deliberately omits allowed/forbidden
+    tools, steps, gates, dependency, and completion-check detail — fetch that
+    on demand via the FULL projection: ``render_xml_clause(contract)`` (the
+    default, ``compact=False``, byte-for-byte unchanged from before this
+    parameter existed), :func:`to_json`, or :func:`render_text` — all pure
+    projections of this SAME already-built ``contract``, no re-fetch. The
+    function-level default stays ``compact=False`` so every existing caller
+    keeps its exact prior (full) output; a caller wanting the bounded profile
+    opts in explicitly.
+    """
     from xml.sax.saxutils import escape as _xml_escape  # noqa: PLC0415
+
+    if compact:
+        _scope = contract.get("scope") or {}
+        _pointers_entry = contract.get("pointers") or {}
+        _pointer_ids = [
+            str(_p["id"])
+            for _p in (_pointers_entry.get("pointers") or [])
+            if isinstance(_p, dict) and _p.get("id")
+        ]
+        return (
+            '<executor_contract compact="true" '
+            f'item_id="{_xml_escape(str(contract.get("item_id") or ""))}" '
+            f'title="{_xml_escape(str(contract.get("title") or ""))}" '
+            f'executable="{"true" if contract.get("executable") else "false"}" '
+            f'contract_hash="{_xml_escape(str(contract.get("contract_hash") or ""))}" '
+            f'requested_version="{_xml_escape(str(_scope.get("requested_version") or ""))}" '
+            f'wave="{_xml_escape(str(_scope.get("wave") or ""))}" '
+            f'track="{_xml_escape(str(_scope.get("track") or ""))}" '
+            f'milestone_type="{_xml_escape(str(_scope.get("milestone_type") or ""))}" '
+            f'priority="{_xml_escape(str(_scope.get("priority") or ""))}" '
+            f'pointer_ids="{_xml_escape(",".join(_pointer_ids))}" />'
+        )
 
     lines = [
         f'<executor_contract item_id="{_xml_escape(str(contract.get("item_id") or ""))}" '
