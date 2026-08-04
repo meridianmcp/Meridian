@@ -2668,10 +2668,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "new_title": {"type": "string", "description": "Title for the merged survivor item."}},
          "required": ["item_ids", "new_title"]}},
     {"name": "set_active_repo",
-     "description": "Update the tunnel's active Serena repo at runtime. When a planning session switches to a different codebase, call this so subsequent Serena requests (find_symbol, find_referencing_symbols, etc.) route to the new repo without restarting the tunnel. Has no effect when no tunnel is connected.",
+     "description": "Update the tunnel's active Serena repo at runtime. When a planning session switches to a different codebase, call this so subsequent Serena requests (find_symbol, find_referencing_symbols, etc.) route to the new repo without restarting the tunnel. Has no effect when no tunnel is connected. 32ba4125 — pass worktree_id instead of repo_path to activate a REGISTERED git worktree (one created via create_worktree / POST /projects/{id}/worktrees) as a validated code-intel context: the repo_path is resolved server-side from that worktree's own record, so an unregistered/arbitrary path can never be activated this way, and the response's `worktree` field carries fingerprint metadata (worktree_id, project_id, branch, path, registered_at). Passing repo_path directly is unchanged and still works for any path (main-repo/non-worktree use).",
      "inputSchema": {"type": "object", "properties": {
-         "repo_path": {"type": "string", "description": "Absolute path to the repository to activate (e.g. /home/me/project or C:\\\\Users\\\\me\\\\project)."}},
-         "required": ["repo_path"]}},
+         "repo_path": {"type": "string", "description": "Absolute path to the repository to activate (e.g. /home/me/project or C:\\\\Users\\\\me\\\\project). Ignored when worktree_id is given."},
+         "worktree_id": {"type": "string", "description": "32ba4125 — id of a REGISTERED active_worktrees row (from create_worktree) to activate as a validated code-intel context. Takes precedence over repo_path; resolves and validates the path from the worktree's own DB record instead of trusting a caller-supplied path."}},
+         "required": []}},
     {"name": "run_verification",
      "description":
         "0e973e52 — run the project's stored test_cmd on YOUR local machine via the "

@@ -5133,6 +5133,27 @@ async def _handle_tunnel_tools(
 ) -> Any:
     """Dispatch group: set_active_repo (tunnel control), run_verification (0e973e52)."""
     if name == "set_active_repo":
+        # 32ba4125 — worktree_id is the validated, fail-closed activation path:
+        # it can only ever resolve to a path a session actually registered via
+        # create_worktree (POST /projects/{id}/worktrees), never an arbitrary
+        # string. Checked FIRST and handled as a fully separate branch so the
+        # plain repo_path path below (and its exact error messages/behavior)
+        # stays byte-for-byte unchanged for existing main-repo/non-worktree
+        # callers that never pass worktree_id.
+        worktree_id = str(args.get("worktree_id") or "").strip()
+        if worktree_id:
+            if tenant is None:
+                raise ValueError("set_active_repo requires an authenticated tenant (tunnel mode)")
+            tenant_id = tenant.get("id", "")
+            from ..worktree_code_intel_context import (  # noqa: PLC0415
+                WorktreeCodeIntelContextError,
+                activate_worktree_code_intel_context,
+            )
+            try:
+                return await activate_worktree_code_intel_context(db, tenant_id, worktree_id)
+            except WorktreeCodeIntelContextError as exc:
+                raise ValueError(str(exc)) from exc
+
         repo_path = str(args.get("repo_path") or "").strip()
         if not repo_path:
             raise ValueError("repo_path is required")
