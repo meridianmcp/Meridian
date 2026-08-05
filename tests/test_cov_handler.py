@@ -2570,11 +2570,20 @@ def test_set_sprint_unstarted_warning():
 
 def test_claim_sprint_item_race_returns_already_claimed():
     """df573218 — claiming an item another session already grabbed returns a
-    structured already_claimed response pointing at the next item, not a crash."""
+    structured already_claimed response pointing at the next item, not a crash.
+
+    2a176d6d/93e266e7 — these items declare real touches_resources, so the
+    real MCP claim_sprint_item entry point now fails closed
+    (MISSING_EXECUTION_IDENTITY) without a session_id. Both claim calls pass
+    a real, registered session_id so the test still exercises the intended,
+    resource-protected path rather than dodging the gate."""
     db = _make_db()
     try:
         proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "race"}, db, "/tmp"))
         pid = proj["id"]
+        import meridian.db as _db_mod  # noqa: PLC0415
+        sess = _run(_db_mod.register_session(db, pid, "racer-1"))
+        sid = sess["id"]
         a = _run(mh._dispatch_mcp_tool(
             "add_sprint_item",
             {"project_id": pid, "version": "v1", "title": "a", "touches_resources": ["file:a.py"]},
@@ -2588,17 +2597,16 @@ def test_claim_sprint_item_race_returns_already_claimed():
         # 94c26322 — this test is about claim-race semantics, not prospecting;
         # bypass is set via the legitimate human/planning-session path
         # (update_sprint_item after creation), never at add-time.
-        import meridian.db as _db_mod  # noqa: PLC0415
         _run(_db_mod.patch_sprint_item(db, pid, a["id"], prospect_bypass=True))
         _run(_db_mod.patch_sprint_item(db, pid, b["id"], prospect_bypass=True))
         # First claim succeeds.
         first = _run(mh._dispatch_mcp_tool(
-            "claim_sprint_item", {"project_id": pid, "item_id": a["id"]}, db, "/tmp",
+            "claim_sprint_item", {"project_id": pid, "item_id": a["id"], "session_id": sid}, db, "/tmp",
         ))
         assert first.get("status") == "in_progress"
         # Second claim of the SAME item → already_claimed + points at b.
         out = _run(mh._dispatch_mcp_tool(
-            "claim_sprint_item", {"project_id": pid, "item_id": a["id"]}, db, "/tmp",
+            "claim_sprint_item", {"project_id": pid, "item_id": a["id"], "session_id": sid}, db, "/tmp",
         ))
         assert out["status"] == "already_claimed"
         assert out["current_status"] == "in_progress"
@@ -2608,23 +2616,28 @@ def test_claim_sprint_item_race_returns_already_claimed():
 
 
 def test_claim_sprint_item_race_no_next_item():
-    """When the raced item is the only one, next_available_id is None."""
+    """When the raced item is the only one, next_available_id is None.
+
+    2a176d6d/93e266e7 — real touches_resources means a real session_id is
+    required to get past MISSING_EXECUTION_IDENTITY."""
     db = _make_db()
     try:
         proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "race2"}, db, "/tmp"))
         pid = proj["id"]
+        import meridian.db as _db_mod  # noqa: PLC0415
+        sess = _run(_db_mod.register_session(db, pid, "racer-2"))
+        sid = sess["id"]
         a = _run(mh._dispatch_mcp_tool(
             "add_sprint_item",
             {"project_id": pid, "version": "v1", "title": "only", "touches_resources": ["file:a.py"]},
             db, "/tmp",
         ))
-        import meridian.db as _db_mod  # noqa: PLC0415
         _run(_db_mod.patch_sprint_item(db, pid, a["id"], prospect_bypass=True))
         _run(mh._dispatch_mcp_tool(
-            "claim_sprint_item", {"project_id": pid, "item_id": a["id"]}, db, "/tmp",
+            "claim_sprint_item", {"project_id": pid, "item_id": a["id"], "session_id": sid}, db, "/tmp",
         ))
         out = _run(mh._dispatch_mcp_tool(
-            "claim_sprint_item", {"project_id": pid, "item_id": a["id"]}, db, "/tmp",
+            "claim_sprint_item", {"project_id": pid, "item_id": a["id"], "session_id": sid}, db, "/tmp",
         ))
         assert out["status"] == "already_claimed"
         assert out["next_available_id"] is None
@@ -2714,7 +2727,12 @@ def test_start_session_agent_instructions_hitl_mode_aware():
 
 
 def test_update_sprint_item_blocks_in_progress():
-    """586eeda9 — mutating an in_progress item is blocked unless force=true."""
+    """586eeda9 — mutating an in_progress item is blocked unless force=true.
+
+    2a176d6d/93e266e7 — the item declares real touches_resources, so a real
+    session_id is required for the claim to actually land (and transition the
+    item to in_progress) instead of failing closed with
+    MISSING_EXECUTION_IDENTITY."""
     db = _make_db()
     try:
         proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "mutguard"}, db, "/tmp"))
@@ -2725,8 +2743,10 @@ def test_update_sprint_item_blocks_in_progress():
         ))
         import meridian.db as _db_mod  # noqa: PLC0415
         _run(_db_mod.patch_sprint_item(db, pid, item["id"], prospect_bypass=True))
+        sess = _run(_db_mod.register_session(db, pid, "mutguard-exec"))
         _run(mh._dispatch_mcp_tool(
-            "claim_sprint_item", {"project_id": pid, "item_id": item["id"]}, db, "/tmp",
+            "claim_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]}, db, "/tmp",
         ))
         out = _run(mh._dispatch_mcp_tool(
             "update_sprint_item", {"project_id": pid, "item_id": item["id"], "title": "b"},

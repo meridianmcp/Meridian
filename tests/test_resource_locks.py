@@ -1163,6 +1163,72 @@ async def test_claim_sprint_item_missing_session_id_no_resources_is_unaffected(d
 
 
 @pytest.mark.asyncio
+async def test_claim_sprint_item_identity_gate_end_to_end_fail_closed_then_acquires_and_releases(db):
+    """93e266e7 — first-class regression for the full MISSING_EXECUTION_IDENTITY
+    contract (2a176d6d finding 1) through its real production entry point
+    (claim_sprint_item via the MCP dispatcher), walking the whole lifecycle in
+    one place so the fail-closed guard is pinned as a durable regression
+    rather than only an incidental side effect of fixing stale test fixtures
+    elsewhere:
+
+      1. No session_id + a real declared touches_resources entry -> the
+         structured, visible MISSING_EXECUTION_IDENTITY error (not a silent
+         success, not an unhandled exception), the item stays pending, and no
+         lock is ever created.
+      2. The SAME item, claimed again with a real registered session_id,
+         succeeds and genuinely acquires the file lock -- verified against
+         the shared file_locks table via get_file_claims, not just the
+         response payload.
+      3. release_file actually releases what claim_sprint_item acquired.
+    """
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "93e266e7-identity-lifecycle")
+    pid = p["id"]
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "lifecycle check",
+        touches_resources=["file:lifecycle_target.py"], prospect_bypass=True,
+    )
+
+    # (1) No identity -> fail closed, structured error, nothing claimed, no lock.
+    refused = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": pid, "item_id": item["id"]},  # no session_id
+        db, "/tmp",
+    )
+    assert refused.get("ok") is False
+    assert refused.get("error") == "MISSING_EXECUTION_IDENTITY"
+    assert refused.get("item_id") == item["id"]
+    assert refused.get("declared_resources") == ["file:lifecycle_target.py"]
+    assert isinstance(refused.get("message"), str) and refused["message"]
+    reread = await db_module.get_sprint_item(db, item["id"])
+    assert reread["status"] == "pending"
+    assert reread.get("claimed_at") is None
+    no_lock = await db_module.get_file_claims(db, "lifecycle_target.py")
+    assert no_lock["file_lock"] is None
+
+    # (2) A real, registered session_id gets past the gate, claims the item,
+    # and genuinely acquires the lock (not just an 'ok' response payload).
+    sess = await db_module.register_session(db, pid, "lifecycle-exec")
+    accepted = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]},
+        db, "/tmp",
+    )
+    assert "error" not in accepted and not accepted.get("blocked")
+    assert accepted.get("status") == "in_progress"
+    held = await db_module.get_file_claims(db, "lifecycle_target.py")
+    assert held["file_lock"] is not None
+    assert held["file_lock"]["session_id"] == sess["id"]
+
+    # (3) release_file actually releases the lock claim_sprint_item acquired.
+    released = await db_module.release_file(db, "lifecycle_target.py", sess["id"])
+    assert released is True
+    cleared = await db_module.get_file_claims(db, "lifecycle_target.py")
+    assert cleared["file_lock"] is None
+
+
+@pytest.mark.asyncio
 async def test_claim_sprint_item_bare_symbol_resource_is_rejected(db):
     """2a176d6d (finding 3) — a bare 'symbol:<name>' declaration (no '::'
     file scope) acquires zero lock; the real claim_sprint_item path must hard
