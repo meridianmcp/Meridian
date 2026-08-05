@@ -11995,6 +11995,1096 @@ def relocate_table(
 
 
 # ---------------------------------------------------------------------------
+# a2cd9f54 -- safe structural table edit primitives: insert_column,
+# split_cell, transpose_table.
+#
+# Word's native table model represents a "column" only implicitly, through
+# w:tblGrid (the column-boundary ruler) plus each row's own w:tc children,
+# whose horizontal extent is governed by w:gridSpan (default 1, meaning "no
+# horizontal merge") and whose VERTICAL continuation is governed by
+# w:vMerge ("restart" starts a merge group, an unadorned/"continue" value
+# extends it). There is no single authoritative "cell (row, col)" address
+# the format hands you directly -- every primitive below derives it by
+# walking a row and accumulating gridSpan (see _row_cell_spans).
+#
+# Scope (explicit, matching this item's "explicit ambiguity and
+# unsupported-merge failures" requirement rather than a general-purpose
+# merge-aware rewrite of arbitrary table geometry):
+#
+#   * insert_column -- supported for ANY table, including ones that already
+#     contain gridSpan/vMerge, AS LONG AS every row's cells consistently
+#     account for the table's declared grid-column count (a genuinely
+#     malformed/ambiguous table is refused with reason="ambiguous_grid").
+#     For each row, the insertion point either (a) lands strictly INSIDE an
+#     existing horizontally-merged cell's span -- its gridSpan is simply
+#     incremented, so the new column becomes part of that merge, matching
+#     what Word itself does when you insert a column through a merged
+#     region -- or (b) lands on a cell boundary -- a brand-new, empty cell
+#     is spliced in for that row.
+#   * split_cell -- supported for the TARGET cell only when it has no
+#     gridSpan>1 and no w:vMerge of its own (neither "restart" nor
+#     "continue"); a target that is already merged is refused with
+#     reason="unsupported_merge" rather than guessing how a split should
+#     interact with an existing merge. A column-split (cols>1) reuses the
+#     exact same grid-widening engine insert_column uses (applied cols-1
+#     times) so every OTHER row in the table stays grid-consistent. A
+#     row-split (rows>1) inserts brand-new <w:tr> rows immediately after the
+#     target row: the split cell's own column(s) get independent new
+#     content in each new row, while every OTHER cell in the target row
+#     grows a w:vMerge spanning the new rows so the table stays visually
+#     rectangular.
+#   * transpose_table -- supported ONLY for a fully rectangular table with
+#     NO gridSpan>1 and NO w:vMerge anywhere (every row has exactly the same
+#     number of plain, unmerged cells). Any merged cell makes the correct
+#     transposed merge geometry genuinely ambiguous (a horizontal merge does
+#     not have one canonical vertical-merge equivalent), so this refuses
+#     rather than risk silently producing a wrong table --
+#     reason="unsupported_merge". Row heights and column widths also have no
+#     canonical semantic mapping under a transpose; the new w:tblGrid falls
+#     back to the table's original total width divided evenly across the
+#     new column count -- an honest, documented default, not a fabricated
+#     precise one.
+#
+# Every write goes through the SAME disposable-copy, byte/zip/XML-integrity
+# pipeline the rest of this module uses (_load_docx_xml_stdlib /
+# _save_docx_xml_stdlib / _atomic_write_docx_bytes / _verify_docx_write /
+# _enforce_render_verification) via the shared _write_table_mutation tail
+# below -- never a whole-document native rewrite. Because every mutation
+# repositions or clones the SAME live ET.Element cell objects (never
+# re-serializes cell content from scratch), everything already inside a
+# cell -- paragraph styles, numbering references, bookmarks, run formatting,
+# relationship ids (images, hyperlinks) -- survives verbatim. Brand-new
+# cells get exactly one fresh, empty <w:p> with its own newly-minted,
+# document-unique w14:paraId (see _existing_para_ids / _new_para_id).
+#
+# Known, documented scope limitation: unlike move_section / copy_section /
+# relocate_table, these three primitives do not (yet) support the
+# draft_output_path / wave_run_id isolated-draft mode -- they always mutate
+# docx_path in place. Adding draft-mode support is a mechanical follow-up
+# (thread the same _resolve_draft_dest call these other primitives use),
+# not attempted here to keep this item's surface reviewable.
+# ---------------------------------------------------------------------------
+
+_W_TBL = _q(_W, "tbl")
+_W_TR = _q(_W, "tr")
+_W_TC = _q(_W, "tc")
+_W_TBLGRID = _q(_W, "tblGrid")
+_W_GRIDCOL = _q(_W, "gridCol")
+_W_TCPR = _q(_W, "tcPr")
+_W_TCW = _q(_W, "tcW")
+_W_GRIDSPAN = _q(_W, "gridSpan")
+_W_VMERGE = _q(_W, "vMerge")
+
+# CT_TcPr's fixed child-element sequence (ECMA-376 Part 1, SS17.4.70) -- used
+# to insert a NEW gridSpan/vMerge element at a schema-valid position rather
+# than blindly appending, which could produce an XML document Word rejects.
+_TCPR_CHILD_ORDER = (
+    "cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd",
+    "noWrap", "tcMar", "textDirection", "tcFitText", "vAlign", "hideMark",
+    "cellIns", "cellDel", "cellMerge",
+)
+
+
+def _resolve_table_element(
+    body: ET.Element, table_index: Any
+) -> tuple[ET.Element, None] | tuple[None, dict[str, Any]]:
+    """Validate ``table_index`` against ``body`` and return ``(tbl, None)``
+    on success or ``(None, error_dict)`` -- the same 0-based body-child
+    addressing scheme :func:`relocate_table` uses."""
+    body_list = list(body)
+    if not isinstance(table_index, int) or isinstance(table_index, bool) or table_index < 0:
+        return None, {"error": f"table_index must be a non-negative int, got {table_index!r}"}
+    if table_index >= len(body_list):
+        return None, {
+            "error": (
+                f"table_index {table_index} out of range -- document body has "
+                f"{len(body_list)} top-level children"
+            )
+        }
+    target_el = body_list[table_index]
+    if target_el.tag != _W_TBL:
+        found_tag = target_el.tag.rsplit("}", 1)[-1]
+        return None, {
+            "error": f"body child at index {table_index} is not a <w:tbl> (found <{found_tag}>)"
+        }
+    return target_el, None
+
+
+def _table_rows(tbl: ET.Element) -> list[ET.Element]:
+    return list(tbl.findall(_W_TR))
+
+
+def _cell_grid_span(tc: ET.Element) -> int:
+    tcPr = tc.find(_W_TCPR)
+    if tcPr is None:
+        return 1
+    gridSpan = tcPr.find(_W_GRIDSPAN)
+    if gridSpan is None:
+        return 1
+    try:
+        return max(1, int(gridSpan.get(_q(_W, "val"), "1")))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _cell_vmerge(tc: ET.Element) -> str | None:
+    """``"restart"`` / ``"continue"`` / ``None`` (no w:vMerge at all).
+
+    A ``<w:vMerge/>`` with no ``w:val`` attribute means ``"continue"`` per
+    ECMA-376 -- only ``w:val="restart"`` is ever spelled out explicitly.
+    """
+    tcPr = tc.find(_W_TCPR)
+    if tcPr is None:
+        return None
+    vMerge = tcPr.find(_W_VMERGE)
+    if vMerge is None:
+        return None
+    return vMerge.get(_q(_W, "val"), "continue")
+
+
+def _row_cell_spans(tr: ET.Element) -> list[tuple[ET.Element, int, int]]:
+    """``[(tc, start_col, span), ...]`` for one row, in document order."""
+    out: list[tuple[ET.Element, int, int]] = []
+    col = 0
+    for tc in tr.findall(_W_TC):
+        span = _cell_grid_span(tc)
+        out.append((tc, col, span))
+        col += span
+    return out
+
+
+def _table_grid_col_count(tbl: ET.Element) -> int | None:
+    grid = tbl.find(_W_TBLGRID)
+    if grid is None:
+        return None
+    cols = grid.findall(_W_GRIDCOL)
+    return len(cols) if cols else None
+
+
+def _validate_uniform_row_spans(tbl: ET.Element, grid_col_count: int) -> list[str]:
+    """Human-readable problems (empty == consistent): every row's cells must
+    account for EXACTLY ``grid_col_count`` grid columns. A row that over- or
+    under-shoots is a malformed-or-ambiguous table this module refuses to
+    guess about (see reason="ambiguous_grid" on the public functions)."""
+    problems: list[str] = []
+    for row_idx, tr in enumerate(_table_rows(tbl)):
+        total = sum(span for _tc, _start, span in _row_cell_spans(tr))
+        if total != grid_col_count:
+            problems.append(
+                f"row {row_idx} spans {total} grid column(s), expected {grid_col_count}"
+            )
+    return problems
+
+
+def _gridcol_width(tbl: ET.Element, index: int) -> int | None:
+    grid = tbl.find(_W_TBLGRID)
+    if grid is None:
+        return None
+    cols = grid.findall(_W_GRIDCOL)
+    if not (0 <= index < len(cols)):
+        return None
+    raw = cols[index].get(_q(_W, "w"))
+    try:
+        return int(raw) if raw is not None else None
+    except ValueError:
+        return None
+
+
+def _tc_width(tc: ET.Element) -> int | None:
+    tcPr = tc.find(_W_TCPR)
+    if tcPr is None:
+        return None
+    tcW = tcPr.find(_W_TCW)
+    if tcW is None:
+        return None
+    raw = tcW.get(_q(_W, "w"))
+    try:
+        return int(raw) if raw is not None else None
+    except ValueError:
+        return None
+
+
+def _ensure_tblgrid(tbl: ET.Element, col_count: int) -> ET.Element:
+    """Return ``tbl``'s ``<w:tblGrid>``, creating one with ``col_count``
+    width-less ``<w:gridCol>`` entries first if it doesn't exist yet (a real
+    Word-authored .docx always has one; this only matters for a hand-built
+    fixture)."""
+    grid = tbl.find(_W_TBLGRID)
+    if grid is not None:
+        return grid
+    grid = ET.Element(_W_TBLGRID)
+    tblPr = tbl.find(_q(_W, "tblPr"))
+    tbl.insert((list(tbl).index(tblPr) + 1) if tblPr is not None else 0, grid)
+    for _ in range(col_count):
+        ET.SubElement(grid, _W_GRIDCOL)
+    return grid
+
+
+def _tcpr_insert_index(tcPr: ET.Element, tag_name: str) -> int:
+    """Index at which to insert a new ``tag_name`` child into ``tcPr`` to
+    respect CT_TcPr's fixed element sequence (see ``_TCPR_CHILD_ORDER``)."""
+    try:
+        target_rank = _TCPR_CHILD_ORDER.index(tag_name)
+    except ValueError:  # pragma: no cover -- defensive; every caller here is a known tag
+        return len(list(tcPr))
+    for i, child in enumerate(tcPr):
+        local = child.tag.rsplit("}", 1)[-1]
+        try:
+            rank = _TCPR_CHILD_ORDER.index(local)
+        except ValueError:
+            continue
+        if rank > target_rank:
+            return i
+    return len(list(tcPr))
+
+
+def _set_grid_span(tc: ET.Element, span: int) -> None:
+    """Set (``span`` > 1) or remove (``span`` <= 1) ``tc``'s ``w:gridSpan``,
+    preserving CT_TcPr element ordering and creating ``w:tcPr`` on demand."""
+    tcPr = tc.find(_W_TCPR)
+    if tcPr is None:
+        if span <= 1:
+            return
+        tcPr = ET.Element(_W_TCPR)
+        tc.insert(0, tcPr)
+    gridSpan = tcPr.find(_W_GRIDSPAN)
+    if span <= 1:
+        if gridSpan is not None:
+            tcPr.remove(gridSpan)
+        return
+    if gridSpan is None:
+        gridSpan = ET.Element(_W_GRIDSPAN)
+        tcPr.insert(_tcpr_insert_index(tcPr, "gridSpan"), gridSpan)
+    gridSpan.set(_q(_W, "val"), str(span))
+
+
+def _set_vmerge(tc: ET.Element, mode: str | None) -> None:
+    """Set (``"restart"`` / ``"continue"``) or remove (``None``) ``tc``'s
+    ``w:vMerge``, preserving CT_TcPr element ordering."""
+    tcPr = tc.find(_W_TCPR)
+    if tcPr is None:
+        if mode is None:
+            return
+        tcPr = ET.Element(_W_TCPR)
+        tc.insert(0, tcPr)
+    vMerge = tcPr.find(_W_VMERGE)
+    if mode is None:
+        if vMerge is not None:
+            tcPr.remove(vMerge)
+        return
+    if vMerge is None:
+        vMerge = ET.Element(_W_VMERGE)
+        tcPr.insert(_tcpr_insert_index(tcPr, "vMerge"), vMerge)
+    if mode == "restart":
+        vMerge.set(_q(_W, "val"), "restart")
+    elif _q(_W, "val") in vMerge.attrib:
+        del vMerge.attrib[_q(_W, "val")]
+
+
+def _new_empty_tc(width: int | None, taken_ids: set[str]) -> ET.Element:
+    """Brand-new, empty ``<w:tc>``: one ``<w:tcPr>`` (with ``w:tcW`` when
+    ``width`` is known) plus one empty ``<w:p>`` carrying a freshly-minted,
+    never-before-seen ``w14:paraId`` (see ``_new_para_id``)."""
+    tc = ET.Element(_W_TC)
+    if width is not None:
+        tcPr = ET.SubElement(tc, _W_TCPR)
+        ET.SubElement(tcPr, _W_TCW, {_q(_W, "w"): str(width), _q(_W, "type"): "dxa"})
+    p = ET.SubElement(tc, _q(_W, "p"))
+    p.set(_q(_W14, "paraId"), _new_para_id(taken_ids))
+    return tc
+
+
+def _new_continuation_tc(width: int | None, taken_ids: set[str]) -> ET.Element:
+    """A brand-new ``<w:tc>`` marked ``w:vMerge`` (continue) -- a vertical-
+    merge placeholder cell for a row inserted by a row-split."""
+    tc = _new_empty_tc(width, taken_ids)
+    _set_vmerge(tc, "continue")
+    return tc
+
+
+def _insert_grid_columns(
+    tbl: ET.Element,
+    insertion_col: int,
+    count: int,
+    default_width: int | None,
+    *,
+    skip_row: ET.Element | None = None,
+    taken_ids: set[str] | None = None,
+) -> int:
+    """Insert ``count`` new grid columns at ``insertion_col`` into ``tbl``'s
+    ``w:tblGrid`` AND, for every row except ``skip_row``, either widen a
+    straddling cell's ``gridSpan`` or splice in a brand-new empty cell at
+    the boundary -- the shared engine behind both :func:`insert_column` and
+    :func:`split_cell`'s column-split mode. Caller must ensure ``tbl`` already
+    has a ``w:tblGrid`` (see :func:`_ensure_tblgrid`). Returns the number of
+    brand-new ``<w:p>`` paragraphs created (one per newly-spliced cell)."""
+    if count <= 0:
+        return 0
+    new_paragraphs = 0
+    ids = taken_ids if taken_ids is not None else _existing_para_ids(tbl)
+    grid = tbl.find(_W_TBLGRID)
+
+    for offset in range(count):
+        col = insertion_col + offset
+        for tr in _table_rows(tbl):
+            if tr is skip_row:
+                continue
+            spans = _row_cell_spans(tr)
+            straddling = next((tc for tc, s, sp in spans if s < col < s + sp), None)
+            if straddling is not None:
+                _set_grid_span(straddling, _cell_grid_span(straddling) + 1)
+                continue
+            tc_children = list(tr.findall(_W_TC))
+            insert_at = next(
+                (i for i, (_tc, s, _sp) in enumerate(spans) if s >= col), len(tc_children)
+            )
+            new_tc = _new_empty_tc(default_width, ids)
+            if insert_at >= len(tc_children):
+                tr.append(new_tc)
+            else:
+                anchor = tc_children[insert_at]
+                tr_children = list(tr)
+                tr.insert(tr_children.index(anchor), new_tc)
+            new_paragraphs += 1
+
+        if grid is not None:
+            new_gridcol = ET.Element(_W_GRIDCOL)
+            if default_width is not None:
+                new_gridcol.set(_q(_W, "w"), str(default_width))
+            grid_cols = grid.findall(_W_GRIDCOL)
+            if col >= len(grid_cols):
+                grid.append(new_gridcol)
+            else:
+                grid_children = list(grid)
+                grid.insert(grid_children.index(grid_cols[col]), new_gridcol)
+
+    return new_paragraphs
+
+
+def _split_rows(
+    target_el: ET.Element,
+    target_row: ET.Element,
+    target_cells: list[ET.Element],
+    start_col: int,
+    extra_rows: int,
+    taken_ids: set[str],
+) -> int:
+    """Insert ``extra_rows`` new ``<w:tr>`` immediately after ``target_row``.
+    The cell(s) in ``target_cells`` get brand-new, independent content in
+    each new row (the actual split-into-rows result). Every OTHER cell in
+    ``target_row`` grows a ``w:vMerge`` spanning the new rows (promoted to
+    ``"restart"`` if it wasn't already part of a merge; left untouched if it
+    already was one, correctly extending that existing merge) so the table
+    stays visually rectangular. Returns the number of brand-new ``<w:p>``
+    paragraphs created."""
+    new_paragraphs = 0
+
+    sibling_spans = [
+        (tc, s, sp) for tc, s, sp in _row_cell_spans(target_row) if tc not in target_cells
+    ]
+    for tc, _s, _sp in sibling_spans:
+        if _cell_vmerge(tc) is None:
+            _set_vmerge(tc, "restart")
+
+    insert_after = target_row
+    for _ in range(extra_rows):
+        new_tr = ET.Element(_W_TR)
+        ordered: list[tuple[int, ET.Element]] = []
+        for tc, s, sp in sibling_spans:
+            placeholder = _new_continuation_tc(_tc_width(tc), taken_ids)
+            _set_grid_span(placeholder, sp)
+            ordered.append((s, placeholder))
+            new_paragraphs += 1
+        for offset, tc in enumerate(target_cells):
+            fresh = _new_empty_tc(_tc_width(tc), taken_ids)
+            ordered.append((start_col + offset, fresh))
+            new_paragraphs += 1
+        ordered.sort(key=lambda item: item[0])
+        for _pos, tc in ordered:
+            new_tr.append(tc)
+
+        siblings_of_target_el = list(target_el)
+        insert_idx = siblings_of_target_el.index(insert_after) + 1
+        target_el.insert(insert_idx, new_tr)
+        insert_after = new_tr
+
+    return new_paragraphs
+
+
+def _write_table_mutation(
+    *,
+    docx_path: str,
+    raw: bytes,
+    root: ET.Element,
+    target_el: ET.Element,
+    table_index: int,
+    expected_counts: dict[str, int],
+    expected_hash: str,
+    index_db_path: str | None,
+    allow_degraded_render: bool,
+    degraded_render_reason: str | None,
+) -> dict[str, Any]:
+    """Shared stage -> verify -> render-gate -> promote tail for the table
+    structural-edit primitives (insert_column / split_cell / transpose_table)
+    -- identical discipline to relocate_table / insert_caption (see their
+    docstrings), factored out since all three share it verbatim. Returns
+    ``{"docx_path": ..., "render_info": {...}}`` on success, or an error
+    dict (already carrying ``"error"``, ``"file_restored"``,
+    ``"concurrent_write_detected"``, ``"table_index"``, ``"docx_path"``) on
+    failure -- the caller can layer its own identifying fields on top and
+    return it verbatim."""
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_docx_write(
+            docx_path,
+            expected_counts=expected_counts,
+            expected_hash=expected_hash,
+            expected_range=(table_index, table_index + 1),
+        )
+        if verify_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["table_index"] = table_index
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["table_index"] = table_index
+            render_error["docx_path"] = docx_path
+            return render_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+    return {"docx_path": docx_path, "render_info": render_info}
+
+
+def insert_column(
+    docx_path: str,
+    table_index: int,
+    col_index: int,
+    position: str = "before",
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """a2cd9f54 -- Insert a new, empty grid column into an existing table.
+
+    ``col_index`` addresses an existing GRID column (0-based, from
+    ``_table_grid_col_count`` / the table's ``w:tblGrid``); ``position``
+    ("before", default, or "after") says which side of it the new column
+    lands on.
+
+    For each row: if the insertion point falls strictly INSIDE an existing
+    horizontally-merged cell's span, that cell's ``w:gridSpan`` is
+    incremented (the new column joins the merge) -- otherwise a brand-new,
+    empty cell (one empty paragraph, a fresh ``w14:paraId``) is spliced in
+    at the boundary. ``w:tblGrid`` always gets exactly one new
+    ``w:gridCol``, defaulted to the width of the column at ``col_index``.
+
+    Refuses (file untouched) with ``reason="ambiguous_grid"`` when the
+    table's rows do not consistently account for its declared grid-column
+    count -- this module never guesses at an inconsistent/malformed table's
+    real column addressing.
+
+    After a successful write, mandatory post-write verification (see
+    :func:`_write_table_mutation` / :func:`_verify_docx_write`) re-reads the
+    file from disk and confirms the exact expected byte content landed --
+    the file is best-effort restored from backup on any mismatch. A real
+    Word/COM (or LibreOffice) render-capability check also runs
+    (:func:`_enforce_render_verification`); see ``allow_degraded_render``.
+
+    Args:
+        docx_path:       Absolute path to the .docx file (mutated in place).
+        table_index:      0-based body-child position of the ``<w:tbl>``
+                          (same addressing as :func:`relocate_table`).
+        col_index:        0-based existing grid-column index to insert
+                          relative to.
+        position:         "before" (default) or "after" ``col_index``.
+        index_db_path:    If supplied, sidecar is invalidated after write.
+        allow_degraded_render: Explicit, audited opt-in to accept this write
+                          when no render backend is available in this
+                          environment. Requires ``degraded_render_reason``.
+        degraded_render_reason: Required, non-empty when
+                          ``allow_degraded_render`` is True.
+
+    Returns:
+        ``{status, table_index, col_index, position, grid_col_count,
+        row_count, col_count, docx_path, render_status, render_verified,
+        render_backend, render_detail}`` or ``{"error": ...}`` (with
+        ``"reason"`` one of ``"ambiguous_grid"`` when applicable) on
+        failure.
+    """
+    if position not in ("before", "after"):
+        return {"error": f"position must be 'before' or 'after', got {position!r}"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    target_el, err = _resolve_table_element(body, table_index)
+    if err is not None:
+        return err
+
+    rows = _table_rows(target_el)
+    grid_col_count = _table_grid_col_count(target_el)
+    if grid_col_count is None:
+        grid_col_count = max(
+            (sum(span for _tc, _s, span in _row_cell_spans(tr)) for tr in rows), default=0
+        )
+    if grid_col_count <= 0:
+        return {"error": "table has no columns to insert relative to"}
+
+    problems = _validate_uniform_row_spans(target_el, grid_col_count)
+    if problems:
+        return {
+            "error": (
+                "insert_column refused: this table's rows do not "
+                f"consistently account for its {grid_col_count} grid "
+                "column(s) -- ambiguous column addressing"
+            ),
+            "reason": "ambiguous_grid",
+            "details": problems,
+        }
+
+    if (
+        not isinstance(col_index, int)
+        or isinstance(col_index, bool)
+        or not (0 <= col_index < grid_col_count)
+    ):
+        return {
+            "error": (
+                f"col_index must be a non-negative int less than the "
+                f"table's {grid_col_count} grid column(s), got {col_index!r}"
+            )
+        }
+
+    insertion_col = col_index if position == "before" else col_index + 1
+
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
+
+    taken_ids = _existing_para_ids(root)
+    new_width = _gridcol_width(target_el, min(col_index, grid_col_count - 1))
+    _ensure_tblgrid(target_el, grid_col_count)
+
+    new_paragraphs_added = _insert_grid_columns(
+        target_el, insertion_col, 1, new_width, taken_ids=taken_ids
+    )
+
+    expected_counts = dict(baseline_counts)
+    expected_counts["paragraph_count"] = baseline_counts["paragraph_count"] + new_paragraphs_added
+    expected_hash = _hash_elements([target_el])
+
+    write_result = _write_table_mutation(
+        docx_path=docx_path,
+        raw=raw,
+        root=root,
+        target_el=target_el,
+        table_index=table_index,
+        expected_counts=expected_counts,
+        expected_hash=expected_hash,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+    if "error" in write_result:
+        return write_result
+
+    from ._vendored_content_tree import _table_node  # noqa: PLC0415
+
+    table_meta = _table_node(target_el, table_index)
+
+    return {
+        "status": "inserted",
+        "table_index": table_index,
+        "col_index": col_index,
+        "position": position,
+        "grid_col_count": grid_col_count + 1,
+        "row_count": table_meta["row_count"],
+        "col_count": table_meta["col_count"],
+        "docx_path": write_result["docx_path"],
+        **write_result["render_info"],
+    }
+
+
+def split_cell(
+    docx_path: str,
+    table_index: int,
+    row_index: int,
+    col_index: int,
+    cols: int = 1,
+    rows: int = 1,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """a2cd9f54 -- Split one table cell into ``cols`` columns and/or ``rows``
+    rows.
+
+    ``row_index`` is a 0-based ``<w:tr>`` index; ``col_index`` is the
+    target cell's STARTING grid column (from ``_row_cell_spans`` -- pass the
+    ``start_col`` a caller already knows from ``document_outline`` /
+    ``get_structure_elements`` table metadata, not an arbitrary grid
+    position inside a wider merged cell).
+
+    Refuses (file untouched) with ``reason="unsupported_merge"`` when the
+    target cell already has ``w:gridSpan`` > 1 or any ``w:vMerge`` --
+    splitting an already-merged cell is not attempted. Also refuses with
+    ``reason="ambiguous_grid"`` (``cols`` > 1 only) under the same
+    inconsistent-table condition :func:`insert_column` checks.
+
+    Column split (``cols`` > 1): the target cell is replaced by ``cols``
+    brand-new, independent cells (its width divided evenly, remainder on
+    the last one); every OTHER row is widened by ``cols - 1`` grid columns
+    via the SAME engine :func:`insert_column` uses (a straddling merged
+    cell's ``gridSpan`` grows; otherwise a blank cell is spliced in), so the
+    whole table stays grid-consistent.
+
+    Row split (``rows`` > 1): ``rows - 1`` brand-new ``<w:tr>`` are inserted
+    immediately after the target row. The split cell's own column(s) get
+    independent new content in each new row; every OTHER cell in the target
+    row grows a ``w:vMerge`` spanning the new rows (idempotent if it was
+    already part of one) so the table stays visually rectangular.
+
+    Args:
+        docx_path:       Absolute path to the .docx file (mutated in place).
+        table_index:     0-based body-child position of the ``<w:tbl>``.
+        row_index:       0-based ``<w:tr>`` index of the target cell.
+        col_index:       Target cell's starting grid column.
+        cols:            Number of columns to split into (default 1 = no
+                          column split).
+        rows:             Number of rows to split into (default 1 = no row
+                          split). At least one of ``cols``/``rows`` must be
+                          > 1.
+        index_db_path:    If supplied, sidecar is invalidated after write.
+        allow_degraded_render: Same audited opt-in as :func:`insert_column`.
+        degraded_render_reason: Required, non-empty when
+                          ``allow_degraded_render`` is True.
+
+    Returns:
+        ``{status, table_index, row_index, col_index, cols, rows, row_count,
+        col_count, docx_path, render_status, render_verified, render_backend,
+        render_detail}`` or ``{"error": ...}`` (with ``"reason"`` one of
+        ``"unsupported_merge"`` / ``"ambiguous_grid"`` when applicable) on
+        failure.
+    """
+    if not isinstance(cols, int) or isinstance(cols, bool) or cols < 1:
+        return {"error": f"cols must be a positive int, got {cols!r}"}
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows < 1:
+        return {"error": f"rows must be a positive int, got {rows!r}"}
+    if cols == 1 and rows == 1:
+        return {"error": "split_cell requires cols>1 and/or rows>1 -- nothing to split"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    target_el, err = _resolve_table_element(body, table_index)
+    if err is not None:
+        return err
+
+    table_rows_list = _table_rows(target_el)
+    if (
+        not isinstance(row_index, int)
+        or isinstance(row_index, bool)
+        or not (0 <= row_index < len(table_rows_list))
+    ):
+        return {
+            "error": (
+                f"row_index must be a non-negative int less than the "
+                f"table's {len(table_rows_list)} row(s), got {row_index!r}"
+            )
+        }
+
+    target_row = table_rows_list[row_index]
+    row_spans = _row_cell_spans(target_row)
+
+    hit = next(((tc, s, sp) for tc, s, sp in row_spans if s == col_index), None)
+    if hit is None:
+        inside = next(
+            ((tc, s, sp) for tc, s, sp in row_spans if s < col_index < s + sp), None
+        )
+        if inside is not None:
+            return {
+                "error": (
+                    f"col_index {col_index} is inside an existing merged "
+                    f"cell (grid columns {inside[1]}-{inside[1] + inside[2] - 1}) "
+                    "-- address a split by the cell's STARTING grid column"
+                ),
+                "reason": "unsupported_merge",
+            }
+        return {
+            "error": f"col_index {col_index} does not address any cell in row {row_index}"
+        }
+
+    target_tc, start_col, span = hit
+    if span > 1:
+        return {
+            "error": (
+                f"cannot split cell at row {row_index}, col {col_index}: it "
+                f"already spans {span} grid column(s) (w:gridSpan) -- "
+                "splitting an already-merged cell is not supported"
+            ),
+            "reason": "unsupported_merge",
+        }
+    if _cell_vmerge(target_tc) is not None:
+        return {
+            "error": (
+                f"cannot split cell at row {row_index}, col {col_index}: it "
+                "is already part of a vertical merge (w:vMerge) -- "
+                "splitting an already-merged cell is not supported"
+            ),
+            "reason": "unsupported_merge",
+        }
+
+    grid_col_count = _table_grid_col_count(target_el)
+    if grid_col_count is None:
+        grid_col_count = max(
+            (sum(sp for _tc, _s, sp in _row_cell_spans(tr)) for tr in table_rows_list),
+            default=0,
+        )
+    if cols > 1:
+        problems = _validate_uniform_row_spans(target_el, grid_col_count)
+        if problems:
+            return {
+                "error": (
+                    "split_cell refused: this table's rows do not "
+                    f"consistently account for its {grid_col_count} grid "
+                    "column(s) -- ambiguous column addressing"
+                ),
+                "reason": "ambiguous_grid",
+                "details": problems,
+            }
+
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
+    taken_ids = _existing_para_ids(root)
+    new_paragraphs_added = 0
+
+    original_width = _tc_width(target_tc)
+
+    if cols > 1:
+        # Net delta, not a gross addition: the ORIGINAL target cell (and
+        # whatever paragraph(s) it held) is removed as part of the splice,
+        # so only the DIFFERENCE between what's added and what's removed
+        # counts toward the structural-verification expectation below.
+        removed_paragraphs = _structural_counts([target_tc])["paragraph_count"]
+        per_col_width = (original_width // cols) if original_width else None
+        new_cells = [_new_empty_tc(per_col_width, taken_ids) for _ in range(cols)]
+        new_paragraphs_added += cols - removed_paragraphs
+
+        tr_children = list(target_row)
+        anchor_idx = tr_children.index(target_tc)
+        target_row.remove(target_tc)
+        for offset, tc in enumerate(new_cells):
+            target_row.insert(anchor_idx + offset, tc)
+
+        _ensure_tblgrid(target_el, grid_col_count)
+        new_paragraphs_added += _insert_grid_columns(
+            target_el, start_col + 1, cols - 1, per_col_width,
+            skip_row=target_row, taken_ids=taken_ids,
+        )
+        target_cells = new_cells
+    else:
+        target_cells = [target_tc]
+
+    if rows > 1:
+        new_paragraphs_added += _split_rows(
+            target_el=target_el,
+            target_row=target_row,
+            target_cells=target_cells,
+            start_col=start_col,
+            extra_rows=rows - 1,
+            taken_ids=taken_ids,
+        )
+
+    expected_counts = dict(baseline_counts)
+    expected_counts["paragraph_count"] = baseline_counts["paragraph_count"] + new_paragraphs_added
+    expected_hash = _hash_elements([target_el])
+
+    write_result = _write_table_mutation(
+        docx_path=docx_path,
+        raw=raw,
+        root=root,
+        target_el=target_el,
+        table_index=table_index,
+        expected_counts=expected_counts,
+        expected_hash=expected_hash,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+    if "error" in write_result:
+        return write_result
+
+    from ._vendored_content_tree import _table_node  # noqa: PLC0415
+
+    table_meta = _table_node(target_el, table_index)
+
+    return {
+        "status": "split",
+        "table_index": table_index,
+        "row_index": row_index,
+        "col_index": col_index,
+        "cols": cols,
+        "rows": rows,
+        "row_count": table_meta["row_count"],
+        "col_count": table_meta["col_count"],
+        "docx_path": write_result["docx_path"],
+        **write_result["render_info"],
+    }
+
+
+def transpose_table(
+    docx_path: str,
+    table_index: int,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """a2cd9f54 -- Transpose a table's rows and columns in place.
+
+    Supported ONLY for a fully rectangular table with NO ``w:gridSpan`` > 1
+    and NO ``w:vMerge`` anywhere -- refuses with ``reason="unsupported_merge"``
+    otherwise (a horizontally-merged cell has no single canonical
+    vertically-merged equivalent, so this never guesses). Also refuses with
+    ``reason="ambiguous_grid"`` if the table's rows do not all have the same
+    cell count.
+
+    Reuses the SAME ``<w:tc>`` element objects (never deep-copied), only
+    repositioning them -- every relationship id (image/hyperlink), bookmark,
+    numbering reference, and run of formatted text inside a cell survives
+    verbatim; only each cell's row/column position changes.
+
+    Row heights and column widths have no canonical semantic mapping under
+    a transpose (a row's height does not become a column's width in any
+    well-defined way): the new ``w:tblGrid`` falls back to the table's
+    original total width (summed from its old ``w:gridCol`` widths, when
+    present) divided evenly across the new column count -- a documented,
+    honest default rather than a fabricated precise one. ``w:trPr`` (e.g.
+    explicit row heights) is intentionally dropped from the new rows for
+    the same reason.
+
+    Args:
+        docx_path:       Absolute path to the .docx file (mutated in place).
+        table_index:      0-based body-child position of the ``<w:tbl>``.
+        index_db_path:    If supplied, sidecar is invalidated after write.
+        allow_degraded_render: Same audited opt-in as :func:`insert_column`.
+        degraded_render_reason: Required, non-empty when
+                          ``allow_degraded_render`` is True.
+
+    Returns:
+        ``{status, table_index, row_count, col_count, docx_path,
+        render_status, render_verified, render_backend, render_detail}`` or
+        ``{"error": ...}`` (with ``"reason"`` one of ``"unsupported_merge"``
+        / ``"ambiguous_grid"`` when applicable) on failure.
+    """
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    target_el, err = _resolve_table_element(body, table_index)
+    if err is not None:
+        return err
+
+    rows = _table_rows(target_el)
+    if not rows:
+        return {"error": "table has no rows to transpose"}
+
+    row_cell_lists: list[list[ET.Element]] = []
+    for tr in rows:
+        cells = tr.findall(_W_TC)
+        for tc in cells:
+            if _cell_grid_span(tc) != 1 or _cell_vmerge(tc) is not None:
+                return {
+                    "error": (
+                        "transpose_table refused: this table contains a "
+                        "merged cell (w:gridSpan or w:vMerge) -- the "
+                        "correct transposed merge geometry is ambiguous, so "
+                        "this primitive only supports a fully rectangular, "
+                        "unmerged table"
+                    ),
+                    "reason": "unsupported_merge",
+                }
+        row_cell_lists.append(cells)
+
+    col_count = len(row_cell_lists[0]) if row_cell_lists else 0
+    if col_count == 0 or any(len(cells) != col_count for cells in row_cell_lists):
+        return {
+            "error": (
+                "transpose_table refused: every row must have the SAME "
+                "number of cells -- this table's rows are not uniform"
+            ),
+            "reason": "ambiguous_grid",
+        }
+    row_count = len(row_cell_lists)
+
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
+
+    # Build the transposed row list: new row r = column r of every old row,
+    # in old-row order. Reuses the SAME <w:tc> element objects (never
+    # deep-copied) -- see docstring.
+    new_trs: list[ET.Element] = []
+    for new_row_idx in range(col_count):
+        new_tr = ET.Element(_W_TR)
+        for old_row_idx in range(row_count):
+            new_tr.append(row_cell_lists[old_row_idx][new_row_idx])
+        new_trs.append(new_tr)
+
+    for tr in rows:
+        target_el.remove(tr)
+    for tr in new_trs:
+        target_el.append(tr)
+
+    # Rebuild w:tblGrid for the new column count (== old row_count). See
+    # docstring for why widths fall back to an even split of the original
+    # total rather than a fabricated precise mapping.
+    old_grid = target_el.find(_W_TBLGRID)
+    total_width = None
+    if old_grid is not None:
+        widths = []
+        for gc in old_grid.findall(_W_GRIDCOL):
+            raw_w = gc.get(_q(_W, "w"))
+            if raw_w is not None:
+                try:
+                    widths.append(int(raw_w))
+                except ValueError:
+                    pass
+        if widths:
+            total_width = sum(widths)
+        target_el.remove(old_grid)
+
+    new_grid = ET.Element(_W_TBLGRID)
+    tblPr = target_el.find(_q(_W, "tblPr"))
+    target_el.insert((list(target_el).index(tblPr) + 1) if tblPr is not None else 0, new_grid)
+    per_col_width = (total_width // row_count) if total_width else None
+    for _ in range(row_count):
+        gc = ET.SubElement(new_grid, _W_GRIDCOL)
+        if per_col_width is not None:
+            gc.set(_q(_W, "w"), str(per_col_width))
+
+    # A pure cell-reshuffle: paragraph/heading/table/image counts are ALL
+    # invariant -- no content is created, destroyed, or leaves the table.
+    expected_counts = dict(baseline_counts)
+    expected_hash = _hash_elements([target_el])
+
+    write_result = _write_table_mutation(
+        docx_path=docx_path,
+        raw=raw,
+        root=root,
+        target_el=target_el,
+        table_index=table_index,
+        expected_counts=expected_counts,
+        expected_hash=expected_hash,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+    if "error" in write_result:
+        return write_result
+
+    from ._vendored_content_tree import _table_node  # noqa: PLC0415
+
+    table_meta = _table_node(target_el, table_index)
+
+    return {
+        "status": "transposed",
+        "table_index": table_index,
+        "row_count": table_meta["row_count"],
+        "col_count": table_meta["col_count"],
+        "docx_path": write_result["docx_path"],
+        **write_result["render_info"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # f1185012 -- page header / footer support.
 #
 # python-docx, the Google Docs API + UI, and Apryse (a commercial DOCX SDK)
