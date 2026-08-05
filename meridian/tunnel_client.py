@@ -38,6 +38,7 @@ from enum import Enum
 from pathlib import Path
 
 from . import __version__
+from . import process_budget as _process_budget
 from . import process_lifecycle as _process_lifecycle
 from . import process_registry as _process_registry
 from . import serena_pool as _serena_pool
@@ -483,6 +484,10 @@ _KILL_REASON_STATES: "dict[str, SlotState]" = {
     "reprobe_restart": SlotState.RECONNECTING,
     "config_reload": SlotState.STOPPED,
     "stopped": SlotState.STOPPED,
+    # 9c8336c4 — a host-local memory/CPU budget breach that survived one
+    # graceful quiesce warning and was force-terminated via the owned-process
+    # lifecycle backend.
+    "budget_quarantined": SlotState.QUARANTINED,
 }
 
 
@@ -760,6 +765,7 @@ class SlotProxy:
         env: "dict | None" = None,
         client_id: str = "",
         reuse_existing: bool = False,
+        use_owned_lifecycle: bool = False,
     ) -> None:
         self.cmd = cmd
         self.port = port
@@ -767,7 +773,16 @@ class SlotProxy:
         self.env = env
         self.client_id: str = client_id
         self.reuse_existing = reuse_existing
+        # 9c8336c4 — opt-in per call site (same contract as
+        # _spawn_owned_with_cache_retry itself): when True, ensure_running()
+        # spawns via the portable owned-process lifecycle backend and keeps
+        # an OwnedProcessHandle on self.owned_handle, which is what makes
+        # this slot eligible for host-local budget enforcement (see
+        # _budget_watchdog). Defaults False — every existing slot's spawn
+        # behaviour is byte-identical unless it explicitly opts in.
+        self.use_owned_lifecycle = use_owned_lifecycle
         self._proc: "subprocess.Popen | None" = None
+        self.owned_handle: "_process_lifecycle.OwnedProcessHandle | None" = None
         # 8e10fb80 — True while this slot is fronting a process we did NOT
         # spawn (detected via reuse_existing). Distinct from ``_proc`` so
         # ``is_running``/``kill`` can tell "we own this" from "someone else
@@ -966,9 +981,22 @@ class SlotProxy:
                 # spawn failure (e.g. a Python child dying on ModuleNotFoundError at
                 # import time) gets classified onto it (dependency_missing vs a
                 # generic child_crashed) instead of surfacing only as a bare log line.
-                self._proc = await asyncio.to_thread(
-                    _spawn_with_cache_retry, self.cmd, self.env, self.label, self.diagnostics
-                )
+                #
+                # 9c8336c4 — a slot that opted into use_owned_lifecycle spawns via
+                # _spawn_owned_with_cache_retry instead, additionally capturing an
+                # OwnedProcessHandle (job-object/process-group tracked) so the
+                # budget watchdog has something it can prove ownership of before
+                # throttling/terminating it. Every other slot's spawn call and
+                # return type is byte-identical to before this feature existed.
+                if self.use_owned_lifecycle:
+                    self._proc, self.owned_handle = await asyncio.to_thread(
+                        _spawn_owned_with_cache_retry,
+                        self.cmd, self.env, self.label, self.diagnostics,
+                    )
+                else:
+                    self._proc = await asyncio.to_thread(
+                        _spawn_with_cache_retry, self.cmd, self.env, self.label, self.diagnostics
+                    )
                 self.holder["proc"] = self._proc
                 # aaddb273 — record ownership so a subsequent tunnel startup can
                 # distinguish this live process from an orphan (see _write_slot_claim).
@@ -979,6 +1007,7 @@ class SlotProxy:
                     file=sys.stderr, flush=True,
                 )
                 self._proc = None
+                self.owned_handle = None
                 self.holder["proc"] = None
                 # ddd46cc8 — classify the launch failure (missing interpreter/binary
                 # vs a generic launch crash) so callers reading .diagnostics can tell
@@ -1069,7 +1098,7 @@ class SlotProxy:
                 )
             self.touch()
 
-    def kill(self, reason: str = "stopped") -> None:
+    def kill(self, reason: str = "stopped") -> "bool | None":
         """Terminate the proxy process (best-effort, no-op if not running).
 
         aaddb273 — also clears the slot-claim file so a subsequent startup does
@@ -1090,11 +1119,25 @@ class SlotProxy:
         ``"stopped"``). An unrecognised reason maps to STOPPED rather than
         raising. Not recorded on the reused-occupant early return above — we
         did not actually tear anything down in that case.
+
+        9c8336c4 — a slot holding an ``owned_handle`` (only true for a slot
+        that opted into ``use_owned_lifecycle``) tears down via
+        :func:`_close_owned_process` (the WHOLE owned tree, job-object/
+        process-group) instead of :func:`_terminate_proc_tree`, and this
+        returns that call's confirmed-gone bool (``None`` for every other
+        slot/path, where no such confirmation exists) so a caller like the
+        budget watchdog can tell a confirmed kill apart from a survivor
+        without re-probing the port itself.
         """
         if self._reused:
             self._reused = False
-            return
-        _terminate_proc_tree(self._proc)
+            return None
+        if self.owned_handle is not None:
+            confirmed_gone = _close_owned_process(self.owned_handle)
+            self.owned_handle = None
+        else:
+            _terminate_proc_tree(self._proc)
+            confirmed_gone = None
         self._proc = None
         self.holder["proc"] = None
         _clear_slot_claim(self.port)
@@ -1102,6 +1145,7 @@ class SlotProxy:
             _KILL_REASON_STATES.get(reason, SlotState.STOPPED),
             phase=reason, root_cause=reason,
         )
+        return confirmed_gone
 
     def sync_holder(self) -> None:
         """Sync the holder's proc reference (watchdog may have replaced it)."""
@@ -1130,6 +1174,64 @@ async def _idle_killer(proxy: "SlotProxy", idle_seconds: float = _IDLE_KILL_SECO
             # ddd46cc8 — reason="idle_killed" so diagnostics distinguish this
             # intentional teardown from a crash/timeout-triggered kill.
             proxy.kill(reason="idle_killed")
+
+
+async def _budget_watchdog(
+    proxy: "SlotProxy",
+    budget: "_process_budget.ProcessBudget | None" = None,
+) -> None:
+    """Periodically sample and enforce a host-local memory/CPU budget
+    (9c8336c4) for a slot spawned via the owned-process lifecycle.
+
+    Runs forever (until cancelled), same shape as :func:`_idle_killer`.
+    A no-op tick whenever ``proxy.owned_handle`` is ``None`` — which is
+    every slot today unless it explicitly opted into
+    ``use_owned_lifecycle=True`` (see :class:`SlotProxy`'s docstring) — so
+    scheduling this task alongside every slot's watchdog/idle-killer is
+    inert by default and only takes effect for a caller that opts a
+    specific slot in.
+
+    Only ever acts on ``proxy.owned_handle`` after
+    :func:`process_lifecycle.verify_handle_live` confirms it is still the
+    SAME process that was originally spawned (the PID-reuse guard) — never
+    a bare pid pulled from anywhere else. This is the sprint's "only
+    processes proven owned by the run registry/job/process-group may be
+    throttled or terminated" rule.
+
+    The first consecutive breach is a "quiesce" warning only (logged, not
+    acted on) — the process gets one full sample interval to come back
+    under budget on its own. Only a SECOND, still-breached sample escalates
+    to a forced :meth:`SlotProxy.kill` (reason ``"budget_quarantined"``,
+    surfaced on ``proxy.diagnostics`` as :data:`SlotState.QUARANTINED`).
+    """
+    cfg = budget or _process_budget.load_host_budget_config()
+    monitor = _process_budget.ProcessBudgetMonitor(proxy.label, cfg)
+    while True:
+        await asyncio.sleep(cfg.sample_interval_seconds)
+        if not cfg.enabled:
+            continue
+        handle = proxy.owned_handle
+        if handle is None or not proxy.is_running:
+            continue
+        if not _process_lifecycle.verify_handle_live(handle):
+            continue
+        sample = _process_budget.sample_process(handle.pid)
+        report = monitor.evaluate(handle.pid, sample)
+        if report.action == "quiesce":
+            print(
+                f"tunnel:{proxy.label}: budget warning ({report.reason}) — "
+                "quiesce signal; will terminate if still over budget on the "
+                "next check",
+                file=sys.stderr, flush=True,
+            )
+        elif report.action == "kill":
+            print(
+                f"tunnel:{proxy.label}: budget exceeded ({report.reason}) — "
+                "quarantining (terminating owned process tree)",
+                file=sys.stderr, flush=True,
+            )
+            confirmed_gone = proxy.kill(reason="budget_quarantined")
+            monitor.record_kill_outcome(survived=confirmed_gone is False)
 
 
 def _tunnel_client_git_root() -> str:
