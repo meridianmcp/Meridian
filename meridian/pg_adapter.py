@@ -11,7 +11,9 @@ SQL translation rules:
   datetime('now', X || ' minutes') / 'hours' / 'days' → same with interval cast
   PRAGMA ...       → no-op
   rowid            → removed from ORDER BY (UUID PKs don't need it)
-  sqlite_master    → fake result that passes all migration guards
+  sqlite_master    → translated into the equivalent real pg_catalog /
+                     information_schema introspection query (see
+                     PostgresConnection._sqlite_master)
 """
 
 from __future__ import annotations
@@ -418,7 +420,7 @@ class PostgresConnection:
             return _PgCursor([], 0)
 
         if "sqlite_master" in stripped.lower():
-            return _PgCursor([{"sql": "pending-hitl 'backlog' 'backburner'", "name": "task_log"}], 1)
+            return await self._sqlite_master(stripped, params)
 
         # ---- Normal statement ----------------------------------------------
 
@@ -505,6 +507,116 @@ class PostgresConnection:
             for row in rows
         ]
         return _PgCursor(fake_rows, len(fake_rows))
+
+    # ---- sqlite_master translation ---------------------------------------
+    #
+    # SQLite-authored code across this codebase (migration guards in
+    # meridian/db/migrations.py, plus a handful of tests that exercise those
+    # guards or assert a guarded index/table was created) queries the
+    # SQLite-only system catalog ``sqlite_master`` to ask "does table/index X
+    # exist" and, for a couple of legacy-CHECK-constraint detectors, "what is
+    # X's DDL text". Postgres has no ``sqlite_master``; we translate the
+    # WHERE clause into the equivalent real Postgres catalog query
+    # (``information_schema.tables`` / ``pg_indexes``) instead of returning a
+    # fixed fake row. Only the query *shapes* this codebase actually issues
+    # are recognised (see 246eccb6 investigation notes): a bare
+    # ``type = 'table'|'index' AND name = <literal-or-?>`` predicate,
+    # optionally selecting ``name`` or ``sql``. An unrecognised shape (e.g. a
+    # bulk "list every table" query, only ever used against a real SQLite
+    # connection directly, never through this adapter) logs a warning and
+    # returns an EMPTY result -- a truthful "nothing matched" -- rather than
+    # fabricating a row that would silently lie to the caller.
+    _SQLITE_MASTER_RE = re.compile(
+        r"SELECT\s+(?P<col>\w+)\s+FROM\s+sqlite_master\s+WHERE\s+"
+        r"type\s*=\s*'(?P<objtype>table|index)'\s+AND\s+name\s*=\s*"
+        r"(?:'(?P<name_lit>[^']*)'|\?)",
+        re.IGNORECASE,
+    )
+
+    async def _sqlite_master(self, stripped_sql: str, params: tuple) -> _PgCursor:
+        m = self._SQLITE_MASTER_RE.search(stripped_sql)
+        if not m:
+            logger.warning(
+                "PostgresConnection: unrecognized sqlite_master query shape; "
+                "returning an empty result instead of a fabricated row: %r",
+                stripped_sql,
+            )
+            return _PgCursor([], 0)
+
+        name = m.group("name_lit")
+        if name is None:
+            # Bound as a positional ``?`` placeholder rather than inlined.
+            if not params:
+                return _PgCursor([], 0)
+            name = params[0]
+
+        if m.group("objtype").lower() == "index":
+            return await self._sqlite_master_index(name)
+        want_sql = m.group("col").lower() == "sql"
+        return await self._sqlite_master_table(name, want_sql)
+
+    async def _sqlite_master_index(self, index_name: str) -> _PgCursor:
+        """Real ``pg_indexes`` lookup for a single index by name.
+
+        ``pg_indexes.indexdef`` is the full ``CREATE [UNIQUE] INDEX ...``
+        text -- the direct Postgres analog of sqlite_master's ``sql`` column
+        -- so a caller asserting e.g. ``"UNIQUE" in sql.upper()`` (the
+        workspace-proposals idempotency-index parity test) gets a real,
+        query-aware answer instead of unrelated placeholder text.
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=_dict_row_factory) as cur:
+                await cur.execute(
+                    "SELECT indexname, indexdef FROM pg_indexes WHERE indexname = %s",
+                    (index_name,),
+                )
+                row = await cur.fetchone()
+        if row is None:
+            return _PgCursor([], 0)
+        return _PgCursor([{"name": row["indexname"], "sql": row["indexdef"]}], 1)
+
+    async def _sqlite_master_table(self, table_name: str, want_sql: bool) -> _PgCursor:
+        """Real ``information_schema.tables`` existence check for a table.
+
+        When the caller also asked for the ``sql`` column, best-effort
+        reconstructs a DDL-like string from live ``information_schema.columns``
+        data (real catalog data, not a fabricated string) -- good enough for
+        the "does this table exist" question every reachable-through-Postgres
+        caller actually asks. The handful of migrations.py callers that
+        string-search a table's ``sql`` text for a legacy SQLite CHECK
+        constraint are SQLite-only migration guards that are never invoked
+        against a Postgres connection in practice (Postgres provisions its
+        schema from meridian/pg_adapter.py's own DDL literals, not by running
+        meridian/db/migrations.py's guarded ``_migrate_*`` helpers) -- this
+        reconstruction is a defensive best effort for that shape, not a
+        contract any real caller currently depends on.
+        """
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=_dict_row_factory) as cur:
+                await cur.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_name = %s",
+                    (table_name,),
+                )
+                exists = await cur.fetchone()
+            if exists is None:
+                return _PgCursor([], 0)
+
+            sql_text = None
+            if want_sql:
+                async with conn.cursor(row_factory=_dict_row_factory) as cur:
+                    await cur.execute(
+                        "SELECT column_name, data_type FROM information_schema.columns "
+                        "WHERE table_name = %s ORDER BY ordinal_position",
+                        (table_name,),
+                    )
+                    columns = await cur.fetchall()
+                col_sql = ", ".join(
+                    f"{c['column_name']} {c['data_type']}" for c in columns
+                )
+                sql_text = f"CREATE TABLE {table_name} ({col_sql})"
+
+        return _PgCursor([{"name": table_name, "sql": sql_text}], 1)
 
 
 # ---------------------------------------------------------------------------
