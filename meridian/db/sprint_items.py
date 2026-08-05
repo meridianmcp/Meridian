@@ -984,6 +984,18 @@ async def fan_out_sprint_items(
     here — the orchestrator is assumed to have already deduped.
 
     Returns the list of new item IDs in insertion order.
+
+    86e4ae44 — deliberately NOT rerouted through
+    :mod:`meridian.db.batch_management`'s shared batch engine. That engine's
+    ``sprint_item`` entry kind creates via :func:`add_sprint_item`, which DOES
+    enforce the 60%-word-overlap duplicate guard this function explicitly
+    skips (see the paragraph above) — rerouting would silently reject
+    near-duplicate titles that succeed today, a real behavior change for
+    every existing caller. See ``batch_management``'s module docstring
+    ("Compatibility: why fan_out_sprint_items / add_sprint_item_pointer are
+    NOT rerouted through this engine") for the full reasoning. The new
+    engine is the additive, atomic/idempotent/duplicate-guarded alternative
+    for callers who want that stricter contract instead of this one.
     """
     ids: list[str] = []
     for spec in items:
@@ -3704,6 +3716,15 @@ async def add_sprint_item_pointer(
     psycopg3: ``?`` placeholders are converted to ``%s`` by the adapter; the
     shared connection is autocommit on Postgres, and ``commit()`` is a real
     flush on aiosqlite.
+
+    86e4ae44 — this function is left untouched deliberately: it is already a
+    clean validate-then-insert single-entry primitive, so
+    :mod:`meridian.db.batch_management`'s shared batch engine calls it
+    directly, as-is, as its ``sprint_item_pointer`` entry kind's atomic
+    mutation step (with a compensating ``delete_sprint_item_pointer`` call
+    for rollback on an ``all_or_nothing`` batch failure). The "routing" the
+    86e4ae44 acceptance criteria ask for happens with the engine consuming
+    this function, not the other way around — no wrapper needed here.
     """
     from ..pointers import (  # noqa: PLC0415 — avoid an import cycle at module load
         validate_pointer,

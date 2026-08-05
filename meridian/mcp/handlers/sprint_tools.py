@@ -39,7 +39,17 @@ async def handle_add_sprint_note(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: add_sprint_note."""
+    """MCP tool: add_sprint_note.
+
+    86e4ae44 — this remains a single-entry tool; ``meridian.db.batch_management``
+    (new shared batch engine) already has a ``sprint_note`` entry kind whose
+    mutation step calls the exact same ``add_session_note`` this handler
+    calls, so a future atomic/idempotent multi-note tool needs no new
+    validation logic. Exposing THAT as a new MCP tool (schemas across
+    mcp_tools.py / handler.py / stdio_handler.py / HTTP routes) is explicitly
+    out of scope for 86e4ae44 and is sprint item 627187b8's job — this
+    handler's external contract is unchanged here.
+    """
     validate_input_size(args.get("title"), "note title", 500)
     validate_input_size(args.get("body"), "note body", 10_000_000)
     return await db_module.add_session_note(
@@ -223,7 +233,20 @@ async def handle_fan_out_sprint_items(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: fan_out_sprint_items."""
+    """MCP tool: fan_out_sprint_items.
+
+    86e4ae44 — this handler's call to ``db_module.fan_out_sprint_items`` below
+    is deliberately UNCHANGED: that function's docstring documents a contract
+    (no duplicate-title guard -- "the orchestrator is assumed to have already
+    deduped") that the new ``meridian.db.batch_management`` shared batch
+    engine's ``sprint_item`` entry kind does NOT share (it creates via
+    ``add_sprint_item``, which DOES enforce the duplicate guard). Rerouting
+    this handler through the new engine would silently reject near-duplicate
+    titles this tool accepts today -- a real behavior change for every
+    existing caller. See ``batch_management``'s module docstring for the
+    full reasoning; exposing the new engine as an atomic/idempotent
+    alternative tool is sprint item 627187b8's job, not this one's.
+    """
     from ..handler import (  # noqa: PLC0415
         _infer_touches_resources,
         _active_executor_session_warnings,
@@ -1691,6 +1714,14 @@ async def handle_add_sprint_item_pointer(
     2976e168 — attach a GENERIC POINTER to a sprint item. Validation lives in
     db.add_sprint_item_pointer (via meridian.pointers.validate_pointer); a
     malformed pointer raises ValueError, surfaced here as a clean {error}.
+
+    86e4ae44 — this remains a single-entry tool; ``meridian.db.batch_management``
+    (new shared batch engine) already has a ``sprint_item_pointer`` entry kind
+    whose mutation step calls this exact same ``db_module.add_sprint_item_pointer``
+    function, so a future atomic/idempotent multi-pointer tool needs no new
+    validation logic. Exposing THAT as a new MCP tool is sprint item
+    627187b8's job (explicitly out of scope for 86e4ae44) -- this handler's
+    external contract is unchanged here.
     """
     if not args.get("project_id"):
         return {"error": "project_id is required (or pass project_name)"}
