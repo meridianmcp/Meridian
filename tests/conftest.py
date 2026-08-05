@@ -30,6 +30,7 @@ Fixtures:
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future
 import os
 import sys
 from pathlib import Path
@@ -364,6 +365,98 @@ async def _ensure_pg_schema_built(url: str) -> None:
     _pg_schema_ready.add(url)
 
 
+@pytest.fixture(scope="session")
+def _sqlite_schema_template(tmp_path_factory):
+    """Build the SQLite schema once in this pytest worker.
+
+    The returned file is immutable test infrastructure: each test copies it into
+    a private ``:memory:`` connection with SQLite's backup API.  Keeping the
+    template on pytest's worker-local temporary root prevents xdist workers from
+    sharing files, while copying into memory preserves the old throwaway-database
+    isolation.  Initialization errors are intentionally propagated; callers must
+    never fall back to a shared or partially initialized database.
+    """
+    from meridian import db as db_module
+
+    template_dir = tmp_path_factory.mktemp("sqlite-schema-template")
+    template_path = template_dir / "schema.db"
+
+    async def _build() -> None:
+        conn = await db_module.init_db(str(template_path))
+        await conn.close()
+
+    try:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(_build())
+        else:
+            # ``request.getfixturevalue`` is used by the async fixtures below
+            # so PostgreSQL runs do not pay for an unused SQLite template.  A
+            # synchronous session fixture can therefore be resolved while an
+            # async fixture's loop is active; build in a short-lived helper
+            # thread instead of nesting event loops in the test thread.
+            result: Future[None] = Future()
+
+            def _run_in_thread() -> None:
+                try:
+                    asyncio.run(_build())
+                except BaseException as exc:  # pragma: no cover - re-raised below
+                    result.set_exception(exc)
+                else:
+                    result.set_result(None)
+
+            import threading
+
+            thread = threading.Thread(target=_run_in_thread, name="sqlite-template")
+            thread.start()
+            thread.join()
+            result.result()
+    except Exception as exc:  # noqa: BLE001 - add fixture context, preserve failure
+        raise RuntimeError(
+            f"failed to initialize SQLite schema template at {template_path}"
+        ) from exc
+    return template_path
+
+
+async def _open_sqlite_from_template(template_path: Path):
+    """Return a fresh SQLite connection copied from the worker template.
+
+    Connection-local pragmas are restored after the backup because SQLite does
+    not copy them as part of the database image.  Any copy failure closes both
+    handles and raises; there is deliberately no ``init_db(':memory:')`` fallback
+    that could hide a broken optimization or produce a mutable shared database.
+    """
+    import aiosqlite
+
+    if not template_path.is_file():
+        raise FileNotFoundError(f"SQLite schema template does not exist: {template_path}")
+
+    source = None
+    target = None
+    try:
+        source = await aiosqlite.connect(str(template_path))
+        cursor = await source.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1"
+        )
+        if await cursor.fetchone() is None:
+            raise RuntimeError(f"SQLite schema template is empty: {template_path}")
+        target = await aiosqlite.connect(":memory:")
+        await source.backup(target)
+        target.row_factory = aiosqlite.Row
+        await target.execute("PRAGMA journal_mode = WAL")
+        await target.execute("PRAGMA busy_timeout = 5000")
+        await target.execute("PRAGMA foreign_keys = ON")
+        return target
+    except Exception:
+        if target is not None:
+            await target.close()
+        raise
+    finally:
+        if source is not None:
+            await source.close()
+
+
 @pytest.fixture
 def event_loop_policy():
     """Event-loop policy pytest-asyncio uses to build each test's loop.
@@ -417,7 +510,7 @@ def _reset_graph_searcher_resolver():
 
 
 @pytest_asyncio.fixture
-async def db():
+async def db(request):
     """Meridian's schema on the active backend, isolated per test.
 
     Default: a fresh in-memory SQLite connection.  When ``TEST_DATABASE_URL``
@@ -432,7 +525,8 @@ async def db():
         await _ensure_pg_schema_built(pg_url)
         conn = await _open_transactional_pg_conn(pg_url)
     else:
-        conn = await db_module.init_db(":memory:")
+        template_path = request.getfixturevalue("_sqlite_schema_template")
+        conn = await _open_sqlite_from_template(template_path)
     try:
         yield conn
     finally:
@@ -465,7 +559,8 @@ async def anydb(request):
     from meridian import db as db_module
 
     if request.param == "sqlite":
-        conn = await db_module.init_db(":memory:")
+        template_path = request.getfixturevalue("_sqlite_schema_template")
+        conn = await _open_sqlite_from_template(template_path)
         try:
             yield conn
         finally:
@@ -483,7 +578,7 @@ async def anydb(request):
 
 
 @pytest.fixture
-def client(tmp_path, monkeypatch):
+def client(tmp_path, monkeypatch, request):
     """FastAPI TestClient backed by SQLite (default) or Postgres (TEST_DATABASE_URL).
 
     When ``TEST_DATABASE_URL`` (or ``DATABASE_URL``) targets Postgres, the
@@ -525,6 +620,22 @@ def client(tmp_path, monkeypatch):
         # from a local .env file — the key must already be present so dotenv skips
         # it. An empty string is falsy, so the lifespan still takes the SQLite path.
         monkeypatch.setenv("MERIDIAN_DB_URL", "")
+
+        # The lifespan still runs once per TestClient so its DB-bound resolver,
+        # log handler, background tasks, and shutdown cleanup remain isolated.
+        # Only replace its repeated full schema/migration build with a private
+        # copy of this worker's immutable template.
+        from meridian import db as db_module
+
+        template_path = request.getfixturevalue("_sqlite_schema_template")
+        _real_init_db = db_module.init_db
+
+        async def _init_db_from_template(path: str):
+            if path == ":memory:":
+                return await _open_sqlite_from_template(template_path)
+            return await _real_init_db(path)
+
+        monkeypatch.setattr(db_module, "init_db", _init_db_from_template)
 
     monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
     # v2.2 — also block MERIDIAN_DEMO_DB_URL so the lifespan doesn't try to
