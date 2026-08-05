@@ -1134,10 +1134,15 @@ async def _handle_mcp_request(
     params = body.get("params") or {}
 
     if method == "initialize":
+        from ..tool_manifest import tool_manifest_revision  # noqa: PLC0415
+        server_info = dict(_server._MCP_SERVER_INFO)
+        server_info["toolManifestRevision"] = tool_manifest_revision(
+            _server._MCP_TOOLS_LIST,
+        )
         return _server._jsonrpc_ok(req_id, {
             "protocolVersion": _server._MCP_PROTOCOL_VERSION,
-            "serverInfo": _server._MCP_SERVER_INFO,
-            "capabilities": {"tools": {}, "prompts": {}},
+            "serverInfo": server_info,
+            "capabilities": {"tools": {"listChanged": True}, "prompts": {}},
         })
 
     if method in ("notifications/initialized", "ping"):
@@ -1238,9 +1243,34 @@ async def _handle_mcp_request(
                         ),
                         "detail": str(exc)[:200],
                     }
-        result: dict = {"tools": tools}
+        from ..tool_manifest import build_tool_manifest  # noqa: PLC0415
+        manifest = build_tool_manifest(tools)
+        manifest_meta: dict = {
+            "revision": manifest["revision"],
+            "count": manifest["count"],
+        }
+        # 49d8244d — generation-aware manifest: layer the runtime config
+        # generation registry (02dbd8b4), a live tunnel slot-health snapshot,
+        # and cache generated_at/age metadata onto the SAME `_meta` block, so a
+        # client/connector/dashboard can tell "freshly rebuilt this call" apart
+        # from "served from a routing cache that hasn't refreshed in N seconds"
+        # without a second round trip. `revision`/`count` above already cover
+        # the full aggregated tool set (native + GitHub + tunnel); `tunnel`
+        # below adds the tunnel-specific generation/health facts that a bare
+        # content hash can't express (see routes/tunnel.py's
+        # tunnel_manifest_snapshot for the shared shape — also returned by
+        # GET /tunnel/status and POST /tunnel/refresh).
+        if tenant and tenant.get("id"):
+            from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+            manifest_meta["tunnel"] = _tunnel_mod.tunnel_manifest_snapshot(tenant["id"])
+        result: dict = {
+            "tools": tools,
+            "_meta": {
+                "meridian/toolManifest": manifest_meta,
+            },
+        }
         if tunnel_health is not None:
-            result["_meta"] = {"meridian/tunnelHealth": tunnel_health}
+            result["_meta"]["meridian/tunnelHealth"] = tunnel_health
         return _server._jsonrpc_ok(req_id, result)
 
     if method == "prompts/list":
@@ -1260,6 +1290,14 @@ async def _handle_mcp_request(
     if method == "tools/call":
         name = params.get("name", "")
         args = params.get("arguments") or {}
+        # Some MCP host bridges qualify a server's tool name with the server
+        # namespace even though tools/list correctly advertises the bare name
+        # (for example ``meridian.get_sprint_items`` vs ``get_sprint_items``).
+        # Accept only our exact compatibility prefix so the advertised tool
+        # identity remains canonical and unrelated dotted tunnel names are not
+        # rewritten.
+        if isinstance(name, str) and name.startswith("meridian."):
+            name = name.removeprefix("meridian.")
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
         # 95499c3e / decision 6fe5210c — Option A project-scope enforcement for
@@ -2742,7 +2780,7 @@ async def _handle_task_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, verify_handoff_token."""
+    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         _log_sid = args.get("session_id", "")
@@ -2836,6 +2874,21 @@ async def _handle_task_tools(
         # handoff.generate_handoff's own strict_pointer_evidence docstring.
         _strict_pointer_evidence = bool(args.get("strict_pointer_evidence"))
         _evidence_status: dict[str, Any] = {}
+        # 3cab355a — out-param populated with one entry per force_include_ids
+        # id that failed validation (unknown/cross-project/cross-version/not-
+        # pending); see handoff.generate_handoff's own force_include_rejected
+        # docstring. Always passed (pure addition, same shape as
+        # evidence_status above) so the caller can tell "silently already
+        # visible" apart from "explicitly rejected, and why".
+        _force_include_rejected: list[dict[str, Any]] = []
+        # ecc8b280 — continuation/terminal-ready gate, mirrors strict_evidence's
+        # opt-in shape exactly (same off-by-default contract, same out-param
+        # pattern). checkpoint=True marks this call as a mid-run progress
+        # report rather than a final handoff — see generate_handoff's own
+        # docstring for the full contract.
+        _checkpoint = bool(args.get("checkpoint"))
+        _strict_continuation = bool(args.get("strict_continuation"))
+        _continuation_status: dict[str, Any] = {}
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -2853,6 +2906,10 @@ async def _handle_task_tools(
                     strict_evidence=_strict_evidence,
                     evidence_status=_evidence_status,
                     strict_pointer_evidence=_strict_pointer_evidence,
+                    force_include_rejected=_force_include_rejected,
+                    checkpoint=_checkpoint,
+                    strict_continuation=_strict_continuation,
+                    continuation_status=_continuation_status,
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -2879,6 +2936,41 @@ async def _handle_task_tools(
                     "underlying capability failure(s) and retry, or call "
                     "generate_handoff without strict_evidence=true to get "
                     "today's graceful-degrade behavior."
+                ),
+            }
+        except handoff_module_local.HandoffContinuationRequired as exc:
+            # ecc8b280 — strict_continuation=True, this call is NOT
+            # checkpoint=True, and actionable pending/in_progress items
+            # remain with no genuine blocker while execution_mode=autonomous:
+            # fail CLOSED. Nothing was rendered/written/persisted for this
+            # call — surface a structured refusal instead of a handoff that
+            # invites a premature "I'm done" stop.
+            return {
+                "error": "HANDOFF_CONTINUATION_BLOCKED",
+                "project_id": args["project_id"],
+                "continuation_status": exc.continuation_state,
+                "message": str(exc),
+            }
+        except handoff_module_local.HandoffStaleReferenceError as exc:
+            # ee8a6af1 — unconditional (not opt-in) fail-closed: a depends_on
+            # edge on the live board points at an id that doesn't resolve for
+            # this project+version scope. Nothing was rendered/written/
+            # persisted for this call — surface a structured refusal so a
+            # caller can reconcile the dangling reference (e.g. via
+            # update_sprint_item / merge_sprint_items) instead of silently
+            # getting a handoff body with an unresolved dependency id.
+            return {
+                "error": "STALE_REFERENCE",
+                "project_id": exc.project_id,
+                "version": exc.version,
+                "stale_references": exc.stale_references,
+                "message": (
+                    "Refusing to generate handoff: "
+                    f"{len(exc.stale_references)} depends_on reference(s) on "
+                    "the live board do not resolve for this project/version "
+                    "scope. This handoff was NOT rendered or persisted. "
+                    "Resolve each stale depends_on (retarget or clear it via "
+                    "update_sprint_item) and retry."
                 ),
             }
         except asyncio.TimeoutError:
@@ -2978,6 +3070,13 @@ async def _handle_task_tools(
         _docx_integrity = await handoff_module_local.build_docx_integrity_gate_for_handoff(
             db, args["project_id"], proposal_evidence=_proposal_evidence,
         )
+        # b108f2e0 — typed blocker-triage decision, emitted on every
+        # generate_handoff mode alongside the three fields above. Fully
+        # guarded — a failure degrades to no field rather than breaking the
+        # mandatory handoff.
+        _blocker_policy_decision = await handoff_module_local.build_blocker_policy_for_handoff(
+            db, args["project_id"], version=_effective_version,
+        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -3001,6 +3100,12 @@ async def _handle_task_tools(
             # 180s timeout fired before generate_handoff reached its own
             # finalize step (see the l0_fallback/degraded handling above).
             "handoff_evidence_status": _evidence_status,
+            # 3cab355a — one entry per requested force_include_ids id that
+            # failed validation, with a machine-readable reason (see
+            # handoff.generate_handoff's force_include_rejected docstring).
+            # Pure ADDITION — [] when force_include_ids was empty/absent, or
+            # when the 180s timeout fired before validation ran.
+            "force_include_rejected": _force_include_rejected,
             # 8a883f60 — echoes the strict_evidence flag this call actually
             # used, so a caller never has to re-derive it from args.
             "strict_evidence": _strict_evidence,
@@ -3015,6 +3120,11 @@ async def _handle_task_tools(
             # artifacts this handoff covers, plus the executable/executable_reasons
             # readiness signal (see meridian.docx_integrity_gate).
             "docx_integrity": _docx_integrity,
+            # b108f2e0 — typed blocker triage: which items are quarantined/
+            # non-executable this run, why, their dependency closure, and
+            # whether the whole run must fail closed (see
+            # meridian.blocker_policy / db.evaluate_board_blockers).
+            "blocker_policy": _blocker_policy_decision,
             # b8f89491 — machine-readable scope: which sprint-version bucket
             # this handoff actually resolved to, and why (explicit argument vs.
             # session-derived vs. unscoped). effective_version is None when the
@@ -3026,6 +3136,14 @@ async def _handle_task_tools(
                 "effective_version": _effective_version,
                 "session_id": session_id,
             },
+            # ecc8b280 — machine-readable continuation_required/terminal_ready
+            # state (full/delta modes only; {} for goal/starter/compact/
+            # planner/l0_fallback, which don't compute it — see
+            # generate_handoff's docstring). Pure ADDITION, emitted on every
+            # call regardless of strict_continuation.
+            "continuation_status": _continuation_status,
+            "checkpoint": _checkpoint,
+            "strict_continuation": _strict_continuation,
         }
     if name == "load_handoff":
         # 5efe254b — trusted retrieval of the latest stored handoff for a project
@@ -3033,6 +3151,7 @@ async def _handle_task_tools(
         # start_session's pending_goal delivery. Read-only — it does NOT clear
         # pending_goal (start_session's pop owns read-once consumption), so it is
         # safe to call repeatedly.
+        from .. import handoff as handoff_module_local  # noqa: PLC0415
         _pid = args["project_id"]
         _latest = None
         try:
@@ -3045,19 +3164,97 @@ async def _handle_task_tools(
             _pending = await db_module.get_pending_goal(db, _pid)
         except Exception:  # noqa: BLE001
             _pending = None
+        # 3af86d28 — surface the latest corrective handoff (any status)
+        # directly, so a receiving executor never has to reconstruct a
+        # correction from narrative notes. None when the project has no
+        # recorded corrections. Best-effort: never breaks the mandatory
+        # load_handoff read on a pre-migration DB.
+        from .. import handoff as handoff_module_local  # noqa: PLC0415
+        _correction = None
+        try:
+            _correction = await handoff_module_local.load_handoff_correction(db, _pid)
+        except Exception:  # noqa: BLE001
+            _correction = None
         return {
             "pending_goal": _pending,
             "handoff": (
                 {
-                    "content": _latest.get("body"),
+                    # f46372e8 — route the stored body through the SAME
+                    # format_handoff_mcp_content helper every generate_handoff
+                    # transport (HTTP route, MCP handler, stdio handler) uses
+                    # for its own `content` field (see that function's
+                    # docstring). Previously this was the one content-bearing
+                    # handoff surface that returned the raw DB column
+                    # unwrapped — harmless today only because that helper is
+                    # currently an identity function, but it meant
+                    # load_handoff could silently drift from the other
+                    # transports' wire contract the moment format_handoff_mcp_
+                    # content ever became non-trivial. This makes the ONE
+                    # canonical serializer genuinely canonical: every
+                    # content-returning path funnels through it, not "every
+                    # path except this one."
+                    "content": handoff_module_local.format_handoff_mcp_content(
+                        _latest.get("body")
+                    ),
                     "mode": _latest.get("mode"),
                     "session_id": _latest.get("session_id"),
                     "created_at": _latest.get("created_at"),
+                    # 3af86d28 — an invalidated handoff (superseded by a
+                    # corrective handoff) is non-executable: a receiving
+                    # executor must not act on `content` above without
+                    # first checking this. The body itself is left verbatim
+                    # for audit — only these three columns change.
+                    "invalidated": bool(_latest.get("invalidated")),
+                    "invalidated_reason": _latest.get("invalidated_reason"),
+                    "superseded_by_correction_id": _latest.get("superseded_by_correction_id"),
                 }
                 if _latest else None
             ),
             "has_handoff": bool(_latest) or bool(_pending),
+            "correction": _correction,
         }
+    if name == "record_handoff_correction":
+        # 3af86d28 — corrective handoff for a blocked executor session. See
+        # meridian.handoff's module docstring above _mint_and_embed_goal_token
+        # for the full design. Records the correction; when regenerate=true,
+        # also repairs pointers, invalidates the source handoff, and produces
+        # a new deterministic revision in this SAME call.
+        from .. import handoff as handoff_module_local  # noqa: PLC0415
+        _pid = args["project_id"]
+        try:
+            _correction = await handoff_module_local.record_handoff_correction(
+                db, _pid,
+                source_handoff_id=args["source_handoff_id"],
+                blocker_classification=args["blocker_classification"],
+                session_id=args.get("session_id"),
+                investigation_evidence=args.get("investigation_evidence"),
+                added_pointers=args.get("added_pointers"),
+                removed_pointers=args.get("removed_pointers"),
+                superseded_pointers=args.get("superseded_pointers"),
+                changed_resources=args.get("changed_resources"),
+                requested_scope=args.get("requested_scope"),
+                version=args.get("version"),
+                source_token=args.get("source_token"),
+                idempotency_key=args.get("idempotency_key"),
+                status=args.get("status") or "draft",
+            )
+        except handoff_module_local.HandoffCorrectionError as exc:
+            return {"error": "HANDOFF_CORRECTION_INVALID", "message": str(exc)}
+        if not args.get("regenerate"):
+            return {"correction": _correction, "regenerated": False}
+        _out_dir = args.get("output_dir") or data_dir
+        try:
+            return await handoff_module_local.regenerate_handoff_correction(
+                db, _pid, _correction["id"], _out_dir,
+                session_id=args.get("session_id"),
+                mode=args.get("mode") or "full",
+            )
+        except handoff_module_local.HandoffCorrectionError as exc:
+            return {
+                "correction": _correction, "regenerated": False,
+                "error": "HANDOFF_CORRECTION_REGENERATE_FAILED",
+                "message": str(exc),
+            }
     if name == "verify_handoff_token":
         # cb8e7c0f — verify a provenance token extracted from a pasted /goal block.
         # Delegates to DB-backed token store in handoff.py (shared across machines).
@@ -4473,20 +4670,36 @@ async def _handle_plugin_tools(
     """
     if name == "refresh_tool_manifest":
         # 142808f3 — plain tool CALL to re-discover the built-in tool set, for
-        # clients that ignore notifications/tools/list_changed. Best-effort re-fire
-        # of the signal too, so a client that DOES honour it also re-lists.
+        # clients that ignore notifications/tools/list_changed.
+        # 49d8244d — extended into the explicit refresh/re-list operation for
+        # the TUNNEL half of the tool surface too: when a tenant is connected,
+        # this now forces a SYNCHRONOUS re-aggregation of every healthy tunnel
+        # slot (routes/tunnel.py's refresh_tunnel_manifest) instead of only
+        # arming the best-effort notifications/tools/list_changed pending flag
+        # — so a session that suspects a recovered/newly-configured slot is
+        # invisible can call this once and get back a fresh manifest_hash to
+        # compare, without needing a second tools/list round trip or a
+        # reconnect. Bounded to 5s (same outer bound as tools/list's own
+        # tunnel-tools fetch) so a cold/wedged slot can't hang this tool call.
         from ..mcp_tools import _MCP_TOOLS_LIST  # noqa: PLC0415
         from ..tool_manifest import build_tool_manifest  # noqa: PLC0415
 
         manifest = build_tool_manifest(_MCP_TOOLS_LIST)
         _tid = tenant.get("id") if tenant else None
         if _tid:
+            from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
             try:
-                from ..routes.tunnel import (  # noqa: PLC0415
-                    notify_tools_list_changed as _notify_tlc,
+                import asyncio as _asyncio  # noqa: PLC0415
+                manifest["tunnel"] = await _asyncio.wait_for(
+                    _tunnel_mod.refresh_tunnel_manifest(_tid), timeout=5.0,
                 )
-                _notify_tlc(_tid)
                 manifest["list_changed_refired"] = True
+            except _asyncio.TimeoutError:
+                # Refresh abandoned past the outer bound — report the last-known
+                # snapshot (still atomic/consistent, just not freshly rebuilt)
+                # rather than block the tool call on a wedged slot.
+                manifest["tunnel"] = _tunnel_mod.tunnel_manifest_snapshot(_tid)
+                manifest["list_changed_refired"] = False
             except Exception:  # noqa: BLE001 — signal is a bonus, manifest is the point
                 manifest["list_changed_refired"] = False
         return manifest
@@ -4952,8 +5165,30 @@ async def _handle_tunnel_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: set_active_repo (tunnel control), run_verification (0e973e52)."""
+    """Dispatch group: set_active_repo (tunnel control), run_verification (0e973e52),
+    get_tunnel_diagnostics (f1e0df55, read-only)."""
     if name == "set_active_repo":
+        # 32ba4125 — worktree_id is the validated, fail-closed activation path:
+        # it can only ever resolve to a path a session actually registered via
+        # create_worktree (POST /projects/{id}/worktrees), never an arbitrary
+        # string. Checked FIRST and handled as a fully separate branch so the
+        # plain repo_path path below (and its exact error messages/behavior)
+        # stays byte-for-byte unchanged for existing main-repo/non-worktree
+        # callers that never pass worktree_id.
+        worktree_id = str(args.get("worktree_id") or "").strip()
+        if worktree_id:
+            if tenant is None:
+                raise ValueError("set_active_repo requires an authenticated tenant (tunnel mode)")
+            tenant_id = tenant.get("id", "")
+            from ..worktree_code_intel_context import (  # noqa: PLC0415
+                WorktreeCodeIntelContextError,
+                activate_worktree_code_intel_context,
+            )
+            try:
+                return await activate_worktree_code_intel_context(db, tenant_id, worktree_id)
+            except WorktreeCodeIntelContextError as exc:
+                raise ValueError(str(exc)) from exc
+
         repo_path = str(args.get("repo_path") or "").strip()
         if not repo_path:
             raise ValueError("repo_path is required")
@@ -5079,6 +5314,15 @@ async def _handle_tunnel_tools(
             result["cwd"] = repo_path
         result["verification_run_id"] = completed_run["id"]
         return result
+
+    if name == "get_tunnel_diagnostics":
+        # f1e0df55 — ONE layered, read-only diagnostic snapshot; the MCP tool
+        # and the GET /tunnel/diagnostics/{tenant_id} HTTP route share the
+        # exact same builder so both surfaces report identically.
+        from ..routes import tunnel as _tunnel_mod  # noqa: PLC0415
+
+        hostname = (args.get("hostname") or "").strip() or None
+        return _tunnel_mod.build_tunnel_diagnostics(tenant, hostname)
 
     return _MISS
 

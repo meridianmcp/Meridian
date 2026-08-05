@@ -42,6 +42,7 @@ import aiosqlite
 
 from . import db as db_module
 from . import enqueue as enqueue_module
+from . import executor_config as executor_config_module
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +55,10 @@ DEFAULT_INTERVAL_S = 30.0
 
 # Default cap on concurrently dispatched workers. Bounds resource use so an
 # enabled dispatcher can never fan out an unbounded number of subprocesses.
-DEFAULT_MAX_IN_FLIGHT = 4
+# 99c0c1be — sourced from executor_config.DEFAULT_PARALLELISM_TARGET so the
+# dispatcher's default and the shared parallelism model never drift apart;
+# the numeric value (4) is unchanged from before this feature existed.
+DEFAULT_MAX_IN_FLIGHT = executor_config_module.DEFAULT_PARALLELISM_TARGET
 
 
 # Signature of the enqueue primitive — injectable so tests can substitute a
@@ -108,18 +112,52 @@ class Dispatcher:
         *,
         interval: float = DEFAULT_INTERVAL_S,
         max_in_flight: int = DEFAULT_MAX_IN_FLIGHT,
+        host_limit: int | None = None,
+        requested_parallelism: int | None = None,
         version: str | None = None,
         enqueue_fn: EnqueueFn | None = None,
         get_groups_fn: Callable[..., Awaitable[dict[str, Any]]] | None = None,
+        evaluate_blockers_fn: Callable[..., Awaitable[dict[str, Any]]] | None = None,
     ) -> None:
         self.db = db
         self.project_id = project_id
         self.interval = interval
-        self.max_in_flight = max(1, int(max_in_flight))
+        # 99c0c1be — max_in_flight is now this dispatcher's CONFIGURED
+        # parallelism target (clamped to [1, executor_config.
+        # PARALLELISM_TARGET_CEILING] == 16, same rule as executor_config.
+        # parallelism_target), not a bare hard cap. The actual per-pass
+        # concurrency ceiling is the deterministic
+        # min(requested, configured_target, host_limit, resource_safe_capacity)
+        # computed fresh every dispatch_once() pass (see below), because
+        # resource_safe_capacity — the size of the current first parallel-safe
+        # group — legitimately varies pass to pass as the board changes.
+        # Every existing caller that passed max_in_flight as a hard
+        # concurrency cap keeps working identically: with no host_limit and a
+        # first group never smaller than max_in_flight, effective_parallelism
+        # == max_in_flight exactly as before this feature existed.
+        self.configured_target = executor_config_module.normalize_parallelism_target(
+            max_in_flight
+        )
+        # host_limit is a genuinely different axis from configured_target: it
+        # is what the HOST/CLIENT reports, not what this project asks for.
+        # None (default) means "unknown" and is excluded from the min() below
+        # — never coerced into a de-facto cap of 1 (see executor_config.
+        # resolve_parallelism's module docstring).
+        self.host_limit = host_limit
+        # None (default) means "derive requested_parallelism from the size of
+        # the current first parallel-safe group each pass" — see dispatch_once.
+        self.requested_parallelism = requested_parallelism
+        # Back-compat: some callers/tests read disp.max_in_flight directly as
+        # "the configured cap."
+        self.max_in_flight = self.configured_target
         self.version = version
         # Injectable seams for testing — default to the real primitives.
         self._enqueue = enqueue_fn or enqueue_module.enqueue_claude_task
         self._get_groups = get_groups_fn or db_module.get_parallelizable_groups
+        # b108f2e0 — typed blocker triage seam: default to the real DB-backed
+        # evaluator. Injectable so tests can assert dispatch_once's
+        # quarantine/run-stop behavior without a real board.
+        self._evaluate_blockers = evaluate_blockers_fn or db_module.evaluate_board_blockers
         # Event the loop awaits with a timeout; set() forces an immediate pass.
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -129,6 +167,15 @@ class Dispatcher:
         # Session row the workers are enqueued under. Created lazily on first
         # dispatch so an idle dispatcher leaves no rows behind.
         self._session_id: str | None = None
+        # 99c0c1be — diagnostics: the most recent resolve_parallelism() result,
+        # so a caller/dashboard can see WHY the last pass ran at the width it
+        # did (requested_parallelism, effective_parallelism, host_limit,
+        # configured_target, resource_safe_capacity, limiting_reason). None
+        # until the first dispatch_once() pass with a non-empty board.
+        self.last_parallelism: dict[str, Any] | None = None
+        # b108f2e0 — last blocker-triage decision this dispatcher observed,
+        # for introspection/tests. None until the first dispatch_once pass.
+        self.last_blocker_decision: dict[str, Any] | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -199,26 +246,91 @@ class Dispatcher:
         """Run a single dispatch pass; return the task rows enqueued this pass.
 
         Dispatches the first parallelizable group, skipping any item already
-        dispatched in this process, and stops once ``max_in_flight`` is
-        reached so the number of live workers stays bounded.
+        dispatched in this process, and stops once the pass's deterministic
+        ``effective_parallelism`` (see ``executor_config.resolve_parallelism``)
+        is reached so the number of live workers stays bounded.
+
+        b108f2e0 — typed blocker triage runs BEFORE any enqueue this pass:
+
+        * A fail-closed blocker (``run_stop=True`` — verified_security /
+          integrity_corruption / run_global_blocker, or an explicit
+          project ``run_stop`` policy) stops this dispatcher entirely
+          (``self._stopped = True``) and enqueues nothing, mirroring the
+          spec's "preserve explicit fail-closed stops" requirement.
+        * Otherwise, any item in ``quarantined_item_ids`` is SKIPPED (never
+          enqueued) but does NOT stop the pass — other, disjoint items in
+          the same group still dispatch normally. This is the actual fix
+          for the incident this module exists for: one under-scoped item
+          no longer halts an otherwise-executable autonomous run.
+
+        Best-effort: a failure evaluating blockers degrades to "no
+        quarantine this pass" (dispatch proceeds unfiltered) rather than
+        ever silently stopping the dispatcher over an enrichment failure —
+        only an ACTUAL fail-closed classification stops it.
         """
+        try:
+            decision = await self._evaluate_blockers(
+                self.db, self.project_id, version=self.version,
+            )
+        except Exception:  # noqa: BLE001 — blocker triage must never break dispatch
+            logger.exception("blocker-policy evaluation failed; dispatching unfiltered")
+            decision = None
+        self.last_blocker_decision = decision
+
+        if decision and decision.get("run_stop"):
+            logger.warning(
+                "dispatcher halted by fail-closed blocker policy: %s",
+                decision.get("run_stop_reason"),
+            )
+            self._stopped = True
+            return []
+
+        quarantined = set((decision or {}).get("quarantined_item_ids") or [])
+
         result = await self._get_groups(self.db, self.project_id, self.version)
         groups = (result or {}).get("groups") or []
         if not groups:
             return []
 
+        first_group = groups[0]
+        # 99c0c1be — resource_safe_capacity (the size of THIS pass's first
+        # conflict-free group) is recomputed every pass since it legitimately
+        # varies as the board changes. Folding it into the SAME deterministic
+        # min() the rest of the parallelism model uses means wave planning
+        # never serializes disjoint, resource-safe work just because some
+        # OTHER input (e.g. an unreported host_limit) happens to be unknown —
+        # an unknown host_limit is simply excluded from the min(), never
+        # treated as 1.
+        requested = (
+            self.requested_parallelism
+            if self.requested_parallelism is not None
+            else len(first_group)
+        )
+        parallelism = executor_config_module.resolve_parallelism(
+            requested,
+            configured_target=self.configured_target,
+            host_limit=self.host_limit,
+            resource_safe_capacity=len(first_group),
+        )
+        self.last_parallelism = parallelism
+        cap = parallelism["effective_parallelism"]
+
         in_flight = len(self._dispatched)
-        if in_flight >= self.max_in_flight:
+        if in_flight >= cap:
             return []
 
         enqueued: list[dict[str, Any]] = []
         # Only the first group is safe to fan out simultaneously; later groups
         # depend on it draining. Run one group per pass.
-        for item in groups[0]:
+        for item in first_group:
             item_id = item.get("id")
             if not item_id or item_id in self._dispatched:
                 continue
-            if in_flight >= self.max_in_flight:
+            if item_id in quarantined:
+                # Quarantined — skip THIS item only; other disjoint items in
+                # the group keep dispatching normally (quarantine_continue).
+                continue
+            if in_flight >= cap:
                 break
             session_id = await self._ensure_session()
             prompt = _worker_prompt(item, self.project_id)

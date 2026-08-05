@@ -25,6 +25,7 @@ EXECUTOR_CONFIG_KEYS = (
     "outputs_dirs",  # e2688fc1 — meridian-outputs indexing dirs surfaced by the codeintel vtab
     "timezone",  # 3d7b7aca — IANA zone (e.g. "America/Denver") for the session current_time block
     "max_planning_turns",  # 75ac1c8e — execution-policy override: turns allowed before the required first action
+    "parallelism_target",  # 99c0c1be — configured PARALLELISM target (<=16); see resolve_parallelism below
 )
 
 EXECUTOR_CREDENTIALS_RULE = (
@@ -185,6 +186,156 @@ def build_execution_policy(
         "permitted_parallel_wave": is_immediate,
         "claim_before_edit": True,
         "genuine_blocker_escalation": GENUINE_BLOCKER_ESCALATION_RULE,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 99c0c1be — configurable PARALLELISM target, decoupled from host-enforced
+# capacity.
+#
+# Historically the only "how many workers at once" knob was Dispatcher's
+# max_in_flight (a bare hard cap, dispatcher.DEFAULT_MAX_IN_FLIGHT=4) and
+# get_parallelizable_groups' conflict-graph coloring (which bounds parallel-
+# SAFETY -- which items may run together -- not parallel-COUNT -- how many
+# run at once). Neither distinguished four genuinely different things:
+#
+#   * requested_parallelism  -- how much parallelism the caller/board is
+#     actually asking for right now (e.g. the size of a resource-conflict-free
+#     batch of eligible items).
+#   * configured_target      -- how much this project is configured to allow
+#     (executor_config.parallelism_target), now permitted up to 16 -- not
+#     hardcoded to a small default forever.
+#   * host_limit              -- how much the host/client actually supports
+#     (e.g. a vendor UI concurrency cap). Often UNKNOWN.
+#   * resource_safe_capacity -- how much can run at once without two items
+#     stepping on the same declared resource.
+#
+# resolve_parallelism() makes all four explicit and produces ONE deterministic
+# effective_parallelism = min(...) plus a limiting_reason, so any caller
+# (Dispatcher, get_parallelizable_groups, a handoff, a dashboard) can say WHY
+# parallelism was capped instead of just reporting a bare number. Two rules
+# are load-bearing:
+#
+#   1. A KNOWN host_limit is always respected -- effective_parallelism can
+#      never exceed a known host_limit. This is the "never claim to override
+#      a lower host-enforced limit" contract.
+#   2. A MISSING host_limit (None -- the host reported nothing) is EXCLUDED
+#      from the min(), never coerced to some conservative stand-in (e.g. 1).
+#      Treating "unknown" as "one" would serialize genuinely disjoint,
+#      resource-safe work for no reason other than an unrelated vendor UI cap
+#      never having been reported -- exactly what this item forbids.
+# ---------------------------------------------------------------------------
+
+PARALLELISM_TARGET_CEILING = 16
+# Matches dispatcher.DEFAULT_MAX_IN_FLIGHT's historical hardcoded value, so an
+# unconfigured project sees byte-for-byte the same effective concurrency as
+# before this feature existed.
+DEFAULT_PARALLELISM_TARGET = 4
+
+# Priority used ONLY to choose a single label when multiple candidates tie at
+# the minimum -- never affects the numeric result. host_limit outranks
+# everything else because it is the one constraint that must never appear
+# silently overridden by a different, equally-small candidate.
+_PARALLELISM_LIMIT_PRIORITY = (
+    "host_limit",
+    "configured_target",
+    "resource_safe_capacity",
+    "requested_parallelism",
+)
+
+
+def normalize_parallelism_target(raw: Any) -> int:
+    """Clamp an executor_config.parallelism_target override to [1, 16].
+
+    Missing/non-numeric/non-positive values fall back to
+    ``DEFAULT_PARALLELISM_TARGET`` rather than raising -- same fail-safe
+    convention ``_normalize_max_planning_turns`` already uses. A value above
+    the ceiling is clamped down to it, never rejected outright, so "ask for
+    more than 16" degrades to "get exactly 16" rather than falling back to
+    the (much smaller) default.
+    """
+    try:
+        target = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_PARALLELISM_TARGET
+    if target <= 0:
+        return DEFAULT_PARALLELISM_TARGET
+    return min(PARALLELISM_TARGET_CEILING, target)
+
+
+def _positive_int_or_none(value: Any) -> int | None:
+    """Coerce to a positive int, or None for missing/invalid/non-positive.
+
+    None is a meaningful, distinct return value (not an error): it means
+    "this candidate does not participate in the min()" -- see the module
+    docstring above on why a missing host_limit must never become 1.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def resolve_parallelism(
+    requested_parallelism: Any,
+    *,
+    configured_target: Any = None,
+    host_limit: Any = None,
+    resource_safe_capacity: Any = None,
+) -> dict[str, Any]:
+    """Deterministically resolve how much parallelism is actually safe/allowed.
+
+    Returns a flat dict with every input surfaced SEPARATELY (never collapsed
+    into just a final number) so a caller can see why the effective value is
+    what it is:
+
+    * ``requested_parallelism`` -- what was asked for (coerced to >=1; a
+      missing/invalid value defaults to 1, never 0 -- "no request" still
+      means "at least one thing can run").
+    * ``configured_target`` -- this project's configured ceiling, normalized
+      via :func:`normalize_parallelism_target` (falls back to
+      ``DEFAULT_PARALLELISM_TARGET``, clamped to ``PARALLELISM_TARGET_CEILING``
+      == 16).
+    * ``host_limit`` -- the host/client-reported cap, or ``None`` when the
+      host did not report one. Never coerced into a number.
+    * ``resource_safe_capacity`` -- the largest batch provably safe to run at
+      once given declared resource conflicts (typically the size of
+      ``get_parallelizable_groups()``'s first group), or ``None`` when not
+      supplied.
+    * ``effective_parallelism`` -- ``min()`` of every non-``None`` candidate
+      above. Always >= 1.
+    * ``limiting_reason`` -- which candidate the ``min()`` came from: one of
+      ``"host_limit"``, ``"configured_target"``, ``"resource_safe_capacity"``,
+      ``"requested_parallelism"``. When several candidates tie at the
+      minimum, ``host_limit`` wins the label (see module docstring), then
+      ``configured_target``, then ``resource_safe_capacity``, then
+      ``requested_parallelism``.
+    """
+    requested = _positive_int_or_none(requested_parallelism) or 1
+    target = normalize_parallelism_target(configured_target)
+    candidates: dict[str, int] = {
+        "requested_parallelism": requested,
+        "configured_target": target,
+    }
+    host_limit_value = _positive_int_or_none(host_limit)
+    if host_limit_value is not None:
+        candidates["host_limit"] = host_limit_value
+    resource_capacity_value = _positive_int_or_none(resource_safe_capacity)
+    if resource_capacity_value is not None:
+        candidates["resource_safe_capacity"] = resource_capacity_value
+
+    effective = min(candidates.values())
+    limiting_reason = next(
+        key for key in _PARALLELISM_LIMIT_PRIORITY if candidates.get(key) == effective
+    )
+    return {
+        "requested_parallelism": requested,
+        "configured_target": target,
+        "host_limit": host_limit_value,
+        "resource_safe_capacity": resource_capacity_value,
+        "effective_parallelism": effective,
+        "limiting_reason": limiting_reason,
     }
 
 

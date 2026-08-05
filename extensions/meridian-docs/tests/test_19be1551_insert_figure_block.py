@@ -11,7 +11,33 @@ import sqlite3
 import zipfile
 import xml.etree.ElementTree as ET
 
-from meridian_docs import docs_intel
+import pytest
+
+from meridian_docs import docs_intel, server
+
+
+@pytest.fixture(autouse=True)
+def _default_render_capability(monkeypatch):
+    """ddd79188 -- insert_figure_block now invokes the real render-capability
+    gate (render_gate.check_render_capability) AFTER structural verification
+    passes. Every test in this file exercises STRUCTURAL correctness and
+    must not depend on -- or be slowed/blocked by -- whichever render
+    backends (LibreOffice, Word COM) happen to be installed on the machine
+    running the suite. Stub a successful 'rendered' result by default so
+    every existing assertion here keeps testing exactly what it tested
+    before this gate existed. Tests that specifically exercise the render
+    gate's own rendered/unavailable-with-reason/failed contract override
+    this stub explicitly (see the "render-capability gate" section below).
+    """
+    monkeypatch.setattr(
+        docs_intel.render_gate,
+        "check_render_capability",
+        lambda docx_path, **kwargs: {
+            "status": "rendered",
+            "backend": "test-stub",
+            "detail": {"stub": True},
+        },
+    )
 
 
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -626,3 +652,171 @@ def test_verify_figure_block_write_covers_every_internal_mismatch_branch(tmp_pat
         path, image_para_id="LASTIMG01", expected_seq_number=1, expected_label_text="x",
     )
     assert caption_missing is not None and "the caption is missing" in caption_missing["error"]
+
+
+# ---------------------------------------------------------------------------
+# Render-capability gate (ddd79188): rendered / unavailable-with-reason /
+# failed, invoked AFTER structural verification passes -- closes the gap
+# between structural re-parse and real Word/COM render verification.
+# ---------------------------------------------------------------------------
+
+def test_insert_figure_block_rendered_status_reports_render_evidence(tmp_path, monkeypatch):
+    docx_path, image_path = _setup(tmp_path)
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {
+            "status": "rendered", "backend": "libreoffice-soffice",
+            "detail": {"converted_via": "soffice", "output_filename": "out.pdf"},
+        },
+    )
+
+    result = docs_intel.insert_figure_block(
+        docx_path, image_path, label_text="Chart", anchor_para_id="P0000001",
+    )
+
+    assert result["status"] == "inserted"
+    assert result["render_status"] == "rendered"
+    assert result["render_verified"] is True
+    assert result["render_backend"] == "libreoffice-soffice"
+    assert result["render_detail"]["converted_via"] == "soffice"
+
+
+def test_insert_figure_block_render_failed_restores_and_errors(tmp_path, monkeypatch):
+    """A structurally-valid write whose render attempt genuinely FAILS must
+    be restored from the pre-write backup and reported as an error -- never
+    silently accepted just because the structural re-parse passed."""
+    docx_path, image_path = _setup(tmp_path)
+    with open(docx_path, "rb") as fh:
+        original_bytes = fh.read()
+
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {
+            "status": "failed", "reason": "soffice crashed", "backend": "libreoffice-soffice",
+        },
+    )
+
+    result = docs_intel.insert_figure_block(
+        docx_path, image_path, label_text="Chart", anchor_para_id="P0000001",
+    )
+
+    assert "error" in result
+    assert result["render_status"] == "failed"
+    assert result["file_restored"] is True
+    with open(docx_path, "rb") as fh:
+        assert fh.read() == original_bytes, (
+            "a real render failure must restore docx_path to its pre-write "
+            "content, exactly like a structural verification failure"
+        )
+
+
+def test_insert_figure_block_render_unavailable_fails_closed_by_default(tmp_path, monkeypatch):
+    """No render backend in this environment must NOT be silently treated as
+    verified -- by default this fails closed (restore + error) for
+    canonical/production promotion, exactly like a real render failure."""
+    docx_path, image_path = _setup(tmp_path)
+    with open(docx_path, "rb") as fh:
+        original_bytes = fh.read()
+
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {
+            "status": "unavailable-with-reason",
+            "reason": "no render backend available in this environment",
+        },
+    )
+
+    result = docs_intel.insert_figure_block(
+        docx_path, image_path, label_text="Chart", anchor_para_id="P0000001",
+    )
+
+    assert "error" in result
+    assert result["render_status"] == "unavailable-with-reason"
+    assert result["file_restored"] is True
+    with open(docx_path, "rb") as fh:
+        assert fh.read() == original_bytes
+
+
+def test_insert_figure_block_render_unavailable_degrades_with_audited_override(tmp_path, monkeypatch):
+    """allow_degraded_render=True + a non-empty degraded_render_reason is the
+    ONLY way to accept a write with no render verification -- and it must
+    never be reported as verified even when the write is accepted."""
+    docx_path, image_path = _setup(tmp_path)
+
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {
+            "status": "unavailable-with-reason",
+            "reason": "no render backend available in this environment",
+        },
+    )
+
+    result = docs_intel.insert_figure_block(
+        docx_path, image_path, label_text="Chart", anchor_para_id="P0000001",
+        allow_degraded_render=True,
+        degraded_render_reason="CI sandbox has no LibreOffice/Word installed",
+    )
+
+    assert result["status"] == "inserted"
+    assert result["render_status"] == "unavailable-with-reason"
+    assert result["render_verified"] is False
+    assert result["render_degraded"] is True
+    assert result["degraded_render_reason"] == "CI sandbox has no LibreOffice/Word installed"
+
+
+def test_insert_figure_block_allow_degraded_render_requires_non_empty_reason(tmp_path):
+    docx_path, image_path = _setup(tmp_path)
+    original = (tmp_path / "report.docx").read_bytes()
+
+    result = docs_intel.insert_figure_block(
+        docx_path, image_path, label_text="Chart", anchor_para_id="P0000001",
+        allow_degraded_render=True,
+    )
+
+    assert "error" in result
+    assert "degraded_render_reason" in result["error"]
+    assert (tmp_path / "report.docx").read_bytes() == original
+
+
+def test_insert_figure_block_structural_reparse_alone_never_yields_verified_render(tmp_path, monkeypatch):
+    """The critical invariant this whole item exists for: a write that
+    passes REAL structural verification (_verify_figure_block_write is NOT
+    stubbed -- this is a genuine write + re-parse) must still fail closed
+    when the render backend cannot confirm the document actually renders.
+    Structural correctness and render verification are two separate,
+    independently-enforced checks; passing one must never be reported as
+    satisfying the other."""
+    docx_path, image_path = _setup(tmp_path)
+
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {"status": "unavailable-with-reason", "reason": "no backend"},
+    )
+
+    result = docs_intel.insert_figure_block(
+        docx_path, image_path, label_text="Chart", anchor_para_id="P0000001",
+    )
+
+    # The write's STRUCTURE was genuinely fine -- yet the overall call still
+    # reports failure, because structural correctness alone is not enough
+    # to be reported "verified" / "inserted".
+    assert "error" in result
+    assert result["render_status"] == "unavailable-with-reason"
+    assert result.get("status") != "inserted"
+
+
+def test_insert_figure_block_server_wrapper_threads_degraded_render_params(tmp_path, monkeypatch):
+    docx_path, image_path = _setup(tmp_path)
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda path, **kwargs: {"status": "unavailable-with-reason", "reason": "no backend"},
+    )
+
+    result = server.insert_figure_block(
+        docx_path, image_path, label_text="Chart", anchor_para_id="P0000001",
+        allow_degraded_render=True, degraded_render_reason="no backend in test env",
+    )
+
+    assert result["status"] == "inserted"
+    assert result["render_verified"] is False
+    assert result["render_degraded"] is True

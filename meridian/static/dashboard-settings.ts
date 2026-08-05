@@ -1,3 +1,85 @@
+// 02dbd8b4 — runtime configuration generation status (tunnel/executor
+// settings). Pure formatter for the `config_generation` record the server
+// attaches to GET/PUT /tunnel/plugins, POST/DELETE /tunnel/plugins/custom, and
+// GET /tunnel/status responses:
+//   {generation, config_hash, source_timestamp, restart_required}
+// Exported (+ attached to window, matching this file's other cross-module
+// helpers) so any renderer of tunnel/connector state shares one label/tone
+// rule instead of re-deriving it inline — the point of the sprint item is
+// exactly that settings UI, tunnel runtime, and connector cache must never
+// independently guess whether they agree with each other.
+export interface TunnelConfigGenerationInfo {
+  generation?: number;
+  config_hash?: string;
+  source_timestamp?: number;
+  restart_required?: boolean;
+}
+
+export function formatTunnelConfigGenerationStatus(
+  info: TunnelConfigGenerationInfo | null | undefined,
+): { label: string; tone: 'ok' | 'warn' | 'unknown'; detail: string } {
+  if (!info || typeof info !== 'object' || info.generation == null) {
+    return {
+      label: 'Unknown',
+      tone: 'unknown',
+      detail: 'No runtime configuration generation has been reported for this tunnel yet.',
+    };
+  }
+  const gen = info.generation;
+  const hash = info.config_hash ? String(info.config_hash).slice(0, 8) : 'unknown';
+  if (info.restart_required) {
+    return {
+      label: `Restart required (generation ${gen})`,
+      tone: 'warn',
+      detail: `Settings changed to generation ${gen} (config ${hash}) while a tunnel was actively connected. Restart "meridian --tunnel" to apply it — the running process is still serving the previous configuration.`,
+    };
+  }
+  return {
+    label: `Applied (generation ${gen})`,
+    tone: 'ok',
+    detail: `Runtime configuration generation ${gen} (config ${hash}) is the latest saved configuration and is what the next tunnel connection will load.`,
+  };
+}
+window.formatTunnelConfigGenerationStatus = formatTunnelConfigGenerationStatus;
+
+// Renders a small warning banner above the Tunnel Plugins card when the
+// tenant-default runtime config generation comes back restart_required — i.e.
+// a settings save happened while a tunnel was actively connected, so the
+// running process is serving a stale (pre-change) configuration. Fully
+// self-owned: creates/updates/removes its own element by a fixed id and never
+// reaches into the Tunnel Plugins section's own DOM (dashboard-plugins.ts
+// re-renders that section asynchronously and would clobber anything injected
+// into it — see loadTunnelPluginsSection). Best-effort: any fetch failure
+// just means no banner, never a visible error.
+export async function _renderTunnelConfigGenerationBanner(projectId: any): Promise<void> {
+  const host = document.getElementById(`settings-body-${projectId}`);
+  if (!host) return;
+  const bannerId = `tunnel-config-gen-banner-${projectId}`;
+  const existing = document.getElementById(bannerId);
+  if (existing) existing.remove();
+  let status: any;
+  try {
+    status = await api(`/tunnel/status/${projectId}`);
+  } catch (e: any) {
+    return;
+  }
+  const info = status && status.config_generation && status.config_generation.default;
+  const formatted = formatTunnelConfigGenerationStatus(info);
+  if (formatted.tone !== 'warn') return; // only surface when action is actually needed
+  const esc = (window as any).escapeHtml || String;
+  const banner = document.createElement('div');
+  banner.id = bannerId;
+  banner.style.cssText = 'margin-top:18px;padding:8px 10px;border-radius:4px;font-size:10px;line-height:1.5;background:#f59e0b1a;border:1px solid #f59e0b55';
+  banner.innerHTML = `<strong style="color:#f59e0b">${esc(formatted.label)}</strong><div style="margin-top:3px;color:var(--muted)">${esc(formatted.detail)}</div>`;
+  const section = document.getElementById(`tunnel-plugins-section-${projectId}`);
+  if (section && section.parentElement === host) {
+    host.insertBefore(banner, section);
+  } else {
+    host.appendChild(banner);
+  }
+}
+window._renderTunnelConfigGenerationBanner = _renderTunnelConfigGenerationBanner;
+
 export function suggestNtfyTopic(projectId: any) {
 
   const proj = (window.state?.projects || []).find((p: any) => p.id === projectId);
@@ -34,6 +116,17 @@ export function _execTurnsNumberInputHtml(
   return `<input id="exec-${field}-${projectId}" type="number" inputmode="numeric" min="${min}" max="${max}" step="${step}" value="${esc(String(value))}" style="width:100px;background:var(--surface-1);border:1px solid var(--border);border-radius:3px;color:var(--text);font-size:11px;font-family:var(--font-mono);padding:3px 6px;margin-top:4px;display:block">`;
 }
 window._execTurnsNumberInputHtml = _execTurnsNumberInputHtml;
+
+// 99c0c1be — configured PARALLELISM target for the autonomous dispatcher.
+// Mirrors meridian/executor_config.py's DEFAULT_PARALLELISM_TARGET (4) and
+// PARALLELISM_TARGET_CEILING (16) — kept as plain local constants here
+// (rather than a shared window global like DEFAULT_MAX_TURNS) since this is
+// the only place in the dashboard that renders this control. The backend is
+// the source of truth for clamping (executor_config.normalize_parallelism_target);
+// these mirror it so the input's bounds match what the server will actually
+// honor, but the server never trusts the client-side clamp alone.
+const DEFAULT_PARALLELISM_TARGET = 4;
+const PARALLELISM_TARGET_CEILING = 16;
 // ca8c0d56 — condensed one-line blurbs for the Claude Code (rc-watcher) and
 // Codex CLI setup sections. These replaced multi-sentence prose paragraphs so the
 // sections lead with the copy-paste config, not a wall of text. Exported as pure
@@ -2342,7 +2435,12 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     </div>
 
     <!-- b970fe07 — Serena default repo path (code-extractor slot). Single value;
-         used at tunnel start only when --repo is not passed on the CLI. -->
+         used at tunnel start only when --repo is not passed on the CLI.
+         9d9a92cc — this same slot feeds Claude Desktop/Code/Cursor uniformly
+         (they all reach it through the tunnel's local proxy port, see
+         docs/mcp-tool-surface.md); a missing/cleared command override now
+         correctly falls back to the current default (Serena), never the
+         retired mcp-server-code-extractor package. -->
     <div style="margin-bottom:10px">
 
       <div style="font-size:10px;color:var(--muted);margin-bottom:4px">Serena Repo Path<br><span style="font-size:9px;color:var(--muted)">Default <code>--project</code> for the tunnel's code-extractor (Serena). Used only when <code>--repo</code> is not passed at tunnel start.</span></div>
@@ -2356,6 +2454,22 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     <div style="margin-bottom:10px">
 
       <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:10px;color:var(--muted)"><input type="checkbox" id="exec-enrich_prospect-${projectId}" ${execCfg.enrich_handoffs_with_code_pointers !== false ? 'checked' : ''} style="cursor:pointer"> Auto-prospect code pointers on handoff <span style="font-size:9px">(attaches file/symbol pointers to sprint items; ON by default)</span></label>
+
+    </div>
+
+    <!-- f7084ed0 — orphan-process-reaper Stop hook toggle. OFF by default;
+         enabling registers a project-scoped Stop hook (meridian/orphan_reaper.py)
+         that reaps dangling pixi/python/node/cmd/uv/conhost processes still
+         rooted in a worktree whose sprint item/session is done, after
+         validating PID + start-time ownership and killing the whole process
+         tree. Saves immediately on change (not batched into "Save defaults")
+         because disabling has an immediate side effect: it deletes any
+         already-written .claude/hooks/orphan_reaper.* files right away
+         instead of waiting for the next generate_handoff. -->
+    <div style="margin-bottom:10px">
+
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:10px;color:var(--muted)"><input type="checkbox" id="exec-orphan-reaper-${projectId}" style="cursor:pointer"> Auto-reap dangling processes from dead worktree sessions <span id="exec-orphan-reaper-status-${projectId}" style="font-size:9px"></span></label>
+      <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Off by default. Registers <code>.claude/hooks/orphan_reaper.sh</code>/<code>.ps1</code>, ownership-validated (PID + start time) before anything is signalled — never touches a process it can't confirm identity for. (Applies on the machine running the tunnel/server.)</span>
 
     </div>
 
@@ -2408,6 +2522,16 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       ${_execTurnsNumberInputHtml('max_turns', projectId, execCfg.max_turns || DEFAULT_MAX_TURNS, 40, 500, 20)}
 
       <span id="exec-max_turns-warn-${projectId}" style="font-size:9px;color:var(--muted)"></span>
+
+    </label>
+
+    <label style="display:block;font-size:10px;color:var(--muted);margin-top:10px">
+
+      Parallelism target: <span id="exec-parallelism_target-val-${projectId}" style="color:var(--text);font-family:var(--font-mono)">${escapeHtml(String(execCfg.parallelism_target || DEFAULT_PARALLELISM_TARGET))}</span> concurrent workers <span style="font-size:9px;color:var(--muted)">(1–${PARALLELISM_TARGET_CEILING})</span>
+
+      ${_execTurnsNumberInputHtml('parallelism_target', projectId, execCfg.parallelism_target || DEFAULT_PARALLELISM_TARGET, 1, PARALLELISM_TARGET_CEILING, 1)}
+
+      <span style="font-size:9px;color:var(--muted)">How many sprint items the autonomous dispatcher may fan out to at once. The ACTUAL effective parallelism is always min(this target, resource-safe capacity, and any host/client-reported concurrency limit) — raising this never overrides a lower limit the host itself enforces.</span>
 
     </label>
 
@@ -2494,6 +2618,15 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       mtVal.textContent = mtSlider.value;
       _renderMtWarn(mtSlider.value);
       mtSlider.addEventListener('input', () => { mtVal.textContent = mtSlider.value; _renderMtWarn(mtSlider.value); });
+    }
+
+    // 99c0c1be — parallelism_target (1-16) live value label, mirroring the
+    // context_threshold/max_turns number-input wiring above.
+    const ptSlider = document.getElementById(`exec-parallelism_target-${projectId}`);
+    const ptVal = document.getElementById(`exec-parallelism_target-val-${projectId}`);
+    if (ptSlider && ptVal) {
+      ptVal.textContent = ptSlider.value;
+      ptSlider.addEventListener('input', () => { ptVal.textContent = ptSlider.value; });
     }
 
     // Wire repo_paths delete/clear in Executor Config section
@@ -2609,6 +2742,43 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
     if (_cdAddBtn) _cdAddBtn.onclick = _addCodeDir;
     if (_cdInput) _cdInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); _addCodeDir(); } });
 
+    // f7084ed0 — orphan-process-reaper toggle: independent of the "Save
+    // defaults" button below (it has an immediate server-side effect —
+    // disabling deletes any already-written hook files right away), so it's
+    // wired as its own fetch-on-render / save-on-change control rather than
+    // folding into the batched `cfg` object saveBtn.onclick builds.
+    const _orphanReaperCb = document.getElementById(`exec-orphan-reaper-${projectId}`) as HTMLInputElement | null;
+    const _orphanReaperStatus = document.getElementById(`exec-orphan-reaper-status-${projectId}`);
+    if (_orphanReaperCb) {
+      api(`/projects/${projectId}/orphan_reaper`).then((s: any) => {
+        _orphanReaperCb.checked = !!(s && s.enabled);
+      }).catch(() => { /* best-effort status fetch — leave unchecked (off) on failure */ });
+      _orphanReaperCb.addEventListener('change', async () => {
+        const desired = _orphanReaperCb.checked;
+        _orphanReaperCb.disabled = true;
+        if (_orphanReaperStatus) _orphanReaperStatus.textContent = 'saving…';
+        try {
+          const res = await api(`/projects/${projectId}/orphan_reaper/toggle`, {
+            method: 'POST',
+            body: JSON.stringify({ enabled: desired }),
+          });
+          const removedCount = Array.isArray(res?.removed_files) ? res.removed_files.length : 0;
+          _orphanReaperCb.checked = !!res?.enabled;
+          if (_orphanReaperStatus) {
+            _orphanReaperStatus.textContent = res?.enabled
+              ? '(enabled)'
+              : (removedCount ? `(disabled — removed ${removedCount} hook file${removedCount === 1 ? '' : 's'})` : '(disabled)');
+            setTimeout(() => { if (_orphanReaperStatus) _orphanReaperStatus.textContent = ''; }, 4000);
+          }
+        } catch (e: any) {
+          _orphanReaperCb.checked = !desired;
+          if (_orphanReaperStatus) _orphanReaperStatus.textContent = e?.message || '(failed to save)';
+        } finally {
+          _orphanReaperCb.disabled = false;
+        }
+      });
+    }
+
     saveBtn.onclick = async () => {
 
       saveBtn.disabled = true;
@@ -2646,6 +2816,10 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
       const mtRaw = mtSlider ? parseInt(mtSlider.value || '', 10) : NaN;
 
       if (!isNaN(mtRaw)) cfg.max_turns = Math.min(500, Math.max(40, mtRaw));
+
+      const ptRaw = ptSlider ? parseInt(ptSlider.value || '', 10) : NaN;
+
+      if (!isNaN(ptRaw)) cfg.parallelism_target = Math.min(PARALLELISM_TARGET_CEILING, Math.max(1, ptRaw));
 
       const loopSel = document.getElementById(`exec-loop_enabled-${projectId}`) as HTMLSelectElement | null;
 
@@ -3927,6 +4101,11 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
   // Tunnel Plugins section (per-account tunnel config) — also defined in
   // dashboard.js, appended below Executor Rules.
   try { (window.loadTunnelPluginsSection as any)?.(projectId); } catch (e: any) {}
+  // 02dbd8b4 — runtime-config-generation banner: warns when the last settings
+  // save happened while a tunnel was actively connected (restart required to
+  // apply it). Independent of loadTunnelPluginsSection's own render cycle —
+  // see _renderTunnelConfigGenerationBanner for why it owns its own element.
+  try { _renderTunnelConfigGenerationBanner(projectId).catch(() => {}); } catch (e: any) {}
 
   if (isDemoMode()) hideDemoAdminControls();
 

@@ -24,6 +24,28 @@ import pytest
 from meridian_docs import docs_intel
 
 
+@pytest.fixture(autouse=True)
+def _default_render_capability(monkeypatch):
+    """016015e1/ddd79188 -- insert_highlighted_note (mode="inline") now
+    invokes the real render-capability gate
+    (render_gate.check_render_capability) AFTER structural verification
+    passes. Tests in this file exercise STRUCTURAL correctness and must not
+    depend on -- or be slowed/blocked by -- whichever render backends
+    (LibreOffice, Word COM) happen to be installed on the machine running
+    the suite. Stub a successful 'rendered' result by default, mirroring
+    test_19be1551_insert_figure_block.py's fixture of the same name.
+    """
+    monkeypatch.setattr(
+        docs_intel.render_gate,
+        "check_render_capability",
+        lambda docx_path, **kwargs: {
+            "status": "rendered",
+            "backend": "test-stub",
+            "detail": {"stub": True},
+        },
+    )
+
+
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
 
@@ -219,6 +241,156 @@ def test_find_references_to_unknown_target_errors(tmp_path):
     path = _write_docx(tmp_path, _TWO_SECTION_XML)
     result = docs_intel.find_references_to(path, "NOPE")
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# 2b. find_references_to -- literal-text reference scan (b2035fb4)
+# ---------------------------------------------------------------------------
+
+_FIGURE_LITERAL_TEXT_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="C0000010">
+      <w:pPr><w:pStyle w:val="Caption"/></w:pPr>
+      <w:bookmarkStart w:id="0" w:name="_Ref300000001"/>
+      <w:r><w:t xml:space="preserve">Figure </w:t></w:r>
+      <w:fldSimple w:instr="SEQ Figure \\* ARABIC"><w:r><w:t>2</w:t></w:r></w:fldSimple>
+      <w:bookmarkEnd w:id="0"/>
+      <w:r><w:t xml:space="preserve">. The quarterly trend chart.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000010">
+      <w:r><w:t xml:space="preserve">As shown in Figure 2, the trend holds across all quarters.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000011">
+      <w:r><w:t xml:space="preserve">This mirrors the discussion in Figure 5, which used an outdated caption number.</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def test_find_references_to_literal_exact_and_stale(tmp_path):
+    path = _write_docx(tmp_path, _FIGURE_LITERAL_TEXT_XML)
+    result = docs_intel.find_references_to(path, "C0000010")
+
+    assert result["reference_count"] == 0  # no REF fields in this fixture at all
+    literal = {r["para_id"]: r for r in result["literal_references"]}
+    assert literal["P0000010"]["status"] == "exact"
+    assert literal["P0000010"]["matched_number"] == "2"
+    assert literal["P0000010"]["matched_text"] == "Figure 2"
+    assert literal["P0000011"]["status"] == "stale"
+    assert literal["P0000011"]["matched_number"] == "5"
+
+    assert result["literal_reference_count"] == 2
+    assert result["combined_reference_count"] == 2
+    assert result["combined_references"] == result["references"] + result["literal_references"]
+
+
+def test_find_references_to_literal_excludes_own_caption_paragraph(tmp_path):
+    path = _write_docx(tmp_path, _FIGURE_LITERAL_TEXT_XML)
+    result = docs_intel.find_references_to(path, "C0000010")
+    literal_para_ids = {r["para_id"] for r in result["literal_references"]}
+    assert "C0000010" not in literal_para_ids
+
+
+def test_find_references_to_include_literal_false_disables_scan(tmp_path):
+    path = _write_docx(tmp_path, _FIGURE_LITERAL_TEXT_XML)
+    result = docs_intel.find_references_to(path, "C0000010", include_literal=False)
+    assert result["literal_references"] == []
+    assert result["literal_reference_count"] == 0
+    assert result["combined_reference_count"] == result["reference_count"]
+
+
+_TWO_FIGURES_COLLIDING_WITH_LITERAL_XML = _TWO_FIGURES_COLLIDING_XML.replace(
+    "<w:sectPr/>",
+    '<w:p w14:paraId="P0000099">'
+    '<w:r><w:t xml:space="preserve">Compare Figure 1 against the appendix chart.</w:t></w:r>'
+    "</w:p>\n    <w:sectPr/>",
+)
+
+
+def test_find_references_to_literal_ambiguous_on_numbering_collision(tmp_path):
+    path = _write_docx(tmp_path, _TWO_FIGURES_COLLIDING_WITH_LITERAL_XML)
+    result = docs_intel.find_references_to(path, "C0000002")
+    literal = {r["para_id"]: r for r in result["literal_references"]}
+    assert literal["P0000099"]["status"] == "ambiguous"
+    assert literal["P0000099"]["matched_number"] == "1"
+
+
+def test_find_references_to_literal_skips_field_driven_blocks(tmp_path):
+    # The REF field's own cached display text ("Figure 1") and the OTHER
+    # caption's own SEQ-bearing text must never be double-counted as a
+    # literal reference -- only the genuinely unfielded paragraph shows up.
+    path = _write_docx(tmp_path, _TWO_FIGURES_COLLIDING_WITH_LITERAL_XML)
+    result = docs_intel.find_references_to(path, "C0000002")
+    literal_para_ids = {r["para_id"] for r in result["literal_references"]}
+    assert literal_para_ids == {"P0000099"}
+
+
+_TABLE_LITERAL_TEXT_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="C0000020">
+      <w:pPr><w:pStyle w:val="Caption"/></w:pPr>
+      <w:bookmarkStart w:id="0" w:name="_Ref400000001"/>
+      <w:r><w:t xml:space="preserve">Table </w:t></w:r>
+      <w:fldSimple w:instr="SEQ Table \\* ARABIC"><w:r><w:t>11</w:t></w:r></w:fldSimple>
+      <w:bookmarkEnd w:id="0"/>
+      <w:r><w:t xml:space="preserve">. Summary statistics.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000020">
+      <w:r><w:t xml:space="preserve">Table 11 summarises the results in full.</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def test_find_references_to_literal_table_kind(tmp_path):
+    path = _write_docx(tmp_path, _TABLE_LITERAL_TEXT_XML)
+    result = docs_intel.find_references_to(path, "C0000020")
+    assert result["target_kind"] == "Table"
+    assert len(result["literal_references"]) == 1
+    assert result["literal_references"][0]["status"] == "exact"
+    assert result["literal_references"][0]["matched_number"] == "11"
+
+
+_FIGURE_CHAPTER_STYLE_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="C0000030">
+      <w:pPr><w:pStyle w:val="Caption"/></w:pPr>
+      <w:bookmarkStart w:id="0" w:name="_Ref500000001"/>
+      <w:r><w:t xml:space="preserve">Figure </w:t></w:r>
+      <w:fldSimple w:instr="SEQ Figure \\* ARABIC"><w:r><w:t>5.21</w:t></w:r></w:fldSimple>
+      <w:bookmarkEnd w:id="0"/>
+      <w:r><w:t xml:space="preserve">. Chapter-scoped figure.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000030">
+      <w:r><w:t xml:space="preserve">Fig. 5.21 illustrates the same trend from a different angle.</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def test_find_references_to_literal_chapter_style_number_and_alias(tmp_path):
+    path = _write_docx(tmp_path, _FIGURE_CHAPTER_STYLE_XML)
+    result = docs_intel.find_references_to(path, "C0000030")
+    assert len(result["literal_references"]) == 1
+    entry = result["literal_references"][0]
+    assert entry["status"] == "exact"
+    assert entry["matched_number"] == "5.21"
+    assert entry["matched_text"] == "Fig. 5.21"
 
 
 # ---------------------------------------------------------------------------

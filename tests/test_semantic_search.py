@@ -17,8 +17,14 @@ import sys
 import pytest
 
 from meridian import db as db_module
+from meridian import handoff as handoff_module
 from meridian import semantic_search as ss
-from meridian.semantic_search import SemanticSearcher, should_escalate
+from meridian.semantic_search import (
+    SemanticMatch,
+    SemanticSearcher,
+    score_confidence,
+    should_escalate,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +72,35 @@ def test_should_escalate_NOT_the_old_less_than_3_condition():
 def test_should_escalate_handles_none_inputs():
     """None inputs coerce to zero (treated as 'found nothing')."""
     assert should_escalate(None, None) is True  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# is_corpus_capped / model_name — embedding-freshness helpers (e631d54f,
+# follow-up to 56cd8712). Pure, DB-free — same style as should_escalate.
+# ---------------------------------------------------------------------------
+
+
+def test_is_corpus_capped_true_at_and_above_cap():
+    assert ss.is_corpus_capped(200, 200) is True
+    assert ss.is_corpus_capped(250, 200) is True
+
+
+def test_is_corpus_capped_false_below_cap():
+    assert ss.is_corpus_capped(199, 200) is False
+    assert ss.is_corpus_capped(0, 200) is False
+
+
+def test_is_corpus_capped_degenerate_cap_treats_any_nonempty_corpus_as_capped():
+    """A cap of 0 (or negative — misconfiguration) means NO corpus size is
+    provably exhaustive, so any non-empty corpus is conservatively capped."""
+    assert ss.is_corpus_capped(5, 0) is True
+    assert ss.is_corpus_capped(0, 0) is False
+    assert ss.is_corpus_capped(1, -1) is True
+
+
+def test_model_name_returns_the_configured_model():
+    assert ss.model_name() == ss._MODEL_NAME
+    assert isinstance(ss.model_name(), str) and ss.model_name()
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +422,64 @@ async def test_search_all_pg_no_escalate_when_gate_false(db_pg, monkeypatch):
     assert not any(n.get("semantic") for n in result["notes"])
 
 
+@pytest.mark.asyncio
+async def test_search_all_pg_escalation_tags_embedding_model_not_degraded_below_cap(
+    db_pg, monkeypatch
+):
+    """e631d54f — a semantically-augmented row carries `embedding_model` and,
+    when the candidate corpus is well under `_SEMANTIC_CORPUS_CAP`,
+    `degraded=False` (the ranking pass was exhaustive over the whole
+    corpus, not a truncated window)."""
+    db = db_pg
+    p = await db_module.create_project(db, "sem-pg-model-tag")
+    note = await db_module.add_project_note(
+        db, p["id"], "Vector database", "embeddings and nearest-neighbor lookup")
+    q = "similarity retrieval xyzzy"
+
+    from meridian import semantic_search
+
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank", lambda query, cands, floor=None: [(note["id"], 0.72)])
+
+    result = await db_module.search_all(db, p["id"], q)
+    matched = next(n for n in result["notes"] if n["id"] == note["id"])
+    assert matched["semantic"] is True
+    assert matched["embedding_model"] == semantic_search.model_name()
+    assert matched["degraded"] is False
+
+
+@pytest.mark.asyncio
+async def test_search_all_pg_escalation_marks_degraded_when_corpus_capped(
+    db_pg, monkeypatch
+):
+    """When the candidate corpus hits `_SEMANTIC_CORPUS_CAP`, augmented rows
+    must be labeled `degraded=True` — the ranking pass only saw a bounded
+    window, so it must never be read as an authoritative 'nothing else
+    matches' answer."""
+    db = db_pg
+    p = await db_module.create_project(db, "sem-pg-capped")
+    note = await db_module.add_project_note(
+        db, p["id"], "Vector database", "embeddings and nearest-neighbor lookup")
+    q = "similarity retrieval xyzzy"
+
+    # Force the single real candidate row to exactly hit the (monkeypatched,
+    # tiny) cap so is_corpus_capped(len(corpus), cap) is True.
+    monkeypatch.setattr(db_module, "_SEMANTIC_CORPUS_CAP", 1)
+
+    from meridian import semantic_search
+
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank", lambda query, cands, floor=None: [(note["id"], 0.72)])
+
+    result = await db_module.search_all(db, p["id"], q)
+    matched = next(n for n in result["notes"] if n["id"] == note["id"])
+    assert matched["degraded"] is True
+
+
 # ---------------------------------------------------------------------------
 # 56cd8712 memory-safety fixes: pre-load headroom guard, chunked+truncated
 # encode, background idle-unload. These install a STUB model2vec (never the real
@@ -479,3 +572,625 @@ def test_maybe_idle_unload_releases_model_after_idle(monkeypatch):
         assert s._model is not None       # kept
     finally:
         s._model = None                   # don't leak singleton state
+
+
+# ---------------------------------------------------------------------------
+# 2204ce80 — hybrid_candidate_retrieval: exact-filter-first lexical discovery,
+# optional bounded local-semantic rerank, fused scoring, exact-id pinning.
+# All tests run on the default SQLite ``db`` fixture — semantic mocking uses
+# monkeypatch on ``semantic_search.is_available``/``rank`` so no real model is
+# ever loaded (same CI-safety guarantee as the rest of this file).
+#
+# e1475682 — meridian.db.vector_index_state: durable metadata for the
+# backend-neutral vector-index contract (meridian_codeindex.vector_index).
+# Pure DB-layer coverage; no model2vec/duckdb import here at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_applies_exact_version_filter_first(db, monkeypatch):
+    """A sprint_item candidate that matches the query lexically but lives in a
+    DIFFERENT version is excluded before lexical scoring ever runs — the exact
+    filter is applied in the SQL WHERE, not as a post-hoc rank penalty."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-version-filter")
+    v1_item = await db_module.add_sprint_item(db, p["id"], "v1", "rate limiter design")
+    await db_module.add_sprint_item(db, p["id"], "v2", "rate limiter design")
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "rate limiter", source_types=["sprint_item"], version="v1",
+    )
+    ids = [c["id"] for c in result["candidates"]]
+    assert ids == [v1_item["id"]]
+    assert result["filters"]["version"] == "v1"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_applies_exact_status_filter(db, monkeypatch):
+    """An explicit status filter is an exact match, applied before lexical
+    discovery — a completed item is excluded when filtering for 'pending'."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-status-filter")
+    pending = await db_module.add_sprint_item(db, p["id"], "v1", "flush the cache")
+    done = await db_module.add_sprint_item(
+        db, p["id"], "v1", "flush the cache twice", force=True)
+    await db_module.complete_sprint_item(db, p["id"], done["id"])
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "flush cache", source_types=["sprint_item"], status="pending",
+    )
+    ids = {c["id"] for c in result["candidates"]}
+    assert pending["id"] in ids
+    assert done["id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_default_lexical_only_provenance(db, monkeypatch):
+    """DEFAULT (semantic disabled): every candidate is lexical-only — no
+    semantic_score, fused_score == lexical_norm, semantic_used is False."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-default-lexical")
+    await db_module.add_project_note(db, p["id"], "Rate limiting", "token bucket algorithm")
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "rate limiting", source_types=["note"],
+    )
+    assert result["semantic_used"] is False
+    assert len(result["candidates"]) == 1
+    cand = result["candidates"][0]
+    assert cand["provenance"] == "lexical"
+    assert cand["semantic_score"] is None
+    assert cand["fused_score"] == cand["lexical_score"] / cand["lexical_score"]  # normalized to 1.0
+    assert cand["fused_score"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_exact_ids_always_pinned_ahead(db, monkeypatch):
+    """An id passed via ``exact_ids`` is ALWAYS included — even when it does
+    NOT match the query lexically at all — pinned ahead of every lexical/
+    semantic row with provenance='exact' and fused_score=1.0. This is the
+    'never let semantic create or replace a pointer' guarantee: the exact
+    row's identity/rank never depends on any scoring step."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-exact-pin")
+    lexical_hit = await db_module.add_project_note(
+        db, p["id"], "Auth flow", "oauth login handshake")
+    pointer_target = await db_module.add_project_note(
+        db, p["id"], "Completely unrelated", "zzz nothing to do with the query")
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "oauth login", source_types=["note"],
+        exact_ids=[pointer_target["id"]],
+    )
+    assert result["candidates"][0]["id"] == pointer_target["id"]
+    assert result["candidates"][0]["provenance"] == "exact"
+    assert result["candidates"][0]["fused_score"] == 1.0
+    ids = [c["id"] for c in result["candidates"]]
+    assert lexical_hit["id"] in ids  # the genuine lexical hit is still present
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_visibility_other_than_project_yields_nothing(db, monkeypatch):
+    """Only visibility=None/'project' is wired up today; any other explicit
+    value returns zero candidates rather than silently ignoring the filter
+    (workspace-level visibility is a documented follow-up)."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-visibility")
+    await db_module.add_project_note(db, p["id"], "Rate limiting", "token bucket algorithm")
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "rate limiting", visibility="workspace",
+    )
+    assert result["candidates"] == []
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_semantic_rerank_only_scores_lexical_pool(db, monkeypatch):
+    """When semantic is available (mocked), it re-scores rows the lexical pass
+    ALREADY found — it never introduces a candidate lexical search missed. The
+    mocked rank() is asked ONLY about the ids the lexical pool discovered."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-semantic-rerank")
+    strong = await db_module.add_project_note(db, p["id"], "Auth service", "oauth login flow")
+    weak = await db_module.add_project_note(db, p["id"], "Auth docs", "oauth login notes")
+    unrelated = await db_module.add_project_note(db, p["id"], "Deploy", "fly.io config")
+
+    seen_ids: list[str] = []
+
+    def _fake_rank(query, candidates, floor=None):
+        nonlocal seen_ids
+        seen_ids = [cid for cid, _ in candidates]
+        # Only the two lexically-discovered notes should ever be offered here.
+        scores = {f"note:{strong['id']}": 0.9, f"note:{weak['id']}": 0.5}
+        return sorted(
+            ((cid, s) for cid, s in scores.items() if cid in seen_ids),
+            key=lambda pair: pair[1], reverse=True,
+        )
+
+    monkeypatch.setattr(ss, "is_available", lambda: True)
+    monkeypatch.setattr(ss, "rank", _fake_rank)
+
+    result = await db_module.hybrid_candidate_retrieval(
+        db, p["id"], "oauth login", source_types=["note"],
+    )
+    assert result["semantic_used"] is True
+    assert f"note:{unrelated['id']}" not in seen_ids  # never offered to rank()
+    by_id = {c["id"]: c for c in result["candidates"]}
+    assert by_id[strong["id"]]["provenance"] == "lexical+semantic"
+    assert by_id[strong["id"]]["semantic_score"] == 0.9
+    assert unrelated["id"] not in by_id  # lexical search never found it either
+    # fused ordering follows the fused_score, not raw insertion order.
+    assert result["candidates"][0]["id"] == strong["id"]
+
+
+@pytest.mark.asyncio
+async def test_hybrid_retrieval_blank_query_returns_no_candidates(db, monkeypatch):
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "hybrid-blank-query")
+    result = await db_module.hybrid_candidate_retrieval(db, p["id"], "   ")
+    assert result["candidates"] == []
+
+
+# ---------------------------------------------------------------------------
+# generate_handoff's optional related_records_query/related_records hook
+# (2204ce80) — a thin, additive wrapper over hybrid_candidate_retrieval. Every
+# pre-existing call site (both args at their default) must see ZERO change.
+# ---------------------------------------------------------------------------
+
+
+def _normalize_nondeterministic_handoff_fields(content: str) -> str:
+    """Strip the per-call nondeterministic fields (the wall-clock
+    ``_Generated at ..._`` line and the freshly-minted single-use
+    ``<goal_token>``) so two handoffs rendered moments apart — otherwise
+    identical — compare equal. Used ONLY to prove the new opt-in
+    related_records args don't alter the rendered content; unrelated to the
+    fields this sprint item's feature actually touches."""
+    import re as _re
+    content = _re.sub(r"_Generated at [^_]+_", "_Generated at TIMESTAMP_", content)
+    content = _re.sub(r"<goal_token>[^<]*</goal_token>", "<goal_token>TOKEN</goal_token>", content)
+    return content
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_related_records_default_off(db, tmp_path, monkeypatch):
+    """Leaving both new args at their default is a complete no-op: same
+    content as a call made before this feature existed."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "handoff-related-off")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+
+    _, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="delta", skip_ai_summary=True,
+    )
+    _, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="delta", skip_ai_summary=True,
+        related_records_query=None, related_records=None,
+    )
+    assert _normalize_nondeterministic_handoff_fields(content_a) == _normalize_nondeterministic_handoff_fields(content_b)
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_related_records_opt_in_populates_dict(db, tmp_path, monkeypatch):
+    """Opting in on both args populates ``related_records`` in place via the
+    shared hybrid retrieval path, WITHOUT altering the rendered content."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "handoff-related-on")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    await db_module.add_project_note(db, p["id"], "Rate limiting", "token bucket algorithm")
+
+    _, baseline_content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="delta", skip_ai_summary=True,
+    )
+    related: dict = {}
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="delta", skip_ai_summary=True,
+        related_records_query="rate limiting", related_records=related,
+    )
+    # rendered output is untouched
+    assert (
+        _normalize_nondeterministic_handoff_fields(content)
+        == _normalize_nondeterministic_handoff_fields(baseline_content)
+    )
+    assert related["candidates"], "expected the matching note to surface"
+    assert any(c["title"] == "Rate limiting" for c in related["candidates"])
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_related_records_lookup_failure_never_breaks_handoff(
+    db, tmp_path, monkeypatch,
+):
+    """A failure inside the related-records lookup must never break the
+    mandatory handoff — it degrades to an empty result."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "handoff-related-error")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+
+    async def _boom(*a, **k):
+        raise RuntimeError("simulated retrieval failure")
+
+    monkeypatch.setattr(db_module, "hybrid_candidate_retrieval", _boom)
+    related: dict = {}
+    path, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), mode="delta", skip_ai_summary=True,
+        related_records_query="rate limiting", related_records=related,
+    )
+    assert path and content  # the handoff itself still succeeded
+    assert related == {"query": "rate limiting", "candidates": []}
+
+
+# ---------------------------------------------------------------------------
+# 3d3ccf2d — confidence-scored semantic matches with deterministic abstention
+# (follow-up on 2204ce80's hybrid_candidate_retrieval). score_confidence() is
+# pure/DB-free: no embedding, no I/O — fully testable against hand-built
+# (id, score) lists, no numpy/model2vec required.
+# ---------------------------------------------------------------------------
+
+
+def test_score_confidence_empty_returns_empty():
+    assert score_confidence([]) == []
+
+
+def test_score_confidence_confident_when_clear_leader():
+    """A single strong, unrivalled candidate (a paraphrase: no lexical overlap
+    with the query but clearly the right concept) is confident — above the
+    floor, and its margin against the implicit 0.0 baseline (no runner-up) is
+    ample."""
+    matches = score_confidence([("a", 0.85)], floor=0.37, min_margin=0.05)
+    assert len(matches) == 1
+    m = matches[0]
+    assert isinstance(m, SemanticMatch)
+    assert m.id == "a"
+    assert m.semantic_score == 0.85
+    assert m.fused_score == 0.85
+    assert m.lexical_score is None
+    assert m.threshold == 0.37
+    assert m.confident is True
+    assert m.reason == "confident_match"
+
+
+def test_score_confidence_below_floor_is_never_confident():
+    """A candidate below the absolute confidence floor is refused regardless
+    of margin — plain low-confidence noise is never auto-bound."""
+    matches = score_confidence([("a", 0.30)], floor=0.37, min_margin=0.05)
+    assert matches[0].confident is False
+    assert matches[0].reason == "below_confidence_threshold"
+
+
+def test_score_confidence_close_runner_up_marks_both_ambiguous():
+    """Two near-tied candidates — modelling a stale record and the fresh one
+    that superseded it, both plausible — both clear the floor but neither
+    leads the other by the required margin. Deterministic abstention refuses
+    to pick a winner: BOTH come back non-confident rather than one being
+    guessed."""
+    matches = score_confidence(
+        [("fresh", 0.60), ("stale", 0.58)], floor=0.37, min_margin=0.05,
+    )
+    by_id = {m.id: m for m in matches}
+    assert by_id["fresh"].confident is False
+    assert by_id["fresh"].reason == "ambiguous_runner_up"
+    assert by_id["stale"].confident is False
+
+
+def test_score_confidence_wide_margin_is_confident():
+    """A clear leader over a genuinely weaker runner-up IS confident — the
+    margin gate only fires on near-ties, not on the mere existence of a
+    second candidate."""
+    matches = score_confidence(
+        [("best", 0.80), ("distant", 0.40)], floor=0.37, min_margin=0.05,
+    )
+    by_id = {m.id: m for m in matches}
+    assert by_id["best"].confident is True
+    assert by_id["best"].reason == "confident_match"
+
+
+def test_score_confidence_respects_custom_min_margin():
+    """The margin requirement is caller-tunable: the same ranked pair is
+    confident under the default margin and ambiguous under a stricter one."""
+    ranked = [("a", 0.70), ("b", 0.60)]  # margin ~0.10
+    lenient = score_confidence(ranked, floor=0.37, min_margin=0.05)
+    assert lenient[0].confident is True
+    strict = score_confidence(ranked, floor=0.37, min_margin=0.15)
+    assert strict[0].confident is False
+    assert strict[0].reason == "ambiguous_runner_up"
+
+
+def test_score_confidence_fuses_lexical_and_semantic_when_provided():
+    """A lexical corroboration blends into fused_score (mirroring
+    db.hybrid_candidate_retrieval's own 0.6/0.4 split) and can re-rank the
+    set; a candidate with no lexical entry fuses to its raw semantic score."""
+    ranked = [("a", 0.50), ("b", 0.45)]
+    matches = score_confidence(
+        ranked, floor=0.30, min_margin=0.05,
+        lexical_scores={"b": 0.95},  # b gets a strong lexical boost
+    )
+    # b's fused score (0.6*0.95 + 0.4*0.45 = 0.75) now outranks a's (0.50).
+    assert matches[0].id == "b"
+    by_id = {m.id: m for m in matches}
+    assert by_id["b"].lexical_score == 0.95
+    assert by_id["a"].lexical_score is None
+
+
+def test_score_confidence_lexical_boost_cannot_rescue_low_semantic_score():
+    """The 'lexical false positive' guard: a candidate that shares vocabulary
+    with the query (strong lexical score) but is semantically unrelated (weak
+    semantic score) is never confident — a lexical boost can raise the
+    reported fused_score but can never manufacture confidence for a
+    candidate the embedding model itself found irrelevant. The gate checks
+    the RAW semantic score, not the fused one."""
+    ranked = [("wrong_meaning", 0.10)]
+    matches = score_confidence(
+        ranked, floor=0.37, min_margin=0.05,
+        lexical_scores={"wrong_meaning": 0.99},  # near-perfect keyword overlap
+    )
+    m = matches[0]
+    assert m.fused_score > 0.37  # the lexical signal pulls the fused score up...
+    assert m.confident is False  # ...but the raw semantic score never cleared the floor
+    assert m.reason == "below_confidence_threshold"
+
+
+def test_rank_confident_wraps_rank_and_scores(monkeypatch):
+    """SemanticSearcher.rank_confident() = rank() + score_confidence(): only
+    candidates that survive rank()'s own floor filter reach scoring at all."""
+    np = pytest.importorskip("numpy")
+
+    s = SemanticSearcher()
+    vecs = {
+        "query": np.array([1.0, 0.0]),
+        "high": np.array([0.98, 0.20]),   # cosine ~0.98
+        "mid": np.array([0.60, 0.80]),    # cosine 0.60
+        "low": np.array([0.30, 0.95]),    # cosine ~0.30 (below the 0.37 floor)
+    }
+    monkeypatch.setattr(s, "embed", _stub_embed_from_map(vecs))
+    candidates = [("h", "high"), ("m", "mid"), ("l", "low")]
+    matches = s.rank_confident("query", candidates, floor=0.37, min_margin=0.05)
+    ids = [m.id for m in matches]
+    assert "l" not in ids  # never survives rank()'s own floor filter
+    by_id = {m.id: m for m in matches}
+    assert by_id["h"].confident is True
+    assert by_id["h"].reason == "confident_match"
+
+
+def test_rank_confident_empty_when_rank_unavailable(monkeypatch):
+    """When the underlying rank() returns [] (unavailable/tripped mid-flight)
+    rank_confident() degrades to [] too — never raises, never fabricates a
+    verdict from nothing."""
+    s = SemanticSearcher()
+    monkeypatch.setattr(s, "embed", lambda texts: None)
+    assert s.rank_confident("q", [("a", "text")]) == []
+
+
+# ---------------------------------------------------------------------------
+# _maybe_semantic_escalate wiring — direct calls with a mocked rank(), on the
+# default SQLite ``db`` fixture. _maybe_semantic_escalate's own SQL helpers
+# (_pure_fts_count_and_trigram_top, _semantic_candidate_corpus) already fail
+# safe on a non-PG dialect (see their own docstrings/try-except), so this
+# exercises the NEW confidence-gating wiring without needing TEST_DATABASE_URL
+# — mirroring the existing db_pg-gated tests above but for the parts that
+# don't need real Postgres SQL.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_maybe_semantic_escalate_merges_confident_paraphrase_match(db, monkeypatch):
+    """A single strong, unrivalled semantic hit — a paraphrase, no lexical
+    overlap with the query but clearly the right concept — is merged in and
+    carries its typed score breakdown."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "escalate-paraphrase")
+    note = await db_module.add_project_note(
+        db, p["id"], "Token bucket",
+        "limits how many requests a client can make per window",
+    )
+
+    from meridian import semantic_search
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank",
+        lambda query, cands, floor=None: [(note["id"], 0.80)],
+    )
+
+    tasks, notes, decisions, sprint_items = await db_module._maybe_semantic_escalate(
+        db, p["id"], "throttling requests per client", 10, [], [], [], [],
+    )
+    assert len(notes) == 1
+    assert notes[0]["id"] == note["id"]
+    assert notes[0]["semantic"] is True
+    assert notes[0]["semantic_reason"] == "confident_match"
+    assert notes[0]["semantic_score"] == 0.80
+
+
+@pytest.mark.asyncio
+async def test_maybe_semantic_escalate_refuses_below_floor_match(db, monkeypatch):
+    """A weak semantic score below the confidence floor is never merged in —
+    deterministic abstention, not a guess (the 'lexical false positive' /
+    plain-noise case: an unrelated record must never be surfaced as a hit)."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "escalate-below-floor")
+    note = await db_module.add_project_note(db, p["id"], "Unrelated", "nothing to do with it")
+
+    from meridian import semantic_search
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank",
+        lambda query, cands, floor=None: [(note["id"], 0.10)],
+    )
+
+    tasks, notes, decisions, sprint_items = await db_module._maybe_semantic_escalate(
+        db, p["id"], "something else entirely", 10, [], [], [], [],
+    )
+    assert notes == []
+
+
+@pytest.mark.asyncio
+async def test_maybe_semantic_escalate_abstains_on_near_tied_stale_vs_fresh(db, monkeypatch):
+    """Two near-tied candidates — modelling a stale record and the fresh one
+    that superseded it, both plausible matches for the query — are BOTH
+    refused: too close to call, so neither is auto-bound."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p = await db_module.create_project(db, "escalate-stale-vs-fresh")
+    stale = await db_module.add_project_note(db, p["id"], "Old rate limiter", "v1 approach")
+    fresh = await db_module.add_project_note(db, p["id"], "New rate limiter", "v2 approach")
+
+    from meridian import semantic_search
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank",
+        lambda query, cands, floor=None: [(fresh["id"], 0.60), (stale["id"], 0.58)],
+    )
+
+    tasks, notes, decisions, sprint_items = await db_module._maybe_semantic_escalate(
+        db, p["id"], "rate limiter approach", 10, [], [], [], [],
+    )
+    assert notes == []  # neither auto-bound — deterministic abstention
+
+
+@pytest.mark.asyncio
+async def test_maybe_semantic_escalate_never_leaks_across_projects(db, monkeypatch):
+    """The candidate corpus is scoped to project_id BEFORE ranking ever runs —
+    exact project scoping is a hard gate confidence scoring never touches.
+    Even a permissive fake rank() that confidently scores everything it's
+    offered cannot resurrect a candidate from a different project, because
+    that candidate is never in the pool to begin with."""
+    monkeypatch.delenv("MERIDIAN_SEMANTIC_ENABLED", raising=False)
+    p_a = await db_module.create_project(db, "escalate-leak-a")
+    p_b = await db_module.create_project(db, "escalate-leak-b")
+    note_a = await db_module.add_project_note(
+        db, p_a["id"], "Shared topic", "same wording appears in both projects")
+    note_b = await db_module.add_project_note(
+        db, p_b["id"], "Shared topic", "same wording appears in both projects")
+
+    from meridian import semantic_search
+    monkeypatch.setattr(semantic_search, "is_available", lambda: True)
+    monkeypatch.setattr(semantic_search, "should_escalate", lambda fts, tri: True)
+    monkeypatch.setattr(
+        semantic_search, "rank",
+        lambda query, cands, floor=None: [(cid, 0.90) for cid, _ in cands],
+    )
+
+    tasks, notes, decisions, sprint_items = await db_module._maybe_semantic_escalate(
+        db, p_a["id"], "shared topic", 10, [], [], [], [],
+    )
+    ids = {n["id"] for n in notes}
+    assert note_a["id"] in ids
+    assert note_b["id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_vector_index_state_upsert_creates_row_at_revision_one(db):
+    p = await db_module.create_project(db, "vec-state-create")
+    state = await db_module.upsert_vector_index_state(
+        db, p["id"],
+        backend="bm25",
+        embedding_model=None,
+        embedding_version=None,
+        dimension=None,
+        source_fingerprint=None,
+    )
+    assert state["backend"] == "bm25"
+    assert state["revision"] == 1
+    assert state["scope"] == db_module.VECTOR_INDEX_DEFAULT_SCOPE
+    assert state["pgvector_enabled"] == 0
+    fetched = await db_module.get_vector_index_state(db, p["id"])
+    assert fetched is not None
+    assert fetched["id"] == state["id"]
+
+
+@pytest.mark.asyncio
+async def test_vector_index_state_upsert_bumps_revision_not_pgvector_flag(db):
+    """Re-indexing on the currently-active backend must never silently flip
+    pgvector_enabled — that flag is owned exclusively by
+    record_vector_backend_benchmark."""
+    p = await db_module.create_project(db, "vec-state-revision")
+    await db_module.upsert_vector_index_state(
+        db, p["id"], backend="duckdb_vss",
+        embedding_model="minishlab/potion-base-8M", dimension=256,
+        source_fingerprint="fp1",
+    )
+    second = await db_module.upsert_vector_index_state(
+        db, p["id"], backend="duckdb_vss",
+        embedding_model="minishlab/potion-base-8M", dimension=256,
+        source_fingerprint="fp2",
+    )
+    assert second["revision"] == 2
+    assert second["source_fingerprint"] == "fp2"
+    assert second["pgvector_enabled"] == 0
+
+
+@pytest.mark.asyncio
+async def test_vector_index_state_rejects_unknown_backend(db):
+    p = await db_module.create_project(db, "vec-state-badbackend")
+    with pytest.raises(ValueError):
+        await db_module.upsert_vector_index_state(db, p["id"], backend="not_a_real_backend")
+
+
+@pytest.mark.asyncio
+async def test_vector_index_state_scopes_are_independent(db):
+    """Two scopes on the same project (e.g. 'code_index' vs 'notes') are
+    tracked as separate rows, never conflated."""
+    p = await db_module.create_project(db, "vec-state-scopes")
+    await db_module.upsert_vector_index_state(db, p["id"], scope="code_index", backend="duckdb_vss")
+    await db_module.upsert_vector_index_state(db, p["id"], scope="notes", backend="bm25")
+    code_state = await db_module.get_vector_index_state(db, p["id"], scope="code_index")
+    notes_state = await db_module.get_vector_index_state(db, p["id"], scope="notes")
+    assert code_state["backend"] == "duckdb_vss"
+    assert notes_state["backend"] == "bm25"
+    scopes = await db_module.list_vector_index_states(db, p["id"])
+    assert {s["scope"] for s in scopes} == {"code_index", "notes"}
+
+
+@pytest.mark.asyncio
+async def test_record_vector_backend_benchmark_requires_existing_state(db):
+    """A benchmark decision needs something to decide about -- recording one
+    for a scope with no active-backend row on file is refused, mirroring
+    complete_verification_run's 'missing evidence' guard."""
+    p = await db_module.create_project(db, "vec-state-nostate")
+    with pytest.raises(ValueError):
+        await db_module.record_vector_backend_benchmark(
+            db, p["id"], evidence={"results": {}}, pgvector_enabled=True,
+            reason="should never get here",
+        )
+
+
+@pytest.mark.asyncio
+async def test_record_vector_backend_benchmark_persists_evidence_and_decision(db):
+    p = await db_module.create_project(db, "vec-state-benchmark")
+    await db_module.upsert_vector_index_state(
+        db, p["id"], backend="duckdb_vss", embedding_model="m", dimension=8,
+        source_fingerprint="fp",
+    )
+    evidence = {
+        "results": {
+            "duckdb_vss": {"backend": "duckdb_vss", "available": True, "recall_at_k": 0.9},
+            "pgvector": {"backend": "pgvector", "available": True, "recall_at_k": 0.95},
+        },
+        "decision": {"pgvector_enabled": True, "reason": "pgvector recall >= duckdb"},
+    }
+    updated = await db_module.record_vector_backend_benchmark(
+        db, p["id"], evidence=evidence, pgvector_enabled=True,
+        reason="pgvector recall 0.95 >= duckdb_vss recall 0.9 - tolerance",
+    )
+    assert updated["pgvector_enabled"] == 1
+    assert updated["revision"] == 2
+    assert "pgvector recall 0.95" in updated["benchmark_decision_reason"]
+    import json as _json
+    stored = _json.loads(updated["benchmark_evidence"])
+    assert stored["decision"]["pgvector_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_record_vector_backend_benchmark_can_keep_gate_closed(db):
+    """A regression (or unavailable pgvector) keeps pgvector_enabled False --
+    the evidence is still recorded so the refusal is auditable."""
+    p = await db_module.create_project(db, "vec-state-refused")
+    await db_module.upsert_vector_index_state(db, p["id"], backend="duckdb_vss")
+    updated = await db_module.record_vector_backend_benchmark(
+        db, p["id"],
+        evidence={"results": {}, "decision": {"pgvector_enabled": False, "reason": "unavailable"}},
+        pgvector_enabled=False,
+        reason="pgvector unavailable: no dsn configured",
+    )
+    assert updated["pgvector_enabled"] == 0
+    assert updated["backend"] == "duckdb_vss"  # active backend untouched by the benchmark call

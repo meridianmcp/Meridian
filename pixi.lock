@@ -8081,7 +8081,7 @@ packages:
 - pypi: ./extensions/meridian-codeindex
   name: meridian-codeindex
   version: 0.1.0
-  sha256: d9eaa621ee8e030866449384f9bd34821a96a5f1bbbf664b578e7674eff98b44
+  sha256: 2e4118ae5679cfc06321f0367cb77b6dc00dee95605c1c3ba7065bbfb5100dfc
   requires_dist:
   - duckdb>=1.0
   - tree-sitter>=0.21 ; extra == 'treesitter'
@@ -8089,6 +8089,7 @@ packages:
   - tree-sitter-typescript>=0.21 ; extra == 'treesitter'
   - model2vec>=0.3 ; extra == 'vectors'
   - numpy>=1.24 ; extra == 'vectors'
+  - psycopg[binary]>=3.1 ; extra == 'pgvector'
   requires_python: '>=3.11,<3.13'
 - pypi: ./packages/docparse
   name: meridian-docparse

@@ -38,6 +38,7 @@ from enum import Enum
 from pathlib import Path
 
 from . import __version__
+from . import process_lifecycle as _process_lifecycle
 from . import serena_pool as _serena_pool
 from .serena_pool import SerenaDaemonPool, SERENA_POOL_BASE_PORT
 
@@ -1381,6 +1382,39 @@ def _classify_serena_failure(err: object) -> "tuple[str, str] | None":
     return None
 
 
+# e99b09e9 — structured launch/terminate diagnostics for the Serena daemon
+# pool. Wired as the ``on_launch``/``on_terminate`` hooks on
+# SerenaDaemonPool.get_or_spawn/reap_idle/shutdown (serena_pool.py stays pure
+# — these callbacks are how the tunnel client opts into logging them). Never
+# prints the raw command (only its hash, via serena_pool._command_hash) so a
+# tenant-customized command that happens to embed a pasted secret never
+# reaches stdout/logs. One line per event, greppable, consistent with this
+# module's existing ``tunnel:<label>: ...`` print convention.
+#
+# get_or_spawn's hook fires on BOTH reuse and fresh-spawn (every relayed
+# request touches the pool), but only a fresh spawn is print-worthy here —
+# logging every reused-daemon request would flood stdout on every single
+# tools/list or find_symbol call. Reuse info is still available to any other
+# caller of the pool that wants it (the hook itself is unfiltered).
+def _print_serena_launch_diag(info: dict) -> None:
+    if info.get("reused"):
+        return
+    print(
+        f"tunnel:extract: serena_launch event=spawn repo={info.get('repo_path')} "
+        f"port={info.get('port')} pid={info.get('pid')} "
+        f"dashboard={info.get('dashboard')} cmd_hash={info.get('command_hash')}",
+        flush=True,
+    )
+
+
+def _print_serena_terminate_diag(info: dict) -> None:
+    print(
+        f"tunnel:extract: serena_terminate repo={info.get('repo_path')} "
+        f"port={info.get('port')} pid={info.get('pid')} reason={info.get('reason')}",
+        flush=True,
+    )
+
+
 # 089a936a — human-readable hint per slot when its first-spawn pre-flight probe
 # fails (the proxy accepted the Popen but never answered a `tools/list`). The
 # dc/office hint is specific (cold npx download); everything else gets a generic
@@ -2029,7 +2063,7 @@ async def _run_extract_pool_connection(
                     daemon = None
                     _spawn_exc: object = None
                     try:
-                        daemon = pool.get_or_spawn(repo_path)
+                        daemon = pool.get_or_spawn(repo_path, on_launch=_print_serena_launch_diag)
                     except Exception as exc:  # noqa: BLE001 — spawn failure → 503
                         _spawn_exc = exc
                         print(
@@ -2129,7 +2163,7 @@ async def _pool_idle_reaper(
     poll_interval = max(60.0, idle_seconds / 6)
     while True:
         await asyncio.sleep(poll_interval)
-        reaped = pool.reap_idle()
+        reaped = pool.reap_idle(on_terminate=_print_serena_terminate_diag)
         for repo_path in reaped:
             print(
                 f"tunnel:extract: Serena for {repo_path} idle >"
@@ -2477,6 +2511,137 @@ def _probe_tar_entry_error(
         return False
 
 
+# ---------------------------------------------------------------------------
+# Missing npx-cache dependency-file detection + bounded integrity check
+# (e0f7bd72) — prospected from an attached fs trace: the failure lives inside
+# the npx mcp-proxy dependency cache. The TOP-LEVEL package (mcp-proxy /
+# @modelcontextprotocol/server-filesystem) extracts and its own entry point is
+# present, but a TRANSITIVE dependency's file underneath it is missing (e.g.
+# npm-cache/_npx/<hash>/node_modules/ajv/dist/ajv.js absent), so the proxy
+# dies on Node's own CommonJS resolver error before it can ever answer
+# tools/list. This is a DISTINCT signature from TAR_ENTRY_ERROR (which npm
+# itself reports during extraction) — here extraction reported success, but
+# the resulting tree is incomplete underneath it — yet it needs the same
+# thorough remedy: a partial/corrupted _npx entry can be re-derived from a
+# clean fetch, but only once _npx (and, if that alone doesn't help, the
+# _cacache CAS store) is actually cleared.
+# ---------------------------------------------------------------------------
+
+# Node's CommonJS resolver error for a require() target that isn't on disk.
+# Distinct from _MODULE_NOT_FOUND_RE above (that one matches Python's
+# ModuleNotFoundError/ImportError wording) — this is Node's own wording, and
+# it always quotes the absolute path it tried (and failed) to resolve.
+_NODE_MODULE_NOT_FOUND_RE = re.compile(r"Cannot find module ['\"]([^'\"]+)['\"]")
+
+
+def _npm_cache_dependency_detail(stderr_text: "str | None") -> "dict | None":
+    """Parse a Node ``Cannot find module`` error into cache/package detail.
+
+    Returns ``{"missing_file": <abs path>, "cache_path": <...>, "package": <...>}``
+    when *stderr_text* names a missing file living inside a ``node_modules``
+    tree, else ``None`` — no match, or the missing specifier isn't a
+    filesystem path at all (a bare ``require('lodash')``-style specifier with
+    no ``node_modules`` segment means the dependency was never declared in
+    the first place; clearing the cache cannot fix that, so it is
+    deliberately NOT treated as this failure class). Pure, side-effect-free,
+    never raises. (e0f7bd72)
+
+    ``cache_path`` is the path up to (not including) the FIRST
+    ``node_modules`` segment — for an npx-cached tool this lands on the
+    per-install hash directory (``.../_npx/<hash>``), which is exactly the
+    directory :func:`_scoped_cache_clear` / :func:`_scoped_cache_clear_thorough`
+    remove. ``package`` is the module name immediately following the LAST
+    ``node_modules`` segment (handles scoped packages like ``@scope/name`` and
+    nested transitive installs like ``mcp-proxy/node_modules/ajv``).
+    """
+    if not stderr_text:
+        return None
+    m = _NODE_MODULE_NOT_FOUND_RE.search(stderr_text)
+    if not m:
+        return None
+    missing_file = m.group(1).strip()
+    if not missing_file or "node_modules" not in missing_file:
+        return None
+    # Normalise slash style so the split works for Windows-style paths too.
+    normalized = missing_file.replace("\\", "/")
+    parts = normalized.split("/node_modules/")
+    if len(parts) < 2 or not parts[0]:
+        return None
+    cache_path = parts[0]
+    tail_parts = [p for p in parts[-1].split("/") if p]
+    if not tail_parts:
+        return None
+    if tail_parts[0].startswith("@") and len(tail_parts) > 1:
+        package = "/".join(tail_parts[:2])  # scoped package: @scope/name
+    else:
+        package = tail_parts[0]
+    return {"missing_file": missing_file, "cache_path": cache_path, "package": package}
+
+
+def _dependency_file_confirmed_missing(missing_file: str) -> bool:
+    """Bounded, single-stat confirmation that *missing_file* really is absent.
+
+    Guards a stderr regex match against a stale/misleading log line (or a
+    file that reappeared between the failure and this check) before trusting
+    it enough to trigger a cache wipe. One ``os.path.exists`` call — never a
+    directory scan or a retry loop. Never raises: a stat failure (permission
+    error, WinError on a virtualized path, ...) is treated as "could not
+    confirm", so the caller falls back to the generic scoped-clear path
+    instead of over-escalating on uncertain data. (e0f7bd72)
+    """
+    try:
+        return not os.path.exists(missing_file)
+    except Exception:  # noqa: BLE001 — never block classification on a stat error
+        return False
+
+
+def _probe_missing_dependency_file(
+    cmd: "list[str]",
+    env: "dict | None",
+    label: str,
+    wait_seconds: float = 5.0,
+) -> "dict | None":
+    """Probe whether *cmd* fails on a missing npx-cache dependency file.
+
+    Mirrors :func:`_probe_tar_entry_error`'s shape exactly (a short, bounded
+    diagnostic spawn with stderr captured) but classifies for the DISTINCT
+    failure class this addresses — see the module comment above. Returns the
+    detail dict from :func:`_npm_cache_dependency_detail` (plus a ``stderr``
+    key holding the full captured text, for reporting) only when BOTH the
+    stderr signature matches AND :func:`_dependency_file_confirmed_missing`
+    confirms the named file is still actually absent on disk; else ``None``.
+
+    Never raises — exceptions from ``Popen`` / ``communicate`` are swallowed
+    so a failing probe can never block the normal retry path. (e0f7bd72)
+    """
+    try:
+        # Note: no _spawn_kwargs() here, matching _probe_tar_entry_error — this
+        # is a short diagnostic spawn we immediately wait on, not the live server.
+        probe = subprocess.Popen(
+            cmd, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            _, stderr_bytes = probe.communicate(timeout=wait_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                probe.kill()
+                probe.communicate()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        stderr_text = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+    except Exception:  # noqa: BLE001 — probe failed entirely; nothing to classify
+        return None
+    detail = _npm_cache_dependency_detail(stderr_text)
+    if detail is None:
+        return None
+    if not _dependency_file_confirmed_missing(detail["missing_file"]):
+        return None
+    detail["stderr"] = stderr_text
+    return detail
+
+
 _stable_cache_env_cache: "dict[str, str] | None" = None
 
 
@@ -2536,11 +2701,52 @@ def _resolve_stable_cache_env() -> "dict[str, str]":
     return _stable_cache_env_cache
 
 
+_stable_pixi_cache_env_cache: "dict[str, str] | None" = None
+
+
+def _resolve_stable_pixi_cache_env() -> "dict[str, str]":
+    """15610335 — explicitly resolve PIXI_CACHE_DIR from the tunnel's OWN
+    process context, mirroring :func:`_resolve_stable_cache_env` immediately
+    above (same AppContainer-virtualization risk, same fix shape).
+
+    Confirmed live (2026-08-04, pixi 0.67.0): ``PIXI_CACHE_DIR`` governs
+    Pixi's ``cache_dir`` (``PIXI_CACHE_DIR=<x> pixi info --json`` reports
+    ``cache_dir`` == ``<x>`` exactly) — and, per Pixi's own directory
+    layout, this is also where a boolean ``detached-environments = true``
+    (see ``meridian.pixi_env_retention``) materializes environments.
+    ``PIXI_HOME`` only controls where the ``pixi`` *binary* installs
+    (``~/.pixi/bin``); it has no effect on this. A grandchild ``pixi run``
+    spawned through a sandboxed ancestor (Claude Desktop's Windows
+    AppContainer — see the docstring above) could otherwise silently
+    resolve a different, virtualized %LOCALAPPDATA%-rooted cache_dir than
+    the tunnel's own trustworthy context.
+
+    Best-effort and memoized: any resolution failure returns ``{}`` (spawned
+    pixi children fall back to resolving their own cache_dir, exactly as
+    before this existed) rather than blocking a spawn.
+    """
+    global _stable_pixi_cache_env_cache
+    if _stable_pixi_cache_env_cache is not None:
+        return _stable_pixi_cache_env_cache
+    try:
+        home = Path.home()
+        if sys.platform == "win32":
+            pixi_cache = home / "AppData" / "Local" / "pixi" / "cache"
+        else:
+            pixi_cache = home / ".cache" / "pixi"
+        pixi_cache.mkdir(parents=True, exist_ok=True)
+        _stable_pixi_cache_env_cache = {"PIXI_CACHE_DIR": str(pixi_cache)}
+    except Exception:  # noqa: BLE001 — never block a spawn over a cache-dir resolve failure
+        _stable_pixi_cache_env_cache = {}
+    return _stable_pixi_cache_env_cache
+
+
 def _spawn_with_cache_retry(
     cmd: "list[str]",
     env: "dict | None",
     label: str,
     diagnostics: "SlotDiagnostics | None" = None,
+    extra_popen_kwargs: "dict | None" = None,
 ) -> "subprocess.Popen":
     """Spawn *cmd* via ``subprocess.Popen``; on failure, do a scoped cache clear and retry once.
 
@@ -2579,16 +2785,29 @@ def _spawn_with_cache_retry(
     :func:`_probe_tar_entry_error`'s own behaviour. The classification is
     recorded on *diagnostics* as a side effect; the return value/retry
     behaviour of this function is unaffected either way.
+
+    3c4ed79d — *extra_popen_kwargs* is optional and purely additive, same
+    contract as *diagnostics* above: every existing caller passes nothing
+    and sees byte-identical behaviour (an empty dict merges in nothing).
+    When given, its entries are merged OVER ``_spawn_kwargs()``'s own for
+    EVERY ``Popen`` call in this function (initial attempt and both retry
+    paths) — e.g. so :func:`_spawn_owned_with_cache_retry` can add
+    ``start_new_session=True`` on POSIX without losing the Windows
+    ``CREATE_NEW_PROCESS_GROUP`` flag ``_spawn_kwargs()`` already applies
+    there.
     """
-    kwargs = _spawn_kwargs()
+    kwargs = {**_spawn_kwargs(), **(extra_popen_kwargs or {})}
     # 2026-07-19 — merge in explicitly-resolved, sandbox-immune cache-dir vars
     # for every spawn through this central choke point (see
     # _resolve_stable_cache_env). When env was None (inherit parent), start
     # from a full copy of the parent env so nothing is lost — only the two
     # cache vars are forced on top, not a narrowing to just those two.
+    # 15610335 — PIXI_CACHE_DIR joins the same merge, same rationale (see
+    # _resolve_stable_pixi_cache_env).
     _cache_env = _resolve_stable_cache_env()
-    if _cache_env:
-        env = {**(env if env is not None else dict(os.environ)), **_cache_env}
+    _pixi_cache_env = _resolve_stable_pixi_cache_env()
+    if _cache_env or _pixi_cache_env:
+        env = {**(env if env is not None else dict(os.environ)), **_cache_env, **_pixi_cache_env}
     try:
         proc = subprocess.Popen(cmd, env=env, **kwargs)
     except Exception as first_exc:  # noqa: BLE001
@@ -2651,13 +2870,58 @@ def _spawn_with_cache_retry(
             )
             _scoped_cache_clear_thorough(cmd, label)
         else:
-            # Fast exit but no TAR signature — fall back to the generic scoped clear.
-            print(
-                f"tunnel:{label}: process exited immediately (code {proc.returncode}); "
-                "applying scoped cache-clear + one retry",
-                file=sys.stderr, flush=True,
-            )
-            _scoped_cache_clear(cmd, label)
+            # e0f7bd72 — bounded dependency-integrity check: distinct from
+            # TAR_ENTRY_ERROR, this catches an npx cache whose top-level
+            # package extracted fine but a TRANSITIVE dependency's file is
+            # missing underneath it (e.g.
+            # npm-cache/_npx/<hash>/node_modules/ajv/dist/ajv.js absent), so
+            # the child dies on Node's own "Cannot find module" error before
+            # it can ever answer tools/list. Bounded: one short diagnostic
+            # spawn (wait_seconds=5.0, same budget as the TAR probe above)
+            # plus a single filesystem stat to confirm the named file really
+            # is missing — never an unbounded scan or retry loop.
+            _dep_detail = _probe_missing_dependency_file(cmd, env, label, wait_seconds=5.0)
+            if _dep_detail is not None:
+                _dep_stderr_final = (_dep_detail.get("stderr") or "")[:500]
+                print(
+                    f"tunnel:{label}: missing dependency file in npm cache "
+                    f"(package={_dep_detail['package']!r}, "
+                    f"cache_path={_dep_detail['cache_path']!r}, "
+                    f"missing_file={_dep_detail['missing_file']!r}); applying "
+                    f"thorough cache clear + retry (final stderr: {_dep_stderr_final!r})",
+                    file=sys.stderr, flush=True,
+                )
+                if diagnostics is not None:
+                    # DEPENDENCY_MISSING (deterministic) so a retry that STILL
+                    # doesn't answer tools/list is re-affirmed as such by
+                    # ensure_running's _fast_exit_state handling below, rather
+                    # than being downgraded to a generic STARTUP_TIMEOUT — the
+                    # slot must never be reported ready off the back of this
+                    # failure alone; only a real _probe_slot_health success
+                    # clears it back to HEALTHY.
+                    diagnostics.set(
+                        SlotState.DEPENDENCY_MISSING, phase="fast_exit",
+                        root_cause=(
+                            f"npm cache missing dependency file for package "
+                            f"{_dep_detail['package']!r} under cache path "
+                            f"{_dep_detail['cache_path']!r} "
+                            f"({_dep_detail['missing_file']!r}) — a thorough "
+                            "cache clear + retry was attempted"
+                        ),
+                        dependency_missing=_dep_detail["package"],
+                        exit_code=proc.returncode,
+                        stderr_summary=_dep_stderr_final or None,
+                    )
+                _scoped_cache_clear_thorough(cmd, label)
+            else:
+                # Fast exit but no TAR / dependency-integrity signature — fall
+                # back to the generic scoped clear.
+                print(
+                    f"tunnel:{label}: process exited immediately (code {proc.returncode}); "
+                    "applying scoped cache-clear + one retry",
+                    file=sys.stderr, flush=True,
+                )
+                _scoped_cache_clear(cmd, label)
         try:
             retried = subprocess.Popen(cmd, env=env, **kwargs)
             _record_spawned_pid(retried, label)  # 6884a668
@@ -2666,6 +2930,79 @@ def _spawn_with_cache_retry(
             raise retry_exc from None
 
     return proc
+
+
+# ---------------------------------------------------------------------------
+# 3c4ed79d — portable owned-process lifecycle integration (additive; see
+# meridian/process_lifecycle.py for the backends themselves). This wires ONE
+# new spawn/teardown pair on top of the existing _spawn_with_cache_retry /
+# _terminate_proc_tree machinery WITHOUT changing either of those functions'
+# default behaviour for any existing caller — _spawn_kwargs() and
+# _terminate_proc_tree() are untouched, so ownership semantics for every
+# process already spawned through them (every current slot) do not change.
+# Adopting a new spawn site into the owned-tracking path (job-object on
+# Windows / process-group on POSIX) is opt-in per call site.
+# ---------------------------------------------------------------------------
+
+
+def _owned_process_backend() -> "_process_lifecycle.PosixProcessGroupBackend | _process_lifecycle.WindowsJobObjectBackend":
+    """Return the portable owned-process lifecycle backend for this platform.
+    A fresh instance per call — both backends are stateless aside from the
+    (lazily-invoked) Windows job-API loader, so there is nothing to cache."""
+    return _process_lifecycle.get_default_backend()
+
+
+def _spawn_owned_with_cache_retry(
+    cmd: "list[str]",
+    env: "dict | None",
+    label: str,
+    diagnostics: "SlotDiagnostics | None" = None,
+) -> "tuple[subprocess.Popen, _process_lifecycle.OwnedProcessHandle | None]":
+    """Spawn *cmd* exactly like :func:`_spawn_with_cache_retry` (identical
+    cache-retry / TAR_ENTRY_ERROR / diagnostics behaviour — this is a NEW,
+    additive entry point, not a replacement for the existing one or any of
+    its callers), and additionally hand back a portable
+    :class:`process_lifecycle.OwnedProcessHandle` so a caller that opts in
+    can tear down the WHOLE owned tree via :func:`_close_owned_process`
+    instead of only the root PID.
+
+    On POSIX, requests ``start_new_session=True`` (via
+    :func:`_spawn_with_cache_retry`'s additive *extra_popen_kwargs*) so the
+    spawned tree gets its own process group from the moment it starts — the
+    retry/diagnostics machinery itself is untouched. On Windows, the
+    already-running process is adopted into a fresh Job Object right after
+    the retry machinery settles on a working ``Popen`` (see
+    :meth:`process_lifecycle.WindowsJobObjectBackend.adopt` for the
+    documented race window this implies vs. that backend's own
+    :meth:`spawn`).
+
+    Best-effort: a handle-construction/job-assignment failure never unwinds
+    or fails the spawn itself — ``proc`` is always returned on success,
+    ``handle`` degrades to ``None`` instead (matching *diagnostics*'s own
+    "purely additive" contract).
+    """
+    posix_extra = {} if sys.platform == "win32" else {"start_new_session": True}
+    proc = _spawn_with_cache_retry(
+        cmd, env, label, diagnostics=diagnostics, extra_popen_kwargs=posix_extra,
+    )
+    try:
+        handle = _owned_process_backend().adopt(proc, cmd=cmd)
+    except Exception:  # noqa: BLE001 — best-effort; the spawn itself already succeeded
+        handle = None
+    return proc, handle
+
+
+def _close_owned_process(
+    handle: "_process_lifecycle.OwnedProcessHandle | None", *, grace_seconds: float = 5.0
+) -> bool:
+    """Tear down an owned process tree via the portable lifecycle backend
+    (3c4ed79d). ``None`` — a slot that never built a handle, or whose
+    :func:`_spawn_owned_with_cache_retry` call degraded — is a no-op
+    success, mirroring :func:`_terminate_proc_tree`'s own ``None``-is-a-
+    no-op contract so callers can pass either interchangeably."""
+    if handle is None:
+        return True
+    return _owned_process_backend().close(handle, grace_seconds=grace_seconds)
 
 
 def _plugin_spawn_env(env: object) -> "dict[str, str] | None":
@@ -2916,7 +3253,23 @@ def _serena_pool_spawn(cmd: "list[str]") -> "subprocess.Popen":
     are allocated dynamically per repo_path, not a single fixed port checked
     at startup. Recording here closes that gap the same way every other spawn
     path already does.
+
+    9d9a92cc — platform-aware launcher resolution: *cmd*'s first token is the
+    literal string ``"uvx"`` (see ``serena_pool.build_serena_command``).
+    ``subprocess.Popen`` resolves a bare launcher name via PATH itself, which
+    is fine when ``uvx`` is on PATH — but uv's own standalone installer drops
+    ``uvx`` in ``~/.local/bin`` on every platform (see :func:`_find_uvx`)
+    without necessarily adding it to PATH, the exact gap
+    :func:`_resolve_extractor_inner_cmd` already guards against for the
+    legacy extractor launcher. Resolve a bare ``"uvx"`` first token to its
+    full path when :func:`_find_uvx` can find it; a machine where it truly
+    can't be found keeps the original bare token, so the OS's own error
+    surfaces exactly as before rather than this function inventing one.
     """
+    if cmd and cmd[0] == "uvx":
+        _resolved_uvx = _find_uvx()
+        if _resolved_uvx:
+            cmd = [_resolved_uvx, *cmd[1:]]
     proc = subprocess.Popen(cmd, **_spawn_kwargs())
     _record_spawned_pid(proc, "extract")
     return proc
@@ -2983,6 +3336,20 @@ def _kill_all_previously_spawned_pids(label: str = "startup") -> None:
                             continue  # owning tunnel still alive -- not our orphan to kill
                     except Exception:  # noqa: BLE001 — owner process gone -- genuine orphan
                         pass
+                # 92aaedb7 — host-local broker liveness guard: the owner-tunnel
+                # check above only knows about the ORIGINAL spawning tunnel. A
+                # shared Serena daemon (see serena_pool.SerenaDaemonPool) can
+                # legitimately outlive the tunnel that spawned it, as long as a
+                # DIFFERENT, still-running sibling tunnel currently leases it —
+                # killing it here would pull it out from under that sibling.
+                # No-op (returns False fast) for any entry that never went
+                # through the broker (every other slot label, and "extract"
+                # entries from before this feature existed).
+                try:
+                    if _serena_pool.has_live_lease(_serena_pool.default_broker_dir(), pid):
+                        continue
+                except Exception:  # noqa: BLE001 — best-effort, never block the sweep
+                    pass
             print(
                 f"tunnel:{label}: killing previously-spawned orphan "
                 f"(pid {pid}, {entry.get('label', '?')}) from a prior generation",
@@ -3579,8 +3946,112 @@ def _find_uvx() -> "str | None":
     return None
 
 
+def _resolve_extract_slot_command(
+    ext_raw: Any, repo_path: str,
+) -> "tuple[str, list[str] | None]":
+    """Deterministically classify the code-extractor slot's configured
+    ``command`` into what should actually launch (9d9a92cc).
+
+    Returns ``(kind, override)``:
+
+    * ``("serena-default", None)`` — no command configured (``None``/empty),
+      an explicit copy of the CURRENT built-in default
+      (:data:`meridian.tunnel_plugins.SERENA_EXTRACT_COMMAND`), or a
+      configured command that could not be coerced into a runnable list at
+      all (a malformed/stale override — e.g. a non-string/non-list value).
+      The caller must spawn the CURRENT default (Serena, via
+      :class:`~meridian.serena_pool.SerenaDaemonPool`) for every one of
+      these cases. Before this fix, the "no command configured" case fell
+      through to :func:`_resolve_extractor_inner_cmd`, which launches the
+      now-**obsolete** ``mcp-server-code-extractor`` PyPI package — correct
+      when that was the slot's only default, stale ever since the built-in
+      default moved to Serena (1428f1b) and never updated at this call
+      site. A config with no explicit override (the overwhelming common
+      case: a fresh tenant, or one who cleared a prior override) must track
+      the CURRENT default, not a historical one.
+    * ``("custom", override)`` — an explicit, valid override — the
+      ``{repo_path}``-expanded command list — including, deliberately, an
+      explicit copy of the legacy extractor command a tenant chose to keep
+      running. :func:`meridian.tunnel_plugins.resolve_plugins` already
+      flags a command matching a superseded default as ``stale_override``
+      (dashboard's "newer default available" badge, cc904bfe); this
+      function does not duplicate that detection — callers wanting the flag
+      read it off the resolved plugin dict (``extract_plugin.get(
+      "stale_override")``) and decide what, if anything, to warn about.
+
+    Pure — no I/O, no subprocess/uvx resolution — so it is fully
+    unit-testable independent of :func:`run_tunnel`'s network/process
+    orchestration.
+    """
+    # Deferred import (matches run_tunnel's own import of tunnel_plugins) —
+    # avoids a circular import at module load time; see run_tunnel's comment
+    # at its own `from .tunnel_plugins import (...)` line for the full story.
+    from .tunnel_plugins import SERENA_EXTRACT_COMMAND, expand_command
+
+    if ext_raw and ext_raw != SERENA_EXTRACT_COMMAND:
+        override = expand_command(ext_raw, repo_path=repo_path)
+        if override:
+            return "custom", override
+    return "serena-default", None
+
+
+def _extract_slot_package_name(command: "list[str] | None") -> str:
+    """Best-effort PACKAGE name for a resolved extract-slot launch command,
+    for non-secret diagnostics (9d9a92cc) — never the raw command/argv,
+    which may embed a secret in a bespoke custom-slot override (mirrors
+    :func:`meridian.serena_pool._command_hash`'s identical
+    non-reversible-diagnostics rationale). Recognizes Serena's own
+    ``uvx --from <package> ...`` shape and falls back to the second token
+    (``uvx <package>`` / ``npx <package>``); ``"unknown"`` for anything
+    shorter or empty.
+    """
+    if not command:
+        return "unknown"
+    if "--from" in command:
+        idx = command.index("--from")
+        if idx + 1 < len(command):
+            return command[idx + 1]
+    return command[1] if len(command) > 1 else command[0]
+
+
+def _extract_slot_diagnostics(
+    kind: str, override: "list[str] | None", repo_path: str,
+) -> dict:
+    """Non-secret diagnostic summary of what the code-extractor slot will
+    actually launch (9d9a92cc) — the exact generated command's resolved
+    PACKAGE (see :func:`_extract_slot_package_name`), the Python runtime
+    running this tunnel process, the effective cwd (``--project``), and a
+    dependency preflight signal (whether ``uvx`` is resolvable on this
+    machine at all — see :func:`_find_uvx`). Intended for the startup
+    banner and a future dashboard "repair" panel. Pure aside from the
+    ``uvx`` PATH/well-known-location probe, so it never spawns anything and
+    never prints anything sensitive.
+    """
+    from .tunnel_plugins import SERENA_EXTRACT_COMMAND  # deferred — see _resolve_extract_slot_command
+
+    resolved = override if kind == "custom" else list(SERENA_EXTRACT_COMMAND)
+    return {
+        "kind": kind,
+        "package": _extract_slot_package_name(resolved),
+        "python_runtime": sys.executable,
+        "cwd": repo_path,
+        "uvx_available": _find_uvx() is not None,
+    }
+
+
 def _resolve_extractor_inner_cmd() -> "list[str] | None":
-    """Resolve the launcher for mcp-server-code-extractor (a **PyPI** package).
+    """Resolve the launcher for the LEGACY ``mcp-server-code-extractor``
+    PyPI package.
+
+    9d9a92cc — this is no longer the code-extractor slot's "no command
+    configured" fallback in :func:`run_tunnel` (see
+    :func:`_resolve_extract_slot_command`'s docstring for the history and
+    the defect this fixed): a missing/empty/malformed override now resolves
+    to the CURRENT default (Serena) instead. This resolver is kept only for
+    an explicit, valid tenant override that names this package by hand
+    (``expand_command`` succeeds → the ``"custom"`` branch handles it via
+    :func:`_build_proxy_for_inner`, not this function) and for direct
+    external/test use; it is otherwise unreachable from ``run_tunnel``.
 
     It is published on PyPI, not npm. Preferred: ``uvx mcp-server-code-extractor``
     (zero install, ephemeral). Fallback: pip-install the package into the current
@@ -4564,6 +5035,86 @@ async def _fetch_filesystem_roots(
     return [], [], "", []
 
 
+async def _fetch_config_generation(
+    base_url: str, token: str, hostname: "str | None",
+) -> "dict | None":
+    """GET /tunnel/plugins — read-only fetch of the runtime config generation
+    record for this machine (02dbd8b4: "every tunnel process ... must report
+    the generation loaded").
+
+    This is a diagnostic/reporting value only, fetched once at startup and
+    printed alongside the rest of the startup banner (see run_tunnel) — it does
+    NOT change what actually spawns (the ``/me``-sourced ``tunnel_plugins``/
+    ``tunnel_plugins_config`` fields resolved above remain authoritative for
+    that), and it is not fed back to the server over the WebSocket. A live,
+    continuously-updated staleness check (the process noticing MID-RUN that a
+    newer generation now exists) would need either a background poll loop or a
+    new server->client push message — both real additions to the wire
+    protocol, deliberately left as follow-up rather than risked here (see the
+    generation-tracking module note in routes/tunnel.py for the parallel
+    server-side scope note).
+
+    Best-effort: returns ``None`` on any failure (older server without this
+    field, network hiccup, non-200) so it can never block or fail startup.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{base_url}/tunnel/plugins",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"hostname": hostname} if hostname else None,
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+    except Exception:  # noqa: BLE001 — best-effort, never blocks startup
+        return None
+    gen = data.get("config_generation") if isinstance(data, dict) else None
+    return gen if isinstance(gen, dict) else None
+
+
+async def _fetch_tunnel_manifest(base_url: str, token: str) -> "dict | None":
+    """GET /tunnel/manifest — read-only fetch of this tenant's current
+    tools/list manifest snapshot (49d8244d: "every tunnel process ... should
+    be able to report the manifest state the server currently has for it").
+
+    Companion diagnostic to :func:`_fetch_config_generation` — same shape of
+    guarantee: fetched once at startup, printed alongside the rest of the
+    startup banner (see ``run_tunnel``), read-only (no rebuild forced; use the
+    ``refresh_tool_manifest`` MCP tool or ``POST /tunnel/refresh`` for that),
+    and best-effort. Called BEFORE this process's own tunnel WebSocket(s)
+    connect, so on a cold start it will typically report
+    ``has_active_tunnel: false`` / an empty manifest for THIS run — its value
+    here is confirming the endpoint is reachable and reporting whatever state
+    (if any) the server already has for this tenant (e.g. a prior connection
+    not yet evicted), not this process's own post-connect tool set. A genuine
+    post-connect trigger — re-fetching once every slot WebSocket is actually
+    established — would need threading a call through ``run_tunnel``'s
+    already-substantial slot-spawn control flow; deliberately left as
+    follow-up rather than risked here, mirroring ``_fetch_config_generation``'s
+    own documented scope limit.
+
+    Best-effort: returns ``None`` on any failure (older server without this
+    route, network hiccup, non-200) so it can never block or fail startup.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{base_url}/tunnel/manifest",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if r.status_code != 200:
+                return None
+            data = r.json()
+    except Exception:  # noqa: BLE001 — best-effort, never blocks startup
+        return None
+    return data if isinstance(data, dict) else None
+
+
 # ---------------------------------------------------------------------------
 # Auto-index helper (calls index_repository on codebase-memory-mcp proxy)
 # ---------------------------------------------------------------------------
@@ -4645,38 +5196,13 @@ def _extract_status_failure(obj: Any) -> "str | None":
     return None
 
 
-def _extract_jsonrpc_error(body: bytes) -> "str | None":
-    """Extract a JSON-RPC or MCP tool-level error message from a response body.
+def _extract_jsonrpc_error_from_obj(data: Any) -> "str | None":
+    """Apply the JSON-RPC/MCP error-detection rules to an already-parsed object.
 
-    codebase-memory-mcp returns HTTP 200 even when ``index_repository`` fails
-    internally (e.g. a partial scan, a missing path, or a silently-aborted
-    pass). The failure surfaces only in the JSON-RPC body:
-
-    * A top-level ``"error"`` key  — a JSON-RPC error response.
-    * ``result.content[*].isError = true`` — an MCP-convention tool error
-      whose text is in ``result.content[0].text``.
-    * ``result.isError = true`` — older MCP tool-error convention.
-    * ``result.status`` (or a nested ``content[*].text`` JSON blob) reading
-      an error-like value (e.g. ``"error"``), optionally with a ``workers``
-      list reporting ``status: "worker_failed"`` / non-zero ``exit_code``
-      entries — codebase-memory-mcp's own application-level failure signal,
-      which does *not* set ``isError`` (cd28b329: this shape previously slid
-      through as a false "indexed" success).
-
-    Returns a short error string if any of these patterns is detected, or
-    ``None`` when the response looks clean. Best-effort: any parse failure
-    returns ``None`` (we log the happy path as before).
-
-    This is the in-repo half of the staleness/coverage gap: the HTTP-only
-    success check (``status < 400``) was the silent-failure path that allowed
-    a broken or partial index to look identical to a successful one.
+    Shared by ``_extract_jsonrpc_error`` for both a bare JSON body and each
+    individually-parsed SSE ``data:`` frame. Returns ``None`` for anything
+    that isn't a dict, or a dict that carries no recognized error signal.
     """
-    if not body:
-        return None
-    try:
-        data = json.loads(body.decode("utf-8", "replace"))
-    except Exception:  # noqa: BLE001 — non-JSON body (SSE, plain text)
-        return None
     if not isinstance(data, dict):
         return None
     # JSON-RPC error response.
@@ -4707,6 +5233,85 @@ def _extract_jsonrpc_error(body: bytes) -> "str | None":
         status_detail = _extract_status_failure(result)
         if status_detail:
             return status_detail
+    return None
+
+
+def _iter_sse_data_frames(text: str) -> "list[str]":
+    """Extract each SSE event's ``data:`` payload from *text*.
+
+    Per the SSE wire format, events are separated by a blank line and an
+    individual event may carry multiple ``data:`` lines, which are joined
+    with ``\\n`` into one field value. Input with no ``data:`` lines at all
+    (plain text, a bare JSON document) yields an empty list.
+    """
+    frames: list[str] = []
+    for event_block in text.replace("\r\n", "\n").split("\n\n"):
+        data_lines = [
+            line[len("data:"):].lstrip(" ")
+            for line in event_block.split("\n")
+            if line.startswith("data:")
+        ]
+        if data_lines:
+            frames.append("\n".join(data_lines))
+    return frames
+
+
+def _extract_jsonrpc_error(body: bytes) -> "str | None":
+    """Extract a JSON-RPC or MCP tool-level error message from a response body.
+
+    codebase-memory-mcp returns HTTP 200 even when ``index_repository`` fails
+    internally (e.g. a partial scan, a missing path, or a silently-aborted
+    pass). The failure surfaces only in the JSON-RPC body:
+
+    * A top-level ``"error"`` key  — a JSON-RPC error response.
+    * ``result.content[*].isError = true`` — an MCP-convention tool error
+      whose text is in ``result.content[0].text``.
+    * ``result.isError = true`` — older MCP tool-error convention.
+    * ``result.status`` (or a nested ``content[*].text`` JSON blob) reading
+      an error-like value (e.g. ``"error"``), optionally with a ``workers``
+      list reporting ``status: "worker_failed"`` / non-zero ``exit_code``
+      entries — codebase-memory-mcp's own application-level failure signal,
+      which does *not* set ``isError`` (cd28b329: this shape previously slid
+      through as a false "indexed" success).
+
+    The body may be a bare JSON document, or an SSE (``text/event-stream``)
+    response — mcp-proxy's Streamable HTTP transport can reply to a single
+    ``tools/call`` POST with ``Content-Type: text/event-stream`` framing
+    instead of a plain JSON body. When a bare ``json.loads`` fails, each SSE
+    ``data:`` frame is parsed and checked in turn so an error carried inside
+    an SSE-wrapped response is not mistaken for "not JSON, nothing to check"
+    (previously this SSE case fell straight through to the happy-path log —
+    see the false "indexed" success this produced before this fix).
+
+    Returns a short error string if any of these patterns is detected, or
+    ``None`` when the response looks clean. Best-effort: any parse failure
+    returns ``None`` (we log the happy path as before).
+
+    This is the in-repo half of the staleness/coverage gap: the HTTP-only
+    success check (``status < 400``) was the silent-failure path that allowed
+    a broken or partial index to look identical to a successful one.
+    """
+    if not body:
+        return None
+    text = body.decode("utf-8", "replace")
+    try:
+        data = json.loads(text)
+    except Exception:  # noqa: BLE001 — not a bare JSON document; try SSE framing
+        data = None
+    if isinstance(data, dict):
+        return _extract_jsonrpc_error_from_obj(data)
+    # Either not JSON at all, or valid JSON that wasn't a dict (e.g. a bare
+    # array) — in both cases, look for SSE `data:` frames and check each one
+    # that parses as JSON-RPC. Ignores frames that aren't valid JSON (e.g. a
+    # genuinely malformed/truncated event) rather than raising.
+    for frame in _iter_sse_data_frames(text):
+        try:
+            frame_data = json.loads(frame)
+        except Exception:  # noqa: BLE001 — malformed frame, skip it
+            continue
+        detail = _extract_jsonrpc_error_from_obj(frame_data)
+        if detail:
+            return detail
     return None
 
 
@@ -5680,6 +6285,38 @@ async def run_tunnel(
     fs_roots, known_repo_paths, cfg_serena_repo_path, cfg_code_dirs = (
         await _fetch_filesystem_roots(base_url, token)
     )
+    # 02dbd8b4 — best-effort report of the runtime config generation this
+    # process is loading (see _fetch_config_generation's docstring for exactly
+    # what this does and does not cover). Purely informational: printed once at
+    # startup so an operator can compare it against the dashboard's Settings →
+    # Tunnel Plugins generation and see at a glance whether this running
+    # process is current or is serving a stale (pre-change) generation.
+    try:
+        import socket as _socket  # noqa: PLC0415 — stdlib, local import keeps module import light
+        _gen_hostname = _socket.gethostname() or ""
+    except Exception:  # noqa: BLE001
+        _gen_hostname = ""
+    loaded_config_generation = await _fetch_config_generation(
+        base_url, token, _gen_hostname or None)
+    if loaded_config_generation:
+        _gen_no = loaded_config_generation.get("generation")
+        _gen_hash = loaded_config_generation.get("config_hash")
+        _gen_restart = loaded_config_generation.get("restart_required")
+        print(
+            f"  config generation: {_gen_no} (hash {_gen_hash})"
+            + ("  [server shows this tenant needs a restart to apply a NEWER "
+               "change made while a tunnel was connected]" if _gen_restart else ""),
+            flush=True,
+        )
+    # 49d8244d — companion best-effort report of the server's CURRENT tools/list
+    # manifest snapshot for this tenant (see _fetch_tunnel_manifest's docstring
+    # for what this call is and is not confirming at this point in startup).
+    loaded_tunnel_manifest = await _fetch_tunnel_manifest(base_url, token)
+    if loaded_tunnel_manifest:
+        _man_hash = loaded_tunnel_manifest.get("manifest_hash")
+        _man_count = loaded_tunnel_manifest.get("tool_count")
+        if _man_hash is not None:
+            print(f"  tool manifest:     {_man_count} tools (hash {_man_hash})", flush=True)
     # b970fe07 — Serena's default --project. The CLI --repo always wins; only when
     # it was absent (repo_path defaulted to cwd) does a configured serena_repo_path
     # take over. Unset config → serena_repo_path stays == repo_path (today's cwd
@@ -5841,7 +6478,57 @@ async def run_tunnel(
         print("  code-extractor:    disabled (tunnel_plugins config)", flush=True)
     else:
         ext_raw = extract_plugin.get("command")
-        if ext_raw == SERENA_EXTRACT_COMMAND:
+        # ada39096 — resolve any EXPLICIT, non-default override first (still
+        # unexpanded-Serena stays out of this: {repo_path} must survive to the
+        # pool's own per-repo_path expansion). An EXPLICIT legacy override
+        # (e.g. a tenant deliberately reverting to
+        # ["uvx", "mcp-server-code-extractor"]) is a non-empty, resolvable
+        # command and is the ONLY path allowed to run the old extractor.
+        #
+        # 9d9a92cc — see _resolve_extract_slot_command's docstring: a missing/
+        # empty/malformed command now resolves to "serena-default" (the CURRENT
+        # built-in), never the obsolete mcp-server-code-extractor fallback this
+        # call site used before the built-in default moved to Serena (1428f1b).
+        _ext_kind, ext_override = _resolve_extract_slot_command(ext_raw, repo_path)
+        _ext_diag = _extract_slot_diagnostics(_ext_kind, ext_override, repo_path)
+        print(
+            f"  code-extractor:    diagnostics: package={_ext_diag['package']} "
+            f"python={_ext_diag['python_runtime']} cwd={_ext_diag['cwd']} "
+            f"uvx_available={_ext_diag['uvx_available']}",
+            flush=True,
+        )
+        if _ext_kind == "custom":
+            if extract_plugin.get("stale_override"):
+                _newer = extract_plugin.get("newer_default_label") or "the current default"
+                print(
+                    f"  code-extractor:    WARNING configured command matches a "
+                    f"superseded default ({_newer} is now current) — clear the "
+                    f"override in the dashboard to switch to Serena",
+                    flush=True, file=sys.stderr,
+                )
+            cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
+            print(f"  code-extractor:    lazy-spawn on port {extract_port} (custom command)", flush=True)
+            proxy_extract = SlotProxy(cmd_extract, extract_port, "extract", client_id=_client_id)
+            slot_proxies.append(proxy_extract)
+        else:
+            # ada39096/9d9a92cc — everything else (the exact-match default case
+            # AND any command that didn't resolve to something usable) spawns
+            # the CURRENT built-in default: Serena, never the deprecated
+            # mcp-server-code-extractor. _resolve_extractor_inner_cmd /
+            # _build_extractor_proxy_command (the dedicated uvx-or-pip-fallback
+            # resolver for that legacy launcher) are intentionally NOT wired
+            # into this decision as an implicit fallback anymore; they remain
+            # standalone, independently unit-tested helpers.
+            if ext_raw and ext_raw != SERENA_EXTRACT_COMMAND:
+                # A command WAS configured but could not be coerced into a
+                # runnable list (malformed/stale override) — repaired to the
+                # current default rather than silently attempted via the
+                # legacy _resolve_extractor_inner_cmd fallback.
+                print(
+                    "  code-extractor:    WARNING configured command was invalid "
+                    "or empty — repaired to the current default (Serena)",
+                    flush=True, file=sys.stderr,
+                )
             # 64650cb4 — default Serena: a per-repo_path daemon pool instead of a
             # single fixed --project instance, so executor sessions touching other
             # repos no longer hit Serena's "outside configured workspaces" error.
@@ -5854,29 +6541,19 @@ async def run_tunnel(
                 # by _kill_all_previously_spawned_pids on the next startup
                 # (see _serena_pool_spawn's docstring for the full gap).
                 spawn=_serena_pool_spawn,
+                # 92aaedb7 — host-local broker: share a repo's Serena daemon
+                # with sibling tunnel_client processes on this machine instead
+                # of each spawning its own duplicate. owner_id=_client_id ties
+                # every lease this pool writes to THIS tunnel invocation, the
+                # same identity already used for slot claim files above.
+                broker_dir=_serena_pool.default_broker_dir(),
+                owner_id=_client_id,
             )
             print(
                 f"  code-extractor:    Serena daemon pool (lazy, per repo_path) "
                 f"from port {SERENA_POOL_BASE_PORT}",
                 flush=True,
             )
-        elif (ext_override := expand_command(ext_raw, repo_path=repo_path)):
-            cmd_extract = _build_proxy_for_inner(npx, list(ext_override), extract_port)
-            print(f"  code-extractor:    lazy-spawn on port {extract_port} (custom command)", flush=True)
-            proxy_extract = SlotProxy(cmd_extract, extract_port, "extract", client_id=_client_id)
-            slot_proxies.append(proxy_extract)
-        else:
-            extractor_inner = _resolve_extractor_inner_cmd()
-            if extractor_inner is not None:
-                cmd_extract = _build_extractor_proxy_command(npx, extractor_inner, extract_port)
-                print(f"  code-extractor:    lazy-spawn on port {extract_port}", flush=True)
-                proxy_extract = SlotProxy(cmd_extract, extract_port, "extract", client_id=_client_id)
-                slot_proxies.append(proxy_extract)
-            else:
-                print(
-                    "  code-extractor:    not available (uvx missing and pip install failed)",
-                    flush=True,
-                )
 
     # 4b. Office MCP slots (ppt/word/dc/docs/zotero/outputs/debug). Off by default;
     # enabled via dashboard.
@@ -6201,7 +6878,7 @@ async def run_tunnel(
             sp.kill()
         # 64650cb4 — tear down every pooled Serena daemon.
         if serena_pool is not None:
-            serena_pool.shutdown()
+            serena_pool.shutdown(on_terminate=_print_serena_terminate_diag)
         # Kill custom (eager) plugin processes.
         for holder in proc_holders:
             _terminate_proc_tree(holder.get("proc"))

@@ -48,7 +48,7 @@ other's task log, and resume from a compressed handoff when context fills up.
 ### Option 1 — binary release (recommended)
 
 Signed binaries for Windows, macOS (Apple Silicon), and Linux are attached to
-every [GitHub release](https://github.com/meridianmcp/Meridian/releases) (current: v0.1.9).
+every [GitHub release](https://github.com/meridianmcp/Meridian/releases) (current: v0.2.6).
 
 **Linux / macOS (one-liner via uv):**
 ```bash
@@ -137,7 +137,9 @@ Add the same `mcpServers` block to:
 - Windows: `%APPDATA%\Claude\claude_desktop_config.json`
 - macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-Restart Claude Desktop. New chats have Meridian tools.
+Restart Claude Desktop. New chats have Meridian tools. If a newly deployed
+tool is still missing, follow the [MCP tool-surface freshness guide](docs/mcp-tool-surface.md)
+before editing any client cache.
 
 ### claude.ai web (recommended for planning chat)
 

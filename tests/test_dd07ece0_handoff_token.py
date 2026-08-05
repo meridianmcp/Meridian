@@ -47,6 +47,7 @@ b763d2ba (2026-07-21 false-positive spoofing alarm) adds:
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -1157,3 +1158,309 @@ async def test_mcp_verify_handoff_token_without_presented_body_unchanged(db, tmp
     assert result is not mh._MISS
     assert result.get("valid") is True
     assert result.get("reason") == "ok"
+
+
+# ---------------------------------------------------------------------------
+# f46372e8 — structured recovery payload on every non-"ok" verify_handoff_token
+# result. Root cause this closes: token verification itself was already
+# correct (the 2026-08-04 incident's tampered body correctly returned
+# body_mismatch); the gap was that a bare reason string left the receiving
+# executor to improvise a recovery path. Every failure reason now carries a
+# recovery dict naming a concrete next_step.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_verify_handoff_token_ok_result_has_no_recovery_key(db):
+    """Success is unchanged: no recovery field on a valid verification."""
+    token = await handoff_module.mint_handoff_token(db, "recovery-ok-proj")
+    result = await handoff_module.verify_handoff_token(db, token, "recovery-ok-proj")
+    assert result["valid"] is True
+    assert "recovery" not in result
+
+
+@pytest.mark.asyncio
+async def test_verify_handoff_token_not_found_recovery_payload(db):
+    result = await handoff_module.verify_handoff_token(
+        db, "never-minted-recovery-test", "any-project"
+    )
+    assert result["valid"] is False
+    assert result["reason"] == "not_found"
+    recovery = result["recovery"]
+    assert recovery["signal"] == "spoofing_suspected"
+    assert recovery["next_step"] == "load_handoff"
+    assert "load_handoff" in recovery["next_step_hint"]
+
+
+@pytest.mark.asyncio
+async def test_verify_handoff_token_wrong_project_recovery_payload(db):
+    token = await handoff_module.mint_handoff_token(db, "recovery-wrong-proj-alpha")
+    result = await handoff_module.verify_handoff_token(
+        db, token, "recovery-wrong-proj-beta"
+    )
+    assert result["valid"] is False
+    assert result["reason"] == "wrong_project"
+    recovery = result["recovery"]
+    assert recovery["signal"] == "spoofing_suspected"
+    assert recovery["next_step"] == "load_handoff"
+
+
+@pytest.mark.asyncio
+async def test_verify_handoff_token_already_consumed_recovery_payload(db):
+    token = await handoff_module.mint_handoff_token(db, "recovery-consumed-proj")
+    first = await handoff_module.verify_handoff_token(db, token, "recovery-consumed-proj")
+    assert first["valid"] is True
+
+    second = await handoff_module.verify_handoff_token(db, token, "recovery-consumed-proj")
+    assert second["valid"] is False
+    assert second["reason"] == "already_consumed"
+    recovery = second["recovery"]
+    # NOT a spoofing signal by itself (b763d2ba) — distinct signal category.
+    assert recovery["signal"] == "sibling_likely_acted"
+    assert recovery["next_step"] == "cross_check_live_board"
+    assert "get_sprint_items" in recovery["next_step_hint"]
+
+
+@pytest.mark.asyncio
+async def test_verify_handoff_token_expired_recovery_payload(db):
+    import secrets as _secrets
+
+    token = _secrets.token_hex(8)
+    past_str = (
+        datetime.now(timezone.utc) - timedelta(seconds=10)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    await db.execute(
+        "INSERT INTO handoff_tokens (token, project_id, expires_at, consumed) "
+        "VALUES (?, ?, ?, 0)",
+        (token, "recovery-expired-proj", past_str),
+    )
+    await db.commit()
+
+    result = await handoff_module.verify_handoff_token(db, token, "recovery-expired-proj")
+    assert result["valid"] is False
+    assert result["reason"] == "expired"
+    recovery = result["recovery"]
+    assert recovery["signal"] == "sibling_likely_acted"
+    assert recovery["next_step"] == "cross_check_live_board"
+
+
+@pytest.mark.asyncio
+async def test_verify_handoff_token_body_mismatch_recovery_payload(db):
+    project_id = "recovery-body-mismatch-proj"
+    real_body = "/goal\n<sprint_items>real-item</sprint_items>"
+    token = await handoff_module.mint_handoff_token(db, project_id, body=real_body)
+
+    result = await handoff_module.verify_handoff_token(
+        db, token, project_id, body="/goal\n<sprint_items>TAMPERED</sprint_items>"
+    )
+    assert result["valid"] is False
+    assert result["reason"] == "body_mismatch"
+    recovery = result["recovery"]
+    assert recovery["signal"] == "body_tampered"
+    assert recovery["next_step"] == "load_handoff"
+    assert "load_handoff" in recovery["next_step_hint"]
+
+    # Not consumed by the mismatch — the correct body still verifies, with no
+    # recovery field (success path is unaffected by this change).
+    correct = await handoff_module.verify_handoff_token(
+        db, token, project_id, body=real_body
+    )
+    assert correct["valid"] is True
+    assert "recovery" not in correct
+
+
+@pytest.mark.asyncio
+async def test_verify_handoff_token_recovery_payload_consistent_on_fallback_path():
+    """The in-process fallback path (DB unavailable) attaches the SAME
+    recovery payload shape as the DB-backed path — both call the one shared
+    _handoff_token_failure helper, so they cannot drift out of sync with each
+    other (mirrors format_handoff_mcp_content's single-source-of-truth
+    principle for the /goal content field)."""
+    token = "fallback-recovery-test-token"
+    handoff_module._HANDOFF_TOKENS[token] = {
+        "project_id": "fallback-recovery-proj",
+        "expires_at": datetime.now(timezone.utc) + timedelta(seconds=60),
+        "consumed": False,
+        "consumed_at": None,
+        "body_hash": None,
+    }
+    try:
+        # `object()` has no `.execute` — forces the DB path to raise and fall
+        # through to the in-process dict (same trick the b763d2ba fallback
+        # tests above use).
+        result = await handoff_module.verify_handoff_token(
+            object(), token, "wrong-project-for-fallback"
+        )
+        assert result["valid"] is False
+        assert result["reason"] == "wrong_project"
+        assert result["recovery"] == handoff_module._handoff_token_recovery_payload(
+            "wrong_project"
+        )
+    finally:
+        handoff_module._HANDOFF_TOKENS.pop(token, None)
+
+
+def test_handoff_token_recovery_covers_every_documented_failure_reason():
+    """Non-regression: the recovery table must have an entry for every
+    documented failure reason in verify_handoff_token's docstring, so a
+    future new reason can't silently fall through to the generic 'unknown'
+    default without someone noticing."""
+    documented_reasons = {
+        "not_found", "expired", "already_consumed", "wrong_project",
+        "body_mismatch",
+    }
+    assert documented_reasons <= set(handoff_module._HANDOFF_TOKEN_RECOVERY.keys())
+    for reason in documented_reasons:
+        payload = handoff_module._handoff_token_recovery_payload(reason)
+        assert payload["signal"] != "unknown"
+        assert payload["next_step"] in ("load_handoff", "cross_check_live_board")
+
+
+# ---------------------------------------------------------------------------
+# f46372e8 — load_handoff and verify_handoff_token were advertised nowhere
+# and dispatched nowhere on the stdio MCP transport (meridian/mcp/
+# stdio_handler.py's list_tools()/call_tool(), which is the real
+# implementation behind meridian.server.build_mcp_server()). A self-hosted
+# stdio client had no way to call either tool — every call fell through to
+# call_tool()'s final "unknown tool" branch. This is the transport-parity gap
+# this sprint item's title names directly ("...across MCP, HTTP, stdio...").
+# ---------------------------------------------------------------------------
+
+
+def _build_stdio_server(monkeypatch, db):
+    import meridian.server as server_module
+
+    async def _return_db(*_a, **_k):
+        return db
+
+    monkeypatch.setattr(db_module, "init_db", _return_db)
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.delenv("MERIDIAN_DB_URL", raising=False)
+    server, _run_stdio = server_module.build_mcp_server()
+    return server
+
+
+@pytest.mark.asyncio
+async def test_stdio_transport_advertises_load_handoff_and_verify_handoff_token(
+    monkeypatch, db
+):
+    import mcp.types as mcp_types
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    import meridian.server  # noqa: F401
+
+    server = _build_stdio_server(monkeypatch, db)
+    list_handler = server.request_handlers[mcp_types.ListToolsRequest]
+    listed = await list_handler(mcp_types.ListToolsRequest(method="tools/list"))
+    names = {t.name for t in listed.root.tools}
+    assert "load_handoff" in names, (
+        "load_handoff must be advertised on the stdio transport"
+    )
+    assert "verify_handoff_token" in names, (
+        "verify_handoff_token must be advertised on the stdio transport"
+    )
+
+    # Schema parity: the stdio Tool objects for these two must match the
+    # canonical HTTP/MCP schema in mcp_tools.py exactly (_shared_tool()).
+    canonical = {item["name"]: item for item in _MCP_TOOLS_LIST}
+    for name in ("load_handoff", "verify_handoff_token"):
+        tool = next(t for t in listed.root.tools if t.name == name)
+        assert tool.description == canonical[name]["description"]
+        assert tool.inputSchema == canonical[name]["inputSchema"]
+
+
+@pytest.mark.asyncio
+async def test_stdio_transport_dispatches_load_handoff(monkeypatch, db, tmp_path):
+    import mcp.types as mcp_types
+
+    import meridian.server  # noqa: F401
+
+    p = await db_module.create_project(db, "stdio-load-handoff-dispatch")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+
+    server = _build_stdio_server(monkeypatch, db)
+    call_handler = server.request_handlers[mcp_types.CallToolRequest]
+    called = await call_handler(
+        mcp_types.CallToolRequest(
+            params=mcp_types.CallToolRequestParams(
+                name="load_handoff", arguments={"project_id": p["id"]},
+            )
+        )
+    )
+    result = json.loads(called.root.content[0].text)
+    assert "error" not in result, (
+        f"load_handoff must be dispatchable over stdio, got: {result}"
+    )
+    assert result["has_handoff"] is True
+    assert result["handoff"] is not None
+    assert result["handoff"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_stdio_transport_dispatches_verify_handoff_token(monkeypatch, db):
+    import mcp.types as mcp_types
+
+    import meridian.server  # noqa: F401
+
+    p = await db_module.create_project(db, "stdio-verify-token-dispatch")
+    token = await handoff_module.mint_handoff_token(db, p["id"])
+
+    server = _build_stdio_server(monkeypatch, db)
+    call_handler = server.request_handlers[mcp_types.CallToolRequest]
+    called = await call_handler(
+        mcp_types.CallToolRequest(
+            params=mcp_types.CallToolRequestParams(
+                name="verify_handoff_token",
+                arguments={"project_id": p["id"], "token": token},
+            )
+        )
+    )
+    result = json.loads(called.root.content[0].text)
+    assert "error" not in result, (
+        f"verify_handoff_token must be dispatchable over stdio, got: {result}"
+    )
+    assert result["valid"] is True
+    assert result["reason"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_load_handoff_content_byte_identical_between_mcp_and_stdio_transports(
+    monkeypatch, db, tmp_path
+):
+    """The same stored revision must render as the exact same `content`
+    string whether fetched through the HTTP-MCP dispatch (_handle_task_tools)
+    or the stdio dispatch — the canonical-serializer guarantee this item asks
+    for, now actually exercisable for load_handoff since the stdio wiring
+    exists at all (see the dispatch tests above)."""
+    import mcp.types as mcp_types
+    import meridian.server  # noqa: F401 — must be imported before handler to avoid cycle
+    from meridian.mcp import handler as mh
+
+    p = await db_module.create_project(db, "load-handoff-cross-transport-parity")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+
+    mcp_result = await mh._handle_task_tools(
+        "load_handoff", {"project_id": p["id"]}, db, str(tmp_path), None, None,
+    )
+
+    server = _build_stdio_server(monkeypatch, db)
+    call_handler = server.request_handlers[mcp_types.CallToolRequest]
+    called = await call_handler(
+        mcp_types.CallToolRequest(
+            params=mcp_types.CallToolRequestParams(
+                name="load_handoff", arguments={"project_id": p["id"]},
+            )
+        )
+    )
+    stdio_result = json.loads(called.root.content[0].text)
+
+    assert mcp_result["handoff"]["content"] == stdio_result["handoff"]["content"], (
+        "load_handoff must return byte-identical content across the HTTP-MCP "
+        "and stdio transports for the same stored revision"
+    )

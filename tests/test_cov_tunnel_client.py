@@ -2516,10 +2516,19 @@ def test_office_slot_spawn_env_encoding_survives_nonascii_log_line(monkeypatch):
         chinese_log.encode("cp1252")
 
 
-def test_run_tunnel_word_slot_child_gets_utf8_stdio_env(monkeypatch, tmp_path):
-    """End-to-end: enabling the `word` slot spawns docx-mcp with PYTHONIOENCODING=
-    utf-8:replace + PYTHONUTF8=1 in the child env (2b04a361). The office spawn env
-    must carry the UTF-8 override alongside the plugin's own MCP_AUTHOR env."""
+def test_run_tunnel_office_slot_child_gets_utf8_stdio_env(monkeypatch, tmp_path):
+    """End-to-end: enabling the `powerpoint` slot spawns powerpoint-mcp with
+    PYTHONIOENCODING=utf-8:replace + PYTHONUTF8=1 in the child env (2b04a361).
+    The office spawn env must carry the UTF-8 override alongside the plugin's
+    own env vars.
+
+    4b26c2ef — this used to exercise the `word` slot (docx-mcp), but word is
+    now RETIRED: resolve_plugins() forces its `enabled` to False
+    unconditionally, so it can no longer be lazy-spawned via config at all —
+    swapped to `powerpoint`, a still-overridable office slot, to keep this
+    end-to-end UTF-8-env coverage alive. The tenant config below also keeps a
+    `word: {enabled: true}` entry alongside it, asserting the companion
+    regression: even with an explicit enable, word must NOT spawn."""
     _stub_run_tunnel_spawn(monkeypatch)
 
     # Capture the env each Popen is handed (FakeProc only records cmd).
@@ -2543,6 +2552,8 @@ def test_run_tunnel_word_slot_child_gets_utf8_stdio_env(monkeypatch, tmp_path):
         AsyncMock(return_value={
             "tenant_id": "tid-word", "plan": "pro",
             "tunnel_plugins_config": [
+                {"name": "powerpoint", "enabled": True},
+                # 4b26c2ef — retired: must be ignored even though explicitly enabled.
                 {"name": "word", "enabled": True},
             ],
         }),
@@ -2552,18 +2563,24 @@ def test_run_tunnel_word_slot_child_gets_utf8_stdio_env(monkeypatch, tmp_path):
     rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
     assert rc == 0
 
-    # Find the docx-mcp (word slot) spawn and inspect its env.
+    # Find the powerpoint-mcp (powerpoint slot) spawn and inspect its env.
+    ppt_spawns = [
+        s for s in spawned
+        if any("powerpoint-mcp" in str(t) for t in s["cmd"])
+    ]
+    assert ppt_spawns, "powerpoint slot (powerpoint-mcp) was not spawned"
+    env = ppt_spawns[0]["env"]
+    assert env is not None, "powerpoint slot spawned with inherited env — UTF-8 not forced"
+    assert env.get("PYTHONIOENCODING") == "utf-8:replace"
+    assert env.get("PYTHONUTF8") == "1"
+
+    # 4b26c2ef — word is RETIRED: forced off regardless of the explicit
+    # `enabled: true` above, so docx-mcp must never spawn at all.
     word_spawns = [
         s for s in spawned
         if any("docx-mcp" in str(t) for t in s["cmd"])
     ]
-    assert word_spawns, "word slot (docx-mcp) was not spawned"
-    env = word_spawns[0]["env"]
-    assert env is not None, "word slot spawned with inherited env — UTF-8 not forced"
-    assert env.get("PYTHONIOENCODING") == "utf-8:replace"
-    assert env.get("PYTHONUTF8") == "1"
-    # The plugin's own env is preserved alongside the encoding override.
-    assert env.get("MCP_AUTHOR") == "Adam"
+    assert not word_spawns, "retired word slot (docx-mcp) was spawned despite being retired"
 
 
 def test_run_tunnel_command_overrides_and_index(monkeypatch, tmp_path):
@@ -2754,11 +2771,20 @@ def test_run_tunnel_code_unavailable_and_extract_disabled(monkeypatch, tmp_path)
     assert len(procs) == 1
 
 
-def test_run_tunnel_legacy_resolved_list_extract_none_skips(monkeypatch, tmp_path):
-    """Backward-compat: an older server sends an already-resolved plugin list with
-    code-extractor command=None. With the resolver returning None the extract slot
-    falls through and skips cleanly (fs alone → exit 0)."""
+def test_run_tunnel_legacy_resolved_list_extract_none_falls_back_to_serena_default(
+    monkeypatch, tmp_path,
+):
+    """9d9a92cc: Backward-compat — an older server sends an already-resolved
+    plugin list with code-extractor command=None. This must now fall back to
+    the CURRENT default (Serena, via the SerenaDaemonPool), NOT skip the slot
+    (the old behavior, which routed a None command through the now-obsolete
+    _resolve_extractor_inner_cmd/mcp-server-code-extractor fallback and
+    treated a None resolver result as "unavailable"). See
+    _resolve_extract_slot_command's docstring for the full history."""
     procs = _stub_run_tunnel_spawn(monkeypatch, code_binary=None)
+    # The legacy extractor resolver must NOT be consulted anymore for a
+    # missing command — if it were, this stub returning None would still
+    # incorrectly skip the slot, defeating the point of this test.
     monkeypatch.setattr(tc, "_resolve_extractor_inner_cmd", lambda: None)
     legacy_plugins = [
         {"name": "filesystem", "slot": "fs", "enabled": True, "command": None, "port": 8808},
@@ -2771,9 +2797,48 @@ def test_run_tunnel_legacy_resolved_list_extract_none_skips(monkeypatch, tmp_pat
     monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
 
     rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
-    # fs spawns; extract command=None + resolver None → skip.
+    # fs spawns; extract command=None now resolves to the Serena pool default
+    # instead of skipping → 2 procs (fs + the pool-spawned Serena daemon).
     assert rc == 0
-    assert len(procs) == 1
+    assert len(procs) == 2
+    assert any(
+        "serena-agent" in str(t) for p in procs for t in p.cmd
+    ), "extract slot did not fall back to the current Serena default"
+    assert not any(
+        "mcp-server-code-extractor" in str(t) for p in procs for t in p.cmd
+    ), "extract slot must never silently launch the obsolete extractor package"
+
+
+def test_run_tunnel_explicit_legacy_extractor_override_still_honored(monkeypatch, tmp_path):
+    """ada39096 — the flip side of the defaulting fix above: a tenant who
+    EXPLICITLY configures the old mcp-server-code-extractor command for the
+    extract slot must still get it (an explicit choice is never overridden),
+    via the generic custom-command path — not via _resolve_extractor_inner_cmd,
+    which stays uncalled either way now that it is no longer wired into this
+    decision as an implicit fallback."""
+    procs = _stub_run_tunnel_spawn(monkeypatch, code_binary=None)
+    legacy_extractor_calls = []
+    monkeypatch.setattr(
+        tc, "_resolve_extractor_inner_cmd",
+        lambda: legacy_extractor_calls.append(1) or ["uvx", "mcp-server-code-extractor"],
+    )
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={
+            "tenant_id": "t", "plan": "pro",
+            "tunnel_plugins_config": {
+                "code-extractor": {"command": ["uvx", "mcp-server-code-extractor"]},
+            },
+        }),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=str(tmp_path))
+    assert rc == 0
+    assert len(procs) == 2  # fs + the explicitly-overridden extract proxy
+    assert any("mcp-server-code-extractor" in p.cmd for p in procs), [p.cmd for p in procs]
+    assert not any("serena-agent" in p.cmd for p in procs)
+    assert legacy_extractor_calls == []
 
 
 def test_run_tunnel_browser_auth_success_caches_token(monkeypatch, tmp_path):

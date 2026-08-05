@@ -34,6 +34,28 @@ if _EXT_PATH not in sys.path:
 from meridian_docs import docs_intel  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _default_render_capability(monkeypatch):
+    """016015e1/ddd79188 -- insert_equation_local now invokes the real
+    render-capability gate (render_gate.check_render_capability) AFTER
+    structural verification passes. Tests in this file exercise STRUCTURAL
+    correctness and must not depend on -- or be slowed/blocked by --
+    whichever render backends (LibreOffice, Word COM) happen to be
+    installed on the machine running the suite. Stub a successful
+    'rendered' result by default, mirroring
+    test_19be1551_insert_figure_block.py's fixture of the same name.
+    """
+    monkeypatch.setattr(
+        docs_intel.render_gate,
+        "check_render_capability",
+        lambda docx_path, **kwargs: {
+            "status": "rendered",
+            "backend": "test-stub",
+            "detail": {"stub": True},
+        },
+    )
+
+
 _M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _W14 = "http://schemas.microsoft.com/office/word/2010/wordml"

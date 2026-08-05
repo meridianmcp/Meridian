@@ -40,6 +40,22 @@ from .code_index import (
     reindex_at_checkpoint,
     search_code_semantic,
 )
+from .vector_index import (
+    BenchmarkResult,
+    DuckDBVSSBackend,
+    IndexMetadata,
+    LexicalBM25Backend,
+    PgVectorBackend,
+    VectorBackendUnavailable,
+    VectorIndexBackend,
+    VectorMatch,
+    VectorRecord,
+    compare_candidates,
+    content_fingerprint,
+    run_benchmark,
+    run_lexical_benchmark,
+    should_enable_pgvector,
+)
 
 __version__ = "0.1.0"
 
@@ -57,4 +73,19 @@ __all__ = [
     "normalize_root_dir",
     "reindex_at_checkpoint",
     "search_code_semantic",
+    # e1475682 — backend-neutral vector-index contract
+    "BenchmarkResult",
+    "DuckDBVSSBackend",
+    "IndexMetadata",
+    "LexicalBM25Backend",
+    "PgVectorBackend",
+    "VectorBackendUnavailable",
+    "VectorIndexBackend",
+    "VectorMatch",
+    "VectorRecord",
+    "compare_candidates",
+    "content_fingerprint",
+    "run_benchmark",
+    "run_lexical_benchmark",
+    "should_enable_pgvector",
 ]

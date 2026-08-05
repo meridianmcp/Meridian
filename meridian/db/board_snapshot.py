@@ -5,8 +5,13 @@ handoff view lag the live board — a session pasted an old sprint-item list,
 another session had already changed statuses, and there was no way to tell
 "is this handoff manifest current" from "is it stale" without ambiguity.
 
-This module gives callers (``generate_handoff`` today; a future ``resume_wave``
-tool per the sprint-item spec) three primitives:
+This module gives callers five primitives -- originally consumed only by
+``start_wave_run``/``resume_wave`` (2a654cb0/efaa918a); ``generate_handoff``
+(mode='delta') and its ``build_continuation_manifest`` helper (836ca1d5) are
+a second consumer, reusing the SAME revision ledger (one canonical staleness
+timeline per ``(project_id, version)`` bucket, regardless of which feature is
+asking) rather than standing up a parallel one; ``generate_handoff``'s own
+stale-reference fail-closed gate (ee8a6af1) is a third:
 
   1. :func:`build_board_snapshot` — a canonical, byte-stable, expanded snapshot
      of the NON-DONE sprint board (every item whose ``status`` is not
@@ -27,6 +32,18 @@ tool per the sprint-item spec) three primitives:
      ``pointers``). This is the "resume delta" a paused/resumed session (or a
      future ``resume_wave`` tool) needs to reconcile a stale manifest against
      the live board.
+  4. :func:`get_project_item_index` — a flat, ALL-statuses (including
+     ``'done'``) existence index of every sprint item for a project (optionally
+     narrowed to one ``version`` bucket). Unlike :func:`build_board_snapshot`
+     this is deliberately NOT non-done-filtered: it exists so a caller can
+     answer "does id X currently exist for this project/version" for ANY
+     status, not just the resumable subset.
+  5. :func:`find_stale_reference_ids` — pure-Python classification of every
+     ``depends_on`` edge in a :func:`get_project_item_index` result as live or
+     stale (see its own docstring). This is the primitive ``generate_handoff``
+     (ee8a6af1) uses to fail closed BEFORE rendering or token-binding any
+     handoff body that would otherwise serialize a dependency id absent from
+     the live board — the 2026-08-04 incident this sprint item fixed.
 
 Design decisions (documented per the sprint-item spec):
 
@@ -88,7 +105,9 @@ from meridian.db import (  # noqa: PLC0415
     get_sprint_items,
     get_sprint_item_pointers,
     parse_touches_resources,
+    get_project_blocker_policy,
 )
+from .. import blocker_policy as _blocker_policy  # b108f2e0 (typed blocker triage)
 
 
 # Fields whose change is (a) what the revision hash is sensitive to and
@@ -155,6 +174,22 @@ async def build_board_snapshot(
         ordering), wave, blocker_kind, milestone_type, track,
         prospect_bypass,
       - ``revision_hash`` — see :func:`_compute_revision_hash`.
+      - ``blocker_summary`` (b108f2e0) — the typed blocker-triage decision
+        for this same non-done item set: ``policy``, ``blocked_item_ids``,
+        ``classifications``, ``skipped_dependents``, ``eligible_item_ids``,
+        ``run_stop``/``run_stop_reason``, ``continuation_rationale`` — see
+        ``meridian.blocker_policy.classify_and_evaluate``. Derived entirely
+        from already-stored item fields (notes/touches_resources/
+        tool_requirements/depends_on/milestone_type) plus the project's
+        persisted ``executor_blocker_policy`` — no wall-clock input, so this
+        is as byte-stable as the rest of the snapshot for an unchanged board.
+        Deliberately NOT folded into ``revision_hash``/the tracked-field diff
+        above: a notes-only edit (the common case that clears a
+        ``needs_scope`` quarantine) is cosmetic by THAT hash's own design
+        (see module docstring), so ``blocker_summary`` is always freshly
+        recomputed here rather than gated behind a hash that wouldn't move
+        for the edit that matters most (acceptance case 6: resume after
+        pointer/notes repair clears quarantine deterministically).
 
     No field in the returned structure is derived from "now" at call time, so
     two calls with no intervening board change produce byte-identical
@@ -162,6 +197,14 @@ async def build_board_snapshot(
     """
     raw_items = await get_sprint_items(db, project_id, version=version)
     raw_items = [it for it in raw_items if (it.get("status") or "") != "done"]
+    try:
+        _policy_row = await get_project_blocker_policy(db, project_id, version=version)
+        blocker_summary = _blocker_policy.classify_and_evaluate(
+            raw_items, policy=_policy_row.get("policy"),
+        )
+        blocker_summary["policy_source"] = _policy_row.get("source")
+    except Exception:  # noqa: BLE001 — blocker_summary is best-effort enrichment
+        blocker_summary = None
     raw_items.sort(
         key=lambda it: (
             str(it.get("version") or ""),
@@ -206,6 +249,7 @@ async def build_board_snapshot(
         "item_count": len(items),
         "items": items,
         "revision_hash": _compute_revision_hash(items),
+        "blocker_summary": blocker_summary,
     }
 
 
@@ -283,6 +327,50 @@ def diff_board_snapshots(previous: dict[str, Any], current: dict[str, Any]) -> d
     }
 
 
+async def compute_scope_diff(
+    db: aiosqlite.Connection,
+    project_id: str,
+    requested_item_ids: "list[str] | None",
+    *,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """3af86d28 — requested-vs-emitted scope diff for a corrective handoff.
+
+    Given the item ids a handoff's ORIGINAL /goal block requested (captured
+    at generation time, or reconstructed from the pasted block), compares
+    them against the LIVE non-done board for the same ``(project_id,
+    version)`` bucket via :func:`build_board_snapshot` — the same canonical
+    snapshot every other resume/staleness primitive in this module uses, so
+    this can never disagree with e.g. :func:`meridian.db.wave_resume.check_wave_resume`
+    about what's actually live.
+
+    Returns:
+      - ``requested_item_ids`` — the input, deduped and sorted.
+      - ``emitted_item_ids`` — requested ids still present on the live
+        non-done board (the handoff's scope is still valid for these).
+      - ``dropped_item_ids`` — requested ids no longer on the live non-done
+        board (completed, deleted, or otherwise resolved since the source
+        handoff was rendered — the scope drifted for these).
+      - ``live_revision_hash`` — the live snapshot's revision hash, echoed
+        back for the caller's own bookkeeping.
+
+    Pure read, no DB writes. This is a convenience for computing the
+    ``requested_scope``/``emitted`` comparison a corrective handoff records
+    (see ``meridian.handoff.record_handoff_correction``'s ``requested_scope``
+    parameter) — callers may pass this dict straight through, or compute
+    their own shape; nothing here is mandatory.
+    """
+    live = await build_board_snapshot(db, project_id, version=version)
+    live_ids = {it["id"] for it in (live.get("items") or []) if it.get("id")}
+    requested = {i for i in (requested_item_ids or []) if i}
+    return {
+        "requested_item_ids": sorted(requested),
+        "emitted_item_ids": sorted(requested & live_ids),
+        "dropped_item_ids": sorted(requested - live_ids),
+        "live_revision_hash": live.get("revision_hash"),
+    }
+
+
 async def get_latest_board_snapshot_revision(
     db: aiosqlite.Connection,
     project_id: str,
@@ -344,3 +432,99 @@ async def record_board_snapshot_revision(
         "revision_hash": revision_hash,
         "is_new": True,
     }
+
+
+async def get_project_item_index(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    version: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Flat existence + dependency-edge index of every sprint item for ``project_id``.
+
+    Returns ``{item_id: {"status": str, "depends_on": str | None,
+    "merged_into": str | None}}`` for EVERY row belonging to ``project_id``
+    (optionally narrowed to a single ``version`` bucket), across ALL
+    statuses — deliberately including ``'done'``, unlike
+    :func:`build_board_snapshot`.
+
+    This is the "does id X currently exist for this project/version" primitive:
+    a single cheap query gives a caller both a live-id existence check and
+    every item's own ``depends_on`` edge, without a second table scan. See
+    :func:`find_stale_reference_ids`, the pure-Python consumer of this index.
+
+    Scoping to ``version`` (when given) means an id belonging to this SAME
+    project but a DIFFERENT version bucket will NOT appear in the index — by
+    design: ``generate_handoff`` validates a version-scoped board against its
+    own version's live snapshot (ee8a6af1), so a genuinely cross-version
+    ``depends_on`` edge is treated the same as a missing one (fail closed
+    rather than silently trusting an edge outside the scoped board).
+    """
+    clauses = ["project_id = ?"]
+    params: list[Any] = [project_id]
+    if version is not None:
+        clauses.append("version = ?")
+        params.append(version)
+    query = (
+        "SELECT id, status, depends_on, merged_into FROM sprint_items "
+        f"WHERE {' AND '.join(clauses)}"
+    )
+    async with db.execute(query, tuple(params)) as cur:
+        rows = await cur.fetchall()
+    index: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        d = _row_to_dict(row)
+        item_id = d.get("id")
+        if not item_id:
+            continue
+        index[item_id] = {
+            "status": d.get("status"),
+            "depends_on": d.get("depends_on"),
+            "merged_into": d.get("merged_into"),
+        }
+    return index
+
+
+def find_stale_reference_ids(item_index: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Classify every non-null ``depends_on`` edge in ``item_index`` as live or stale.
+
+    ``item_index`` is a :func:`get_project_item_index` result (or an
+    equivalent hand-built dict in tests). For every item that declares a
+    ``depends_on`` target, the target id is:
+
+    * **live** (not reported) when it has an entry in ``item_index`` whose
+      ``merged_into`` is unset — this covers EVERY status including
+      ``'done'``: a dependency that already completed is a resolved
+      reference, not a stale one.
+    * **stale, reason "missing"** when it has no entry in ``item_index`` at
+      all — it never existed for this project/version scope, was deleted, or
+      belongs to a different project entirely (``item_index`` is always
+      scoped to one project, so a foreign-project id is indistinguishable
+      from — and correctly treated the same as — a nonexistent one).
+    * **stale, reason "merged_away"** when it DOES have an entry, but that
+      entry's ``merged_into`` is set — :func:`meridian.db.sprint_items.
+      merge_sprint_items` folded it into a survivor. The row still exists
+      for audit purposes, but the id is no longer an independently
+      referenceable board entry; the live identity is ``merged_into``.
+
+    Returns a list of ``{"item_id": ..., "depends_on": ..., "reason": ...}``
+    (plus ``"merged_into"`` for the merged_away reason), sorted by
+    ``(item_id, depends_on)`` for deterministic error messages. Empty list
+    means every dependency edge in ``item_index`` resolves.
+    """
+    stale: list[dict[str, Any]] = []
+    for item_id, entry in item_index.items():
+        target = entry.get("depends_on")
+        if not target:
+            continue
+        target_entry = item_index.get(target)
+        if target_entry is None:
+            stale.append({"item_id": item_id, "depends_on": target, "reason": "missing"})
+        elif target_entry.get("merged_into"):
+            stale.append({
+                "item_id": item_id,
+                "depends_on": target,
+                "reason": "merged_away",
+                "merged_into": target_entry["merged_into"],
+            })
+    return sorted(stale, key=lambda s: (s["item_id"], s["depends_on"]))

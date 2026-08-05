@@ -131,6 +131,24 @@ def search_outputs(
       scan_boundary, pending_count, indexed_count, expected_count,
       last_error, fts_pending, partial} -- the single authoritative object
       the other ad hoc fields are derived from.
+      ``discovery`` (b85394bd) is a planner/diagnostic dict surfacing this
+      call's own phase timings and the resolved discovery-vs-analysis
+      capacity split: {walk_seconds, discovered_this_call, discovered_total,
+      walk_complete, pending_stale_count, walk_batch_limit,
+      analysis_batch_limit, analysis_batch_source, analysis_backlog_deferred,
+      analysis_seconds, classification_seconds, write_seconds,
+      fts_seconds, rebuild_seconds, ...}. ``walk_batch_limit`` is the raw
+      filesystem-discovery cap this call used (independent of analysis
+      capacity, effectively unbounded by default); ``analysis_batch_limit``
+      is the memory-/commit-pressure-adaptive cap on how many stale files
+      Phase 1/2 took on THIS call (never the whole backlog at once);
+      ``analysis_batch_source`` is ``"adaptive"`` or ``"override"`` (an
+      explicit ``max_batch``/``MERIDIAN_OUTPUTS_MAX_BATCH`` was set);
+      ``analysis_backlog_deferred`` is how many confirmed-stale files were
+      left queued past this call's own analysis intake cap (0 when the
+      whole backlog fit). A non-zero ``analysis_backlog_deferred`` also
+      implies ``partial``/``pending_stale_count`` above, for the same
+      "re-invoke rather than conclude not-found" reason.
       Each hit has: path, score, bm25, is_archival, canonical_path, kind,
       generating_script, csv_columns, json_keys, size, mtime, annotations,
       literal_match.
@@ -143,6 +161,42 @@ def search_outputs(
         max_seconds=max_seconds,
         subtree=subtree,
     )
+
+
+@mcp.tool()
+def register_output_paths(
+    outputs_dir: str,
+    paths: list[str],
+) -> dict[str, Any]:
+    """Directly register a small, EXPLICIT list of exactly-known output
+    file paths so they're searchable right away (item b85394bd), instead of
+    waiting for the ambient full-root walk to discover them on its own
+    schedule -- the direct MCP-level counterpart to
+    ``outputs_local.index_paths``/``register_priority_path``.
+
+    The natural caller: a build/pipeline step (or an agent) that just
+    produced or otherwise already knows a specific set of output files and
+    wants them indexed NOW, without triggering (or waiting on) a full
+    ``search_outputs`` rebuild pass over ``outputs_dir``. Cost is bounded by
+    ``len(paths)``, not the size of ``outputs_dir`` -- safe to call
+    synchronously even against a huge, still-converging tree.
+
+    A path that doesn't exist on disk YET is queued (``queued`` in the
+    response) rather than treated as an error -- a later call to this tool,
+    ``search_outputs``, or the ambient walk reaching it will pick it up
+    automatically once it's actually written.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      paths:        Exact output file paths to register/index now.
+
+    Returns:
+      {registered, indexed, queued, paths} on success (``indexed`` -- rows
+      written this call; ``paths`` -- the paths actually indexed), or
+      {registered: False, reason: ...} if ``outputs_dir``/``paths`` are
+      missing. Best effort, never raises.
+    """
+    return outputs_local.register_output_paths(outputs_dir, paths)
 
 
 @mcp.tool()

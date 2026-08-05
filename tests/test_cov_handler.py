@@ -352,6 +352,23 @@ def test_tools_call_unknown_tool_returns_internal_error():
     assert "unknown tool" in resp["error"]["message"]
 
 
+def test_tools_call_strips_meridian_namespace_compatibility_prefix(monkeypatch):
+    seen = {}
+
+    async def fake_dispatch(name, args, db, data_dir, **kwargs):
+        seen["name"] = name
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    monkeypatch.setattr(mh, "_dispatch_mcp_tool", fake_dispatch)
+    resp = _run(mh._handle_mcp_request(
+        _req("tools/call", {"name": "meridian.get_sprint_items", "arguments": {}}),
+        db=None, data_dir="/tmp",
+    ))
+
+    assert seen["name"] == "get_sprint_items"
+    assert json.loads(resp["result"]["content"][0]["text"])["content"][0]["text"] == "ok"
+
+
 def test_tools_call_readonly_token_blocks_write_tool():
     resp = _run(mh._handle_mcp_request(
         _req("tools/call", {"name": "log_task", "arguments": {}}),

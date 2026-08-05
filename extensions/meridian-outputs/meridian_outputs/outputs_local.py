@@ -409,17 +409,33 @@ class _ResumableFileWalk:
     # _resolve_max_batch) still lets anyone who deliberately wants a real
     # count cap set one.
     #
-    # IMPORTANT: this constant is a WALK-only concern (this class's own
-    # per-drain() cap, and OutputsFtsIndex's related walk-vs-analysis
-    # throttle in rebuild()'s Phase 0). It must NOT also become the DB
-    # write-chunk size (_WRITE_CHUNK) -- OutputsFtsIndex.__init__ resolves
-    # that SEPARATELY via its own `_WRITE_CHUNK_DEFAULT`/`_resolve_write_
-    # chunk`, specifically so bumping this default doesn't silently turn
-    # every DB write into one giant, unchunked SQL statement.
-    # Keep discovery from outrunning analysis/write by hundreds of thousands
-    # of paths on a large root.  This remains an explicit constructor/env
-    # override; the default is a bounded fairness window for resumable scans.
-    _MAX_BATCH = 4_096
+    # IMPORTANT: this constant is a WALK-only concern -- this class's own
+    # per-drain() cap, i.e. raw DISCOVERY capacity (how many paths a single
+    # drain() call may pull off the filesystem generator). It must NOT also
+    # become the DB write-chunk size (_WRITE_CHUNK) -- OutputsFtsIndex.__init__
+    # resolves that SEPARATELY via its own `_WRITE_CHUNK_DEFAULT`/
+    # `_resolve_write_chunk`, specifically so bumping this default doesn't
+    # silently turn every DB write into one giant, unchunked SQL statement.
+    #
+    # b85394bd -- FOLLOW-UP to 1bce8c41: an intervening perf change (47a1c53)
+    # quietly dropped this back down to 4_096 and repurposed
+    # OutputsFtsIndex._adaptive_batch_limit() (memory/commit-pressure aware,
+    # designed to bound ANALYSIS/write intake, see that method's docstring)
+    # as rebuild()'s walk-drain cap too -- reintroducing exactly the
+    # count-primary-not-time-primary regression 1bce8c41 fixed, silently:
+    # every rebuild() call capped discovery at whatever the adaptive
+    # controller sized for ANALYSIS, confirmed live as a flat 4_096-path
+    # ceiling per call on a large root (2026-07-31). The two concerns are
+    # separate: this constant governs DISCOVERY capacity only (bounded by
+    # `deadline`, effectively unbounded by default per 1bce8c41's original
+    # rationale, still restated below); `_adaptive_batch_limit()` governs how
+    # much of the discovered backlog Phase 1/2 take on in a single call (see
+    # rebuild()'s `analysis_limit`, resolved independently). Restored to
+    # 1bce8c41's "effectively unbounded" default so discovery itself is
+    # time-primary again; an explicit constructor arg or
+    # MERIDIAN_OUTPUTS_MAX_BATCH env var still caps it for anyone who
+    # deliberately wants a real count cap.
+    _MAX_BATCH = 1_000_000_000
     _MAX_BATCH_ENV_VAR = "MERIDIAN_OUTPUTS_MAX_BATCH"
 
     @classmethod
@@ -2654,7 +2670,24 @@ class OutputsFtsIndex:
         # benefit, since there was never a risk of overwhelming Phase 1/2.
         newly_seen: list[str] = []
         walk_started = time.monotonic()
-        batch_limit = self._adaptive_batch_limit()
+        # b85394bd -- discovery capacity and adaptive ANALYSIS capacity are
+        # deliberately two different numbers now (previously both were
+        # `self._adaptive_batch_limit()`, conflating "how fast can the walk
+        # enumerate paths" with "how much can Phase 1/2 afford to hash/write
+        # this call", and reintroducing 1bce8c41's count-primary-walk
+        # regression -- see the _MAX_BATCH docstring above):
+        #   walk_batch      -- discovery capacity: the walk's own per-drain()
+        #                       cap (`self._max_batch`, decoupled, explicit
+        #                       param/env-overridable, effectively unbounded
+        #                       by default so the walk stays time-primary).
+        #   analysis_limit  -- adaptive analysis capacity: memory- and
+        #                       commit-pressure-aware, used ONLY to (a) gate
+        #                       the discovery throttle below and (b) bound
+        #                       how much of the pending-stale backlog Phase 1
+        #                       takes on THIS call (see "bounded analysis
+        #                       intake" further down).
+        walk_batch = self._max_batch
+        analysis_limit = self._adaptive_batch_limit()
         if os.path.isdir(self.outputs_dir):
             if self._walk_state is None:
                 # A brand-new pass is starting (either the very first one,
@@ -2665,14 +2698,16 @@ class OutputsFtsIndex:
                 self._walk_epoch += 1
                 self._walk_state = _ResumableFileWalk(
                     self.outputs_dir, exclude_patterns=self._exclude_patterns,
-                    max_batch=batch_limit, on_error=self._record_walk_error,
+                    max_batch=walk_batch, on_error=self._record_walk_error,
                 )
                 self._walk_accumulated = []
             else:
-                # The walk persists across calls; update its drain cap as the
-                # adaptive controller learns from commit pressure.
-                self._walk_state.max_batch = batch_limit
-            if len(self._pending_stale) < batch_limit:
+                # The walk persists across calls; discovery capacity is
+                # static (own knob), so this only re-applies it in case a
+                # constructor/env override changed between instances -- it
+                # is NOT re-derived from adaptive analysis pressure.
+                self._walk_state.max_batch = walk_batch
+            if len(self._pending_stale) < analysis_limit:
                 newly_seen = self._walk_state.drain(phase1_deadline)
                 self._walk_accumulated.extend(newly_seen)
                 if newly_seen:
@@ -2741,6 +2776,16 @@ class OutputsFtsIndex:
             "discovered_total": len(all_paths),
             "walk_complete": bool(walk_complete),
             "pending_stale_count": len(self._pending_stale),
+            # b85394bd -- planner/diagnostic surface for the discovery-vs-
+            # analysis split: the resolved caps THIS call actually used, and
+            # whether the analysis figure came from an explicit override or
+            # the memory-adaptive controller, so a caller can tell a slow
+            # convergence apart from a deliberately-tuned one.
+            "walk_batch_limit": walk_batch,
+            "analysis_batch_limit": analysis_limit,
+            "analysis_batch_source": (
+                "override" if self._max_batch_overridden else "adaptive"
+            ),
         })
 
         # ------------------------------------------------------------------
@@ -2767,8 +2812,29 @@ class OutputsFtsIndex:
             if self._manifest.get(p) != sig or p not in self._row_cache:
                 self._pending_stale[p] = sig
 
-        stale: list[str] = list(self._pending_stale)
-        stale_sigs: dict[str, tuple[float | None, int | None]] = dict(self._pending_stale)
+        # b85394bd -- BOUNDED ANALYSIS INTAKE: `self._pending_stale` may hold
+        # far more than one call should take on at once (discovery capacity
+        # is now effectively unbounded per call -- see `walk_batch` above --
+        # so a single fast drain() on a huge tree can add tens of thousands
+        # of paths to the backlog in one shot). Only the first
+        # `analysis_limit` entries (stable insertion order -- the walk's own
+        # deterministic sorted-DFS discovery order, see `_scan_boundary`)
+        # are taken into `stale`/`stale_sigs` and therefore into Phase 1's
+        # ThreadPoolExecutor submission and Phase 2's write below; anything
+        # beyond that stays in `self._pending_stale` untouched (never
+        # submitted, never popped) for a later call to pick up -- this is
+        # what actually prevents "the entire pending list is submitted to
+        # ThreadPoolExecutor" regardless of backlog size. Deterministic:
+        # the same backlog + the same analysis_limit always yields the same
+        # bounded slice.
+        stale_all: list[str] = list(self._pending_stale)
+        stale: list[str] = stale_all[:analysis_limit]
+        stale_sigs: dict[str, tuple[float | None, int | None]] = {
+            p: self._pending_stale[p] for p in stale
+        }
+        self.last_rebuild_metrics["analysis_backlog_deferred"] = (
+            len(stale_all) - len(stale)
+        )
 
         # Parallel per-file analysis for stale paths (fingerprint + hash + stat).
         # Workers run before the write lock is taken so heavy I/O (e.g. hashing
@@ -2895,20 +2961,36 @@ class OutputsFtsIndex:
                 # Non-stale (mtime/size unchanged) archival candidates already
                 # have a known-good hash from a prior rebuild -- reuse it
                 # instead of re-hashing the file from disk again this run.
-                # (`path not in stale_set` structurally guarantees a row_cache
-                # hit here: staleness is defined as "manifest mismatch OR no
-                # row_cache entry", so a non-stale path always has one.)
+                # b85394bd -- `path not in stale_set` used to structurally
+                # guarantee a row_cache hit here (staleness was defined as
+                # "manifest mismatch OR no row_cache entry", covering every
+                # currently-stale path). That invariant no longer holds
+                # unconditionally: `stale`/`stale_set` is now a BOUNDED
+                # analysis-intake slice of `self._pending_stale` (see
+                # "BOUNDED ANALYSIS INTAKE" above), so a path can be
+                # genuinely stale, deferred past this call's intake cap, AND
+                # never previously cached (a brand-new file) all at once --
+                # `path not in stale_set` no longer implies a row_cache hit
+                # for that path. `.get()` degrades this to the same safe
+                # None default 5845cc6d already documents below for a
+                # straggler Phase 1 didn't reach in time, rather than a
+                # KeyError.
                 if path not in stale_set:
-                    return self._row_cache[path].sha256
+                    cached_row = self._row_cache.get(path)
+                    if cached_row is not None:
+                        return cached_row.sha256
+                    return None
                 # 5845cc6d — genuinely stale but Phase 1 didn't get to it
-                # before its own sub-deadline. Do NOT fall back to a fresh
-                # synchronous self._hasher(path) call here: classify_canonical
-                # _archival has no deadline check of its own, so looping
-                # through potentially thousands of un-analysed stale files
-                # would blow the overall budget just as badly as the original
-                # Phase-1-blocks-forever bug this fix targets. None is a safe
-                # default ("not confirmed archival this round") -- the file
-                # gets a proper hash once its turn in a future Phase 1 comes up.
+                # before its own sub-deadline (or, per b85394bd above, was
+                # deferred past this call's bounded analysis intake).  Do
+                # NOT fall back to a fresh synchronous self._hasher(path)
+                # call here: classify_canonical_archival has no deadline
+                # check of its own, so looping through potentially thousands
+                # of un-analysed stale files would blow the overall budget
+                # just as badly as the original Phase-1-blocks-forever bug
+                # this fix targets. None is a safe default ("not confirmed
+                # archival this round") -- the file gets a proper hash once
+                # its turn in a future Phase 1 comes up.
                 return None
 
             classifications = classify_canonical_archival(
@@ -2935,6 +3017,20 @@ class OutputsFtsIndex:
                 # (it's being resumed across future rebuild() calls), so the
                 # index is known-incomplete regardless of whether Phase 1/2
                 # themselves hit their own deadlines this call.
+                self.last_rebuild_partial = True
+            if self.last_rebuild_metrics.get("analysis_backlog_deferred"):
+                # b85394bd -- bounded analysis intake deliberately deferred
+                # part of the backlog (independent of any deadline breach --
+                # `_apply_precomputed` above only sets this for a genuine
+                # deadline hit, and resets it to False at its own start, so
+                # this must be re-applied AFTER that call returns). Real work
+                # remains queued in `self._pending_stale`; report the rebuild
+                # as partial so callers (search_outputs()'s ad hoc `partial`/
+                # `pending_stale_count` fields, not just the structured
+                # `convergence` object which already derives independently
+                # from `self._pending_stale`) keep surfacing it -- same
+                # "re-invoke, don't conclude not-found" contract as every
+                # other partial-rebuild cause.
                 self.last_rebuild_partial = True
             # <false-convergence fix, see root-cause note at the pop below> --
             # write_confirmed tracks whether Phase 2's DB write (+ FTS commit)
@@ -4073,6 +4169,49 @@ def register_priority_path(outputs_dir: str, path: str) -> dict[str, Any]:
     return result
 
 
+def register_output_paths(outputs_dir: str, paths: list[str]) -> dict[str, Any]:
+    """Module-level convenience wrapper: bulk-register a small, EXPLICIT
+    list of exactly-known output paths (item b85394bd), using the SAME
+    cached :class:`OutputsFtsIndex` instance a subsequent ``search_outputs``
+    call for this ``outputs_dir`` will use -- so paths registered here are
+    genuinely reflected in the very next search, not a throwaway side index.
+
+    Distinct from :func:`register_priority_path` (single path, thin
+    provenance-triggered wrapper): this is the direct, general-purpose entry
+    point for a caller that already knows the exact file list it wants
+    indexed right now -- e.g. a build/pipeline step announcing "these N
+    files are the outputs I just produced" -- without waiting on, or
+    depending on the timing of, the ambient full-root walk (Phase 0) to
+    discover them on its own schedule. Delegates straight to
+    :meth:`OutputsFtsIndex.index_paths`, which bypasses Phase 0's
+    resumable-walk/backlog-throttle machinery entirely: cost is bounded by
+    ``len(paths)``, not ``outputs_dir``'s total size, so this stays cheap
+    and synchronous even against a huge, still-converging tree.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      paths:        Exact output file paths to register/index now.
+
+    Returns:
+      ``{"registered": True, "indexed": N, "queued": N, "paths": [...]}``
+      on success (``indexed`` -- rows written this call; ``queued`` -- paths
+      that don't exist on disk YET, retried automatically on a later call
+      once they do), or ``{"registered": False, "reason": ...}`` when
+      ``outputs_dir``/``paths`` are missing. Best effort, never raises.
+    """
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        return {"registered": False, "reason": "outputs_dir does not exist"}
+    if not paths:
+        return {"registered": False, "reason": "paths is required"}
+    index = _get_cached_index(outputs_dir)
+    for p in paths:
+        if p and str(p).strip():
+            index._priority_registered.add(os.path.normpath(p))
+    result = index.index_paths(paths)
+    result["registered"] = True
+    return result
+
+
 def _find_ancestor_cached_index(subtree_dir: str) -> "OutputsFtsIndex | None":
     """Best-effort lookup of an already-cached :class:`OutputsFtsIndex`
     whose ``outputs_dir`` is an ANCESTOR of (or equal to) ``subtree_dir`` --
@@ -4293,6 +4432,18 @@ def search_outputs(
     # was given, `index` is already the subtree-scoped instance, so this
     # describes the SUBTREE's own convergence, not the whole root's.
     result["convergence"] = index.get_convergence_state().to_dict()
+    # e631d54f (follow-up to 6af1518d) -- a single, explicit `degraded` flag
+    # mirroring `convergence["converged"]`, computed regardless of whether
+    # `hits` is empty. The `zero_hits_warning` below only ever fires for a
+    # ZERO-hit response; a NON-empty `hits` list from a not-yet-converged
+    # index was previously indistinguishable from a complete answer unless a
+    # caller cross-referenced `convergence["converged"]` itself. That gap is
+    # exactly what makes a partial/stale index unsafe as an authoritative
+    # pointer/provenance signal (e.g. "does an output matching X already
+    # exist anywhere in the tree") -- a caller doing an existence/dedup check
+    # must see `degraded=True` and treat these hits as candidates only, never
+    # as proof nothing else matches.
+    result["degraded"] = not result["convergence"]["converged"]
     if not hits and (
         result.get("partial") or result.get("fts_pending")
         or result.get("db_write_error")
@@ -4427,6 +4578,46 @@ def get_indexed_output(outputs_dir: str, file_path: str) -> dict[str, Any] | Non
         return None
     index = _get_cached_index(outputs_dir)
     return index.resolve_output(file_path)
+
+
+def get_indexed_output_status(outputs_dir: str, file_path: str) -> dict[str, Any]:
+    """The authoritative-gate-safe sibling of :func:`get_indexed_output`
+    (item e631d54f, follow-up to 6af1518d).
+
+    :func:`get_indexed_output` returning ``None`` is ambiguous on a
+    not-yet-converged index: it cannot distinguish "confirmed absent" from
+    "the ambient walk simply hasn't reached this path yet". A caller that
+    needs an AUTHORITATIVE absence answer (e.g. composing a
+    provenance-status verdict, or a dedup/existence check before writing a
+    new output) must consult ``degraded`` before trusting a ``None``/empty
+    ``row`` here as confirmed absence -- when ``degraded`` is ``True``, the
+    correct read is "unknown, index still catching up", never "absent".
+
+    Never triggers a rebuild (same read-only contract as
+    :func:`get_indexed_output`) -- this only adds the convergence context a
+    caller needs to interpret the (unchanged) membership answer correctly.
+
+    Returns:
+      ``{"row": <dict|None>, "degraded": bool, "convergence": {...}}`` where
+      ``row`` is identical to what :func:`get_indexed_output` returns, and
+      ``convergence`` is :meth:`OutputsFtsIndex.get_convergence_state`'s
+      dict (whole-``outputs_dir`` convergence -- this is a membership check
+      against the full tree, not a subtree-scoped one). ``outputs_dir``/
+      ``file_path`` missing or invalid returns ``row=None`` with
+      ``degraded=True`` (never a confident "absent").
+    """
+    if not file_path or not str(file_path).strip():
+        return {"row": None, "degraded": True, "convergence": None}
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        return {"row": None, "degraded": True, "convergence": None}
+    index = _get_cached_index(outputs_dir)
+    row = index.resolve_output(file_path)
+    convergence = index.get_convergence_state().to_dict()
+    return {
+        "row": row,
+        "degraded": not convergence["converged"],
+        "convergence": convergence,
+    }
 
 
 def get_path_annotations(outputs_dir: str, path: str) -> list[dict[str, Any]]:

@@ -2,11 +2,37 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import zipfile
 import xml.etree.ElementTree as ET
 
+import pytest
+
 from meridian_docs import docs_intel
+
+
+@pytest.fixture(autouse=True)
+def _default_render_capability(monkeypatch):
+    """ddd79188 follow-up -- highlight_document_matches / insert_word_comment
+    now invoke the real render-capability gate
+    (render_gate.check_render_capability) AFTER the structural write is
+    staged, verified, and promoted. Every test in this file exercises
+    STRUCTURAL correctness and must not depend on -- or be slowed/blocked by
+    -- whichever render backends (LibreOffice, Word COM) happen to be
+    installed on the machine running the suite. Stub a successful 'rendered'
+    result by default, mirroring test_19be1551_insert_figure_block.py's own
+    fixture of the same name.
+    """
+    monkeypatch.setattr(
+        docs_intel.render_gate,
+        "check_render_capability",
+        lambda docx_path, **kwargs: {
+            "status": "rendered",
+            "backend": "test-stub",
+            "detail": {"stub": True},
+        },
+    )
 
 
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -156,3 +182,87 @@ def test_read_document_snapshot_works_while_path_is_open(tmp_path):
     assert result["paragraph_count"] >= 4
     assert "word/document.xml" in result["xml_parts"]
     assert not (tmp_path / "doc.docx.bak").exists()
+
+
+def test_read_document_snapshot_includes_fingerprint_and_limitations(tmp_path):
+    path = _write_docx(tmp_path)
+    with open(path, "rb") as handle:
+        expected_sha256 = hashlib.sha256(handle.read()).hexdigest()
+
+    result = docs_intel.read_document_snapshot(path)
+
+    assert result["source_sha256"] == expected_sha256
+    assert len(result["source_sha256"]) == 64  # hex-encoded SHA-256
+
+    limitations = result["limitations"]
+    assert isinstance(limitations, list)
+    assert len(limitations) >= 2
+    assert any("last SAVED state" in item for item in limitations)
+    assert any("word_lock_hint" in item for item in limitations)
+
+
+def test_read_document_snapshot_error_path_has_no_fingerprint(tmp_path):
+    missing_path = str(tmp_path / "does_not_exist.docx")
+
+    result = docs_intel.read_document_snapshot(missing_path)
+
+    assert "error" in result
+    assert "source_sha256" not in result
+    assert "limitations" not in result
+
+
+def test_search_document_xml_attaches_quoted_text_and_unique_word_search_locator(tmp_path):
+    path = _write_docx(tmp_path)
+
+    results = docs_intel.search_document_xml(
+        path, "evaluates every paragraph", limit=5
+    )
+
+    assert results
+    top = results[0]
+    assert top["element_id"] == "P0000001"
+    assert "…" not in top["quoted_text"]
+    assert top["quoted_text"] in "The robust search method evaluates every paragraph."
+    locator = top["word_search_locator"]
+    assert locator["find_text"] == top["quoted_text"]
+    assert locator["part"] == "word/document.xml"
+    assert locator["element_id"] == top["element_id"]
+    assert locator["unique_in_part"] is True
+    assert locator["occurrence_count_in_part"] == 1
+
+
+_DOCUMENT_XML_REPEATED_PHRASE = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="R0000001">
+      <w:r><w:t>Please review this clause carefully.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="R0000002">
+      <w:r><w:t>Please review this clause carefully.</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def test_search_document_xml_word_search_locator_flags_non_unique_matches(tmp_path):
+    path = str(tmp_path / "repeated.docx")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", _DOCUMENT_XML_REPEATED_PHRASE)
+
+    results = docs_intel.search_document_xml(path, "clause carefully", limit=10)
+
+    assert len(results) == 2
+    element_ids = set()
+    for result in results:
+        assert result["quoted_text"] == "Please review this clause carefully."
+        locator = result["word_search_locator"]
+        assert locator["find_text"] == "Please review this clause carefully."
+        assert locator["part"] == "word/document.xml"
+        assert locator["unique_in_part"] is False
+        assert locator["occurrence_count_in_part"] == 2
+        element_ids.add(result["element_id"])
+    assert element_ids == {"R0000001", "R0000002"}

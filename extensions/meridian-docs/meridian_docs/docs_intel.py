@@ -52,6 +52,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Any
 
+from . import render_gate
+
 # OOXML namespaces.
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
@@ -1438,6 +1440,18 @@ def _load_docx_xml_stdlib(path: str) -> tuple[bytes, ET.Element]:
     Raises ``FileNotFoundError`` when the path is absent.
     Raises ``ValueError`` when the file is not a valid .docx ZIP or is missing
     ``word/document.xml``.
+
+    b17ef22b — contract with :func:`_save_docx_xml_stdlib`: callers must
+    thread ``raw_bytes`` through to ``_save_docx_xml_stdlib`` UNMODIFIED
+    (every existing call site already does — ``raw, root =
+    _load_docx_xml_stdlib(path)`` followed later by
+    ``_save_docx_xml_stdlib(raw, root, dest)``). ``_save_docx_xml_stdlib``
+    re-reads the ORIGINAL ``word/document.xml`` straight out of ``raw`` to
+    recover the namespace prefixes/declarations the source document actually
+    used, so it can preserve them (and keep ``mc:Ignorable`` valid) on
+    write-back rather than letting ``ET.tostring`` renumber or silently drop
+    them. Passing a ``raw`` that doesn't match ``document_root``'s true
+    origin defeats that preservation.
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"no such file: {path}")
@@ -1620,6 +1634,267 @@ def _docx_manifest_hash(changed_parts: dict[str, bytes]) -> str:
     return h.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# b17ef22b — namespace-prefix-preserving, fail-closed word/document.xml
+# write-back.
+#
+# THE DEFECT: ``ET.tostring()`` decides which prefix to print for a given
+# namespace URI purely from the process-global ``register_namespace()``
+# table (module load only pre-registers the common OOXML namespaces above)
+# plus auto-generated ``ns0``/``ns1``/... fallbacks for anything else. Two
+# distinct ways this silently mangles a round-tripped document that this
+# module didn't intend to touch at all:
+#
+#   1. A namespace that IS referenced by some element/attribute tag in the
+#      document, but uses a prefix this module never registered (a vendor
+#      extension namespace, or simply a non-default prefix convention some
+#      other tool wrote the file with) gets renumbered to ``ns0``/``ns1``/...
+#      on write-back instead of keeping its original prefix.
+#   2. A namespace declared on the root purely for markup-compatibility
+#      (listed in ``mc:Ignorable``, or simply one of the several namespaces
+#      real Word documents always declare whether or not THIS document
+#      happens to use it) is invisible to ``ET.tostring()``'s "is this URI
+#      referenced by some q-name in the tree" walk — xmlns declarations are
+#      consumed into the parser's namespace context at parse time and are
+#      never represented as element attributes, so an unreferenced-but-
+#      declared namespace is dropped from the output ENTIRELY. This breaks
+#      ``mc:Ignorable`` (per ECMA-376 Part 3, every prefix token in its
+#      value must stay a currently-declared namespace prefix) and narrows
+#      the package's advertised namespace support out from under it.
+#
+# THE FIX (scoped to _save_docx_xml_stdlib / _load_docx_xml_stdlib only —
+# see AGENTS.md item b17ef22b; this module's other ET-based part writers,
+# e.g. header/footer/comments/rels parts, are NOT touched here):
+#
+#   1. Before ``ET.tostring()``, temporarily register EVERY namespace prefix
+#      the ORIGINAL word/document.xml actually declared (not just the fixed
+#      module-load set) so referenced namespaces keep their real prefix
+#      instead of getting renumbered. Reads ``raw`` (the untouched original
+#      ZIP bytes every caller already threads through unchanged from
+#      ``_load_docx_xml_stdlib`` to ``_save_docx_xml_stdlib``) rather than
+#      requiring a signature change — ``_load_docx_xml_stdlib`` has ~50
+#      call sites across this file owned by other in-flight work, so
+#      widening its return tuple is out of scope here.
+#   2. After serializing, re-splice back any root-level namespace
+#      declaration that was present in the original but that ET's "only if
+#      referenced" walk dropped (case 2 above) — preserving markup-
+#      compatibility declarations even when nothing in the tree happens to
+#      use them.
+#   3. Fail closed, BEFORE ever building the replacement ZIP or touching
+#      disk (raising :class:`DocxWriteVerificationError`, same fail-closed
+#      contract as dccc2311's structural-manifest gate) if: the serialized
+#      XML isn't well-formed; any original namespace URI ends up bound to a
+#      DIFFERENT prefix in the output (defense-in-depth behind step 1 — the
+#      one scenario step 1 alone cannot fully rule out is two distinct
+#      original URIs sharing a prefix via a nested re-declaration, since
+#      ``register_namespace`` is a single global URI -> prefix slot); or
+#      ``mc:Ignorable`` ends up referencing an undeclared prefix.
+#
+# Known, deliberately out-of-scope limitations (documented per this item's
+# own fallback clause rather than risking a rushed full rewrite):
+#   - Only ROOT-level namespace declarations are tracked/preserved. A
+#     namespace prefix re-declared on some DESCENDANT element (legal XML,
+#     essentially never produced by Word) is not specially preserved.
+#   - This does not convert the writer to a true "edit only the touched XML
+#     parts" transactional model — it keeps the existing whole-document
+#     ET parse/serialize architecture (structurally required by the ~50
+#     other call sites in this file) and hardens IT to be namespace- and
+#     mc:Ignorable-preserving plus fail-closed instead.
+#   - The temporary registration window is guarded by a single process-wide
+#     lock (``_NAMESPACE_REGISTRATION_LOCK``), not a per-document one, since
+#     ``xml.etree.ElementTree``'s namespace table is itself process-global
+#     state with no per-call scoping available in the stdlib. This fully
+#     preserves correctness (no cross-document leakage is possible, since
+#     the critical section is serialized end-to-end) at the cost of
+#     serializing the in-memory ``ET.tostring()`` step (not any disk I/O)
+#     across concurrent writes to *different* documents.
+# ---------------------------------------------------------------------------
+
+# Guards the temporary ET.register_namespace(...) / ET.tostring() / restore
+# window in _save_docx_xml_stdlib -- see the module comment above for why a
+# lock (rather than per-call scoping, which the stdlib namespace table does
+# not support) is required for correctness under concurrent writers.
+_NAMESPACE_REGISTRATION_LOCK = threading.Lock()
+
+_MC_URI = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_MC_IGNORABLE_ATTR = _q(_MC_URI, "Ignorable")
+
+
+def _root_namespace_declarations(document_xml_bytes: bytes) -> list[tuple[str, str]]:
+    """Return the ``(prefix, uri)`` namespace declarations bound on the ROOT
+    element of ``document_xml_bytes``, in document order (``prefix`` is
+    ``""`` for an unprefixed/default declaration).
+
+    Uses ``ET.iterparse(events=("start-ns", "start"))`` — the real XML
+    parser's own namespace-scope tracking — rather than a regex over the raw
+    start tag, so this can never disagree with what ``ET.fromstring`` itself
+    considers a namespace binding (single- vs double-quoted attribute
+    values, entity-escaped characters in a URI, whitespace variations, etc.
+    all come for free). Collection stops at the first ``start`` event: every
+    real .docx declares its namespaces once, on the ``<w:document>`` root,
+    so that is also the first element this ever sees.
+    """
+    declarations: list[tuple[str, str]] = []
+    for event, value in ET.iterparse(io.BytesIO(document_xml_bytes), events=("start-ns", "start")):
+        if event == "start-ns":
+            prefix, uri = value
+            declarations.append((prefix or "", uri))
+        else:
+            break
+    return declarations
+
+
+def _extract_root_start_tag(xml_bytes: bytes) -> str:
+    """Return the literal root-element start tag (e.g. the full
+    ``<w:document xmlns:w="..." ...>`` or self-closing ``<w:document .../>``
+    text, verbatim) from a serialized XML document, skipping past any
+    leading XML declaration / comments / processing instructions.
+
+    A plain ``str.index("<")`` is not enough because ``<?xml ...?>`` also
+    starts with ``<``; this walks forward past any ``<?...?>``/``<!--...-->``
+    prologue, then scans the root tag's own text honoring quoted attribute
+    values so a literal ``>`` inside one (illegal in OOXML, but this stays
+    defensive) cannot truncate the match early.
+    """
+    text = xml_bytes.decode("utf-8")
+    pos = 0
+    length = len(text)
+    while True:
+        start = text.index("<", pos)
+        if text.startswith("<?", start):
+            pos = text.index("?>", start) + 1
+            continue
+        if text.startswith("<!--", start):
+            pos = text.index("-->", start) + 1
+            continue
+        i = start + 1
+        quote: str | None = None
+        while i < length:
+            ch = text[i]
+            if quote:
+                if ch == quote:
+                    quote = None
+            elif ch in ("'", '"'):
+                quote = ch
+            elif ch == ">":
+                return text[start : i + 1]
+            i += 1
+        raise ValueError("unterminated root element start tag")
+
+
+def _xml_escape_attr_value(value: str) -> str:
+    """Escape ``value`` for embedding as a double-quoted XML attribute value."""
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+
+
+def _restore_dropped_namespace_declarations(
+    original_document_xml: bytes, new_document_xml: bytes
+) -> bytes:
+    """Re-insert any root-level ``xmlns:*`` declaration present in the
+    ORIGINAL ``word/document.xml`` that ``ET.tostring`` silently dropped
+    from the newly-serialized output because nothing in the tree happens to
+    reference that namespace URI (see the module comment above — this is
+    the case ``ET.register_namespace`` cannot fix, since it only affects the
+    prefix chosen for namespaces ET decides to emit at all).
+    """
+    original_decls = _root_namespace_declarations(original_document_xml)
+    if not original_decls:
+        return new_document_xml
+
+    new_decls = _root_namespace_declarations(new_document_xml)
+    new_uris = {uri for _prefix, uri in new_decls}
+    missing = [(prefix, uri) for prefix, uri in original_decls if uri not in new_uris]
+    if not missing:
+        return new_document_xml
+
+    insertion = "".join(
+        f' xmlns:{prefix}="{_xml_escape_attr_value(uri)}"'
+        if prefix
+        else f' xmlns="{_xml_escape_attr_value(uri)}"'
+        for prefix, uri in missing
+    )
+
+    text = new_document_xml.decode("utf-8")
+    tag = _extract_root_start_tag(new_document_xml)
+    tag_start = text.index(tag)
+    if tag.endswith("/>"):
+        repaired_tag = tag[:-2] + insertion + "/>"
+    else:
+        repaired_tag = tag[:-1] + insertion + ">"
+    repaired_text = text[:tag_start] + repaired_tag + text[tag_start + len(tag) :]
+    return repaired_text.encode("utf-8")
+
+
+def _assert_namespace_prefixes_preserved(
+    original_decls: list[tuple[str, str]],
+    final_decls: list[tuple[str, str]],
+    dest: str,
+) -> None:
+    """Fail closed if any namespace URI bound to a given prefix in the
+    ORIGINAL document.xml ends up bound to a DIFFERENT prefix in the
+    newly-serialized output.
+
+    Defense-in-depth behind the register/restore step in
+    :func:`_save_docx_xml_stdlib`: that step makes this impossible in the
+    overwhelming common case, but ``ET.register_namespace`` is keyed on a
+    single global URI -> prefix slot, so two distinct original namespace
+    URIs that happen to share a prefix via a nested re-declaration (legal
+    XML, essentially never produced by Word, and not itself tracked by
+    :func:`_root_namespace_declarations`) could still yield an ambiguous or
+    incorrect result this check exists to catch — rejecting the write
+    rather than risking a silently corrupted package.
+    """
+    original_by_uri: dict[str, str] = {}
+    for prefix, uri in original_decls:
+        original_by_uri.setdefault(uri, prefix)
+
+    final_by_uri: dict[str, str] = {}
+    for prefix, uri in final_decls:
+        final_by_uri.setdefault(uri, prefix)
+
+    mismatches = {
+        uri: {"original_prefix": orig_prefix, "new_prefix": final_by_uri[uri]}
+        for uri, orig_prefix in original_by_uri.items()
+        if uri in final_by_uri and final_by_uri[uri] != orig_prefix
+    }
+    if mismatches:
+        raise DocxWriteVerificationError(
+            f"post-write verification failed: {dest} would have one or more "
+            "namespace prefixes renamed on write-back (an original "
+            "xmlns declaration re-emitted under a different prefix) -- "
+            f"discarding the staged write, {dest} is untouched",
+            manifest={"prefix_mismatches": mismatches},
+        )
+
+
+def _assert_mc_ignorable_prefixes_declared(
+    reparsed_root: ET.Element,
+    final_decls: list[tuple[str, str]],
+    dest: str,
+) -> None:
+    """Fail closed if ``mc:Ignorable`` on the write-back's root element lists
+    a namespace prefix that is not (or no longer) declared.
+
+    Per ECMA-376 Part 3 (Markup Compatibility and Extensibility), every
+    prefix token in ``mc:Ignorable`` must be a currently in-scope namespace
+    prefix -- an ``mc:Ignorable`` referencing an undeclared prefix is a
+    document Word and other OOXML consumers can refuse to open cleanly or
+    silently mishandle.
+    """
+    ignorable = reparsed_root.get(_MC_IGNORABLE_ATTR)
+    if not ignorable:
+        return
+    declared_prefixes = {prefix for prefix, _uri in final_decls if prefix}
+    missing = [token for token in ignorable.split() if token not in declared_prefixes]
+    if missing:
+        raise DocxWriteVerificationError(
+            f"post-write verification failed: mc:Ignorable in {dest} "
+            f"references undeclared namespace prefix(es) {missing!r} after "
+            f"write-back -- discarding the staged write, {dest} is untouched",
+            manifest={"ignorable": ignorable, "missing_prefixes": missing},
+        )
+
+
 def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> dict[str, Any]:
     """Write ``root`` back into ``dest`` as ``word/document.xml``.
 
@@ -1643,11 +1918,69 @@ def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> dict[str, 
     "manifest_hash", "pre_counts", "post_counts", "promoted_sha256"}``
     (5988a5bb) — callers that don't need it (most existing call sites, which
     predate this change) simply ignore the return value.
+
+    b17ef22b — namespace-prefix-preserving, fail-closed write-back (see the
+    module comment above ``_NAMESPACE_REGISTRATION_LOCK`` for the full
+    design). Before serializing, every namespace prefix ``raw``'s ORIGINAL
+    ``word/document.xml`` actually declared is registered so referenced
+    namespaces keep their real prefix instead of being renumbered; after
+    serializing, any originally-declared-but-unreferenced namespace ET
+    dropped is spliced back onto the root; and the result is rejected
+    (``DocxWriteVerificationError``, before any bytes are staged to disk) if
+    it isn't well-formed XML, if any original namespace prefix was renamed,
+    or if ``mc:Ignorable`` ends up referencing an undeclared prefix.
     """
-    new_xml = ET.tostring(root, encoding="unicode")
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        original_document_xml = zf.read("word/document.xml")
+    original_ns_decls = _root_namespace_declarations(original_document_xml)
+
+    with _NAMESPACE_REGISTRATION_LOCK:
+        snapshot = dict(ET._namespace_map)  # type: ignore[attr-defined]
+        try:
+            for prefix, uri in original_ns_decls:
+                ET.register_namespace(prefix, uri)
+            new_xml = ET.tostring(root, encoding="unicode")
+        finally:
+            ET._namespace_map.clear()  # type: ignore[attr-defined]
+            ET._namespace_map.update(snapshot)  # type: ignore[attr-defined]
+
     new_document_bytes = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + new_xml
     ).encode("utf-8")
+
+    # Validate well-formedness BEFORE the namespace-restore splice touches
+    # the string: _restore_dropped_namespace_declarations itself parses
+    # (via _root_namespace_declarations) to discover what ET emitted, and a
+    # malformed ET.tostring() result would otherwise surface as an
+    # unhandled xml.etree.ElementTree.ParseError there instead of the
+    # intended fail-closed DocxWriteVerificationError.
+    try:
+        ET.fromstring(new_document_bytes)
+    except ET.ParseError as exc:
+        raise DocxWriteVerificationError(
+            "post-write verification failed: the serialized "
+            f"word/document.xml for {dest} is not well-formed XML: {exc} -- "
+            f"discarding the staged write, {dest} is untouched",
+            manifest={"parse_error": str(exc)},
+        ) from exc
+
+    new_document_bytes = _restore_dropped_namespace_declarations(
+        original_document_xml, new_document_bytes
+    )
+
+    try:
+        reparsed_root = ET.fromstring(new_document_bytes)
+    except ET.ParseError as exc:
+        raise DocxWriteVerificationError(
+            "post-write verification failed: the namespace-repaired "
+            f"word/document.xml for {dest} is not well-formed XML: {exc} -- "
+            f"discarding the staged write, {dest} is untouched",
+            manifest={"parse_error": str(exc)},
+        ) from exc
+
+    final_ns_decls = _root_namespace_declarations(new_document_bytes)
+    _assert_namespace_prefixes_preserved(original_ns_decls, final_ns_decls, dest)
+    _assert_mc_ignorable_prefixes_declared(reparsed_root, final_ns_decls, dest)
 
     out = io.BytesIO()
     with zipfile.ZipFile(io.BytesIO(raw)) as src:
@@ -1691,6 +2024,12 @@ def _atomic_write_docx_bytes(
        fail-closed verification failure: :class:`DocxWriteVerificationError`
        is raised, the staged file is discarded, and ``dest`` is left
        byte-for-byte untouched (never a partially-written or corrupted file).
+       Independently of ``pre_manifest``, when ``changed_parts`` is given,
+       every changed ``.xml``/``.rels`` member is also re-read from that SAME
+       staged-and-flushed file and checked for XML well-formedness — a
+       malformed member is a ZIP-valid but corrupt .docx that the structural
+       manifest counts alone would not necessarily catch (see the inline
+       comment above the check), and is rejected the same fail-closed way.
     3. PROMOTE — the ONLY point at which the live file changes is inside
        :func:`_docx_promotion_lock`'s single serialized canonical-merge
        point for this destination — an ``os.replace`` (atomic on the same
@@ -1766,6 +2105,71 @@ def _atomic_write_docx_bytes(
                         "count_mismatches": mismatches,
                     },
                 )
+
+        # dccc2311 follow-up -- verify every CHANGED part that claims to be
+        # XML (``.xml``/``.rels``, which also covers the un-suffixed-but-XML
+        # ``[Content_Types].xml``) is actually well-formed, re-read from the
+        # STAGED file fresh off disk (never the in-memory ``changed_parts``
+        # values, which would only re-validate the build step's own intent --
+        # same "verify from disk" discipline as the structural-manifest check
+        # above). Multi-part writers like
+        # :func:`_save_docx_with_new_parts_stdlib` build some parts via raw
+        # text splicing (:func:`_insert_before_closing_tag`) rather than an
+        # ElementTree round-trip, so -- unlike a ``word/document.xml``
+        # rewrite that always emits valid XML straight out of
+        # ``ET.tostring`` -- a splice bug CAN produce a byte sequence that is
+        # not well-formed XML. Nothing upstream of this point catches that: a
+        # malformed member does not fail the ZIP-container check the
+        # ``BadZipFile`` branch above performs, and the structural-manifest
+        # counts silently treat an unparsable part as "0 elements" (see
+        # ``_docx_style_count`` / ``_docx_equation_count`` /
+        # ``_docx_relationship_count``) rather than raising -- so without
+        # this check a corrupted-but-still-a-valid-ZIP write would be
+        # promoted and reported as success.
+        if changed_parts:
+            xml_changed_names = [
+                name for name in changed_parts
+                if name.endswith(".xml") or name.endswith(".rels")
+            ]
+            if xml_changed_names:
+                try:
+                    with zipfile.ZipFile(io.BytesIO(staged_bytes)) as staged_zip:
+                        staged_names = set(staged_zip.namelist())
+                        xml_parse_errors: dict[str, str] = {}
+                        for part_name in xml_changed_names:
+                            if part_name not in staged_names:
+                                xml_parse_errors[part_name] = (
+                                    "part missing from staged archive"
+                                )
+                                continue
+                            try:
+                                ET.fromstring(staged_zip.read(part_name))
+                            except ET.ParseError as exc:
+                                xml_parse_errors[part_name] = str(exc)
+                except zipfile.BadZipFile as exc:
+                    # Already reported above when pre_manifest is supplied;
+                    # when it is not, this is the first (and only) chance to
+                    # catch it.
+                    raise DocxWriteVerificationError(
+                        "post-write verification failed: the staged artifact "
+                        f"for {dest} is not a valid .docx after being "
+                        f"flushed to disk: {exc} — discarding it, {dest} is "
+                        "untouched",
+                        manifest={"pre_counts": pre_manifest, "post_counts": post_counts},
+                    ) from exc
+                if xml_parse_errors:
+                    raise DocxWriteVerificationError(
+                        "post-write verification failed: one or more parts "
+                        f"this write changed in {dest} are not well-formed "
+                        "XML after being flushed to disk — discarding the "
+                        "staged artifact instead of promoting a corrupted "
+                        f"write; {dest} is untouched",
+                        manifest={
+                            "pre_counts": pre_manifest,
+                            "post_counts": post_counts,
+                            "xml_parse_errors": xml_parse_errors,
+                        },
+                    )
 
         # --- PROMOTE: the single serialized canonical-merge point ----------
         with _docx_promotion_lock(dest):
@@ -2008,6 +2412,155 @@ def _safe_restore_after_verification_failure(
     return True, _restore_docx_backup(write_dest), False
 
 
+# ---------------------------------------------------------------------------
+# Render-capability gate (ddd79188) -- shared by insert_figure_block and
+# merge_draft_into_canonical. Closes the gap between STRUCTURAL verification
+# (this module's own re-parse-and-check, above) and REAL Word/COM (or
+# LibreOffice) render verification: a document can pass every structural
+# check here and still fail to open in Word. Must only be called AFTER
+# structural verification has already succeeded, and while the caller still
+# holds ``write_dest``'s :func:`_docx_promotion_lock` -- this function may
+# itself restore ``write_dest`` from the SAME pre-write ``.bak`` a structural
+# verification failure would restore from, so it needs the identical
+# compare-and-swap safety :func:`_safe_restore_after_verification_failure`
+# gives that path (never blindly clobber a different, already-promoted
+# concurrent writer's work).
+# ---------------------------------------------------------------------------
+
+def _enforce_render_verification(
+    write_dest: str,
+    *,
+    promoted_sha256: str | None,
+    allow_degraded_render: bool,
+    degraded_render_reason: str | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Invoke :func:`render_gate.check_render_capability` on ``write_dest``
+    and enforce its three-state contract (93cd9798: ``rendered`` /
+    ``unavailable-with-reason`` / ``failed``) as a write-time gate.
+
+    Returns ``(error, render_info)`` -- exactly one is non-``None``:
+
+    * ``(None, render_info)`` -- the write may stand. ``render_info`` is a
+      dict of render-evidence fields (``render_status``, ``render_verified``,
+      plus backend/reason detail) to merge into the caller's success payload.
+    * ``(error, None)`` -- the write must be rejected. ``error`` already
+      carries ``"error"``, ``"file_restored"``, and
+      ``"concurrent_write_detected"`` -- the same shape the caller's own
+      structural-verification-failure branch returns -- so the caller can
+      layer its own identifying fields (``docx_path`` / ``canonical_path`` /
+      ``draft_path`` / ``merged``) on top and return it verbatim.
+
+    Three-state handling:
+
+      - ``"rendered"`` -- a real render backend actually produced visual
+        output for this document. The ONLY status that means "verified" --
+        ``render_verified`` is ``True`` only here.
+      - ``"failed"`` -- a render backend WAS available but the render attempt
+        for THIS document errored. This is a real, confirmed problem: the
+        write is restored from backup (never left half-verified) and an
+        error is returned -- never reported as ``"rendered"``.
+      - ``"unavailable-with-reason"`` -- no render backend exists in this
+        environment. This says nothing about the document itself, but it
+        also means visual-render verification genuinely did not happen --
+        so this FAILS CLOSED (restore + error) for canonical/production
+        promotion by default, exactly like ``"failed"`` does. The only way
+        to proceed anyway is an EXPLICIT, audited opt-in:
+        ``allow_degraded_render=True`` paired with a non-empty
+        ``degraded_render_reason`` -- the write is then kept, but
+        ``render_verified`` is still ``False`` and ``render_degraded`` /
+        ``degraded_render_reason`` are stamped onto the payload so no
+        caller can mistake a degraded acceptance for a real verification.
+    """
+    try:
+        render_result = render_gate.check_render_capability(write_dest)
+    except Exception as exc:  # noqa: BLE001 -- a broken checker must fail closed, never crash the write or masquerade as verified
+        render_result = {
+            "status": render_gate.FAILED,
+            "reason": f"render capability check raised {type(exc).__name__}: {exc}",
+        }
+    if (
+        not isinstance(render_result, dict)
+        or render_result.get("status") not in render_gate.RENDER_STATUSES
+    ):
+        render_result = {
+            "status": render_gate.FAILED,
+            "reason": f"render capability check returned an invalid result: {render_result!r}",
+        }
+
+    status = render_result.get("status")
+    reason = render_result.get("reason")
+    backend = render_result.get("backend")
+    detail = render_result.get("detail")
+
+    if status == render_gate.RENDERED:
+        return None, {
+            "render_status": status,
+            "render_verified": True,
+            "render_backend": backend,
+            "render_detail": detail,
+        }
+
+    degraded_accepted = (
+        status == render_gate.UNAVAILABLE_WITH_REASON
+        and allow_degraded_render
+        and bool(degraded_render_reason and str(degraded_render_reason).strip())
+    )
+    if degraded_accepted:
+        return None, {
+            "render_status": status,
+            "render_verified": False,
+            "render_reason": reason,
+            "render_degraded": True,
+            "degraded_render_reason": str(degraded_render_reason).strip(),
+        }
+
+    # Fail closed: restore-then-error -- identical CAS discipline to a
+    # structural verification failure, since a real (concurrent) writer may
+    # have already promoted something newer to write_dest since our own
+    # promotion.
+    safe_to_restore, restored, concurrent_write_detected = (
+        _safe_restore_after_verification_failure(write_dest, promoted_sha256)
+    )
+    if status == render_gate.FAILED:
+        headline = f"render verification failed: {reason or 'unknown render error'}"
+    else:
+        headline = (
+            "render verification unavailable in this environment "
+            f"({reason or 'no render backend available'}) -- failing closed for "
+            "canonical/production promotion. Pass allow_degraded_render=True "
+            "with a non-empty degraded_render_reason to explicitly accept this "
+            "write without real visual-render verification (audited degrade, "
+            "never a silent one)."
+        )
+    error: dict[str, Any] = {
+        "error": headline,
+        "render_status": status,
+        "render_reason": reason,
+        "file_restored": restored,
+        "concurrent_write_detected": concurrent_write_detected,
+    }
+    if not safe_to_restore:
+        if concurrent_write_detected:
+            error["error"] = (
+                error["error"]
+                + " -- AND a different writer's promotion has landed on this "
+                "file since ours, so this could not be safely auto-corrected: "
+                "restoring from our own backup would destroy that writer's "
+                f"already-promoted work. {write_dest} was left untouched, "
+                "exactly as that other writer left it -- investigate manually."
+            )
+        else:
+            error["error"] = (
+                error["error"]
+                + " -- this write's own promotion fingerprint is unavailable, "
+                "so it could not be safely confirmed that restoring from "
+                "backup would not destroy a different writer's work; "
+                f"{write_dest} was left untouched rather than risk it -- "
+                "investigate manually."
+            )
+    return error, None
+
+
 def _verify_docx_write(
     docx_path: str,
     *,
@@ -2101,6 +2654,225 @@ def _verify_docx_write(
             ),
             "count_mismatches": count_mismatches,
             "content_hash_mismatch": hash_mismatch,
+        }
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 679c86f4 -- post-write image-ownership invariant (orphan image paragraphs +
+# duplicate drawing references).
+#
+# _verify_docx_write (9907df44, above) confirms a move/copy landed the
+# EXPECTED structural counts and content hash -- but it has no notion of
+# image *ownership*: a bug that detaches an image paragraph from its Figure
+# caption (leaving an orphan image with no caption immediately after it), or
+# that duplicates an image paragraph without also duplicating its underlying
+# media relationship (leaving two independent figure blocks pointing at the
+# SAME r:embed id -- confirmed live for copy_section, whose deep-copy pass
+# renames every w14:paraId and bookmark name but never touches a drawing's
+# r:embed attribute), can still produce structurally-consistent counts and a
+# perfectly-matching content hash for the range that moved/copied, because
+# neither check ever looks at drawing/relationship identity.
+#
+# _verify_image_ownership re-reads the file FRESH FROM DISK (same discipline
+# as _verify_docx_write) and enforces, for every DIRECT body image paragraph:
+#
+#   (a) it is immediately followed by a body paragraph carrying a SEQ Figure
+#       field (its caption), OR
+#   (b) it is part of a run of CONSECUTIVE direct-body image paragraphs (a
+#       multi-image composite -- OOXML's own idiom for side-by-side figures
+#       sharing one caption) whose LAST member is immediately followed by a
+#       shared SEQ Figure caption. A composite is recognised by physical
+#       adjacency in body order; nothing but more images may sit between its
+#       members.
+#
+# and, independently, that no r:embed relationship id is referenced by more
+# than one such image/composite block -- a duplicate is a strong signal that
+# a copy/duplicate operation forgot to mint a fresh media relationship for
+# the paragraph it duplicated (rather than the writer's own intentional
+# same-image reuse), so it is rejected fail-closed unless the caller
+# explicitly opts in via ``allow_relationship_reuse`` (the narrow,
+# caller-declared stand-in this hardening item scopes for "the manifest
+# declares intentional reuse" -- the full claim/manifest pipeline described
+# in fe989980 is a separate, larger sprint item).
+#
+# insert_image intentionally creates an image paragraph with no caption yet
+# (the documented insert_image -> insert_caption two-step composition
+# insert_figure_block's own docstring calls out as still-supported), so its
+# caller passes ``require_immediate_caption=False`` -- it still gets the
+# duplicate-relationship half of the invariant (structurally unreachable via
+# insert_image's own always-fresh relationship id, but real defense-in-depth
+# against a future id-collision bug) plus its first-ever post-write
+# verification.
+# ---------------------------------------------------------------------------
+
+def _direct_body_image_paragraphs(body: ET.Element) -> list[tuple[int, ET.Element]]:
+    """``(body_child_index, paragraph)`` for every DIRECT body child paragraph
+    that contains an embedded image (DrawingML ``<w:drawing>`` or legacy VML
+    ``<w:pict>``).
+
+    Restricted to direct body children (not table-cell paragraphs) -- "the
+    caption immediately follows the image" is a body-sibling-order relation,
+    the same restriction :func:`relocate_figure` already applies when
+    selecting a figure block to move.
+    """
+    w_p = _q(_W, "p")
+    w_drawing = _q(_W, "drawing")
+    w_pict = _q(_W, "pict")
+    return [
+        (idx, child)
+        for idx, child in enumerate(body)
+        if child.tag == w_p
+        and (
+            child.find(f".//{w_drawing}") is not None
+            or child.find(f".//{w_pict}") is not None
+        )
+    ]
+
+
+def _has_figure_seq_field(paragraph: ET.Element) -> bool:
+    """True when ``paragraph`` carries a ``SEQ Figure`` field (simple or complex)."""
+    w_fld_simple = _q(_W, "fldSimple")
+    w_instr = _q(_W, "instr")
+    w_instr_text = _q(_W, "instrText")
+    for field in paragraph.iter(w_fld_simple):
+        if _SEQ_FIGURE_RE.search(field.get(w_instr) or ""):
+            return True
+    for instr in paragraph.iter(w_instr_text):
+        if _SEQ_FIGURE_RE.search("".join(instr.itertext())):
+            return True
+    return False
+
+
+def _image_paragraph_relationship_ids(paragraph: ET.Element) -> list[str]:
+    """Every ``r:embed`` relationship id referenced by drawings inside ``paragraph``."""
+    embed_attr = _q(_IMAGE_REL_NS, "embed")
+    return [
+        blip.get(embed_attr)
+        for blip in paragraph.iter(_q(_A, "blip"))
+        if blip.get(embed_attr)
+    ]
+
+
+def _verify_image_ownership(
+    docx_path: str,
+    *,
+    require_immediate_caption: bool = True,
+    allow_relationship_reuse: bool = False,
+) -> dict[str, Any] | None:
+    """679c86f4 -- mandatory post-write image-ownership verification.
+
+    Re-reads ``docx_path`` FRESH FROM DISK -- mirrors :func:`_verify_docx_write`'s
+    "never trust the in-memory tree that was just serialized" discipline.
+    Returns ``None`` when the on-disk document satisfies the image-ownership
+    invariant, or an ``{"error": ..., "orphan_image_paragraphs": [...],
+    "duplicate_relationships": {...}}`` dict on the first violation -- never a
+    false success payload.
+
+    ``require_immediate_caption`` (default ``True``) toggles rule (a)/(b)
+    above; pass ``False`` for a write whose OWN contract intentionally leaves
+    an image paragraph uncaptioned (see :func:`insert_image`). The duplicate
+    ``r:embed`` check always runs regardless of this flag.
+
+    ``allow_relationship_reuse`` (default ``False``, fail closed) is the
+    caller's explicit declaration that a detected relationship reuse is
+    intentional; when set, a detected duplicate is not reported as a
+    violation.
+    """
+    try:
+        raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write image-ownership verification failed: could not "
+                f"re-read {docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write image-ownership verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    body_list = list(body2)
+    w_p = _q(_W, "p")
+    w14_para_id = _q(_W14, "paraId")
+    image_paras = _direct_body_image_paragraphs(body2)
+
+    orphans: list[dict[str, Any]] = []
+    relationship_owners: dict[str, list[str]] = {}
+
+    pos = 0
+    while pos < len(image_paras):
+        # Group a run of CONSECUTIVE direct-body image paragraphs together --
+        # OOXML's own idiom for a multi-image composite (side-by-side images
+        # sharing one caption) is physical adjacency with nothing but more
+        # images in between; a run of length 1 is an ordinary single-image
+        # figure.
+        group_start = pos
+        while (
+            pos + 1 < len(image_paras)
+            and image_paras[pos + 1][0] == image_paras[pos][0] + 1
+        ):
+            pos += 1
+        group = image_paras[group_start:pos + 1]
+        pos += 1
+
+        last_idx = group[-1][0]
+        next_idx = last_idx + 1
+        has_caption = (
+            next_idx < len(body_list)
+            and body_list[next_idx].tag == w_p
+            and _has_figure_seq_field(body_list[next_idx])
+        )
+
+        if require_immediate_caption and not has_caption:
+            for member_idx, member_el in group:
+                orphans.append(
+                    {
+                        "para_id": member_el.get(w14_para_id)
+                        or f"body-index-{member_idx}",
+                        "body_index": member_idx,
+                        "composite_size": len(group),
+                        "reason": (
+                            "image paragraph is not immediately followed by a "
+                            "SEQ Figure caption, and is not declared as part "
+                            "of a multi-image composite that is"
+                            if len(group) == 1
+                            else "multi-image composite (adjacent image "
+                            "paragraphs) is not immediately followed by a "
+                            "shared SEQ Figure caption"
+                        ),
+                    }
+                )
+
+        block_key = group[0][1].get(w14_para_id) or f"body-index-{group[0][0]}"
+        for _member_idx, member_el in group:
+            for rel_id in _image_paragraph_relationship_ids(member_el):
+                relationship_owners.setdefault(rel_id, []).append(block_key)
+
+    duplicate_relationships = {
+        rel_id: sorted(set(owners))
+        for rel_id, owners in relationship_owners.items()
+        if len(set(owners)) > 1
+    }
+    if allow_relationship_reuse:
+        duplicate_relationships = {}
+
+    if orphans or duplicate_relationships:
+        return {
+            "error": (
+                "post-write image-ownership verification failed: the "
+                f"on-disk document at {docx_path} violates the image-"
+                "ownership invariant -- returning an error instead of a "
+                "false success payload"
+            ),
+            "orphan_image_paragraphs": orphans,
+            "duplicate_relationships": duplicate_relationships,
         }
     return None
 
@@ -2279,6 +3051,20 @@ def _build_caption_paragraph(
     ``"Figure 3"`` and stays correct across reordering/renumbering on Word's
     next field refresh, instead of hand-typed prose text going stale.
 
+    5b2ce3fb — the bookmark pair's numeric ``w:id`` is derived from
+    ``ref_bookmark``'s own digit suffix (every caller sources ``ref_bookmark``
+    from :func:`_next_ref_bookmark_name`, or a local seed reserved from it, so
+    that suffix is always both present and already document-unique) rather
+    than a hardcoded constant.  A previous hardcoded ``w:id="0"`` meant every
+    caption inserted into the same document produced ANOTHER bookmarkStart/
+    bookmarkEnd pair sharing that same id -- Word-invalid duplicate ``w:id``
+    markers that make bookmarkStart/bookmarkEnd pairing ambiguous the moment
+    more than one caption (or an internal note, see
+    :func:`_build_internal_note_paragraph`) exists in the file. The
+    ``w:name`` stays the sole human-readable identifier; ``w:id`` is now just
+    as unique, satisfying OOXML's per-document ``w:id`` uniqueness
+    requirement for bookmarks.
+
     4efc63fd — ``centered`` (from ``style_policy["caption_centered"]`` via
     :func:`resolve_style_policy`) adds ``w:jc w:val="center"`` to the
     paragraph; default ``False`` preserves this function's original output.
@@ -2298,8 +3084,13 @@ def _build_caption_paragraph(
         ET.SubElement(pPr, _q(_W, "jc"), {_q(_W, "val"): "center"})
 
     if ref_bookmark:
+        # 5b2ce3fb -- reuse ref_bookmark's own digit suffix as the numeric
+        # w:id (see docstring above) instead of a hardcoded "0" that
+        # collided across every caption in the same document.
+        bm_id_match = _REF_BOOKMARK_RE.match(ref_bookmark)
+        bm_id = bm_id_match.group(1) if bm_id_match else ref_bookmark
         bm_start = ET.SubElement(p, _q(_W, "bookmarkStart"))
-        bm_start.set(_q(_W, "id"), "0")
+        bm_start.set(_q(_W, "id"), bm_id)
         bm_start.set(_q(_W, "name"), ref_bookmark)
 
     # Run: "<kind> " prefix.
@@ -2317,7 +3108,7 @@ def _build_caption_paragraph(
 
     if ref_bookmark:
         bm_end = ET.SubElement(p, _q(_W, "bookmarkEnd"))
-        bm_end.set(_q(_W, "id"), "0")
+        bm_end.set(_q(_W, "id"), bm_id)
 
     # Run: ". <label_text>".
     r_label = ET.SubElement(p, _q(_W, "r"))
@@ -2642,6 +3433,186 @@ def _save_docx_with_image(
         handle.write(out.getvalue())
 
 
+def _verify_image_insertion_write(
+    docx_path: str,
+    *,
+    image_para_id: str,
+    expected_image_bytes: bytes,
+) -> dict[str, Any] | None:
+    """efa6cb53 -- post-write verification for :func:`insert_image`.
+
+    Re-reads ``docx_path`` FRESH FROM DISK (never the in-memory tree that was
+    just serialized -- that would only re-validate this function's own
+    intent, not the actual write) and confirms, in order: the image
+    paragraph is present and centered (``w:jc w:val="center"``); it still
+    contains a ``<w:drawing>`` whose ``<a:blip>`` references a relationship
+    id that ACTUALLY resolves in the freshly re-read
+    ``word/_rels/document.xml.rels``; that relationship's target names a
+    ``word/media/*`` part that is genuinely present in the freshly re-read
+    ZIP package (not merely referenced); that part's bytes match exactly
+    what was supposed to be written (a real, uncorrupted new media part, not
+    a dangling reference or a truncated/mismatched write); and that
+    ``[Content_Types].xml`` declares a content type for it. Returns ``None``
+    when every check passes, or an ``{"error": ...}`` dict on the first
+    mismatch -- mirroring :func:`_verify_figure_block_write`'s "real error
+    instead of a false success payload" discipline (9907df44), which
+    :func:`insert_image` itself never had until now.
+    """
+    try:
+        raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    w14_para_id = _q(_W14, "paraId")
+    image_para = next(
+        (el for el in body2.iter(_q(_W, "p")) if el.get(w14_para_id) == image_para_id),
+        None,
+    )
+    if image_para is None:
+        return {
+            "error": (
+                f"post-write verification failed: image paragraph "
+                f"{image_para_id!r} not found anywhere in {docx_path} after "
+                "the write"
+            )
+        }
+    if _paragraph_alignment(image_para) != "center":
+        return {
+            "error": (
+                "post-write verification failed: image paragraph "
+                f"{image_para_id!r} is not centered (w:jc=\"center\") after "
+                "the write"
+            )
+        }
+
+    blip = image_para.find(f".//{_q(_A, 'blip')}")
+    relationship_id = blip.get(_q(_IMAGE_REL_NS, "embed")) if blip is not None else None
+    if blip is None or not relationship_id:
+        return {
+            "error": (
+                "post-write verification failed: image paragraph "
+                f"{image_para_id!r} no longer contains a resolvable "
+                "<a:blip r:embed=...> reference after the write"
+            )
+        }
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw2)) as archive:
+            names = set(archive.namelist())
+            rels_bytes = (
+                archive.read("word/_rels/document.xml.rels")
+                if "word/_rels/document.xml.rels" in names
+                else None
+            )
+            content_types_bytes = (
+                archive.read("[Content_Types].xml")
+                if "[Content_Types].xml" in names
+                else None
+            )
+            media_bytes: bytes | None = None
+            media_part_name: str | None = None
+            if rels_bytes is not None:
+                rels_root2 = ET.fromstring(rels_bytes)
+                relationship = next(
+                    (child for child in rels_root2 if child.get("Id") == relationship_id),
+                    None,
+                )
+                if relationship is not None:
+                    target = relationship.get("Target") or ""
+                    if target.startswith("media/"):
+                        media_part_name = f"word/{target}"
+                    elif target.startswith("word/media/"):
+                        media_part_name = target
+                    if media_part_name is not None and media_part_name in names:
+                        media_bytes = archive.read(media_part_name)
+    except zipfile.BadZipFile as exc:
+        return {
+            "error": (
+                f"post-write verification failed: {docx_path} is not a "
+                f"readable ZIP package after the write: {exc}"
+            )
+        }
+
+    if rels_bytes is None:
+        return {
+            "error": (
+                "post-write verification failed: word/_rels/document.xml.rels "
+                f"is missing from {docx_path} after the write"
+            )
+        }
+    if media_part_name is None:
+        return {
+            "error": (
+                "post-write verification failed: relationship "
+                f"{relationship_id!r} referenced by the image is missing (or "
+                f"does not target a word/media/ part) in "
+                f"word/_rels/document.xml.rels of {docx_path} after the write"
+            )
+        }
+    if media_bytes is None:
+        return {
+            "error": (
+                "post-write verification failed: media part "
+                f"{media_part_name!r} referenced by relationship "
+                f"{relationship_id!r} is not actually present in the ZIP "
+                f"package of {docx_path} after the write"
+            )
+        }
+    if hashlib.sha256(media_bytes).hexdigest() != hashlib.sha256(expected_image_bytes).hexdigest():
+        return {
+            "error": (
+                "post-write verification failed: media part "
+                f"{media_part_name!r} in {docx_path} does not match the "
+                "image bytes that were supposed to be written -- the media "
+                "part is present but corrupted or mismatched"
+            )
+        }
+
+    if content_types_bytes is None:
+        return {
+            "error": (
+                "post-write verification failed: [Content_Types].xml is "
+                f"missing from {docx_path} after the write"
+            )
+        }
+    content_types_root2 = ET.fromstring(content_types_bytes)
+    extension = os.path.splitext(media_part_name)[1].lstrip(".").lower()
+    part_name_abs = f"/{media_part_name}"
+    has_content_type = any(
+        child.get("Extension", "").lower() == extension
+        for child in content_types_root2
+        if child.tag.rsplit("}", 1)[-1] == "Default"
+    ) or any(
+        child.get("PartName", "") == part_name_abs
+        for child in content_types_root2
+        if child.tag.rsplit("}", 1)[-1] == "Override"
+    )
+    if not has_content_type:
+        return {
+            "error": (
+                "post-write verification failed: [Content_Types].xml has no "
+                f"Default/Override declaring a content type for "
+                f"{media_part_name!r} in {docx_path} after the write"
+            )
+        }
+
+    return None
+
+
 def insert_image(
     docx_path: str,
     image_path: str,
@@ -2663,8 +3634,26 @@ def insert_image(
     inches; if omitted, dimensions are inferred from the image header when
     possible, with a six-inch default width.
 
+    679c86f4/efa6cb53 -- after the write, the file is re-read FRESH FROM DISK
+    and checked two ways: the image-ownership invariant
+    (:func:`_verify_image_ownership`, ``require_immediate_caption=False``
+    since this function's own contract intentionally leaves the new image
+    uncaptioned -- pair it with :func:`insert_caption` or use
+    :func:`insert_figure_block` for an atomic image+caption insert), and
+    that the brand-new relationship+media this call itself created actually
+    landed intact (:func:`_verify_image_insertion_write`: the image
+    paragraph must be present and centered, its relationship must resolve,
+    the referenced media part must genuinely exist in the ZIP package, its
+    bytes must match what was written, and its content type must be
+    declared). Either check failing fails the write closed: the pre-write
+    backup is restored (subject to the same compare-and-swap concurrent-
+    writer safety as every other write in this module, guarded against
+    clobbering a concurrent writer's already-promoted work -- 5988a5bb) and
+    an error is returned instead of a false success payload.
+
     Returns {status, image_para_id, image_name, docx_path}, or
-    {error: message} without mutating the document on validation failure.
+    {error: message} without mutating the document on validation failure or
+    a post-write verification failure that could not be cleanly restored.
     """
     if not isinstance(docx_path, str) or not docx_path:
         return {"error": "docx_path must be a non-empty string"}
@@ -2744,13 +3733,75 @@ def insert_image(
         )
     )
     body.insert(insert_at, paragraph)
-    try:
-        _save_docx_with_image(
-            raw, root, image_bytes, image_name, relationship_id,
-            image_type[1], docx_path
+
+    # 679c86f4/efa6cb53 -- hold docx_path's promotion lock across
+    # stage+promote (_save_docx_with_image is not itself lock-aware)
+    # THROUGH both post-write verification passes (image-ownership, then
+    # insertion-write) and any conditional restore below, matching the same
+    # discipline insert_figure_block already applies to this same save
+    # helper (5988a5bb) so a brand-new media part and relationship are
+    # never reported as "inserted" unless a fresh re-read from disk
+    # actually proves it landed intact. promoted_sha256 is computed
+    # locally right after the write for the same reason insert_figure_
+    # block's own comment gives: this function is one of
+    # _save_docx_with_image's several callers, so the helper itself cannot
+    # return a shared transaction dict.
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_image(
+                raw, root, image_bytes, image_name, relationship_id,
+                image_type[1], docx_path
+            )
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = _docx_file_sha256(docx_path)
+
+        verify_error = _verify_image_ownership(
+            docx_path, require_immediate_caption=False
         )
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+        if verify_error is None:
+            verify_error = _verify_image_insertion_write(
+                docx_path,
+                image_para_id=image_para_id,
+                expected_image_bytes=image_bytes,
+            )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to docx_path
+            # since our own promotion, in which case this verification
+            # "failure" is a false positive and restoring from our own
+            # backup would destroy that writer's completed, already-
+            # promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["image_para_id"] = image_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
     _invalidate_sidecar_mtime(index_db_path)
     return {
         "status": "inserted",
@@ -2898,6 +3949,8 @@ def insert_figure_block(
     section_heading: str | None = None,
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """19be1551 — atomically insert a centered image paragraph AND its
     adjacent real SEQ Figure caption in a SINGLE document-load-mutate-save
@@ -2948,10 +4001,27 @@ def insert_figure_block(
     Supported image formats, dimension inference, and the six-inch default
     width all match :func:`insert_image`.
 
+    ddd79188 -- AFTER structural verification passes, this also invokes
+    :func:`render_gate.check_render_capability` on the just-written
+    ``docx_path`` (see :func:`_enforce_render_verification`) -- structural
+    XML re-parse alone (the check above) can never prove the document
+    actually opens/renders correctly in Word. ``"rendered"`` continues
+    normally with render evidence attached to the success payload.
+    ``"failed"`` (a render backend WAS available but errored on this
+    document) restores ``docx_path`` from the SAME pre-write backup and
+    returns an error -- exactly like a structural verification failure.
+    ``"unavailable-with-reason"`` (no render backend in this environment)
+    ALSO fails closed by default -- it is never reported as verified --
+    unless the caller explicitly passes ``allow_degraded_render=True`` with
+    a non-empty ``degraded_render_reason``, an audited opt-in that keeps the
+    write but stamps ``render_verified=False`` / ``render_degraded=True`` on
+    the payload rather than silently treating "could not check" as "passed".
+
     Returns ``{status, image_para_id, image_name, kind, seq_number,
-    label_text, section_heading, ref_bookmark, docx_path}``, or
-    ``{"error": message}`` without mutating the document on validation
-    failure or verification failure that could not be cleanly restored.
+    label_text, section_heading, ref_bookmark, docx_path, render_status,
+    render_verified, ...}``, or ``{"error": message}`` without mutating the
+    document on validation failure, structural verification failure, or
+    render-verification failure that could not be cleanly restored.
     """
     if not isinstance(docx_path, str) or not docx_path:
         return {"error": "docx_path must be a non-empty string"}
@@ -2961,6 +4031,16 @@ def insert_figure_block(
         return {"error": "position must be before or after"}
     if not label_text or not str(label_text).strip():
         return {"error": "label_text must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
     suffix = os.path.splitext(image_path)[1].lower()
     image_type = _IMAGE_TYPES.get(suffix)
     if image_type is None:
@@ -3123,6 +4203,22 @@ def insert_figure_block(
             verify_error["docx_path"] = docx_path
             return verify_error
 
+        # ddd79188 -- structural verification alone (above) can never prove
+        # the document actually renders in Word; run the real render-
+        # capability gate now, still inside the promotion lock so a
+        # fail-closed restore has the same CAS safety a structural failure
+        # gets. Must run AFTER structural verification, not instead of it.
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["image_para_id"] = image_para_id
+            render_error["docx_path"] = docx_path
+            return render_error
+
     _invalidate_sidecar_mtime(index_db_path)
     if index_db_path and os.path.exists(index_db_path):
         _upsert_sidecar_caption(
@@ -3145,6 +4241,7 @@ def insert_figure_block(
         "section_heading": section_heading,
         "ref_bookmark": ref_bookmark,
         "docx_path": docx_path,
+        **render_info,
     }
 
 
@@ -3254,6 +4351,103 @@ def find_image_paragraph(
 # Public caption API: insert / edit / remove
 # ---------------------------------------------------------------------------
 
+def _verify_caption_write(
+    docx_path: str,
+    *,
+    ref_bookmark: str,
+    kind: str,
+    expected_seq_number: int,
+    expected_label_text: str,
+) -> dict[str, Any] | None:
+    """9d749639 follow-up (ddd79188) — post-write verification for
+    :func:`insert_caption`, mirroring :func:`_verify_figure_block_write`'s
+    "brand new content, no prior on-disk baseline to diff against" style
+    (:func:`_verify_docx_write`'s count/hash comparison has nothing to diff
+    a freshly inserted caption against).
+
+    Re-reads ``docx_path`` FRESH FROM DISK and locates the caption paragraph
+    by its unique ``ref_bookmark`` (1c59cb90's ``_Ref<digits>`` bookmark,
+    document-unique and assigned before the write) rather than by position —
+    positions shift, bookmarks don't. Confirms that paragraph still carries a
+    ``SEQ <kind>`` field with the expected cached number and the expected
+    label text. Returns ``None`` when every check passes, or an
+    ``{"error": ...}`` dict on the first mismatch.
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    w_bookmark_start = _q(_W, "bookmarkStart")
+    w_p = _q(_W, "p")
+    caption_para = next(
+        (
+            child
+            for child in body2
+            if child.tag == w_p
+            and any(
+                bm.get(_q(_W, "name")) == ref_bookmark
+                for bm in child.findall(w_bookmark_start)
+            )
+        ),
+        None,
+    )
+    if caption_para is None:
+        return {
+            "error": (
+                "post-write verification failed: no caption paragraph "
+                f"carrying bookmark {ref_bookmark!r} was found in "
+                f"{docx_path} after the write"
+            )
+        }
+
+    fld = caption_para.find(_q(_W, "fldSimple"))
+    instr = fld.get(_q(_W, "instr")) if fld is not None else None
+    if fld is None or f"SEQ {kind}" not in (instr or ""):
+        return {
+            "error": (
+                "post-write verification failed: caption paragraph "
+                f"(bookmark {ref_bookmark!r}) does not contain a SEQ {kind} "
+                "field after the write"
+            )
+        }
+    seq_text_el = fld.find(f".//{_q(_W, 't')}")
+    seq_text = seq_text_el.text if seq_text_el is not None else None
+    if seq_text != str(expected_seq_number):
+        return {
+            "error": (
+                "post-write verification failed: caption SEQ number "
+                f"mismatch (expected {expected_seq_number!r}, got "
+                f"{seq_text!r})"
+            )
+        }
+
+    caption_text = "".join(t.text or "" for t in caption_para.iter(_q(_W, "t")))
+    if expected_label_text not in caption_text:
+        return {
+            "error": (
+                "post-write verification failed: caption label text "
+                f"mismatch (expected to contain {expected_label_text!r}, "
+                f"got {caption_text!r})"
+            )
+        }
+    return None
+
+
 def insert_caption(
     docx_path: str,
     anchor_para_id: str,
@@ -3263,6 +4457,8 @@ def insert_caption(
     section_heading: str | None = None,
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real Word Caption paragraph into a .docx file.
 
@@ -3277,6 +4473,23 @@ def insert_caption(
     4efc63fd — ``style_policy["caption_centered"]`` (default ``False``, via
     :func:`resolve_style_policy`) controls whether the new caption paragraph
     gets ``w:jc w:val="center"``.
+
+    ddd79188 — AFTER the write is staged, structurally verified (see
+    :func:`_verify_caption_write`), and promoted, a real Word/COM (or
+    LibreOffice) render-capability check also runs against the just-written
+    file (:func:`_enforce_render_verification`), mirroring the same gate
+    :func:`insert_figure_block` already enforces: structural XML re-parse
+    alone can never prove the document actually opens/renders in Word.
+    ``"rendered"`` continues normally with render evidence attached to the
+    success payload. ``"failed"`` (a render backend WAS available but errored
+    on this document) restores ``docx_path`` from the pre-write backup and
+    returns an error — exactly like a structural verification failure.
+    ``"unavailable-with-reason"`` (no render backend in this environment)
+    ALSO fails closed by default — never reported as verified — unless the
+    caller explicitly passes ``allow_degraded_render=True`` with a non-empty
+    ``degraded_render_reason``, an audited opt-in that keeps the write but
+    stamps ``render_verified=False`` / ``render_degraded=True`` on the
+    payload rather than silently treating "could not check" as "passed".
 
     Args:
         docx_path:       Absolute path to the .docx file (mutated in place).
@@ -3296,14 +4509,29 @@ def insert_caption(
                          after the write so the next read auto-reindexes.
         style_policy:    Optional overrides merged via
                          :func:`resolve_style_policy`.
+        allow_degraded_render: ddd79188 — explicit, audited opt-in to accept
+                         this write when no render backend is available in
+                         this environment (render status
+                         "unavailable-with-reason"). Requires
+                         degraded_render_reason. Never bypasses a real render
+                         "failed" status.
+        degraded_render_reason: Required, non-empty when
+                         allow_degraded_render is True; carried onto the
+                         result as an audit trail (this stdlib-only, DB-free
+                         extension does not persist it itself — a caller with
+                         DB access, e.g. Meridian core, is responsible for
+                         logging/pinning it).
 
     Returns:
         ``{status, kind, seq_number, label_text, section_heading, ref_bookmark,
-        docx_path}`` or ``{"error": <message>}`` on failure (file is NOT
-        mutated on error).  ``ref_bookmark`` (1c59cb90) is the ``_Ref<digits>``
-        bookmark name wrapping the caption's "<Kind> <N>" text — pass it as
-        ``bookmark_name`` to :func:`insert_cross_reference` to insert a live
-        "Figure N" prose reference elsewhere that survives reordering.
+        docx_path, render_status, render_verified, render_backend,
+        render_detail}`` or ``{"error": <message>}`` on failure (file NOT
+        left mutated on validation failure; restored from backup on a
+        structural- or render-verification failure).  ``ref_bookmark``
+        (1c59cb90) is the ``_Ref<digits>`` bookmark name wrapping the
+        caption's "<Kind> <N>" text — pass it as ``bookmark_name`` to
+        :func:`insert_cross_reference` to insert a live "Figure N" prose
+        reference elsewhere that survives reordering.
     """
     kind = str(kind).strip()
     if kind not in ("Figure", "Table"):
@@ -3324,6 +4552,16 @@ def insert_caption(
         }
     if not label_text or not str(label_text).strip():
         return {"error": "label_text must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
 
     try:
         policy = resolve_style_policy(style_policy)
@@ -3345,10 +4583,11 @@ def insert_caption(
 
     seq_number = _count_seq_captions(root, kind) + 1
     ref_bookmark = _next_ref_bookmark_name(root)
+    label_text_clean = label_text.strip()
 
     caption_p = _build_caption_paragraph(
         kind=kind,
-        label_text=label_text.strip(),
+        label_text=label_text_clean,
         seq_cached=str(seq_number),
         ref_bookmark=ref_bookmark,
         centered=policy["caption_centered"],
@@ -3357,10 +4596,78 @@ def insert_caption(
     insert_at = child_idx if position == "before" else child_idx + 1
     body.insert(insert_at, caption_p)
 
-    try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    # ddd79188 -- hold docx_path's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write structural verify, any conditional restore, and
+    # the real render-capability gate below -- closing the same-process
+    # window between promotion and verify/restore entirely (see
+    # _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_caption_write(
+            docx_path,
+            ref_bookmark=ref_bookmark,
+            kind=kind,
+            expected_seq_number=seq_number,
+            expected_label_text=label_text_clean,
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to docx_path
+            # since our own promotion, in which case this verification
+            # "failure" is a false positive and restoring from our own
+            # backup would destroy that writer's completed, already-
+            # promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["kind"] = kind
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        # ddd79188 -- structural verification alone (above) can never prove
+        # the document actually renders in Word; run the real render-
+        # capability gate now, still inside the promotion lock so a
+        # fail-closed restore has the same CAS safety a structural failure
+        # gets. Must run AFTER structural verification, not instead of it.
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["kind"] = kind
+            render_error["docx_path"] = docx_path
+            return render_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
@@ -3370,7 +4677,7 @@ def insert_caption(
             kind=kind,
             para_id=None,  # newly inserted para has no w14:paraId yet
             seq_number=str(seq_number),
-            caption_text=f"{kind} {seq_number}. {label_text.strip()}",
+            caption_text=f"{kind} {seq_number}. {label_text_clean}",
             section_heading=section_heading,
             ref_bookmark=ref_bookmark,
         )
@@ -3379,10 +4686,11 @@ def insert_caption(
         "status": "inserted",
         "kind": kind,
         "seq_number": seq_number,
-        "label_text": label_text.strip(),
+        "label_text": label_text_clean,
         "section_heading": section_heading,
         "ref_bookmark": ref_bookmark,
         "docx_path": docx_path,
+        **render_info,
     }
 
 
@@ -5330,6 +6638,107 @@ def _build_omath_paragraph(
     return p
 
 
+def _verify_equation_write(
+    docx_path: str,
+    *,
+    position: str,
+    anchor_para_id: str,
+    insert_at: int | None,
+    expected_flat_text: str,
+) -> dict[str, Any] | None:
+    """a80af3a0 follow-up (ddd79188) — post-write verification for
+    :func:`insert_equation_local`, mirroring :func:`_verify_figure_block_write`'s
+    "brand new content, no prior on-disk baseline to diff against" style.
+
+    Re-reads ``docx_path`` FRESH FROM DISK. For ``position="append"``, the
+    anchor paragraph itself was mutated (nothing new was inserted at the body
+    level) so it is re-resolved via :func:`_find_para_by_id` using the SAME
+    ``anchor_para_id`` the caller was given. For ``position="before"``/
+    ``"after"``, a brand-new paragraph carries no bookmark or native id of
+    its own (unlike :func:`insert_caption`/:func:`insert_highlighted_note`'s
+    paragraphs) — it is located by the exact body index (``insert_at``) it
+    was spliced into, still inside the SAME promotion-lock critical section
+    as our own promotion, mirroring :func:`_verify_docx_write`'s
+    ``expected_range`` positional check.
+
+    Either way, confirms the located paragraph contains an ``<m:oMath>``
+    whose flattened ``<m:t>`` text content (:func:`_omml_flatten_text_local`)
+    matches ``expected_flat_text``. Returns ``None`` when every check
+    passes, or an ``{"error": ...}`` dict on the first mismatch.
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    if position == "append":
+        located = _find_para_by_id(root2, anchor_para_id)
+        if located is None:
+            return {
+                "error": (
+                    "post-write verification failed: anchor paragraph "
+                    f"{anchor_para_id!r} not found in {docx_path} after "
+                    "the write"
+                )
+            }
+        _abody, para_elem, _acidx = located
+        where = f"anchor paragraph {anchor_para_id!r}"
+    else:
+        body_list = list(body2)
+        if insert_at is None or insert_at >= len(body_list):
+            return {
+                "error": (
+                    "post-write verification failed: expected a new "
+                    f"equation paragraph at body index {insert_at!r} in "
+                    f"{docx_path} after the write, but the document only "
+                    f"has {len(body_list)} top-level element(s)"
+                )
+            }
+        para_elem = body_list[insert_at]
+        if para_elem.tag != _q(_W, "p"):
+            return {
+                "error": (
+                    "post-write verification failed: body index "
+                    f"{insert_at!r} is not a paragraph in {docx_path} after "
+                    "the write"
+                )
+            }
+        where = f"new equation paragraph at body index {insert_at!r}"
+
+    omath_els = para_elem.findall(f".//{_qm('oMath')}")
+    if not omath_els:
+        return {
+            "error": (
+                f"post-write verification failed: {where} does not contain "
+                f"an <m:oMath> element in {docx_path} after the write"
+            )
+        }
+    actual_flat_text = "".join(t.text or "" for t in omath_els[-1].iter(_qm("t")))
+    if actual_flat_text != expected_flat_text:
+        return {
+            "error": (
+                f"post-write verification failed: equation content "
+                f"mismatch in {where} (expected flattened text "
+                f"{expected_flat_text!r}, got {actual_flat_text!r})"
+            )
+        }
+    return None
+
+
 def insert_equation_local(
     docx_path: str,
     anchor_para_id: str,
@@ -5337,6 +6746,8 @@ def insert_equation_local(
     position: str = "after",
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Insert an equation into a .docx file.
 
@@ -5359,6 +6770,19 @@ def insert_equation_local(
     default 0 / no indent). Not consulted for ``position="append"`` (inline
     equations have no paragraph of their own to style).
 
+    ddd79188 — AFTER the write is staged, structurally verified (see
+    :func:`_verify_equation_write`), and promoted, a real Word/COM (or
+    LibreOffice) render-capability check also runs against the just-written
+    file (:func:`_enforce_render_verification`), mirroring the same gate
+    :func:`insert_figure_block` already enforces: structural XML re-parse
+    alone can never prove the document actually opens/renders in Word.
+    ``"rendered"`` continues normally with render evidence attached to the
+    success payload. ``"failed"`` restores ``docx_path`` from the pre-write
+    backup and returns an error. ``"unavailable-with-reason"`` (no render
+    backend in this environment) ALSO fails closed by default — never
+    reported as verified — unless the caller explicitly passes
+    ``allow_degraded_render=True`` with a non-empty ``degraded_render_reason``.
+
     Args:
         docx_path:       Absolute path to the .docx file (mutated in place).
         anchor_para_id:  ``w14:paraId`` or ``p{N}`` / ``tbl{N}`` of the
@@ -5371,15 +6795,34 @@ def insert_equation_local(
         style_policy:    Optional overrides merged via
                          :func:`resolve_style_policy`; see that function's
                          docstring for keys.
+        allow_degraded_render: ddd79188 — explicit, audited opt-in to accept
+                         this write when no render backend is available in
+                         this environment. Requires degraded_render_reason.
+        degraded_render_reason: Required, non-empty when
+                         allow_degraded_render is True; carried onto the
+                         result as an audit trail.
 
     Returns:
-        ``{status, position, para_id, omml, docx_path}``
-        or ``{"error": <message>}`` on failure (file NOT mutated on error).
+        ``{status, position, para_id, omml, docx_path, render_status,
+        render_verified, render_backend, render_detail}``
+        or ``{"error": <message>}`` on failure (file NOT left mutated on
+        validation failure; restored from backup on a structural- or
+        render-verification failure).
     """
     if position not in ("before", "after", "append"):
         return {"error": f"position must be 'before', 'after', or 'append', got {position!r}"}
     if not payload or not str(payload).strip():
         return {"error": "payload must be a non-empty string (OMML XML or LaTeX)"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
 
     try:
         policy = resolve_style_policy(style_policy)
@@ -5407,6 +6850,7 @@ def insert_equation_local(
 
     body, anchor_elem, child_idx = result
 
+    insert_at: int | None = None
     if position == "append":
         # Inline: append <m:oMath> directly to the anchor paragraph.
         omath_el = ET.fromstring(omml)
@@ -5421,10 +6865,82 @@ def insert_equation_local(
         insert_at = child_idx if position == "before" else child_idx + 1
         body.insert(insert_at, new_p)
 
-    try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    expected_flat_text = _omml_flatten_text_local(omml)
+
+    # ddd79188 -- hold docx_path's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write structural verify, any conditional restore, and
+    # the real render-capability gate below -- closing the same-process
+    # window between promotion and verify/restore entirely (see
+    # _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_equation_write(
+            docx_path,
+            position=position,
+            anchor_para_id=anchor_para_id,
+            insert_at=insert_at,
+            expected_flat_text=expected_flat_text,
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to docx_path
+            # since our own promotion, in which case this verification
+            # "failure" is a false positive and restoring from our own
+            # backup would destroy that writer's completed, already-
+            # promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["position"] = position
+            verify_error["para_id"] = anchor_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        # ddd79188 -- structural verification alone (above) can never prove
+        # the document actually renders in Word; run the real render-
+        # capability gate now, still inside the promotion lock so a
+        # fail-closed restore has the same CAS safety a structural failure
+        # gets. Must run AFTER structural verification, not instead of it.
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["position"] = position
+            render_error["para_id"] = anchor_para_id
+            render_error["docx_path"] = docx_path
+            return render_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
@@ -5434,6 +6950,7 @@ def insert_equation_local(
         "para_id": anchor_para_id,
         "omml": omml,
         "docx_path": docx_path,
+        **render_info,
     }
 
 
@@ -6952,8 +8469,20 @@ def _next_note_bookmark_name(root: ET.Element) -> str:
     Mirrors :func:`_next_ref_bookmark_name` but with its own numbering track
     so internal-note bookmarks never collide with caption cross-reference
     bookmarks even though both live in the same w:bookmarkStart namespace.
+
+    5b2ce3fb -- seeded at 200000000 (mirroring :func:`_next_ref_bookmark_name`'s
+    own 100000000 baseline for the identical reason): :func:`_build_internal_note_paragraph`
+    reuses this name's digit suffix verbatim as the paragraph's numeric
+    ``w:bookmarkStart``/``w:bookmarkEnd`` ``w:id`` (see that function), so the
+    number must stay clear of the small sequential ids (0, 1, 2, ...) Word
+    itself assigns to bookmarks a human author creates -- a low seed like the
+    previous ``0`` would reliably collide with those on any document that
+    already has real bookmarks, producing Word-invalid duplicate ``w:id``
+    markers. Distinct from the ``_Ref`` range (100000000-199999999) so the
+    two schemes stay visually and numerically separate, matching this
+    function's own "never collide" docstring claim above.
     """
-    max_seen = 0
+    max_seen = 200000000 - 1
     for bm in root.iter(_q(_W, "bookmarkStart")):
         name = bm.get(_q(_W, "name")) or ""
         m = _INTERNAL_NOTE_BOOKMARK_RE.match(name)
@@ -6979,14 +8508,28 @@ def _build_internal_note_paragraph(
     4efc63fd -- ``highlight_color`` (from
     ``style_policy["note_highlight_color"]`` via :func:`resolve_style_policy`)
     defaults to the original hardcoded ``"yellow"``.
+
+    5b2ce3fb -- the bookmark pair's numeric ``w:id`` is derived from
+    ``note_id``'s own digit suffix (the sole caller sources ``note_id`` from
+    :func:`_next_note_bookmark_name`, so that suffix is always present and
+    already document-unique) instead of a hardcoded constant. A previous
+    hardcoded ``w:id="0"`` meant every internal note (and every caption, see
+    :func:`_build_caption_paragraph`) inserted into the same document
+    produced ANOTHER bookmarkStart/bookmarkEnd pair sharing that id --
+    Word-invalid duplicate ``w:id`` markers that make bookmarkStart/
+    bookmarkEnd pairing ambiguous the moment more than one such element
+    exists in the file.
     """
     p = ET.Element(_q(_W, "p"))
     pPr = ET.SubElement(p, _q(_W, "pPr"))
     pStyle = ET.SubElement(pPr, _q(_W, "pStyle"))
     pStyle.set(_q(_W, "val"), style)
 
+    bm_id_match = _INTERNAL_NOTE_BOOKMARK_RE.match(note_id)
+    bm_id = bm_id_match.group(1) if bm_id_match else note_id
+
     bm_start = ET.SubElement(p, _q(_W, "bookmarkStart"))
-    bm_start.set(_q(_W, "id"), "0")
+    bm_start.set(_q(_W, "id"), bm_id)
     bm_start.set(_q(_W, "name"), note_id)
 
     r = ET.SubElement(p, _q(_W, "r"))
@@ -6998,7 +8541,7 @@ def _build_internal_note_paragraph(
     t.text = text
 
     bm_end = ET.SubElement(p, _q(_W, "bookmarkEnd"))
-    bm_end.set(_q(_W, "id"), "0")
+    bm_end.set(_q(_W, "id"), bm_id)
     return p
 
 
@@ -7354,10 +8897,91 @@ def get_section_content(docx_path: str, heading_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# b2035fb4 -- literal-text reference profiles for find_references_to.
+#
+# The field-based scan below only ever sees REF/PAGEREF/NOTEREF fields --
+# nothing in OOXML distinguishes an intentional literal mention ("as shown in
+# Figure 5.21") from any other prose, so a caption referenced only by typed-in
+# text is invisible to it. Each "profile" is just the alias words + number
+# shape for one caption kind (deliberately named like
+# :func:`resolve_style_policy`'s vocabulary even though this scan is
+# read-only and has no policy to persist).  Figure/Table are the only kinds
+# find_references_to can currently resolve a "current number" for (via
+# :func:`_caption_kind_and_seq`, which reads SEQ Figure / SEQ Table fields);
+# Equation is included in the profile table for symmetry with any future
+# SEQ-Equation-backed caption support, but is inert until a target actually
+# resolves to that kind.
+# ---------------------------------------------------------------------------
+_LITERAL_REF_ALIASES: dict[str, tuple[str, ...]] = {
+    "Figure": ("Figure", r"Fig\."),
+    "Table": ("Table", r"Tab\."),
+    "Equation": ("Equation", r"Eq\."),
+}
+_LITERAL_REF_NUMBER = r"(\d+(?:\.\d+)*)"
+_FIELD_DRIVEN_TYPES = frozenset({"REF", "PAGEREF", "NOTEREF", "SEQ"})
+
+
+def _literal_reference_pattern(kind: str) -> re.Pattern[str] | None:
+    """Compile the literal-text reference regex for ``kind`` (``None`` if
+    ``kind`` has no registered profile)."""
+    aliases = _LITERAL_REF_ALIASES.get(kind)
+    if not aliases:
+        return None
+    alt = "|".join(aliases)
+    return re.compile(rf"\b(?:{alt})\s+{_LITERAL_REF_NUMBER}", re.IGNORECASE)
+
+
+_LITERAL_REF_PATTERNS: dict[str, re.Pattern[str]] = {
+    kind: _literal_reference_pattern(kind) for kind in _LITERAL_REF_ALIASES
+}
+
+
+def _block_has_field_driven_text(block: dict[str, Any]) -> bool:
+    """True when ``block`` contains a REF/PAGEREF/NOTEREF/SEQ field.
+
+    Such a block's ``text`` is (at least partly) a field's CACHED rendering
+    (e.g. a REF field's cached display text is literally ``"Figure 1"``, and
+    a caption paragraph's own text embeds its SEQ number) rather than
+    typed-in prose -- scanning it for literal references would either
+    double-count a reference the field-based scan already found, or flag a
+    caption's own number against itself. Literal scanning skips these blocks
+    entirely so ``literal_references`` only ever reports genuine plain text.
+    """
+    return any(
+        fld.get("field_type") in _FIELD_DRIVEN_TYPES for fld in block.get("fields", [])
+    )
+
+
+def _current_kind_number_counts(blocks: list[dict[str, Any]], kind: str) -> dict[str, int]:
+    """Count how many live captions of ``kind`` (``"Figure"``/``"Table"``)
+    currently cache each SEQ number, across ``blocks`` from
+    :func:`document_content_tree`.
+
+    Mirrors :func:`renumber_sequences`'s own collision bookkeeping so a
+    literal match against a number two DIFFERENT captions currently share is
+    reported ``"ambiguous"`` rather than a false-confident ``"exact"``.
+    """
+    is_caption = _is_figure_caption if kind == "Figure" else _is_table_caption
+    seq_re = _SEQ_FIGURE_RE if kind == "Figure" else _SEQ_TABLE_RE
+    counts: dict[str, int] = {}
+    for block in blocks:
+        if not is_caption(block):
+            continue
+        num = _seq_cached_number(block, seq_re)
+        if num:
+            counts[num] = counts.get(num, 0) + 1
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # Public API 2/9: find_references_to (fea654f9)
 # ---------------------------------------------------------------------------
 
-def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
+def find_references_to(
+    docx_path: str,
+    target_id: str,
+    include_literal: bool = True,
+) -> dict[str, Any]:
     """fea654f9 -- find everything that points AT a figure/table/heading id.
 
     The missing inverse of :func:`insert_cross_reference`: given a target
@@ -7378,6 +9002,32 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
         (covers manually-bookmarked headings; there is no automatic
         heading-bookmark mechanism elsewhere in this module).
 
+    b2035fb4 -- when the target resolves to a Figure/Table caption (so its
+    CURRENT cached SEQ number is known) and ``include_literal`` is True
+    (the default), a second, independent scan runs over every plain-text
+    paragraph/table cell -- excluding any block that itself carries a
+    REF/PAGEREF/NOTEREF/SEQ field, see :func:`_block_has_field_driven_text`
+    -- for literal mentions like ``"Figure 5.21"`` or ``"Table 11"`` using
+    the alias/number profile in ``_LITERAL_REF_ALIASES``. Each hit is
+    classified:
+      - ``"exact"``: the matched number equals the target's current cached
+        number, and no OTHER live caption of the same kind currently shares
+        that number.
+      - ``"ambiguous"``: the matched number equals the target's current
+        cached number, but at least one other live caption of the same kind
+        ALSO currently caches that number (a numbering collision), so the
+        literal text cannot be confidently attributed to this target alone.
+      - ``"stale"``: the matched number does not equal the target's current
+        cached number -- almost always a manually-typed reference that
+        predates a renumbering and was never updated by hand (this is the
+        motivating gap: :func:`renumber_sequences` fixes REF field caches
+        automatically, but has no way to find or fix literal prose).
+    These never mutate the document and never suppress the field-based
+    ``references`` list -- ``combined_references`` is the closure of both,
+    meant to be reviewed BEFORE calling :func:`renumber_sequences` so any
+    ``"stale"``/``"ambiguous"`` literal mention can be triaged by a human
+    while the pre-renumber numbers are still visible in the report.
+
     This is read-only -- it never mutates ``docx_path`` and never retrofits a
     missing bookmark (unlike :func:`insert_cross_reference`, which creates
     one when the target caption predates cross-reference support).
@@ -7385,12 +9035,20 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
     Args:
         docx_path: Absolute path to the .docx file.
         target_id: A caption/heading para_id, or an existing bookmark name.
+        include_literal: When True (default), also run the literal-text scan
+            described above. Set False to reproduce the pre-b2035fb4,
+            field-only behavior exactly.
 
     Returns:
         ``{target_id, target_kind, bookmark_names, references,
-        reference_count, docx_path}`` where each entry in ``references`` is
-        ``{para_id, index, field_type, bookmark_name, display_text,
-        paragraph_text}``.
+        reference_count, literal_references, literal_reference_count,
+        combined_references, combined_reference_count, docx_path}``.
+        Each entry in ``references`` is ``{para_id, index, field_type,
+        bookmark_name, display_text, paragraph_text, match_kind="field"}``.
+        Each entry in ``literal_references`` is ``{para_id, index,
+        match_kind="literal", field_type=None, matched_text, matched_number,
+        status, paragraph_text}``. ``combined_references`` is simply
+        ``references + literal_references``.
 
         ``{"error": <message>}`` when ``docx_path`` cannot be read, or
         ``target_id`` cannot be resolved to anything in the document.
@@ -7408,6 +9066,8 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
 
     bookmark_names: list[str] = []
     target_kind = "bookmark"
+    kind_seq: tuple[str, str] | None = None
+    own_body_idx: int | None = None
 
     if _REF_BOOKMARK_RE.match(target_id) or target_id.startswith(_BIBKEY_BOOKMARK_PREFIX) \
             or _INTERNAL_NOTE_BOOKMARK_RE.match(target_id):
@@ -7417,11 +9077,21 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
         if not found_directly:
             return {"error": f"bookmark {target_id!r} not found in {docx_path}"}
         bookmark_names.append(target_id)
+
+        if _REF_BOOKMARK_RE.match(target_id):
+            caption_hit = _find_caption_by_ref_bookmark(root, target_id)
+            if caption_hit is not None:
+                caption_elem, kind_seq = caption_hit
+                target_kind = kind_seq[0]
+                body_children = list(body)
+                if caption_elem in body_children:
+                    own_body_idx = body_children.index(caption_elem)
     else:
         result = _find_para_by_id(root, target_id)
         if result is None:
             return {"error": f"para_id {target_id!r} not found in {docx_path}"}
         _body, target_elem, _idx = result
+        own_body_idx = _idx
 
         kind_seq = _caption_kind_and_seq(target_elem)
         if kind_seq is not None:
@@ -7442,6 +9112,10 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
             "bookmark_names": [],
             "references": [],
             "reference_count": 0,
+            "literal_references": [],
+            "literal_reference_count": 0,
+            "combined_references": [],
+            "combined_reference_count": 0,
             "note": (
                 "target paragraph carries no bookmark, so no REF/PAGEREF field "
                 "could possibly point at it yet -- nothing to find. If this is "
@@ -7473,7 +9147,45 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
                     "bookmark_name": bm_target,
                     "display_text": fld.get("cached_result"),
                     "paragraph_text": block.get("text", ""),
+                    "match_kind": "field",
                 })
+
+    own_para_id = (
+        blocks[own_body_idx].get("para_id")
+        if own_body_idx is not None and 0 <= own_body_idx < len(blocks)
+        else None
+    )
+
+    literal_references: list[dict[str, Any]] = []
+    if include_literal and kind_seq is not None:
+        literal_kind, current_number = kind_seq
+        pattern = _LITERAL_REF_PATTERNS.get(literal_kind)
+        if pattern is not None:
+            number_counts = _current_kind_number_counts(blocks, literal_kind)
+            for block in blocks:
+                if own_para_id is not None and block.get("para_id") == own_para_id:
+                    continue
+                if _block_has_field_driven_text(block):
+                    continue
+                text = block.get("text") or ""
+                for m in pattern.finditer(text):
+                    matched_number = m.group(1)
+                    if matched_number == current_number:
+                        status = (
+                            "ambiguous" if number_counts.get(matched_number, 0) > 1 else "exact"
+                        )
+                    else:
+                        status = "stale"
+                    literal_references.append({
+                        "para_id": block.get("para_id"),
+                        "index": block.get("index"),
+                        "match_kind": "literal",
+                        "field_type": None,
+                        "matched_text": m.group(0),
+                        "matched_number": matched_number,
+                        "status": status,
+                        "paragraph_text": text,
+                    })
 
     return {
         "target_id": target_id,
@@ -7481,6 +9193,10 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
         "bookmark_names": bookmark_names,
         "references": references,
         "reference_count": len(references),
+        "literal_references": literal_references,
+        "literal_reference_count": len(literal_references),
+        "combined_references": references + literal_references,
+        "combined_reference_count": len(references) + len(literal_references),
         "docx_path": docx_path,
     }
 
@@ -7721,6 +9437,78 @@ def renumber_sequences(docx_path: str, index_db_path: str | None = None) -> dict
 # Public API 5/9: insert_highlighted_note + list_internal_notes (65c8eb31)
 # ---------------------------------------------------------------------------
 
+def _verify_note_write(
+    docx_path: str,
+    *,
+    note_id: str,
+    expected_text: str,
+) -> dict[str, Any] | None:
+    """65c8eb31 follow-up (ddd79188) — post-write verification for
+    :func:`insert_highlighted_note`'s ``mode="inline"`` path, mirroring
+    :func:`_verify_figure_block_write`'s "brand new content, no prior
+    on-disk baseline to diff against" style.
+
+    Re-reads ``docx_path`` FRESH FROM DISK and locates the note paragraph by
+    its unique ``_MNote<digits>`` bookmark (assigned before the write via
+    :func:`_next_note_bookmark_name`) rather than by position — positions
+    shift, bookmarks don't. Confirms that paragraph's full text matches
+    ``expected_text`` exactly. Returns ``None`` when every check passes, or
+    an ``{"error": ...}`` dict on the first mismatch.
+    """
+    try:
+        _raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                "post-write verification failed: re-read of "
+                f"{docx_path} has no <w:body> element"
+            )
+        }
+
+    w_bookmark_start = _q(_W, "bookmarkStart")
+    w_p = _q(_W, "p")
+    note_para = next(
+        (
+            child
+            for child in body2
+            if child.tag == w_p
+            and any(
+                bm.get(_q(_W, "name")) == note_id
+                for bm in child.findall(w_bookmark_start)
+            )
+        ),
+        None,
+    )
+    if note_para is None:
+        return {
+            "error": (
+                "post-write verification failed: no internal-note "
+                f"paragraph carrying bookmark {note_id!r} was found in "
+                f"{docx_path} after the write"
+            )
+        }
+
+    actual_text = "".join(t.text or "" for t in note_para.iter(_q(_W, "t")))
+    if actual_text != expected_text:
+        return {
+            "error": (
+                "post-write verification failed: internal-note text "
+                f"mismatch in paragraph (bookmark {note_id!r}) (expected "
+                f"{expected_text!r}, got {actual_text!r})"
+            )
+        }
+    return None
+
+
 def insert_highlighted_note(
     docx_path: str,
     text: str,
@@ -7732,6 +9520,8 @@ def insert_highlighted_note(
     author: str = "Meridian",
     initials: str = "M",
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """Insert an internal note inline or as a native Word comment.
 
@@ -7749,6 +9539,20 @@ def insert_highlighted_note(
     the existing ``style`` parameter above, which selects the note's
     *category* (currently only ``"internal_note"`` is supported), not its
     OOXML rendering.
+
+    ddd79188 — for ``mode="inline"``, AFTER the write is staged, structurally
+    verified (see :func:`_verify_note_write`), and promoted, a real Word/COM
+    (or LibreOffice) render-capability check also runs against the
+    just-written file (:func:`_enforce_render_verification`), mirroring the
+    same gate :func:`insert_figure_block` already enforces. ``"rendered"``
+    continues normally with render evidence attached. ``"failed"`` restores
+    ``docx_path`` from the pre-write backup and returns an error.
+    ``"unavailable-with-reason"`` (no render backend in this environment)
+    ALSO fails closed by default unless the caller explicitly passes
+    ``allow_degraded_render=True`` with a non-empty ``degraded_render_reason``.
+    For ``mode="comment"``, ``allow_degraded_render``/``degraded_render_reason``
+    are forwarded verbatim to :func:`insert_word_comment`, which already
+    enforces this same gate (5bab074/W2-C) for its own comments.xml write.
     """
     if not text or not str(text).strip():
         return {"error": "text must be a non-empty string"}
@@ -7763,6 +9567,16 @@ def insert_highlighted_note(
         }
     if mode not in ("inline", "comment"):
         return {"error": f"mode must be 'inline' or 'comment', got {mode!r}"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
 
     try:
         policy = resolve_style_policy(style_policy)
@@ -7776,6 +9590,8 @@ def insert_highlighted_note(
             anchor_para_id=anchor_para_id,
             author=author,
             initials=initials,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
         )
         if result.get("status") == "inserted":
             comment_id = result["comment_id"]
@@ -7800,32 +9616,100 @@ def insert_highlighted_note(
     body, _anchor_elem, child_idx = result
 
     note_id = _next_note_bookmark_name(root)
+    text_clean = text.strip()
     note_p = _build_internal_note_paragraph(
-        text.strip(), note_id, policy["note_style"], policy["note_highlight_color"]
+        text_clean, note_id, policy["note_style"], policy["note_highlight_color"]
     )
 
     insert_at = child_idx if position == "before" else child_idx + 1
     body.insert(insert_at, note_p)
 
-    try:
-        _save_docx_xml_stdlib(raw, root, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    # ddd79188 -- hold docx_path's promotion lock across stage+promote
+    # (_save_docx_xml_stdlib, which reentrantly acquires it internally)
+    # THROUGH the post-write structural verify, any conditional restore, and
+    # the real render-capability gate below -- closing the same-process
+    # window between promotion and verify/restore entirely (see
+    # _docx_promotion_lock's module-level comment).
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_note_write(
+            docx_path,
+            note_id=note_id,
+            expected_text=text_clean,
+        )
+        if verify_error is not None:
+            # 5988a5bb -- do NOT blindly restore: a different (concurrent)
+            # writer may have already promoted something newer to docx_path
+            # since our own promotion, in which case this verification
+            # "failure" is a false positive and restoring from our own
+            # backup would destroy that writer's completed, already-
+            # promoted work.
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["note_id"] = note_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        # ddd79188 -- structural verification alone (above) can never prove
+        # the document actually renders in Word; run the real render-
+        # capability gate now, still inside the promotion lock so a
+        # fail-closed restore has the same CAS safety a structural failure
+        # gets. Must run AFTER structural verification, not instead of it.
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["note_id"] = note_id
+            render_error["docx_path"] = docx_path
+            return render_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
     if index_db_path and os.path.exists(index_db_path):
-        _upsert_sidecar_note(index_db_path, note_id, text.strip(), anchor_para_id)
+        _upsert_sidecar_note(index_db_path, note_id, text_clean, anchor_para_id)
 
     return {
         "status": "inserted",
         "mode": "inline",
         "note_id": note_id,
-        "text": text.strip(),
+        "text": text_clean,
         "anchor_para_id": anchor_para_id,
         "position": position,
         "style": policy["note_style"],
         "docx_path": docx_path,
+        **render_info,
     }
 
 
@@ -8345,6 +10229,8 @@ def merge_draft_into_canonical(
     canonical_path: str,
     draft_path: str,
     index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """fe989980 -- promote an isolated wave-scoped draft into ``canonical_path``.
 
@@ -8377,17 +10263,44 @@ def merge_draft_into_canonical(
          On mismatch, ``canonical_path`` is best-effort restored from the
          backup :func:`_atomic_write_docx_bytes` just wrote and this returns
          an ERROR -- never a false success.
+      4. ddd79188 -- AFTER step 3's structural verification passes,
+         :func:`render_gate.check_render_capability` is invoked on the now-
+         promoted ``canonical_path`` (see :func:`_enforce_render_verification`).
+         Structural reparse alone (step 3) can never prove the promoted
+         document actually opens/renders in Word. ``"rendered"`` continues
+         normally with render evidence attached. ``"failed"`` (a render
+         backend errored on this specific document) restores
+         ``canonical_path`` from the SAME backup and returns an error, same
+         as a step-3 failure. ``"unavailable-with-reason"`` (no render
+         backend in this environment) ALSO fails closed by default --
+         never reported as verified -- unless the caller explicitly passes
+         ``allow_degraded_render=True`` with a non-empty
+         ``degraded_render_reason`` (audited opt-in: the promotion is kept
+         but ``render_verified=False`` / ``render_degraded=True`` are
+         stamped onto the payload).
 
     Returns ``{"merged": True, "status": "merged", "canonical_path",
     "draft_path", "paragraph_count", "heading_count", "table_count",
-    "image_count"}`` on success.
+    "image_count", "render_status", "render_verified", ...}`` on success.
 
     Returns ``{"merged": False, "error": <message>, ...}`` on failure --
     with ``"file_restored": <bool>`` present only for the post-promotion
-    verification-failure case (step 3); every other failure mode leaves
+    structural-verification-failure case (step 3) or the render-verification
+    failure case (step 4); every other failure mode leaves
     ``canonical_path`` untouched by construction, so there is nothing to
     restore.
     """
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "merged": False,
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            ),
+        }
     if not draft_path or not os.path.exists(draft_path):
         return {
             "merged": False,
@@ -8465,6 +10378,8 @@ def merge_draft_into_canonical(
                 "error": f"could not write {canonical_path}: {exc}",
             }
 
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
         verify_error = _verify_docx_write(
             canonical_path,
             expected_counts=draft_counts,
@@ -8479,10 +10394,7 @@ def merge_draft_into_canonical(
             # our own backup would destroy that writer's completed,
             # already-promoted work -- check first.
             safe_to_restore, restored, concurrent_write_detected = (
-                _safe_restore_after_verification_failure(
-                    canonical_path,
-                    transaction.get("promoted_sha256") if transaction else None,
-                )
+                _safe_restore_after_verification_failure(canonical_path, promoted_sha256)
             )
             verify_error["merged"] = False
             verify_error["file_restored"] = restored
@@ -8511,6 +10423,23 @@ def merge_draft_into_canonical(
             verify_error["draft_path"] = draft_path
             return verify_error
 
+        # ddd79188 -- structural verification alone (above) can never prove
+        # the promoted document actually renders in Word; run the real
+        # render-capability gate now, still inside the promotion lock so a
+        # fail-closed restore has the same CAS safety a structural failure
+        # gets. Must run AFTER structural verification, not instead of it.
+        render_error, render_info = _enforce_render_verification(
+            canonical_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["merged"] = False
+            render_error["canonical_path"] = canonical_path
+            render_error["draft_path"] = draft_path
+            return render_error
+
     _invalidate_sidecar_mtime(index_db_path)
 
     return {
@@ -8519,6 +10448,7 @@ def merge_draft_into_canonical(
         "canonical_path": canonical_path,
         "draft_path": draft_path,
         **draft_counts,
+        **render_info,
     }
 
 
@@ -8911,6 +10841,7 @@ def copy_section(
     trim_original_to: str | None = None,
     draft_output_path: str | None = None,
     wave_run_id: str | None = None,
+    allow_relationship_reuse: bool = False,
 ) -> dict[str, Any]:
     """8213050a -- duplicate an existing section (heading + its content) to a
     new location in the document, leaving the original untouched (unless
@@ -8940,6 +10871,24 @@ def copy_section(
         self-consistent. A field targeting a bookmark OUTSIDE the copied
         range is left pointing at the original (shared) target, since that
         target was not duplicated.
+
+    679c86f4 -- what this deep copy does NOT do: rewrite a copied image
+    paragraph's ``r:embed`` relationship id, or duplicate its underlying
+    ``word/media/*`` part. A section whose copied range contains a Figure
+    (an image paragraph immediately followed by its SEQ Figure caption) ends
+    up with TWO independent figure blocks -- the original and the copy --
+    both pointing at the SAME image relationship. After the write, the
+    on-disk document is re-read and checked against the image-ownership
+    invariant (:func:`_verify_image_ownership`); a detected relationship
+    reuse fails the copy closed (the pre-write backup is restored, subject
+    to the same compare-and-swap concurrent-writer safety as the rest of
+    this module) UNLESS ``allow_relationship_reuse=True`` -- the caller's
+    explicit declaration that duplicating the reference (rather than the
+    underlying image) is intentional. This is a narrower, caller-declared
+    stand-in for "the manifest declares intentional reuse"; actually
+    duplicating the media part and minting a fresh relationship is out of
+    scope here (a separate, larger change -- see fe989980's broader
+    claim/manifest integration).
 
     48daaf66 -- ``destination_position="after"`` onto a HEADING anchor
     resolves to after that heading's ENTIRE section (own body + subsections),
@@ -9009,6 +10958,13 @@ def copy_section(
         wave_run_id:                  fe989980 -- required together with
                                       ``draft_output_path``; see
                                       :func:`move_section`.
+        allow_relationship_reuse:    679c86f4 -- ``False`` (default, fail
+                                      closed) rejects a copy that leaves an
+                                      image's ``r:embed`` relationship shared
+                                      between the original and the copy;
+                                      ``True`` is the caller's explicit
+                                      declaration that this specific reuse is
+                                      intentional.
 
     Returns:
         ``{status, section_id, heading_text, new_heading_para_id,
@@ -9307,6 +11263,56 @@ def copy_section(
             verify_error["copied_block_count"] = len(copied_elements)
             return verify_error
 
+        # 679c86f4 -- additionally, the copy must satisfy the image-ownership
+        # invariant post-write: every image paragraph in the WHOLE document
+        # (original section, its copy, and anything else) must still be
+        # immediately followed by its SEQ Figure caption (or be part of a
+        # composite whose last member is), and no r:embed relationship may
+        # be shared between two independent figure blocks. copy_section's
+        # deep-copy pass mints fresh paraIds/bookmark names for the copied
+        # range but never rewrites a drawing's r:embed attribute, so copying
+        # a section that contains a Figure leaves the original and the copy
+        # pointing at the SAME underlying image relationship -- exactly the
+        # violation this check exists to catch. Fails closed (pre-write
+        # backup restored, subject to the same compare-and-swap
+        # concurrent-writer safety as above) unless the caller passed
+        # allow_relationship_reuse=True to explicitly declare the reuse
+        # intentional.
+        ownership_error = _verify_image_ownership(
+            dest, allow_relationship_reuse=allow_relationship_reuse
+        )
+        if ownership_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            ownership_error["file_restored"] = restored
+            ownership_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    ownership_error["error"] = (
+                        ownership_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    ownership_error["error"] = (
+                        ownership_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            ownership_error["section_id"] = section_id
+            ownership_error["copied_block_count"] = len(copied_elements)
+            return ownership_error
+
     # fe989980 -- in draft mode, docx_path was never touched; its sidecar
     # index is still accurate, so skip invalidating it.
     if not draft_output_path:
@@ -9370,6 +11376,16 @@ def relocate_figure(
     splits before writing, verifies the saved document from disk, invalidates
     the local structure sidecar, and runs renumber_sequences so Figure
     SEQ caches and REF display text remain correct after the reorder.
+
+    679c86f4 -- after :func:`_verify_docx_write`'s structural-count/content-hash
+    check passes, the saved document is additionally re-read and checked
+    against the image-ownership invariant (:func:`_verify_image_ownership`):
+    the moved image paragraph must still be immediately followed by its SEQ
+    Figure caption, and its ``r:embed`` relationship must not be shared with
+    an independent figure block elsewhere in the document. On either check's
+    failure the pre-write backup is restored (subject to the same
+    compare-and-swap concurrent-writer safety as the rest of this module)
+    and an error is returned instead of a false success payload.
 
     Returns {status, figure_index, moved_block_count, image_para_id,
     caption_para_id, new_body_index, renumber_sequences, docx_path,
@@ -9591,6 +11607,50 @@ def relocate_figure(
             verify_error["figure_index"] = figure_index
             verify_error["moved_block_count"] = removed_count
             return verify_error
+
+        # 679c86f4 -- additionally, the moved figure block must still satisfy
+        # the image-ownership invariant post-write: the image paragraph must
+        # remain immediately followed by its SEQ Figure caption (or be part
+        # of a composite whose last member is), and no r:embed relationship
+        # may now be shared with an independent figure block elsewhere in
+        # the document. relocate_figure moves the SAME live elements as one
+        # atomic pair rather than duplicating them, so a legitimate move can
+        # never itself introduce a relationship duplicate or detach the
+        # caption -- a violation here means the move produced a genuinely
+        # broken document, not an expected/allowed shape, so no
+        # allow_relationship_reuse escape hatch is offered.
+        ownership_error = _verify_image_ownership(dest)
+        if ownership_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    dest, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            ownership_error["file_restored"] = restored
+            ownership_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    ownership_error["error"] = (
+                        ownership_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {dest} was left untouched, exactly as that other "
+                        "writer left it -- investigate manually."
+                    )
+                else:
+                    ownership_error["error"] = (
+                        ownership_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {dest} was left untouched rather than "
+                        "risk it -- investigate manually."
+                    )
+            ownership_error["figure_index"] = figure_index
+            ownership_error["moved_block_count"] = removed_count
+            return ownership_error
 
     # fe989980 -- in draft mode, docx_path was never touched; its sidecar
     # index is still accurate, so skip invalidating it.
@@ -10142,8 +12202,23 @@ def _set_page_header_or_footer(
     kind: str,
     header_footer_type: str,
     index_db_path: str | None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Shared implementation for :func:`set_page_header` / :func:`set_page_footer`."""
+    """Shared implementation for :func:`set_page_header` / :func:`set_page_footer`.
+
+    ddd79188 follow-up -- holds ``docx_path``'s promotion lock across the
+    multi-part write (:func:`_save_docx_with_new_parts_stdlib`) THROUGH a
+    real Word/COM (or LibreOffice) render-capability check
+    (:func:`_enforce_render_verification`), mirroring the same gate
+    :func:`insert_figure_block` / :func:`merge_draft_into_canonical` already
+    enforce: structural ZIP/XML/relationship verification alone can never
+    prove the document actually opens/renders in Word. ``allow_degraded_render``
+    / ``degraded_render_reason`` are the same audited opt-in those functions
+    expose for the "no render backend available in this environment" case --
+    see :func:`_enforce_render_verification` for the full three-state
+    contract.
+    """
     if not text or not str(text).strip():
         return {"error": "text must be a non-empty string"}
     if header_footer_type not in _HDR_FTR_VALID_TYPES:
@@ -10151,6 +12226,16 @@ def _set_page_header_or_footer(
             "error": (
                 f"type must be one of {sorted(_HDR_FTR_VALID_TYPES)}, "
                 f"got {header_footer_type!r}"
+            )
+        }
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
             )
         }
     if not os.path.exists(docx_path):
@@ -10259,10 +12344,24 @@ def _set_page_header_or_footer(
     finally:
         src.close()
 
-    try:
-        _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
-    except OSError as exc:
-        return {"error": f"could not write {docx_path}: {exc}"}
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = _docx_file_sha256(docx_path)
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["kind"] = kind
+            render_error["type"] = header_footer_type
+            render_error["docx_path"] = docx_path
+            return render_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
@@ -10274,6 +12373,7 @@ def _set_page_header_or_footer(
         "relationship_id": rel_id,
         "text": text.strip(),
         "docx_path": docx_path,
+        **render_info,
     }
 
 
@@ -10282,6 +12382,8 @@ def set_page_header(
     text: str,
     header_type: str = "default",
     index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """f1185012 -- Add or replace a page header on ``docx_path``.
 
@@ -10291,6 +12393,16 @@ def set_page_header(
     final ``<w:sectPr>`` -- OR, if a header of this exact ``header_type``
     already exists, overwrites that SAME part's content in place (no new
     part/relationship/override, no sectPr change).
+
+    ddd79188 follow-up -- after the write is staged, verified (ZIP/XML/
+    relationship/media integrity), and promoted, a real Word/COM (or
+    LibreOffice) render-capability check also runs against the just-written
+    file (see :func:`_enforce_render_verification`). ``"rendered"`` continues
+    normally with render evidence attached to the result. ``"failed"``
+    restores the pre-write backup and returns an error. ``"unavailable-with-
+    reason"`` (no render backend in this environment) ALSO fails closed by
+    default -- never reported as verified -- unless ``allow_degraded_render``
+    and a non-empty ``degraded_render_reason`` are both supplied.
 
     Args:
         docx_path:    Absolute path to the .docx file (mutated in place).
@@ -10302,12 +12414,29 @@ def set_page_header(
                       a section's ``<w:titlePg>`` -- not set by this function.
         index_db_path: If supplied, invalidates that sidecar's cached mtime
                       so the next read re-parses the document.
+        allow_degraded_render: Explicit, audited opt-in to accept this write
+                      when no render backend is available in this
+                      environment. Requires ``degraded_render_reason``.
+        degraded_render_reason: Required, non-empty when
+                      ``allow_degraded_render`` is True; carried onto the
+                      result as an audit trail.
 
     Returns:
-        ``{status, kind, type, part_name, relationship_id, text, docx_path}``
-        or ``{"error": <message>}`` on failure (file NOT mutated on error).
+        ``{status, kind, type, part_name, relationship_id, text, docx_path,
+        render_status, render_verified, ...}``
+        or ``{"error": <message>}`` on failure (file NOT left mutated on
+        validation failure; restored from backup on a structural- or
+        render-verification failure).
     """
-    return _set_page_header_or_footer(docx_path, text, "header", header_type, index_db_path)
+    return _set_page_header_or_footer(
+        docx_path,
+        text,
+        "header",
+        header_type,
+        index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
 
 
 def set_page_footer(
@@ -10315,15 +12444,26 @@ def set_page_footer(
     text: str,
     footer_type: str = "default",
     index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """f1185012 -- Add or replace a page footer on ``docx_path``.
 
     Mirrors :func:`set_page_header` exactly (same allocation-vs-overwrite
-    "set" semantics, same part/relationship/content-type plumbing) for
-    ``<w:footerReference>`` / ``word/footer<N>.xml`` instead. See its
-    docstring for the full parameter/return contract.
+    "set" semantics, same part/relationship/content-type plumbing, same
+    fail-closed render-verification gate) for ``<w:footerReference>`` /
+    ``word/footer<N>.xml`` instead. See its docstring for the full
+    parameter/return contract.
     """
-    return _set_page_header_or_footer(docx_path, text, "footer", footer_type, index_db_path)
+    return _set_page_header_or_footer(
+        docx_path,
+        text,
+        "footer",
+        footer_type,
+        index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
 
 # ---------------------------------------------------------------------------
 # 7c5e0e9a — document-wide XML search and native Word-comment write-back.
@@ -10353,6 +12493,27 @@ def _search_snippet(text: str, terms: list[str], radius: int = 90) -> str:
     prefix = "…" if start else ""
     suffix = "…" if end < len(text) else ""
     return prefix + text[start:end] + suffix
+
+
+def _search_locator_text(text: str, terms: list[str], radius: int = 40) -> str:
+    """c7cc9da4 -- a short, LITERAL substring of ``text`` around the first
+    match: exact characters only, never an ellipsis or any other synthesized
+    character, so pasting this verbatim into Word's own Ctrl+F Find box
+    actually locates this occurrence.
+
+    Distinct from :func:`_search_snippet`, which is a human-readable preview
+    (may be prefixed/suffixed with "…") and is not guaranteed to be an exact
+    substring Word's own Find can match.
+    """
+    if not text:
+        return ""
+    folded = text.casefold()
+    positions = [folded.find(term) for term in terms if term and folded.find(term) >= 0]
+    if not positions:
+        return text.strip()[: radius * 2]
+    start = max(0, min(positions) - radius)
+    end = min(len(text), max(positions) + max(map(len, terms)) + radius)
+    return text[start:end].strip()
 
 
 def _search_element_text(element: ET.Element) -> str:
@@ -10553,6 +12714,7 @@ def _bm25_search_units(
             enriched = dict(unit)
             enriched["bm25_score"] = score
             enriched["snippet"] = _search_snippet(unit["text"], terms)
+            enriched["quoted_text"] = _search_locator_text(unit["text"], terms)
             enriched["highlight_ranges"] = [
                 [match.start(), match.end()]
                 for term in terms
@@ -10561,6 +12723,43 @@ def _bm25_search_units(
             scored.append((score, order, enriched))
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [unit for _score, _order, unit in scored[: max(0, int(limit))]]
+
+
+def _attach_word_search_locators(
+    results: list[dict[str, Any]], all_units: list[dict[str, Any]]
+) -> None:
+    """c7cc9da4 -- stamp each result with a Word-Find-ready locator.
+
+    A recommendation anchored to a search result needs more than
+    ``element_id`` (which addresses an OOXML paragraph/table/section, not
+    something a human reviewer can act on directly inside Word):
+    ``word_search_locator`` pairs the same literal text ``quoted_text``
+    already carries with how many times that EXACT literal string occurs
+    anywhere else in the same XML part (counted across ``all_units`` --
+    the unfiltered, whole-part unit list, not just the returned matches, so
+    the count reflects the real document, not just this query's results).
+
+    ``unique_in_part=True`` means pasting ``find_text`` into Word's own
+    Ctrl+F box lands on this occurrence and only this one; otherwise
+    ``occurrence_count_in_part`` tells the reviewer how many Find-Next
+    presses to expect -- this module has no way to drive Word's cursor
+    itself, so an honest count is the best it can hand back.
+    """
+    part_corpus: dict[str, str] = {}
+    for unit in all_units:
+        part_corpus[unit["part"]] = part_corpus.get(unit["part"], "") + "\n" + unit["text"]
+    for result in results:
+        quoted_text = result.get("quoted_text") or ""
+        part = result.get("part", "")
+        corpus = part_corpus.get(part, "")
+        occurrences = corpus.casefold().count(quoted_text.casefold()) if quoted_text else 0
+        result["word_search_locator"] = {
+            "find_text": quoted_text,
+            "part": part,
+            "element_id": result.get("element_id"),
+            "unique_in_part": occurrences == 1,
+            "occurrence_count_in_part": occurrences,
+        }
 
 
 def search_document_xml(
@@ -10578,6 +12777,33 @@ def search_document_xml(
     tables. This is a stateless first-stage search; the existing sidecar FTS5
     index remains the fast paragraph-only path, while this surface covers the
     whole package and leaves a clean seam for a future vector engine.
+
+    c7cc9da4 -- this is the anchor-resolution surface for a Meridian-docs
+    review session's recommendations. Each result carries, in addition to
+    ``element_id`` (the stable paragraph/section/table/caption id a
+    recommendation attaches to):
+
+      - ``quoted_text``: an exact, literal substring of the source text
+        around the match -- unlike ``snippet``, it never contains a
+        synthesized "…" truncation marker, so it is safe to quote verbatim
+        in a recommendation or paste into Word's own Find box.
+      - ``word_search_locator``: ``{find_text, part, element_id,
+        unique_in_part, occurrence_count_in_part}`` -- ``find_text`` is the
+        same literal text as ``quoted_text``; ``unique_in_part`` tells a
+        reviewer whether a plain Ctrl+F search for it in Word will land on
+        this occurrence and only this one, or whether ``Find Next`` will be
+        needed ``occurrence_count_in_part`` times.
+
+    Image anchors resolve via the neighboring ``figure_caption`` result's
+    ``element_id`` (the caption paragraph) together with
+    :func:`find_image_paragraph`, which returns the picture paragraph's own
+    id for a given ``figure_index`` -- an image paragraph carries no
+    searchable text of its own, so it is never a direct search hit. Equation
+    anchors are NOT covered by this search (OMML math markup has no
+    ``<w:t>`` body text to match against) -- use
+    :func:`parse_docx_equations_local` (exposed as the ``extract_equations``
+    / ``get_equations`` MCP tools), which carries its own stable equation
+    ids, for those.
     """
     if not query or not str(query).strip():
         return []
@@ -10586,13 +12812,16 @@ def search_document_xml(
             raw = handle.read()
     except OSError as exc:
         return [{"error": str(exc)}]
+    all_units = _iter_document_search_units(raw)
     requested = {str(value).casefold() for value in element_types or []}
     units = [
         unit
-        for unit in _iter_document_search_units(raw)
+        for unit in all_units
         if _search_allowed_type(unit["element_type"], requested)
     ]
-    return _bm25_search_units(units, str(query), limit)
+    results = _bm25_search_units(units, str(query), limit)
+    _attach_word_search_locators(results, all_units)
+    return results
 
 
 def _highlight_run_if_matching(run: ET.Element, terms: list[str], color: str) -> bool:
@@ -10618,6 +12847,8 @@ def highlight_document_matches(
     element_types: list[str] | None = None,
     color: str = "yellow",
     limit: int = 100,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
     """Apply native w:highlight to matching text runs in a DOCX.
 
@@ -10625,6 +12856,16 @@ def highlight_document_matches(
     Matching runs retain their original content and formatting; a run is
     highlighted when it contains at least one query term. The operation is
     idempotent and returns the matched result records.
+
+    ddd79188 follow-up -- once the highlighted parts are staged, verified
+    (ZIP/XML/relationship/media integrity via
+    :func:`_save_docx_with_new_parts_stdlib`), and promoted, a real Word/COM
+    (or LibreOffice) render-capability check also runs against the
+    just-written file (:func:`_enforce_render_verification`), mirroring the
+    same gate :func:`insert_figure_block` / :func:`merge_draft_into_canonical`
+    already enforce. ``allow_degraded_render`` / ``degraded_render_reason``
+    are the same audited opt-in those functions expose for the "no render
+    backend available in this environment" case.
     """
     if color not in {
         "yellow", "brightGreen", "turquoise", "pink", "blue", "red",
@@ -10634,6 +12875,16 @@ def highlight_document_matches(
         return {"error": f"unsupported highlight color: {color!r}"}
     if not query or not str(query).strip():
         return {"error": "query must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
     try:
         raw, _root = _load_docx_xml_stdlib(docx_path)
     except (OSError, ValueError) as exc:
@@ -10668,13 +12919,33 @@ def highlight_document_matches(
                 break
     if not updated_parts:
         return {"status": "no_matches", "matched_runs": 0, "matches": matches}
-    _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = _docx_file_sha256(docx_path)
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["matches"] = matches
+            render_error["docx_path"] = docx_path
+            return render_error
+
     return {
         "status": "highlighted",
         "matched_runs": matched_runs,
         "match_count": len(matches),
         "matches": matches,
         "color": color,
+        "docx_path": docx_path,
+        **render_info,
     }
 
 
@@ -10705,12 +12976,35 @@ def insert_word_comment(
     anchor_para_id: str,
     author: str = "Meridian",
     initials: str = "M",
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Insert a real Word comment anchored to an existing paragraph."""
+    """Insert a real Word comment anchored to an existing paragraph.
+
+    ddd79188 follow-up -- once the comment parts are staged, verified
+    (ZIP/XML/relationship/media integrity via
+    :func:`_save_docx_with_new_parts_stdlib`), and promoted, a real Word/COM
+    (or LibreOffice) render-capability check also runs against the
+    just-written file (:func:`_enforce_render_verification`), mirroring the
+    same gate :func:`insert_figure_block` / :func:`merge_draft_into_canonical`
+    already enforce. ``allow_degraded_render`` / ``degraded_render_reason``
+    are the same audited opt-in those functions expose for the "no render
+    backend available in this environment" case.
+    """
     if not text or not str(text).strip():
         return {"error": "text must be a non-empty string"}
     if not author or not str(author).strip():
         return {"error": "author must be a non-empty string"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
     except (OSError, ValueError) as exc:
@@ -10818,7 +13112,25 @@ def insert_word_comment(
             b'<?xml version="1.0" encoding="UTF-8"?>\n'
             + ET.tostring(content_types_root, encoding="utf-8")
         )
-    _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+    with _docx_promotion_lock(docx_path):
+        try:
+            _save_docx_with_new_parts_stdlib(raw, updated_parts, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = _docx_file_sha256(docx_path)
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["comment_id"] = comment_id
+            render_error["anchor_para_id"] = anchor_para_id
+            render_error["docx_path"] = docx_path
+            return render_error
+
     return {
         "status": "inserted",
         "mode": "comment",
@@ -10828,7 +13140,668 @@ def insert_word_comment(
         "author": str(author).strip(),
         "initials": str(initials or "").strip()[:9],
         "docx_path": docx_path,
+        **render_info,
     }
+
+
+# ---------------------------------------------------------------------------
+# Public API: locate_anchor / locate_anchors (2271789f)
+#
+# A read-only, fresh-snapshot anchor locator. Every call re-parses the .docx
+# from disk (via document_content_tree + parse_docx_equations_local) rather
+# than trusting any sidecar SQLite index -- there is no staleness window to
+# reason about because nothing is cached between calls. Each resolved anchor
+# is stamped with the SHA-256 fingerprint (_source_fingerprint) of the exact
+# bytes it was resolved against, so a caller holding an OLDER fingerprint can
+# detect drift by passing query["expected_source_fingerprint"] before
+# trusting a previously-returned target_para_id against a document that may
+# have since changed.
+#
+# Query keys (all optional; at least one is required so the query is not a
+# no-op):
+#   para_id           -- direct lookup: a real w14:paraId, the
+#                         document_content_tree/parse_docx synthesized
+#                         "sp<hash>" id, a table id "tbl<index>", a
+#                         table-cell id "tbl<index>:r<row>:c<col>", or an
+#                         equation's own para_id. Short-circuits every other
+#                         key below.
+#   section_path      -- e.g. "3.2.4". Matched against BOTH an explicit
+#                         numeric prefix parsed out of the heading's own
+#                         text (Word's "3.2.4 Title" auto/manual outline
+#                         numbering rendered as literal text) and a
+#                         positional path computed from heading levels/order
+#                         when no explicit prefix is present. NOTE: a
+#                         heading that merely *starts* with a number that
+#                         isn't outline numbering (e.g. "5 Steps to
+#                         Success") is indistinguishable from real section
+#                         numbering by this heuristic -- a known tradeoff.
+#   section_text      -- substring match (casefold unless case_sensitive)
+#                         against heading text; combinable with
+#                         section_path (both must match).
+#   caption_label     -- e.g. "Table 3" / "Figure 2". Matched against the
+#                         caption's SEQ-field cached number, falling back to
+#                         a positional occurrence count when the field was
+#                         never recalculated by Word.
+#   text              -- literal Ctrl+F-style substring (casefold unless
+#                         case_sensitive) searched over paragraph/heading/
+#                         caption text and table cell text, scoped to
+#                         whatever section_path/caption_label already
+#                         narrowed (unscoped text queries also fall back to
+#                         equation flat_text so equations stay findable).
+#   element_types     -- optional list restricting result kinds to any of
+#                         heading | paragraph | table | table_cell |
+#                         figure_caption | table_caption | equation.
+#   case_sensitive    -- bool, default False.
+#   expected_source_fingerprint -- optional; if given and it does not match
+#                         the CURRENT source fingerprint, resolution is
+#                         skipped entirely and {"status": "stale", ...} is
+#                         returned immediately -- never trust stale
+#                         paragraph indices against a document that moved.
+#
+# Every result carries an explicit "candidates" list -- empty when a query
+# resolved uniquely, populated (with status="ambiguous") when more than one
+# element matched -- rather than silently guessing which one was meant.
+# Never mutates document_path.
+# ---------------------------------------------------------------------------
+
+_EXPLICIT_SECTION_NUM_RE = re.compile(r"^\s*(\d+(?:\.\d+){0,8})[.)]?\s+(?=\S)")
+_TABLE_ID_RE = re.compile(r"^tbl(\d+)$")
+_TABLE_CELL_ID_RE = re.compile(r"^tbl(\d+):r(\d+):c(\d+)$")
+_CAPTION_LABEL_QUERY_RE = re.compile(r"^\s*(figure|table)\s+(.+?)\s*$", re.IGNORECASE)
+
+
+def _normalize_preview(text: str, max_words: int = 12) -> str:
+    """Collapse whitespace and take the leading ``max_words`` words.
+
+    Display preview only -- never changes the source text. ``quoted_text``
+    in a locator result always carries the verbatim, un-normalized string.
+    """
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return ""
+    words = normalized.split(" ")
+    preview = " ".join(words[:max_words])
+    return preview + "..." if len(words) > max_words else preview
+
+
+def _heading_numbering(heading_blocks: list[dict[str, Any]]) -> dict[str, dict[str, str | None]]:
+    """Compute both an explicit and a positional section path per heading.
+
+    ``explicit_number`` comes from a leading "N", "N.N", "N.N.N" ... prefix
+    already present in the heading's own text. ``computed_path`` is a
+    positional fallback: per-level counters that increment left to right and
+    reset any deeper level whenever a shallower heading is seen -- the same
+    scheme a generated table of contents would use.
+    """
+    counters: list[int] = []
+    result: dict[str, dict[str, str | None]] = {}
+    for h in heading_blocks:
+        level = max(1, int(h.get("level", 1) or 1))
+        if len(counters) < level:
+            counters.extend([0] * (level - len(counters)))
+        else:
+            counters = counters[:level]
+        counters[level - 1] += 1
+        computed_path = ".".join(str(c) for c in counters[:level])
+        match = _EXPLICIT_SECTION_NUM_RE.match(h.get("text", "") or "")
+        result[h["para_id"]] = {
+            "explicit_number": match.group(1) if match else None,
+            "computed_path": computed_path,
+        }
+    return result
+
+
+def _table_anchor_id(index: int) -> str:
+    return f"tbl{index}"
+
+
+def _iter_anchor_records(
+    source: str | bytes | bytearray,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fresh (never cached) ordered anchor index for one document snapshot.
+
+    Returns ``(records, tree)`` where ``tree`` is the raw
+    :func:`document_content_tree` result (paragraph_count/table_count/
+    heading_count/duplicate_para_ids) and ``records`` is one dict per
+    document_content_tree block, in document order, each augmented with:
+
+      - ``para_id``        -- stable id (table blocks get a synthesized
+                               ``"tbl<index>"`` id; paragraph/heading blocks
+                               already carry document_content_tree's own
+                               w14:paraId / synth-id / positional id).
+      - ``element_kind``    -- heading | paragraph | table | figure_caption
+                               | table_caption.
+      - ``caption_label``   -- "Figure N" / "Table N" for caption
+                               paragraphs, else None.
+      - ``table_ref``       -- for a table_caption paragraph, the ``index``
+                               of the table block it immediately follows.
+      - ``section_path``    -- nearest enclosing heading's path.
+      - ``heading_para_id`` -- nearest enclosing heading's para_id.
+      - ``section_stack``   -- ordered list of ancestor heading para_ids
+                               (root first): subtree membership is simply
+                               ``heading_id in record["section_stack"]``.
+      - ``explicit_number`` / ``computed_path`` -- heading blocks only.
+    """
+    from ._vendored_content_tree import document_content_tree  # noqa: PLC0415
+
+    tree = document_content_tree(source)
+    blocks: list[dict[str, Any]] = tree.get("blocks") or []
+    numbering = _heading_numbering([b for b in blocks if b.get("kind") == "heading"])
+
+    records: list[dict[str, Any]] = []
+    section_stack: list[tuple[int, str, str]] = []
+    last_table_index: int | None = None
+    figure_seq_counter = 0
+    table_seq_counter = 0
+
+    for block in blocks:
+        kind = block.get("kind")
+        record = dict(block)
+        caption_label: str | None = None
+        table_ref: int | None = None
+        element_kind = kind
+
+        if kind == "heading":
+            level = max(1, int(block.get("level", 1) or 1))
+            while section_stack and section_stack[-1][0] >= level:
+                section_stack.pop()
+            info = numbering.get(
+                block["para_id"], {"explicit_number": None, "computed_path": str(level)}
+            )
+            path = info["explicit_number"] or info["computed_path"]
+            section_stack.append((level, block["para_id"], path))
+            record["explicit_number"] = info["explicit_number"]
+            record["computed_path"] = info["computed_path"]
+        elif kind == "table":
+            record["para_id"] = _table_anchor_id(block["index"])
+            rows = block.get("rows") or []
+            record["text"] = " | ".join(", ".join(row) for row in rows[:3])
+            last_table_index = block["index"]
+        elif kind == "paragraph":
+            if _is_figure_caption(block):
+                figure_seq_counter += 1
+                num = _seq_cached_number(block, _SEQ_FIGURE_RE) or str(figure_seq_counter)
+                caption_label = f"Figure {num}"
+                element_kind = "figure_caption"
+            elif _is_table_caption(block):
+                table_seq_counter += 1
+                num = _seq_cached_number(block, _SEQ_TABLE_RE) or str(table_seq_counter)
+                caption_label = f"Table {num}"
+                element_kind = "table_caption"
+                table_ref = last_table_index
+
+        stack_ids = [entry[1] for entry in section_stack]
+        record["section_path"] = section_stack[-1][2] if section_stack else None
+        record["heading_para_id"] = stack_ids[-1] if stack_ids else None
+        record["section_stack"] = stack_ids
+        record["caption_label"] = caption_label
+        record["element_kind"] = element_kind
+        record["table_ref"] = table_ref
+        records.append(record)
+
+    return records, tree
+
+
+def _table_cell_record(table_record: dict[str, Any], row: int, col: int) -> dict[str, Any]:
+    rows = table_record.get("rows") or []
+    return {
+        "element_kind": "table_cell",
+        "index": table_record.get("index"),
+        "para_id": f"{_table_anchor_id(table_record['index'])}:r{row}:c{col}",
+        "text": rows[row][col],
+        "section_path": table_record.get("section_path"),
+        "heading_para_id": table_record.get("heading_para_id"),
+        "section_stack": table_record.get("section_stack", []),
+        "table_index": table_record.get("index"),
+        "row": row,
+        "col": col,
+    }
+
+
+def _match_table_cell_by_id(records: list[dict[str, Any]], target_id: str) -> list[dict[str, Any]]:
+    match = _TABLE_CELL_ID_RE.match(target_id or "")
+    if not match:
+        return []
+    table_index, row, col = int(match.group(1)), int(match.group(2)), int(match.group(3))
+    for record in records:
+        if record.get("element_kind") == "table" and record.get("index") == table_index:
+            rows = record.get("rows") or []
+            if row < len(rows) and col < len(rows[row]):
+                return [_table_cell_record(record, row, col)]
+    return []
+
+
+def _fold(value: str, case_sensitive: bool) -> str:
+    return value if case_sensitive else value.casefold()
+
+
+def _search_text_in_records(
+    scope: list[dict[str, Any]], query_text: str, *, case_sensitive: bool
+) -> list[dict[str, Any]]:
+    needle = _fold(query_text, case_sensitive)
+    matches: list[dict[str, Any]] = []
+    for record in scope:
+        if record.get("element_kind") == "table":
+            for row_idx, row in enumerate(record.get("rows") or []):
+                for col_idx, cell_text in enumerate(row):
+                    if needle in _fold(cell_text, case_sensitive):
+                        matches.append(_table_cell_record(record, row_idx, col_idx))
+        else:
+            text = record.get("text", "") or ""
+            if needle in _fold(text, case_sensitive):
+                matches.append(record)
+    return matches
+
+
+def _parse_caption_label(label: str) -> tuple[str, str] | None:
+    match = _CAPTION_LABEL_QUERY_RE.match(label or "")
+    if not match:
+        return None
+    return match.group(1).casefold(), match.group(2).strip()
+
+
+def _filter_by_element_types(
+    records: list[dict[str, Any]], element_types: list[str] | None
+) -> list[dict[str, Any]]:
+    if not element_types:
+        return records
+    wanted = {str(t).casefold() for t in element_types}
+    return [r for r in records if str(r.get("element_kind", "")).casefold() in wanted]
+
+
+def _anchor_brief(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "target_para_id": record.get("para_id"),
+        "element_type": record.get("element_kind"),
+        "document_order": record.get("index"),
+        "section_path": record.get("section_path"),
+        "leading_text_preview": _normalize_preview(record.get("text", "") or ""),
+    }
+
+
+def _bookmark_and_ref_status(document_path: str, target_para_id: str | None) -> tuple[bool, dict[str, Any]]:
+    """Best-effort bookmark/REF lookup for a resolved anchor's target_para_id.
+
+    Table/table-cell synthetic ids ("tbl<n>" / "tbl<n>:r<n>:c<n>") are never
+    real paragraph ids in the document -- :func:`find_references_to` cannot
+    resolve them, so those are reported as un-checked rather than guessed.
+    """
+    if (
+        not target_para_id
+        or _TABLE_ID_RE.match(target_para_id)
+        or _TABLE_CELL_ID_RE.match(target_para_id)
+    ):
+        return False, {
+            "checked": False,
+            "reason": "synthetic table identifier -- not a real paragraph id",
+        }
+    try:
+        refs = find_references_to(document_path, target_para_id)
+    except (OSError, ValueError, KeyError, ET.ParseError):
+        return False, {"checked": False, "reason": "lookup failed"}
+    if not refs or refs.get("error"):
+        return False, {
+            "checked": True,
+            "reference_count": 0,
+            "references": [],
+            "bookmark_names": [],
+            "note": (refs or {}).get("error"),
+        }
+    return bool(refs.get("bookmark_names")), {
+        "checked": True,
+        "reference_count": refs.get("reference_count", 0),
+        "references": refs.get("references", []),
+        "bookmark_names": refs.get("bookmark_names", []),
+    }
+
+
+def _build_resolved_anchor(
+    record: dict[str, Any],
+    *,
+    document_path: str,
+    source_fingerprint: str,
+    word_search_locator: str | None,
+) -> dict[str, Any]:
+    text = record.get("text", "") or ""
+    preview = _normalize_preview(text)
+    target_para_id = record.get("para_id")
+    bookmark_exists, ref_status = _bookmark_and_ref_status(document_path, target_para_id)
+    return {
+        "status": "resolved",
+        "document_path": document_path,
+        "source_fingerprint": source_fingerprint,
+        "element_type": record.get("element_kind"),
+        "section_path": record.get("section_path"),
+        "heading_para_id": record.get("heading_para_id"),
+        "target_para_id": target_para_id,
+        "document_order": record.get("index"),
+        "quoted_text": text,
+        "leading_text_preview": preview,
+        "first_words": preview,
+        "word_search_locator": word_search_locator or preview,
+        "bookmark_exists": bookmark_exists,
+        "ref_status": ref_status,
+        "candidates": [],
+    }
+
+
+def _ambiguous_anchor_result(
+    candidates: list[dict[str, Any]],
+    *,
+    document_path: str,
+    source_fingerprint: str,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": "ambiguous",
+        "document_path": document_path,
+        "source_fingerprint": source_fingerprint,
+        "reason": reason or f"{len(candidates)} elements matched this query; narrow it",
+        "candidate_count": len(candidates),
+        "candidates": [_anchor_brief(c) for c in candidates],
+    }
+
+
+def _not_found_anchor_result(
+    reason: str, *, document_path: str, source_fingerprint: str | None
+) -> dict[str, Any]:
+    return {
+        "status": "not_found",
+        "document_path": document_path,
+        "source_fingerprint": source_fingerprint,
+        "reason": reason,
+        "candidates": [],
+    }
+
+
+def _equation_pseudo_record(eq: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "element_kind": "equation",
+        "index": eq.get("ordinal"),
+        "para_id": eq.get("para_id"),
+        "text": eq.get("flat_text", ""),
+        "section_path": None,
+        "heading_para_id": None,
+        "section_stack": [],
+    }
+
+
+def _resolve_anchor_query(
+    records: list[dict[str, Any]],
+    equations: list[dict[str, Any]],
+    query: dict[str, Any],
+    *,
+    document_path: str,
+    source_fingerprint: str,
+) -> dict[str, Any]:
+    query = dict(query or {})
+    case_sensitive = bool(query.get("case_sensitive", False))
+    element_types = query.get("element_types")
+    para_id_query = query.get("para_id")
+    section_path_query = query.get("section_path")
+    section_text_query = query.get("section_text")
+    caption_label_query = query.get("caption_label")
+    text_query = query.get("text")
+
+    if not any(
+        [para_id_query, section_path_query, section_text_query, caption_label_query, text_query]
+    ):
+        return _not_found_anchor_result(
+            "query must set at least one of para_id, section_path, section_text, "
+            "caption_label, or text",
+            document_path=document_path,
+            source_fingerprint=source_fingerprint,
+        )
+
+    def _finish(matches: list[dict[str, Any]], *, locator: str | None = None) -> dict[str, Any]:
+        matches = _filter_by_element_types(matches, element_types)
+        if not matches:
+            return _not_found_anchor_result(
+                "no element matched this query",
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+            )
+        if len(matches) > 1:
+            return _ambiguous_anchor_result(
+                matches, document_path=document_path, source_fingerprint=source_fingerprint
+            )
+        return _build_resolved_anchor(
+            matches[0],
+            document_path=document_path,
+            source_fingerprint=source_fingerprint,
+            word_search_locator=locator,
+        )
+
+    # 1. Direct para_id short-circuits everything else.
+    if para_id_query:
+        direct = [r for r in records if r.get("para_id") == para_id_query]
+        if not direct:
+            direct = _match_table_cell_by_id(records, para_id_query)
+        if not direct:
+            direct = [
+                _equation_pseudo_record(eq)
+                for eq in equations
+                if eq.get("para_id") == para_id_query
+            ]
+        if not direct:
+            return _not_found_anchor_result(
+                f"para_id {para_id_query!r} not found",
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+            )
+        return _finish(direct)
+
+    scope = records
+
+    # 2. Section scoping (heading resolution).
+    heading_target: dict[str, Any] | None = None
+    if section_path_query or section_text_query:
+        wanted_path = str(section_path_query).strip() if section_path_query else None
+        heading_candidates = [
+            r
+            for r in scope
+            if r.get("element_kind") == "heading"
+            and (
+                wanted_path is None
+                or r.get("explicit_number") == wanted_path
+                or r.get("computed_path") == wanted_path
+            )
+            and (
+                not section_text_query
+                or _fold(str(section_text_query), case_sensitive)
+                in _fold(r.get("text") or "", case_sensitive)
+            )
+        ]
+        if not heading_candidates:
+            return _not_found_anchor_result(
+                "no heading matched section_path/section_text",
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+            )
+        if len(heading_candidates) > 1:
+            return _ambiguous_anchor_result(
+                heading_candidates,
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+                reason="multiple headings matched section_path/section_text; narrow the query",
+            )
+        heading_target = heading_candidates[0]
+        if not (caption_label_query or text_query):
+            return _finish([heading_target])
+        scope = [r for r in scope if heading_target["para_id"] in r.get("section_stack", [])]
+
+    # 3. caption_label scoping.
+    caption_target: dict[str, Any] | None = None
+    if caption_label_query:
+        parsed_query = _parse_caption_label(str(caption_label_query))
+        caption_candidates = []
+        for r in scope:
+            if not r.get("caption_label"):
+                continue
+            parsed_candidate = _parse_caption_label(r["caption_label"])
+            if parsed_query and parsed_candidate and parsed_query == parsed_candidate:
+                caption_candidates.append(r)
+        if not caption_candidates:
+            return _not_found_anchor_result(
+                f"no caption matched {caption_label_query!r}",
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+            )
+        if len(caption_candidates) > 1:
+            return _ambiguous_anchor_result(
+                caption_candidates,
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+                reason=f"multiple captions matched {caption_label_query!r}",
+            )
+        caption_target = caption_candidates[0]
+        if not text_query:
+            return _finish([caption_target])
+        if (
+            caption_target.get("element_kind") == "table_caption"
+            and caption_target.get("table_ref") is not None
+        ):
+            scope = [
+                r
+                for r in records
+                if r.get("element_kind") == "table" and r.get("index") == caption_target["table_ref"]
+            ] + [caption_target]
+        else:
+            scope = [caption_target]
+
+    # 4. text (Ctrl+F) search within whatever scope survived steps 2-3.
+    if text_query:
+        text_matches = _search_text_in_records(scope, str(text_query), case_sensitive=case_sensitive)
+        if not text_matches and heading_target is None and caption_target is None:
+            # Fully unscoped text query: also try equation flat_text so
+            # equations stay reachable via plain Ctrl+F-style search.
+            needle = _fold(str(text_query), case_sensitive)
+            text_matches.extend(
+                _equation_pseudo_record(eq)
+                for eq in equations
+                if needle in _fold(eq.get("flat_text", "") or "", case_sensitive)
+            )
+        return _finish(text_matches, locator=str(text_query))
+
+    # section/caption-only queries already returned above.
+    return _not_found_anchor_result(
+        "query did not resolve to any element",
+        document_path=document_path,
+        source_fingerprint=source_fingerprint,
+    )
+
+
+def locate_anchor(document_path: str, query: dict[str, Any]) -> dict[str, Any]:
+    """2271789f -- read-only, fresh-snapshot deterministic anchor locator.
+
+    Re-parses ``document_path`` from disk on every call (no sidecar SQLite
+    index, so there is nothing that can go stale between calls) and resolves
+    ``query`` against sections, paragraphs, captions, tables (incl. cell
+    text), and equations. See the module-level comment above this function
+    for the full query-key contract and the shape of a resolved result:
+    ``{status, section_path, heading_para_id, target_para_id,
+    document_order, element_type, quoted_text, leading_text_preview,
+    first_words, word_search_locator, bookmark_exists, ref_status,
+    candidates, document_path, source_fingerprint}``.
+
+    Pass ``query["expected_source_fingerprint"]`` (a value previously
+    returned as ``source_fingerprint``) to detect the document having
+    changed underneath a stashed locator result before trusting it again --
+    a mismatch short-circuits to ``{"status": "stale", ...}`` without
+    attempting resolution against what may now be the wrong paragraph.
+
+    Never mutates ``document_path``. Returns ``{"error": ...}`` only when
+    the document itself cannot be read or parsed as a .docx.
+    """
+    if not isinstance(query, dict) or not query:
+        return {"error": "query must be a non-empty dict"}
+    try:
+        with open(document_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    source_fingerprint = _source_fingerprint(raw)
+    expected = query.get("expected_source_fingerprint")
+    if expected and expected != source_fingerprint:
+        return {
+            "status": "stale",
+            "document_path": document_path,
+            "reason": "source_fingerprint_mismatch",
+            "expected_source_fingerprint": expected,
+            "source_fingerprint": source_fingerprint,
+            "candidates": [],
+        }
+
+    try:
+        records, _tree = _iter_anchor_records(raw)
+        equations = parse_docx_equations_local(raw)
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return {"error": str(exc)}
+
+    return _resolve_anchor_query(
+        records, equations, query, document_path=document_path, source_fingerprint=source_fingerprint
+    )
+
+
+def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[str, Any]:
+    """2271789f -- resolve multiple independent :func:`locate_anchor` queries
+    against ONE fresh parse of ``document_path`` (one source_fingerprint, one
+    document_content_tree walk) instead of re-reading the file per query.
+
+    Query order is preserved in ``results``; each entry has the exact same
+    shape :func:`locate_anchor` returns for a single query. Returns
+    ``{"document_path", "source_fingerprint", "query_count", "results"}``,
+    or ``{"error": ...}`` if the document itself cannot be read/parsed.
+    """
+    if not isinstance(queries, list) or not queries:
+        return {"error": "queries must be a non-empty list of query dicts"}
+    try:
+        with open(document_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    source_fingerprint = _source_fingerprint(raw)
+    try:
+        records, _tree = _iter_anchor_records(raw)
+        equations = parse_docx_equations_local(raw)
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return {"error": str(exc)}
+
+    results: list[dict[str, Any]] = []
+    for query in queries:
+        if not isinstance(query, dict) or not query:
+            results.append({"error": "query must be a non-empty dict"})
+            continue
+        expected = query.get("expected_source_fingerprint")
+        if expected and expected != source_fingerprint:
+            results.append({
+                "status": "stale",
+                "document_path": document_path,
+                "reason": "source_fingerprint_mismatch",
+                "expected_source_fingerprint": expected,
+                "source_fingerprint": source_fingerprint,
+                "candidates": [],
+            })
+            continue
+        results.append(
+            _resolve_anchor_query(
+                records,
+                equations,
+                query,
+                document_path=document_path,
+                source_fingerprint=source_fingerprint,
+            )
+        )
+
+    return {
+        "document_path": document_path,
+        "source_fingerprint": source_fingerprint,
+        "query_count": len(queries),
+        "results": results,
+    }
+
 
 def read_document_snapshot(docx_path: str) -> dict[str, Any]:
     """Read the saved DOCX snapshot without writing or requiring a close.
@@ -10837,6 +13810,29 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
     That file is reported as a hint, not treated as a blocker. The returned
     content is the last saved on-disk snapshot; unsaved edits remain visible
     only inside Word until the document is saved.
+
+    c7cc9da4 -- this is the entry point for a Meridian-docs REVIEW SESSION: a
+    non-mutating pass over a .docx that may currently be open in Word. Two
+    fields exist specifically to support that workflow:
+
+      - "source_sha256": a SHA-256 fingerprint of the EXACT bytes this call
+        just read (same family as index_docx_structure's source_sha256).
+        A review session that accumulates recommendations anchored against
+        this snapshot and later stages accepted edits into a disposable
+        draft (never docx_path itself -- see move_section / copy_section /
+        relocate_table / relocate_figure's draft_output_path parameter, and
+        merge_docx_draft for promotion) must re-fingerprint docx_path
+        immediately before that promotion and refuse to proceed on any
+        mismatch. See render_gate.verify_promotion_readiness, which
+        performs exactly that compare-and-refuse check plus structural/
+        render verification, fail-closed, without mutating either file.
+      - "limitations": explicit, human-readable caveats about what this
+        snapshot does NOT prove -- most importantly, that content typed in
+        Word since the last save is invisible here. A caller (human or
+        agent) building recommendations from this snapshot should surface
+        these limitations alongside anything derived from it, rather than
+        silently treating "read succeeded" as "reflects what's on screen in
+        Word right now".
     """
     try:
         with open(docx_path, "rb") as handle:
@@ -10865,9 +13861,24 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
         "docx_path": docx_path,
         "byte_size": len(raw),
         "saved_mtime": _stat_mtime(docx_path),
+        "source_sha256": _source_fingerprint(raw),
         "word_lock_hint": os.path.exists(lock_hint),
         "xml_parts": xml_parts,
         "paragraph_count": len(paragraphs),
         "heading_count": sum(1 for paragraph in paragraphs if _is_heading(paragraph["style"])),
         "paragraphs": paragraphs,
+        "limitations": [
+            "This reflects only the last SAVED state of docx_path. Any "
+            "edits made in Word since the last save -- including changes "
+            "Word is only holding in memory or in autosave/recovery "
+            "buffers -- are NOT visible here until the document is "
+            "actually saved to disk.",
+            "word_lock_hint=True only means a ~$ lock file exists next to "
+            "docx_path, which usually indicates Word (or another "
+            "application) currently has it open. It is informational "
+            "only -- it never blocked and never delayed this read, and "
+            "its absence is not proof the file is closed (a crashed Word "
+            "session can leave the lock file behind, and a non-Word "
+            "writer may not create one at all).",
+        ],
     }

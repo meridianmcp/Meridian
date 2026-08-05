@@ -350,6 +350,20 @@ class HandoffResult(BaseModel):
     # as capability_contract above. None only if gate-building itself failed
     # (best-effort).
     docx_integrity: dict[str, Any] | None = None
+    # 3cab355a — one entry per requested force_include_ids id that failed
+    # validation (unknown/cross-project/cross-version/not-pending — see
+    # meridian.handoff.generate_handoff's force_include_rejected docstring).
+    # None when force_include_ids was absent on this call; an empty list
+    # means it was present and every requested id validated. list, not a
+    # typed submodel, for the same forward-compat reason as
+    # capability_contract above.
+    force_include_rejected: list[dict[str, Any]] | None = None
+    # ecc8b280 — machine-readable continuation_required/terminal_ready state
+    # (see meridian.continuation_gate). dict, not a typed submodel, for the
+    # same forward-compat reason as capability_contract above. None for
+    # modes that don't compute it (planner/starter/compact/goal/l0_fallback)
+    # or if generate_handoff's build itself failed before reaching the gate.
+    continuation_status: dict[str, Any] | None = None
 
 
 class TaskUpdate(BaseModel):

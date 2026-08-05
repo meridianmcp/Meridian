@@ -2717,6 +2717,55 @@ async def test_generate_handoff_capability_contract_deterministic_across_repeate
     assert _strip_goal_token(result_a["content"]) == _strip_goal_token(result_b["content"])
 
 
+async def test_generate_handoff_surfaces_blocker_policy_for_empty_critical_item(
+    db, tmp_path,
+):
+    """b108f2e0 — acceptance case 1, through the REAL MCP generate_handoff
+    dispatch: an empty-scope CRITICAL item is quarantined (not a run stop),
+    appears in the handoff's blocker_policy field as non-executable, while
+    an independent well-scoped item stays eligible.
+    """
+    p = await db_module.create_project(db, "blocker-policy-handoff")
+    empty_item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "CRITICAL tenant isolation breach",
+        notes="", priority="urgent",
+    )
+    good_item = await db_module.add_sprint_item(
+        db, p["id"], "v1", "unrelated well-scoped fix", notes="clear repro + fix plan",
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    decision = result["blocker_policy"]
+    assert decision is not None
+    assert decision["policy"] == "quarantine_continue"
+    assert decision["run_stop"] is False
+    assert empty_item["id"] in decision["blocked_item_ids"]
+    assert decision["classifications"][empty_item["id"]] == "needs_scope"
+    assert good_item["id"] in decision["eligible_item_ids"]
+
+
+async def test_generate_handoff_blocker_policy_run_stop_when_configured(db, tmp_path):
+    """An explicit project-level run_stop policy makes even a single
+    under-scoped item halt the whole run, surfaced through the same
+    generate_handoff field.
+    """
+    p = await db_module.create_project(db, "blocker-policy-run-stop")
+    await db_module.set_project_blocker_policy(db, p["id"], "run_stop")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "under-scoped item", notes="", priority="urgent",
+    )
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff", {"project_id": p["id"], "mode": "goal"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    decision = result["blocker_policy"]
+    assert decision is not None
+    assert decision["run_stop"] is True
+    assert decision["eligible_item_ids"] == []
+
+
 # ---------------------------------------------------------------------------
 # (3) XML/JSON projection parity — the /goal text's typed clauses must carry
 # the SAME canonical JSON as the sibling capability_contract field, for the
@@ -3082,6 +3131,221 @@ async def test_unavailable_required_tool_fails_visibly_across_all_three_projecti
 
 
 # ---------------------------------------------------------------------------
+# cb00889c — bounded handoff profiles with on-demand executor contracts.
+#
+# Two independent pieces:
+#   (a) executor_contract.render_xml_clause(contract, compact=True) — a
+#       bounded per-item projection (item_id/title/scope/contract_hash/
+#       pointer_ids/executable only), with the pre-existing full projection
+#       still available on demand via the unchanged compact=False default.
+#   (b) handoff.format_handoff_mcp_content's/generate_handoff's own
+#       max_bytes/max_content_bytes budget — an integrity-first backstop that
+#       never touches disk/DB persistence and never cuts through an embedded
+#       <goal_token>/SECURITY banner.
+# ---------------------------------------------------------------------------
+
+
+def test_render_xml_clause_compact_default_unchanged():
+    """The function-level default stays compact=False — byte-for-byte the
+    same full projection every existing caller already depends on."""
+    contract = {
+        "item_id": "abc123", "mode": "autonomous", "executable": False,
+        "contract_hash": "deadbeef",
+        "executable_reasons": ["missing_required_tools:Serena: find_symbol"],
+        "allowed_tools": [],
+        "forbidden_tools": [{"name": "find_symbol", "server_or_namespace": "Serena"}],
+        "steps": [],
+        "gate_after": None,
+    }
+    full = ec.render_xml_clause(contract)
+    assert "compact" not in full
+    assert "<forbidden_tool>Serena: find_symbol</forbidden_tool>" in full
+
+
+def test_render_xml_clause_compact_embeds_only_bounded_fields():
+    contract = {
+        "item_id": "item-42",
+        "title": "Refactor the payments module",
+        "scope": {
+            "project_id": "proj-1", "requested_version": "v3", "wave": "2",
+            "track": "backend", "milestone_type": "feature", "priority": "high",
+        },
+        "contract_hash": "cafef00d",
+        "executable": True,
+        "executable_reasons": [],
+        "allowed_tools": [{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "availability_status": "available",
+        }],
+        "forbidden_tools": [],
+        "steps": [{"order": 1, "kind": "finish", "description": "Call complete_sprint_item."}],
+        "gate_after": {"wave_end": "wave-2", "gate_passed": True},
+        "pointers": {
+            "item_id": "item-42",
+            "pointers": [
+                {"id": "ptr-1", "source_type": "code", "targets": []},
+                {"id": "ptr-2", "source_type": "code", "targets": []},
+                {"source_type": "code", "targets": []},  # no id — must be skipped
+            ],
+        },
+    }
+    compact = ec.render_xml_clause(contract, compact=True)
+    assert compact == (
+        '<executor_contract compact="true" item_id="item-42" '
+        'title="Refactor the payments module" executable="true" '
+        'contract_hash="cafef00d" requested_version="v3" wave="2" '
+        'track="backend" milestone_type="feature" priority="high" '
+        'pointer_ids="ptr-1,ptr-2" />'
+    )
+    # Bounded: none of the full projection's tool/step/gate detail leaks in.
+    assert "find_symbol" not in compact
+    assert "complete_sprint_item" not in compact
+    assert "gate_after" not in compact
+    # The SAME information remains available on demand via the full/JSON/text
+    # projections of this identical, already-built contract — no re-fetch.
+    full = ec.render_xml_clause(contract, compact=False)
+    assert "find_symbol" in full
+    as_json = json.loads(ec.to_json(contract))
+    assert as_json["item_id"] == "item-42"
+
+
+def test_render_xml_clause_compact_handles_missing_pointers_title_scope():
+    """A minimal/degraded contract (no pointers, no title, no scope) still
+    renders a valid, well-formed compact element — never raises."""
+    contract = {"item_id": "item-99", "contract_hash": "h", "executable": False}
+    compact = ec.render_xml_clause(contract, compact=True)
+    assert compact.startswith('<executor_contract compact="true"')
+    assert compact.endswith("/>")
+    assert 'pointer_ids=""' in compact
+    assert 'title=""' in compact
+    assert 'executable="false"' in compact
+
+
+async def test_build_executor_contract_carries_title_for_compact_projection(db):
+    """build_executor_contract now carries the item's title (cheap, always
+    available on ``item``) so the compact projection can name the item
+    without any re-fetch — proven end-to-end against a real built contract,
+    not just a static fixture."""
+    p = await db_module.create_project(db, "ec-title")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Refactor the parser")
+    contract = await ec.build_executor_contract(db, p["id"], item)
+    assert contract["title"] == "Refactor the parser"
+    compact = ec.render_xml_clause(contract, compact=True)
+    assert 'title="Refactor the parser"' in compact
+    assert f'item_id="{item["id"]}"' in compact
+
+
+# ---------------------------------------------------------------------------
+# format_handoff_mcp_content's byte budget.
+# ---------------------------------------------------------------------------
+
+
+def test_format_handoff_mcp_content_identity_under_budget():
+    """Content at/under the default budget is returned byte-identical — zero
+    functional change for the overwhelming common case (every existing
+    caller's content)."""
+    small = "/goal\nstart_session()\n<sprint_items>a, b, c</sprint_items>"
+    assert handoff_module.format_handoff_mcp_content(small) == small
+
+
+def test_format_handoff_mcp_content_disabled_via_none_or_nonpositive():
+    huge = "X" * 5000
+    assert handoff_module.format_handoff_mcp_content(huge, max_bytes=None) == huge
+    assert handoff_module.format_handoff_mcp_content(huge, max_bytes=0) == huge
+    assert handoff_module.format_handoff_mcp_content(huge, max_bytes=-1) == huge
+
+
+def test_format_handoff_mcp_content_truncates_oversized_content():
+    huge = "Y" * 5000
+    out = handoff_module.format_handoff_mcp_content(huge, max_bytes=1000)
+    assert len(out.encode("utf-8")) < 5000
+    assert "TRUNCATED" in out
+    assert "limit=1000 bytes" in out
+
+
+async def test_format_handoff_mcp_content_never_truncates_goal_token_banner(db):
+    """Even a budget far smaller than the protected region still keeps the
+    <goal_token>/SECURITY banner (and everything before it) byte-for-byte —
+    integrity-first over strict budget compliance."""
+    p = await db_module.create_project(db, "budget-token-protect")
+    body = '/goal\nstart_session(project_name="x")'
+    embedded = await handoff_module._mint_and_embed_goal_token(db, p["id"], body)
+    assert "<goal_token>" in embedded  # sanity: mint actually worked
+    padded = embedded + "\n<sprint_items>" + ("z" * 5000) + "</sprint_items>"
+    out = handoff_module.format_handoff_mcp_content(padded, max_bytes=10)
+    banner_match = handoff_module._GOAL_TOKEN_BANNER_RE.search(embedded)
+    assert banner_match is not None
+    protected_prefix = embedded[: banner_match.end()]
+    assert out.startswith(protected_prefix)
+    assert "TRUNCATED" in out
+    assert len(out.encode("utf-8")) < len(padded.encode("utf-8"))
+
+
+def test_format_handoff_mcp_content_non_string_passthrough():
+    assert handoff_module.format_handoff_mcp_content(None) is None  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# generate_handoff's own max_content_bytes threading — bounds the RETURNED
+# content only; disk/DB persistence always keeps the full render.
+# ---------------------------------------------------------------------------
+
+
+async def test_generate_handoff_default_budget_noop_for_typical_content(db, tmp_path):
+    p = await db_module.create_project(db, "budget-genhandoff-default")
+    await db_module.set_goal(db, p["id"], "ship", sprint="s1")
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+    )
+    assert "TRUNCATED" not in content
+
+
+async def test_generate_handoff_default_budget_truncates_pathologically_large_content(
+    db, tmp_path,
+):
+    """A pathologically large handoff (simulated via extra_narrative, the
+    fastest deterministic way to exceed the default budget without hundreds
+    of DB writes) is bounded in the RETURNED content, while the on-disk file
+    and the DB-persisted pending_goal both keep the complete render."""
+    p = await db_module.create_project(db, "budget-genhandoff-huge")
+    await db_module.set_goal(db, p["id"], "ship", sprint="s1")
+    huge_narrative = "N" * 400_000
+    path, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        extra_narrative=huge_narrative,
+    )
+    assert len(content.encode("utf-8")) < 400_000
+    assert "TRUNCATED" in content
+    on_disk = Path(path).read_text(encoding="utf-8")
+    assert huge_narrative in on_disk  # disk keeps the full, untruncated render
+
+
+async def test_generate_handoff_max_content_bytes_none_disables_budget(db, tmp_path):
+    p = await db_module.create_project(db, "budget-genhandoff-disable")
+    await db_module.set_goal(db, p["id"], "ship", sprint="s1")
+    huge_narrative = "M" * 400_000
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+        extra_narrative=huge_narrative, max_content_bytes=None,
+    )
+    assert huge_narrative in content
+    assert "TRUNCATED" not in content
+
+
+async def test_generate_handoff_max_content_bytes_explicit_override(db, tmp_path):
+    """An explicit, smaller max_content_bytes bounds even ordinarily-small
+    content, proving the parameter is genuinely threaded through (not just
+    inert plumbing that happens to never trigger)."""
+    p = await db_module.create_project(db, "budget-genhandoff-explicit")
+    await db_module.set_goal(db, p["id"], "ship", sprint="s1")
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, max_content_bytes=50,
+    )
+    assert "TRUNCATED" in content
+    assert len(content.encode("utf-8")) < 5000
+
+
+# ---------------------------------------------------------------------------
 # (6) A fresh session's /goal block alone must be sufficient to start — no
 # missing context a human would need to fill in by hand.
 # ---------------------------------------------------------------------------
@@ -3408,4 +3672,490 @@ async def test_generate_handoff_mcp_dispatch_strict_evidence_blocked_response(
         e["capability"] == "wave_gate_exclusion" for e in result["evidence_errors"]
     )
     assert "wave_gate_exclusion" in result["evidence_status"]
-    assert "strict_evidence=true" not in result["message"] or "strict_evidence" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# 3af86d28 — corrective handoffs: data structure + invalidate-original +
+# generate-new-revision path (meridian.handoff.record_handoff_correction /
+# invalidate_handoff / regenerate_handoff_correction / load_handoff_correction).
+# ---------------------------------------------------------------------------
+
+
+async def _seed_handoff(db, name: str, tmp_path):
+    """Create a project with a goal + one FRESH generated handoff row.
+    Returns (project, handoff_row)."""
+    p = await db_module.create_project(db, name)
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+    )
+    rows = await db_module.get_handoffs(db, p["id"], limit=1)
+    return p, rows[0]
+
+
+@pytest.mark.asyncio
+async def test_record_handoff_correction_rejects_bad_blocker_classification(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-bad-blocker", tmp_path)
+    with pytest.raises(handoff_module.HandoffCorrectionError):
+        await handoff_module.record_handoff_correction(
+            db, p["id"], source_handoff_id=h["id"], blocker_classification="nonsense",
+        )
+
+
+@pytest.mark.asyncio
+async def test_record_handoff_correction_rejects_bad_status(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-bad-status", tmp_path)
+    with pytest.raises(handoff_module.HandoffCorrectionError):
+        await handoff_module.record_handoff_correction(
+            db, p["id"], source_handoff_id=h["id"], blocker_classification="other",
+            status="not-a-status",
+        )
+
+
+@pytest.mark.asyncio
+async def test_record_handoff_correction_rejects_unknown_source(db):
+    p = await db_module.create_project(db, "corr-unknown-source")
+    with pytest.raises(handoff_module.HandoffCorrectionError):
+        await handoff_module.record_handoff_correction(
+            db, p["id"], source_handoff_id="nonexistent-id", blocker_classification="other",
+        )
+
+
+@pytest.mark.asyncio
+async def test_record_handoff_correction_happy_path(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-happy", tmp_path)
+    corr = await handoff_module.record_handoff_correction(
+        db, p["id"],
+        source_handoff_id=h["id"],
+        blocker_classification="pointer_unresolved",
+        investigation_evidence={"finding": "file renamed"},
+        added_pointers=[{
+            "source_type": "code",
+            "targets": [{"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+        }],
+        changed_resources=["meridian/server.py"],
+        version="v1",
+    )
+    assert corr["status"] == "draft"
+    assert corr["source_handoff_id"] == h["id"]
+    assert corr["source_body_hash"] == handoff_module._hash_goal_body(h["body"])
+    assert corr["investigation_evidence"] == {"finding": "file renamed"}
+    assert corr["changed_resources"] == ["meridian/server.py"]
+    assert len(corr["added_pointers"]) == 1
+    assert corr["removed_pointers"] == []
+    assert corr["new_handoff_id"] is None
+    assert corr["pointer_repair_report"] is None
+
+
+@pytest.mark.asyncio
+async def test_record_handoff_correction_idempotency_key_dedups(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-idem", tmp_path)
+    first = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="other",
+        idempotency_key="retry-1",
+    )
+    second = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="scope_stale",
+        idempotency_key="retry-1",
+    )
+    assert first["id"] == second["id"]
+    assert second["blocker_classification"] == "other"  # the ORIGINAL wins, not overwritten
+    listed = await handoff_module.list_handoff_corrections(db, p["id"])
+    assert len(listed) == 1
+
+
+@pytest.mark.asyncio
+async def test_record_handoff_correction_auto_supersedes_prior_open_correction(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-supersede", tmp_path)
+    first = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="other",
+    )
+    second = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="scope_stale",
+    )
+    refreshed_first = await handoff_module.get_handoff_correction(db, first["id"])
+    assert refreshed_first["status"] == "superseded"
+    assert second["status"] == "draft"
+
+
+@pytest.mark.asyncio
+async def test_list_handoff_corrections_filters_by_source_and_status(db, tmp_path):
+    p = await db_module.create_project(db, "corr-list-filters")
+    await db_module.set_goal(db, p["id"], "goal", sprint="s")
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    h1 = (await db_module.get_handoffs(db, p["id"], limit=1))[0]
+    await db_module.pop_pending_goal(db, p["id"])  # simulate a start_session consuming it
+    # get_handoffs orders by created_at DESC, id DESC — SQLite's created_at is
+    # only second-granularity, so two rows inserted within the same second can
+    # tie and the id (a random UUID) is not a chronological tiebreaker. Diff
+    # the id sets before/after instead of trusting "limit=1 is the new one".
+    _before_ids = {r["id"] for r in await db_module.get_handoffs(db, p["id"], limit=10)}
+    await handoff_module.generate_handoff(db, p["id"], str(tmp_path), skip_ai_summary=True)
+    _after_rows = await db_module.get_handoffs(db, p["id"], limit=10)
+    h2 = next(r for r in _after_rows if r["id"] not in _before_ids)
+    assert h2["id"] != h1["id"]
+
+    c1 = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h1["id"], blocker_classification="other",
+    )
+    c2 = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h2["id"], blocker_classification="other",
+        status="blocked",
+    )
+
+    only_h1 = await handoff_module.list_handoff_corrections(db, p["id"], source_handoff_id=h1["id"])
+    assert [c["id"] for c in only_h1] == [c1["id"]]
+
+    only_blocked = await handoff_module.list_handoff_corrections(db, p["id"], status="blocked")
+    assert [c["id"] for c in only_blocked] == [c2["id"]]
+
+    everything = await handoff_module.list_handoff_corrections(db, p["id"])
+    assert {c["id"] for c in everything} == {c1["id"], c2["id"]}
+
+
+@pytest.mark.asyncio
+async def test_invalidate_handoff_marks_row_without_mutating_body(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-invalidate", tmp_path)
+    original_body = h["body"]
+    updated = await handoff_module.invalidate_handoff(
+        db, h["id"], reason="testing", correction_id="corr-x",
+    )
+    assert bool(updated["invalidated"]) is True
+    assert updated["invalidated_reason"] == "testing"
+    assert updated["superseded_by_correction_id"] == "corr-x"
+    assert updated["body"] == original_body
+
+
+@pytest.mark.asyncio
+async def test_invalidate_handoff_unknown_id_returns_none(db):
+    assert await handoff_module.invalidate_handoff(db, "nope", reason="x") is None
+
+
+@pytest.mark.asyncio
+async def test_update_handoff_correction_status_sets_status_and_reason(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-status-update", tmp_path)
+    corr = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="other",
+    )
+    updated = await handoff_module.update_handoff_correction_status(
+        db, corr["id"], "blocked", reason="waiting on upstream fix",
+    )
+    assert updated["status"] == "blocked"
+    assert updated["status_reason"] == "waiting on upstream fix"
+
+
+@pytest.mark.asyncio
+async def test_update_handoff_correction_status_rejects_bad_status(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-status-bad", tmp_path)
+    corr = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="other",
+    )
+    with pytest.raises(handoff_module.HandoffCorrectionError):
+        await handoff_module.update_handoff_correction_status(db, corr["id"], "nope")
+
+
+@pytest.mark.asyncio
+async def test_update_handoff_correction_status_unknown_id_returns_none(db):
+    assert await handoff_module.update_handoff_correction_status(db, "nope", "blocked") is None
+
+
+@pytest.mark.asyncio
+async def test_regenerate_handoff_correction_invalidates_source_and_preserves_body(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-regen", tmp_path)
+    original_body = h["body"]
+    corr = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="scope_stale",
+    )
+    result = await handoff_module.regenerate_handoff_correction(
+        db, p["id"], corr["id"], str(tmp_path), mode="full",
+    )
+    assert result["regenerated"] is True
+    assert result["already_regenerated"] is False
+    assert result["new_handoff_id"] is not None
+    assert result["new_handoff_id"] != h["id"]
+    assert result["new_token"]
+    assert result["new_body_hash"] == handoff_module._hash_goal_body(result["new_handoff_content"])
+    assert bool(result["invalidated_source"]["invalidated"]) is True
+    assert result["invalidated_source"]["body"] == original_body  # untouched
+    assert result["correction"]["status"] == "verified"
+    assert result["correction"]["new_handoff_id"] == result["new_handoff_id"]
+    assert result["correction"]["new_token"] == result["new_token"]
+
+    # The ORIGINAL row, re-fetched independently, is untouched and still invalidated.
+    refetched_source = await db_module.get_handoff(db, h["id"])
+    assert refetched_source["body"] == original_body
+    assert bool(refetched_source["invalidated"]) is True
+    assert refetched_source["superseded_by_correction_id"] == corr["id"]
+
+    # Exactly two handoffs rows exist now (source + new revision) — the fix for
+    # the amend-vs-fresh interaction (see regenerate_handoff_correction's own
+    # comment) means the new revision landed in a FRESH row, never an amend of
+    # the just-invalidated source row.
+    all_rows = await db_module.get_handoffs(db, p["id"], limit=10)
+    assert len(all_rows) == 2
+    assert {r["id"] for r in all_rows} == {h["id"], result["new_handoff_id"]}
+
+
+@pytest.mark.asyncio
+async def test_regenerate_handoff_correction_repairs_pointers_and_persists_report(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-regen-pointers", tmp_path)
+    corr = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="pointer_unresolved",
+        added_pointers=[{
+            "source_type": "code",
+            "targets": [{"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 3}}],
+        }],
+    )
+    result = await handoff_module.regenerate_handoff_correction(
+        db, p["id"], corr["id"], str(tmp_path),
+    )
+    report = result["pointer_repair_report"]
+    assert report["repaired_count"] == 1
+    assert report["unresolved_count"] == 0
+    assert result["correction"]["pointer_repair_report"]["repaired_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_regenerate_handoff_correction_is_idempotent(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-regen-idem", tmp_path)
+    corr = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="other",
+    )
+    first = await handoff_module.regenerate_handoff_correction(
+        db, p["id"], corr["id"], str(tmp_path),
+    )
+    rows_after_first = await db_module.get_handoffs(db, p["id"], limit=10)
+
+    second = await handoff_module.regenerate_handoff_correction(
+        db, p["id"], corr["id"], str(tmp_path),
+    )
+    rows_after_second = await db_module.get_handoffs(db, p["id"], limit=10)
+
+    assert second["already_regenerated"] is True
+    assert second["regenerated"] is False
+    assert second["new_handoff_id"] == first["new_handoff_id"]
+    assert second["new_token"] == first["new_token"]
+    assert len(rows_after_second) == len(rows_after_first)  # no new row on retry
+
+
+@pytest.mark.asyncio
+async def test_regenerate_handoff_correction_refuses_blocked_status(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-regen-blocked", tmp_path)
+    corr = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="other",
+        status="blocked",
+    )
+    with pytest.raises(handoff_module.HandoffCorrectionError):
+        await handoff_module.regenerate_handoff_correction(db, p["id"], corr["id"], str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_regenerate_handoff_correction_refuses_superseded_status(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-regen-superseded", tmp_path)
+    first = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="other",
+    )
+    await handoff_module.record_handoff_correction(  # auto-supersedes `first`
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="scope_stale",
+    )
+    with pytest.raises(handoff_module.HandoffCorrectionError):
+        await handoff_module.regenerate_handoff_correction(db, p["id"], first["id"], str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_regenerate_handoff_correction_unknown_id_raises(db, tmp_path):
+    p = await db_module.create_project(db, "corr-regen-unknown")
+    with pytest.raises(handoff_module.HandoffCorrectionError):
+        await handoff_module.regenerate_handoff_correction(db, p["id"], "nope", str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_regenerate_handoff_correction_cross_project_raises(db, tmp_path):
+    p1, h1 = await _seed_handoff(db, "corr-regen-cross-a", tmp_path)
+    p2 = await db_module.create_project(db, "corr-regen-cross-b")
+    corr = await handoff_module.record_handoff_correction(
+        db, p1["id"], source_handoff_id=h1["id"], blocker_classification="other",
+    )
+    with pytest.raises(handoff_module.HandoffCorrectionError):
+        await handoff_module.regenerate_handoff_correction(db, p2["id"], corr["id"], str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_load_handoff_correction_by_id_source_and_latest(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-load", tmp_path)
+    corr = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="other",
+    )
+    by_id = await handoff_module.load_handoff_correction(db, p["id"], correction_id=corr["id"])
+    assert by_id["id"] == corr["id"]
+    assert by_id["new_handoff_content"] is None  # not regenerated yet
+
+    latest = await handoff_module.load_handoff_correction(db, p["id"])
+    assert latest["id"] == corr["id"]
+
+    by_source = await handoff_module.load_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"],
+    )
+    assert by_source["id"] == corr["id"]
+
+
+@pytest.mark.asyncio
+async def test_load_handoff_correction_includes_new_content_after_regenerate(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-load-regen", tmp_path)
+    corr = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="other",
+    )
+    regen = await handoff_module.regenerate_handoff_correction(
+        db, p["id"], corr["id"], str(tmp_path),
+    )
+    loaded = await handoff_module.load_handoff_correction(db, p["id"], correction_id=corr["id"])
+    assert loaded["new_handoff_content"] == regen["new_handoff_content"]
+
+
+@pytest.mark.asyncio
+async def test_load_handoff_correction_returns_none_when_absent(db):
+    p = await db_module.create_project(db, "corr-load-none")
+    assert await handoff_module.load_handoff_correction(db, p["id"]) is None
+
+
+@pytest.mark.asyncio
+async def test_load_handoff_correction_cross_project_raises(db, tmp_path):
+    p1, h1 = await _seed_handoff(db, "corr-load-cross-a", tmp_path)
+    p2 = await db_module.create_project(db, "corr-load-cross-b")
+    corr = await handoff_module.record_handoff_correction(
+        db, p1["id"], source_handoff_id=h1["id"], blocker_classification="other",
+    )
+    with pytest.raises(handoff_module.HandoffCorrectionError):
+        await handoff_module.load_handoff_correction(db, p2["id"], correction_id=corr["id"])
+
+
+# ---------------------------------------------------------------------------
+# MCP dispatch: record_handoff_correction + load_handoff's correction surface
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mcp_dispatch_record_handoff_correction_record_only(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-mcp-record", tmp_path)
+    result = await mcp_handler._handle_task_tools(
+        "record_handoff_correction",
+        {"project_id": p["id"], "source_handoff_id": h["id"],
+         "blocker_classification": "pointer_unresolved"},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert result["regenerated"] is False
+    assert result["correction"]["status"] == "draft"
+    assert result["correction"]["source_handoff_id"] == h["id"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_dispatch_record_handoff_correction_with_regenerate(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-mcp-regen", tmp_path)
+    result = await mcp_handler._handle_task_tools(
+        "record_handoff_correction",
+        {"project_id": p["id"], "source_handoff_id": h["id"],
+         "blocker_classification": "other", "regenerate": True},
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert result["regenerated"] is True
+    assert result["new_handoff_id"]
+    assert result["invalidated_source"]["invalidated"] in (1, True)
+
+
+@pytest.mark.asyncio
+async def test_mcp_dispatch_record_handoff_correction_invalid_source_returns_error(db):
+    p = await db_module.create_project(db, "corr-mcp-invalid")
+    result = await mcp_handler._handle_task_tools(
+        "record_handoff_correction",
+        {"project_id": p["id"], "source_handoff_id": "nope", "blocker_classification": "other"},
+        db, "/tmp", tenant=None, _mcp_tenant_id=None,
+    )
+    assert result["error"] == "HANDOFF_CORRECTION_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_mcp_dispatch_load_handoff_surfaces_correction_and_invalidation(db, tmp_path):
+    p, h = await _seed_handoff(db, "corr-mcp-load", tmp_path)
+    corr = await handoff_module.record_handoff_correction(
+        db, p["id"], source_handoff_id=h["id"], blocker_classification="other",
+    )
+    regen = await handoff_module.regenerate_handoff_correction(
+        db, p["id"], corr["id"], str(tmp_path),
+    )
+
+    result = await mcp_handler._handle_task_tools(
+        "load_handoff", {"project_id": p["id"]}, db, str(tmp_path),
+        tenant=None, _mcp_tenant_id=None,
+    )
+    assert result["correction"]["id"] == corr["id"]
+    # correction.new_handoff_content is fetched by EXACT new_handoff_id (see
+    # load_handoff_correction), so it is always correct regardless of how
+    # load_handoff's own separate "latest handoff" lookup below resolves —
+    # a receiving executor reading the `correction` field never depends on
+    # get_handoffs' created_at/id tiebreak ordering at all.
+    assert result["correction"]["new_handoff_content"] == regen["new_handoff_content"]
+    assert result["correction"]["new_handoff_id"] == regen["new_handoff_id"]
+    # The pre-existing `handoff` field (load_handoff's OWN "latest row"
+    # lookup, unrelated to this feature) now carries the three new
+    # invalidation keys regardless of which row it resolves to. Note:
+    # get_handoffs' created_at/id ordering is only second-granularity on
+    # SQLite, so which of the two rows (source vs regenerated) it considers
+    # "latest" when both share a wall-clock second is a separate, known,
+    # pre-existing limitation — not asserted here; only the new keys' mere
+    # presence is.
+    assert "invalidated" in result["handoff"]
+    assert "invalidated_reason" in result["handoff"]
+    assert "superseded_by_correction_id" in result["handoff"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_dispatch_load_handoff_correction_null_when_none_recorded(db, tmp_path):
+    p = await db_module.create_project(db, "corr-mcp-load-none")
+    result = await mcp_handler._handle_task_tools(
+        "load_handoff", {"project_id": p["id"]}, db, str(tmp_path),
+        tenant=None, _mcp_tenant_id=None,
+    )
+    assert result["correction"] is None
+
+
+# ---------------------------------------------------------------------------
+# f46372e8 — load_handoff now routes its stored `content` through the SAME
+# format_handoff_mcp_content() helper every generate_handoff transport uses,
+# so the "one canonical serializer" guarantee actually covers every
+# content-returning handoff surface, not "every one except load_handoff".
+# ---------------------------------------------------------------------------
+
+
+async def test_load_handoff_content_routed_through_format_handoff_mcp_content(
+    db, tmp_path,
+):
+    p = await db_module.create_project(db, "load-handoff-canonical-serializer")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    await db_module.add_sprint_item(db, p["id"], "v1", "do the thing")
+
+    _path, generated_content, _amended = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True
+    )
+
+    result = await mcp_handler._handle_task_tools(
+        "load_handoff", {"project_id": p["id"]}, db, str(tmp_path), None, None,
+    )
+    assert result is not mcp_handler._MISS
+    assert result["handoff"]["content"] == handoff_module.format_handoff_mcp_content(
+        generated_content
+    )
+    # Sanity: with format_handoff_mcp_content currently an identity function,
+    # this also equals the raw generated content exactly.
+    assert result["handoff"]["content"] == generated_content
+
+
+async def test_load_handoff_returns_none_handoff_when_none_stored(db, tmp_path):
+    """No prior generate_handoff call for this project — handoff is None and
+    format_handoff_mcp_content is never reached (no crash on a missing row)."""
+    p = await db_module.create_project(db, "load-handoff-no-prior-handoff")
+    result = await mcp_handler._handle_task_tools(
+        "load_handoff", {"project_id": p["id"]}, db, str(tmp_path), None, None,
+    )
+    assert result is not mcp_handler._MISS
+    assert result["handoff"] is None
+    assert result["has_handoff"] is False

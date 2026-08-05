@@ -638,7 +638,13 @@ async def handle_set_executor_config(
               # policy — executor_config.build_execution_policy clamps/rejects
               # at read time (falls back to the mode default), same fail-safe
               # convention max_turns already uses.
-              "max_planning_turns"):
+              "max_planning_turns",
+              # 99c0c1be — configured PARALLELISM target (permits up to 16).
+              # Same fail-safe convention: an invalid/out-of-range value is
+              # never persisted verbatim as a live cap — normalize_parallelism_target
+              # (executor_config.py) clamps/rejects at read time, exactly like
+              # max_planning_turns above.
+              "parallelism_target"):
         if k in args:
             cfg[k] = args[k]
     if "repo_paths" in args:

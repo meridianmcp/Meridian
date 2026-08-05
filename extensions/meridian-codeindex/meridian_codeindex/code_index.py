@@ -58,8 +58,12 @@ import json
 import logging
 import os
 import threading
+import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .vector_index import IndexMetadata
 
 _log = logging.getLogger(__name__)
 
@@ -661,6 +665,22 @@ def _vectors_enabled() -> bool:
     return os.environ.get(_ENV_VECTORS, "").strip().lower() in _TRUTHY
 
 
+def _model2vec_version() -> str | None:
+    """Best-effort ``model2vec`` package version, or ``None`` if unimportable.
+
+    Used as the "embedding version" half of :meth:`CodeIndex.describe_vector_index`
+    (e1475682) — ``_EMBED_MODEL_NAME`` alone identifies *which* pretrained
+    model, this identifies *which build of the encoder* produced the
+    vectors, matching ``IndexMetadata.embedding_version``'s intent.
+    """
+    try:
+        import model2vec  # noqa: PLC0415
+
+        return getattr(model2vec, "__version__", None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class _Embedder:
     """Lazy local Model2Vec embedder.
 
@@ -676,6 +696,19 @@ class _Embedder:
         self._model: Any = None
         self._import_ok: bool | None = None
         self._dim: int | None = None
+
+    @property
+    def model_name(self) -> str:
+        """The embedding model identifier this embedder would use.
+
+        e631d54f — a stable, tracked "embedding model/version" marker,
+        independent of whether the model has actually been loaded. Compared
+        against the model name persisted alongside the LAST successfully
+        built vector index (:class:`CodeIndex`'s ``code_index_meta`` row) to
+        detect a model upgrade even when no source file changed — see
+        :meth:`CodeIndex.reindex`'s deterministic-invalidation branch.
+        """
+        return self._model_name
 
     def available(self) -> bool:
         """True only when the vector leg is enabled AND model2vec is importable."""
@@ -729,6 +762,47 @@ class _Embedder:
             return None
 
 
+# ---------------------------------------------------------------------------
+# Explicit embedding-freshness / convergence state (item e631d54f, follow-up
+# to the outputs-side answer in 6af1518d).
+# ---------------------------------------------------------------------------
+#
+# CodeIndex.reindex() is a single synchronous full pass over the Merkle diff
+# (never deadline-bound / resumable the way OutputsFtsIndex's walk is), so a
+# BM25/keyword result from this index is either fully current (the last
+# reindex() call completed) or reflects whatever the last successful pass
+# saw — there is no "partial keyword walk" state to track here. The genuine
+# staleness risk is narrower and specific to the OPTIONAL vector leg: an
+# embedding model upgrade, a load/encode failure, or chunks written by a
+# targeted registration whose vectors haven't been (re)computed yet can all
+# leave the vector leg silently behind the keyword leg. This dataclass makes
+# that risk explicit instead of leaving a caller to infer it from
+# ``_vss_ready`` alone.
+
+@dataclass(frozen=True)
+class IndexConvergenceState:
+    """A single, explicit snapshot of how fresh/converged one
+    :class:`CodeIndex`'s embeddings are, right now. See
+    :meth:`CodeIndex.get_convergence_state`.
+    """
+
+    root_dir: str
+    source_fingerprint: str | None
+    index_revision: int
+    embedding_model: str | None
+    configured_embedding_model: str | None
+    vectors_enabled: bool
+    vectors_ready: bool
+    total_chunks: int
+    pending_embedding_count: int
+    last_checkpoint_at: float | None
+    degraded: bool
+    converged: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class CodeIndex:
     """The local code index — Merkle-driven incremental chunk store + hybrid search.
 
@@ -772,6 +846,11 @@ class CodeIndex:
         self._fts_built = False
         self._vss_ready = False
         self._vss_dim: int | None = None
+        # e631d54f — in-memory mirror of the persisted index_revision, kept
+        # in lockstep by reindex()/index_paths() so a caller that just
+        # bumped it doesn't need a round-trip through _load_meta() to see
+        # its own write reflected.
+        self._index_revision: int = 0
 
     # -- connection / schema -------------------------------------------------
 
@@ -791,30 +870,82 @@ class CodeIndex:
         )
         con.execute(
             "CREATE TABLE IF NOT EXISTS code_index_meta ("
-            "id INTEGER PRIMARY KEY, merkle_json VARCHAR)"
+            "id INTEGER PRIMARY KEY, merkle_json VARCHAR, "
+            "embedding_model VARCHAR, index_revision INTEGER, "
+            "last_checkpoint_at DOUBLE)"
         )
+        # e631d54f — migrate a sidecar DB persisted before these freshness
+        # columns existed (same upgrade shape as outputs_local's
+        # _HASH_ALGO_VERSION precedent). ADD COLUMN IF NOT EXISTS is a no-op
+        # on an already-current schema, so this is cheap to run on every
+        # connect; any failure (e.g. a DuckDB build without IF NOT EXISTS
+        # support) is swallowed — the meta row simply keeps its existing
+        # columns and freshness tracking degrades gracefully to defaults.
+        for col, coltype in (
+            ("embedding_model", "VARCHAR"),
+            ("index_revision", "INTEGER"),
+            ("last_checkpoint_at", "DOUBLE"),
+        ):
+            try:
+                con.execute(
+                    f"ALTER TABLE code_index_meta ADD COLUMN IF NOT EXISTS {col} {coltype}"
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
-    # -- Merkle persistence --------------------------------------------------
+    # -- meta persistence (Merkle tree + embedding freshness state) ---------
 
-    def _load_merkle(self, con: Any) -> MerkleTree | None:
+    _META_DEFAULTS: dict[str, Any] = {
+        "merkle": None, "embedding_model": None,
+        "index_revision": 0, "last_checkpoint_at": None,
+    }
+
+    def _load_meta(self, con: Any) -> dict[str, Any]:
+        """Load the persisted Merkle tree + embedding-freshness state.
+
+        Never raises — a missing/corrupt/pre-migration row falls back to
+        :data:`_META_DEFAULTS` (revision 0, no model, no checkpoint) so a
+        fresh or partially-written sidecar can't crash a caller's lifecycle
+        hook.
+        """
         try:
             rows = con.execute(
-                "SELECT merkle_json FROM code_index_meta WHERE id = 1"
+                "SELECT merkle_json, embedding_model, index_revision, "
+                "last_checkpoint_at FROM code_index_meta WHERE id = 1"
             ).fetchall()
         except Exception:  # noqa: BLE001
-            return None
-        if not rows or not rows[0][0]:
-            return None
-        try:
-            return MerkleTree.from_json(rows[0][0])
-        except Exception:  # noqa: BLE001
-            return None
+            return dict(self._META_DEFAULTS)
+        if not rows:
+            return dict(self._META_DEFAULTS)
+        merkle_json, embedding_model, index_revision, last_checkpoint_at = rows[0]
+        merkle: MerkleTree | None = None
+        if merkle_json:
+            try:
+                merkle = MerkleTree.from_json(merkle_json)
+            except Exception:  # noqa: BLE001
+                merkle = None
+        return {
+            "merkle": merkle,
+            "embedding_model": embedding_model,
+            "index_revision": int(index_revision) if index_revision is not None else 0,
+            "last_checkpoint_at": last_checkpoint_at,
+        }
 
-    def _store_merkle(self, con: Any, tree: MerkleTree) -> None:
+    def _store_meta(
+        self,
+        con: Any,
+        *,
+        tree: MerkleTree,
+        embedding_model: str | None,
+        index_revision: int,
+        last_checkpoint_at: float,
+    ) -> None:
         con.execute("DELETE FROM code_index_meta WHERE id = 1")
         con.execute(
-            "INSERT INTO code_index_meta (id, merkle_json) VALUES (1, ?)",
-            [tree.to_json()],
+            "INSERT INTO code_index_meta "
+            "(id, merkle_json, embedding_model, index_revision, last_checkpoint_at) "
+            "VALUES (1, ?, ?, ?, ?)",
+            [tree.to_json(), embedding_model, index_revision, last_checkpoint_at],
         )
 
     # -- chunk row upsert / delete ------------------------------------------
@@ -850,6 +981,19 @@ class CodeIndex:
         swallowed. Returns
         ``{changed_files, added, modified, removed, chunks_written,
         root_hash, rebuilt}``.
+
+        e631d54f — deterministic invalidation: a Merkle diff can only ever
+        see SOURCE changes. If the configured embedding model has changed
+        since the last successful vector build (or the vector leg was
+        enabled after chunks already existed), the vector leg is stale even
+        on a run where NOTHING on disk moved — a plain "diff is empty, do
+        nothing" short-circuit would silently keep serving embeddings from
+        the old model forever. When that mismatch is detected on an
+        otherwise-empty diff, this refreshes ONLY the vector leg (not a full
+        re-chunk) so the index never mixes embeddings across model versions.
+        Every successful rebuild (chunk-driven or vector-only) bumps a
+        persisted ``index_revision`` and ``last_checkpoint_at`` — see
+        :meth:`get_convergence_state`.
         """
         with self._lock:
             new_tree = build_merkle_tree(self.root_dir, hasher=self._hasher)
@@ -861,16 +1005,38 @@ class CodeIndex:
             try:
                 con = self._connect()
                 self._ensure_schema(con)
-                prev = None if full else self._load_merkle(con)
+                meta = self._load_meta(con)
+                prev = None if full else meta["merkle"]
+                revision = meta["index_revision"]
                 diff = new_tree.diff(prev)
                 summary.update({
                     "added": diff.added, "modified": diff.modified,
                     "removed": diff.removed,
                     "changed_files": diff.changed_files,
                 })
+                configured_model = (
+                    self._embedder.model_name if self._embedder.available() else None
+                )
                 if diff.is_empty and prev is not None:
-                    # Nothing moved — the whole point of the Merkle short-circuit.
-                    self._store_merkle(con, new_tree)
+                    # Nothing moved on disk — the whole point of the Merkle
+                    # short-circuit. Still persist (unchanged tree, fresh
+                    # checkpoint timestamp) so get_convergence_state() sees a
+                    # recent last_checkpoint_at even on a no-op pass.
+                    self._store_meta(
+                        con, tree=new_tree, embedding_model=meta["embedding_model"],
+                        index_revision=revision, last_checkpoint_at=time.time(),
+                    )
+                    self._index_revision = revision
+                    if configured_model and configured_model != meta["embedding_model"]:
+                        self._rebuild_vss(con)
+                        if self._vss_ready:
+                            revision += 1
+                            self._store_meta(
+                                con, tree=new_tree, embedding_model=configured_model,
+                                index_revision=revision, last_checkpoint_at=time.time(),
+                            )
+                            self._index_revision = revision
+                            summary["rebuilt"] = True
                     return summary
                 if diff.removed:
                     self._delete_file_chunks(con, diff.removed)
@@ -882,8 +1048,16 @@ class CodeIndex:
                     self._insert_chunks(con, chunks)
                     written += len(chunks)
                 summary["chunks_written"] = written
-                self._store_merkle(con, new_tree)
                 self._rebuild_search(con)
+                revision += 1
+                new_embedding_model = (
+                    configured_model if self._vss_ready else meta["embedding_model"]
+                )
+                self._store_meta(
+                    con, tree=new_tree, embedding_model=new_embedding_model,
+                    index_revision=revision, last_checkpoint_at=time.time(),
+                )
+                self._index_revision = revision
                 summary["rebuilt"] = True
             except Exception:  # noqa: BLE001 — never crash a caller's lifecycle hook
                 _log.debug("CodeIndex.reindex failed", exc_info=True)
@@ -1088,6 +1262,201 @@ class CodeIndex:
             except Exception:  # noqa: BLE001
                 return 0
 
+    # -- explicit embedding-freshness / convergence state (e631d54f) --------
+
+    def get_convergence_state(self) -> "IndexConvergenceState":
+        """Return an explicit, structured freshness snapshot for THIS index.
+
+        Answers "can a caller trust this index's vector results right now,
+        or are they degraded" without having to separately inspect
+        ``_vss_ready`` / guess at staleness. ``degraded`` is ``False``
+        whenever the vector leg is disabled (``vectors_enabled=False``) —
+        the BM25 leg alone has no partial/stale state to track (see the
+        module comment above :class:`IndexConvergenceState`). When the
+        vector leg IS enabled, ``degraded`` is ``True`` if: the last
+        vector build didn't succeed (``not vectors_ready``), some chunks
+        still have no embedding (``pending_embedding_count > 0``), or the
+        model that produced the persisted embeddings no longer matches the
+        currently configured model (a pending deterministic-invalidation
+        case that the NEXT :meth:`reindex` call will resolve). Never
+        raises: a DuckDB failure reports a conservative ``degraded=True``
+        snapshot rather than crashing the caller.
+        """
+        with self._lock:
+            try:
+                con = self._connect()
+                self._ensure_schema(con)
+                meta = self._load_meta(con)
+                total = int(
+                    con.execute("SELECT COUNT(*) FROM code_chunks").fetchone()[0]
+                )
+            except Exception:  # noqa: BLE001
+                _log.debug("CodeIndex.get_convergence_state failed", exc_info=True)
+                return IndexConvergenceState(
+                    root_dir=self.root_dir, source_fingerprint=None,
+                    index_revision=0, embedding_model=None,
+                    configured_embedding_model=None,
+                    vectors_enabled=self._embedder.available(),
+                    vectors_ready=False, total_chunks=0,
+                    pending_embedding_count=0, last_checkpoint_at=None,
+                    degraded=True, converged=False,
+                )
+            vectors_enabled = self._embedder.available()
+            configured_model = self._embedder.model_name if vectors_enabled else None
+            pending = 0
+            if vectors_enabled and total:
+                try:
+                    pending = int(
+                        con.execute(
+                            "SELECT COUNT(*) FROM code_chunks WHERE embedding IS NULL"
+                        ).fetchone()[0]
+                    )
+                except Exception:  # noqa: BLE001 — no embedding column yet: every row pending
+                    pending = total
+            model_mismatch = bool(
+                vectors_enabled and configured_model and meta["embedding_model"]
+                and meta["embedding_model"] != configured_model
+            )
+            degraded = bool(
+                vectors_enabled and (
+                    not self._vss_ready or pending > 0 or model_mismatch
+                    or meta["embedding_model"] is None
+                )
+            )
+            merkle = meta["merkle"]
+            return IndexConvergenceState(
+                root_dir=self.root_dir,
+                source_fingerprint=merkle.root_hash if merkle is not None else None,
+                index_revision=meta["index_revision"],
+                embedding_model=meta["embedding_model"],
+                configured_embedding_model=configured_model,
+                vectors_enabled=vectors_enabled,
+                vectors_ready=bool(self._vss_ready),
+                total_chunks=total,
+                pending_embedding_count=pending,
+                last_checkpoint_at=meta["last_checkpoint_at"],
+                degraded=degraded,
+                converged=not degraded,
+            )
+
+    # -- targeted registration after provenance writes (e631d54f) -----------
+
+    def index_paths(self, paths: list[str]) -> dict[str, Any]:
+        """Synchronously (re)chunk + persist a small, EXPLICIT set of files,
+        bypassing the ambient Merkle-diff walk over the whole root — mirrors
+        ``meridian_outputs.outputs_local.OutputsFtsIndex.index_paths`` /
+        ``register_priority_path`` (item 6af1518d requirement 3) on the
+        code-index side. Cost is bounded by ``len(paths)``, not by the size
+        of ``root_dir`` — safe to call synchronously right after a
+        provenance write for one of these paths (e.g. a generator script
+        just wrote/overwrote it) even on a large tree whose own ambient
+        :meth:`reindex` pass hasn't reached it yet.
+
+        Deliberately does NOT touch the persisted Merkle tree — the next
+        full :meth:`reindex` will (harmlessly, via ``INSERT OR REPLACE``)
+        rediscover these paths through its own diff and re-process them if
+        their content has moved on since; this call only makes them
+        searchable NOW instead of waiting for that next pass. Paths outside
+        ``root_dir`` or with an unsupported extension are silently skipped.
+        On success, bumps the persisted ``index_revision`` and
+        ``last_checkpoint_at`` (only when a prior full :meth:`reindex` has
+        already established a Merkle baseline to persist alongside) so
+        :meth:`get_convergence_state` reflects the targeted write. Rebuilds
+        the FTS (+ vector, if enabled) index over the WHOLE chunk table —
+        same cost model :meth:`reindex` already pays on any change. Best
+        -effort: never raises. Returns
+        ``{"indexed": N, "skipped": N, "paths": [...]}``.
+        """
+        with self._lock:
+            targets: list[tuple[str, str]] = []  # (abs_path, rel_path)
+            skipped = 0
+            for p in paths or []:
+                if not p:
+                    skipped += 1
+                    continue
+                abs_p = p if os.path.isabs(p) else self._abs(p)
+                abs_p = os.path.normpath(abs_p)
+                if not is_indexable(abs_p):
+                    skipped += 1
+                    continue
+                try:
+                    rel = os.path.relpath(abs_p, self.root_dir).replace(os.sep, "/")
+                except ValueError:  # different drive on Windows
+                    skipped += 1
+                    continue
+                if rel.startswith(".."):
+                    skipped += 1  # outside root_dir
+                    continue
+                targets.append((abs_p, rel))
+            if not targets:
+                return {"indexed": 0, "skipped": skipped, "paths": []}
+            try:
+                con = self._connect()
+                self._ensure_schema(con)
+                written_rel: list[str] = []
+                for abs_p, rel in targets:
+                    self._delete_file_chunks(con, [rel])
+                    chunks = self._chunk_path(abs_p)
+                    if chunks:
+                        self._insert_chunks(con, chunks)
+                        written_rel.append(rel)
+                    else:
+                        skipped += 1
+                if written_rel:
+                    self._rebuild_search(con)
+                    meta = self._load_meta(con)
+                    if meta["merkle"] is not None:
+                        revision = meta["index_revision"] + 1
+                        configured_model = (
+                            self._embedder.model_name
+                            if self._embedder.available() else None
+                        )
+                        new_embedding_model = (
+                            configured_model if self._vss_ready
+                            else meta["embedding_model"]
+                        )
+                        self._store_meta(
+                            con, tree=meta["merkle"],
+                            embedding_model=new_embedding_model,
+                            index_revision=revision,
+                            last_checkpoint_at=time.time(),
+                        )
+                        self._index_revision = revision
+                return {
+                    "indexed": len(written_rel), "skipped": skipped,
+                    "paths": written_rel,
+                }
+            except Exception:  # noqa: BLE001 — never crash a caller's write path
+                _log.debug("CodeIndex.index_paths failed", exc_info=True)
+                return {"indexed": 0, "skipped": len(paths or []), "paths": []}
+
+    def describe_vector_index(self) -> "IndexMetadata":
+        """Backend-neutral metadata snapshot of this index's optional VSS leg
+        (e1475682) — see :mod:`meridian_codeindex.vector_index.IndexMetadata`.
+
+        A read-only view of the state :meth:`_rebuild_vss` already tracks
+        (``_vss_ready`` / ``_vss_dim`` / the embedder) — CodeIndex keeps
+        managing its own hybrid search path unchanged; this only exposes
+        that state in the shared contract's shape so a caller can persist or
+        compare it via ``meridian.db.vector_index_state`` /
+        :func:`meridian_codeindex.vector_index.compare_candidates` without
+        CodeIndex importing that module on its hot (search) path.
+        """
+        from .vector_index import IndexMetadata  # local import — keep this an
+        # optional, cold-path integration; code_index.py's search hot path
+        # never imports vector_index.py.
+
+        return IndexMetadata(
+            backend="duckdb_vss" if self._vss_ready else "bm25_lexical",
+            embedding_model=_EMBED_MODEL_NAME if self._embedder.available() else None,
+            embedding_version=_model2vec_version() if self._embedder.available() else None,
+            dimension=self._vss_dim,
+            source_fingerprint=None,
+            project_id=None,
+            scope=self.root_dir,
+            record_count=self.count(),
+        )
+
     def close(self) -> None:
         """Close the owned DuckDB connection (no-op for an injected one)."""
         with self._lock:
@@ -1228,6 +1597,34 @@ def reindex_at_checkpoint(
     return idx.reindex()
 
 
+def register_priority_path(
+    root_dir: str, path: str, *, db_path: str = ":memory:",
+) -> dict[str, Any]:
+    """Provenance-triggered targeted registration — module-level convenience
+    wrapper around :meth:`CodeIndex.index_paths`, mirroring
+    ``meridian_outputs.outputs_local.register_priority_path`` (item 6af1518d
+    requirement 3) on the code-index side.
+
+    Intended caller: right after a provenance write for ``path`` (e.g. a
+    generator script just wrote/overwrote it, or
+    ``meridian_outputs.annotate.record_provenance`` just recorded it) so it
+    becomes searchable via :func:`search_code_semantic` immediately instead
+    of waiting for the next :func:`reindex_at_checkpoint` pass over the whole
+    ``root_dir``. Uses the SAME process-cached :class:`CodeIndex` instance
+    every other function in this module keys off of via
+    :func:`get_code_index`. Never raises — a missing/invalid ``root_dir``
+    reports zero indexed rather than erroring.
+    """
+    root_dir = normalize_root_dir(root_dir)
+    if not root_dir or not os.path.isdir(root_dir):
+        return {
+            "indexed": 0, "skipped": 1, "paths": [],
+            "error": f"root_dir does not exist: {root_dir}",
+        }
+    idx = get_code_index(root_dir, db_path=db_path)
+    return idx.index_paths([path])
+
+
 def search_code_semantic(
     root_dir: str,
     query: str,
@@ -1246,6 +1643,17 @@ def search_code_semantic(
     deliverable on its own. Returns
     ``{root_dir, query, total_indexed, vectors_enabled, hits:[...]}``. A missing
     directory / empty tree returns an empty hits list, never an error.
+
+    e631d54f — the response also carries ``convergence``
+    (:meth:`CodeIndex.get_convergence_state`, as a dict) and a top-level
+    ``degraded`` bool mirroring ``convergence["degraded"]``. ``degraded`` is
+    always ``False`` when the vector leg is off (pure-BM25 hits have no
+    partial/stale state to flag); when the vector leg IS enabled, a
+    ``degraded=True`` result means the returned ``hits`` may be missing
+    vector-leg candidates (stale/absent embeddings, or a model-version
+    mismatch pending the next reindex) — such hits are real BM25 matches but
+    must NOT be read as "the vector leg found nothing better", and must
+    never satisfy an authoritative pointer/provenance gate on their own.
 
     This function reads ``root_dir`` off the filesystem of whatever process
     calls it — there is no remote/hosted awareness here at all. A caller
@@ -1278,4 +1686,7 @@ def search_code_semantic(
     result["total_indexed"] = idx.count()
     result["vectors_active"] = idx._vss_ready
     result["hits"] = idx.search(query, limit=limit, kind=kind)
+    convergence = idx.get_convergence_state().to_dict()
+    result["convergence"] = convergence
+    result["degraded"] = convergence["degraded"]
     return result

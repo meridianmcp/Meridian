@@ -63,6 +63,7 @@ from . import outputs_local
 __all__ = [
     "resolve_figure_output",
     "find_outputs_by_source",
+    "classify_temp_output_ownership",
 ]
 
 
@@ -224,3 +225,81 @@ def find_outputs_by_source(
     matches.sort(key=lambda h: (h.get("mtime") or 0), reverse=True)
     trimmed = matches[: max(int(limit), 1)]
     return {"source_path": source_path, "outputs": trimmed, "total": len(matches)}
+
+
+def classify_temp_output_ownership(outputs_dir: str, path: str) -> dict[str, Any]:
+    """Sprint item 2ae3f011 -- confirm whether ``path`` is a Meridian-owned
+    TEMPORARY output eligible for reversible quarantine, or must never be
+    touched.
+
+    This is the ``ownership_check`` this module's callers should inject into
+    ``meridian.worktree_cleanup.build_quarantine_manifest`` /
+    ``purge_quarantined_output`` (that module has no hard dependency on this
+    extension -- see its own docstring -- so it always needs a real
+    classifier supplied by whoever calls it with real ownership knowledge;
+    this is that classifier). Built entirely on
+    ``outputs_local.get_indexed_output`` (this module's only existing
+    dependency, per its own module docstring) -- no new hashing, no private
+    reach-through, no re-implementation of the canonical/archival heuristic
+    that already lives in ``outputs_local.classify_canonical_archival``
+    (``get_indexed_output`` already surfaces its ``is_archival`` verdict on
+    the same row).
+
+    Ownership rule (conservative by design -- false negatives are safe,
+    false positives are not):
+      - Never discovered by the outputs index at all (``get_indexed_output``
+        returns ``None``) -> NOT eligible, regardless of filename. Could be
+        anything, including a user's own file that merely happens to live
+        under the outputs tree -- "never delete user or canonical outputs".
+      - Discovered, but ``is_archival`` is ``False`` (this IS the canonical/
+        live output) -> NOT eligible, regardless of how confidently it's
+        "known" -- canonical outputs are never quarantine candidates.
+      - Discovered AND ``is_archival`` is ``True`` -> eligible: a confirmed
+        Meridian-owned temporary/archival copy.
+
+    Returns ``{"path", "eligible", "is_archival", "canonical_path",
+    "sha256", "size", "reason"}``. Never raises: a missing/invalid
+    ``outputs_dir``/``path`` just returns ``eligible=False`` with an
+    explanatory ``reason``, same fail-closed posture as every other
+    ownership decision this function makes.
+    """
+    if not path or not str(path).strip():
+        return {
+            "path": path, "eligible": False, "is_archival": None,
+            "canonical_path": None, "sha256": None, "size": None,
+            "reason": "path is required",
+        }
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        return {
+            "path": path, "eligible": False, "is_archival": None,
+            "canonical_path": None, "sha256": None, "size": None,
+            "reason": "outputs_dir is required",
+        }
+
+    indexed = outputs_local.get_indexed_output(outputs_dir, path)
+    if indexed is None:
+        return {
+            "path": path, "eligible": False, "is_archival": None,
+            "canonical_path": None, "sha256": None, "size": None,
+            "reason": "never discovered by the outputs index -- ownership cannot be confirmed",
+        }
+
+    is_archival = bool(indexed.get("is_archival"))
+    common = {
+        "path": path,
+        "is_archival": is_archival,
+        "canonical_path": indexed.get("canonical_path"),
+        "sha256": indexed.get("sha256"),
+        "size": indexed.get("size"),
+    }
+    if not is_archival:
+        return {
+            **common,
+            "eligible": False,
+            "reason": "classified as the canonical output, not a temporary/archival copy",
+        }
+    return {
+        **common,
+        "eligible": True,
+        "reason": "confirmed Meridian-owned temporary output (archival copy, known to the outputs index)",
+    }

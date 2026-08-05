@@ -273,3 +273,113 @@ def test_worker_prompt_no_resources():
     prompt = dispatcher_module._worker_prompt(item, "proj-1")
     assert "abc123" in prompt
     assert "resources" not in prompt.lower()
+
+
+# --- b108f2e0: typed blocker triage integration ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_skips_quarantined_item_continues_others(db, project):
+    """A quarantined item is skipped this pass, but a disjoint item in the
+    same group still dispatches — the core fix: one blocked item never
+    stalls an otherwise-executable autonomous run.
+    """
+    await db_module.add_sprint_item(
+        db, project, "v1", "Blocked Item", touches_resources=["file:blocked"]
+    )
+    await db_module.add_sprint_item(
+        db, project, "v1", "Fine Item", touches_resources=["file:fine"]
+    )
+    fake = _FakeEnqueue()
+
+    async def _fake_evaluate(db_, pid, *, version=None, items=None, signals=None):
+        return {
+            "run_stop": False,
+            "run_stop_reason": None,
+            "quarantined_item_ids": ["will-not-match-but-set-below"],
+        }
+
+    disp = Dispatcher(db, project, enqueue_fn=fake, evaluate_blockers_fn=_fake_evaluate)
+
+    # Resolve the real blocked item's id from the live board, then re-point
+    # the fake evaluator at it (mirrors how a real evaluate_board_blockers
+    # call would report it).
+    items = await db_module.get_sprint_items(db, project)
+    blocked_id = next(i["id"] for i in items if i["title"] == "Blocked Item")
+
+    async def _fake_evaluate2(db_, pid, *, version=None, items=None, signals=None):
+        return {"run_stop": False, "run_stop_reason": None, "quarantined_item_ids": [blocked_id]}
+
+    disp._evaluate_blockers = _fake_evaluate2
+
+    enqueued = await disp.dispatch_once()
+    assert len(enqueued) == 1
+    assert len(fake.calls) == 1
+    assert "Fine Item" in fake.calls[0]["prompt"]
+    assert disp._stopped is False
+    assert disp.last_blocker_decision["quarantined_item_ids"] == [blocked_id]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_halts_on_fail_closed_blocker(db, project):
+    """A fail-closed blocker (verified_security / integrity_corruption /
+    run_global_blocker, or an explicit run_stop policy) stops the dispatcher
+    entirely and enqueues nothing.
+    """
+    await db_module.add_sprint_item(
+        db, project, "v1", "Item A", touches_resources=["file:a"]
+    )
+    fake = _FakeEnqueue()
+
+    async def _fake_evaluate(db_, pid, *, version=None, items=None, signals=None):
+        return {
+            "run_stop": True,
+            "run_stop_reason": "fail_closed_blocker:verified_security;items:x",
+            "quarantined_item_ids": [],
+        }
+
+    disp = Dispatcher(db, project, enqueue_fn=fake, evaluate_blockers_fn=_fake_evaluate)
+    enqueued = await disp.dispatch_once()
+    assert enqueued == []
+    assert fake.calls == []
+    assert disp._stopped is True
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_survives_blocker_evaluation_failure(db, project):
+    """A blocker-evaluation failure degrades to unfiltered dispatch — it
+    must never itself stop the dispatcher (only an ACTUAL fail-closed
+    classification does that).
+    """
+    await db_module.add_sprint_item(
+        db, project, "v1", "Item A", touches_resources=["file:a"]
+    )
+    fake = _FakeEnqueue()
+
+    async def _boom_evaluate(db_, pid, *, version=None, items=None, signals=None):
+        raise RuntimeError("evaluation blew up")
+
+    disp = Dispatcher(db, project, enqueue_fn=fake, evaluate_blockers_fn=_boom_evaluate)
+    enqueued = await disp.dispatch_once()
+    assert len(enqueued) == 1
+    assert disp._stopped is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_uses_real_evaluate_board_blockers_by_default(db, project):
+    """End-to-end (no injected evaluator): an empty-scope CRITICAL item is
+    quarantined by the REAL db.evaluate_board_blockers, while an
+    independent, well-scoped item still dispatches.
+    """
+    await db_module.add_sprint_item(
+        db, project, "v1", "CRITICAL empty item", notes="", priority="urgent",
+    )
+    await db_module.add_sprint_item(
+        db, project, "v1", "Fine Item", touches_resources=["file:fine"]
+    )
+    fake = _FakeEnqueue()
+    disp = Dispatcher(db, project, enqueue_fn=fake)
+    enqueued = await disp.dispatch_once()
+    assert len(enqueued) == 1
+    assert "Fine Item" in fake.calls[0]["prompt"]
+    assert disp._stopped is False

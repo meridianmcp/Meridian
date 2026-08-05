@@ -29,6 +29,28 @@ import xml.etree.ElementTree as ET
 from meridian_docs import docs_intel
 
 
+@pytest.fixture(autouse=True)
+def _default_render_capability(monkeypatch):
+    """ddd79188 follow-up -- set_page_header/set_page_footer now invoke the
+    real render-capability gate (render_gate.check_render_capability) AFTER
+    the structural write is staged, verified, and promoted. Every test in
+    this file exercises STRUCTURAL correctness and must not depend on -- or
+    be slowed/blocked by -- whichever render backends (LibreOffice, Word COM)
+    happen to be installed on the machine running the suite. Stub a
+    successful 'rendered' result by default, mirroring
+    test_19be1551_insert_figure_block.py's own fixture of the same name.
+    """
+    monkeypatch.setattr(
+        docs_intel.render_gate,
+        "check_render_capability",
+        lambda docx_path, **kwargs: {
+            "status": "rendered",
+            "backend": "test-stub",
+            "detail": {"stub": True},
+        },
+    )
+
+
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _PKG_CT_NS = "http://schemas.openxmlformats.org/package/2006/content-types"

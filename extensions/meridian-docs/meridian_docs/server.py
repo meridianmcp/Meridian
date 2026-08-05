@@ -126,7 +126,22 @@ def search_document(
     element_types: list[str] | None = None,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """BM25-search all searchable DOCX XML parts with structural filters."""
+    """BM25-search all searchable DOCX XML parts with structural filters.
+
+    c7cc9da4 -- the anchor-resolution surface for review-session
+    recommendations: every result carries a stable ``element_id``
+    (paragraph/heading/section/table/caption), an exact literal
+    ``quoted_text`` (safe to quote verbatim, unlike ``snippet`` which may be
+    "…"-truncated), and a ``word_search_locator`` -- ``{find_text, part,
+    element_id, unique_in_part, occurrence_count_in_part}`` -- telling a
+    reviewer whether pasting ``find_text`` into Word's own Ctrl+F box lands
+    unambiguously on this occurrence. Image anchors resolve via a
+    ``figure_caption`` result's ``element_id`` (its caption) paired with
+    ``find_image_paragraph`` for the picture paragraph itself; equation
+    anchors come from ``extract_equations`` / ``get_equations`` instead,
+    since OMML math has no searchable body text. See
+    ``docs_intel.search_document_xml`` for the full contract.
+    """
     return docs_intel.search_document_xml(
         docx_path=docx_path,
         query=query,
@@ -142,10 +157,31 @@ def highlight_document(
     element_types: list[str] | None = None,
     color: str = "yellow",
     limit: int = 100,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply native Word highlighting to structural XML search matches.
 
+    ddd79188 follow-up -- once the highlighted parts are staged, verified
+    (ZIP/XML/relationship/media integrity), and promoted, a real Word/COM
+    (or LibreOffice) render-capability check also runs against the
+    just-written file, mirroring insert_figure_block / merge_docx_draft.
+    "rendered" continues normally with render evidence attached to the
+    result. "failed" (a render backend was available but errored on this
+    document) restores the pre-write backup and returns an error, same as a
+    structural verification failure. "unavailable-with-reason" (no render
+    backend in this environment) ALSO fails closed by default -- never
+    reported as verified -- unless allow_degraded_render=True is passed
+    together with a non-empty degraded_render_reason, an audited opt-in that
+    keeps the write but stamps render_verified=False / render_degraded=True
+    on the result instead of silently treating "could not check" as
+    "passed".
+
+    allow_degraded_render: see insert_figure_block's docstring for the full
+      contract. Requires degraded_render_reason.
+    degraded_render_reason: required, non-empty when allow_degraded_render is
+      True; carried onto the result as an audit trail.
     session_id: 273df573 — identifies the calling Meridian session to the
       tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
       meridian/routes/tunnel.py). Not forwarded to docs_intel; has no effect
@@ -158,12 +194,61 @@ def highlight_document(
         element_types=element_types,
         color=color,
         limit=limit,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 @mcp.tool()
 def read_document_snapshot(docx_path: str) -> dict[str, Any]:
-    """Read the last saved DOCX snapshot without writing or requiring a close."""
+    """Read the last saved DOCX snapshot without writing or requiring a close.
+
+    c7cc9da4 -- the entry point for a Meridian-docs review session: never
+    treats a Word ~$ lock file as a blocker, and always reads the last
+    SAVED on-disk bytes (unsaved Word edits are invisible until saved).
+    Returns a ``source_sha256`` fingerprint of those exact bytes -- record
+    it and re-check it (e.g. via ``render_gate.verify_promotion_readiness``)
+    before promoting any later draft/overlay, so a promotion never lands
+    against content the review never actually saw -- plus an explicit
+    ``limitations`` list spelling out both caveats for a caller that
+    forwards this snapshot into a recommendation or report. See
+    ``docs_intel.read_document_snapshot`` for the full contract.
+    """
     return docs_intel.read_document_snapshot(docx_path)
+
+
+@mcp.tool()
+def locate_anchor(document_path: str, query: dict[str, Any]) -> dict[str, Any]:
+    """2271789f -- read-only, fresh-snapshot deterministic anchor locator.
+
+    Resolves ``query`` against sections, paragraphs, captions, tables
+    (including cell text), and equations, re-parsing ``document_path`` from
+    disk on every call (never a stale sidecar index). Query keys (all
+    optional; at least one required): ``para_id``, ``section_path`` (e.g.
+    "3.2.4"), ``section_text``, ``caption_label`` (e.g. "Table 3"), ``text``
+    (Ctrl+F-style literal substring), ``element_types``, ``case_sensitive``,
+    and ``expected_source_fingerprint`` (detects the document having
+    changed since a previously-returned ``source_fingerprint``).
+
+    A resolved result includes ``section_path``, ``heading_para_id``,
+    ``target_para_id``, ``document_order``, ``quoted_text``,
+    ``leading_text_preview``/``first_words``, ``word_search_locator``,
+    ``bookmark_exists``, ``ref_status``, and an explicit (empty when
+    unambiguous) ``candidates`` list. ``status`` is one of "resolved",
+    "ambiguous", "not_found", or "stale". Never mutates document_path. See
+    :func:`meridian_docs.docs_intel.locate_anchor` for the full contract.
+    """
+    return docs_intel.locate_anchor(document_path=document_path, query=query)
+
+
+@mcp.tool()
+def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[str, Any]:
+    """2271789f -- resolve multiple independent locate_anchor queries against
+    ONE fresh parse of document_path (one source_fingerprint, one index
+    pass), preserving query order in the returned ``results`` list. See
+    :func:`locate_anchor` for the per-query contract and
+    :func:`meridian_docs.docs_intel.locate_anchors` for full details.
+    """
+    return docs_intel.locate_anchors(document_path=document_path, queries=queries)
 
 
 @mcp.tool()
@@ -353,6 +438,8 @@ def insert_figure_block(
     section_heading: str | None = None,
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """19be1551 — atomically insert a centered image paragraph AND its
@@ -387,6 +474,20 @@ def insert_figure_block(
     must match what was written. On a verification failure, the pre-write
     backup is restored and an error is returned instead of a false success.
 
+    ddd79188 — AFTER that structural verification passes, a real
+    render-capability check (check_render_capability) also runs against the
+    just-written file: structural re-parse alone can never prove the
+    document actually opens/renders in Word. "rendered" continues normally
+    with render evidence attached. "failed" (a render backend was available
+    but errored on this document) restores the pre-write backup and returns
+    an error, same as a structural verification failure. "unavailable-with-
+    reason" (no render backend in this environment) ALSO fails closed by
+    default — never reported as verified — unless allow_degraded_render=True
+    is passed together with a non-empty degraded_render_reason, an audited
+    opt-in that keeps the write but stamps render_verified=False /
+    render_degraded=True on the result instead of silently treating "could
+    not check" as "passed".
+
     Supported image formats, dimension inference, and the six-inch default
     width all match insert_image.
 
@@ -411,6 +512,18 @@ def insert_figure_block(
                        new figure/caption without a stale cache.
       style_policy:    Optional style policy overrides (see
                        resolve_style_policy).
+      allow_degraded_render: ddd79188 — explicit, audited opt-in to accept
+                       this write when no render backend is available in
+                       this environment (render status
+                       "unavailable-with-reason"). Requires
+                       degraded_render_reason. Never bypasses a real render
+                       "failed" status — only the "no backend available"
+                       case can be degraded.
+      degraded_render_reason: Required, non-empty when allow_degraded_render
+                       is True; carried onto the result as an audit trail
+                       (this stdlib-only, DB-free extension does not persist
+                       it itself — a caller with DB access, e.g. Meridian
+                       core, is responsible for logging/pinning it).
       session_id:      273df573 — identifies the calling Meridian session to
                        the tunnel-layer DOCX region-claim guard
                        (check_docs_write_conflict in meridian/routes/
@@ -420,9 +533,11 @@ def insert_figure_block(
 
     Returns:
       {status, image_para_id, image_name, kind, seq_number, label_text,
-      section_heading, ref_bookmark, docx_path}
+      section_heading, ref_bookmark, docx_path, render_status,
+      render_verified, render_backend, render_detail}
       or {error: <message>} on failure (file NOT left mutated on validation
-      failure; restored from backup on a post-write verification failure).
+      failure; restored from backup on a structural- or render-verification
+      failure).
     """
     return docs_intel.insert_figure_block(
         docx_path=docx_path,
@@ -435,6 +550,8 @@ def insert_figure_block(
         section_heading=section_heading,
         index_db_path=index_db_path,
         style_policy=style_policy,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 
@@ -480,6 +597,8 @@ def insert_caption(
     section_heading: str | None = None,
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real Word Caption paragraph into a .docx file.
@@ -495,6 +614,20 @@ def insert_caption(
     4efc63fd — style_policy["caption_centered"] (default False) controls
     whether the new caption gets w:jc w:val="center".
 
+    ddd79188 — AFTER the write is staged, structurally verified, and
+    promoted, a real render-capability check (check_render_capability) also
+    runs against the just-written file: structural re-parse alone can never
+    prove the document actually opens/renders in Word. "rendered" continues
+    normally with render evidence attached. "failed" (a render backend was
+    available but errored on this document) restores the pre-write backup
+    and returns an error, same as a structural verification failure.
+    "unavailable-with-reason" (no render backend in this environment) ALSO
+    fails closed by default — never reported as verified — unless
+    allow_degraded_render=True is passed together with a non-empty
+    degraded_render_reason, an audited opt-in that keeps the write but
+    stamps render_verified=False / render_degraded=True on the result
+    instead of silently treating "could not check" as "passed".
+
     Args:
       docx_path:       Absolute path to the .docx file (mutated in place).
       anchor_para_id:  w14:paraId or p{N} of the paragraph/table to anchor on.
@@ -508,6 +641,17 @@ def insert_caption(
                        next read auto-reindexes (keeps metadata in sync).
       style_policy:    Optional style policy overrides (see
                        resolve_style_policy / audit_equation_style).
+      allow_degraded_render: ddd79188 — explicit, audited opt-in to accept
+                       this write when no render backend is available in
+                       this environment (render status
+                       "unavailable-with-reason"). Requires
+                       degraded_render_reason. Never bypasses a real render
+                       "failed" status.
+      degraded_render_reason: Required, non-empty when allow_degraded_render
+                       is True; carried onto the result as an audit trail
+                       (this stdlib-only, DB-free extension does not persist
+                       it itself — a caller with DB access, e.g. Meridian
+                       core, is responsible for logging/pinning it).
       session_id:      273df573 — identifies the calling Meridian session to
                        the tunnel-layer DOCX region-claim guard
                        (check_docs_write_conflict in meridian/routes/
@@ -516,8 +660,12 @@ def insert_caption(
                        (e.g. standalone `uvx meridian-docs`).
 
     Returns:
-      {status, kind, seq_number, label_text, section_heading, docx_path}
-      or {error: <message>} on failure (file NOT mutated on error).
+      {status, kind, seq_number, label_text, section_heading, ref_bookmark,
+      docx_path, render_status, render_verified, render_backend,
+      render_detail}
+      or {error: <message>} on failure (file NOT left mutated on validation
+      failure; restored from backup on a structural- or render-verification
+      failure).
     """
     return docs_intel.insert_caption(
         docx_path=docx_path,
@@ -528,6 +676,8 @@ def insert_caption(
         section_heading=section_heading,
         index_db_path=index_db_path,
         style_policy=style_policy,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 
@@ -898,6 +1048,8 @@ def insert_equation(
     position: str = "after",
     index_db_path: str | None = None,
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Insert an equation into a .docx file.
@@ -916,6 +1068,20 @@ def insert_equation(
     left indentation (body_indent_twips, default 0). Not consulted for
     position="append".
 
+    ddd79188 — AFTER the write is staged, structurally verified, and
+    promoted, a real render-capability check (check_render_capability) also
+    runs against the just-written file: structural re-parse alone can never
+    prove the document actually opens/renders in Word. "rendered" continues
+    normally with render evidence attached. "failed" (a render backend was
+    available but errored on this document) restores the pre-write backup
+    and returns an error, same as a structural verification failure.
+    "unavailable-with-reason" (no render backend in this environment) ALSO
+    fails closed by default — never reported as verified — unless
+    allow_degraded_render=True is passed together with a non-empty
+    degraded_render_reason, an audited opt-in that keeps the write but
+    stamps render_verified=False / render_degraded=True on the result
+    instead of silently treating "could not check" as "passed".
+
     Args:
       docx_path:       Absolute path to the .docx file (mutated in place).
       anchor_para_id:  w14:paraId or p{N}/tbl{N} to anchor the insertion.
@@ -924,6 +1090,11 @@ def insert_equation(
       index_db_path:   If supplied, sidecar is invalidated after write.
       style_policy:    Optional style policy overrides (see
                        resolve_style_policy / audit_equation_style).
+      allow_degraded_render: ddd79188 — explicit, audited opt-in to accept
+                       this write when no render backend is available in
+                       this environment. Requires degraded_render_reason.
+      degraded_render_reason: Required, non-empty when allow_degraded_render
+                       is True; carried onto the result as an audit trail.
       session_id:      273df573 — identifies the calling Meridian session to
                        the tunnel-layer DOCX region-claim guard
                        (check_docs_write_conflict in meridian/routes/
@@ -932,8 +1103,11 @@ def insert_equation(
                        (e.g. standalone `uvx meridian-docs`).
 
     Returns:
-      {status, position, para_id, omml, docx_path}
-      or {error: <message>} on failure (file NOT mutated on error).
+      {status, position, para_id, omml, docx_path, render_status,
+      render_verified, render_backend, render_detail}
+      or {error: <message>} on failure (file NOT left mutated on validation
+      failure; restored from backup on a structural- or render-verification
+      failure).
     """
     return docs_intel.insert_equation_local(
         docx_path=docx_path,
@@ -942,6 +1116,8 @@ def insert_equation(
         position=position,
         index_db_path=index_db_path,
         style_policy=style_policy,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 
@@ -1319,7 +1495,9 @@ def get_section_content(docx_path: str, heading_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
+def find_references_to(
+    docx_path: str, target_id: str, include_literal: bool = True
+) -> dict[str, Any]:
     """fea654f9 — Find everything that points AT a figure/table/heading id.
 
     The missing inverse of insert_cross_reference: given a target (a
@@ -1328,15 +1506,29 @@ def find_references_to(docx_path: str, target_id: str) -> dict[str, Any]:
     NOTEREF fields whose instruction targets that same bookmark. Needed for
     safe renumbering/moving without breaking references elsewhere.
 
+    b2035fb4 — when the target resolves to a Figure/Table caption and
+    include_literal is True (default), also scans plain-text paragraphs
+    (never fielded ones) for literal mentions such as "Figure 5.21" or
+    "Table 11" that no REF field backs, classifying each as exact/ambiguous/
+    stale against the caption's CURRENT cached number. Review the combined
+    field + literal closure before calling renumber_sequences so a stale
+    literal mention can be triaged while the pre-renumber numbers are still
+    visible in the report.
+
     Args:
       docx_path: Absolute path to the .docx file.
       target_id: A caption/heading para_id, or an existing bookmark name.
+      include_literal: Also run the literal-text scan described above
+        (default True). Pass False to reproduce the field-only behavior.
 
     Returns:
       {target_id, target_kind, bookmark_names, references, reference_count,
-      docx_path} or {error: <message>}.
+      literal_references, literal_reference_count, combined_references,
+      combined_reference_count, docx_path} or {error: <message>}.
     """
-    return docs_intel.find_references_to(docx_path=docx_path, target_id=target_id)
+    return docs_intel.find_references_to(
+        docx_path=docx_path, target_id=target_id, include_literal=include_literal
+    )
 
 
 @mcp.tool()
@@ -1406,6 +1598,8 @@ def insert_highlighted_note(
     author: str = "Meridian",
     initials: str = "M",
     style_policy: dict[str, Any] | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert an internal note inline or as a native Word comment.
@@ -1419,6 +1613,23 @@ def insert_highlighted_note(
     consulted for mode="comment". Distinct from the `style` parameter above,
     which selects the note's category (only "internal_note" is supported),
     not its rendering.
+
+    ddd79188 — for mode="inline", AFTER the write is staged, structurally
+    verified, and promoted, a real render-capability check
+    (check_render_capability) also runs against the just-written file:
+    structural re-parse alone can never prove the document actually
+    opens/renders in Word. "rendered" continues normally with render
+    evidence attached. "failed" restores the pre-write backup and returns an
+    error. "unavailable-with-reason" (no render backend in this environment)
+    ALSO fails closed by default — never reported as verified — unless
+    allow_degraded_render=True is passed together with a non-empty
+    degraded_render_reason. For mode="comment", these two params are
+    forwarded to insert_word_comment, which already enforces this same gate.
+
+    allow_degraded_render / degraded_render_reason: explicit, audited opt-in
+      to accept a write when no render backend is available in this
+      environment; degraded_render_reason is required and must be non-empty
+      whenever allow_degraded_render=True.
 
     session_id: 273df573 — identifies the calling Meridian session to the
       tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
@@ -1437,6 +1648,8 @@ def insert_highlighted_note(
         author=author,
         initials=initials,
         style_policy=style_policy,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 
@@ -1858,6 +2071,8 @@ def merge_docx_draft(
     canonical_path: str,
     draft_path: str,
     index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """fe989980 — promote an isolated wave-scoped draft into canonical_path.
@@ -1883,6 +2098,21 @@ def merge_docx_draft(
     mismatch canonical_path is best-effort restored from that backup and
     this returns an error, never a false success.
 
+    ddd79188 — AFTER that structural verification passes, a real
+    render-capability check (check_render_capability) also runs against the
+    now-promoted canonical_path: structural re-parse alone can never prove
+    the promoted document actually opens/renders in Word. "rendered"
+    continues normally with render evidence attached. "failed" (a render
+    backend was available but errored on this document) restores
+    canonical_path from the SAME backup and returns an error, same as a
+    structural verification failure. "unavailable-with-reason" (no render
+    backend in this environment) ALSO fails closed by default — never
+    reported as verified — unless allow_degraded_render=True is passed
+    together with a non-empty degraded_render_reason, an audited opt-in
+    that keeps the promotion but stamps render_verified=False /
+    render_degraded=True on the result instead of silently treating "could
+    not check" as "passed".
+
     session_id: 273df573 — identifies the calling Meridian session to the
       tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
       meridian/routes/tunnel.py; the guarded path is canonical_path, since
@@ -1890,16 +2120,24 @@ def merge_docx_draft(
       no effect when this tool is invoked outside Meridian's tunnel (e.g.
       standalone `uvx meridian-docs`).
 
+    allow_degraded_render / degraded_render_reason: see insert_figure_block's
+      docstring for the shared contract — required together, and the
+      reason is carried onto the result as an audit trail rather than
+      persisted by this stdlib-only, DB-free extension itself.
+
     Returns {merged: True, status: "merged", canonical_path, draft_path,
-    paragraph_count, heading_count, table_count, image_count} on success, or
+    paragraph_count, heading_count, table_count, image_count, render_status,
+    render_verified, render_backend, render_detail} on success, or
     {merged: False, error: <message>, ...} on failure — with
-    file_restored: <bool> present only when a post-promotion verification
-    failure triggered a restore.
+    file_restored: <bool> present only when a post-promotion structural- or
+    render-verification failure triggered a restore.
     """
     return docs_intel.merge_draft_into_canonical(
         canonical_path=canonical_path,
         draft_path=draft_path,
         index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 

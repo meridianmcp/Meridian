@@ -24,6 +24,7 @@ from meridian.pointers import (
     serialize_targets,
     deserialize_targets,
     resolve_pointer,
+    repair_pointer_set,
 )
 
 
@@ -215,6 +216,150 @@ def test_target_kind_existing_uses_injectable_path_exists_checker():
     ok = validate_pointer(ptr, path_exists=lambda _uri: True)
     assert ok["targets"][0]["target_kind"] == "existing"
     with pytest.raises(PointerValidationError):
+        validate_pointer(ptr, path_exists=lambda _uri: False)
+
+
+# ---------------------------------------------------------------------------
+# ba539706 — canonical local URI/path normalization contract
+#
+# normalize_local_uri_candidates is the ONE shared normalization both
+# validate_pointer's write-time target_kind='existing' check and
+# verify_target_readiness's completion-time gate go through, so a pointer
+# recorded under one valid path spelling (file:// URI, WSL /mnt/<drive>,
+# forward vs. backslash separators, a UNC host) isn't reported "missing"
+# purely because a later check ran under a different one. Pure string
+# transforms — no real filesystem/OS dependency, so these unit tests run
+# identically on every CI platform.
+# ---------------------------------------------------------------------------
+
+def test_normalize_local_uri_candidates_empty_uri_returns_empty_list():
+    assert pointers_module.normalize_local_uri_candidates("") == []
+
+
+def test_normalize_local_uri_candidates_relative_path_passthrough():
+    """A plain relative path (no drive letter, no /mnt/ prefix, no file://
+    scheme) isn't touched beyond separator variants — no normalization is
+    invented for it, matching prior (pre-ba539706) behavior exactly."""
+    candidates = pointers_module.normalize_local_uri_candidates("some/fake/path.py")
+    assert candidates[0] == "some/fake/path.py"
+    assert "some\\fake\\path.py" in candidates
+
+
+def test_normalize_local_uri_candidates_file_uri_posix():
+    candidates = pointers_module.normalize_local_uri_candidates(
+        "file:///home/alice/doc.docx"
+    )
+    assert "file:///home/alice/doc.docx" in candidates
+    assert "/home/alice/doc.docx" in candidates
+
+
+def test_normalize_local_uri_candidates_file_uri_windows_drive():
+    candidates = pointers_module.normalize_local_uri_candidates(
+        "file:///C:/Users/alice/doc.docx"
+    )
+    assert "C:/Users/alice/doc.docx" in candidates
+    assert "C:\\Users\\alice\\doc.docx" in candidates
+
+
+def test_normalize_local_uri_candidates_file_uri_unc_host():
+    candidates = pointers_module.normalize_local_uri_candidates(
+        "file://server/share/doc.docx"
+    )
+    assert "\\\\server\\share\\doc.docx" in candidates
+
+
+def test_normalize_local_uri_candidates_file_uri_percent_encoded():
+    candidates = pointers_module.normalize_local_uri_candidates(
+        "file:///C:/Users/alice%20smith/doc.docx"
+    )
+    assert "C:/Users/alice smith/doc.docx" in candidates
+
+
+def test_normalize_local_uri_candidates_windows_drive_to_wsl():
+    candidates = pointers_module.normalize_local_uri_candidates(
+        "C:\\Users\\alice\\doc.docx"
+    )
+    assert "/mnt/c/Users/alice/doc.docx" in candidates
+
+
+def test_normalize_local_uri_candidates_wsl_to_windows_drive():
+    candidates = pointers_module.normalize_local_uri_candidates(
+        "/mnt/c/Users/alice/doc.docx"
+    )
+    assert "C:\\Users\\alice\\doc.docx" in candidates
+
+
+def test_normalize_local_uri_candidates_forward_slash_windows_path():
+    """A Windows drive path spelled with forward slashes still yields the
+    same WSL candidate as the backslash spelling."""
+    candidates = pointers_module.normalize_local_uri_candidates(
+        "C:/Users/alice/doc.docx"
+    )
+    assert "/mnt/c/Users/alice/doc.docx" in candidates
+
+
+def test_normalize_local_uri_candidates_deduplicates_and_orders_original_first():
+    candidates = pointers_module.normalize_local_uri_candidates("plain/path.py")
+    assert candidates[0] == "plain/path.py"
+    assert len(candidates) == len(set(candidates))
+
+
+def test_looks_like_local_path_treats_file_uri_as_local():
+    """file:// is a local filesystem reference (just URI-spelled) — it must
+    NOT be excluded by the generic '://' -> non-local rule, or the existence
+    check would be silently skipped instead of actually verified."""
+    assert pointers_module._looks_like_local_path("file:///C:/Users/alice/doc.docx") is True
+    assert pointers_module._looks_like_local_path("file:///home/alice/doc.docx") is True
+
+
+def test_looks_like_local_path_still_excludes_remote_and_scheme_uris():
+    """Non-file:// remote schemes are unaffected — fail-closed behavior for
+    genuinely unavailable remote targets is preserved."""
+    assert pointers_module._looks_like_local_path("https://example.com/a") is False
+    assert pointers_module._looks_like_local_path("zotero:ABCD1234") is False
+    assert pointers_module._looks_like_local_path("doc:1") is False
+    assert pointers_module._looks_like_local_path("finding:xyz") is False
+
+
+def test_target_kind_existing_file_uri_normalizes_against_bare_path_checker():
+    """A target_kind='existing' file:// uri validates when the injectable
+    path_exists checker only recognizes the bare-path spelling (mirrors a
+    checker backed by plain os.path.exists, which never understands file://
+    URIs directly)."""
+    bare = "C:/Users/alice/doc.docx"
+    ptr = {
+        "source_type": "docs",
+        "targets": [{"uri": "file:///C:/Users/alice/doc.docx", "target_kind": "existing",
+                     "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    }
+    ok = validate_pointer(ptr, path_exists=lambda uri: uri == bare)
+    assert ok["targets"][0]["target_kind"] == "existing"
+
+
+def test_target_kind_existing_wsl_uri_normalizes_against_windows_style_checker():
+    """A pointer recorded under the WSL /mnt/<drive> spelling still validates
+    when the injectable checker only recognizes the Windows-drive spelling —
+    the two-way normalization the ba539706 contract exists for."""
+    windows_style = "C:\\Users\\alice\\doc.docx"
+    ptr = {
+        "source_type": "docs",
+        "targets": [{"uri": "/mnt/c/Users/alice/doc.docx", "target_kind": "existing",
+                     "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    }
+    ok = validate_pointer(ptr, path_exists=lambda uri: uri == windows_style)
+    assert ok["targets"][0]["target_kind"] == "existing"
+
+
+def test_target_kind_existing_normalization_still_fails_closed_when_genuinely_missing():
+    """A path that doesn't exist under ANY normalized spelling still raises —
+    normalization only widens which SPELLING is accepted, never what counts
+    as present."""
+    ptr = {
+        "source_type": "docs",
+        "targets": [{"uri": "file:///C:/Users/alice/ghost.docx", "target_kind": "existing",
+                     "selector": {"type": "range", "start_line": 1, "end_line": 1}}],
+    }
+    with pytest.raises(PointerValidationError, match="target_kind='existing'"):
         validate_pointer(ptr, path_exists=lambda _uri: False)
 
 
@@ -509,6 +654,103 @@ async def test_resolve_symbol_resolver_exception_is_guarded():
                                 symbol_resolver=_boom,
                                 citation_resolver=_stub_citation_resolver)
     assert out["targets"][0]["resolved"] is False
+
+
+# ---------------------------------------------------------------------------
+# repair_pointer_set (3af86d28) — re-resolution before a corrective handoff
+# regeneration trusts a set of "added_pointers" evidence.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_range_always_repairs():
+    """A range selector IS the location — no lookup, always resolves."""
+    ptrs = [{
+        "source_type": "code",
+        "targets": [{"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}}],
+    }]
+    out = await repair_pointer_set(None, "pid", ptrs)
+    assert out["repaired_count"] == 1
+    assert out["unresolved_count"] == 0
+    assert out["repaired"][0]["resolution"]["targets"][0]["resolved"] is True
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_symbol_resolves_with_injected_resolver():
+    ptrs = [{
+        "source_type": "code",
+        "targets": [{"uri": "found.py", "selector": {"type": "symbol", "qualified_name": "found.symbol"}}],
+    }]
+    out = await repair_pointer_set(
+        None, "pid", ptrs,
+        symbol_resolver=_stub_symbol_resolver,
+        citation_resolver=_stub_citation_resolver,
+    )
+    assert out["repaired_count"] == 1
+    assert out["unresolved_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_symbol_unresolved_without_match():
+    """No injected resolver matches -> the default resolver finds nothing ->
+    unresolved, with an explicit reason (never silently dropped)."""
+    ptrs = [{
+        "source_type": "code",
+        "targets": [{"uri": "gone.py", "selector": {"type": "symbol", "qualified_name": "vanished.symbol"}}],
+    }]
+    out = await repair_pointer_set(
+        None, "pid", ptrs,
+        symbol_resolver=_stub_symbol_resolver,
+        citation_resolver=_stub_citation_resolver,
+    )
+    assert out["repaired_count"] == 0
+    assert out["unresolved_count"] == 1
+    assert out["unresolved"][0]["pointer"]["source_type"] == "code"
+    assert "did not resolve" in out["unresolved"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_malformed_pointer_entry_sorted_unresolved():
+    out = await repair_pointer_set(None, "pid", ["not-a-dict", 42])
+    assert out["repaired_count"] == 0
+    assert out["unresolved_count"] == 2
+    assert all("malformed" in u["reason"] for u in out["unresolved"])
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_validation_failure_sorted_unresolved():
+    """A structurally invalid pointer (empty targets) never reaches
+    resolve_pointer — validate_pointer's own PointerValidationError is
+    caught and surfaced with a 'validation failed' reason."""
+    out = await repair_pointer_set(None, "pid", [{"source_type": "code", "targets": []}])
+    assert out["repaired_count"] == 0
+    assert out["unresolved_count"] == 1
+    assert "validation failed" in out["unresolved"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_empty_and_none_input():
+    assert await repair_pointer_set(None, "pid", []) == {
+        "repaired": [], "unresolved": [], "repaired_count": 0, "unresolved_count": 0,
+    }
+    assert await repair_pointer_set(None, "pid", None) == {
+        "repaired": [], "unresolved": [], "repaired_count": 0, "unresolved_count": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_repair_pointer_set_mixed_batch_counts_both():
+    ptrs = [
+        {"source_type": "code", "targets": [{"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 1}}]},
+        {"source_type": "code", "targets": [{"uri": "gone.py", "selector": {"type": "symbol", "qualified_name": "vanished"}}]},
+    ]
+    out = await repair_pointer_set(
+        None, "pid", ptrs,
+        symbol_resolver=_stub_symbol_resolver,
+        citation_resolver=_stub_citation_resolver,
+    )
+    assert out["repaired_count"] == 1
+    assert out["unresolved_count"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1163,6 +1405,91 @@ async def test_readiness_injectable_path_and_dir_checkers():
     assert out["ready"] is True
     assert ("exists", "fake/path.csv") in calls
     assert ("isdir", "fake/path.csv") in calls
+
+
+# -- ba539706: normalized-spelling readiness (Windows/WSL/file:// parity) ----
+
+
+@pytest.mark.asyncio
+async def test_readiness_file_uri_resolves_against_bare_path_checker():
+    """A file:// target resolves when the injected checker only recognizes
+    the bare-path spelling (a plain os.path.exists-backed checker never
+    understands file:// URIs directly) — reported uri stays the ORIGINAL
+    file:// string, only the internal existence lookup is normalized."""
+    bare = "C:/Users/alice/doc.docx"
+    out = await verify_target_readiness(
+        {"uri": "file:///C:/Users/alice/doc.docx", "target_kind": "existing"},
+        path_exists=lambda uri: uri == bare,
+        is_dir=lambda _uri: False,
+    )
+    assert out["ready"] is True
+    assert out["status"] == "unresolved"  # no figure_resolver wired
+    assert out["uri"] == "file:///C:/Users/alice/doc.docx"
+
+
+@pytest.mark.asyncio
+async def test_readiness_wsl_spelling_resolves_against_windows_style_checker():
+    """A pointer recorded in the WSL /mnt/<drive> spelling is verified ready
+    when the checker only recognizes the Windows-drive spelling — this is
+    the exact 'meridian-docs opens it but readiness reports missing' bug
+    ba539706 fixes."""
+    windows_style = "C:\\Users\\alice\\doc.docx"
+    out = await verify_target_readiness(
+        {"uri": "/mnt/c/Users/alice/doc.docx", "target_kind": "existing"},
+        path_exists=lambda uri: uri == windows_style,
+        is_dir=lambda _uri: False,
+    )
+    assert out["ready"] is True
+    assert out["status"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_readiness_is_dir_check_uses_matched_normalized_candidate():
+    """The is_dir follow-up check runs against the SAME normalized candidate
+    that matched existence, not the original (possibly-unrecognized) uri
+    spelling."""
+    windows_style = "C:\\Users\\alice\\outdir"
+    isdir_calls = []
+
+    def _isdir(uri):
+        isdir_calls.append(uri)
+        return True
+
+    out = await verify_target_readiness(
+        {"uri": "/mnt/c/Users/alice/outdir", "target_kind": "existing"},
+        path_exists=lambda uri: uri == windows_style,
+        is_dir=_isdir,
+    )
+    assert out["ready"] is False
+    assert out["status"] == "is_directory"
+    assert isdir_calls == [windows_style]
+
+
+@pytest.mark.asyncio
+async def test_readiness_normalization_never_widens_remote_uri_scope():
+    """Fail-closed for genuinely unavailable remote targets is unchanged —
+    a zotero:/doc:/finding:/URL uri is still reported 'skipped', never
+    silently treated as a local candidate."""
+    out = await verify_target_readiness(
+        {"uri": "zotero:ABCD1234", "target_kind": "existing"},
+        path_exists=lambda _uri: True,  # would wrongly pass if scope leaked
+    )
+    assert out["ready"] is True
+    assert out["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_readiness_missing_when_no_normalized_candidate_matches():
+    """A target genuinely absent under every normalized spelling still
+    reports 'missing' — normalization only widens accepted SPELLING, never
+    what counts as present."""
+    out = await verify_target_readiness(
+        {"uri": "file:///C:/Users/alice/ghost.docx", "target_kind": "existing"},
+        path_exists=lambda _uri: False,
+    )
+    assert out["ready"] is False
+    assert out["status"] == "missing"
+    assert out["uri"] == "file:///C:/Users/alice/ghost.docx"
 
 
 # -- existing: file present / missing / is-a-directory -----------------------

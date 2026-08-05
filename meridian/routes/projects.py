@@ -1293,6 +1293,19 @@ async def delete_worktree(
     removed = await db_module.remove_worktree(db, worktree_id)
     if not removed:
         raise HTTPException(status_code=404, detail="worktree not found or already removed")
+    # 32ba4125 — clean up the code-intel context tied to this worktree: a
+    # stale _tenant_active_repo cache entry must never keep pointing
+    # subsequent code-intel calls (search_graph, find_symbol, ...) at a path
+    # whose worktree no longer exists. Same best-effort posture as the
+    # on-disk cleanup above — never blocks or fails the deletion itself.
+    try:
+        from ..worktree_code_intel_context import clear_stale_active_repo_cache  # noqa: PLC0415
+        clear_stale_active_repo_cache(wt)
+    except Exception as exc:  # noqa: BLE001 — cache cleanup is best-effort
+        import logging as _l
+        _l.getLogger("meridian.server").warning(
+            "delete_worktree: active-repo cache cleanup failed for %s: %s", wt["path"], exc
+        )
 
 
 # ---------------------------------------------------------------------------

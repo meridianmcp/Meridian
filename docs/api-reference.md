@@ -588,6 +588,7 @@ No auth required.
 | `POST` | `/.well-known/agent.json` | Support POST discovery per A2A spec |
 | `GET` | `/.well-known/oauth-authorization-server` |  |
 | `GET` | `/.well-known/oauth-protected-resource` |  |
+| `GET` | `/.well-known/openid-configuration` | OIDC discovery alias for clients that probe this path before OAuth AS metadata |
 
 
 ### `/__gate__`
@@ -1012,6 +1013,8 @@ No auth required.
 | `POST` | `/projects/{project_id}/goal/north-star` | v0.5.2 — update only the north star field |
 | `POST` | `/projects/{project_id}/goal/sprint` | v0.5.2 — update only the sprint field |
 | `POST` | `/projects/{project_id}/handoff` | Render and write the handoff file for a project |
+| `POST` | `/projects/{project_id}/handoff/corrections` | 3af86d28 — record a corrective handoff for a blocked executor session |
+| `GET` | `/projects/{project_id}/handoff/corrections/latest` | 3af86d28 — load a corrective handoff directly (never reconstruct from notes) |
 | `GET` | `/projects/{project_id}/handoff/planner` | GET the planner-optimised handoff for a project |
 | `GET` | `/projects/{project_id}/hitl` | HITL requests scoped to a single project |
 | `POST` | `/projects/{project_id}/hitl` | Create a HITL request. Sessions paused on blocking should POST then poll |
@@ -1026,6 +1029,8 @@ No auth required.
 | `GET` | `/projects/{project_id}/ntfy` | Return the current notification settings for this project |
 | `PATCH` | `/projects/{project_id}/ntfy` | Save (or clear) the notify URL and/or notify_email for this project |
 | `PATCH` | `/projects/{project_id}/organization` | 8db00fcb — set a project's status (active\|parked\|archived) and/or |
+| `GET` | `/projects/{project_id}/orphan_reaper` | f7084ed0 — dashboard-facing status for the orphan-process-reaper Stop |
+| `POST` | `/projects/{project_id}/orphan_reaper/toggle` | f7084ed0 — dashboard opt-in/opt-out for the orphan-process-reaper Stop |
 | `POST` | `/projects/{project_id}/parent` | 0fed6a42 — set / change / clear a project's parent (subproject hierarchy) |
 | `POST` | `/projects/{project_id}/queue-session` | Queue the next /goal string; it's appended to the next handoff and then |
 | `GET` | `/projects/{project_id}/queued-session` | Return the currently queued next-session goal, or null |
@@ -1150,15 +1155,18 @@ No auth required.
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/tunnel/active-repo` | Send a set_active_repo control message to the tenant's extract WebSocket |
+| `GET` | `/tunnel/diagnostics/{tenant_id}` | Layered, read-only tunnel/connector diagnostics for one tenant (f1e0df55) |
 | `DELETE` | `/tunnel/filesystem-roots` | live-fs-roots — remove a served filesystem root and apply it live |
 | `GET` | `/tunnel/filesystem-roots` | Return the directories the tunnel's filesystem connector may read |
 | `POST` | `/tunnel/filesystem-roots` | live-fs-roots — add a served filesystem root and push it live |
+| `GET` | `/tunnel/manifest` | Read-only tools/list manifest snapshot for this tenant (49d8244d) |
 | `GET` | `/tunnel/plugins` | Return the current tenant's resolved tunnel plugins + raw override config |
 | `PUT` | `/tunnel/plugins` | Persist the tenant's tunnel plugin overrides (Settings → Tunnel Plugins) |
 | `GET` | `/tunnel/plugins/check` | Check whether a plugin binary is available on the server's PATH |
 | `DELETE` | `/tunnel/plugins/custom` | 9811d04c — remove a persisted custom plugin by name |
 | `POST` | `/tunnel/plugins/custom` | 9811d04c — persist a chosen custom plugin into the tenant's tunnel config |
 | `POST` | `/tunnel/plugins/install` | Run a plugin install command on the server machine (self-hosted deployments) |
+| `POST` | `/tunnel/refresh` | Force a synchronous tunnel-tool re-aggregation and return the manifest |
 | `GET` | `/tunnel/registry` | Proxy the official MCP Registry API to avoid browser CORS restrictions |
 | `GET` | `/tunnel/status/{tenant_id}` | Return whether the tenant currently has an active tunnel socket |
 

@@ -2638,6 +2638,30 @@ async def _migrate_pg_wave_base_manifests(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_pixi_env_roots(conn: PostgresConnection) -> None:
+    """15610335 — external Pixi detached-environment registry, per worktree.
+
+    Creates pixi_env_roots on existing Postgres DBs. Mirrors
+    db.worktrees._migrate_pixi_env_roots. Not present in the base
+    CREATE_TABLES_CORE literal — this guarded migration is the only
+    creation path on Postgres, matching _migrate_pg_wave_base_manifests.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS pixi_env_roots ("
+        "    id TEXT PRIMARY KEY,"
+        "    worktree_id TEXT NOT NULL REFERENCES active_worktrees(id),"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    root_path TEXT NOT NULL,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    reclaimed_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_pixi_env_roots_worktree "
+        "ON pixi_env_roots(worktree_id);"
+        "CREATE INDEX IF NOT EXISTS idx_pixi_env_roots_project "
+        "ON pixi_env_roots(project_id, reclaimed_at);"
+    )
+
+
 async def _migrate_pg_sprint_batch_claims(conn: PostgresConnection) -> None:
     """22cad9b8 — immutable sprint_batch_claims: atomic parallel-batch claim
     manifests, mirroring wave_base_manifests' immutability pattern.
@@ -3936,6 +3960,98 @@ async def _migrate_pg_sprint_item_require_strict_evidence(conn: PostgresConnecti
     )
 
 
+async def _migrate_pg_handoffs_invalidation(conn: PostgresConnection) -> None:
+    """3af86d28 — invalidation/non-executable marking for a ``handoffs`` row
+    (mirrors db.migrations._migrate_handoffs_invalidation).
+
+    Four additive columns. ADD COLUMN IF NOT EXISTS is idempotent.
+    """
+    await conn.executescript(
+        "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS "
+        "invalidated INTEGER NOT NULL DEFAULT 0;"
+        "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS invalidated_reason TEXT;"
+        "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS invalidated_at TEXT;"
+        "ALTER TABLE handoffs ADD COLUMN IF NOT EXISTS "
+        "superseded_by_correction_id TEXT;"
+    )
+
+
+async def _migrate_pg_handoff_corrections_table(conn: PostgresConnection) -> None:
+    """3af86d28 — handoff_corrections: corrective-handoff data structure
+    (mirrors db.migrations._migrate_handoff_corrections_table — see that
+    function's docstring for the full field-by-field rationale).
+
+    CREATE TABLE / INDEX IF NOT EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS handoff_corrections (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            session_id TEXT,
+            source_handoff_id TEXT NOT NULL,
+            source_token TEXT,
+            source_body_hash TEXT,
+            version TEXT,
+            requested_scope TEXT,
+            blocker_classification TEXT NOT NULL,
+            investigation_evidence TEXT,
+            added_pointers TEXT NOT NULL DEFAULT '[]',
+            removed_pointers TEXT NOT NULL DEFAULT '[]',
+            superseded_pointers TEXT NOT NULL DEFAULT '[]',
+            changed_resources TEXT NOT NULL DEFAULT '[]',
+            pointer_repair_report TEXT,
+            status TEXT NOT NULL DEFAULT 'draft'
+                CHECK (status IN ('draft','verified','superseded','blocked')),
+            status_reason TEXT,
+            idempotency_key TEXT,
+            new_handoff_id TEXT,
+            new_token TEXT,
+            new_body_hash TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_handoff_corrections_project
+            ON handoff_corrections(project_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_handoff_corrections_source
+            ON handoff_corrections(source_handoff_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_handoff_corrections_idempotency
+            ON handoff_corrections(project_id, idempotency_key)
+            WHERE idempotency_key IS NOT NULL;
+        """
+    )
+
+
+async def _migrate_pg_vector_index_state(conn: PostgresConnection) -> None:
+    """e1475682 — vector_index_state (mirrors SQLite).
+
+    One row per (project_id, scope): the backend actually in use
+    (bm25/duckdb_vss/pgvector), the embedding model/version + dimension that
+    produced it, a source_fingerprint for staleness detection, an
+    incrementing revision, and the last benchmark evidence + decision reason
+    behind pgvector_enabled. Mirrors
+    db.vector_index_state._migrate_vector_index_state.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS vector_index_state ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    scope TEXT NOT NULL DEFAULT 'default',"
+        "    backend TEXT NOT NULL DEFAULT 'bm25',"
+        "    embedding_model TEXT,"
+        "    embedding_version TEXT,"
+        "    dimension INTEGER,"
+        "    source_fingerprint TEXT,"
+        "    revision INTEGER NOT NULL DEFAULT 1,"
+        "    pgvector_enabled INTEGER NOT NULL DEFAULT 0,"
+        "    benchmark_evidence TEXT,"
+        "    benchmark_decision_reason TEXT,"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE (project_id, scope)"
+        ");"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -4041,4 +4157,8 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_batch_claims,
     _migrate_pg_verification_runs,
     _migrate_pg_sprint_item_require_strict_evidence,
+    _migrate_pg_handoffs_invalidation,
+    _migrate_pg_handoff_corrections_table,
+    _migrate_pg_vector_index_state,
+    _migrate_pg_pixi_env_roots,
 )

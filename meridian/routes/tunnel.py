@@ -26,8 +26,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
+from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -38,6 +41,7 @@ from .. import db as db_module
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
+    migrate_retired_overrides, config_fingerprint,
 )
 
 router = APIRouter()
@@ -309,7 +313,7 @@ def notify_tools_list_changed(tenant_id: str) -> None:
     that wasn't actually a recovery simply re-marks a tenant that will re-list to
     the same tool set).
     """
-    _tunnel_tool_routes.pop(tenant_id, None)
+    _invalidate_tunnel_manifest(tenant_id)  # 49d8244d — routes + manifest timestamp together
     _tools_list_changed_pending.add(tenant_id)
 
 
@@ -323,6 +327,176 @@ def consume_tools_list_changed(tenant_id: str) -> bool:
         _tools_list_changed_pending.discard(tenant_id)
         return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Runtime configuration generation — sprint item 02dbd8b4
+#
+# Every tenant-scoped tunnel/executor settings write (tunnel plugin config,
+# per-host overrides) is stamped with a monotonically increasing generation
+# number, the effective config's content hash (tunnel_plugins.config_fingerprint),
+# and the server wall-clock time it was persisted. Config-bearing responses
+# (GET/PUT /tunnel/plugins, POST /tunnel/plugins/custom, DELETE
+# /tunnel/plugins/custom, GET /tunnel/status) echo this record back so the
+# dashboard, a connected tunnel client (best-effort, see tunnel_client.py's
+# startup config-generation fetch), and the connector cache can all be checked
+# against the same source of truth instead of silently drifting.
+#
+# Scope of this "highest-value core" pass (documented per the sprint item's own
+# escape hatch — the full item is substantial):
+#   * The generation registry is in-memory and per-process: it resets on a
+#     server restart and is NOT shared across Fly.io instances. A cold read
+#     after a reset re-seeds generation 1 from whatever is currently persisted
+#     (see get_runtime_config_generation) rather than reporting nothing, but a
+#     multi-instance-consistent counter would need a durable, shared store
+#     (e.g. a tenants column + migration) — out of scope for the files this
+#     item is allowed to touch. Follow-up: promote this to a DB-backed counter.
+#   * restart_required is decided at WRITE time from has_active_tunnel(): True
+#     iff some tunnel socket for the tenant was connected when the config
+#     changed (an already-spawned slot subprocess was launched from the OLD
+#     config and cannot safely absorb a slot-definition change without a
+#     coordinated restart — 02dbd8b4: "do not silently restart a tunnel while
+#     actively serving requests"). It does NOT automatically clear itself on a
+#     later reconnect (the registry does not currently track per-connection
+#     "loaded generation" handshakes) — a stale True after a legitimate
+#     reconnect is a known, documented false-positive; clearing it precisely
+#     would need the client to report back the generation it actually loaded
+#     (tunnel_client.py's fetch is currently read-only/diagnostic, not fed back
+#     over the WebSocket — see the module docstring note there). No active
+#     tunnel at write time ⇒ False: nothing is running against the stale
+#     config, so the very next connect simply loads the new generation.
+#   * We never restart or kill a client process from here — there is no safe
+#     way to do that over the current wire protocol without dropping whatever
+#     that process is mid-serving. "Coordinate drain/restart safely" is
+#     implemented as *visibility* (config_generation + inflight counts + the
+#     resulting restart_required signal) an operator or a future automated
+#     drain-then-restart flow can act on, not as an auto-restart trigger.
+# ---------------------------------------------------------------------------
+
+# tenant_id -> hostname (None = tenant-default scope) -> generation record:
+#   {"generation": int, "config_hash": str, "source_timestamp": float,
+#    "restart_required": bool}
+_config_generations: "dict[str, dict[str | None, dict]]" = defaultdict(dict)
+
+# tenant_id -> asyncio.Lock. Serializes read-modify-write of a tenant's
+# generation counter so two concurrent settings writes (even across two
+# different hostnames of the same tenant — the counter is tenant-wide) can
+# never observe/assign a duplicate generation number or silently drop one
+# write's bump. Never shared across tenants (project/tenant isolation).
+_config_generation_locks: "dict[str, asyncio.Lock]" = defaultdict(asyncio.Lock)
+
+# tenant_id -> slot label -> count of requests currently in flight on that
+# slot. Maintained by _do_proxy (the single low-level chokepoint every HTTP
+# proxy route AND the MCP/jsonrpc bridge funnel through) purely so a restart
+# decision can answer "is this tenant's tunnel actively serving right now" —
+# never used for the existing per-slot admission-control semaphore, which
+# already has its own independent bookkeeping.
+_inflight_count: "dict[str, dict[str, int]]" = defaultdict(lambda: defaultdict(int))
+
+
+def _mark_inflight(tenant_id: str, label: str, delta: int) -> None:
+    """Adjust the (tenant, slot) in-flight counter, pruning empty entries."""
+    per_tenant = _inflight_count[tenant_id]
+    new_val = per_tenant.get(label, 0) + delta
+    if new_val <= 0:
+        per_tenant.pop(label, None)
+        if not per_tenant:
+            _inflight_count.pop(tenant_id, None)
+    else:
+        per_tenant[label] = new_val
+
+
+def tenant_inflight_counts(tenant_id: str) -> "dict[str, int]":
+    """Current per-slot in-flight request counts for a tenant (read-only)."""
+    return dict(_inflight_count.get(tenant_id, {}))
+
+
+def _seed_runtime_config_generation(
+    tenant_id: str, hostname: "str | None", current_config: Any,
+) -> dict:
+    """First-touch snapshot for a (tenant, host) scope with no recorded generation.
+
+    A fresh server process (or the first-ever read for this scope) has no
+    generation history yet. Rather than reporting "unknown" forever until the
+    next write, seed generation 1 for whatever is CURRENTLY persisted so a
+    cold read establishes a coherent baseline. This is pure discovery — it
+    never sets restart_required, since nothing changed as a result of reading.
+    """
+    record = {
+        "generation": 1,
+        "config_hash": config_fingerprint(current_config),
+        "source_timestamp": time.time(),
+        "restart_required": False,
+    }
+    _config_generations[tenant_id][hostname] = record
+    return dict(record)
+
+
+def get_runtime_config_generation(
+    tenant_id: str, hostname: "str | None", current_config: Any,
+) -> dict:
+    """Read-only: the latest known generation record for (tenant, hostname).
+
+    Seeds one from *current_config* on first read (see
+    _seed_runtime_config_generation) instead of returning nothing. Never
+    mutates restart_required and never bumps the generation number — only
+    bump_runtime_config_generation does that, and only after an actual write.
+    """
+    record = _config_generations[tenant_id].get(hostname)
+    if record is None:
+        return _seed_runtime_config_generation(tenant_id, hostname, current_config)
+    return dict(record)
+
+
+def all_runtime_config_generations(tenant_id: str) -> "dict[str, dict]":
+    """Every recorded (hostname -> generation record) for a tenant, JSON-safe.
+
+    Used by /tunnel/status so the dashboard can cross-check EVERY machine's
+    config generation from one call. The tenant-default scope (hostname=None)
+    is reported under the key ``"default"``. Does not seed missing entries —
+    only scopes that have actually been read/written via GET|PUT /tunnel/plugins
+    show up here (avoids fabricating per-host entries for hosts nobody asked
+    about yet).
+    """
+    return {
+        (host or "default"): dict(record)
+        for host, record in _config_generations.get(tenant_id, {}).items()
+    }
+
+
+async def bump_runtime_config_generation(
+    tenant_id: str, hostname: "str | None", normalized_config: Any,
+) -> dict:
+    """Advance (tenant, hostname)'s runtime config generation after a settings
+    write, and decide hot-reload vs restart-required.
+
+    Concurrency-safe: serialized per tenant via _config_generation_locks so two
+    overlapping writes for the same tenant can't assign/observe a duplicate
+    generation number or clobber each other's bump.
+
+    A write that doesn't actually change the effective config (identical hash
+    to the last recorded generation for this scope) is a no-op: the generation
+    number does NOT advance and restart_required is NOT touched — resaving
+    identical settings must never manufacture a fake pending restart.
+    """
+    lock = _config_generation_locks[tenant_id]
+    async with lock:
+        scope = _config_generations[tenant_id]
+        prev = scope.get(hostname)
+        new_hash = config_fingerprint(normalized_config)
+        if prev is not None and prev.get("config_hash") == new_hash:
+            return dict(prev)
+        next_gen = (prev.get("generation") if prev else 0) + 1
+        record = {
+            "generation": next_gen,
+            "config_hash": new_hash,
+            "source_timestamp": time.time(),
+            # has_active_tunnel is defined further down in this module; resolved
+            # at call time (module-level function lookup), not at def time.
+            "restart_required": has_active_tunnel(tenant_id),
+        }
+        scope[hostname] = record
+        return dict(record)
 
 
 def _record_slot_health(
@@ -500,7 +674,7 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
 
     _tunnel_sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, "fs")
-    _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd — reconnect: rebuild tool routes
+    _invalidate_tunnel_manifest(tenant_id)  # 4331f9cd / 49d8244d — reconnect: rebuild tool routes
     # af5b5739 — record THIS Fly instance as the socket owner so a request that
     # lands on a sibling instance can Fly-replay to us (no-op off Fly).
     owner_instance = record_tenant_owner_instance(tenant_id)
@@ -569,7 +743,7 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
         # connection on another instance may already have re-claimed the tenant).
         clear_tenant_owner_instance(tenant_id, owner_instance)
         if not has_active_tunnel(tenant_id):
-            _tunnel_tool_routes.pop(tenant_id, None)  # 4331f9cd
+            _invalidate_tunnel_manifest(tenant_id)  # 4331f9cd / 49d8244d
         # Cancel any in-flight proxy requests for this tenant
         for fut in list(_pending_reqs.values()):
             if not fut.done():
@@ -818,9 +992,10 @@ async def _serve_tunnel_ws(
 
     sockets[tenant_id] = ws
     _clear_tunnel_mcp_session(tenant_id, label)
-    # 4331f9cd — a (re)connect may change the slot's tool set; drop the cached
-    # routes so the next tools/list rebuilds them for this tenant.
-    _tunnel_tool_routes.pop(tenant_id, None)
+    # 4331f9cd / 49d8244d — a (re)connect may change the slot's tool set; drop the
+    # cached routes (+ manifest timestamp, atomically) so the next tools/list
+    # rebuilds them for this tenant.
+    _invalidate_tunnel_manifest(tenant_id)
     # af5b5739 / 5f02a21c — record THIS Fly instance as the owner so a sibling
     # instance that gets a request for this slot can Fly-replay to us. af5b5739
     # only wired this for the FS slot (tunnel_ws); _serve_tunnel_ws covers ppt,
@@ -870,10 +1045,10 @@ async def _serve_tunnel_ws(
         sockets.pop(tenant_id, None)
         _clear_tunnel_mcp_session(tenant_id, label, socket=ws)
         _clear_slot_health(tenant_id, label)
-        # 4331f9cd — slot dropped; if no tunnel remains, drop cached routes so the
-        # next tools/list rebuilds cleanly.
+        # 4331f9cd / 49d8244d — slot dropped; if no tunnel remains, drop cached
+        # routes (+ manifest timestamp) so the next tools/list rebuilds cleanly.
         if not has_active_tunnel(tenant_id):
-            _tunnel_tool_routes.pop(tenant_id, None)
+            _invalidate_tunnel_manifest(tenant_id)
         # af5b5739 / 5f02a21c — release ownership only if still ours.
         clear_tenant_owner_instance(tenant_id, owner_instance)
         for fut in list(pending.values()):
@@ -1048,6 +1223,76 @@ async def send_active_repo_control(tenant_id: str, repo_path: str) -> dict[str, 
 
 
 # ---------------------------------------------------------------------------
+# /tunnel/refresh  — explicit refresh/re-list operation (49d8244d)
+# ---------------------------------------------------------------------------
+
+@router.post("/tunnel/refresh")
+async def refresh_tunnel_tools_route(request: Request) -> Response:
+    """Force a synchronous tunnel-tool re-aggregation and return the manifest.
+
+    The explicit refresh operation the dashboard (Settings → Tunnel Plugins
+    status card) and any HTTP-capable connector can call instead of guessing
+    at a TTL: it atomically invalidates the routing cache, re-fetches every
+    healthy slot's tools, and returns the resulting
+    :func:`tunnel_manifest_snapshot` — the same shape surfaced by
+    ``GET /tunnel/status/{tenant_id}`` and the MCP ``tools/list`` ``_meta``
+    block, so a caller can diff ``manifest_hash`` against what it last saw.
+
+    No tunnel connected is not an error here — it returns a snapshot with
+    ``has_active_tunnel: false`` and a null ``manifest_hash`` (nothing to
+    aggregate), same as any other read of tunnel state.
+    """
+    if not _hosted_mode():
+        return _json_response({"error": "tunnel requires hosted mode"}, status_code=503)
+
+    auth_header = request.headers.get("authorization", "")
+    raw_token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else auth_header
+    if not raw_token:
+        raw_token = request.query_params.get("token", "")
+    auth_db = request.app.state.db
+    tenant = await _resolve_tenant_from_token(auth_db, raw_token)
+    if tenant is None:
+        return _json_response({"error": "invalid token"}, status_code=401)
+    if not _is_tunnel_allowed(tenant):
+        return _json_response({"error": "tunnel requires Pro plan"}, status_code=403)
+
+    tenant_id = tenant["id"]
+    snapshot = await refresh_tunnel_manifest(tenant_id)
+    return _json_response({"ok": True, "tenant_id": tenant_id, **snapshot})
+
+
+@router.get("/tunnel/manifest")
+async def get_tunnel_manifest_route(request: Request) -> Response:
+    """Read-only tools/list manifest snapshot for this tenant (49d8244d).
+
+    Unlike ``POST /tunnel/refresh``, this never forces a rebuild — it reports
+    whatever the last ``list_tunnel_tools``/``refresh_tunnel_manifest`` call
+    left behind (see :func:`tunnel_manifest_snapshot`). Safe to poll cheaply
+    and often (a startup diagnostic, a dashboard auto-refresh, a connector
+    health check) without paying the fan-out cost of a real slot
+    re-aggregation on every call — use ``POST /tunnel/refresh`` when a forced
+    rebuild is actually wanted.
+    """
+    if not _hosted_mode():
+        return _json_response({"error": "tunnel requires hosted mode"}, status_code=503)
+
+    auth_header = request.headers.get("authorization", "")
+    raw_token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else auth_header
+    if not raw_token:
+        raw_token = request.query_params.get("token", "")
+    auth_db = request.app.state.db
+    tenant = await _resolve_tenant_from_token(auth_db, raw_token)
+    if tenant is None:
+        return _json_response({"error": "invalid token"}, status_code=401)
+    if not _is_tunnel_allowed(tenant):
+        return _json_response({"error": "tunnel requires Pro plan"}, status_code=403)
+
+    tenant_id = tenant["id"]
+    snapshot = tunnel_manifest_snapshot(tenant_id)
+    return _json_response({"ok": True, "tenant_id": tenant_id, **snapshot})
+
+
+# ---------------------------------------------------------------------------
 # Shared proxy helper
 # ---------------------------------------------------------------------------
 
@@ -1093,6 +1338,11 @@ async def _do_proxy(
             status_code=503,
             media_type="application/json",
         )
+    # 02dbd8b4 — mark this (tenant, slot) as actively serving so a runtime-config
+    # restart decision can see it (see tenant_inflight_counts / _mark_inflight
+    # above). Mirrors the semaphore's own acquire/release lifecycle 1:1 but is
+    # independent bookkeeping, not a substitute for the admission-control semaphore.
+    _mark_inflight(tenant_id, label, 1)
 
     req_id = str(uuid.uuid4())
     loop = asyncio.get_event_loop()
@@ -1167,6 +1417,7 @@ async def _do_proxy(
     finally:
         pending.pop(req_id, None)
         sem.release()
+        _mark_inflight(tenant_id, label, -1)
 
     status = int(resp_msg.get("status", 502))
     resp_headers = resp_msg.get("headers") or {}
@@ -1572,6 +1823,15 @@ async def tunnel_status(tenant_id: str) -> dict:
         "slot_status": {
             k: dict(v) for k, v in _slot_status_detail.get(tenant_id, {}).items()
         },
+        # 02dbd8b4 — runtime configuration generation per machine (hostname ->
+        # {generation, config_hash, source_timestamp, restart_required}), plus
+        # in-flight request counts and the resulting drain-safety verdict, so the
+        # dashboard's connection panel can show "settings changed — restart
+        # required" without a second round trip, and never silently claims a
+        # tunnel is in-sync with the latest saved config when it isn't.
+        "config_generation": all_runtime_config_generations(tenant_id),
+        "inflight": tenant_inflight_counts(tenant_id),
+        "safe_to_restart": not any(tenant_inflight_counts(tenant_id).values()),
     }
 
 
@@ -1609,12 +1869,34 @@ async def get_tunnel_plugins(request: Request) -> Response:
     # hostname → the default config (back-compat with the single-machine dashboard).
     from ..tunnel_plugins import select_host_config, parse_plugins_by_host
     hostname = (request.query_params.get("hostname") or "").strip() or None
+
+    default_cfg = _parse_plugins_json(tenant.get("tunnel_plugins"))
     by_host = parse_plugins_by_host(tenant.get("tunnel_plugins_by_host"))
-    parsed = select_host_config(
-        _parse_plugins_json(tenant.get("tunnel_plugins")),
-        tenant.get("tunnel_plugins_by_host"),
-        hostname,
-    )
+
+    # 4b26c2ef — self-heal a stale `word: {enabled: true}` override left over
+    # from before the word slot was retired. Covers BOTH the tenant's default
+    # config AND every per-host slice (not just the ?hostname= currently being
+    # viewed), so a stale override on some other registered machine doesn't
+    # linger unnoticed just because nobody happens to view that machine's tab.
+    default_cfg, default_changed = migrate_retired_overrides(default_cfg)
+    by_host_changed = False
+    for host_key, host_cfg in list(by_host.items()):
+        migrated_host, host_changed = migrate_retired_overrides(host_cfg)
+        if host_changed:
+            by_host[host_key] = migrated_host
+            by_host_changed = True
+    if default_changed or by_host_changed:
+        _update_fields: dict[str, Any] = {}
+        if default_changed:
+            _update_fields["tunnel_plugins"] = json.dumps(default_cfg) if default_cfg else None
+        if by_host_changed:
+            _update_fields["tunnel_plugins_by_host"] = json.dumps(by_host) if by_host else None
+        try:
+            await db_module.update_tenant(request.app.state.db, tenant["id"], **_update_fields)
+        except Exception:  # noqa: BLE001 — self-heal is best-effort, never blocks the GET
+            pass
+
+    parsed = select_host_config(default_cfg, by_host, hostname)
     tid = tenant.get("id")
     # Machines the dashboard can offer per-machine config for: those with a saved
     # per-host config + machines that registered hook tokens (registered_hostnames).
@@ -1663,6 +1945,11 @@ async def get_tunnel_plugins(request: Request) -> Response:
         "slot_status": {
             k: dict(v) for k, v in _slot_status_detail.get(tid, {}).items()
         },
+        # 02dbd8b4 — the generation currently in effect for THIS scope (default
+        # or ?hostname=X), so the settings UI can render "you're on generation N"
+        # / a restart-required banner without a second call, and a tunnel client
+        # can compare what it loaded at startup against this to detect drift.
+        "config_generation": get_runtime_config_generation(tid, hostname, parsed),
     })
 
 
@@ -1672,7 +1959,13 @@ async def put_tunnel_plugins(request: Request) -> Response:
 
     Accepts ``{"config": <overrides>}`` or a bare overrides dict/list. The config
     is normalized before storage; an empty result clears overrides (NULL → the
-    built-in defaults). Takes effect the next time `meridian --tunnel` (re)starts.
+    built-in defaults).
+
+    Every write bumps the tenant/hostname-scoped runtime configuration
+    generation (02dbd8b4) and reports back whether it is safe to treat as
+    already-applied or whether a running tunnel needs a restart to pick it up
+    — see ``config_generation`` in the response. A no-op save (identical
+    effective config) does not advance the generation or flag a restart.
     """
     tenant = await _get_tenant_from_request(request)
     if tenant is None:
@@ -1683,6 +1976,12 @@ async def put_tunnel_plugins(request: Request) -> Response:
         return _json_response({"error": "invalid JSON body"}, status_code=400)
     raw = body.get("config") if isinstance(body, dict) and "config" in body else body
     normalized = normalize_plugins_config(raw)
+    # 4b26c2ef — sanitize a client-submitted `enabled: true` override for the
+    # now-retired word slot before it ever reaches storage — resolve_plugins()
+    # would force it back off regardless, but this stops a stale dashboard tab
+    # (or any other client still offering the old word toggle) from re-persisting
+    # the inert override on every save. Migrates the intent onto meridian-docs.
+    normalized, _ = migrate_retired_overrides(normalized)
     # 8660d701 — ?hostname=X persists this config for that machine only
     # (tunnel_plugins_by_host); without a hostname it writes the per-tenant default
     # (tunnel_plugins), preserving the legacy single-machine behaviour.
@@ -1703,11 +2002,13 @@ async def put_tunnel_plugins(request: Request) -> Response:
         stored = json.dumps(normalized) if normalized else None
         await db_module.update_tenant(
             request.app.state.db, tenant["id"], tunnel_plugins=stored)
+    gen_record = await bump_runtime_config_generation(tenant["id"], hostname, normalized)
     return _json_response({
         "ok": True,
         "hostname": hostname,
         "plugins": resolve_plugins(normalized),
         "config": normalized,
+        "config_generation": gen_record,
     })
 
 
@@ -1741,12 +2042,15 @@ def _config_as_entry_list(parsed: Any) -> list[dict]:
 
 
 async def _store_tunnel_config(request: Request, tenant: dict, hostname: str | None,
-                               entries: list[dict]) -> Any:
+                               entries: list[dict]) -> "tuple[Any, dict]":
     """Persist a full tunnel-plugins config (list of entries) for a tenant/machine.
 
     Mirrors put_tunnel_plugins' storage: with ``hostname`` it writes that
     machine's slice of ``tunnel_plugins_by_host``; otherwise the per-tenant
-    ``tunnel_plugins`` default. Returns the normalized config that was stored.
+    ``tunnel_plugins`` default. Also bumps the (tenant, hostname) runtime
+    config generation (02dbd8b4) exactly like put_tunnel_plugins, since a
+    custom-plugin add/remove changes the same effective config. Returns
+    ``(normalized_config, generation_record)``.
     """
     normalized = normalize_plugins_config(entries)
     if hostname:
@@ -1763,7 +2067,8 @@ async def _store_tunnel_config(request: Request, tenant: dict, hostname: str | N
         stored = json.dumps(normalized) if normalized else None
         await db_module.update_tenant(
             request.app.state.db, tenant["id"], tunnel_plugins=stored)
-    return normalized
+    gen_record = await bump_runtime_config_generation(tenant["id"], hostname, normalized)
+    return normalized, gen_record
 
 
 def _current_tunnel_config(tenant: dict, hostname: str | None) -> Any:
@@ -1774,6 +2079,281 @@ def _current_tunnel_config(tenant: dict, hostname: str | None) -> Any:
         tenant.get("tunnel_plugins_by_host"),
         hostname,
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /tunnel/diagnostics/{tenant_id} — layered read-only diagnostics (f1e0df55)
+#
+# ONE aggregated, read-only snapshot across every source of truth this module
+# already tracks SEPARATELY (dashboard-persisted config, live per-slot socket
+# state, client-reported per-slot health/lifecycle, the server-side tool
+# routing cache, and the tools/list discovery-changed marker) so a caller
+# never has to reconcile them by hand and — the specific failure mode this
+# item calls out — never mistakes "saved in the dashboard" for "actually
+# running". Multi-tenant safe: scoped to one resolved tenant and redacted
+# before it leaves the process.
+# ---------------------------------------------------------------------------
+
+# ``_slot_status_detail[...]["state"]`` values (mirrors tunnel_client.SlotState,
+# see ddd46cc8) that mean "serving, but something is currently wrong" as
+# opposed to "not serving at all" or "deliberately paused".
+_DIAG_DEGRADED_STATES = frozenset({
+    "degraded", "transport_closed", "tools_list_timeout",
+    "startup_timeout", "child_crashed", "dependency_missing",
+})
+# States that mean the client intentionally tore the slot down. Reported as
+# "restart_required" (not "degraded") ONLY when the dashboard still has the
+# slot enabled — i.e. persisted config and last-known runtime state disagree.
+_DIAG_RESTART_STATES = frozenset({"idle_killed", "stopped"})
+
+# Field-name substrings that mark a value as credential-shaped and therefore
+# always redacted, regardless of what state/slot it appears under.
+_DIAG_REDACT_KEY_HINTS = (
+    "token", "secret", "key", "password", "credential", "authorization", "bearer",
+)
+# Catches an inline secret embedded in a free-text value (e.g. a custom
+# plugin's command-line args) even when the surrounding field's *name* gives
+# no hint — "--api-key=sk_live_xxx" is redacted whether or not the key is
+# literally called "env".
+_DIAG_INLINE_SECRET_RE = re.compile(
+    r"(?i)\b(token|secret|api[_-]?key|password|credential|bearer)\b\s*[:=]\s*\S+"
+)
+
+
+def _diag_redact(value: Any, field_name: str = "") -> Any:
+    """Recursively strip anything credential-shaped before it leaves the process.
+
+    Applied to every per-slot record the diagnostics view assembles. A dict
+    value is redacted per-key (by that key's own name); a string value is
+    redacted wholesale when its OWN field name looks like a credential, and
+    otherwise scrubbed for an inline ``key=value``-shaped secret so a custom
+    plugin's raw command string can't leak one either."""
+    if isinstance(value, dict):
+        return {k: _diag_redact(v, k) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_diag_redact(v, field_name) for v in value]
+    if isinstance(value, str):
+        if any(hint in field_name.lower() for hint in _DIAG_REDACT_KEY_HINTS):
+            return "[redacted]"
+        return _DIAG_INLINE_SECRET_RE.sub(lambda m: f"{m.group(1)}=[redacted]", value)
+    return value
+
+
+def _diag_slot_label(
+    *, dashboard_enabled: bool, process_active: bool,
+    healthy_flag: bool, detail: "dict | None",
+) -> str:
+    """Classify one connector slot into exactly ONE of five distinct states.
+
+    Precedence (most to least specific) — matches sprint item f1e0df55's
+    requirement to "show restart-required, stale, degraded, quarantined, and
+    healthy states distinctly" and to never call a dashboard-only setting
+    "active":
+
+    1. ``quarantined``       — the client gave up retrying after a
+                                deterministic failure (SlotState.QUARANTINED).
+    2. ``restart_required``   (lifecycle-state case) — the client explicitly
+                                reported an intentional teardown
+                                (idle-killed/stopped, SlotState) while the
+                                dashboard still has the slot enabled. Checked
+                                before "degraded" because these are normal
+                                lifecycle events, not failures, even though
+                                the accompanying report may also carry
+                                ``healthy=false``.
+    3. ``degraded``           — serving, but the last probe/report was bad
+                                (a specific known-bad SlotState, or a bare
+                                ``healthy=false`` with no more specific
+                                state attached).
+    4. ``stale`` / ``restart_required`` (split-brain case) — the
+                                dashboard-persisted setting no longer matches
+                                the last-observed runtime. If the dashboard
+                                has the slot enabled, nothing is running, AND
+                                we have NO diagnostic history at all (never
+                                connected from this vantage point, or simply
+                                hasn't started yet) — that's ``stale``: we
+                                genuinely don't know why. Every other
+                                mismatch (a process running that the
+                                dashboard has disabled, or an enabled slot
+                                that has some diagnostic history showing it
+                                is down) is ``restart_required``: restart the
+                                tunnel to reconcile.
+    5. ``healthy``            — consistently and correctly off (disabled in
+                                the dashboard AND nothing running), or
+                                consistently on with no adverse signal.
+    """
+    state = (detail or {}).get("state")
+    if state == "quarantined" or (detail or {}).get("quarantine_reason"):
+        return "quarantined"
+    if state in _DIAG_RESTART_STATES and dashboard_enabled:
+        return "restart_required"
+    if state in _DIAG_DEGRADED_STATES or not healthy_flag:
+        return "degraded"
+    if dashboard_enabled != process_active:
+        if dashboard_enabled and detail is None:
+            return "stale"  # enabled, not running, and no history at all
+        return "restart_required"
+    return "healthy"  # consistently off, or consistently on with no issues
+
+
+def _diag_remediation(label: str, detail: "dict | None") -> str:
+    """Exact, human-actionable remediation text for one slot's diagnostic label."""
+    if label == "healthy":
+        return "No action needed."
+    if label == "quarantined":
+        reason = (detail or {}).get("quarantine_reason") or (detail or {}).get("reason") or "a deterministic failure"
+        return (
+            f"Slot quarantined after {reason}. Fix the underlying dependency/config "
+            "on your machine, then restart `meridian --tunnel` to clear the "
+            "quarantine and retry."
+        )
+    if label == "degraded":
+        why = (detail or {}).get("detail") or (detail or {}).get("reason") or "the last health probe failed"
+        return f"Slot is serving in a degraded state ({why}). Check the local tunnel client's logs."
+    if label == "restart_required":
+        return (
+            "The dashboard-persisted setting for this slot does not match what is "
+            "currently running. Restart `meridian --tunnel` (or resave the setting "
+            "and restart) to pick up the change."
+        )
+    if label == "stale":
+        return "No recent health signal for this slot. Reconnect or restart the tunnel to refresh its status."
+    return "Unknown state — treat as needing investigation."
+
+
+def _config_generation(config: Any) -> int:
+    """Deterministic small integer 'generation' for a persisted plugin config.
+
+    Not a monotonic counter — nothing increments it across restarts — it is a
+    stable hash-derived number so two reads of the SAME persisted config agree,
+    and any edit changes it. Lets a caller detect "the persisted config changed
+    since I last looked" with a cheap equality check instead of a deep diff."""
+    blob = json.dumps(config, sort_keys=True, default=str) if config else ""
+    return int(hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def _config_manifest_hash(config: Any) -> str:
+    """sha256 hex digest of the normalized persisted plugin config.
+
+    Pure equality-comparison fingerprint (dashboard-persisted config vs. what a
+    connected tunnel client last acted on) — never reversed. ``config`` here is
+    the plugin enable/command/port shape (already redacted downstream by
+    ``_diag_redact`` wherever it is echoed back), not raw tenant credentials."""
+    blob = json.dumps(config, sort_keys=True, default=str) if config else ""
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = None) -> dict:
+    """Assemble the full layered diagnostic snapshot for one tenant (f1e0df55).
+
+    Shared by the ``GET /tunnel/diagnostics/{tenant_id}`` HTTP route and the
+    ``get_tunnel_diagnostics`` MCP tool so both surfaces report identically.
+    Returns an unauthenticated-shaped stub (empty slots, no tenant) when
+    ``tenant`` is None, mirroring ``get_tunnel_plugins``'s existing contract."""
+    run_id = uuid.uuid4().hex
+    generated_at = time.time()
+    if tenant is None:
+        return {
+            "run_id": run_id,
+            "generated_at": generated_at,
+            "tenant_id": None,
+            "authenticated": False,
+            "hostname": hostname,
+            "tunnel_process": {"any_active": False, "cross_instance_owner": None, "cross_instance_miss": False},
+            "slots": {},
+            "server_routing_cache": {"routed_tool_count": 0, "cache_populated": False},
+            "connector_manifest": {
+                "config_generation": _config_generation(None),
+                "manifest_hash": _config_manifest_hash(None),
+                "tools_list_stale": False,
+            },
+        }
+
+    tid = tenant.get("id")
+    parsed = _current_tunnel_config(tenant, hostname)
+    resolved = resolve_plugins(parsed)
+
+    slots: dict[str, dict] = {}
+    for p in resolved:
+        slot = p["slot"]
+        sockets, _ = _label_maps(slot)
+        process_active = tid in sockets
+        healthy_flag = _slot_health.get(tid, {}).get(slot, True)
+        detail = _slot_status_detail.get(tid, {}).get(slot)
+        dashboard_enabled = bool(p.get("enabled"))
+        label = _diag_slot_label(
+            dashboard_enabled=dashboard_enabled,
+            process_active=process_active,
+            healthy_flag=healthy_flag,
+            detail=detail,
+        )
+        slots[slot] = _diag_redact({
+            # Persisted-in-dashboard state — NEVER reported as "active" here,
+            # only as what is saved.
+            "dashboard_configured": {
+                "enabled": dashboard_enabled,
+                "command": p.get("command"),
+                "description": p.get("description"),
+            },
+            # Live server-side tunnel-process state for this slot.
+            "process_active": process_active,
+            # External child (the client's spawned MCP server subprocess) state,
+            # as last reported by a plugin_status message — None if never reported.
+            "external_child_state": (detail or {}).get("state"),
+            "healthy_reported": healthy_flag,
+            "retry_count": (detail or {}).get("retry_count"),
+            "quarantine_reason": (detail or {}).get("quarantine_reason"),
+            "last_error": (detail or {}).get("detail") or (detail or {}).get("reason"),
+            "state": label,
+            "remediation": _diag_remediation(label, detail),
+        })
+
+    routing_cache = dict(_tunnel_tool_routes.get(tid, {}))
+
+    return {
+        "run_id": run_id,
+        "generated_at": generated_at,
+        "tenant_id": tid,
+        "authenticated": True,
+        "hostname": hostname,
+        "tunnel_process": {
+            "any_active": has_active_tunnel(tid),
+            # Fly.io multi-instance: which instance (if any) is known to own
+            # this tenant's socket, and whether THIS instance has a miss.
+            "cross_instance_owner": tenant_owner_instance(tid),
+            "cross_instance_miss": tunnel_cross_instance_miss(tenant),
+        },
+        "slots": slots,
+        # Server-side tool-name -> slot routing cache (``_tunnel_tool_routes``):
+        # what the LAST tools/list discovery aggregated, not what's configured.
+        "server_routing_cache": {
+            "routed_tool_count": len(routing_cache),
+            "cache_populated": bool(routing_cache),
+        },
+        # Connector discovery/manifest state: a config fingerprint (for drift
+        # detection) plus whether a slot recovery is pending re-advertisement.
+        "connector_manifest": {
+            "config_generation": _config_generation(parsed),
+            "manifest_hash": _config_manifest_hash(parsed),
+            "tools_list_stale": tid in _tools_list_changed_pending,
+        },
+    }
+
+
+@router.get("/tunnel/diagnostics/{tenant_id}")
+async def tunnel_diagnostics(tenant_id: str, request: Request) -> Response:
+    """Layered, read-only tunnel/connector diagnostics for one tenant (f1e0df55).
+
+    Aggregates dashboard-persisted config, live per-slot process state,
+    client-reported per-slot health, the server routing cache, and the
+    tools/list discovery-changed marker into ONE snapshot — see
+    :func:`build_tunnel_diagnostics` for the full field-by-field contract.
+    ``tenant_id`` in the path is documentary only (matches the sibling
+    ``/tunnel/status/{tenant_id}`` route's shape); the actual tenant is
+    resolved from the request's own auth, same as ``/tunnel/plugins``.
+    """
+    tenant = await _get_tenant_from_request(request)
+    hostname = (request.query_params.get("hostname") or "").strip() or None
+    return _json_response(build_tunnel_diagnostics(tenant, hostname))
 
 
 @router.post("/tunnel/plugins/custom")
@@ -1819,7 +2399,7 @@ async def add_custom_plugin(request: Request) -> Response:
         return _json_response({"error": err}, status_code=400)
 
     entries.append(entry)
-    await _store_tunnel_config(request, tenant, hostname, entries)
+    _, gen_record = await _store_tunnel_config(request, tenant, hostname, entries)
     # Re-read the stored config so the returned custom list reflects exactly what
     # persisted (and would resolve at tunnel spawn). force_refresh=True bypasses
     # the 20889f40 request.state memoization, which would otherwise still hold
@@ -1831,6 +2411,7 @@ async def add_custom_plugin(request: Request) -> Response:
         "hostname": hostname,
         "added": entry,
         "custom": resolve_custom_plugins(stored),
+        "config_generation": gen_record,
     })
 
 
@@ -1882,7 +2463,7 @@ async def remove_custom_plugin(request: Request) -> Response:
         return _json_response(
             {"error": f"no custom plugin named '{name}'"}, status_code=404)
 
-    await _store_tunnel_config(request, tenant, hostname, kept)
+    _, gen_record = await _store_tunnel_config(request, tenant, hostname, kept)
     # force_refresh=True -- see add_custom_plugin above for why this can't use
     # the memoized 20889f40 tenant snapshot.
     stored = _current_tunnel_config(
@@ -1892,6 +2473,7 @@ async def remove_custom_plugin(request: Request) -> Response:
         "hostname": hostname,
         "removed": name,
         "custom": resolve_custom_plugins(stored),
+        "config_generation": gen_record,
     })
 
 
@@ -2613,6 +3195,116 @@ def _namespace_source_title(title: Any, src: str) -> "str | None":
 # Per-process routing cache: tenant_id → {tool_name: tunnel_label}
 _tunnel_tool_routes: dict[str, dict[str, str]] = {}
 
+# ---------------------------------------------------------------------------
+# Generation-aware tools/list manifest — sprint item 49d8244d
+#
+# Builds on the runtime-config generation registry above (02dbd8b4) to give
+# every aggregated tools/list a deterministic, checkable fingerprint of the
+# TUNNEL half of the tool surface: a content hash of the current routing
+# table (``_tunnel_tool_routes``), a live slot-health snapshot, the config
+# generation record, and cache-freshness metadata (``generated_at`` /
+# ``age_seconds``) so a client can tell "fresh this call" apart from "served
+# from a routing table that hasn't been rebuilt in N seconds".
+#
+# Four distinct caches are in play here, and this pass only ever touches the
+# first two directly:
+#   1. server route cache   — ``_tunnel_tool_routes`` (this module): which
+#      tunnel slot a prefixed tool name forwards to. Invalidated atomically
+#      with #2 by ``_invalidate_tunnel_manifest`` below.
+#   2. tunnel slot cache    — ``_slot_health`` / ``_tools_list_changed_pending``
+#      (this module): which slots are currently healthy/advertised. Always
+#      read LIVE by ``tunnel_manifest_snapshot`` — never itself "stale" the way
+#      the routing table can be, so it is not part of the invalidation helper.
+#   3. client discovery cache — the connected MCP client's own remembered
+#      tools/list result (claude.ai, Claude Desktop, a stdio client). This
+#      server cannot reach into that cache; the closest thing to "invalidate"
+#      it is ``notifications/tools/list_changed`` (unreliable — see
+#      ``notify_tools_list_changed``) or the explicit ``refresh_tool_manifest``
+#      tool call, which forces a synchronous rebuild the client can compare
+#      hashes against.
+#   4. connector manifest cache — an intermediary (mcp-remote, a proxy) that
+#      caches the raw tools/list JSON-RPC response itself. Also out of this
+#      server's reach; ``POST /tunnel/refresh`` exists so a connector/dashboard
+#      that DOES control its own cache has an explicit, idempotent operation to
+#      call before re-issuing tools/list, instead of guessing at a TTL.
+#
+# Scope of this "highest-value core" pass (mirrors 02dbd8b4's own escape
+# hatch — the full item is substantial):
+#   * generated_at/age_seconds describe the ROUTING TABLE (#1) only — the exact
+#     same distinction the runtime-config registry draws between "config
+#     generation" (a fact about persisted settings) and "restart_required" (a
+#     fact about a running process). slot_health / list_changed_pending are
+#     always current as of the call, so they carry no separate age.
+#   * This is still per-process, in-memory, single-Fly-instance state — same
+#     documented limitation as ``_config_generations``. A multi-instance-
+#     consistent manifest would need the same durable/shared-store follow-up.
+#   * "Ensure recovered tools become visible without a full chat restart" is
+#     satisfied for the ONE mechanism a stateless `/mcp` transport actually
+#     offers: a plain tool CALL (``refresh_tool_manifest``) that synchronously
+#     forces the rebuild and returns the new hash, so a session can detect drift
+#     and re-list without disconnecting. It is NOT a server-push guarantee —
+#     no transport-level push exists here (see ``notify_tools_list_changed``).
+# ---------------------------------------------------------------------------
+
+# tenant_id → wall-clock time.time() the routing cache (_tunnel_tool_routes)
+# was last (re)built by list_tunnel_tools. Powers generated_at/age_seconds.
+_tunnel_manifest_generated_at: dict[str, float] = {}
+
+
+def _invalidate_tunnel_manifest(tenant_id: str) -> None:
+    """Atomically drop the routing cache AND its manifest timestamp (49d8244d).
+
+    Every call site that used to do a bare
+    ``_tunnel_tool_routes.pop(tenant_id, None)`` on a slot connect/disconnect/
+    recovery now routes through here, so the two caches can never disagree
+    about whether a rebuild is pending — a stale ``age_seconds`` surviving a
+    routing-cache drop (or vice versa) would silently mislead a caller.
+    """
+    _tunnel_tool_routes.pop(tenant_id, None)
+    _tunnel_manifest_generated_at.pop(tenant_id, None)
+
+
+def _tunnel_manifest_hash(tenant_id: str) -> "str | None":
+    """Deterministic sha256 over the tenant's current tool-routing cache.
+
+    ``None`` when there is no cached route table for this tenant (no active
+    tunnel, or the cache was invalidated and not yet rebuilt) — distinguishing
+    "no manifest yet" from a real (possibly empty) one lets a caller decide
+    whether an explicit refresh is worth triggering.
+    """
+    routes = _tunnel_tool_routes.get(tenant_id)
+    if routes is None:
+        return None
+    canonical = json.dumps(sorted(routes.items()), separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def tunnel_manifest_snapshot(tenant_id: str) -> dict:
+    """Point-in-time manifest snapshot for a tenant's tunnel tool surface.
+
+    The shared shape returned by ``GET /tunnel/status``, ``POST
+    /tunnel/refresh``, and the aggregated MCP ``tools/list`` ``_meta`` block
+    (see ``meridian/mcp/handler.py``) so all three surfaces describe the exact
+    same underlying state instead of drifting relative to each other.
+    """
+    generated = _tunnel_manifest_generated_at.get(tenant_id)
+    now = time.time()
+    return {
+        "manifest_hash": _tunnel_manifest_hash(tenant_id),
+        "tool_count": len(_tunnel_tool_routes.get(tenant_id) or {}),
+        # Always live — see the module note above on why these carry no age.
+        "slot_health": dict(_slot_health.get(tenant_id, {})),
+        "config_generation": all_runtime_config_generations(tenant_id),
+        "generated_at": (
+            datetime.fromtimestamp(generated, tz=timezone.utc).isoformat()
+            if generated is not None else None
+        ),
+        "age_seconds": (round(now - generated, 3) if generated is not None else None),
+        "list_changed_pending": tenant_id in _tools_list_changed_pending,
+        "has_active_tunnel": has_active_tunnel(tenant_id),
+    }
+
+
 # Phase 3 — server-side tool-description rewriting. When the bridge aggregates a
 # tenant's tunneled tools, the raw filesystem read tools (read_file /
 # read_multiple_files) get a code-intel-first directive prepended to their
@@ -3258,13 +3950,47 @@ async def list_tunnel_tools(
             aggregated.append(_rewrite_tool_description(tool_copy))
     if routes:
         _tunnel_tool_routes[tenant_id] = routes
+        _tunnel_manifest_generated_at[tenant_id] = time.time()  # 49d8244d
     elif not has_active_tunnel(tenant_id):
-        _tunnel_tool_routes.pop(tenant_id, None)
+        _invalidate_tunnel_manifest(tenant_id)  # 49d8244d
+    else:
+        # 49d8244d — active tunnel, zero tools aggregated this pass (e.g. every
+        # slot currently unhealthy). The existing _tunnel_tool_routes entry (if
+        # any) is deliberately left untouched so call_tunnel_tool can keep
+        # routing by it, but stamp the manifest timestamp anyway so
+        # tunnel_manifest_snapshot's age_seconds reflects "a fetch was just
+        # attempted" rather than silently reporting a growing staleness for a
+        # cache that in fact just got re-checked (and confirmed unchanged).
+        _tunnel_manifest_generated_at[tenant_id] = time.time()
     # 54ddd609 — this (re)aggregation reflects the current live slot health, so a
     # pending tools/list_changed marker (set on a slot recovery) is now satisfied:
     # the caller is observing the recovered tools. Drain it so it fires only once.
     _tools_list_changed_pending.discard(tenant_id)
     return aggregated
+
+
+async def refresh_tunnel_manifest(
+    tenant_id: str, reserved_names: "frozenset[str] | set[str]" = frozenset(),
+) -> dict:
+    """Explicit refresh/re-list operation (49d8244d).
+
+    Forces a synchronous re-aggregation of every currently-healthy tunnel
+    slot's tools — stronger than :func:`notify_tools_list_changed`, which only
+    arms a pending flag consumed by the NEXT caller-initiated ``tools/list``.
+    This makes the rebuild happen NOW, so the manifest this call returns
+    already reflects a recovered/newly-configured slot rather than requiring a
+    second round trip.
+
+    Callers: the ``refresh_tool_manifest`` MCP tool (meridian/mcp/handler.py)
+    and ``POST /tunnel/refresh`` below (dashboard + any HTTP-capable
+    connector). Invalidates the routing cache first (atomically, via
+    :func:`_invalidate_tunnel_manifest`) so a concurrent reader never observes
+    a route table that's half-old/half-new, then rebuilds it via
+    :func:`list_tunnel_tools` and returns the resulting snapshot.
+    """
+    _invalidate_tunnel_manifest(tenant_id)
+    await list_tunnel_tools(tenant_id, reserved_names)
+    return tunnel_manifest_snapshot(tenant_id)
 
 
 # ---------------------------------------------------------------------------

@@ -105,6 +105,16 @@ async def generate_handoff_endpoint(
         _force_include_ids = [str(x) for x in _raw_fii if x]
     _strict_evidence = bool(body.get("strict_evidence"))
     _strict_pointer_evidence = bool(body.get("strict_pointer_evidence"))
+    # 3cab355a — mirror handler.py's out-param: one entry per requested
+    # force_include_ids id that failed validation (unknown/cross-project/
+    # cross-version/not-pending). See handoff.generate_handoff's
+    # force_include_rejected docstring.
+    _force_include_rejected: list[dict[str, Any]] = []
+    # ecc8b280 — same gap as force_include_ids/strict_evidence above: thread
+    # the continuation-gate args through the REST body too.
+    _checkpoint = bool(body.get("checkpoint"))
+    _strict_continuation = bool(body.get("strict_continuation"))
+    _continuation_status: dict[str, Any] = {}
     skip_summary = not os.environ.get("ANTHROPIC_API_KEY")
     db = await _db(request)
     data_dir = _data_dir(request)
@@ -120,6 +130,10 @@ async def generate_handoff_endpoint(
                 force_include_ids=_force_include_ids,
                 strict_evidence=_strict_evidence,
                 strict_pointer_evidence=_strict_pointer_evidence,
+                force_include_rejected=_force_include_rejected,
+                checkpoint=_checkpoint,
+                strict_continuation=_strict_continuation,
+                continuation_status=_continuation_status,
             ),
             timeout=90.0,
         )
@@ -141,6 +155,34 @@ async def generate_handoff_endpoint(
                 "project_id": project_id,
                 "evidence_status": exc.evidence_status,
                 "evidence_errors": exc.errors,
+                "message": str(exc),
+            },
+        ) from exc
+    except handoff_module.HandoffContinuationRequired as exc:
+        # ecc8b280 — strict_continuation=True, not checkpoint=True, and
+        # actionable work remains: fail CLOSED, mirroring the MCP HTTP
+        # dispatch's structured refusal instead of a generic 500.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "HANDOFF_CONTINUATION_BLOCKED",
+                "project_id": project_id,
+                "continuation_status": exc.continuation_state,
+                "message": str(exc),
+            },
+        ) from exc
+    except handoff_module.HandoffStaleReferenceError as exc:
+        # ee8a6af1 — unconditional fail-closed: a depends_on edge on the live
+        # board points at an id that doesn't resolve for this project/version
+        # scope. Mirrors the MCP HTTP dispatch's structured refusal instead
+        # of a generic 500.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "STALE_REFERENCE",
+                "project_id": exc.project_id,
+                "version": exc.version,
+                "stale_references": exc.stale_references,
                 "message": str(exc),
             },
         ) from exc
@@ -168,4 +210,96 @@ async def generate_handoff_endpoint(
         "capability_contract": capability_contract,
         "proposal_evidence": proposal_evidence,
         "docx_integrity": docx_integrity,
+        "force_include_rejected": _force_include_rejected,
+        "continuation_status": _continuation_status,
     }
+
+
+@router.post("/projects/{project_id}/handoff/corrections")
+async def record_handoff_correction_endpoint(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """3af86d28 — record a corrective handoff for a blocked executor session.
+
+    REST mirror of the MCP ``record_handoff_correction`` tool — see
+    ``meridian.handoff.record_handoff_correction`` /
+    ``regenerate_handoff_correction`` for the full contract. Pass
+    ``regenerate: true`` in the body to also repair pointers, invalidate the
+    source handoff, and produce a new deterministic revision in this same
+    call.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+    source_handoff_id = body.get("source_handoff_id")
+    blocker_classification = body.get("blocker_classification")
+    if not source_handoff_id or not blocker_classification:
+        raise HTTPException(
+            status_code=422,
+            detail="source_handoff_id and blocker_classification are required",
+        )
+    try:
+        correction = await handoff_module.record_handoff_correction(
+            db, project_id,
+            source_handoff_id=source_handoff_id,
+            blocker_classification=blocker_classification,
+            session_id=body.get("session_id"),
+            investigation_evidence=body.get("investigation_evidence"),
+            added_pointers=body.get("added_pointers"),
+            removed_pointers=body.get("removed_pointers"),
+            superseded_pointers=body.get("superseded_pointers"),
+            changed_resources=body.get("changed_resources"),
+            requested_scope=body.get("requested_scope"),
+            version=body.get("version"),
+            source_token=body.get("source_token"),
+            idempotency_key=body.get("idempotency_key"),
+            status=body.get("status") or "draft",
+        )
+    except handoff_module.HandoffCorrectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not body.get("regenerate"):
+        return {"correction": correction, "regenerated": False}
+    data_dir = _data_dir(request)
+    try:
+        return await handoff_module.regenerate_handoff_correction(
+            db, project_id, correction["id"], body.get("output_dir") or data_dir,
+            session_id=body.get("session_id"),
+            mode=body.get("mode") or "full",
+        )
+    except handoff_module.HandoffCorrectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/projects/{project_id}/handoff/corrections/latest")
+async def load_handoff_correction_endpoint(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """3af86d28 — load a corrective handoff directly (never reconstruct from notes).
+
+    REST mirror of ``meridian.handoff.load_handoff_correction``. Optional
+    query params ``correction_id`` / ``source_handoff_id`` scope the lookup;
+    with neither, returns the project's single latest correction (any
+    status). ``{correction: null}`` when the project has no corrections.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    correction_id = request.query_params.get("correction_id")
+    source_handoff_id = request.query_params.get("source_handoff_id")
+    try:
+        correction = await handoff_module.load_handoff_correction(
+            db, project_id,
+            correction_id=correction_id,
+            source_handoff_id=source_handoff_id,
+        )
+    except handoff_module.HandoffCorrectionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"correction": correction}

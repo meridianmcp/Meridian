@@ -378,6 +378,150 @@ def test_resolve_extractor_inner_returns_none_on_install_failure(monkeypatch):
     assert tc._resolve_extractor_inner_cmd() is None
 
 
+# ---------------------------------------------------------------------------
+# 9d9a92cc — _resolve_extract_slot_command / diagnostics: correct Claude
+# Desktop/Code/Cursor runtime configuration for the code-extractor slot. A
+# missing/empty/malformed command must resolve to the CURRENT default
+# (Serena), never the obsolete mcp-server-code-extractor PyPI package that
+# this slot's "no command" case used to fall back to before the built-in
+# default moved to Serena (1428f1b).
+# ---------------------------------------------------------------------------
+
+def test_resolve_extract_slot_command_no_override_is_serena_default():
+    kind, override = tc._resolve_extract_slot_command(None, "/repo")
+    assert kind == "serena-default"
+    assert override is None
+
+
+def test_resolve_extract_slot_command_empty_list_is_serena_default():
+    # A stored config with an explicitly empty command (e.g. a cleared
+    # dashboard override, or an older/legacy resolved plugin list) must NOT
+    # fall back to the obsolete extractor package.
+    kind, override = tc._resolve_extract_slot_command([], "/repo")
+    assert kind == "serena-default"
+    assert override is None
+
+
+def test_resolve_extract_slot_command_explicit_default_copy_is_serena_default():
+    # A config that stores an exact (value-equal) copy of the current
+    # built-in default is indistinguishable from "no override" and must
+    # resolve the same way.
+    from meridian.tunnel_plugins import SERENA_EXTRACT_COMMAND
+
+    copy_of_default = list(SERENA_EXTRACT_COMMAND)
+    kind, override = tc._resolve_extract_slot_command(copy_of_default, "/repo")
+    assert kind == "serena-default"
+    assert override is None
+
+
+def test_resolve_extract_slot_command_malformed_is_serena_default():
+    # A truthy but un-coercible override (can't become a runnable list) must
+    # also repair to the current default rather than silently trying the
+    # legacy extractor fallback.
+    kind, override = tc._resolve_extract_slot_command({"not": "a command"}, "/repo")
+    assert kind == "serena-default"
+    assert override is None
+
+
+def test_resolve_extract_slot_command_custom_override_expands_repo_path():
+    kind, override = tc._resolve_extract_slot_command(
+        ["my-tool", "--project", "{repo_path}"], "/repo/path",
+    )
+    assert kind == "custom"
+    assert override == ["my-tool", "--project", "/repo/path"]
+
+
+def test_resolve_extract_slot_command_explicit_legacy_extractor_is_custom():
+    # A tenant who deliberately kept the legacy package as an explicit
+    # override still gets it — this function does not second-guess an
+    # EXPLICIT, valid choice; resolve_plugins' stale_override flag (surfaced
+    # separately) is what tells the caller to warn about it.
+    legacy = ["uvx", "mcp-server-code-extractor"]
+    kind, override = tc._resolve_extract_slot_command(legacy, "/repo")
+    assert kind == "custom"
+    assert override == legacy
+
+
+def test_extract_slot_package_name_serena_from_flag():
+    assert tc._extract_slot_package_name(
+        ["uvx", "--from", "serena-agent", "serena", "start-mcp-server"]
+    ) == "serena-agent"
+
+
+def test_extract_slot_package_name_uvx_second_token_fallback():
+    assert tc._extract_slot_package_name(["uvx", "mcp-server-code-extractor"]) == "mcp-server-code-extractor"
+
+
+def test_extract_slot_package_name_empty_is_unknown():
+    assert tc._extract_slot_package_name(None) == "unknown"
+    assert tc._extract_slot_package_name([]) == "unknown"
+
+
+def test_extract_slot_diagnostics_serena_default_never_leaks_custom_argv(monkeypatch):
+    monkeypatch.setattr(tc, "_find_uvx", lambda: "/usr/local/bin/uvx")
+    monkeypatch.setattr(tc.sys, "executable", "/env/bin/python")
+    diag = tc._extract_slot_diagnostics("serena-default", None, "/repo")
+    assert diag == {
+        "kind": "serena-default",
+        "package": "serena-agent",
+        "python_runtime": "/env/bin/python",
+        "cwd": "/repo",
+        "uvx_available": True,
+    }
+
+
+def test_extract_slot_diagnostics_custom_reports_resolved_package_not_raw_argv(monkeypatch):
+    monkeypatch.setattr(tc, "_find_uvx", lambda: None)
+    monkeypatch.setattr(tc.sys, "executable", "/env/bin/python")
+    override = ["uvx", "--from", "some-secret-tool==1.0", "some-secret-tool", "--token", "sk_live_abc"]
+    diag = tc._extract_slot_diagnostics("custom", override, "/repo")
+    # Only the resolved PACKAGE name appears — never the raw argv (which may
+    # embed a secret in a bespoke custom-slot override).
+    assert diag["package"] == "some-secret-tool==1.0"
+    assert diag["uvx_available"] is False
+    assert "sk_live_abc" not in str(diag)
+
+
+# ---------------------------------------------------------------------------
+# 9d9a92cc — _serena_pool_spawn platform-aware uvx resolution
+# ---------------------------------------------------------------------------
+
+def test_serena_pool_spawn_resolves_bare_uvx_to_full_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc, "_find_uvx", lambda: "/opt/uv/uvx")
+    captured = {}
+
+    class _FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    result = tc._serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert result.pid == 4242
+    assert captured["cmd"] == ["/opt/uv/uvx", "--from", "serena-agent", "serena"]
+
+
+def test_serena_pool_spawn_keeps_bare_uvx_when_unresolvable(tmp_path, monkeypatch):
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc, "_find_uvx", lambda: None)
+    captured = {}
+
+    class _FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, **kw):
+        captured["cmd"] = cmd
+        return _FakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    tc._serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    # Unresolvable → falls back to the bare token unchanged (no regression).
+    assert captured["cmd"] == ["uvx", "--from", "serena-agent", "serena"]
+
+
 def test_build_code_proxy_command_uses_shell_for_cmd_shim_on_windows(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "win32")
     shim = r"C:\Users\13144\AppData\Roaming\npm\codebase-memory-mcp.cmd"
@@ -554,8 +698,64 @@ def test_extract_jsonrpc_error_mcp_content_item_is_error():
 
 
 def test_extract_jsonrpc_error_non_json_body_returns_none():
-    """A non-JSON body (plain text, SSE) is silently ignored."""
+    """A body that is not JSON and not a parseable SSE data frame is silently ignored."""
     assert tc._extract_jsonrpc_error(b"event: message\ndata: {bad json}\n\n") is None
+    assert tc._extract_jsonrpc_error(b"plain text, not JSON, not SSE") is None
+
+
+def test_extract_jsonrpc_error_sse_wrapped_tool_error_is_detected():
+    """An SSE-framed (text/event-stream) body carrying result.isError must be
+    detected, not silently treated as a clean response (d786ca46: mcp-proxy's
+    Streamable HTTP transport can wrap the tools/call response in
+    ``data: {...}\\n\\n`` SSE framing even for a single-shot POST; a bare
+    ``json.loads`` on the whole body fails for this shape, and previously
+    that parse failure was indistinguishable from "no error to report").
+    """
+    body = (
+        b"event: message\n"
+        b'data: {"jsonrpc":"2.0","id":"idx","result":{"isError":true,'
+        b'"content":[{"type":"text","text":"index scan aborted"}]}}\n\n'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "index scan aborted" in result
+
+
+def test_extract_jsonrpc_error_sse_wrapped_status_failure_is_detected():
+    """An SSE-framed body carrying the nested status/worker-failure shape
+    (cd28b329) — no isError anywhere — is still detected through SSE framing.
+    """
+    body = (
+        b"event: message\n"
+        b'data: {"jsonrpc":"2.0","id":"idx","result":{"status":"error","workers":['
+        b'{"status":"worker_failed","exit_code":1}]}}\n\n'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "status=error" in result
+    assert "1 worker(s) failed" in result
+
+
+def test_extract_jsonrpc_error_sse_wrapped_clean_response_returns_none():
+    """An SSE-framed body with no error signal still returns None (no false positive)."""
+    body = (
+        b"event: message\n"
+        b'data: {"jsonrpc":"2.0","id":"idx","result":{"content":[{"type":"text","text":"ok"}]}}\n\n'
+    )
+    assert tc._extract_jsonrpc_error(body) is None
+
+
+def test_extract_jsonrpc_error_sse_multiple_data_lines_joined():
+    """Multiple `data:` lines within one SSE event are newline-joined per spec
+    before being parsed as a single JSON document."""
+    body = (
+        b"event: message\n"
+        b'data: {"jsonrpc":"2.0","id":"idx","error":\n'
+        b'data: {"code":-32603,"message":"split across lines"}}\n\n'
+    )
+    result = tc._extract_jsonrpc_error(body)
+    assert result is not None
+    assert "split across lines" in result
 
 
 def test_extract_jsonrpc_error_empty_body_returns_none():
@@ -712,6 +912,47 @@ def test_index_code_dir_logs_jsonrpc_error_body(monkeypatch, capsys):
     # Must warn on stderr, not silently print "indexed"
     assert "scan partial" in captured.err
     assert "indexed" not in captured.out
+
+
+def test_index_code_dir_logs_sse_wrapped_jsonrpc_error_body(monkeypatch, capsys):
+    """_index_code_dir must not log a false 'indexed' success when
+    index_repository's HTTP-200 response is SSE-wrapped (d786ca46).
+
+    Before this fix, ``_extract_jsonrpc_error`` called ``json.loads`` on the
+    whole body; an SSE (``text/event-stream``) response failed that parse and
+    fell through to the "clean" branch, so a genuine index failure delivered
+    via SSE framing printed 'code-intel: indexed' instead of a warning.
+    """
+    import httpx as _httpx
+
+    _call_count = [0]
+
+    class FakeResp:
+        def __init__(self, body: bytes):
+            self.status_code = 200
+            self.content = body
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, url, **kw):
+            _call_count[0] += 1
+            if _call_count[0] == 1:
+                return FakeResp(b'{"jsonrpc":"2.0","id":"probe","result":{"tools":[]}}')
+            # index_repository call: HTTP 200, SSE-framed, MCP isError=true.
+            return FakeResp(
+                b"event: message\n"
+                b'data: {"jsonrpc":"2.0","id":"idx","result":{"isError":true,'
+                b'"content":[{"type":"text","text":"index scan aborted"}]}}\n\n'
+            )
+
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+    asyncio.run(tc._index_code_dir(8809, "/repo"))
+
+    captured = capsys.readouterr()
+    assert "index scan aborted" in captured.err
+    assert "code-intel: indexed" not in captured.out
 
 
 # ---------------------------------------------------------------------------
@@ -2346,6 +2587,106 @@ def test_kill_all_previously_spawned_pids_skips_pid_reused_entry(tmp_path, monke
     assert killed == {}
 
 
+def test_kill_all_previously_spawned_pids_spares_daemon_leased_by_live_sibling(tmp_path, monkeypatch):
+    """92aaedb7: a Serena daemon's ORIGINAL spawning tunnel can be dead while a
+    DIFFERENT, still-running sibling tunnel currently leases it via the
+    host-local broker (meridian.serena_pool) -- the once-per-startup orphan
+    sweep must not kill it out from under that sibling."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    registry = tc._all_spawned_registry_path()
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps([
+        {"pid": 777, "label": "extract", "create_time": 1000.0,
+         "owner_tunnel_pid": 111, "owner_tunnel_create_time": 2000.0},
+    ]))
+
+    # Broker registry: a sibling (tunnel_pid=333, still alive) currently
+    # leases the daemon recorded at pid 777, even though the tunnel that
+    # originally spawned it (owner_tunnel_pid=111 above) is dead.
+    from meridian import serena_pool as sp
+    broker_dir = sp.default_broker_dir()
+    key_dir = broker_dir / "somekey"
+    key_dir.mkdir(parents=True)
+    (key_dir / "daemon.json").write_text(json.dumps({"pid": 777, "port": 8700}))
+    (key_dir / "lease-sibling.json").write_text(
+        json.dumps({"owner_id": "sibling", "tunnel_pid": 333})
+    )
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    killed = {}
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            if self.pid == 777:
+                return 1000.0  # matches -- genuine child, not PID-reused
+            raise Exception("owner tunnel pid no longer exists")  # 111 is dead
+
+        def terminate(self):
+            killed.setdefault("terminate", []).append(self.pid)
+
+        def wait(self, timeout=None):
+            pass
+
+    fake_psutil.Process = _FakeProc
+    # Backs serena_pool._default_pid_alive's liveness check of tunnel_pid=333.
+    fake_psutil.pid_exists = lambda pid: pid == 333
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    tc._kill_all_previously_spawned_pids()
+
+    assert killed == {}, "a daemon still leased by a live sibling must not be killed"
+    # Registry still cleared -- this generation starts recording from empty.
+    assert json.loads(registry.read_text()) == []
+
+
+def test_kill_all_previously_spawned_pids_kills_orphan_with_no_broker_lease(tmp_path, monkeypatch):
+    """Sibling-lease guard is a narrowing, not a blanket skip: an entry with
+    no matching broker descriptor at all (the common case -- most spawned
+    pids are never Serena daemons) is killed exactly as before."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    registry = tc._all_spawned_registry_path()
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(json.dumps([
+        {"pid": 555, "label": "extract", "create_time": 1000.0,
+         "owner_tunnel_pid": 111, "owner_tunnel_create_time": 2000.0},
+    ]))
+
+    import types
+    fake_psutil = types.ModuleType("psutil")
+    killed = {}
+
+    class _FakeProc:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def create_time(self):
+            if self.pid == 555:
+                return 1000.0
+            raise Exception("owner tunnel pid no longer exists")
+
+        def terminate(self):
+            killed.setdefault("terminate", []).append(self.pid)
+
+        def wait(self, timeout=None):
+            pass
+
+    fake_psutil.Process = _FakeProc
+    fake_psutil.pid_exists = lambda pid: False
+    monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+    tc._kill_all_previously_spawned_pids()
+
+    assert killed.get("terminate") == [555]
+
+
 def test_kill_all_previously_spawned_pids_survives_missing_file(tmp_path, monkeypatch):
     monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
     tc._kill_all_previously_spawned_pids()  # must not raise
@@ -2424,6 +2765,76 @@ def test_serena_daemon_pool_wired_via_serena_pool_spawn_in_run_tunnel():
     source = inspect.getsource(tc.run_tunnel)
     assert "spawn=_serena_pool_spawn" in source
     assert "spawn=lambda cmd: subprocess.Popen(cmd" not in source
+
+
+def test_serena_daemon_pool_wired_with_host_local_broker_in_run_tunnel():
+    """92aaedb7: run_tunnel must opt the pool into the host-local broker
+    (broker_dir + owner_id) so sibling tunnel_client processes on this
+    machine can share a repo's Serena daemon instead of each spawning their
+    own duplicate. Guards against a future regression silently dropping the
+    wiring and reverting to fully-isolated, unshared pools."""
+    import inspect
+
+    source = inspect.getsource(tc.run_tunnel)
+    assert "broker_dir=_serena_pool.default_broker_dir()" in source
+    assert "owner_id=_client_id" in source
+
+
+def test_serena_launch_diag_wired_into_run_tunnel_shutdown():
+    """e99b09e9: the pool's shutdown() must be called with the structured
+    terminate-diagnostic callback, not bare — guards a future regression
+    silently dropping the shutdown_reason diagnostic."""
+    import inspect
+
+    source = inspect.getsource(tc.run_tunnel)
+    assert "serena_pool.shutdown(on_terminate=_print_serena_terminate_diag)" in source
+
+
+def test_serena_launch_diag_wired_into_pool_idle_reaper():
+    import inspect
+
+    source = inspect.getsource(tc._pool_idle_reaper)
+    assert "on_terminate=_print_serena_terminate_diag" in source
+
+
+def test_serena_launch_diag_wired_into_extract_pool_connection():
+    import inspect
+
+    source = inspect.getsource(tc._run_extract_pool_connection)
+    assert "on_launch=_print_serena_launch_diag" in source
+
+
+def test_print_serena_launch_diag_logs_only_new_spawn_not_reuse(capsys):
+    """A reused daemon must not spam a log line on every relayed request; only
+    a genuine new spawn is print-worthy."""
+    tc._print_serena_launch_diag({
+        "repo_path": "/repo", "port": 8700, "pid": 123, "reused": False,
+        "dashboard": "headless", "command_hash": "abc123def456",
+    })
+    out = capsys.readouterr().out
+    assert "serena_launch" in out
+    assert "event=spawn" in out
+    assert "port=8700" in out
+    assert "pid=123" in out
+    assert "dashboard=headless" in out
+    assert "abc123def456" in out
+
+    tc._print_serena_launch_diag({
+        "repo_path": "/repo", "port": 8700, "pid": 123, "reused": True,
+        "dashboard": "headless", "command_hash": "abc123def456",
+    })
+    assert capsys.readouterr().out == ""  # reuse is silent
+
+
+def test_print_serena_terminate_diag_reports_reason(capsys):
+    tc._print_serena_terminate_diag({
+        "repo_path": "/repo", "port": 8700, "pid": 123, "reason": "idle_timeout",
+    })
+    out = capsys.readouterr().out
+    assert "serena_terminate" in out
+    assert "reason=idle_timeout" in out
+    assert "port=8700" in out
+    assert "pid=123" in out
 
 
 def test_kill_stale_port_occupant_spares_live_client_process(tmp_path, monkeypatch):
@@ -3911,6 +4322,14 @@ def test_spawn_with_cache_retry_tar_error_uses_thorough_clear(monkeypatch):
         tc, "_probe_tar_entry_error",
         lambda cmd, env, label, wait_seconds=5.0: True,
     )
+    # e0f7bd72 — TAR detection short-circuits before the dependency-integrity
+    # check runs, but mock it anyway so an accidental real invocation (which
+    # would consume an extra Popen call from the counted sequence below) can
+    # never silently pass.
+    monkeypatch.setattr(
+        tc, "_probe_missing_dependency_file",
+        lambda cmd, env, label, wait_seconds=5.0: None,
+    )
     # Patch time.sleep to avoid a real 100ms pause in the test.
     monkeypatch.setattr(tc.time, "sleep", lambda n: None)
 
@@ -3983,6 +4402,12 @@ def test_spawn_with_cache_retry_fast_exit_non_tar_uses_scoped_clear(monkeypatch)
         tc, "_probe_tar_entry_error",
         lambda cmd, env, label, wait_seconds=5.0: False,  # not a TAR error
     )
+    # e0f7bd72 — also not a missing-dependency-file signature, so this must
+    # still fall all the way through to the generic scoped clear.
+    monkeypatch.setattr(
+        tc, "_probe_missing_dependency_file",
+        lambda cmd, env, label, wait_seconds=5.0: None,
+    )
     monkeypatch.setattr(tc.time, "sleep", lambda n: None)
 
     spawn_count = [0]
@@ -4002,6 +4427,283 @@ def test_spawn_with_cache_retry_fast_exit_non_tar_uses_scoped_clear(monkeypatch)
     assert spawn_count[0] == 2
     assert len(scoped_called) == 1, "scoped clear used for non-TAR fast-exit"
     assert len(thorough_called) == 0
+
+
+# ---------------------------------------------------------------------------
+# e0f7bd72 — bounded npx-cache dependency-integrity check + repair/retry.
+# ---------------------------------------------------------------------------
+
+_AJV_STDERR = (
+    "internal/modules/cjs/loader.js:888\n"
+    "  throw err;\n"
+    "  ^\n\n"
+    "Error: Cannot find module "
+    "'C:\\Users\\me\\AppData\\Local\\npm-cache\\_npx\\abc123\\node_modules\\"
+    "mcp-proxy\\node_modules\\ajv\\dist\\ajv.js'\n"
+    "Require stack:\n"
+    "- C:\\Users\\me\\AppData\\Local\\npm-cache\\_npx\\abc123\\node_modules\\"
+    "mcp-proxy\\dist\\index.js\n"
+    "    at Module._resolveFilename (node:internal/modules/cjs/loader:1234:15)\n"
+    "  code: 'MODULE_NOT_FOUND'\n"
+)
+
+
+# --- _npm_cache_dependency_detail -------------------------------------------
+
+def test_npm_cache_dependency_detail_parses_windows_path():
+    detail = tc._npm_cache_dependency_detail(_AJV_STDERR)
+    assert detail is not None
+    assert detail["package"] == "ajv"
+    assert detail["cache_path"] == "C:/Users/me/AppData/Local/npm-cache/_npx/abc123"
+    assert detail["missing_file"].endswith("ajv/dist/ajv.js".replace("/", "\\"))
+
+
+def test_npm_cache_dependency_detail_parses_posix_path_and_scoped_package():
+    stderr = (
+        "Error: Cannot find module "
+        "'/home/me/.npm/_npx/def456/node_modules/@modelcontextprotocol/"
+        "server-filesystem/dist/index.js'\n"
+        "  code: 'MODULE_NOT_FOUND'\n"
+    )
+    detail = tc._npm_cache_dependency_detail(stderr)
+    assert detail is not None
+    assert detail["package"] == "@modelcontextprotocol/server-filesystem"
+    assert detail["cache_path"] == "/home/me/.npm/_npx/def456"
+
+
+def test_npm_cache_dependency_detail_none_for_bare_specifier():
+    """A bare require('lodash')-style specifier (no node_modules path) means
+    the dependency was never declared — clearing the cache cannot fix that,
+    so it must NOT be classified as this failure class."""
+    assert tc._npm_cache_dependency_detail(
+        "Error: Cannot find module 'lodash'\n  code: 'MODULE_NOT_FOUND'\n"
+    ) is None
+
+
+def test_npm_cache_dependency_detail_none_for_clean_output():
+    assert tc._npm_cache_dependency_detail("Server started on port 3000") is None
+
+
+def test_npm_cache_dependency_detail_none_for_empty():
+    assert tc._npm_cache_dependency_detail("") is None
+    assert tc._npm_cache_dependency_detail(None) is None  # type: ignore[arg-type]
+
+
+# --- _dependency_file_confirmed_missing -------------------------------------
+
+def test_dependency_file_confirmed_missing_true_when_absent(tmp_path):
+    missing = tmp_path / "node_modules" / "ajv" / "dist" / "ajv.js"
+    assert tc._dependency_file_confirmed_missing(str(missing)) is True
+
+
+def test_dependency_file_confirmed_missing_false_when_present(tmp_path):
+    present = tmp_path / "ajv.js"
+    present.write_text("module.exports = {};")
+    assert tc._dependency_file_confirmed_missing(str(present)) is False
+
+
+def test_dependency_file_confirmed_missing_never_raises(monkeypatch):
+    def _boom(path):
+        raise OSError("access denied")
+    monkeypatch.setattr(tc.os.path, "exists", _boom)
+    assert tc._dependency_file_confirmed_missing("C:\\some\\path\\ajv.js") is False
+
+
+# --- _probe_missing_dependency_file -----------------------------------------
+
+def test_probe_missing_dependency_file_detects_and_confirms(monkeypatch, tmp_path):
+    """Detects the signature AND confirms the named file is really missing on
+    disk before returning a detail dict."""
+    missing_file = str(tmp_path / "node_modules" / "ajv" / "dist" / "ajv.js")
+    stderr = f"Error: Cannot find module '{missing_file}'\n  code: 'MODULE_NOT_FOUND'\n"
+
+    class _Proc:
+        returncode = 1
+        def communicate(self, timeout=None):
+            return b"", stderr.encode()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _Proc())
+
+    detail = tc._probe_missing_dependency_file(["npx", "-y", "mcp-proxy"], None, "fs")
+    assert detail is not None
+    assert detail["package"] == "ajv"
+    assert detail["missing_file"] == missing_file
+    assert "MODULE_NOT_FOUND" in detail["stderr"]
+
+
+def test_probe_missing_dependency_file_none_when_file_actually_present(monkeypatch, tmp_path):
+    """A stderr line matching the pattern but pointing at a file that DOES
+    exist on disk (stale/misleading log line) must not trigger a repair."""
+    present_file = tmp_path / "ajv.js"
+    present_file.write_text("module.exports = {};")
+    stderr = f"Error: Cannot find module '{present_file}'\n  code: 'MODULE_NOT_FOUND'\n"
+
+    class _Proc:
+        returncode = 1
+        def communicate(self, timeout=None):
+            return b"", stderr.encode()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _Proc())
+
+    assert tc._probe_missing_dependency_file(["npx", "-y", "mcp-proxy"], None, "fs") is None
+
+
+def test_probe_missing_dependency_file_none_on_clean_output(monkeypatch):
+    class _Proc:
+        returncode = 0
+        def communicate(self, timeout=None):
+            return b"listening on port 8808", b""
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _Proc())
+    assert tc._probe_missing_dependency_file(["npx", "-y", "mcp-proxy"], None, "fs") is None
+
+
+def test_probe_missing_dependency_file_none_for_long_running_process(monkeypatch):
+    import subprocess as _sp
+
+    class _LongRunningProc:
+        returncode = None
+        def communicate(self, timeout=None):
+            raise _sp.TimeoutExpired(cmd=["npx"], timeout=timeout)
+        def kill(self): pass
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _LongRunningProc())
+    assert tc._probe_missing_dependency_file(
+        ["npx", "-y", "mcp-proxy"], None, "fs", wait_seconds=0.01,
+    ) is None
+
+
+def test_probe_missing_dependency_file_none_on_popen_exception(monkeypatch):
+    def _boom(cmd, env=None, **kw):
+        raise OSError("cannot spawn")
+    monkeypatch.setattr(tc.subprocess, "Popen", _boom)
+    assert tc._probe_missing_dependency_file(["npx", "-y", "mcp-proxy"], None, "fs") is None
+
+
+# --- _spawn_with_cache_retry dependency-integrity repair path ---------------
+
+def test_spawn_with_cache_retry_dependency_missing_uses_thorough_clear_and_reports(
+    monkeypatch, tmp_path,
+):
+    """A fast-exit process that fails on a missing npx-cache dependency file
+    gets the THOROUGH clear (same remedy as TAR_ENTRY_ERROR), and the final
+    diagnostics report the cache path, package, and final stderr — without
+    ever marking anything ready (that stays _probe_slot_health's job)."""
+    missing_file = str(tmp_path / "node_modules" / "ajv" / "dist" / "ajv.js")
+    dep_detail = {
+        "missing_file": missing_file,
+        "cache_path": str(tmp_path),
+        "package": "ajv",
+        "stderr": f"Error: Cannot find module '{missing_file}'\n  code: 'MODULE_NOT_FOUND'\n",
+    }
+    thorough_called = []
+    scoped_called = []
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear_thorough",
+        lambda cmd, label="": thorough_called.append(cmd),
+    )
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear",
+        lambda cmd, label="": scoped_called.append(cmd) or True,
+    )
+    monkeypatch.setattr(
+        tc, "_probe_tar_entry_error",
+        lambda cmd, env, label, wait_seconds=5.0: False,
+    )
+    monkeypatch.setattr(
+        tc, "_probe_missing_dependency_file",
+        lambda cmd, env, label, wait_seconds=5.0: dict(dep_detail),
+    )
+    # ddd46cc8's diagnostics side-channel runs its OWN separate stderr probe
+    # (_probe_fast_exit_stderr) before the TAR/dependency checks below — mock
+    # it too so it doesn't consume one of the two counted Popen calls below.
+    monkeypatch.setattr(
+        tc, "_probe_fast_exit_stderr",
+        lambda cmd, env, wait_seconds=2.0: None,
+    )
+    monkeypatch.setattr(tc.time, "sleep", lambda n: None)
+
+    spawn_count = [0]
+    fake_proc_dead = _FakeProc2(exit_code=1)
+    fake_proc_alive = _FakeProc2(exit_code=None)
+
+    def _popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        if spawn_count[0] == 1:
+            return fake_proc_dead
+        return fake_proc_alive
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+
+    diagnostics = tc.SlotDiagnostics(slot="fs")
+    result = tc._spawn_with_cache_retry(
+        ["npx", "-y", "mcp-proxy", "--", "npx", "-y",
+         "@modelcontextprotocol/server-filesystem"],
+        None, "fs", diagnostics,
+    )
+
+    assert result is fake_proc_alive
+    assert spawn_count[0] == 2
+    assert len(thorough_called) == 1, "thorough clear must be used for a cache-integrity miss"
+    assert len(scoped_called) == 0
+
+    # Reports cache path, package, and final stderr onto diagnostics — but
+    # never claims the slot is ready (that is _probe_slot_health's exclusive
+    # job downstream in ensure_running).
+    assert diagnostics.state is tc.SlotState.DEPENDENCY_MISSING
+    assert diagnostics.state in tc._DETERMINISTIC_STATES
+    assert diagnostics.dependency_missing == "ajv"
+    # root_cause embeds the cache path via !r (repr), which escapes backslashes
+    # on Windows — compare the path's last (backslash-free) component instead
+    # of the raw str(tmp_path) to stay platform-agnostic.
+    assert tmp_path.name in diagnostics.root_cause
+    assert "cache path" in diagnostics.root_cause
+    assert "ajv" in diagnostics.root_cause
+    assert "MODULE_NOT_FOUND" in (diagnostics.stderr_summary or "")
+    assert diagnostics.state is not tc.SlotState.HEALTHY
+
+
+def test_spawn_with_cache_retry_dependency_missing_without_diagnostics_still_repairs(
+    monkeypatch, tmp_path,
+):
+    """diagnostics=None (legacy callers / earlier tests) must still get the
+    thorough-clear repair — the diagnostics side-channel is purely additive."""
+    missing_file = str(tmp_path / "node_modules" / "ajv" / "dist" / "ajv.js")
+    dep_detail = {
+        "missing_file": missing_file,
+        "cache_path": str(tmp_path),
+        "package": "ajv",
+        "stderr": "Error: Cannot find module ... code: 'MODULE_NOT_FOUND'",
+    }
+    thorough_called = []
+    monkeypatch.setattr(
+        tc, "_scoped_cache_clear_thorough",
+        lambda cmd, label="": thorough_called.append(cmd),
+    )
+    monkeypatch.setattr(tc, "_scoped_cache_clear", lambda cmd, label="": True)
+    monkeypatch.setattr(
+        tc, "_probe_tar_entry_error",
+        lambda cmd, env, label, wait_seconds=5.0: False,
+    )
+    monkeypatch.setattr(
+        tc, "_probe_missing_dependency_file",
+        lambda cmd, env, label, wait_seconds=5.0: dict(dep_detail),
+    )
+    monkeypatch.setattr(tc.time, "sleep", lambda n: None)
+
+    spawn_count = [0]
+    fake_proc_dead = _FakeProc2(exit_code=1)
+    fake_proc_alive = _FakeProc2(exit_code=None)
+
+    def _popen(cmd, env=None, **kw):
+        spawn_count[0] += 1
+        return fake_proc_dead if spawn_count[0] == 1 else fake_proc_alive
+
+    monkeypatch.setattr(tc.subprocess, "Popen", _popen)
+
+    result = tc._spawn_with_cache_retry(["npx", "-y", "mcp-proxy"], None, "fs")
+    assert result is fake_proc_alive
+    assert len(thorough_called) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -4203,3 +4905,329 @@ def test_staleness_alert_loop_survives_probe_exception(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "has been updated" not in captured.err
     assert state["n"] >= 3
+
+
+# ---------------------------------------------------------------------------
+# _fetch_config_generation — sprint item 02dbd8b4
+#
+# GET /tunnel/plugins purely to learn the runtime config generation record the
+# server has for this (tenant, hostname) — a best-effort, read-only diagnostic
+# fetch the client reports at startup (see run_tunnel). Must never raise and
+# must never block startup on a slow/broken/pre-feature server.
+# ---------------------------------------------------------------------------
+
+def test_fetch_config_generation_returns_the_record(monkeypatch):
+    """A 200 response with a config_generation object is returned verbatim."""
+    calls = []
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {
+                "plugins": [], "config": {},
+                "config_generation": {
+                    "generation": 3, "config_hash": "abc123", "source_timestamp": 1.0,
+                    "restart_required": True,
+                },
+            }
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw):
+            calls.append((url, kw))
+            return FakeResp()
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(tc._fetch_config_generation("https://x.test", "tok", "myhost"))
+    assert result == {
+        "generation": 3, "config_hash": "abc123", "source_timestamp": 1.0,
+        "restart_required": True,
+    }
+    # Hits GET /tunnel/plugins with the hostname scoped as a query param and an
+    # Authorization header carrying the token (mirrors _fetch_filesystem_roots).
+    url, kw = calls[0]
+    assert url == "https://x.test/tunnel/plugins"
+    assert kw["headers"]["Authorization"] == "Bearer tok"
+    assert kw["params"] == {"hostname": "myhost"}
+
+
+def test_fetch_config_generation_omits_hostname_param_when_none(monkeypatch):
+    calls = []
+
+    class FakeResp:
+        status_code = 200
+        def json(self):
+            return {"config_generation": {"generation": 1, "config_hash": "h", "restart_required": False}}
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw):
+            calls.append(kw)
+            return FakeResp()
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+
+    asyncio.run(tc._fetch_config_generation("https://x.test", "tok", None))
+    assert calls[0]["params"] is None
+
+
+def test_fetch_config_generation_none_on_non_200(monkeypatch):
+    class FakeResp:
+        status_code = 401
+        def json(self):
+            raise AssertionError("must not parse body of a non-200 response")
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, *a, **kw): return FakeResp()
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", FakeClient)
+
+    assert asyncio.run(tc._fetch_config_generation("https://x.test", "tok", None)) is None
+
+
+def test_fetch_config_generation_none_on_network_error(monkeypatch):
+    """Best-effort: a transport error must never raise out of the helper."""
+    class ErrorClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, *a, **kw): raise Exception("connection refused")
+
+    import httpx as _httpx
+    monkeypatch.setattr(_httpx, "AsyncClient", ErrorClient)
+
+    assert asyncio.run(tc._fetch_config_generation("https://x.test", "tok", None)) is None
+
+
+def test_fetch_config_generation_none_when_field_absent_or_wrong_type(monkeypatch):
+    """An older server's /tunnel/plugins response has no config_generation key —
+    must degrade to None, not KeyError/AttributeError, so a pre-02dbd8b4 server
+    never breaks tunnel startup."""
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, *a, **kw):
+            return self
+
+    class FakeRespNoField:
+        status_code = 200
+        def json(self):
+            return {"plugins": []}  # no config_generation at all
+
+    class FakeRespWrongType:
+        status_code = 200
+        def json(self):
+            return {"config_generation": "not-a-dict"}
+
+    import httpx as _httpx
+
+    class Client1(FakeClient):
+        async def get(self, *a, **kw): return FakeRespNoField()
+    monkeypatch.setattr(_httpx, "AsyncClient", Client1)
+    assert asyncio.run(tc._fetch_config_generation("https://x.test", "tok", None)) is None
+
+    class Client2(FakeClient):
+        async def get(self, *a, **kw): return FakeRespWrongType()
+    monkeypatch.setattr(_httpx, "AsyncClient", Client2)
+    assert asyncio.run(tc._fetch_config_generation("https://x.test", "tok", None)) is None
+
+
+# ---------------------------------------------------------------------------
+# 3c4ed79d — portable owned-process lifecycle integration
+# (_spawn_owned_with_cache_retry / _close_owned_process / the additive
+# extra_popen_kwargs on _spawn_with_cache_retry). See
+# meridian/process_lifecycle.py + tests/test_process_lifecycle.py for the
+# backends themselves.
+# ---------------------------------------------------------------------------
+
+
+class _OwnedFakeProc:
+    def __init__(self, pid=321):
+        self.pid = pid
+
+    def poll(self):
+        return None  # alive — _spawn_with_cache_retry's fast-exit check passes through
+
+
+def test_spawn_with_cache_retry_extra_popen_kwargs_merged(monkeypatch):
+    """3c4ed79d — the new *extra_popen_kwargs* param merges OVER _spawn_kwargs()
+    for every Popen call in the function."""
+    captured = []
+
+    def fake_popen(cmd, env=None, **kwargs):
+        captured.append(kwargs)
+        return _OwnedFakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    tc._spawn_with_cache_retry(
+        ["node"], None, "test", extra_popen_kwargs={"start_new_session": True},
+    )
+    assert captured[0].get("start_new_session") is True
+
+
+def test_spawn_with_cache_retry_omitted_extra_kwargs_unchanged(monkeypatch):
+    """3c4ed79d — omitting *extra_popen_kwargs* is byte-identical to before:
+    on POSIX, _spawn_kwargs() alone contributes nothing."""
+    captured = []
+
+    def fake_popen(cmd, env=None, **kwargs):
+        captured.append(kwargs)
+        return _OwnedFakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    tc._spawn_with_cache_retry(["node"], None, "test")
+    assert captured[0] == {}
+
+
+def test_spawn_owned_with_cache_retry_posix_gets_new_session(monkeypatch):
+    captured = []
+
+    def fake_popen(cmd, env=None, **kwargs):
+        captured.append(kwargs)
+        return _OwnedFakeProc(pid=654)
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    proc, handle = tc._spawn_owned_with_cache_retry(["node", "x.js"], None, "test")
+    assert proc.pid == 654
+    assert captured[0].get("start_new_session") is True
+    assert handle is not None
+    assert handle.pid == 654
+    assert handle.group_id == 654
+    assert handle.cmdline == ["node", "x.js"]
+
+
+class _FakeWin32JobAPIForTunnel:
+    """Minimal fake job API, mirrors test_process_lifecycle.py's fake — kept
+    local so this file has no cross-test-module import dependency."""
+
+    def __init__(self):
+        self.calls = []
+        self._next = 5000
+
+    def _h(self):
+        self._next += 1
+        return self._next
+
+    def create_job(self):
+        h = self._h()
+        self.calls.append(("create_job", h))
+        return h
+
+    def set_kill_on_close(self, job_handle):
+        self.calls.append(("set_kill_on_close", job_handle))
+        return True
+
+    def open_process(self, pid):
+        h = self._h()
+        self.calls.append(("open_process", pid, h))
+        return h
+
+    def assign_process(self, job_handle, process_handle):
+        self.calls.append(("assign_process", job_handle, process_handle))
+        return True
+
+    def terminate_job(self, job_handle, exit_code=1):
+        self.calls.append(("terminate_job", job_handle, exit_code))
+        return True
+
+    def close_handle(self, handle):
+        self.calls.append(("close_handle", handle))
+        return True
+
+
+def test_spawn_owned_with_cache_retry_windows_assigns_job(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _OwnedFakeProc(pid=999))
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+
+    from meridian import process_lifecycle as pl
+
+    fake_api = _FakeWin32JobAPIForTunnel()
+    monkeypatch.setattr(
+        tc._process_lifecycle, "get_default_backend",
+        lambda: pl.WindowsJobObjectBackend(api_loader=lambda: fake_api),
+    )
+
+    proc, handle = tc._spawn_owned_with_cache_retry(["node.exe"], None, "test")
+    assert proc.pid == 999
+    assert handle is not None
+    assert handle.job_id is not None
+    kinds = [c[0] for c in fake_api.calls]
+    assert kinds == ["create_job", "set_kill_on_close", "open_process", "assign_process"]
+
+
+def test_spawn_owned_with_cache_retry_degrades_to_none_on_adopt_failure(monkeypatch):
+    """A handle-construction failure never fails the spawn — proc is still
+    returned, handle degrades to None."""
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _OwnedFakeProc(pid=1))
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+
+    class _BoomBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _BoomBackend())
+
+    proc, handle = tc._spawn_owned_with_cache_retry(["node"], None, "test")
+    assert proc.pid == 1
+    assert handle is None
+
+
+def test_close_owned_process_none_is_noop():
+    assert tc._close_owned_process(None) is True
+
+
+def test_close_owned_process_delegates_to_backend(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    calls = []
+
+    class _FakeBackend:
+        def close(self, handle, *, grace_seconds=5.0):
+            calls.append((handle, grace_seconds))
+            return True
+
+    handle = pl.OwnedProcessHandle(run_id="r", pid=1, executable="x", cwd=None, cmdline=["x"])
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+
+    ok = tc._close_owned_process(handle, grace_seconds=2.0)
+
+    assert ok is True
+    assert calls == [(handle, 2.0)]
+
+
+def test_owned_process_backend_selects_by_platform(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    assert isinstance(tc._owned_process_backend(), pl.WindowsJobObjectBackend)
+
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    assert isinstance(tc._owned_process_backend(), pl.PosixProcessGroupBackend)

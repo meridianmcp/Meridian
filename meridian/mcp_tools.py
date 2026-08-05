@@ -83,6 +83,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "start_wave_run": 'start_wave_run(project_id="abc-123", version="v0.2.5", wave_label="wave-2", item_ids=["item-uuid-a", "item-uuid-b"], failure_modes={"item-uuid-a": "stop"})',
     "finalize_wave_run": 'finalize_wave_run(wave_run_id="run-uuid", evidence={"status": "ok", "exit_code": 0, "passed": 1780, "failed": 0}, expected_revision_hash="sha256:...")',
     "resume_wave": 'resume_wave(wave_run_id="run-uuid", goal_token="a1b2c3d4e5f6a7b8", presented_body="/goal\\n<sprint_items>...</sprint_items>")',
+    "record_handoff_correction": 'record_handoff_correction(project_id="abc-123", source_handoff_id="handoff-uuid", blocker_classification="pointer_unresolved", investigation_evidence={"finding": "the file was renamed since the handoff was rendered"}, regenerate=True)',
     "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
     "configure_wave_gate": 'configure_wave_gate(project_id="abc-123", wave_end="wave-3", actions=[{"type": "push_dev"}, {"type": "run_verification"}, {"type": "push_main"}, {"type": "deploy"}])',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
@@ -365,16 +366,34 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "if any capability comes back failed/degraded, nothing is rendered or persisted "
         "and the call returns {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, "
         "evidence_errors, message} — default (strict_evidence omitted/false) behavior is "
-        "completely unchanged.",
+        "completely unchanged. "
+        "Also returns continuation_status (ecc8b280) for full/delta modes: a "
+        "{continuation_required, terminal_ready, execution_mode, actionable_count, "
+        "actionable_pending_count, actionable_in_progress_count, actionable_item_ids, "
+        "blocked_count, blocked_item_ids, reason} object reporting whether actionable "
+        "pending/in_progress work remains on the live, version-scoped board with no "
+        "recorded blocker_kind, while execution_mode=autonomous — the machine-readable "
+        "signal that an autonomous session may NOT yet treat itself as finished. Pass "
+        "checkpoint=true when THIS call is a mid-run progress report, not a final "
+        "session-ending handoff — a checkpoint is never blocked by the gate below. Pass "
+        "strict_continuation=true to fail CLOSED instead of just reporting: if "
+        "continuation_required is true and checkpoint is not set, nothing is rendered "
+        "or persisted and the call returns {error: HANDOFF_CONTINUATION_BLOCKED, "
+        "continuation_status, message} — resolve/claim the remaining item(s), record a "
+        "genuine blocker_kind on them, or call again with checkpoint=true. Default "
+        "(strict_continuation omitted/false) behavior never blocks — continuation_status "
+        "is still always returned so a caller can act on it voluntarily.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"]},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."},
          "version": {"type": "string", "description": "(b8f89491) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this handoff to — applies to every mode (full/delta/starter/compact/goal), not just starter. Wins over the calling session's own stored sprint_version. Omit to fall back to session_id's scope, or to the whole project's cross-version backlog when neither is set."},
-         "force_include_ids": {"type": "array", "items": {"type": "string"}, "description": "(45f519a0) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming."},
+         "force_include_ids": {"type": "array", "items": {"type": "string"}, "description": "(45f519a0, validated by 3cab355a) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming. Every id is validated: it must belong to this project, match the effective version scope (when one applies), and be genuinely todo/pending — an unknown/cross-project/cross-version/not-pending id is rejected (reported in the response's force_include_rejected list, never silently dropped) rather than honoured. Accepted ids are also exempt from the code-pointer enrichment cap, so a requested item always gets prospected regardless of how large the pending board is."},
          "skip_ai_summary": {"type": "boolean", "description": "65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time."},
          "strict_evidence": {"type": "boolean", "description": "(8a883f60) Opt-in, off by default — mirrors complete_sprint_item's strict_evidence shape exactly. When true, a failed/degraded pointer-enrichment/freshness/wave-gate/graph-search capability makes this call refuse to render or persist a handoff at all, returning {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, evidence_errors, message} instead. Leave false/omitted for today's graceful-degrade behavior (handoff_evidence_status is still returned either way)."},
-         "strict_pointer_evidence": {"type": "boolean", "description": "(eb8b6894) Opt-in, off by default, separate from strict_evidence above. When true, the claimable/goal batch's UNPROSPECTED exclusion requires a pending item's durable pointer(s) to have actually RESOLVED (resolve_pointer succeeded), not merely be PRESENT as a row — a structurally-valid-but-unresolved pointer no longer silently satisfies the gate. Never raises/blocks the whole handoff (unlike strict_evidence): an affected item is simply excluded from the claimable batch, the same way today's presence-only UNPROSPECTED gate already excludes items. Every pending item's pointer_resolution_status (structural_valid/target_resolved/provenance_verified/resolution_source/strict_satisfied) is always returned regardless of this flag — it only changes which items make the claimable cut."}},
+         "strict_pointer_evidence": {"type": "boolean", "description": "(eb8b6894) Opt-in, off by default, separate from strict_evidence above. When true, the claimable/goal batch's UNPROSPECTED exclusion requires a pending item's durable pointer(s) to have actually RESOLVED (resolve_pointer succeeded), not merely be PRESENT as a row — a structurally-valid-but-unresolved pointer no longer silently satisfies the gate. Never raises/blocks the whole handoff (unlike strict_evidence): an affected item is simply excluded from the claimable batch, the same way today's presence-only UNPROSPECTED gate already excludes items. Every pending item's pointer_resolution_status (structural_valid/target_resolved/provenance_verified/resolution_source/strict_satisfied) is always returned regardless of this flag — it only changes which items make the claimable cut."},
+         "checkpoint": {"type": "boolean", "description": "(ecc8b280) Mark THIS call as a mid-run progress report rather than a final, session-ending handoff. Applies to full/delta modes only. A checkpoint=true call is never refused by strict_continuation below, regardless of how much actionable work remains — it changes nothing about what gets rendered, only whether the continuation gate can engage."},
+         "strict_continuation": {"type": "boolean", "description": "(ecc8b280) Opt-in, off by default — mirrors strict_evidence's shape. When true and checkpoint is not set, refuses to render/persist this handoff (full/delta modes only) if actionable pending/in_progress items remain on the live board with no recorded blocker_kind while execution_mode=autonomous, returning {error: HANDOFF_CONTINUATION_BLOCKED, continuation_status, message} instead. Leave false/omitted for today's behavior (continuation_status is still always returned either way)."}},
          "required": []}},
     {"name": "load_handoff", "description":
         "Read-only: Return the latest stored handoff for a project as an MCP tool "
@@ -403,7 +422,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "strips those back out and checks the remaining text against the body hash "
         "bound at mint time. A genuine token re-attached to a DIFFERENT (edited) body "
         "now returns 'body_mismatch' instead of a false 'ok'. Omitting presented_body "
-        "preserves the exact prior token-only provenance check.",
+        "preserves the exact prior token-only provenance check. "
+        "f46372e8: every non-'ok' result also carries a structured recovery object "
+        "{signal, message, next_step, next_step_hint} telling you what to do next — "
+        "next_step is 'load_handoff' (fetch the canonical stored handoff; not_found/ "
+        "wrong_project/body_mismatch) or 'cross_check_live_board' (re-derive the task "
+        "list from get_sprint_items across all non-done statuses; already_consumed/ "
+        "expired) — so you don't have to improvise a recovery path per failure reason.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string",
              "description": "The project_id the /goal block claims to be for."},
@@ -414,6 +439,46 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "presented_body": {"type": "string",
              "description": "Optional: the full pasted /goal block (token + SECURITY banner included) to check against the token's stored body_hash, if any. Closes the 2ee0000c body-integrity gap — see description."}},
          "required": ["token"]}},
+    {"name": "record_handoff_correction", "description":
+        "3af86d28 — record a corrective handoff when a blocked executor session "
+        "reaches a wall after receiving a handoff (its evidence/scope no longer "
+        "holds, a pointer stopped resolving, a required capability went away, "
+        "etc.). Links to the immutable source_handoff_id (never mutated), "
+        "classifies the blocker, and carries structured investigation evidence, "
+        "added/removed/superseded pointers, and changed resources. Records "
+        "status='draft' by default (or pass status explicitly). Pass "
+        "idempotency_key to make retries safe — a repeat call with the same "
+        "key returns the existing correction unchanged rather than duplicating "
+        "it. Pass regenerate=true to ALSO, in this same call: re-resolve every "
+        "added pointer live (repair), mark the source handoff invalidated/"
+        "non-executable (its body is left untouched, for audit), and produce a "
+        "new deterministic handoff revision (new body hash + provenance token) "
+        "via the normal generate_handoff renderer. Idempotent: a correction "
+        "that already produced a revision returns that same result again "
+        "instead of regenerating a second time. A receiving executor should "
+        "load the result via load_handoff (its 'correction' field) or a "
+        "direct get_sprint — not by reconstructing the correction from "
+        "log_task/note text. No DOCX or canonical project mutation is implied "
+        "by recording a correction.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "source_handoff_id": {"type": "string", "description": "The immutable handoffs.id row this correction is for (e.g. load_handoff's handoff.id is NOT the row id directly — use a handoff id you have from generate_handoff/get_handoffs)."},
+         "blocker_classification": {"type": "string", "enum": ["evidence_invalid", "scope_stale", "pointer_unresolved", "dependency_missing", "environment_blocked", "capability_unavailable", "other"], "description": "Controlled vocabulary for why the handoff needed correcting."},
+         "session_id": {"type": "string", "description": "The blocked executor session recording this correction."},
+         "investigation_evidence": {"description": "Free-form JSON: what you found during investigation."},
+         "added_pointers": {"type": "array", "items": {"type": "object"}, "description": "Pointer dicts (same shape as add_sprint_item_pointer's source_type/targets/label) asserting new evidence. Re-resolved live when regenerate=true."},
+         "removed_pointers": {"type": "array", "items": {}, "description": "Pointer dicts or ids being removed as evidence."},
+         "superseded_pointers": {"type": "array", "items": {}, "description": "Pointer dicts or ids whose premise was replaced."},
+         "changed_resources": {"type": "array", "items": {"type": "string"}, "description": "File/resource paths that changed since the source handoff was rendered."},
+         "requested_scope": {"description": "Free-form JSON describing the scope the ORIGINAL handoff asked for, for comparison against what actually got emitted."},
+         "version": {"type": "string", "description": "Sprint-version bucket in scope, if any — also used to scope the regenerated revision when regenerate=true."},
+         "source_token": {"type": "string", "description": "Optional: the <goal_token> value from the original /goal block, preserved for audit only (not re-verified by this call)."},
+         "idempotency_key": {"type": "string", "description": "Optional caller-supplied dedup key so a retried call returns the existing correction instead of duplicating it."},
+         "status": {"type": "string", "enum": ["draft", "verified", "superseded", "blocked"], "description": "Initial status. Default draft."},
+         "regenerate": {"type": "boolean", "description": "When true, also repairs pointers, invalidates the source handoff, and produces a new deterministic revision in this SAME call. Default false (record only)."},
+         "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"], "description": "Only used when regenerate=true — forwarded to generate_handoff."},
+         "output_dir": {"type": "string", "description": "Only used when regenerate=true; defaults to the server's data directory."}},
+         "required": ["source_handoff_id", "blocker_classification"]}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact project context block (north star, sprint, "
         "pending sprint items, recent tasks, recent decisions, active sessions) "
@@ -2514,16 +2579,39 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "slot": {"type": "string", "description": "Plugin slot or name to reset (e.g. 'docs', 'outputs', or the plugin's 'name' field from list_plugins)."},
          "hostname": {"type": "string", "description": "Optional: reset only this machine's override (tunnel_plugins_by_host) instead of the per-tenant default."}},
          "required": ["slot"]}},
+    {"name": "get_tunnel_diagnostics", "description":
+        "f1e0df55 — Read-only: ONE layered diagnostic snapshot of your tunnel/"
+        "connectors, separating what's SAVED in the dashboard from what's "
+        "ACTUALLY running so a saved-but-not-yet-applied setting is never "
+        "reported as active. Per slot (fs/code/extract/ppt/word/dc/docs/zotero/"
+        "outputs/debug): dashboard_configured (persisted), process_active (live "
+        "server-side socket), external_child_state (last client-reported "
+        "lifecycle state), last_error, and exact remediation text — plus one of "
+        "five distinct states: healthy, stale, degraded, quarantined, or "
+        "restart_required (persisted config and observed runtime disagree). "
+        "Also reports the server-side tool routing cache size, a config "
+        "generation + manifest_hash fingerprint for drift detection, and whether "
+        "a tools/list re-discovery is pending. Includes a run_id + timestamp for "
+        "correlating with support requests. Tokens/credentials are redacted. "
+        "Requires an authenticated hosted tenant (tunnel mode) — self-hosted "
+        "callers with no tenant get an empty, unauthenticated-shaped snapshot.",
+     "inputSchema": {"type": "object", "properties": {
+         "hostname": {"type": "string", "description": "Optional: report only this machine's per-host config override instead of the per-tenant default (mirrors get_tunnel_plugins's ?hostname=)."}},
+         "required": []}},
     {"name": "refresh_tool_manifest", "description":
         "Read-only: return the authoritative, compact manifest of ALL built-in "
         "Meridian MCP tools (name + one-line summary). Call this when you suspect "
         "your client's tool schema went stale ('I nuked the schema', a tool you "
         "expected is suddenly 'not found', or right after a /compact) — it is a "
         "plain tool CALL, so it works even on clients that ignore the "
-        "notifications/tools/list_changed signal (e.g. Claude Desktop). Best-effort "
-        "also re-fires list_changed for your tenant so a client that DOES honour it "
-        "re-lists. Names returned here are canonical: a name present here but absent "
-        "from your tool list is a stale-schema artifact, not a removed tool.",
+        "notifications/tools/list_changed signal (e.g. Claude Desktop). Names "
+        "returned here are canonical: a name present here but absent from your "
+        "tool list is a stale-schema artifact, not a removed tool. If you're "
+        "tunnel-connected, this also forces a synchronous re-aggregation of your "
+        "tunnel's plugin tools (filesystem/code-intel/office/etc.) — the returned "
+        "`tunnel` object carries a manifest_hash + slot_health + config_generation "
+        "snapshot so you can tell a recovered/newly-configured slot is now visible "
+        "without a reconnect.",
      "inputSchema": {"type": "object", "properties": {},
          "required": []}},
     {"name": "get_graph_diff", "description":
@@ -2599,10 +2687,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "new_title": {"type": "string", "description": "Title for the merged survivor item."}},
          "required": ["item_ids", "new_title"]}},
     {"name": "set_active_repo",
-     "description": "Update the tunnel's active Serena repo at runtime. When a planning session switches to a different codebase, call this so subsequent Serena requests (find_symbol, find_referencing_symbols, etc.) route to the new repo without restarting the tunnel. Has no effect when no tunnel is connected.",
+     "description": "Update the tunnel's active Serena repo at runtime. When a planning session switches to a different codebase, call this so subsequent Serena requests (find_symbol, find_referencing_symbols, etc.) route to the new repo without restarting the tunnel. Has no effect when no tunnel is connected. 32ba4125 — pass worktree_id instead of repo_path to activate a REGISTERED git worktree (one created via create_worktree / POST /projects/{id}/worktrees) as a validated code-intel context: the repo_path is resolved server-side from that worktree's own record, so an unregistered/arbitrary path can never be activated this way, and the response's `worktree` field carries fingerprint metadata (worktree_id, project_id, branch, path, registered_at). Passing repo_path directly is unchanged and still works for any path (main-repo/non-worktree use).",
      "inputSchema": {"type": "object", "properties": {
-         "repo_path": {"type": "string", "description": "Absolute path to the repository to activate (e.g. /home/me/project or C:\\\\Users\\\\me\\\\project)."}},
-         "required": ["repo_path"]}},
+         "repo_path": {"type": "string", "description": "Absolute path to the repository to activate (e.g. /home/me/project or C:\\\\Users\\\\me\\\\project). Ignored when worktree_id is given."},
+         "worktree_id": {"type": "string", "description": "32ba4125 — id of a REGISTERED active_worktrees row (from create_worktree) to activate as a validated code-intel context. Takes precedence over repo_path; resolves and validates the path from the worktree's own DB record instead of trusting a caller-supplied path."}},
+         "required": []}},
     {"name": "run_verification",
      "description":
         "0e973e52 — run the project's stored test_cmd on YOUR local machine via the "
@@ -2707,6 +2796,7 @@ _READ_ONLY_TOOLS = {
     "get_sprint_items", "get_sprint_progress", "get_agent_instructions",
     "reconcile_sprint_drift", "get_planning_brief", "get_file_claims",
     "list_plugins", "get_plugin_details", "refresh_tool_manifest",
+    "get_tunnel_diagnostics",
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
     "get_citation_edges",
     "find_similar_equation", "find_symbol_usages",
@@ -2766,6 +2856,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "log_task":                "session",
     "generate_handoff":        "session",
     "load_handoff":            "session",
+    "record_handoff_correction": "session",
     "verify_handoff_token":    "session",
     "checkpoint":              "session",
     "get_session_brief":       "session",
@@ -2913,6 +3004,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "list_plugins":      "plugin",
     "get_plugin_details": "plugin",
     "reset_plugin_override": "plugin",
+    "get_tunnel_diagnostics": "plugin",
     # config / infra
     "set_executor_config": "config",
     "get_capability_manifest": "config",
@@ -2967,6 +3059,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "annotate_outputs":          "executor",
     "log_task":                  "executor",
     "generate_handoff":          "executor",
+    "record_handoff_correction": "executor",
     "checkpoint":                "executor",
     "add_sprint_note":           "executor",
     "heartbeat":                 "executor",
@@ -3086,6 +3179,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "list_plugins":              "both",
     "get_plugin_details":        "both",
     "reset_plugin_override":     "both",
+    "get_tunnel_diagnostics":    "both",
     "refresh_tool_manifest":     "both",
     "ingest_document":           "both",
     "fan_out_sprint_items":      "both",  # orchestrators also use it; keep "both"
@@ -3267,6 +3361,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "list_sessions":              "maintenance-only",
     "heartbeat":                  "maintenance-only",
     "load_handoff":               "maintenance-only",
+    "record_handoff_correction":  "maintenance-only",
     "verify_handoff_token":       "maintenance-only",
     # sprint item pointer cleanup
     "delete_sprint_item_pointer": "maintenance-only",
@@ -3312,6 +3407,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "list_plugins":               "maintenance-only",
     "get_plugin_details":         "maintenance-only",
     "reset_plugin_override":      "maintenance-only",
+    "get_tunnel_diagnostics":     "maintenance-only",
     "refresh_tool_manifest":      "maintenance-only",
     # analysis / graph
     "analyze_model_efficiency":   "maintenance-only",
@@ -3369,11 +3465,13 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "start_wave_run": "Start Wave Run",
     "finalize_wave_run": "Finalize Wave Run",
     "resume_wave": "Resume Wave",
+    "record_handoff_correction": "Record Handoff Correction",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",
     "get_plugin_details": "Get Plugin Details",
     "reset_plugin_override": "Reset Plugin Override",
+    "get_tunnel_diagnostics": "Get Tunnel Diagnostics",
     "refresh_tool_manifest": "Refresh Tool Manifest",
     "set_active_repo": "Set Active Repo",
     "analyze_model_efficiency": "Analyze Model Efficiency",

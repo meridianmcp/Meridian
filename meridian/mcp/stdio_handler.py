@@ -15,6 +15,15 @@ from .. import enqueue as enqueue_module
 from .. import toml_config as toml_config_module
 
 
+def _create_stdio_initialization_options(server: Any) -> Any:
+    """Create stdio initialization options with deterministic tool invalidation."""
+    from mcp.server.lowlevel.server import NotificationOptions
+
+    return server.create_initialization_options(
+        notification_options=NotificationOptions(tools_changed=True),
+    )
+
+
 def build_mcp_server():
     """Construct the MCP server with all eight Meridian tools.
 
@@ -528,10 +537,48 @@ def build_mcp_server():
                                 "be present."
                             ),
                         },
+                        "checkpoint": {
+                            "type": "boolean",
+                            "description": (
+                                "(ecc8b280) Mark this call as a mid-run progress "
+                                "report rather than a final, session-ending "
+                                "handoff (full/delta modes only). Never blocked "
+                                "by strict_continuation below."
+                            ),
+                        },
+                        "strict_continuation": {
+                            "type": "boolean",
+                            "description": (
+                                "(ecc8b280) Opt-in fail-closed continuation check. "
+                                "When true and checkpoint is not set, refuses to "
+                                "render/persist a full/delta handoff if actionable "
+                                "pending/in_progress items remain with no "
+                                "blocker_kind while execution_mode=autonomous."
+                            ),
+                        },
                     },
                     "required": [],
                 },
             ),
+            # f46372e8 — load_handoff and verify_handoff_token were never
+            # advertised OR dispatched on the stdio transport: this file's
+            # list_tools()/call_tool() are the actual implementation behind
+            # build_mcp_server() (meridian/server.py re-exports it directly),
+            # and neither tool name appeared anywhere in either function, so a
+            # self-hosted stdio MCP client (the "Self-hosted (from source)"
+            # config in AGENTS.md) could not call either one — every call
+            # fell through call_tool()'s final `else` and returned
+            # {"error": "unknown tool: ..."}. This silently broke the entire
+            # trusted-handoff-channel and token-verification security model
+            # (AGENTS.md's "Handoff delivery & trust" section) for anyone on
+            # this transport, forcing them to skip verification entirely —
+            # exactly the failure mode implicated in the 2026-08-04 incident
+            # this sprint item traces back to. _shared_tool() pulls the exact
+            # same schema HTTP/MCP already advertises (meridian/mcp_tools.py's
+            # _MCP_TOOLS_LIST) so the three transports can never advertise
+            # divergent schemas for these tools going forward.
+            _shared_tool("load_handoff"),
+            _shared_tool("verify_handoff_token"),
             Tool(
                 name="get_context_block",
                 description=(
@@ -2282,7 +2329,18 @@ def build_mcp_server():
                 _stdio_strict_pointer_evidence = bool(
                     arguments.get("strict_pointer_evidence")
                 )
+                # 3cab355a — mirror handler.py's out-param: one entry per
+                # requested force_include_ids id that failed validation
+                # (unknown/cross-project/cross-version/not-pending). See
+                # handoff.generate_handoff's force_include_rejected docstring.
+                _stdio_force_include_rejected: list[dict[str, Any]] = []
+                # ecc8b280 — mirror handler.py's continuation gate args exactly.
+                _stdio_checkpoint = bool(arguments.get("checkpoint"))
+                _stdio_strict_continuation = bool(arguments.get("strict_continuation"))
+                _stdio_continuation_status: dict[str, Any] = {}
                 _handoff_evidence_blocked = False
+                _handoff_continuation_blocked = False
+                _handoff_stale_reference_blocked = False
                 try:
                     path, content, _ = await asyncio.wait_for(
                         handoff_module.generate_handoff(
@@ -2295,6 +2353,10 @@ def build_mcp_server():
                             force_include_ids=_stdio_force_include_ids,
                             strict_evidence=_stdio_strict_evidence,
                             strict_pointer_evidence=_stdio_strict_pointer_evidence,
+                            force_include_rejected=_stdio_force_include_rejected,
+                            checkpoint=_stdio_checkpoint,
+                            strict_continuation=_stdio_strict_continuation,
+                            continuation_status=_stdio_continuation_status,
                         ),
                         timeout=90.0,
                     )
@@ -2315,7 +2377,33 @@ def build_mcp_server():
                         "message": str(exc),
                     }
                     _handoff_evidence_blocked = True
-                if not _handoff_evidence_blocked:
+                except handoff_module.HandoffContinuationRequired as exc:
+                    # ecc8b280 — mirror handler.py's structured refusal: nothing
+                    # was rendered/persisted for this call.
+                    result = {
+                        "error": "HANDOFF_CONTINUATION_BLOCKED",
+                        "project_id": arguments["project_id"],
+                        "continuation_status": exc.continuation_state,
+                        "message": str(exc),
+                    }
+                    _handoff_continuation_blocked = True
+                except handoff_module.HandoffStaleReferenceError as exc:
+                    # ee8a6af1 — mirror handler.py's structured refusal: nothing
+                    # was rendered/persisted, so surface that instead of falling
+                    # through to the generic error string.
+                    result = {
+                        "error": "STALE_REFERENCE",
+                        "project_id": exc.project_id,
+                        "version": exc.version,
+                        "stale_references": exc.stale_references,
+                        "message": str(exc),
+                    }
+                    _handoff_stale_reference_blocked = True
+                if (
+                    not _handoff_evidence_blocked
+                    and not _handoff_continuation_blocked
+                    and not _handoff_stale_reference_blocked
+                ):
                     # a5e8aa74 — return content EXACTLY as generate_handoff rendered
                     # it, via the shared helper meridian/mcp/handler.py and
                     # meridian/routes/handoff.py also use, so all transports emit a
@@ -2326,11 +2414,26 @@ def build_mcp_server():
                         "path": path,
                         "content": handoff_module.format_handoff_mcp_content(content),
                         "mode": mode,
+                        # 3cab355a — see the comment above the generate_handoff
+                        # call; [] when force_include_ids was empty/absent or
+                        # the 90s timeout fired before validation ran.
+                        "force_include_rejected": _stdio_force_include_rejected,
+                        "continuation_status": _stdio_continuation_status,
                     }
             elif name == "get_context_block":
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.
                 result = await _dispatch_mcp_tool(
                     "get_context_block", arguments, db, state["data_dir"]
+                )
+            elif name in ("load_handoff", "verify_handoff_token"):
+                # f46372e8 — these two were advertised nowhere and dispatched
+                # nowhere on the stdio transport (see the list_tools() comment
+                # above _shared_tool("load_handoff")); route through the same
+                # _dispatch_mcp_tool -> _handle_task_tools path the HTTP MCP
+                # transport uses so all three transports share one
+                # implementation and can't drift out of sync with each other.
+                result = await _dispatch_mcp_tool(
+                    name, arguments, db, state["data_dir"]
                 )
             elif name in (
                 "pin_decision", "update_decision", "get_pinned_decisions",
@@ -2608,7 +2711,12 @@ def build_mcp_server():
                 await server.run(
                     read_stream,
                     write_stream,
-                    server.create_initialization_options(),
+                    # Advertise the standard invalidation capability. Claude
+                    # Desktop and Cursor own their local tool caches; the
+                    # server must not guess or edit vendor-specific cache
+                    # paths. They can instead refresh from the canonical
+                    # tools/list response when this notification is emitted.
+                    _create_stdio_initialization_options(server),
                 )
         finally:
             keepalive.cancel()

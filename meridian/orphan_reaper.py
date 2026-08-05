@@ -1,5 +1,15 @@
 """e401221d — Meridian-side mitigation for Claude Code's dangling-process bug.
 
+15610335 — this module also reclaims stale EXTERNAL Pixi detached
+environments left behind by dead worktrees (see ``meridian.pixi_env_retention``
+for why a registry/marker is needed at all: Pixi's ``detached-environments``
+moves each worktree's ~1GB environment OUTSIDE the git-tracked tree, into a
+directory keyed by a hash of the worktree's own path, so ``git worktree
+remove`` never touches it). ``reclaim_stale_pixi_envs`` below reuses the same
+``dead_paths`` this module already fetches for process-reaping and matches
+them against marker files written under the configured external root — no
+new server route needed, this is pure local-filesystem work.
+
 Root cause is Anthropic's own client lifecycle (a `claude -p ...
 --dangerously-skip-permissions` process, or a spawned pixi/python/node child,
 can outlive its terminal / parent session) -- not fixable from inside
@@ -31,6 +41,41 @@ silent no-op when psutil is missing or any step fails, matching the
 optional-psutil pattern already used elsewhere in this codebase (see
 ``meridian/tunnel_client.py``'s slot-claim liveness checks). This hook is
 registered ``blocking=False`` (advisory) — cleanup must never gate a Stop.
+
+f7084ed0 — deterministic, tree-safe, opt-out cleanup. Three additions on top
+of the above, mirroring patterns already proven elsewhere in this codebase
+rather than inventing new ones:
+
+1. **Ownership-validated kill.** ``list_orphan_candidates`` now also records
+   each process's ``create_time`` (when psutil provides one). Immediately
+   before signalling anything, ``reap_orphans`` re-snapshots live processes
+   and requires the pid to still resolve to the SAME process (matching name
+   and, when both sides have one, matching ``create_time`` within a 1s
+   tolerance — see ``_identity_matches``) before it will touch it. A pid that
+   has since exited, or been reassigned by the OS to an unrelated process
+   (PID reuse), is a safe no-op (``"already_gone"`` / ``"identity_mismatch"``
+   in the result's ``skipped`` list) rather than a kill. This is the exact
+   PID+create_time guard ``meridian/tunnel_client.py`` already uses for its
+   own orphan sweeps (``_kill_all_previously_spawned_pids``,
+   ``_is_slot_claimed_by_live_client``) — reused here, not reinvented.
+2. **Tree-safe kill.** The default kill primitive (``_psutil_kill_tree``)
+   terminates the WHOLE process family rooted at the matched pid, not just
+   that one pid — on Windows via ``taskkill /F /T /PID`` (mirrors
+   ``tunnel_client._terminate_proc_tree``'s Windows path exactly, since a
+   plain ``proc.terminate()`` only kills the direct child and orphans
+   node/cmd/python grandchildren); on POSIX via psutil's recursive
+   ``children(recursive=True)`` walked and terminated alongside the parent,
+   escalating to ``kill()`` for anything still alive after the grace period.
+3. **Disabled by default, dashboard-toggleable.** ``seed_orphan_reaper_hook``
+   now registers the Stop hook DISABLED (``enabled=False``) the first time it
+   runs for a project — cleanup is opt-in, never silently active. Toggling is
+   ``set_orphan_reaper_enabled`` (flips the ``custom_hooks.enabled`` flag via
+   the existing 273287cb ``update_custom_hook`` path — no schema change
+   needed) exposed over HTTP as ``GET``/``POST .../orphan_reaper(/toggle)``
+   in ``meridian/server.py`` for the dashboard. Disabling immediately deletes
+   any already-written ``.claude/hooks/orphan_reaper.*`` files
+   (``remove_orphan_reaper_artifacts``) instead of waiting for the next
+   ``generate_handoff`` to simply stop re-writing them.
 """
 from __future__ import annotations
 
@@ -38,9 +83,12 @@ import argparse
 import json
 import logging
 import os
+import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 logger = logging.getLogger(__name__)
@@ -53,14 +101,31 @@ HOOK_EVENT = "Stop"
 
 # Process name substrings we consider reap candidates, matched
 # case-insensitively against the process's base executable name (e.g.
-# "python.exe", "pixi", "node.exe", "pythonw.exe", "pixi.exe").
-_TARGET_NAME_SUBSTRINGS: tuple[str, ...] = ("pixi", "python", "node")
+# "python.exe", "pixi", "node.exe", "pythonw.exe", "pixi.exe"). f7084ed0 adds
+# cmd/uv/conhost — the original list missed cmd.exe (pixi/npm often shell out
+# through it on Windows), uv.exe/uvx.exe (covered by the "uv" substring), and
+# conhost.exe (the console host backing a detached worktree session's window)
+# — all called out as coverage gaps in this item's prospecting notes.
+_TARGET_NAME_SUBSTRINGS: tuple[str, ...] = (
+    "pixi", "python", "node", "cmd", "uv", "conhost",
+)
+
+# f7084ed0 — defense-in-depth denylist: never treat a process as a candidate
+# if its name matches one of these, even if it happens to also match a
+# substring above (e.g. a hypothetical future target substring colliding with
+# part of "msedgewebview2.exe"). Nothing in _TARGET_NAME_SUBSTRINGS matches
+# WebView2 today, but this makes that safety property explicit and future-
+# proof rather than incidental.
+_EXCLUDED_NAME_SUBSTRINGS: tuple[str, ...] = ("webview2",)
 
 
 def _proc_name_is_target(name: str) -> bool:
-    """True if *name* looks like one of pixi/python/node (case-insensitive
-    substring match — covers .exe suffixes and pythonw/python3 variants)."""
+    """True if *name* looks like one of the target process families
+    (case-insensitive substring match — covers .exe suffixes and
+    pythonw/python3/uvx variants) AND is not explicitly denylisted."""
     lname = (name or "").lower()
+    if any(sub in lname for sub in _EXCLUDED_NAME_SUBSTRINGS):
+        return False
     return any(sub in lname for sub in _TARGET_NAME_SUBSTRINGS)
 
 
@@ -105,6 +170,50 @@ def process_belongs_to_dead_worktree(
             if norm_dp in norm_raw:
                 return orig_dp
     return None
+
+
+def _identity_matches(candidate: dict[str, Any], current: dict[str, Any] | None) -> bool:
+    """Pure ownership check: is *current* (a fresh process snapshot taken
+    right before a kill, or ``None`` if that pid no longer resolves to any
+    live process) still the SAME process *candidate* was matched as a moment
+    earlier by ``list_orphan_candidates``?
+
+    Guards against two distinct races between "we found this pid" and "we're
+    about to signal this pid": the process simply exited on its own in the
+    meantime (``current is None`` -> False, reason the caller should record
+    as ``"already_gone"``), or — the more dangerous case — the OS reassigned
+    that same pid to a completely unrelated process in the interim (PID
+    reuse; ``current is not None`` but its name/create_time disagree with
+    what was originally observed -> False, ``"identity_mismatch"``). Mirrors
+    the PID+create_time guard ``meridian/tunnel_client.py`` already applies
+    before killing anything (``_kill_all_previously_spawned_pids``).
+
+    Pure and side-effect-free — both snapshots are plain dicts, no OS calls —
+    so this is trivially unit-testable independent of psutil / real process
+    listing, same as ``process_belongs_to_dead_worktree`` above.
+
+    Missing/``None`` fields degrade to "nothing to contradict" rather than
+    "reject": a candidate/snapshot pair that never carried ``create_time``
+    (e.g. a psutil-less environment, or a caller that only tracks name/cwd)
+    still matches on name alone, same as this reaper's pre-f7084ed0
+    behavior — this check only ADDS a rejection path, it never narrows the
+    cases that were previously allowed to proceed.
+    """
+    if current is None:
+        return False
+    cand_name = (candidate.get("name") or "").strip().lower()
+    cur_name = (current.get("name") or "").strip().lower()
+    if cand_name and cur_name and cand_name != cur_name:
+        return False
+    cand_ct = candidate.get("create_time")
+    cur_ct = current.get("create_time")
+    if cand_ct is not None and cur_ct is not None:
+        try:
+            if abs(float(cur_ct) - float(cand_ct)) >= 1.0:
+                return False
+        except (TypeError, ValueError):
+            pass  # unparsable create_time on either side — nothing to contradict
+    return True
 
 
 def list_orphan_candidates(
@@ -158,7 +267,7 @@ def _psutil_process_iter() -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001 — psutil not installed
         return []
     out: list[dict[str, Any]] = []
-    for p in psutil.process_iter(["pid", "name", "cwd", "cmdline"]):
+    for p in psutil.process_iter(["pid", "name", "cwd", "cmdline", "create_time"]):
         try:
             info = p.info
             cmdline = " ".join(info.get("cmdline") or [])
@@ -168,6 +277,7 @@ def _psutil_process_iter() -> list[dict[str, Any]]:
                     "name": info.get("name") or "",
                     "cwd": info.get("cwd") or "",
                     "cmdline": cmdline,
+                    "create_time": info.get("create_time"),
                 }
             )
         except Exception:  # noqa: BLE001 — a single vanished/permission-denied process must not sink the scan
@@ -175,25 +285,83 @@ def _psutil_process_iter() -> list[dict[str, Any]]:
     return out
 
 
-def _psutil_kill(pid: int) -> bool:
-    """Best-effort real kill: terminate(), escalate to kill() if still alive
-    after a short grace wait. Returns True iff the process is confirmed gone
-    afterward (or was already gone). Never raises."""
+def _psutil_collect_tree(pid: int) -> list[int]:
+    """Real (psutil-backed) descendant enumeration: given a root pid, return
+    that pid plus every currently-live descendant's pid (recursive), so a
+    tree-safe kill can terminate the whole family a matched process spawned
+    (pixi -> python -> ...), not just the single matched pid — addresses the
+    "doesn't recurse child groups" gap noted in this item's prospecting.
+    Best-effort: a lookup failure (process already gone, permission denied)
+    degrades to just ``[pid]`` rather than raising."""
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(pid)
+        children = [c.pid for c in proc.children(recursive=True)]
+        return [pid, *children]
+    except Exception:  # noqa: BLE001
+        return [pid]
+
+
+def _psutil_kill_tree(pid: int) -> bool:
+    """Best-effort real kill: tree-safe and cross-platform.
+
+    Windows: ``taskkill /F /T /PID`` — kills the whole process tree by PID in
+    one OS call. Mirrors ``meridian.tunnel_client._terminate_proc_tree``'s
+    Windows path exactly (a plain ``proc.terminate()`` only kills the direct
+    child, orphaning node/cmd/python grandchildren — the same failure mode
+    this item's prospecting notes flagged).
+
+    POSIX: recursively collects live descendants (:func:`_psutil_collect_tree`),
+    terminates the whole family together, waits, then escalates to ``kill()``
+    for any stragglers — graceful-then-forced signaling.
+
+    Returns True iff the process is confirmed gone afterward (or was already
+    gone). Never raises — ownership/identity validation happens one layer up
+    in ``reap_orphans``, not here; this is purely "given a pid we've already
+    decided is safe to touch, make it and its children go away."
+    """
     try:
         import psutil  # type: ignore
     except Exception:  # noqa: BLE001 — psutil not installed
         return False
-    try:
-        proc = psutil.Process(pid)
-    except Exception:  # noqa: BLE001 — psutil.NoSuchProcess or similar — already gone
-        return True
-    try:
-        proc.terminate()
+
+    if sys.platform == "win32":
         try:
-            proc.wait(timeout=3)
-        except Exception:  # noqa: BLE001 — still alive after grace period; escalate
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, check=False, timeout=10,
+            )
+        except Exception:  # noqa: BLE001 — fall through to the pid_exists check below
+            pass
+        try:
+            return not psutil.pid_exists(pid)
+        except Exception:  # noqa: BLE001
+            return False
+
+    tree_pids = _psutil_collect_tree(pid)
+    procs = []
+    for p in tree_pids:
+        try:
+            procs.append(psutil.Process(p))
+        except Exception:  # noqa: BLE001 — already gone by the time we look it up
+            continue
+    for proc in procs:
+        try:
+            proc.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        _gone, alive = psutil.wait_procs(procs, timeout=3)
+    except Exception:  # noqa: BLE001
+        alive = procs
+    for proc in alive:
+        try:
             proc.kill()
-            proc.wait(timeout=3)
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        psutil.wait_procs(alive, timeout=3)
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -208,21 +376,50 @@ def reap_orphans(
     kill_fn: Callable[[int], bool] | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Find and (unless *dry_run*) kill orphaned pixi/python/node processes
-    rooted under one of *dead_paths*. Never raises.
+    """Find and (unless *dry_run*) kill orphaned target-family processes
+    (see ``_TARGET_NAME_SUBSTRINGS``) rooted under one of *dead_paths*. Never
+    raises. Returns a machine-readable, JSON-safe result dict — the same
+    shape whether run for real or in ``dry_run`` mode — suitable for a
+    dashboard preview or a CLI ``--dry-run`` print.
+
+    f7084ed0 — ownership-validated: immediately before signalling anything
+    (never during a dry run, which signals nothing), re-snapshots live
+    processes via *process_iter* (or the real psutil enumeration when not
+    injected) and requires each candidate's pid to still resolve to the SAME
+    process it was originally matched as (see ``_identity_matches``) — a pid
+    that has exited, or been reused by an unrelated process, in the window
+    between the initial scan and the kill is recorded in ``skipped`` with
+    reason ``"already_gone"`` / ``"identity_mismatch"`` and never signalled.
+    A revalidation-snapshot failure degrades to "treat every candidate as
+    unconfirmed" (fail closed — never falls back to killing blindly).
 
     *kill_fn* is the test injection point for killing (given a pid, return
-    True if the process was successfully terminated); defaults to a real
-    ``psutil``-backed terminate/kill escalation.
+    True if the process was successfully terminated); defaults to
+    :func:`_psutil_kill_tree` — a real, tree-safe (whole process family, not
+    just the matched pid), ``psutil``-backed terminate/kill escalation.
     """
     candidates = list_orphan_candidates(dead_paths, process_iter=process_iter)
     if kill_fn is None:
-        kill_fn = _psutil_kill
+        kill_fn = _psutil_kill_tree
     killed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+
+    fresh_by_pid: dict[Any, dict[str, Any]] = {}
+    if candidates and not dry_run:
+        revalidate_iter = process_iter or _psutil_process_iter
+        try:
+            fresh_by_pid = {p.get("pid"): p for p in revalidate_iter()}
+        except Exception:  # noqa: BLE001 — can't revalidate; every candidate below
+            fresh_by_pid = {}  # will correctly fail closed as "already_gone"
+
     for c in candidates:
         if dry_run:
             skipped.append({**c, "reason": "dry_run"})
+            continue
+        current = fresh_by_pid.get(c.get("pid"))
+        if not _identity_matches(c, current):
+            reason = "already_gone" if current is None else "identity_mismatch"
+            skipped.append({**c, "reason": reason})
             continue
         try:
             ok = bool(kill_fn(int(c["pid"])))
@@ -238,6 +435,54 @@ def reap_orphans(
         "skipped": skipped,
         "killed_count": len(killed),
         "skipped_count": len(skipped),
+    }
+
+
+def reclaim_stale_pixi_envs(
+    dead_paths: list[str],
+    pixi_env_root: str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Find and (unless *dry_run*) remove external Pixi detached-environment
+    directories whose marker file matches one of *dead_paths* — the
+    external-environment counterpart to :func:`reap_orphans`. Never raises.
+
+    *pixi_env_root* defaults to
+    ``meridian.pixi_env_retention.default_detached_environments_root()``
+    when omitted (``~/.pixi/workspace-envs``); pass it explicitly (or set
+    ``MERIDIAN_PIXI_ENV_ROOT``, wired in :func:`main`) when this machine's
+    global Pixi config points somewhere else.
+    """
+    from . import pixi_env_retention  # noqa: PLC0415 — avoid import cost when unused
+
+    root = Path(pixi_env_root) if pixi_env_root else pixi_env_retention.default_detached_environments_root()
+    try:
+        candidates = pixi_env_retention.find_external_envs_for_dead_worktrees(root, dead_paths)
+    except Exception:  # noqa: BLE001 — discovery failure must never crash the hook
+        logger.warning("orphan_reaper: pixi env discovery failed", exc_info=True)
+        return {"candidates_count": 0, "reclaimed_count": 0, "skipped_count": 0, "reclaimed": [], "skipped": []}
+
+    reclaimed: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for c in candidates:
+        if dry_run:
+            skipped.append({**c, "reason": "dry_run"})
+            continue
+        try:
+            outcome = pixi_env_retention.reclaim_external_env(c["path"], root, confirm=True)
+        except Exception:  # noqa: BLE001 — one bad reclaim must not sink the batch
+            skipped.append({**c, "reason": "reclaim_raised"})
+            continue
+        if outcome.get("removed"):
+            reclaimed.append(c)
+        else:
+            skipped.append({**c, "reason": outcome.get("detail", "reclaim_failed")})
+    return {
+        "candidates_count": len(candidates),
+        "reclaimed_count": len(reclaimed),
+        "skipped_count": len(skipped),
+        "reclaimed": reclaimed,
+        "skipped": skipped,
     }
 
 
@@ -261,14 +506,95 @@ def fetch_dead_worktree_paths(
     return [str(row["path"]) for row in data if isinstance(row, dict) and row.get("path")]
 
 
+# ---------------------------------------------------------------------------
+# 2ae3f011 -- temp-output quarantine discovery for dead worktrees.
+#
+# Dead worktrees (the same `dead_paths` this module already fetches to reap
+# orphaned processes above) can also contain genuinely valuable TEMPORARY
+# OUTPUT files -- data/figures a script dropped during the run -- that a
+# naive `worktree_cleanup.remove_worktree_on_disk` would otherwise wipe
+# along with the rest of the scaffolding. This is the DISCOVERY half of
+# that story: a pure, best-effort filesystem walk for files whose NAME
+# matches a temp/archival-output naming convention. It deliberately mirrors
+# (does NOT import -- extensions/meridian-outputs is not on this pixi env's
+# dependency graph, see pixi.toml's 52cbe5d8 comment) the broader stage-1b
+# suffix conventions in
+# `extensions/meridian-outputs/meridian_outputs/classify.py`.
+#
+# Matching a name pattern here is only a PREFILTER, never a verdict: turning
+# a candidate into an actual quarantine action still requires a real
+# ownership/provenance check (see `worktree_cleanup.build_quarantine_manifest`'s
+# injected `ownership_check` -- a real caller supplies
+# `provenance.classify_temp_output_ownership` from the meridian-outputs
+# extension). `main()`'s own `--quarantine-outputs` flag below only ever
+# prints a DRY-RUN manifest -- it never moves or deletes a file itself.
+# ---------------------------------------------------------------------------
+
+_TEMP_OUTPUT_SUFFIX_RE = re.compile(
+    r"[_-](?:backup|bak|deprecated|mislabeled|wip|copy|stale|archived?|old(?:_\d+)?)"
+    r"(?:[_.]\S*)?$|\.(?:bak|orig|backup)(?:[_.].*)?$|~$",
+    re.IGNORECASE,
+)
+
+
+def find_temp_output_candidates(dead_paths: list[str]) -> list[str]:
+    """Best-effort filesystem walk of *dead_paths* for files whose name
+    matches a temp/archival-output naming convention. Returns absolute-ish
+    file paths as strings (whatever ``os.walk`` yields joined with the
+    filename) -- pure discovery, no filesystem mutation. Never raises: an
+    unreadable/missing directory just contributes nothing, matching every
+    other best-effort scan in this module."""
+    out: list[str] = []
+    for root in dead_paths or []:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in filenames:
+                    stem = os.path.splitext(name)[0]
+                    if _TEMP_OUTPUT_SUFFIX_RE.search(name) or _TEMP_OUTPUT_SUFFIX_RE.search(stem):
+                        out.append(os.path.join(dirpath, name))
+        except OSError:  # noqa: BLE001 -- best-effort scan, one bad dir must not sink it
+            continue
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for ``python -m meridian.orphan_reaper``, invoked from the
     thin sh/ps1 hook wrappers registered by ``seed_orphan_reaper_hook``.
-    Always exits 0 — advisory-only cleanup, must never block Claude Code."""
+    Always exits 0 — advisory-only cleanup, must never block Claude Code.
+
+    ``--dry-run`` prints the full machine-readable ``reap_orphans`` result as
+    JSON to stdout (candidates found, none signalled) — so a human or the
+    dashboard can preview exactly what a real run would touch, including any
+    identity-mismatch/already-gone safe no-ops, before opting in for real.
+    """
     parser = argparse.ArgumentParser(description="Reap orphaned pixi/python/node processes from dead Meridian worktree sessions.")
     parser.add_argument("--project-id", required=True)
     parser.add_argument("--url", default=os.environ.get("MERIDIAN_URL") or "http://localhost:7878")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--quarantine-outputs",
+        action="store_true",
+        help=(
+            "Also print a DRY-RUN temp-output quarantine manifest for dead "
+            "worktrees. Advisory only -- this CLI entry point never moves or "
+            "deletes a file itself (no ownership_check is wired here; see "
+            "meridian.worktree_cleanup.build_quarantine_manifest)."
+        ),
+    )
+    parser.add_argument(
+        "--archive-root",
+        default=None,
+        help="Archive root used only for the --quarantine-outputs dry-run manifest.",
+    )
+    parser.add_argument(
+        "--pixi-env-root",
+        default=os.environ.get("MERIDIAN_PIXI_ENV_ROOT"),
+        help="15610335 — external Pixi detached-environments root to sweep for "
+             "stale entries (default: ~/.pixi/workspace-envs via "
+             "meridian.pixi_env_retention.default_detached_environments_root).",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -276,15 +602,50 @@ def main(argv: list[str] | None = None) -> int:
         if not dead_paths:
             return 0
         result = reap_orphans(dead_paths, dry_run=args.dry_run)
-        if result["killed_count"]:
+        if args.dry_run:
+            print(json.dumps(result, default=str))
+        elif result["killed_count"]:
             print(
                 f"Meridian orphan_reaper: reaped {result['killed_count']} dangling "
                 f"process(es) from {len(dead_paths)} dead worktree(s).",
                 file=sys.stderr,
             )
+        if args.quarantine_outputs:
+            _print_quarantine_dry_run(dead_paths, args.archive_root)
+        env_result = reclaim_stale_pixi_envs(
+            dead_paths, pixi_env_root=args.pixi_env_root, dry_run=args.dry_run,
+        )
+        if env_result["reclaimed_count"]:
+            print(
+                f"Meridian orphan_reaper: reclaimed {env_result['reclaimed_count']} "
+                f"stale external Pixi environment(s).",
+                file=sys.stderr,
+            )
     except Exception:  # noqa: BLE001 — advisory cleanup must never fail the Stop hook
         logger.warning("orphan_reaper: unexpected failure", exc_info=True)
     return 0
+
+
+def _print_quarantine_dry_run(dead_paths: list[str], archive_root: str | None) -> None:
+    """Best-effort dry-run manifest print for ``--quarantine-outputs``. Never
+    raises (caught by ``main``'s own broad except regardless, but this stays
+    consistent with every other best-effort step in this module) and never
+    moves/deletes anything -- see the module docstring above ``main``."""
+    from . import worktree_cleanup  # noqa: PLC0415 — avoid import cost when unused
+
+    candidates = find_temp_output_candidates(dead_paths)
+    if not candidates:
+        return
+    root = archive_root or os.path.join(os.getcwd(), ".meridian_quarantine")
+    manifest = worktree_cleanup.build_quarantine_manifest(candidates, archive_root=root)
+    print(
+        f"Meridian orphan_reaper: temp-output quarantine dry-run found "
+        f"{manifest['eligible_count']} eligible file(s) of {manifest['total']} "
+        f"candidate(s) under dead worktree(s) (archive_root={root}). No files "
+        "were moved or deleted -- ownership confirmation must come from the "
+        "meridian-outputs extension.",
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +699,17 @@ async def seed_orphan_reaper_hook(db: Any, project_id: str, url: str | None = No
     with slug ``orphan_reaper`` already exists for this project, its script
     bodies are refreshed in place (so a template update ships to existing
     projects) rather than erroring on the duplicate-slug guard in
-    ``add_custom_hook``. Returns the resulting ``custom_hooks`` row.
+    ``add_custom_hook``. Refreshing NEVER touches ``enabled`` — whatever a
+    human (or ``set_orphan_reaper_enabled``) last set persists across every
+    future ``generate_handoff`` call. Returns the resulting ``custom_hooks``
+    row.
+
+    f7084ed0 — a brand-new row is created ``enabled=False``: cleanup is
+    opt-in, disabled by default, until a human flips it on via the dashboard
+    toggle (``set_orphan_reaper_enabled`` / ``GET``/``POST
+    /projects/{id}/orphan_reaper`` in ``meridian/server.py``). Before this,
+    every project got this Stop hook silently active the moment it first ran
+    ``generate_handoff`` — no opt-out existed.
     """
     from . import db as db_module  # noqa: PLC0415 — avoid import cycle at module load
 
@@ -360,8 +731,76 @@ async def seed_orphan_reaper_hook(db: Any, project_id: str, url: str | None = No
         script_sh=script_sh,
         script_ps1=script_ps1,
         blocking=False,
-        enabled=True,
+        enabled=False,
     )
+
+
+# f7084ed0 — filenames _write_custom_hooks (meridian/handoff.py's
+# _render_custom_hook_files) writes for this hook: a non-blocking hook with
+# both script_sh and script_ps1 renders 3 files (the .ps1 body is wrapped, so
+# there's both the wrapper and the "_body.ps1" it shells out to). Kept as a
+# single source of truth so seeding and artifact-removal never drift apart.
+ORPHAN_REAPER_HOOK_FILENAMES: tuple[str, ...] = (
+    f"{HOOK_NAME}.sh", f"{HOOK_NAME}.ps1", f"{HOOK_NAME}_body.ps1",
+)
+
+
+async def set_orphan_reaper_enabled(
+    db: Any, project_id: str, enabled: bool, url: str | None = None
+) -> dict[str, Any]:
+    """The ONLY path that flips the orphan-reaper Stop hook's ``enabled``
+    flag — backs the dashboard toggle (``meridian/server.py``'s
+    ``GET``/``POST /projects/{project_id}/orphan_reaper(/toggle)`` routes).
+
+    Ensures the hook row exists first (via ``seed_orphan_reaper_hook`` —
+    idempotent, created disabled by default on a brand-new project, or
+    refreshed with its CURRENT enabled state preserved for an existing one),
+    then explicitly sets ``enabled`` only if it differs from the current
+    value — an update that never touches ``script_sh``/``script_ps1``.
+    Returns the resulting ``custom_hooks`` row.
+
+    Callers that want the "disabling removes generated hook artifacts
+    immediately" behavior should follow a ``enabled=False`` call with
+    :func:`remove_orphan_reaper_artifacts` against the project's own
+    ``.claude/hooks`` dir (this function has no filesystem access of its
+    own — it only touches the DB row, mirroring every other function in this
+    module's DB-layer/filesystem-layer split).
+    """
+    from . import db as db_module  # noqa: PLC0415 — avoid import cycle at module load
+
+    hook = await seed_orphan_reaper_hook(db, project_id, url=url)
+    if bool(hook.get("enabled")) == bool(enabled):
+        return hook
+    updated = await db_module.update_custom_hook(
+        db, project_id, hook["id"], enabled=bool(enabled),
+    )
+    return updated if updated is not None else hook
+
+
+def remove_orphan_reaper_artifacts(hooks_dir: "Path | str") -> list[str]:
+    """Delete any already-written orphan-reaper hook files from *hooks_dir*
+    (a repo's ``.claude/hooks`` directory) immediately, rather than waiting
+    for the next ``generate_handoff`` to simply stop re-writing them (the
+    existing behavior for every other custom hook — see
+    ``db.hooks.delete_custom_hook``'s docstring). Returns the filenames
+    actually removed (empty list if none were present). Best-effort and pure
+    filesystem cleanup: never raises, never touches the DB, never touches
+    anything outside *hooks_dir* itself.
+    """
+    removed: list[str] = []
+    try:
+        base = Path(hooks_dir)
+    except Exception:  # noqa: BLE001 — malformed path input
+        return removed
+    for filename in ORPHAN_REAPER_HOOK_FILENAMES:
+        try:
+            path = base / filename
+            if path.exists():
+                path.unlink()
+                removed.append(filename)
+        except Exception:  # noqa: BLE001 — one bad file must not abort the rest
+            continue
+    return removed
 
 
 if __name__ == "__main__":

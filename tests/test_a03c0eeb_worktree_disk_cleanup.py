@@ -69,6 +69,73 @@ def test_resolve_worktree_disk_path_relative_and_absolute(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# 1a. looks_like_worktree_path / remove_worktree_on_disk refusal --
+# 2026-08-04 incident regression: an ``active_worktrees`` row registered
+# with path="meridian" (a plain source-directory name, not a real worktree
+# path) must never reach shutil.rmtree just because it exists on disk and
+# `git worktree remove` fails on it. This is the exact shape of the bug: a
+# path that is a REAL, EXISTING subdirectory of repo_root that happens not
+# to be a worktree at all -- distinct from test_remove_worktree_on_disk_
+# falls_back_to_rmtree's ".claude/worktrees/fake" case, which IS a worktree
+# location by convention even though git never registered it.
+# ---------------------------------------------------------------------------
+
+
+def test_looks_like_worktree_path_accepts_the_documented_conventions(tmp_path: Path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    assert worktree_cleanup.looks_like_worktree_path(
+        repo_root, repo_root / ".claude" / "worktrees" / "abcd1234"
+    ) is True
+    sibling = tmp_path / "repo-worktree-abcd1234"
+    assert worktree_cleanup.looks_like_worktree_path(repo_root, sibling) is True
+
+
+def test_looks_like_worktree_path_rejects_repo_root_itself(tmp_path: Path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    assert worktree_cleanup.looks_like_worktree_path(repo_root, repo_root.resolve()) is False
+
+
+def test_looks_like_worktree_path_rejects_a_real_source_subdirectory(tmp_path: Path):
+    """The exact 2026-08-04 shape: a plain child directory name (e.g. a
+    package source tree) is neither under .claude/worktrees/ nor a sibling
+    matching the {repo}-worktree-... pattern."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    source_dir = repo_root / "meridian"
+    source_dir.mkdir()
+    assert worktree_cleanup.looks_like_worktree_path(repo_root, source_dir) is False
+
+
+def test_looks_like_worktree_path_rejects_unrelated_sibling(tmp_path: Path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    unrelated = tmp_path / "some-other-project"
+    assert worktree_cleanup.looks_like_worktree_path(repo_root, unrelated) is False
+
+
+def test_remove_worktree_on_disk_refuses_a_real_source_subdirectory(tmp_path: Path):
+    """End-to-end regression for the 2026-08-04 incident: remove_worktree_on_
+    disk must refuse to touch a path shaped like real repo source, even
+    though it exists on disk and `git worktree remove` will fail on it (the
+    exact condition that previously fell through to a blind rmtree)."""
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    source_dir = repo_root / "meridian"
+    source_dir.mkdir()
+    (source_dir / "server.py").write_text("# real source file")
+
+    result = worktree_cleanup.remove_worktree_on_disk(repo_root, "meridian")
+
+    assert result["attempted"] is False
+    assert result["removed"] is False
+    assert result["detail"] == "NOT_A_WORKTREE_PATH"
+    assert source_dir.exists()
+    assert (source_dir / "server.py").exists()
+
+
+# ---------------------------------------------------------------------------
 # 2. list_worktrees_pending_cleanup — DB level
 # ---------------------------------------------------------------------------
 

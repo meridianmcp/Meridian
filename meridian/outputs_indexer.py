@@ -715,6 +715,20 @@ class OutputsFtsIndex:
         self._manifest: dict[str, tuple[float | None, int | None]] = {}
         self._row_cache: dict[str, OutputRow] = {}
         self.last_rebuild_partial = False
+        # 5b897ad3 — convergence-authoritative signals, mirroring the
+        # extensions/meridian-outputs package's OutputsFtsIndex contract
+        # (1a799e52/81a0b23d there): a large/cold tree can legitimately need
+        # several rebuild() calls to finish, and this module previously gave
+        # a caller no way to tell "still catching up" apart from "genuinely
+        # nothing found" beyond the bare `last_rebuild_partial` boolean, and
+        # SILENTLY swallowed DB-write failures (a real Phase 2 persistence
+        # failure looked identical to a healthy index). last_pending_count is
+        # the number of stale files still awaiting analysis+write as of the
+        # MOST RECENT rebuild() call (0 once a call fully catches up);
+        # last_db_write_error is the most recent DB-write exception's message
+        # (None when the last call's write, if any, succeeded).
+        self.last_pending_count = 0
+        self.last_db_write_error: str | None = None
 
     # -- connection / schema --------------------------------------------------
 
@@ -891,9 +905,21 @@ class OutputsFtsIndex:
         a huge/cold tree bails out early with a partial result
         (:attr:`last_rebuild_partial` set) instead of hanging; already-cached
         rows are unaffected, and files not yet reached stay "stale" for the
-        next call. ``None`` disables the budget.
+        next call. ``None`` disables the budget. :attr:`last_pending_count`
+        (5b897ad3) is set to how many stale files are STILL awaiting
+        analysis+write as of this call — 0 once a call fully catches up, even
+        if an earlier call left ``last_rebuild_partial`` set from a prior
+        incomplete pass.
+
+        A DB-write failure (the ``changed`` branch below) no longer just logs
+        at DEBUG and disappears (5b897ad3) — it is captured in
+        :attr:`last_db_write_error` (reset to ``None`` at the top of every
+        call, so it reflects only the MOST RECENT call), mirroring the
+        extensions/meridian-outputs package's ``1a799e52`` fix: a real
+        persistence failure must never look identical to a healthy index.
         """
         with self._lock:
+            self.last_db_write_error = None
             deadline = None if max_seconds is None else time.monotonic() + max_seconds
             # 9e02e448 — MERIDIAN_NOTES.md auto-ingest: a GUARANTEED step on
             # every rebuild so human-authored annotations are never silently
@@ -922,8 +948,18 @@ class OutputsFtsIndex:
                             ],
                         )
                     self._rebuild_fts(con)
-                except Exception:  # noqa: BLE001 — never crash the watcher/run
+                except Exception as exc:  # noqa: BLE001 — never crash the watcher/run
                     _log.debug("OutputsFtsIndex.rebuild failed", exc_info=True)
+                    # 5b897ad3 — surface the failure instead of only logging
+                    # at DEBUG: `rows`/`len(rows)` below are derived from the
+                    # in-memory row_cache (already updated by
+                    # _compute_rows_incremental BEFORE this write was
+                    # attempted), so total_indexed/total_in_index would keep
+                    # reporting growing "success" while nothing was actually
+                    # persisted — exactly the deceptive state this attribute
+                    # (and search_outputs()'s db_write_error field) exists to
+                    # make visible.
+                    self.last_db_write_error = str(exc)
             return len(rows)
 
     def _compute_rows_incremental(
@@ -938,6 +974,10 @@ class OutputsFtsIndex:
         flipped because a SIBLING file changed — see below).
         """
         self.last_rebuild_partial = False
+        # 5b897ad3 — reset per-call; recomputed below from `stale` so a call
+        # that fully catches up (or finds nothing stale) always reports 0,
+        # never a stale count left over from an EARLIER partial call.
+        self.last_pending_count = 0
         paths = _iter_output_files(self.outputs_dir)
         path_set = set(paths)
         changed = False
@@ -964,6 +1004,7 @@ class OutputsFtsIndex:
             # and a sibling's add/remove/edit can flip another file's archival
             # verdict even when that file's own content is untouched.
             classifications = classify_canonical_archival(paths, hasher=self._hasher)
+            processed = 0
             for p in stale:
                 if deadline is not None and time.monotonic() > deadline:
                     self.last_rebuild_partial = True
@@ -992,6 +1033,10 @@ class OutputsFtsIndex:
                 self._row_cache[p] = row
                 self._manifest[p] = (mtime, size)
                 changed = True
+                processed += 1
+            # 5b897ad3 — how many of `stale` this call did NOT get to (0 when
+            # the loop above ran to completion without hitting the deadline).
+            self.last_pending_count = len(stale) - processed
             # Files that didn't need re-fingerprinting may still need their
             # is_archival/canonical_path refreshed (cheap metadata-only patch,
             # no re-hash/re-read) if a sibling's change flipped their verdict.
@@ -1299,6 +1344,20 @@ def search_outputs(
     and its canonical twin. ``result["partial"]`` is set when ``max_seconds``
     was exceeded mid-rebuild — the returned hits reflect whatever was indexed
     so far, not necessarily every file on disk right now.
+
+    *** A ZERO-HIT RESULT IS NOT PROOF THE FILE/TERM DOESN'T EXIST *** (5b897ad3),
+    exactly as for ``extensions/meridian-outputs``'s own ``search_outputs`` — on
+    a large/cold tree, a single call may not finish rebuilding within
+    ``max_seconds``. When ``hits`` is empty AND the index is not known-complete
+    (``partial`` and/or ``db_write_error`` set), this also sets
+    ``zero_hits_warning`` — a single, hard-to-miss field explaining that this
+    specific zero-hit result must not be read as "not found"; re-invoke with
+    the same ``outputs_dir``/``query`` to let indexing continue (``pending_count``
+    reports how many files are still queued) rather than concluding the term
+    doesn't exist. ``result["db_write_error"]`` (5b897ad3) surfaces a DB-write
+    failure that would otherwise be silently swallowed — a real persistence
+    failure that never made it into the index must not look identical to a
+    healthy, converged one.
     """
     result: dict[str, Any] = {
         "outputs_dir": outputs_dir,
@@ -1323,6 +1382,40 @@ def search_outputs(
     result["hits"] = hits
     if index.last_rebuild_partial:
         result["partial"] = True
+    if index.last_pending_count:
+        # 5b897ad3 — only meaningful alongside partial=True (mirrors
+        # extensions/meridian-outputs's pending_stale_count precedent): a
+        # fully-converged rebuild always leaves this at 0, so it's omitted
+        # there to keep the existing full-coverage response shape unchanged.
+        result["pending_count"] = index.last_pending_count
+    if index.last_db_write_error:
+        # 5b897ad3 — a real Phase-2 persistence failure this call. Rows may
+        # still be visible in total_indexed (in-memory row_cache, populated
+        # BEFORE the write is attempted), but they were NOT confirmed written
+        # to disk.
+        result["db_write_error"] = index.last_db_write_error
+    if not hits and (result.get("partial") or result.get("db_write_error")):
+        # 5b897ad3 — <surface-it-loudly>, mirroring the
+        # extensions/meridian-outputs package's zero_hits_warning precedent:
+        # make an incomplete/unpersisted index impossible to mistake for a
+        # confirmed "not found" on a large/cold tree.
+        result["zero_hits_warning"] = (
+            "search_outputs returned 0 hits, but indexing of outputs_dir has "
+            "NOT finished (partial=True and/or db_write_error is set on this "
+            "same response) -- this is NOT a reliable 'file does not exist' "
+            "signal. Re-invoke search_outputs on the same outputs_dir and "
+            "query to let indexing continue (see pending_count for how much "
+            "work remains queued), and only treat a miss as confirmed once a "
+            "response comes back with no partial/db_write_error fields at all."
+        )
+        _log.warning(
+            "search_outputs: zero hits for query=%r under outputs_dir=%r "
+            "while the index is incomplete (partial=%s, pending_count=%s, "
+            "db_write_error=%s) -- this is NOT a confirmed miss; caller "
+            "should re-invoke rather than conclude the file/term doesn't exist",
+            query, outputs_dir, result.get("partial"), result.get("pending_count"),
+            result.get("db_write_error"),
+        )
     return result
 
 

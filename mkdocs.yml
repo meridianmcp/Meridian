@@ -7,10 +7,14 @@ edit_uri: edit/main/docs/
 
 # Internal operator runbooks live in docs/ for convenience but must NOT be
 # published — they describe hosted-infra capacity strategy and provisioning.
+# mcp-tunnel-slots.md (9d9a92cc) is an internal implementation reference
+# (function/commit-hash notes for the tunnel client) rather than a polished
+# user-facing page — excluded for the same reason as the runbooks above.
 exclude_docs: |
   fly-scaling.md
   backup-runbook.md
   mcp-directory-listing.md
+  mcp-tunnel-slots.md
 
 theme:
   name: material

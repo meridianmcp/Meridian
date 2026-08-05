@@ -609,3 +609,330 @@ def test_rrf_fusion_merges_two_rankings():
     # b appears in both lists → highest fused score.
     assert ids[0] == "b"
     assert set(ids) == {"a", "b", "c"}
+
+
+# ===========================================================================
+# 5. Embedding freshness / convergence state (item e631d54f, follow-up to
+# outputs_local's ConvergenceState in 6af1518d).
+#
+# These tests are CI-SAFE: they never install the real DuckDB `vss`
+# extension and never load a real model2vec model. `_FakeEmbedder` stands in
+# for `_Embedder` (CodeIndex.__init__ accepts any embedder duck-typing
+# `.available()` / `.embed()` / `.model_name`), and `_fake_rebuild_vss`
+# reproduces `CodeIndex._rebuild_vss`'s embedding-column bookkeeping WITHOUT
+# the `INSTALL vss` / `CREATE INDEX ... USING HNSW` steps that require the
+# native extension — so "the vector leg fully converged" can be tested
+# deterministically in any environment.
+# ===========================================================================
+
+
+class _FakeEmbedder:
+    """Duck-typed stand-in for :class:`meridian_codeindex.code_index._Embedder`."""
+
+    def __init__(self, model_name: str = "fake-embed-v1", *, enabled: bool = True,
+                 fail: bool = False) -> None:
+        self._model_name = model_name
+        self._enabled = enabled
+        self._fail = fail
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    def available(self) -> bool:
+        return self._enabled
+
+    def embed(self, texts):
+        if not self._enabled or not texts or self._fail:
+            return None
+        return [[1.0, 0.0, 0.0] for _ in texts]
+
+
+def _fake_rebuild_vss(idx: "ci.CodeIndex"):
+    """Bind a deterministic, extension-free stand-in for ``idx._rebuild_vss``
+    onto ``idx`` (matching test_semantic_search.py's plain-function
+    monkeypatch-onto-instance convention — no ``self`` param needed since an
+    instance-dict attribute isn't bound via the descriptor protocol)."""
+
+    def _run(con):
+        idx._vss_ready = False
+        rows = con.execute("SELECT chunk_id, content FROM code_chunks").fetchall()
+        if not rows:
+            return
+        texts = [r[1] or "" for r in rows]
+        vectors = idx._embedder.embed(texts)
+        if not vectors:
+            return
+        dim = len(vectors[0])
+        if dim <= 0:
+            return
+        con.execute("ALTER TABLE code_chunks DROP COLUMN IF EXISTS embedding")
+        con.execute(f"ALTER TABLE code_chunks ADD COLUMN embedding FLOAT[{dim}]")
+        for (chunk_id, _content), vec in zip(rows, vectors):
+            con.execute(
+                "UPDATE code_chunks SET embedding = ? WHERE chunk_id = ?",
+                [vec, chunk_id],
+            )
+        idx._vss_ready = True
+        idx._vss_dim = dim
+
+    return _run
+
+
+def test_convergence_state_bm25_only_is_never_degraded(tmp_path):
+    """Vectors disabled (the default posture) → degraded is always False; a
+    pure-BM25 index has no partial/stale vector state to flag."""
+    _write(tmp_path / "svc.py", _SAMPLE_PY)
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        idx.reindex()
+        state = idx.get_convergence_state()
+        assert state.vectors_enabled is False
+        assert state.degraded is False
+        assert state.converged is True
+        assert state.total_chunks > 0
+        assert state.index_revision == 1
+        assert state.source_fingerprint  # non-empty root hash
+        assert state.last_checkpoint_at is not None
+    finally:
+        idx.close()
+
+
+def test_convergence_state_revision_unchanged_on_noop_reindex(tmp_path):
+    _write(tmp_path / "svc.py", "def hello():\n    return 1\n")
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        idx.reindex()
+        rev1 = idx.get_convergence_state().index_revision
+        # No source change → Merkle short-circuit; revision must NOT bump.
+        idx.reindex()
+        rev2 = idx.get_convergence_state().index_revision
+        assert rev1 == rev2 == 1
+    finally:
+        idx.close()
+
+
+def test_convergence_state_revision_bumps_on_source_change(tmp_path):
+    _write(tmp_path / "svc.py", "def hello():\n    return 1\n")
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        idx.reindex()
+        rev1 = idx.get_convergence_state().index_revision
+        time.sleep(0.01)
+        _write(tmp_path / "svc.py", "def hello():\n    return 2\n")
+        idx.reindex()
+        rev2 = idx.get_convergence_state().index_revision
+        assert rev2 == rev1 + 1
+    finally:
+        idx.close()
+
+
+def test_convergence_state_degraded_when_vectors_enabled_but_embed_fails(tmp_path):
+    """Vectors requested but the embedder can't produce vectors (model load
+    failure, RSS pressure, whatever) → vectors_ready stays False and the
+    index is explicitly flagged degraded, never silently reported as fine."""
+    _write(tmp_path / "svc.py", _SAMPLE_PY)
+    idx = ci.CodeIndex(str(tmp_path), embedder=_FakeEmbedder(fail=True))
+    try:
+        summary = idx.reindex()
+        assert summary["rebuilt"] is True  # FTS still rebuilt
+        assert idx._vss_ready is False
+        state = idx.get_convergence_state()
+        assert state.vectors_enabled is True
+        assert state.vectors_ready is False
+        assert state.degraded is True
+        assert state.converged is False
+    finally:
+        idx.close()
+
+
+def test_convergence_state_not_degraded_once_vector_leg_fully_converged(tmp_path, monkeypatch):
+    _write(tmp_path / "svc.py", _SAMPLE_PY)
+    idx = ci.CodeIndex(str(tmp_path), embedder=_FakeEmbedder(model_name="model-a"))
+    try:
+        monkeypatch.setattr(idx, "_rebuild_vss", _fake_rebuild_vss(idx))
+        idx.reindex()
+        state = idx.get_convergence_state()
+        assert state.vectors_ready is True
+        assert state.pending_embedding_count == 0
+        assert state.embedding_model == "model-a"
+        assert state.configured_embedding_model == "model-a"
+        assert state.degraded is False
+        assert state.converged is True
+        assert state.index_revision == 1
+    finally:
+        idx.close()
+
+
+def test_deterministic_invalidation_on_model_change_with_empty_diff(tmp_path, monkeypatch):
+    """A configured embedding-model upgrade must invalidate the vector leg
+    even when NOTHING on disk changed — a Merkle diff alone can never see a
+    model-version change, so reindex() must check for it explicitly."""
+    _write(tmp_path / "svc.py", _SAMPLE_PY)
+    idx = ci.CodeIndex(str(tmp_path), embedder=_FakeEmbedder(model_name="model-a"))
+    monkeypatch.setattr(idx, "_rebuild_vss", _fake_rebuild_vss(idx))
+    try:
+        idx.reindex()
+        state1 = idx.get_convergence_state()
+        assert state1.embedding_model == "model-a"
+        assert state1.index_revision == 1
+
+        # Simulate a model upgrade — no source file touched.
+        idx._embedder = _FakeEmbedder(model_name="model-b")
+        summary = idx.reindex()
+        assert summary["changed_files"] == []          # Merkle diff is empty
+        assert summary["rebuilt"] is True               # yet the vector leg WAS rebuilt
+
+        state2 = idx.get_convergence_state()
+        assert state2.embedding_model == "model-b"
+        assert state2.configured_embedding_model == "model-b"
+        assert state2.index_revision == state1.index_revision + 1
+        assert state2.degraded is False
+    finally:
+        idx.close()
+
+
+def test_index_paths_targeted_registration_after_full_reindex(tmp_path):
+    """A file written AFTER the last full reindex() becomes searchable via
+    index_paths() without waiting for the next whole-tree walk, and bumps
+    index_revision (a Merkle baseline already exists to persist alongside)."""
+    _write(tmp_path / "svc.py", "def hello():\n    return 1\n")
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        idx.reindex()
+        rev_before = idx.get_convergence_state().index_revision
+
+        new_file = tmp_path / "fresh.py"
+        _write(new_file, "def freshly_written():\n    return 42\n")
+        result = idx.index_paths([str(new_file)])
+        assert result["indexed"] == 1
+        assert result["skipped"] == 0
+
+        hits = idx.search("freshly_written")
+        assert any(h["name"] == "freshly_written" for h in hits)
+
+        rev_after = idx.get_convergence_state().index_revision
+        assert rev_after == rev_before + 1
+    finally:
+        idx.close()
+
+
+def test_index_paths_before_any_reindex_still_indexes(tmp_path):
+    """index_paths() works even on a brand-new index with no prior full
+    reindex() pass (no Merkle baseline yet) — content is searchable
+    immediately, but there's no baseline to persist a revision bump against."""
+    new_file = tmp_path / "solo.py"
+    _write(new_file, "def solo_target():\n    return 1\n")
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        result = idx.index_paths([str(new_file)])
+        assert result["indexed"] == 1
+        hits = idx.search("solo_target")
+        assert any(h["name"] == "solo_target" for h in hits)
+        assert idx.get_convergence_state().index_revision == 0
+    finally:
+        idx.close()
+
+
+def test_index_paths_skips_unsupported_and_outside_root(tmp_path):
+    outside = tmp_path.parent / "outside_e631d54f_test.py"
+    _write(outside, "def nope():\n    return 1\n")
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        result = idx.index_paths([
+            str(tmp_path / "notes.md"),   # unsupported extension
+            str(outside),                  # outside root_dir
+            "",                             # falsy
+        ])
+        assert result["indexed"] == 0
+        assert result["skipped"] == 3
+    finally:
+        idx.close()
+        try:
+            os.remove(outside)
+        except OSError:
+            pass
+
+
+def test_register_priority_path_module_wrapper_makes_content_searchable_without_full_reindex(tmp_path):
+    db_path = str(tmp_path / "idx.duckdb")
+    new_file = tmp_path / "priority.py"
+    _write(new_file, "def provenance_written_symbol():\n    return 1\n")
+
+    result = ci.register_priority_path(str(tmp_path), str(new_file), db_path=db_path)
+    assert result["indexed"] == 1
+
+    # reindex=False proves it's searchable WITHOUT a full whole-tree pass.
+    res = ci.search_code_semantic(
+        str(tmp_path), "provenance_written_symbol", db_path=db_path, reindex=False,
+    )
+    assert any(h["name"] == "provenance_written_symbol" for h in res["hits"])
+
+
+def test_register_priority_path_missing_root_dir_errors():
+    result = ci.register_priority_path(
+        os.path.join("does", "not", "exist"), "whatever.py",
+    )
+    assert "error" in result
+    assert result["indexed"] == 0
+
+
+def test_search_code_semantic_includes_convergence_and_degraded(tmp_path):
+    _write(tmp_path / "svc.py", _SAMPLE_PY)
+    db_path = str(tmp_path / "idx.duckdb")
+    res = ci.search_code_semantic(str(tmp_path), "parse_token", db_path=db_path)
+    assert "convergence" in res
+    assert res["degraded"] is False
+    assert res["convergence"]["vectors_enabled"] is False
+    assert res["convergence"]["converged"] is True
+
+# describe_vector_index — bridge to the backend-neutral vector-index
+# contract (e1475682, meridian_codeindex.vector_index.IndexMetadata)
+# ===========================================================================
+
+
+def test_describe_vector_index_reflects_bm25_only_by_default(tmp_path, monkeypatch):
+    """With the vector leg disabled (the default), describe_vector_index
+    reports the honest degraded backend name and no embedding metadata."""
+    monkeypatch.delenv("MERIDIAN_CODE_INDEX_VECTORS", raising=False)
+    _write(tmp_path / "svc.py", "def hello():\n    return 1\n")
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        idx.reindex()
+        meta = idx.describe_vector_index()
+        assert meta.backend == "bm25_lexical"
+        assert meta.embedding_model is None
+        assert meta.dimension is None
+        assert meta.scope == idx.root_dir
+        assert meta.record_count == idx.count()
+    finally:
+        idx.close()
+
+
+@pytest.mark.skipif(
+    not _vectors_available(),
+    reason="model2vec and/or DuckDB VSS extension not available in this env",
+)
+def test_describe_vector_index_reports_duckdb_vss_when_vectors_ready(tmp_path, monkeypatch):
+    monkeypatch.setenv("MERIDIAN_CODE_INDEX_VECTORS", "1")
+    try:
+        from model2vec import StaticModel
+
+        StaticModel.from_pretrained(ci._EMBED_MODEL_NAME)
+    except BaseException as exc:  # noqa: BLE001
+        _skip_if_model_oom(exc)
+    _write(
+        tmp_path / "math_ops.py",
+        "def add_numbers(a, b):\n    return a + b\n",
+    )
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        idx.reindex()
+        assert idx._vss_ready
+        meta = idx.describe_vector_index()
+        assert meta.backend == "duckdb_vss"
+        assert meta.embedding_model == ci._EMBED_MODEL_NAME
+        assert meta.dimension == idx._vss_dim
+        assert meta.record_count == idx.count()
+    finally:
+        idx.close()

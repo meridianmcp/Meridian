@@ -898,6 +898,11 @@ def test_tunnel_status_reports_active_sockets():
         "debug_active": False,
         "slot_health": {},  # d71ba2e7 — no slots reported unhealthy
         "slot_status": {},  # 9a8645c1 — no slot diagnostics
+        # 02dbd8b4 — runtime config generation + drain-safety reporting; empty
+        # for a tenant that has never had a config write/read this process.
+        "config_generation": {},
+        "inflight": {},
+        "safe_to_restart": True,
     }
 
 

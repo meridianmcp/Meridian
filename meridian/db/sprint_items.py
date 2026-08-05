@@ -29,9 +29,15 @@ from meridian.db import (  # noqa: PLC0415
     serialize_touches_resources,
     parse_touches_resources,
     _resource_sets_conflict,
+    get_executor_config,
+    get_project,
+    set_executor_config,
 )
 from .. import tool_requirements as _tool_requirements  # 76dde31f (665 follow-up)
 from .. import artifact_declaration as _artifact_declaration  # 2f9cb288 (665 follow-up)
+from .. import executor_config as _executor_config  # 99c0c1be — parallelism diagnostics
+from .. import continuation_gate as _continuation_gate  # ecc8b280
+from .. import blocker_policy as _blocker_policy  # b108f2e0 (typed blocker triage)
 
 
 # ---------------------------------------------------------------------------
@@ -2011,6 +2017,28 @@ async def complete_sprint_item(
                 result["evidence_quality_warning"] = _evidence_quality_warning
             if _stored_evidence_warning:
                 result["stored_evidence_warning"] = _stored_evidence_warning
+        # ecc8b280 — machine-readable continuation_required/terminal_ready
+        # state, scoped to this item's own version bucket, so a caller that
+        # only calls complete_sprint_item (never get_sprint_progress) still
+        # gets a structured signal about whether autonomous work remains
+        # instead of having to infer it from prose. Advisory only — never
+        # blocks completion, fails open on any error, same shape as the two
+        # warning fields above.
+        try:
+            _cg_sibling_items = await get_sprint_items_cached(db, project_id)
+            _cg_version = result.get("version")
+            if _cg_version:
+                _cg_sibling_items = [
+                    it for it in _cg_sibling_items if it.get("version") == _cg_version
+                ]
+            _cg_project = await get_project(db, project_id)
+            result = dict(result)
+            result["continuation"] = _continuation_gate.compute_continuation_state(
+                _cg_sibling_items,
+                execution_mode=(_cg_project or {}).get("execution_mode"),
+            )
+        except Exception:  # noqa: BLE001 — advisory only, never block completion
+            pass
     return result
 
 
@@ -3805,10 +3833,106 @@ def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
     return (item.get("title") or "").lstrip().upper().startswith("MANUAL")
 
 
+# ---------------------------------------------------------------------------
+# dcfbe55c — macro-wave projection: presentation/orchestration layer ONLY.
+#
+# get_parallelizable_groups' greedy coloring can legitimately produce many
+# conflict-free groups (8-10+ on a busy sprint) — every one of them IS
+# genuinely safe to fan out, but surfacing that many "batch N" waves in a
+# human/executor-facing /goal is confusing to read and easy to lose track of
+# mid-run. pack_groups_into_macro_waves does NOT change what is safe: it
+# never merges two groups' items into one flat parallel set (that would be an
+# unsafe claim-safety waiver), and claim_sprint_item's real resource-lock
+# enforcement is completely independent of this projection and remains the
+# actual safety mechanism regardless of how the /goal chooses to display
+# things. It only decides how many DISPLAY buckets ("macro waves") the
+# already-proven-safe, already-ordered groups are chunked into, preserving
+# each original group as an ordered sub-batch within its macro wave.
+# ---------------------------------------------------------------------------
+
+MACRO_WAVE_COUNT_DEFAULT = 3
+MACRO_WAVE_COUNT_MIN = 1
+MACRO_WAVE_COUNT_MAX = 3
+
+
+def _clamp_macro_wave_count(requested: Any) -> int:
+    """Coerce a requested macro-wave cap into the supported [1, 3] range.
+
+    Never raises: missing/non-numeric/out-of-range values fall back to the
+    default (3) or clamp to the nearest bound, matching every other
+    normalize_*/``_xxx_from_settings`` helper's fail-safe convention
+    elsewhere in this codebase (e.g. ``executor_config.py``).
+    """
+    try:
+        n = int(requested) if requested is not None else MACRO_WAVE_COUNT_DEFAULT
+    except (TypeError, ValueError):
+        return MACRO_WAVE_COUNT_DEFAULT
+    return max(MACRO_WAVE_COUNT_MIN, min(MACRO_WAVE_COUNT_MAX, n))
+
+
+def pack_groups_into_macro_waves(
+    groups: list[list[dict[str, Any]]],
+    requested_macro_wave_count: Any = MACRO_WAVE_COUNT_DEFAULT,
+) -> list[dict[str, Any]]:
+    """dcfbe55c — pack conflict-free ``groups`` into at most N macro-waves.
+
+    ``groups`` is exactly get_parallelizable_groups' own ``"groups"`` list —
+    each element already proven internally conflict-free by the greedy
+    coloring above. This function never inspects or recomputes resource
+    conflicts; it purely chunks the list for display.
+
+    Algorithm: CONTIGUOUS chunking (not round-robin), so the incoming group
+    order — highest-priority-first, see get_parallelizable_groups' e08fee30
+    note — is preserved both within a macro wave and across macro waves. A
+    round-robin scheme would scramble that ordering and could put a
+    high-priority group behind a low-priority one in the rendered sequence.
+
+    When ``len(groups) <= N`` (the common case — most boards don't have more
+    conflict-free groups than the cap), every group already gets its own
+    macro wave: a no-op projection, nothing to compress, and the resulting
+    list is the same length/order as ``groups`` itself.
+
+    Returns a list of ``{"batches": [group, ...], "batch_count": int,
+    "item_count": int}`` dicts, one per non-empty macro wave, at most
+    ``requested_macro_wave_count`` (clamped to [1, 3]) entries long. Each
+    ``batches`` entry IS one of the original ``groups`` elements (same list
+    object, not a copy) so a caller can cross-reference by identity/content
+    without re-deriving anything.
+    """
+    if not groups:
+        return []
+    n = _clamp_macro_wave_count(requested_macro_wave_count)
+    if len(groups) <= n:
+        return [
+            {"batches": [g], "batch_count": 1, "item_count": len(g)}
+            for g in groups
+        ]
+    macro_waves: list[dict[str, Any]] = []
+    base, extra = divmod(len(groups), n)
+    idx = 0
+    for wi in range(n):
+        size = base + (1 if wi < extra else 0)
+        if size <= 0:
+            continue
+        chunk = groups[idx: idx + size]
+        idx += size
+        macro_waves.append({
+            "batches": chunk,
+            "batch_count": len(chunk),
+            "item_count": sum(len(b) for b in chunk),
+        })
+    return macro_waves
+
+
 async def get_parallelizable_groups(
     db: aiosqlite.Connection,
     project_id: str,
     version: str | None = None,
+    *,
+    configured_target: int | None = None,
+    host_limit: int | None = None,
+    requested_parallelism: int | None = None,
+    requested_macro_wave_count: Any = MACRO_WAVE_COUNT_DEFAULT,
 ) -> dict[str, Any]:
     """255096d9 — cluster pending sprint items that are safe to run in parallel.
 
@@ -3826,7 +3950,10 @@ async def get_parallelizable_groups(
          in sequence.
 
     Returns ``{"version", "groups": [[item, ...], ...], "group_count",
-    "eligible_count", "blocked": [...], "undeclared_count"}``. ``groups`` items
+    "eligible_count", "blocked": [...], "undeclared_count", "requested_parallelism",
+    "effective_parallelism", "host_limit", "configured_target",
+    "resource_safe_capacity", "limiting_reason", "macro_waves",
+    "macro_wave_count", "requested_macro_wave_count"}``. ``groups`` items
     are full sprint-item dicts with a derived ``resources`` list attached.
 
     2282a636 — items with ``blocker_kind='manual'`` (blocked on a real-world
@@ -3838,6 +3965,31 @@ async def get_parallelizable_groups(
     ``include_manual_blocker``, not on ``milestone_type='human'`` or title prefix.
     e08fee30 — within the safe-parallel ordering, higher-priority eligible items
     are placed first so urgent work colors into the earliest groups.
+
+    99c0c1be — the return dict also carries deterministic PARALLELISM
+    diagnostics computed by :func:`meridian.executor_config.resolve_parallelism`
+    against the first (largest, resource-conflict-free) group:
+    ``requested_parallelism`` (defaults to the first group's size unless the
+    ``requested_parallelism`` kwarg is passed), ``configured_target`` (defaults
+    to this project's persisted ``executor_config.parallelism_target`` unless
+    the ``configured_target`` kwarg overrides it — so callers such as
+    ``handoff.py`` that invoke this function unmodified automatically pick up
+    a project's configured target), ``host_limit`` (``None`` unless the
+    caller explicitly passes one — an unknown host limit is NEVER invented
+    here, so wave planning never serializes disjoint, resource-safe work just
+    because an unrelated vendor UI cap is unreported), ``resource_safe_capacity``
+    (the first group's size), ``effective_parallelism`` and ``limiting_reason``.
+    This is pure diagnostics: it does not change which items land in which
+    ``groups`` — the coloring algorithm below is unchanged.
+
+    ``requested_macro_wave_count`` (dcfbe55c, default 3, clamped to [1, 3])
+    controls ``macro_waves``: a deterministic, PRESENTATION-ONLY packing of
+    ``groups`` into at most that many display waves via
+    :func:`pack_groups_into_macro_waves` — see that function's docstring for
+    the full contract. It is NOT a claim-safety waiver; ``groups`` (the real
+    conflict-free partition) is returned unchanged regardless of this cap,
+    and claim_sprint_item's resource-lock enforcement never consults
+    ``macro_waves`` at all.
     """
     # include_manual_blocker=False: a manual-blocker item is not claimable work,
     # so it must not be offered as a parallelizable batch member.
@@ -3926,6 +4078,36 @@ async def get_parallelizable_groups(
     # Each undeclared item is its own sequential group (never co-scheduled).
     for it in undeclared_items:
         groups.append([it])
+
+    # 99c0c1be — deterministic parallelism diagnostics for the first (largest,
+    # resource-conflict-free) group. configured_target defaults to this
+    # project's persisted executor_config.parallelism_target (fetched here) so
+    # callers that invoke this function unmodified — e.g. handoff.py — pick up
+    # a project's configured target automatically. host_limit has NO such
+    # default: an unknown host limit must never be invented (see
+    # executor_config.resolve_parallelism), so it stays None unless the
+    # caller explicitly knows and passes one.
+    if configured_target is None:
+        try:
+            _exec_cfg = await get_executor_config(db, project_id)
+            configured_target = (_exec_cfg or {}).get("parallelism_target")
+        except Exception:  # noqa: BLE001 — diagnostics must never break grouping
+            configured_target = None
+    _first_group_size = len(groups[0]) if groups else 0
+    _requested = (
+        requested_parallelism if requested_parallelism is not None else _first_group_size
+    )
+    _parallelism = _executor_config.resolve_parallelism(
+        _requested,
+        configured_target=configured_target,
+        host_limit=host_limit,
+        resource_safe_capacity=_first_group_size,
+    )
+    # dcfbe55c — presentation-only macro-wave projection; see the module-level
+    # note above pack_groups_into_macro_waves. Does not affect "groups" above,
+    # which remains the authoritative conflict-free partition.
+    _macro_wave_cap = _clamp_macro_wave_count(requested_macro_wave_count)
+    macro_waves = pack_groups_into_macro_waves(groups, _macro_wave_cap)
     return {
         "version": version,
         "groups": groups,
@@ -3934,6 +4116,15 @@ async def get_parallelizable_groups(
         "undeclared_count": undeclared,
         "blocked": blocked,
         "running": running,  # df573218 — items currently in flight
+        "requested_parallelism": _parallelism["requested_parallelism"],
+        "effective_parallelism": _parallelism["effective_parallelism"],
+        "host_limit": _parallelism["host_limit"],
+        "configured_target": _parallelism["configured_target"],
+        "resource_safe_capacity": _parallelism["resource_safe_capacity"],
+        "limiting_reason": _parallelism["limiting_reason"],
+        "macro_waves": macro_waves,
+        "macro_wave_count": len(macro_waves),
+        "requested_macro_wave_count": _macro_wave_cap,
     }
 
 
@@ -5394,3 +5585,167 @@ async def _get_blocking_wave_gate(
             _blocking = _cfg
             _blocking_num = _cfg_num
     return _blocking
+
+
+# ---------------------------------------------------------------------------
+# b108f2e0 — typed blocker triage: project-configurable executor_blocker_policy
+# persistence + DB-backed evaluation, layered on the pure meridian.blocker_policy
+# module. Stored inside the EXISTING executor_config JSON blob (no new table /
+# migration needed — mirrors how test_cmd and other free-form executor knobs
+# already persist) under the "blocker_policy" key, shaped as either a plain
+# string (project-wide default) or {"default": str, "by_version": {v: str}}
+# once a caller sets a version-scoped override. Auditable via the EXISTING
+# append-only action_audit_log table (record_action_audit_event) — no new
+# audit storage either.
+# ---------------------------------------------------------------------------
+
+_BLOCKER_POLICY_CONFIG_KEY = "blocker_policy"
+
+
+def _resolve_stored_blocker_policy(raw: Any, *, version: "str | None") -> tuple[Any, str]:
+    """Resolve the raw ``executor_config["blocker_policy"]`` value for one
+    ``version`` bucket. Returns ``(value, source)`` where ``source`` is
+    ``"version"`` (an explicit per-version override matched), ``"default"``
+    (the project-wide default applied), or ``"unset"`` (nothing stored at
+    all — caller falls back to ``blocker_policy.DEFAULT_POLICY``).
+    """
+    if isinstance(raw, dict):
+        by_version = raw.get("by_version")
+        if version and isinstance(by_version, dict) and version in by_version:
+            return by_version[version], "version"
+        if "default" in raw:
+            return raw.get("default"), "default"
+        return None, "unset"
+    if isinstance(raw, str):
+        return raw, "default"
+    return None, "unset"
+
+
+async def get_project_blocker_policy(
+    db: aiosqlite.Connection, project_id: str, *, version: "str | None" = None
+) -> dict[str, Any]:
+    """Return the effective ``executor_blocker_policy`` for a project (b108f2e0).
+
+    A project that never configured one gets :data:`blocker_policy.DEFAULT_POLICY`
+    back, never an error — mirrors ``get_project_capability_manifest``'s "no
+    manifest -> empty profile" contract. A corrupted/invalid stored value
+    (should not happen — ``set_project_blocker_policy`` validates at write
+    time — but defends against a hand-edited DB row) degrades to the safe
+    default rather than raising, since this is a READ path other mandatory
+    calls (board snapshots, handoffs) depend on.
+    """
+    cfg = await get_executor_config(db, project_id)
+    raw = cfg.get(_BLOCKER_POLICY_CONFIG_KEY)
+    value, source = _resolve_stored_blocker_policy(raw, version=version)
+    try:
+        normalized = _blocker_policy.normalize_policy(value)
+    except _blocker_policy.BlockerPolicyError:
+        normalized = _blocker_policy.DEFAULT_POLICY
+        source = "unset"
+    if value is None:
+        source = "unset"
+    return {
+        "project_id": project_id,
+        "version": version,
+        "policy": normalized,
+        "source": source,
+    }
+
+
+async def set_project_blocker_policy(
+    db: aiosqlite.Connection,
+    project_id: str,
+    policy: str,
+    *,
+    version: "str | None" = None,
+    actor: "str | None" = None,
+) -> dict[str, Any]:
+    """Validate, persist, and audit-log a project's ``executor_blocker_policy``
+    (b108f2e0). Raises ``blocker_policy.BlockerPolicyError`` for an invalid
+    policy value, ``ValueError`` if the project does not exist (surfaced by
+    the underlying ``set_executor_config`` -> ``update_project_settings``
+    call).
+
+    ``version`` (optional) scopes the override to one sprint-version bucket,
+    leaving the project-wide default (and any OTHER version's override)
+    untouched — the executor_config blob is READ, merged, and WRITTEN BACK
+    whole (``set_executor_config`` replaces the entire blob, so a naive write
+    here would silently drop unrelated keys like ``test_cmd``).
+    """
+    normalized = _blocker_policy.normalize_policy(policy)
+    cfg = await get_executor_config(db, project_id)
+    raw = cfg.get(_BLOCKER_POLICY_CONFIG_KEY)
+    stored: dict[str, Any] = dict(raw) if isinstance(raw, dict) else (
+        {"default": raw} if isinstance(raw, str) else {}
+    )
+    if version:
+        by_version = dict(stored.get("by_version") or {})
+        by_version[version] = normalized
+        stored["by_version"] = by_version
+    else:
+        stored["default"] = normalized
+    new_cfg = dict(cfg)
+    new_cfg[_BLOCKER_POLICY_CONFIG_KEY] = stored
+    await set_executor_config(db, project_id, new_cfg)
+    try:
+        # Lazy import: record_action_audit_event lives in .workspace, which
+        # itself imports names FROM this module (_sprint_item_slug_base /
+        # _sprint_item_nickname_base) — a top-level import here would be
+        # circular at package-init time. Safe at call time, long after both
+        # modules have finished loading (mirrors capability_contract.py's own
+        # lazy `from . import executor_contract` pattern).
+        from . import workspace as _workspace_module  # noqa: PLC0415
+
+        await _workspace_module.record_action_audit_event(
+            db,
+            "blocker_policy_set",
+            project_id=project_id,
+            actor=actor,
+            detail=json.dumps({"policy": normalized, "version": version}),
+        )
+    except Exception:  # noqa: BLE001 — a dropped audit entry must not break the write
+        pass
+    return await get_project_blocker_policy(db, project_id, version=version)
+
+
+async def evaluate_board_blockers(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    version: "str | None" = None,
+    items: "list[dict[str, Any]] | None" = None,
+    signals: "dict[str, dict[str, Any]] | None" = None,
+) -> dict[str, Any]:
+    """DB-backed whole-run blocker decision for a project (b108f2e0):
+    fetches the live (non-done) board, the project's configured
+    ``executor_blocker_policy``, and combines them via the pure
+    ``blocker_policy.classify_and_evaluate`` combinator.
+
+    ``items`` lets a caller that already fetched the SAME live-item list
+    (e.g. ``build_board_snapshot``'s own ``raw_items``, or a handoff's
+    pending-item fetch) pass it straight through instead of this function
+    re-querying — the strongest identical-data guarantee, mirroring
+    ``capability_contract.build_capability_contract``'s own ``items`` kwarg.
+    When omitted, self-fetches every non-``done`` item for ``project_id``
+    (optionally scoped to ``version``), matching
+    ``board_snapshot.build_board_snapshot``'s own "non-done is deliberately
+    literal" filter so the two agree on what's "live" for the same board.
+
+    ``signals`` is passed straight through to
+    ``blocker_policy.classify_and_evaluate`` — per-item classification
+    overrides (dependency/tool/security/etc. signals) a caller has already
+    verified. Never raises: a malformed stored policy degrades to the safe
+    default (see :func:`get_project_blocker_policy`); this function itself
+    has no additional failure mode beyond the DB fetch, which callers should
+    still guard per this codebase's "best-effort enrichment" convention.
+    """
+    live_items = items
+    if live_items is None:
+        raw_items = await get_sprint_items(db, project_id, version=version)
+        live_items = [it for it in raw_items if (it.get("status") or "") != "done"]
+    policy_row = await get_project_blocker_policy(db, project_id, version=version)
+    decision = _blocker_policy.classify_and_evaluate(
+        live_items, signals=signals, policy=policy_row["policy"]
+    )
+    decision["policy_source"] = policy_row.get("source")
+    return decision
