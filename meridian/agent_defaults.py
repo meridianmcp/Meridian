@@ -122,7 +122,19 @@ import re
 #         elsewhere in this file's b2d312b1 section. Swapped the stale names
 #         for the real ones so this section is internally consistent instead
 #         of sending a session looking for a tool/process that was never real.
-AGENT_INSTRUCTIONS_STANDARD_VERSION = 16
+#   v17 — bound index_repository to the active repo, never trust a 502 as an
+#         index (c95d0c12): reproduced live, a repo root nesting 138
+#         .claude/worktrees + .codex/worktrees copies of itself made a
+#         full-root index_repository call return a hosted 502, while a
+#         narrow index of just the package directory succeeded. Session-start
+#         reindex guidance now says to sanity-check the repo root for nested
+#         worktree containers first (meridian.code_index.compute_bounded_reindex_scope)
+#         and fall back to the recommended narrower path when unsafe, and to
+#         treat any index_repository response carrying an error field (a 502,
+#         a timeout, anything non-success) as a FAILED index — never proceed
+#         as if search_graph/get_code_snippet are backed by fresh data
+#         (meridian.code_index.is_index_repository_failure).
+AGENT_INSTRUCTIONS_STANDARD_VERSION = 17
 
 _STANDARD_MARKER_RE = re.compile(r"meridian-executor-standard:\s*v(\d+)")
 
@@ -242,6 +254,17 @@ The code-intel tools you have available depend on HOW you are connected:
   client defers tool loading) and you will touch source files, run
   `index_repository(mode="fast")` once — the codebase graph goes
   stale after commits, so a fresh index keeps prospecting accurate (eacf7063).
+- **Before indexing a repo root, check for nested worktrees (c95d0c12).** A
+  repo that nests `.claude/worktrees` or `.codex/worktrees` copies of itself
+  can make a full-root `index_repository` call fail outright (observed live:
+  a hosted 502 on a repo with 138 nested worktrees, while indexing just the
+  package directory succeeded). If your client has filesystem access, a
+  cheap top-level check — no full walk needed — is whether `.claude/worktrees`
+  or `.codex/worktrees` contains more than a handful of entries; if so, index
+  a narrower `repo_path` (the package directory, e.g. `meridian/`) instead of
+  the repo root. **Never treat an error response (a 502, a timeout, any
+  non-success) as a successful or current index** — that state must be
+  surfaced, not silently treated as "prospecting is now accurate."
 - **`search_graph` results can be stale or wrong (b2d312b1).** The codebase-memory-mcp
   index (`codebase__search_graph` / `search_graph`) has been observed returning zero
   results for symbols that genuinely exist AND returning line spans that are off by

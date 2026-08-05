@@ -1633,3 +1633,106 @@ class TestProspectSymbolCommitDriftIntegration:
         )
         assert probe_called["yes"] is False
         assert result["fallback_reason"] == "graph_skipped_stale_graph=true"
+
+
+# ---------------------------------------------------------------------------
+# c95d0c12 — bound codebase-memory reindex to the active repository and
+# exclude nested worktrees.
+# ---------------------------------------------------------------------------
+
+from meridian.code_index import (  # noqa: E402
+    compute_bounded_reindex_scope,
+    is_index_repository_failure,
+)
+
+
+class TestComputeBoundedReindexScope:
+    def test_safe_when_no_worktree_containers(self, tmp_path):
+        (tmp_path / "meridian").mkdir()
+        result = compute_bounded_reindex_scope(str(tmp_path))
+        assert result["safe"] is True
+        assert result["nested_worktree_count"] == 0
+        assert result["recommended_repo_path"] == str(tmp_path)
+
+    def test_safe_when_worktree_count_at_or_below_threshold(self, tmp_path):
+        worktrees = tmp_path / ".claude" / "worktrees"
+        worktrees.mkdir(parents=True)
+        for i in range(3):
+            (worktrees / f"session-{i}").mkdir()
+
+        result = compute_bounded_reindex_scope(str(tmp_path), worktree_threshold=5)
+        assert result["nested_worktree_count"] == 3
+        assert result["safe"] is True
+        assert str(worktrees) in result["excluded_paths"]
+        assert result["recommended_repo_path"] == str(tmp_path)
+
+    def test_unsafe_when_worktree_count_exceeds_threshold_falls_back_to_package_dir(
+        self, tmp_path
+    ):
+        claude_worktrees = tmp_path / ".claude" / "worktrees"
+        claude_worktrees.mkdir(parents=True)
+        codex_worktrees = tmp_path / ".codex" / "worktrees"
+        codex_worktrees.mkdir(parents=True)
+        for i in range(4):
+            (claude_worktrees / f"session-{i}").mkdir()
+        for i in range(4):
+            (codex_worktrees / f"session-{i}").mkdir()
+        (tmp_path / "meridian").mkdir()
+
+        result = compute_bounded_reindex_scope(str(tmp_path), worktree_threshold=5)
+        assert result["nested_worktree_count"] == 8
+        assert result["safe"] is False
+        assert result["recommended_repo_path"] == str(tmp_path / "meridian")
+        assert str(claude_worktrees) in result["excluded_paths"]
+        assert str(codex_worktrees) in result["excluded_paths"]
+
+    def test_excludes_conventional_cache_and_vcs_dirs(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "__pycache__").mkdir()
+        (tmp_path / ".pixi").mkdir()
+
+        result = compute_bounded_reindex_scope(str(tmp_path))
+        assert str(tmp_path / ".git") in result["excluded_paths"]
+        assert str(tmp_path / "__pycache__") in result["excluded_paths"]
+        assert str(tmp_path / ".pixi") in result["excluded_paths"]
+
+    def test_nonexistent_repo_path_is_safe_with_no_exclusions(self, tmp_path):
+        missing = tmp_path / "does-not-exist"
+        result = compute_bounded_reindex_scope(str(missing))
+        assert result["safe"] is True
+        assert result["excluded_paths"] == []
+        assert result["nested_worktree_count"] == 0
+
+    def test_unsafe_with_no_package_dir_falls_back_to_repo_root(self, tmp_path):
+        worktrees = tmp_path / ".claude" / "worktrees"
+        worktrees.mkdir(parents=True)
+        for i in range(10):
+            (worktrees / f"session-{i}").mkdir()
+        # No "meridian" or same-named package directory exists.
+
+        result = compute_bounded_reindex_scope(str(tmp_path), worktree_threshold=5)
+        assert result["safe"] is False
+        assert result["recommended_repo_path"] == str(tmp_path)
+
+
+class TestIsIndexRepositoryFailure:
+    def test_none_result_is_failure(self):
+        assert is_index_repository_failure(None) is True
+
+    def test_empty_dict_is_failure(self):
+        assert is_index_repository_failure({}) is True
+
+    def test_non_dict_result_is_failure(self):
+        assert is_index_repository_failure("502 Bad Gateway") is True
+        assert is_index_repository_failure([]) is True
+
+    def test_dict_with_error_field_is_failure(self):
+        assert is_index_repository_failure({"error": "502 Bad Gateway"}) is True
+        assert is_index_repository_failure({"indexed": True, "error": "timeout"}) is True
+
+    def test_dict_without_error_field_is_success(self):
+        assert is_index_repository_failure({"indexed": True, "git_commit": "abc123"}) is False
+
+    def test_dict_with_falsy_error_field_is_success(self):
+        assert is_index_repository_failure({"error": None}) is False
+        assert is_index_repository_failure({"error": ""}) is False

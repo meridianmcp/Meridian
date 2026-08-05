@@ -29,6 +29,7 @@ involvement at all and also exposes a ``meridian-codeindex`` CLI.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Any
 
 from meridian_codeindex import code_index as _impl
@@ -101,3 +102,100 @@ def search_code_semantic(
     result["vectors_active"] = idx._vss_ready
     result["hits"] = idx.search(query, limit=limit, kind=kind)
     return result
+
+
+# ---------------------------------------------------------------------------
+# c95d0c12 — bound codebase-memory reindex to the active repository and
+# exclude nested worktrees.
+#
+# codebase-memory's index_repository tool takes no include/exclude parameter
+# -- the only lever Meridian (or an agent following its guidance) has is
+# WHICH repo_path to hand it, and whether to trust the response. Reproduced
+# 2026-08-05: this repo nests 138 .claude/worktrees + .codex/worktrees
+# copies of itself; a full-root index_repository call returned a hosted 502,
+# while a narrow index of just meridian/ succeeded (4,570 nodes, 21,405
+# edges) -- proving the failure is scope/volume-related, not a universal
+# indexer failure. These two helpers give a caller (agent or Meridian's own
+# guidance) a cheap, top-level-only pre-flight check and an explicit
+# success/failure classifier, so a 502 (or any other error-shaped response)
+# is never silently treated as a current index.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_EXCLUDED_DIR_NAMES = frozenset({
+    ".git", ".pixi", ".venv", "venv", "node_modules", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build",
+    ".codebase-memory",
+})
+
+_WORKTREE_CONTAINER_DIR_NAMES = frozenset({".claude", ".codex"})
+
+
+def compute_bounded_reindex_scope(
+    repo_path: str,
+    *,
+    worktree_threshold: int = 5,
+) -> dict[str, Any]:
+    """Pre-flight scope check for an index_repository(repo_path=...) call.
+
+    Non-recursive top-level scan only (cheap, no full walk): looks for
+    ``.claude/worktrees`` / ``.codex/worktrees`` containers directly under
+    *repo_path* and counts the worktree copies inside each, plus any of the
+    usual cache/VCS directories that should never be indexed as source.
+
+    Returns ``{repo_path, excluded_paths, nested_worktree_count, safe,
+    recommended_repo_path}``. ``safe`` is False once the nested worktree
+    count exceeds *worktree_threshold*; when unsafe, ``recommended_repo_path``
+    falls back to a conventional source subdirectory (the repo's own package
+    dir, else ``meridian``) instead of the bloated root -- the same narrow
+    scope confirmed to succeed in the 2026-08-05 reproduction. This function
+    never raises and never itself calls index_repository; it only advises.
+    """
+    root = Path(repo_path)
+    excluded_paths: list[str] = []
+    nested_worktree_count = 0
+
+    if root.is_dir():
+        for container_name in sorted(_WORKTREE_CONTAINER_DIR_NAMES):
+            container = root / container_name / "worktrees"
+            if not container.is_dir():
+                continue
+            excluded_paths.append(str(container))
+            try:
+                nested_worktree_count += sum(1 for p in container.iterdir() if p.is_dir())
+            except OSError:
+                pass
+        for name in sorted(_DEFAULT_EXCLUDED_DIR_NAMES):
+            candidate = root / name
+            if candidate.is_dir():
+                excluded_paths.append(str(candidate))
+
+    safe = nested_worktree_count <= worktree_threshold
+    recommended_repo_path = repo_path
+    if not safe:
+        for candidate_name in (root.name, "meridian"):
+            candidate = root / candidate_name
+            if candidate.is_dir() and candidate != root:
+                recommended_repo_path = str(candidate)
+                break
+
+    return {
+        "repo_path": repo_path,
+        "excluded_paths": excluded_paths,
+        "nested_worktree_count": nested_worktree_count,
+        "safe": safe,
+        "recommended_repo_path": recommended_repo_path,
+    }
+
+
+def is_index_repository_failure(result: "dict[str, Any] | None") -> bool:
+    """True when an index_repository response must NOT be treated as a
+    successful/current index (c95d0c12).
+
+    A missing result, a non-dict result, or a dict carrying a truthy
+    ``error`` field are all failures. This is a fail-SAFE classifier for the
+    specific gap this item closes (a 502/error response silently treated as
+    a fresh index) -- it is not a schema validator for the success shape.
+    """
+    if not result or not isinstance(result, dict):
+        return True
+    return bool(result.get("error"))
