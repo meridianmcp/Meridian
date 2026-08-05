@@ -448,3 +448,89 @@ def test_locate_anchors_missing_file_returns_error():
 def test_locate_anchors_empty_queries_returns_error(doc_path):
     result = docs_intel.locate_anchors(doc_path, [])
     assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# 1dff1300 -- cross-feature consistency: a heading's target_para_id as
+# resolved by locate_anchor must be directly usable as document_outline /
+# read_document_snapshot's section_anchor -- both address the SAME
+# para_id identity space. Grouped in this file (rather than the other two
+# pagination test files) because it specifically exercises locate_anchor's
+# own anchor-resolution output feeding the new pagination functions, plus
+# cursor edge cases (mismatched section_anchor) that belong alongside this
+# file's existing anchor/staleness-flavored coverage.
+# ---------------------------------------------------------------------------
+
+
+def test_locate_anchor_resolved_id_works_as_document_outline_section_anchor(doc_path):
+    located = docs_intel.locate_anchor(doc_path, {"section_path": "3.2.4"})
+    assert located["status"] == "resolved"
+
+    result = docs_intel.document_outline(doc_path, section_anchor=located["target_para_id"])
+
+    assert "error" not in result
+    assert [h["text"] for h in result["headings"]] == ["3.2.4 Threshold Table"]
+
+
+def test_locate_anchor_resolved_id_works_as_read_document_snapshot_section_anchor(doc_path):
+    located = docs_intel.locate_anchor(doc_path, {"section_text": "overview"})
+    assert located["status"] == "resolved"
+    assert located["target_para_id"] == "H0000005"
+
+    result = docs_intel.read_document_snapshot(doc_path, section_anchor="H0000005")
+
+    assert "error" not in result
+    texts = [p["text"] for p in result["paragraphs"]]
+    # "Overview" (H2) subsection: itself only -- the very next paragraph is
+    # the Figure 1 caption, which belongs to it (no nested sub-heading of
+    # its own), and it ends at the next H2 sibling "Detailed Analysis".
+    assert texts[0] == "Overview"
+    assert "Detailed Analysis" not in texts
+
+
+def test_document_outline_cursor_rejects_mismatched_section_anchor(doc_path):
+    outline_root = docs_intel.document_outline(doc_path)
+    methods_id = next(h["para_id"] for h in outline_root["headings"] if h["text"] == "Methods")
+    conclusion_id = next(
+        h["para_id"] for h in outline_root["headings"] if h["text"] == "Conclusion"
+    )
+
+    page1 = docs_intel.document_outline(doc_path, section_anchor=methods_id, page_size=1)
+    assert page1["has_more"] is True
+
+    # Replay the SAME cursor but with a DIFFERENT section_anchor.
+    result = docs_intel.document_outline(
+        doc_path, section_anchor=conclusion_id, cursor=page1["cursor"]
+    )
+
+    assert "error" in result
+    assert result["reason"] == "invalid_cursor"
+
+
+def test_read_document_snapshot_pagination_reconstructs_the_full_document(doc_path):
+    """Page through the whole doc_path fixture (headings, body text, a
+    table caption, an equation paragraph, a REF field paragraph) in small
+    pages and confirm the reconstructed sequence is byte-for-byte identical
+    to a single unpaginated call -- deterministic document order holds
+    across an arbitrary number of page boundaries, not just a toy 2-page
+    case."""
+    full = docs_intel.read_document_snapshot(doc_path)
+
+    collected: list[dict] = []
+    cursor = None
+    page_size = 3
+    for _ in range(20):
+        page = docs_intel.read_document_snapshot(
+            doc_path, page_size=page_size if cursor is None else None, cursor=cursor
+        )
+        assert "error" not in page
+        collected.extend(page["paragraphs"])
+        if not page["has_more"]:
+            break
+        cursor = page["cursor"]
+    else:
+        raise AssertionError("pagination did not terminate within 20 pages")
+
+    assert [p["text"] for p in collected] == [p["text"] for p in full["paragraphs"]]
+    assert [p["para_id"] for p in collected] == [p["para_id"] for p in full["paragraphs"]]
+    assert len(collected) == full["paragraph_count"]

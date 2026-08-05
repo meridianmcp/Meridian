@@ -40,10 +40,37 @@ mcp = FastMCP("meridian-docs")
 
 
 @mcp.tool()
-def document_outline(path: str) -> dict[str, Any]:
+def document_outline(
+    path: str,
+    page_size: int | None = None,
+    cursor: str | None = None,
+    section_anchor: str | None = None,
+) -> dict[str, Any]:
     """Heading outline of a .docx: paragraph_count, heading_count, and an ordered
-    list of headings (level, text, para_id). Stateless — builds no index."""
-    return docs_intel.document_outline(path)
+    list of headings (level, text, para_id, index, section_type). Stateless —
+    builds no index. Every response includes document_fingerprint.
+
+    1dff1300 — cursor-based pagination + section scoping, so a large
+    document's outline can never silently truncate or exceed a token
+    budget. Omitting page_size and cursor (the default) returns the full
+    outline, unchanged from before.
+
+    Pass page_size (no cursor) for the first page: at most page_size
+    headings, plus cursor (opaque token for the next page, or None when
+    this is the last page), has_more, and total. Pass cursor (from a prior
+    call) for the next page. section_anchor (a heading's para_id or exact
+    heading text) scopes the outline to just that heading's own subsection
+    (itself + nested sub-headings + their body).
+
+    A cursor whose embedded fingerprint no longer matches the document's
+    current content, or whose section_anchor doesn't match this call's, or
+    that is malformed, is rejected: {"error": ..., "reason":
+    "stale_cursor" | "invalid_cursor"}. An unresolvable section_anchor
+    returns {"error": ..., "reason": "section_not_found"}.
+    """
+    return docs_intel.document_outline(
+        path, page_size=page_size, cursor=cursor, section_anchor=section_anchor
+    )
 
 
 @mcp.tool()
@@ -199,7 +226,13 @@ def highlight_document(
     )
 
 @mcp.tool()
-def read_document_snapshot(docx_path: str) -> dict[str, Any]:
+def read_document_snapshot(
+    docx_path: str,
+    page_size: int | None = None,
+    cursor: str | None = None,
+    section_anchor: str | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
     """Read the last saved DOCX snapshot without writing or requiring a close.
 
     c7cc9da4 -- the entry point for a Meridian-docs review session: never
@@ -210,10 +243,26 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
     before promoting any later draft/overlay, so a promotion never lands
     against content the review never actually saw -- plus an explicit
     ``limitations`` list spelling out both caveats for a caller that
-    forwards this snapshot into a recommendation or report. See
+    forwards this snapshot into a recommendation or report.
+
+    1dff1300 — cursor-based pagination + section scoping (same contract as
+    document_outline — see its docstring) so a large document's snapshot
+    can never silently truncate or exceed a token budget. Omitting
+    page_size and cursor (the default) returns the full paragraph list,
+    unchanged from before. Each paginated paragraph carries section_path
+    and heading_para_id. index_db_path, when given, attaches stale_index
+    (the structural sidecar's freshness) plus whole-document tables/
+    figures identity and page-scoped equations identity already recorded
+    there, best-effort — never blocks on a missing/stale sidecar. See
     ``docs_intel.read_document_snapshot`` for the full contract.
     """
-    return docs_intel.read_document_snapshot(docx_path)
+    return docs_intel.read_document_snapshot(
+        docx_path,
+        page_size=page_size,
+        cursor=cursor,
+        section_anchor=section_anchor,
+        index_db_path=index_db_path,
+    )
 
 
 @mcp.tool()

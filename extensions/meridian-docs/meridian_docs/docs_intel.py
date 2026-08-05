@@ -36,6 +36,7 @@ synthetic in-memory .docx (see tests/test_docs_intel.py).
 """
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import io
@@ -381,7 +382,234 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     return paragraphs
 
 
-def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# 1dff1300 -- cursor-based pagination + section scoping shared by
+# document_outline and read_document_snapshot, so neither can silently
+# truncate or exceed a caller's token budget on a large document.
+#
+# The cursor is a small, opaque, self-contained (not server-side-stateful)
+# token: base64(json({v, kind, fp, off, ps, sa})). It is NOT a security
+# boundary (no signing/HMAC -- there is no secret key material anywhere in
+# this stdlib-only, DB-free extension to sign with), only a structural/
+# freshness guard: malformed input or a fingerprint mismatch (the document
+# changed between page requests) is rejected with a clear, explicit reason
+# rather than silently served against stale or fabricated data.
+# ---------------------------------------------------------------------------
+
+_PAGE_CURSOR_VERSION = 1
+
+
+def _encode_page_cursor(
+    *, kind: str, fingerprint: str, offset: int, page_size: int, section_anchor: str | None
+) -> str:
+    payload = {
+        "v": _PAGE_CURSOR_VERSION,
+        "kind": kind,
+        "fp": fingerprint,
+        "off": offset,
+        "ps": page_size,
+        "sa": section_anchor,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_page_cursor(cursor: str, *, kind: str) -> dict[str, Any] | None:
+    """Decode and structurally validate a page cursor previously minted by
+    :func:`_encode_page_cursor`. Returns ``None`` (never raises) for
+    anything malformed, tampered with, or issued for a different ``kind``
+    (an outline cursor can never be replayed against read_document_snapshot,
+    or vice versa) -- callers turn a ``None`` into a clear, explicit
+    ``"invalid_cursor"`` error rather than a stack trace."""
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("v") != _PAGE_CURSOR_VERSION or payload.get("kind") != kind:
+        return None
+    if not isinstance(payload.get("fp"), str) or not payload["fp"]:
+        return None
+    off = payload.get("off")
+    if not isinstance(off, int) or isinstance(off, bool) or off < 0:
+        return None
+    ps = payload.get("ps")
+    if not isinstance(ps, int) or isinstance(ps, bool) or ps <= 0:
+        return None
+    sa = payload.get("sa")
+    if sa is not None and not isinstance(sa, str):
+        return None
+    return payload
+
+
+def _resolve_pagination_window(
+    *,
+    kind: str,
+    fingerprint: str,
+    total_items: int,
+    page_size: int | None,
+    cursor: str | None,
+    section_anchor: str | None,
+) -> tuple[int, int, None] | tuple[None, None, dict[str, Any]]:
+    """Resolve the ``(offset, page_size)`` window a pagination call should
+    return, validating a caller-supplied ``cursor`` against the CURRENT
+    ``fingerprint``/``section_anchor``. Only called once the caller has
+    already established this IS a paginating call (``page_size is not None
+    or cursor is not None``).
+
+    Returns ``(offset, page_size, None)`` on success, or
+    ``(None, None, error)`` with a clear, explicit ``error["reason"]`` (one
+    of ``"invalid_cursor"``, ``"stale_cursor"``, ``"invalid_page_size"``) on
+    any rejection -- never silently served against stale/mismatched data.
+    """
+    if cursor is not None:
+        decoded = _decode_page_cursor(cursor, kind=kind)
+        if decoded is None:
+            return None, None, {
+                "error": "cursor is malformed, tampered with, or was not issued by this function",
+                "reason": "invalid_cursor",
+            }
+        if decoded["fp"] != fingerprint:
+            return None, None, {
+                "error": (
+                    "cursor is stale: the document's content has changed "
+                    "since this cursor was issued -- restart pagination "
+                    "with page_size (no cursor) to get a fresh sequence"
+                ),
+                "reason": "stale_cursor",
+            }
+        if (decoded.get("sa") or None) != (section_anchor or None):
+            return None, None, {
+                "error": (
+                    "cursor was issued for a different section_anchor than "
+                    "the one passed to this call"
+                ),
+                "reason": "invalid_cursor",
+            }
+        offset = decoded["off"]
+        resolved_page_size = page_size if page_size is not None else decoded["ps"]
+        if not isinstance(resolved_page_size, int) or isinstance(resolved_page_size, bool) or resolved_page_size <= 0:
+            return None, None, {
+                "error": f"page_size must be a positive int, got {resolved_page_size!r}",
+                "reason": "invalid_page_size",
+            }
+        if offset > total_items:
+            return None, None, {
+                "error": (
+                    f"cursor offset {offset} is beyond the current item "
+                    f"count ({total_items}) for this fingerprint -- the "
+                    "cursor is stale"
+                ),
+                "reason": "stale_cursor",
+            }
+        return offset, resolved_page_size, None
+
+    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0:
+        return None, None, {
+            "error": f"page_size must be a positive int, got {page_size!r}",
+            "reason": "invalid_page_size",
+        }
+    return 0, page_size, None
+
+
+def _paginated_page_result(
+    offset: int,
+    page_size: int,
+    total_items: int,
+    *,
+    kind: str,
+    fingerprint: str,
+    section_anchor: str | None,
+) -> tuple[int, int, str | None, bool]:
+    """Compute ``(page_start, page_end, next_cursor, has_more)`` for an
+    already-resolved ``(offset, page_size)`` pagination window."""
+    page_end = min(offset + page_size, total_items)
+    has_more = page_end < total_items
+    next_cursor = (
+        _encode_page_cursor(
+            kind=kind, fingerprint=fingerprint, offset=page_end,
+            page_size=page_size, section_anchor=section_anchor,
+        )
+        if has_more else None
+    )
+    return offset, page_end, next_cursor, has_more
+
+
+def _resolve_section_anchor_bounds(
+    paras: list[dict[str, Any]], anchor: str
+) -> tuple[int, int] | None:
+    """Resolve ``anchor`` (a heading's ``para_id``, or its exact heading
+    text) against ``paras`` (:func:`parse_docx`'s flat paragraph list) to a
+    ``[start, end)`` PARAGRAPH-INDEX range covering that heading's own
+    paragraph plus its entire subsection (nested sub-headings and their
+    body) -- the same "whole section, not just the heading line" semantics
+    :func:`move_section` / :func:`copy_section` / :func:`relocate_table`
+    already use via :func:`_locate_section_bounds`, resolved here against the
+    flat paragraph list instead of the raw XML body (this module's other
+    section-bounds helper needs a live ``ET.Element`` body; document_outline
+    and read_document_snapshot only ever have :func:`parse_docx`'s output).
+
+    Returns ``None`` when ``anchor`` does not resolve to any heading.
+    """
+    heading_positions = [
+        (i, _heading_level(p.get("style")))
+        for i, p in enumerate(paras)
+        if _is_heading(p.get("style"))
+    ]
+    target_pos = next(
+        (
+            pos
+            for pos, (idx, _level) in enumerate(heading_positions)
+            if paras[idx].get("para_id") == anchor or paras[idx].get("text") == anchor
+        ),
+        None,
+    )
+    if target_pos is None:
+        return None
+    start_idx, target_level = heading_positions[target_pos]
+    end_idx = len(paras)
+    for idx, level in heading_positions[target_pos + 1 :]:
+        if level <= target_level:
+            end_idx = idx
+            break
+    return start_idx, end_idx
+
+
+def _annotate_section_paths(paras: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a NEW list of paragraph dicts (shallow copies), each carrying
+    a ``section_path`` (ancestor heading texts, root first -- ``[]`` for
+    content before the first heading; a heading paragraph's own text is the
+    LAST entry of its own ``section_path``) and ``heading_para_id`` (the
+    innermost ancestor heading's ``para_id``, ``None`` before the first
+    heading). Mirrors the same heading-stack walk :func:`_build_chunks_from_paras`
+    uses for chunk boundaries, applied per-paragraph instead of per-chunk.
+    """
+    heading_stack: list[dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
+    for p in paras:
+        style = p.get("style")
+        if _is_heading(style):
+            lvl = _heading_level(style)
+            while heading_stack and heading_stack[-1]["level"] >= lvl:
+                heading_stack.pop()
+            heading_stack.append(
+                {"level": lvl, "text": p.get("text", ""), "para_id": p.get("para_id")}
+            )
+        section_path = [h["text"] for h in heading_stack]
+        heading_para_id = heading_stack[-1]["para_id"] if heading_stack else None
+        out.append({**p, "section_path": section_path, "heading_para_id": heading_para_id})
+    return out
+
+
+def document_outline(
+    source: str | bytes | bytearray,
+    *,
+    page_size: int | None = None,
+    cursor: str | None = None,
+    section_anchor: str | None = None,
+) -> dict[str, Any]:
     """13462df2 — stateless heading outline of a .docx (path or raw bytes). No
     sidecar index: a pure parse. Returns ``paragraph_count`` + ``heading_count``
     + an ordered ``headings`` list (level/text/para_id/section_type) — the
@@ -391,15 +619,74 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
     4a07e566 — each heading now carries a ``section_type`` field
     (abstract/toc/lof/main/appendix) classifying the document region it belongs
     to. The ``section_regions`` key summarises the distinct regions in order.
+
+    1dff1300 — cursor-based pagination + section scoping, so a large
+    document's outline can never silently truncate or exceed a caller's
+    token budget:
+
+      - Every call (paginated or not) now includes ``document_fingerprint``
+        (SHA-256 of the exact source bytes just parsed -- see
+        :func:`_source_fingerprint`) — the identity a returned ``cursor`` is
+        bound to. Each heading also now carries its ``index`` (position in
+        :func:`parse_docx`'s paragraph list -- deterministic document
+        order, stable across calls on unchanged content).
+      - Pass ``page_size`` (no ``cursor``) for the FIRST page: at most
+        ``page_size`` headings, plus ``cursor`` (an opaque token for the
+        NEXT page, or ``None`` when this is the last page), ``has_more``,
+        and ``total`` (the true heading count, after ``section_anchor``
+        scoping if given).
+      - Pass ``cursor`` (from a prior call) for the NEXT page. Its
+        ``page_size``/``section_anchor`` are remembered from the call that
+        minted it unless explicitly overridden.
+      - ``section_anchor`` (a heading's ``para_id`` or exact heading text)
+        scopes the outline to just that heading's own subsection (itself +
+        nested sub-headings + their body) — the same "whole section" bounds
+        :func:`move_section` / :func:`copy_section` use.
+      - A cursor whose embedded fingerprint no longer matches the
+        document's CURRENT content (it changed between page requests), or
+        whose embedded ``section_anchor`` doesn't match this call's, or
+        that is simply malformed, is rejected with a clear
+        ``{"error": ..., "reason": "stale_cursor" | "invalid_cursor"}`` —
+        never silently served against stale/mismatched data.
+      - Omitting BOTH ``page_size`` and ``cursor`` (the default) returns
+        the ENTIRE outline exactly as before this item — fully backward
+        compatible; ``document_fingerprint`` (and each heading's ``index``)
+        are the only new fields added to that response shape.
+
+    Returns:
+      Non-paginated (default): ``{paragraph_count, heading_count, headings,
+      section_regions, document_fingerprint}``.
+      Paginated: adds ``{cursor, has_more, total, section_anchor}`` —
+      ``headings``/``paragraph_count``/``heading_count`` reflect just the
+      current page / section scope, ``total`` is the true (post-scoping)
+      heading count.
+      ``{"error": ..., "reason": ...}`` on an invalid cursor/page_size
+      (``reason`` one of ``"invalid_cursor"``, ``"stale_cursor"``,
+      ``"invalid_page_size"``) or an unresolvable ``section_anchor``
+      (``reason="section_not_found"``) — never a partial/misleading page.
     """
     paras = parse_docx(source)
+    fingerprint = _source_fingerprint(source)
+
+    scoped_paras = paras
+    if section_anchor is not None:
+        bounds = _resolve_section_anchor_bounds(paras, section_anchor)
+        if bounds is None:
+            return {
+                "error": f"section_anchor {section_anchor!r} does not resolve to any heading",
+                "reason": "section_not_found",
+            }
+        start_idx, end_idx = bounds
+        scoped_paras = paras[start_idx:end_idx]
+
     raw_headings = [
         {
+            "index": p.get("index"),
             "level": _heading_level(p.get("style")),
             "text": p.get("text", ""),
             "para_id": p.get("para_id"),
         }
-        for p in paras
+        for p in scoped_paras
         if _is_heading(p.get("style"))
     ]
     headings = _assign_section_types(raw_headings)
@@ -411,11 +698,42 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
         if not seen_regions or seen_regions[-1] != r:
             seen_regions.append(r)
 
+    if page_size is None and cursor is None:
+        return {
+            "paragraph_count": len(scoped_paras),
+            "heading_count": len(headings),
+            "headings": headings,
+            "section_regions": seen_regions,
+            "document_fingerprint": fingerprint,
+        }
+
+    offset, resolved_page_size, error = _resolve_pagination_window(
+        kind="outline",
+        fingerprint=fingerprint,
+        total_items=len(headings),
+        page_size=page_size,
+        cursor=cursor,
+        section_anchor=section_anchor,
+    )
+    if error is not None:
+        return error
+
+    page_start, page_end, next_cursor, has_more = _paginated_page_result(
+        offset, resolved_page_size, len(headings),
+        kind="outline", fingerprint=fingerprint, section_anchor=section_anchor,
+    )
+    page_headings = headings[page_start:page_end]
+
     return {
-        "paragraph_count": len(paras),
-        "heading_count": len(headings),
-        "headings": headings,
+        "paragraph_count": len(scoped_paras),
+        "heading_count": len(page_headings),
+        "headings": page_headings,
         "section_regions": seen_regions,
+        "document_fingerprint": fingerprint,
+        "cursor": next_cursor,
+        "has_more": has_more,
+        "total": len(headings),
+        "section_anchor": section_anchor,
     }
 
 
@@ -14893,7 +15211,14 @@ def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[st
     }
 
 
-def read_document_snapshot(docx_path: str) -> dict[str, Any]:
+def read_document_snapshot(
+    docx_path: str,
+    *,
+    page_size: int | None = None,
+    cursor: str | None = None,
+    section_anchor: str | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
     """Read the saved DOCX snapshot without writing or requiring a close.
 
     Word normally leaves a sibling ~$ lock file while a document is open.
@@ -14923,6 +15248,37 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
         these limitations alongside anything derived from it, rather than
         silently treating "read succeeded" as "reflects what's on screen in
         Word right now".
+
+    1dff1300 -- cursor-based pagination + section scoping, identical
+    contract to :func:`document_outline` (see its docstring for the full
+    cursor/staleness/rejection rules) applied to the ``paragraphs`` list
+    instead of ``headings``. A cursor minted by ``document_outline`` is
+    never accepted here, and vice versa (each is bound to its own
+    ``kind``). Omitting BOTH ``page_size`` and ``cursor`` (the default)
+    returns the FULL paragraph list exactly as before this item -- fully
+    backward compatible; ``source_sha256`` (already present) doubles as
+    this function's document-identity fingerprint, so no new top-level
+    field is needed for that.
+
+    Each paragraph in a PAGINATED response additionally carries
+    ``section_path`` (ancestor heading texts, root first) and
+    ``heading_para_id`` -- deterministic document order and stable
+    per-paragraph identity were already true of ``para_id`` (see
+    :func:`parse_docx`'s three-tier id scheme); this adds the section
+    identity alongside it.
+
+    ``index_db_path``, when given, attaches ``stale_index`` (this
+    document's structural-sidecar freshness -- see
+    :func:`get_structure_freshness`) and, best-effort, whole-document
+    ``tables`` / ``figures`` identity metadata already recorded in that
+    sidecar (see :func:`get_local_structure_elements`) plus ``equations``
+    (see :func:`get_local_equations`, filtered to the ones whose
+    ``para_id`` falls within the current page/section when paginating --
+    ``para_id`` is directly comparable across both functions, unlike the
+    sidecar's raw body-child ``index``, which counts tables/paragraphs
+    together and is therefore NOT filtered per-page here). Never raises
+    and never blocks on a missing/stale/incomplete sidecar -- absence or
+    staleness is reported via ``stale_index``, never a hard failure.
     """
     try:
         with open(docx_path, "rb") as handle:
@@ -14933,6 +15289,20 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
         paragraphs = parse_docx(raw)
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
         return {"error": str(exc)}
+
+    fingerprint = _source_fingerprint(raw)
+
+    scoped_paragraphs = paragraphs
+    if section_anchor is not None:
+        bounds = _resolve_section_anchor_bounds(paragraphs, section_anchor)
+        if bounds is None:
+            return {
+                "error": f"section_anchor {section_anchor!r} does not resolve to any heading",
+                "reason": "section_not_found",
+            }
+        start_idx, end_idx = bounds
+        scoped_paragraphs = paragraphs[start_idx:end_idx]
+
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         xml_parts = sorted(
             name
@@ -14946,17 +15316,15 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
         os.path.dirname(docx_path),
         "~$" + os.path.basename(docx_path),
     )
-    return {
+
+    result: dict[str, Any] = {
         "status": "read_only",
         "docx_path": docx_path,
         "byte_size": len(raw),
         "saved_mtime": _stat_mtime(docx_path),
-        "source_sha256": _source_fingerprint(raw),
+        "source_sha256": fingerprint,
         "word_lock_hint": os.path.exists(lock_hint),
         "xml_parts": xml_parts,
-        "paragraph_count": len(paragraphs),
-        "heading_count": sum(1 for paragraph in paragraphs if _is_heading(paragraph["style"])),
-        "paragraphs": paragraphs,
         "limitations": [
             "This reflects only the last SAVED state of docx_path. Any "
             "edits made in Word since the last save -- including changes "
@@ -14972,3 +15340,58 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
             "writer may not create one at all).",
         ],
     }
+
+    if index_db_path is not None:
+        result["stale_index"] = get_structure_freshness(index_db_path)
+        try:
+            elements = get_local_structure_elements(index_db_path, allow_stale=True)
+            result["tables"] = elements.get("tables", [])
+            result["figures"] = elements.get("figures", [])
+        except sqlite3.OperationalError:
+            result["tables"] = []
+            result["figures"] = []
+        try:
+            result["equations"] = get_local_equations(index_db_path)
+        except sqlite3.OperationalError:
+            result["equations"] = []
+
+    if page_size is None and cursor is None:
+        result["paragraph_count"] = len(scoped_paragraphs)
+        result["heading_count"] = sum(
+            1 for paragraph in scoped_paragraphs if _is_heading(paragraph["style"])
+        )
+        result["paragraphs"] = scoped_paragraphs
+        return result
+
+    offset, resolved_page_size, error = _resolve_pagination_window(
+        kind="snapshot",
+        fingerprint=fingerprint,
+        total_items=len(scoped_paragraphs),
+        page_size=page_size,
+        cursor=cursor,
+        section_anchor=section_anchor,
+    )
+    if error is not None:
+        return error
+
+    page_start, page_end, next_cursor, has_more = _paginated_page_result(
+        offset, resolved_page_size, len(scoped_paragraphs),
+        kind="snapshot", fingerprint=fingerprint, section_anchor=section_anchor,
+    )
+    annotated = _annotate_section_paths(scoped_paragraphs)
+    page_paragraphs = annotated[page_start:page_end]
+
+    if index_db_path is not None and "equations" in result:
+        page_para_ids = {p.get("para_id") for p in page_paragraphs}
+        result["equations"] = [
+            eq for eq in result["equations"] if eq.get("para_id") in page_para_ids
+        ]
+
+    result["paragraph_count"] = len(page_paragraphs)
+    result["heading_count"] = sum(1 for p in page_paragraphs if _is_heading(p.get("style")))
+    result["paragraphs"] = page_paragraphs
+    result["cursor"] = next_cursor
+    result["has_more"] = has_more
+    result["total"] = len(scoped_paragraphs)
+    result["section_anchor"] = section_anchor
+    return result
