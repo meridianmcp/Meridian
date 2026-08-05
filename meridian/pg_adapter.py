@@ -3150,11 +3150,12 @@ async def _migrate_pg_workspace_proposals(conn: PostgresConnection) -> None:
         f"    last_activity_at TEXT NOT NULL DEFAULT ({_TS})"
         ");"
         "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS family_id TEXT;"
-        # _TS returns a formatted TEXT value, matching created_at/updated_at
-        # and the SQLite schema.  Using TIMESTAMPTZ here makes the entire
-        # migration roll back because PostgreSQL cannot use to_char(...) as a
-        # timestamptz default, leaving legacy production databases without the
-        # column that proposal reads require.
+        # 595126d (2026-08-05 hotfix) -- _TS returns a formatted TEXT value,
+        # matching created_at/updated_at and the SQLite schema. Using
+        # TIMESTAMPTZ here makes the entire migration roll back because
+        # PostgreSQL cannot use to_char(...) as a timestamptz default,
+        # leaving legacy production databases without the column that
+        # proposal reads require.
         f"ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS last_activity_at TEXT NOT NULL DEFAULT ({_TS});"
         "UPDATE workspace_proposals SET last_activity_at = COALESCE(last_activity_at, created_at);"
         "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
@@ -3166,6 +3167,16 @@ async def _migrate_pg_workspace_proposals(conn: PostgresConnection) -> None:
         "ON workspace_proposals(tenant_id, last_activity_at, created_seq);"
         "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_family "
         "ON workspace_proposals(tenant_id, family_id);"
+        # 867317f6 -- idempotency_key: optional caller-supplied dedup key so
+        # add_workspace_proposal is safe to retry. Scoped by
+        # COALESCE(tenant_id, '') rather than raw tenant_id so a self-host
+        # DB (tenant_id always NULL) still gets real duplicate-prevention --
+        # plain NULLs are never equal under a UNIQUE index/constraint on
+        # either backend. Mirrors db.migrations._migrate_workspace_proposals.
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS idempotency_key TEXT;"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_proposals_idempotency "
+        "ON workspace_proposals(COALESCE(tenant_id, ''), idempotency_key) "
+        "WHERE idempotency_key IS NOT NULL;"
         "CREATE TABLE IF NOT EXISTS proposal_events ("
         "    id TEXT PRIMARY KEY,"
         "    proposal_id TEXT NOT NULL,"
