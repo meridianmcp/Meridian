@@ -53,9 +53,11 @@ import hashlib
 import io
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
@@ -68,6 +70,11 @@ __all__ = [
     "UNAVAILABLE_WITH_REASON",
     "FAILED",
     "RENDER_STATUSES",
+    "TIMEOUT_ERROR",
+    "TRANSPORT_ERROR",
+    "CORRUPTION_ERROR",
+    "UNKNOWN_ERROR",
+    "FAILURE_CLASSES",
     "RenderCapabilityError",
     "RenderBackend",
     "KNOWN_BACKENDS",
@@ -87,6 +94,30 @@ FAILED = "failed"
 RENDER_STATUSES: tuple[str, str, str] = (RENDERED, UNAVAILABLE_WITH_REASON, FAILED)
 
 
+# ---------------------------------------------------------------------------
+# c44d245d -- bounded, diagnostic failure classification for the ``"failed"``
+# status. The three-state contract above (rendered / unavailable-with-reason /
+# failed) stays exactly as-is -- this classifies *why* a ``"failed"`` result
+# happened, carried as ``error_class`` on both the raised
+# :class:`RenderCapabilityError` and the ``detail`` dict of the returned
+# result, so a caller can tell "the render backend hung" apart from "the
+# render backend couldn't even start" apart from "the document itself is
+# broken" instead of collapsing all three into one opaque reason string.
+# ---------------------------------------------------------------------------
+
+TIMEOUT_ERROR = "timeout"
+TRANSPORT_ERROR = "transport"
+CORRUPTION_ERROR = "corruption"
+UNKNOWN_ERROR = "unknown"
+
+FAILURE_CLASSES: tuple[str, str, str, str] = (
+    TIMEOUT_ERROR,
+    TRANSPORT_ERROR,
+    CORRUPTION_ERROR,
+    UNKNOWN_ERROR,
+)
+
+
 class RenderCapabilityError(Exception):
     """Raised by a :class:`RenderBackend`'s ``render`` callable when a render
     attempt for a specific document fails.
@@ -95,7 +126,42 @@ class RenderCapabilityError(Exception):
     backend raises) and converts it into a ``"failed"`` status -- it is never
     allowed to propagate to the caller and never silently reported as
     ``"rendered"``.
+
+    c44d245d -- carries structured diagnostic fields so ``check_render_
+    capability`` can report *why* a render failed, not just that it did:
+
+    * ``error_class`` -- one of :data:`FAILURE_CLASSES`. Defaults to
+      ``UNKNOWN_ERROR`` so existing ``raise RenderCapabilityError("...")``
+      call sites (message-only) keep working unchanged.
+    * ``exit_code`` -- the subprocess exit code, when the failure came from a
+      subprocess backend that actually ran to completion.
+    * ``stderr`` -- captured stderr text, when available.
+    * ``timed_out`` -- ``True`` when the render attempt was killed for
+      exceeding its bounded time budget.
+    * ``retryable`` -- ``True`` only for failures that are safe AND likely
+      useful to retry (idempotent transport hiccups: the backend couldn't be
+      reached/spawned this one time). Timeouts and document-corruption
+      failures are never retryable -- retrying either just repeats the same
+      outcome at extra cost (corruption) or doubles the wait for no new
+      information (timeout).
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_class: str = UNKNOWN_ERROR,
+        exit_code: int | None = None,
+        stderr: str | None = None,
+        timed_out: bool = False,
+        retryable: bool = False,
+    ):
+        super().__init__(message)
+        self.error_class = error_class if error_class in FAILURE_CLASSES else UNKNOWN_ERROR
+        self.exit_code = exit_code
+        self.stderr = stderr
+        self.timed_out = timed_out
+        self.retryable = bool(retryable)
 
 
 @dataclass(frozen=True)
@@ -136,34 +202,103 @@ def _soffice_unavailable_reason() -> str | None:
     return "LibreOffice ('soffice'/'libreoffice') not found on PATH"
 
 
+# c44d245d -- module-level so tests can monkeypatch a short bound instead of
+# waiting out a real 60s timeout to exercise the timeout-classification path.
+_SOFFICE_TIMEOUT_SECONDS = 60.0
+
+# Substrings (lowercased) in soffice's stderr that indicate the SOURCE
+# document itself is the problem (a genuinely corrupt/unreadable .docx),
+# as opposed to a transient environment hiccup (profile lock contention,
+# a busy display server, a momentarily-unavailable temp dir, etc.). This is
+# a best-effort heuristic, not a guarantee -- soffice does not have a
+# machine-readable error-classification exit code, so this is the same kind
+# of "read the diagnostic text" classification a human operator would do.
+_SOFFICE_CORRUPTION_MARKERS = (
+    "source file could not be loaded",
+    "not a valid",
+    "corrupt",
+    "damaged",
+    "unreadable content",
+    "cannot be read",
+)
+
+
+def _classify_soffice_failure(stderr: str) -> tuple[str, bool]:
+    """Return ``(error_class, retryable)`` for a nonzero-exit soffice run."""
+    lowered = (stderr or "").lower()
+    if any(marker in lowered for marker in _SOFFICE_CORRUPTION_MARKERS):
+        return CORRUPTION_ERROR, False
+    # No corruption marker found -- treat as a transient transport/environment
+    # issue (e.g. soffice's user-profile lock held by another instance) and
+    # allow ONE retry; check_render_capability enforces the actual bound.
+    return TRANSPORT_ERROR, True
+
+
 def _soffice_render(docx_path: str) -> dict[str, Any]:
     executable = _soffice_executable()
     if executable is None:
         # unavailable_reason() should have prevented this call; guard anyway
         # so a race (PATH changing mid-process) still fails loudly, not silently.
         raise RenderCapabilityError(
-            "soffice executable disappeared between capability check and render"
+            "soffice executable disappeared between capability check and render",
+            error_class=TRANSPORT_ERROR,
+            retryable=True,
         )
     with tempfile.TemporaryDirectory(prefix="meridian_render_gate_") as out_dir:
         try:
             result = subprocess.run(
                 [executable, "--headless", "--convert-to", "pdf", "--outdir", out_dir, docx_path],
                 capture_output=True,
-                timeout=60,
+                timeout=_SOFFICE_TIMEOUT_SECONDS,
                 check=False,
             )
+        except subprocess.TimeoutExpired as exc:
+            # subprocess.run() already kills (process.kill()) the EXACT child
+            # process IT spawned before re-raising TimeoutExpired -- this
+            # never touches any other soffice instance running on the
+            # machine, satisfying "clean only Meridian-owned processes"
+            # without any extra process-sweeping logic. Timeouts are never
+            # retried: a render that hung once is likely to hang again, and
+            # retrying just doubles the wait for no new information.
+            stderr = None
+            if exc.stderr:
+                stderr = (
+                    exc.stderr.decode("utf-8", errors="replace")
+                    if isinstance(exc.stderr, (bytes, bytearray))
+                    else str(exc.stderr)
+                )
+            raise RenderCapabilityError(
+                f"soffice --convert-to pdf exceeded its {_SOFFICE_TIMEOUT_SECONDS:.0f}s "
+                "bound and was terminated",
+                error_class=TIMEOUT_ERROR,
+                timed_out=True,
+                stderr=stderr,
+                retryable=False,
+            ) from exc
         except (OSError, subprocess.SubprocessError) as exc:
-            raise RenderCapabilityError(f"soffice conversion could not start: {exc}") from exc
+            raise RenderCapabilityError(
+                f"soffice conversion could not start: {exc}",
+                error_class=TRANSPORT_ERROR,
+                retryable=True,
+            ) from exc
         if result.returncode != 0:
             stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            error_class, retryable = _classify_soffice_failure(stderr)
             raise RenderCapabilityError(
                 f"soffice --convert-to pdf exited with code {result.returncode}: "
-                f"{stderr or '(no stderr output)'}"
+                f"{stderr or '(no stderr output)'}",
+                error_class=error_class,
+                exit_code=result.returncode,
+                stderr=stderr or None,
+                retryable=retryable,
             )
         produced = [name for name in os.listdir(out_dir) if name.lower().endswith(".pdf")]
         if not produced:
             raise RenderCapabilityError(
-                "soffice reported success (exit code 0) but produced no .pdf output"
+                "soffice reported success (exit code 0) but produced no .pdf output",
+                error_class=UNKNOWN_ERROR,
+                exit_code=result.returncode,
+                retryable=False,
             )
         return {"converted_via": "soffice", "output_filename": produced[0]}
 
@@ -192,28 +327,140 @@ def _word_com_unavailable_reason() -> str | None:
     return None
 
 
+# c44d245d -- module-level so tests can shrink the bound instead of waiting
+# out a real 60s hang to exercise the timeout-classification/cleanup path.
+_WORD_COM_TIMEOUT_SECONDS = 60.0
+
+# Word COM errors surface as a broad pywintypes.com_error whose message text
+# is the only signal available (no structured error code Python can reliably
+# decode across Office versions) -- same best-effort text-classification
+# philosophy as _classify_soffice_failure above.
+_WORD_COM_TRANSIENT_MARKERS = (
+    "rpc server is unavailable",
+    "call was rejected by callee",
+    "server execution failed",
+    "operation unavailable",
+    "the message filter indicated",
+)
+_WORD_COM_CORRUPTION_MARKERS = (
+    "cannot open",
+    "is not a valid",
+    "cannot be opened because there are problems",
+    "converter",
+    "damaged",
+)
+
+
+def _classify_word_com_exception(exc: BaseException) -> tuple[str, bool]:
+    """Return ``(error_class, retryable)`` for an exception raised while
+    driving Word COM automation."""
+    message = str(exc).lower()
+    if any(marker in message for marker in _WORD_COM_TRANSIENT_MARKERS):
+        return TRANSPORT_ERROR, True
+    if any(marker in message for marker in _WORD_COM_CORRUPTION_MARKERS):
+        return CORRUPTION_ERROR, False
+    return UNKNOWN_ERROR, False
+
+
+def _word_application_pid(word: Any) -> int | None:
+    """Best-effort resolve the OS process id backing a ``Word.Application``
+    COM object, via its main window handle. Returns ``None`` (never raises)
+    when pywin32's ``win32process`` isn't importable or the handle can't be
+    resolved -- callers must treat a ``None`` pid as "cleanup unavailable",
+    not as an error.
+    """
+    try:
+        import win32process  # local import: optional dependency, pywin32-only
+
+        hwnd = word.Hwnd
+        _thread_id, process_id = win32process.GetWindowThreadProcessId(hwnd)
+        return int(process_id)
+    except Exception:
+        return None
+
+
+def _terminate_owned_process(pid: int) -> bool:
+    """Best-effort terminate exactly the process id THIS call spawned and
+    tracked (never a sweep of every WINWORD.EXE on the machine) after a
+    bounded Word COM render exceeded its time budget. Returns ``True`` on a
+    best-effort success, ``False`` on any failure -- never raises, since this
+    already runs on the "something went badly wrong" path and must not mask
+    the real timeout with a secondary crash.
+    """
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
 def _word_com_render(docx_path: str) -> dict[str, Any]:
     import win32com.client  # local import: optional dependency, only touched when available
 
     with tempfile.TemporaryDirectory(prefix="meridian_render_gate_") as out_dir:
         pdf_path = os.path.join(out_dir, "render_probe.pdf")
-        word = None
-        doc = None
-        try:
-            word = win32com.client.DispatchEx("Word.Application")
-            word.Visible = False
-            doc = word.Documents.Open(os.path.abspath(docx_path), ReadOnly=True)
-            doc.SaveAs(pdf_path, FileFormat=_WD_FORMAT_PDF)
-        except Exception as exc:  # COM errors surface as broad pywintypes.com_error
-            raise RenderCapabilityError(f"Word COM render failed: {exc}") from exc
-        finally:
-            if doc is not None:
-                doc.Close(False)
-            if word is not None:
-                word.Quit()
+        outcome: dict[str, Any] = {}
+        owned: dict[str, int | None] = {"pid": None}
+
+        def _worker() -> None:
+            word = None
+            doc = None
+            try:
+                word = win32com.client.DispatchEx("Word.Application")
+                word.Visible = False
+                owned["pid"] = _word_application_pid(word)
+                doc = word.Documents.Open(os.path.abspath(docx_path), ReadOnly=True)
+                doc.SaveAs(pdf_path, FileFormat=_WD_FORMAT_PDF)
+            except Exception as exc:  # COM errors surface as broad pywintypes.com_error
+                outcome["exc"] = exc
+            finally:
+                try:
+                    if doc is not None:
+                        doc.Close(False)
+                except Exception:
+                    pass
+                try:
+                    if word is not None:
+                        word.Quit()
+                except Exception:
+                    pass
+
+        # c44d245d -- Word COM automation has no native call-level timeout
+        # (a modal "keep changes?"/repair prompt can block Documents.Open
+        # indefinitely). Bound it explicitly with a watchdog thread: if the
+        # worker hasn't finished within the budget, terminate ONLY the exact
+        # Word process this call spawned (never every WINWORD.EXE running on
+        # the box) and report a classified timeout rather than hanging the
+        # whole render-capability check forever.
+        worker_thread = threading.Thread(target=_worker, daemon=True)
+        worker_thread.start()
+        worker_thread.join(_WORD_COM_TIMEOUT_SECONDS)
+
+        if worker_thread.is_alive():
+            pid = owned.get("pid")
+            terminated = _terminate_owned_process(pid) if pid is not None else False
+            raise RenderCapabilityError(
+                f"Word COM render exceeded its {_WORD_COM_TIMEOUT_SECONDS:.0f}s bound "
+                f"and was terminated (owned pid={pid!r}, terminated={terminated})",
+                error_class=TIMEOUT_ERROR,
+                timed_out=True,
+                retryable=False,
+            )
+
+        if "exc" in outcome:
+            exc = outcome["exc"]
+            error_class, retryable = _classify_word_com_exception(exc)
+            raise RenderCapabilityError(
+                f"Word COM render failed: {exc}",
+                error_class=error_class,
+                retryable=retryable,
+            ) from exc
+
         if not os.path.exists(pdf_path):
             raise RenderCapabilityError(
-                "Word COM reported success but no PDF was written to disk"
+                "Word COM reported success but no PDF was written to disk",
+                error_class=UNKNOWN_ERROR,
+                retryable=False,
             )
         return {"converted_via": "word-com", "output_filename": os.path.basename(pdf_path)}
 
@@ -271,10 +518,28 @@ def _result(
     return out
 
 
+def _failure_detail(exc: RenderCapabilityError | None, *, attempts: int, exception_type: str | None = None) -> dict[str, Any]:
+    detail: dict[str, Any] = {"attempts": attempts}
+    if exc is not None:
+        detail["error_class"] = exc.error_class
+        detail["timed_out"] = exc.timed_out
+        if exc.exit_code is not None:
+            detail["exit_code"] = exc.exit_code
+        if exc.stderr:
+            detail["stderr"] = exc.stderr
+    else:
+        detail["error_class"] = UNKNOWN_ERROR
+        detail["timed_out"] = False
+    if exception_type is not None:
+        detail["exception_type"] = exception_type
+    return detail
+
+
 def check_render_capability(
     docx_path: str,
     *,
     backends: Sequence[RenderBackend] = KNOWN_BACKENDS,
+    max_retries: int = 1,
 ) -> dict[str, Any]:
     """Capability-detection status check for visual-QA rendering readiness.
 
@@ -302,6 +567,25 @@ def check_render_capability(
     concrete, checkable error about this specific call), not
     ``"unavailable-with-reason"`` (which is reserved for environment-level
     capability gaps that are true regardless of which document was passed).
+
+    c44d245d -- bounded, diagnostic failure handling on top of the three-state
+    contract above (which is unchanged):
+
+      - A ``"failed"`` result's ``detail`` now always carries ``error_class``
+        (one of :data:`FAILURE_CLASSES`: ``"timeout"``, ``"transport"``,
+        ``"corruption"``, ``"unknown"``), ``timed_out``, and ``attempts``, plus
+        ``exit_code``/``stderr`` when the backend captured them. This lets a
+        caller distinguish "the backend hung", "the backend couldn't be
+        reached/spawned", and "this specific document is broken" instead of
+        parsing a free-text reason string.
+      - ``max_retries`` (default 1) bounds automatic retry of a render
+        attempt, and ONLY when the immediately-preceding failure classified
+        itself as ``retryable=True`` (a transient, idempotent transport
+        hiccup -- rendering never mutates ``docx_path``, so retrying is always
+        safe from a data standpoint; the classification is about whether
+        it's *useful*, not just safe). Timeouts and document-corruption
+        failures are never retryable and so are never retried, no matter how
+        high ``max_retries`` is set.
     """
     if not docx_path or not str(docx_path).strip():
         return _result(FAILED, reason="docx_path must be a non-empty string")
@@ -319,14 +603,32 @@ def check_render_capability(
             reason="no render backend available in this environment: " + "; ".join(reasons),
         )
 
-    try:
-        detail = backend.render(docx_path)
-    except RenderCapabilityError as exc:
-        return _result(FAILED, reason=str(exc), backend=backend.name)
-    except Exception as exc:  # backend bug / unexpected subprocess or COM error
-        return _result(FAILED, reason=f"{type(exc).__name__}: {exc}", backend=backend.name)
-
-    return _result(RENDERED, backend=backend.name, detail=detail)
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            detail = backend.render(docx_path)
+        except RenderCapabilityError as exc:
+            if exc.retryable and attempts <= max_retries:
+                continue
+            return _result(
+                FAILED,
+                reason=str(exc),
+                backend=backend.name,
+                detail=_failure_detail(exc, attempts=attempts),
+            )
+        except Exception as exc:  # backend bug / unexpected subprocess or COM error
+            # An unclassified exception (not RenderCapabilityError) is never
+            # retried -- only a backend that explicitly classifies its own
+            # failure as retryable gets the retry budget.
+            return _result(
+                FAILED,
+                reason=f"{type(exc).__name__}: {exc}",
+                backend=backend.name,
+                detail=_failure_detail(None, attempts=attempts, exception_type=type(exc).__name__),
+            )
+        else:
+            return _result(RENDERED, backend=backend.name, detail=detail)
 
 
 # ---------------------------------------------------------------------------
