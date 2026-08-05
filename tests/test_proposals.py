@@ -6,6 +6,7 @@ import aiosqlite
 import pytest
 
 from meridian import db as db_module
+from meridian import pg_adapter
 
 
 async def _table_columns(db, table: str) -> set[str]:
@@ -50,6 +51,46 @@ async def test_proposal_events_schema_supports_append_only_provenance(db):
 async def test_proposal_schema_supports_family_and_activity_discovery(db):
     columns = await _table_columns(db, "workspace_proposals")
     assert columns >= {"family_id", "last_activity_at"}
+
+
+@pytest.mark.asyncio
+async def test_postgres_proposal_migration_uses_text_activity_column():
+    """The Postgres upgrade must not fail on legacy schemas.
+
+    _TS is a formatted text expression.  The migration must therefore add the
+    activity column as TEXT; TIMESTAMPTZ would make PostgreSQL roll back the
+    whole migration before the proposal read path can use it.
+    """
+
+    class CaptureConnection:
+        def __init__(self):
+            self.script = ""
+
+        async def executescript(self, sql):
+            self.script = sql
+
+    conn = CaptureConnection()
+    await pg_adapter._migrate_pg_workspace_proposals(conn)
+
+    assert (
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
+        "last_activity_at TEXT NOT NULL DEFAULT"
+    ) in conn.script
+    assert "last_activity_at TIMESTAMPTZ" not in conn.script
+
+
+@pytest.mark.asyncio
+async def test_postgres_migration_is_registered_for_workspace_proposals():
+    """The self-healing migration remains in the Postgres migration queue."""
+
+    assert any(
+        pg_adapter._migrate_pg_workspace_proposals in migrations
+        for migrations in (
+            pg_adapter._PG_MIGRATIONS_CORE,
+            pg_adapter._PG_MIGRATIONS_HOSTED,
+            pg_adapter._PG_MIGRATIONS_LATE,
+        )
+    )
 
 
 @pytest.mark.asyncio

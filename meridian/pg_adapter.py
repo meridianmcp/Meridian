@@ -3150,7 +3150,12 @@ async def _migrate_pg_workspace_proposals(conn: PostgresConnection) -> None:
         f"    last_activity_at TEXT NOT NULL DEFAULT ({_TS})"
         ");"
         "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS family_id TEXT;"
-        f"ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ NOT NULL DEFAULT ({_TS});"
+        # _TS returns a formatted TEXT value, matching created_at/updated_at
+        # and the SQLite schema.  Using TIMESTAMPTZ here makes the entire
+        # migration roll back because PostgreSQL cannot use to_char(...) as a
+        # timestamptz default, leaving legacy production databases without the
+        # column that proposal reads require.
+        f"ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS last_activity_at TEXT NOT NULL DEFAULT ({_TS});"
         "UPDATE workspace_proposals SET last_activity_at = COALESCE(last_activity_at, created_at);"
         "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
         "created_seq BIGSERIAL;"
