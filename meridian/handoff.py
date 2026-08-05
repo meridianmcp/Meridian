@@ -6997,14 +6997,13 @@ async def generate_handoff(
         _effective_version = await _resolve_session_sprint_version(db, session_id)
     # ee8a6af1 — fail closed on stale sprint/dependency references BEFORE any
     # remaining mode (starter/compact, goal, full, delta) renders, persists,
-    # or mints a token-bound body. Validated against ONE fresh
-    # project+version board snapshot (board_snapshot.get_project_item_index),
-    # covering every status including 'done' — a completed dependency is
-    # resolved, not stale. See HandoffStaleReferenceError above for the
-    # incident this closes.
-    _stale_item_index = await db_module.get_project_item_index(
-        db, project_id, version=_effective_version
-    )
+    # or mints a token-bound body. Validate dependency identity against ONE
+    # fresh project-wide board index, not the version-filtered executable view:
+    # a dependency may legitimately live in an older/newer sprint bucket, and
+    # get_parallelizable_groups will render it as an external blocker when it
+    # is not part of this handoff's version scope. Still fail closed for truly
+    # missing or merged-away IDs and for foreign-project IDs.
+    _stale_item_index = await db_module.get_project_item_index(db, project_id)
     _stale_references = db_module.find_stale_reference_ids(_stale_item_index)
     if _stale_references:
         raise HandoffStaleReferenceError(project_id, _effective_version, _stale_references)

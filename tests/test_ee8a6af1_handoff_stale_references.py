@@ -297,25 +297,26 @@ async def test_generate_handoff_stale_reference_blocks_every_mode(db, tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_generate_handoff_version_scoping_treats_cross_version_dependency_as_stale(
+async def test_generate_handoff_version_scoping_accepts_cross_version_dependency(
     db, tmp_path,
 ):
-    """Deliberate design choice (documented on get_project_item_index): a
-    version-scoped handoff validates depends_on against its OWN version's
-    live snapshot. A dependency edge pointing outside that scope fails
-    closed rather than being silently trusted."""
+    """Cross-version dependencies are valid project-local external edges.
+
+    The executable item list remains version-scoped, while dependency
+    identity is checked against the whole project so a valid prerequisite in
+    another sprint bucket cannot suppress every handoff mode.
+    """
     pid = await _project(db, "stale-ref-cross-version")
     parent_v2 = await db_module.add_sprint_item(db, pid, "v2", "parent lives in v2")
-    await db_module.add_sprint_item(
+    child_v1 = await db_module.add_sprint_item(
         db, pid, "v1", "child in v1", depends_on=parent_v2["id"],
     )
 
-    with pytest.raises(handoff_module.HandoffStaleReferenceError) as excinfo:
-        await handoff_module.generate_handoff(
-            db, pid, str(tmp_path), skip_ai_summary=True, mode="goal", version="v1",
-        )
-    assert excinfo.value.version == "v1"
-    assert excinfo.value.stale_references[0]["depends_on"] == parent_v2["id"]
+    _, scoped_content, _ = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="goal", version="v1",
+    )
+    assert scoped_content
+    assert child_v1["id"] in scoped_content
 
     # Unscoped (version=None) sees the whole project — not stale.
     _, content, _ = await handoff_module.generate_handoff(

@@ -453,12 +453,13 @@ async def get_project_item_index(
     every item's own ``depends_on`` edge, without a second table scan. See
     :func:`find_stale_reference_ids`, the pure-Python consumer of this index.
 
-    Scoping to ``version`` (when given) means an id belonging to this SAME
-    project but a DIFFERENT version bucket will NOT appear in the index — by
-    design: ``generate_handoff`` validates a version-scoped board against its
-    own version's live snapshot (ee8a6af1), so a genuinely cross-version
-    ``depends_on`` edge is treated the same as a missing one (fail closed
-    rather than silently trusting an edge outside the scoped board).
+    Scoping to ``version`` (when given) is still used by executable board
+    snapshots and callers that need a version-local item list. Handoff
+    dependency integrity deliberately uses the unscoped form: a dependency
+    target in another version of the SAME project is a valid external edge,
+    not a missing ID. The handoff renderer separately reports that target as
+    outside the current goal/version. Foreign-project IDs remain absent and
+    therefore fail closed.
     """
     clauses = ["project_id = ?"]
     params: list[Any] = [project_id]
