@@ -166,6 +166,70 @@ jobs:
         run: pixi run python -m playwright install chromium --with-deps
       - run: pixi run python -m pytest tests/test_demo_ux.py -n 3 -q --tb=short
 
+  # 0ab8139f -- fail-closed dependency-contract gate for the local tunnel
+  # extension servers (meridian-docs, meridian-outputs), run BEFORE the
+  # meridian-docs job's install/test steps below (via `needs:`). Root cause
+  # (GitHub Actions run 31047597879, origin/dev commit 5390b65):
+  # meridian-docs CI installed the committed manifest with
+  # dependencies=["mcp>=1.0", "latex2mathml>=2.0"]; pip resolved mcp==2.0.0,
+  # which removed mcp.server.fastmcp (both extensions' entry points import
+  # it), so the job died with a ModuleNotFoundError deep inside pytest
+  # collection instead of a clear, named, early failure. Board item 106caa76
+  # (commit 324bfbf) pinned mcp>=1.27,<2 in both manifests; this job is the
+  # CI-side guarantee that a regression on that pin (or its future
+  # equivalent) can never again surface as a buried collection error.
+  #
+  # Two-stage, scripts/preflight_extension_dependencies.py-backed (a small,
+  # independently unit-tested Python script -- see
+  # tests/test_ci_extension_dependency_preflight.py -- rather than an inline
+  # shell block, since a workflow YAML step itself can't practically be
+  # unit-tested):
+  #   1. "manifest" needs no install at all: it reads the two COMMITTED
+  #      pyproject.toml files directly and asserts their declared `mcp`
+  #      specifier both excludes the 2.x major and has a lower bound >=1.27
+  #      -- parsed as real version clauses, never a literal string compare,
+  #      so a legitimate future bump (e.g. >=1.28,<2) keeps passing. This is
+  #      what makes "a deliberately stale manifest fails before suite
+  #      collection with an actionable message" true: it fails before either
+  #      extension is even installed.
+  #   2. "import" runs AFTER both extensions are actually installed in this
+  #      job's fresh Python (pip install -e, same as meridian-docs's own
+  #      install step below) and imports mcp.server.fastmcp plus each
+  #      extension's server module, asserting `<module>.mcp` is a real
+  #      FastMCP instance -- the literal regression check for the crash
+  #      itself, not just the manifest text.
+  #
+  # Promotion parity (0ab8139f acceptance criterion): deploy.yml's
+  # auto-promote job merges the EXACT SHA that passed this workflow
+  # (`workflow_run.head_sha`), never a newer/untested dev tip (see that
+  # job's own comments) -- so making this job a required, non-continue-on-
+  # error part of "Test (dev branch)"'s conclusion is *itself* the
+  # promotion-parity guarantee: no SHA lacking this dependency contract can
+  # reach main via the routine auto-promote path. deploy.yml is
+  # deliberately NOT edited here (out of this item's declared scope, and
+  # out of reach for changes that could plausibly touch deploy
+  # credentials/live infra); see this item's completion notes for the
+  # honest accounting of what that leaves deferred (an explicit
+  # belt-and-suspenders re-check inside deploy.yml itself, for the
+  # non-routine hotfix/manual-dispatch promotion paths that don't flow
+  # through this workflow_run gate).
+  extension-dependency-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate committed extension manifests pin a compatible mcp major
+        run: python scripts/preflight_extension_dependencies.py manifest
+      - name: Install both extensions (editable) -- same install shape as the meridian-docs job below
+        run: |
+          pip install -e extensions/meridian-docs
+          pip install -e extensions/meridian-outputs
+      - name: Verify mcp.server.fastmcp and both entry points import in the freshly-installed environment
+        run: python scripts/preflight_extension_dependencies.py import
+
   meridian-docs:
     # 9a817fce (W2-D) -- extensions/meridian-docs is a separate, stdlib-only
     # distribution that is NOT wired into pixi.toml's pypi-dependencies (see
@@ -187,6 +251,12 @@ jobs:
     # install step ever regresses) -- that fallback path is real, asserted
     # coverage, never a silent skip, so this job stays a meaningful blocking
     # gate either way.
+    #
+    # 0ab8139f -- needs: extension-dependency-preflight so a broken mcp pin
+    # fails fast (no LibreOffice install, no extension install) with the
+    # named, actionable preflight failure above instead of resurfacing as a
+    # ModuleNotFoundError buried in this job's own pytest collection.
+    needs: extension-dependency-preflight
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
