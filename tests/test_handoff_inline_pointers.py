@@ -153,6 +153,38 @@ async def test_annotate_resolved_pointers_attaches_range(db):
 
 
 @pytest.mark.asyncio
+async def test_annotate_resolved_pointers_uses_injected_live_symbol_resolver(db):
+    """Handoff pointer annotation must not silently fall back to stale snapshots."""
+    p = await db_module.create_project(db, "inline-live-symbol")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "Patch the live symbol")
+    await db_module.add_sprint_item_pointer(
+        db,
+        p["id"],
+        item["id"],
+        "code",
+        [{
+            "uri": "file:meridian/live.py",
+            "selector": {"type": "symbol", "qualified_name": "live_fn"},
+        }],
+    )
+
+    async def live_resolver(_db, _project_id, qualified_name, _limit):
+        assert qualified_name == "live_fn"
+        return [{
+            "qualified_name": qualified_name,
+            "file": "meridian/live.py",
+            "resolution_source": "live_graph",
+        }]
+
+    out = await handoff_module._annotate_resolved_pointers(
+        db, p["id"], [{"id": item["id"], "title": item["title"]}],
+        symbol_resolver=live_resolver,
+    )
+    assert "`live_fn` — meridian/live.py" in out[0]["resolved_pointers"][0]["targets"]
+    assert out[0]["pointer_records"][0]["resolution_source"] == "live_graph"
+
+
+@pytest.mark.asyncio
 async def test_annotate_resolved_pointers_no_pointers_left_untouched(db):
     p = await db_module.create_project(db, "inline-none")
     item = await db_module.add_sprint_item(db, p["id"], "v1", "No pointers here")

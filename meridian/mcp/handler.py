@@ -2843,6 +2843,24 @@ async def _handle_task_tools(
             )
         except Exception:  # noqa: BLE001
             _graph_searcher = None
+        # 2026-08-05 pointer-resolution follow-up: handoff enrichment used to
+        # resolve durable symbol pointers through pointers.resolve_pointer's
+        # cached snapshot default, even though the same request already had a
+        # live tenant-aware graph/Serena resolver available for code-pointer
+        # enrichment. Thread that resolver into the pointer pass as well. The
+        # optional root_dir enables the local semantic fallback when no tunnel
+        # is available; it is request-scoped and never persisted.
+        _pointer_symbol_resolver = None
+        try:
+            from ..prospect import build_symbol_resolver  # noqa: PLC0415
+            _pointer_root_dir = str(args.get("root_dir") or "").strip()
+            _pointer_symbol_resolver = build_symbol_resolver(
+                tenant=tenant,
+                root_dir=_pointer_root_dir,
+                data_dir=data_dir,
+            )
+        except Exception:  # noqa: BLE001
+            _pointer_symbol_resolver = None
         # 65c8b426 — Part 2: default skip_ai_summary=True for the MCP tool path
         # so the 3 serial Haiku calls (summarize_session fan-out, ai_summary blurb,
         # sprint retrospective) are skipped unless the caller explicitly opts in.
@@ -2899,6 +2917,7 @@ async def _handle_task_tools(
                     session_id=session_id,
                     commit_messages=[c["message"] for c in _gh_commits],
                     graph_searcher=_graph_searcher,
+                    pointer_symbol_resolver=_pointer_symbol_resolver,
                     identity=_resolve_caller_identity(tenant),
                     force_include_ids=_force_include_ids,
                     skip_ai_summary=_skip_ai,

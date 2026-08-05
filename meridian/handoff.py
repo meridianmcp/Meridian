@@ -2221,6 +2221,29 @@ def _build_goal_pointer_lines(pending_sprint_items: list[dict[str, Any]]) -> str
     return "\n" + "\n".join(f"- {_xml_escape(line)}" for line in lines)
 
 
+def _build_executor_item_ids_clause(
+    pending_sprint_items: list[dict[str, Any]],
+) -> str:
+    """Render the authoritative executor item-id manifest.
+
+    The prose inside ``<sprint_items>`` is intentionally human-readable and
+    may contain batches, dependency wording, or presentation-only macro-wave
+    labels.  Receivers must not have to parse that prose to know which items
+    this handoff actually authorizes.  Keep this separate, ordered, and
+    machine-readable so a pasted executor handoff has one deterministic ID
+    source to claim and reconcile against the live board.
+    """
+    ids = [
+        str(item["id"])
+        for item in pending_sprint_items
+        if isinstance(item, dict) and item.get("id")
+    ]
+    if not ids:
+        return "\n<executor_item_ids count=\"0\" />"
+    escaped = _xml_escape(",".join(ids), {chr(34): "&quot;"})
+    return f'\n<executor_item_ids count="{len(ids)}">{escaped}</executor_item_ids>'
+
+
 def _build_execution_policy_clause(policy: dict[str, Any] | None) -> str:
     """75ac1c8e — render the canonical ``<execution_policy>`` /goal tag.
 
@@ -2822,6 +2845,7 @@ def _build_quick_start_goal(
         '<first_step>First call get_sprint_items(status="pending") to load the '
         "live board (the ids below are a snapshot and may have shifted)."
         "</first_step>\n"
+        f"{_build_executor_item_ids_clause(pending_sprint_items)}\n"
         f"<sprint_items>{_xml_escape(items_clause.strip())}{_pointer_lines_block}</sprint_items>\n"
         # 0d5453bc — explicit per-item vs end-of-megasprint split: targeted tests
         # only per item; the full suite is a single gate at the very end. This
@@ -4424,6 +4448,7 @@ async def _annotate_resolved_pointers(
     pending_items: list[dict[str, Any]],
     *,
     node_resolver: Callable[[str], Any] | None = None,
+    symbol_resolver: Callable[..., Any] | None = None,
     stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """36fea6ca — attach each pending item's DURABLE, resolved pointers as a
@@ -4550,7 +4575,11 @@ async def _annotate_resolved_pointers(
             for ptr in stored:
                 try:
                     resolved = await pointers_module.resolve_pointer(
-                        db, ptr, project_id=project_id, node_resolver=node_resolver
+                        db,
+                        ptr,
+                        project_id=project_id,
+                        node_resolver=node_resolver,
+                        symbol_resolver=symbol_resolver,
                     )
                 except Exception as _resolve_exc:  # noqa: BLE001 — resolve_pointer never raises, but be safe
                     if stats is not None:
@@ -6777,6 +6806,7 @@ async def generate_handoff(
     session_id: str | None = None,
     commit_messages: list[str] | None = None,
     graph_searcher: Callable[[str], Any] | None = None,
+    pointer_symbol_resolver: Callable[..., Any] | None = None,
     extra_narrative: str | None = None,
     identity: str | None = None,
     force_include_ids: list[str] | None = None,
@@ -7278,7 +7308,11 @@ async def generate_handoff(
         _rp_stats: dict[str, int] = {}
         try:
             pending_sprint_items = await _annotate_resolved_pointers(
-                db, project_id, pending_sprint_items, stats=_rp_stats,
+                db,
+                project_id,
+                pending_sprint_items,
+                symbol_resolver=pointer_symbol_resolver,
+                stats=_rp_stats,
             )
             # 8a883f60 — _annotate_resolved_pointers NEVER raises for a
             # per-item fetch/resolve failure either — recover that signal

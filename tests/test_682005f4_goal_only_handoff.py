@@ -441,6 +441,30 @@ async def test_starter_preview_full_batch_includes_all_pending_ids(db, tmp_path)
         assert iid in content
 
 
+@pytest.mark.asyncio
+async def test_goal_exposes_authoritative_executor_item_id_manifest(db, tmp_path):
+    """Executor handoffs expose every claimable ID outside presentation prose."""
+    p = await db_module.create_project(db, "executor-item-id-manifest")
+    ids = []
+    for i in range(5):
+        item = await db_module.add_sprint_item(
+            db, p["id"], "v1", f"manifest item {i}", force=True
+        )
+        ids.append(item["id"])
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+
+    match = re.search(
+        r'<executor_item_ids count="(?P<count>\d+)">(?P<ids>[^<]+)</executor_item_ids>',
+        content,
+    )
+    assert match is not None
+    assert int(match.group("count")) == len(ids)
+    assert match.group("ids").split(",") == ids
+
+
 # ---------------------------------------------------------------------------
 # 9c6cac08 (665 follow-up) — deterministic paste-ready serialization and
 # scope fidelity, specific to the bare goal-only mode this file covers.
