@@ -251,6 +251,63 @@ def test_build_diagnostics_unauthenticated_stub_when_no_tenant():
     assert result["slots"] == {}
     assert "run_id" in result and result["run_id"]
     assert result["server_routing_cache"] == {"routed_tool_count": 0, "cache_populated": False}
+    # 315b0a63 — process_leases is present even in the unauthenticated/
+    # no-tenant branch, since that's the shape self-hosted callers get.
+    assert "process_leases" in result
+
+
+# ---------------------------------------------------------------------------
+# 315b0a63 — process_leases: local worker-lease registry summary
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _isolated_process_registry(monkeypatch, tmp_path):
+    """Point the process-lease broker singleton at a tmp_path-isolated
+    registry file, and reset it before/after so this never reads/pollutes
+    a real home directory or a sibling test's state."""
+    from meridian import process_registry as process_registry_module
+
+    monkeypatch.setenv("MERIDIAN_LEASE_REGISTRY_PATH", str(tmp_path / "leases.json"))
+    process_registry_module.reset_default_broker()
+    yield process_registry_module
+    process_registry_module.reset_default_broker()
+
+
+def test_process_leases_summary_empty_registry(_isolated_process_registry):
+    result = tn.build_tunnel_diagnostics(None)
+    assert result["process_leases"] == {"available": True, "active": 0, "unowned_survivors": 0}
+
+
+def test_process_leases_summary_reports_active_lease(_isolated_process_registry):
+    broker = _isolated_process_registry.get_broker()
+    broker.register("claude-code", 123)
+    result = tn.build_tunnel_diagnostics(_TENANT)
+    assert result["process_leases"]["available"] is True
+    assert result["process_leases"]["active"] == 1
+    assert result["process_leases"]["unowned_survivors"] == 0
+
+
+def test_process_leases_summary_reports_unowned_survivor(_isolated_process_registry):
+    broker = _isolated_process_registry.get_broker()
+    broker.register("codex", 456, ttl_seconds=0.01)
+    import time as _time
+    _time.sleep(0.05)
+    result = tn.build_tunnel_diagnostics(_TENANT)
+    # No create_time was recorded — process_lifecycle.verify_handle_live
+    # degrades to True (nothing to verify against), so an expired lease
+    # with no create_time is correctly reported as a survivor.
+    assert result["process_leases"]["unowned_survivors"] == 1
+
+
+def test_process_leases_summary_degrades_on_broker_error(monkeypatch):
+    class _BoomBroker:
+        def list_leases(self):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tn.process_registry_module, "get_broker", lambda: _BoomBroker())
+    result = tn.build_tunnel_diagnostics(None)
+    assert result["process_leases"] == {"available": False, "active": 0, "unowned_survivors": 0}
 
 
 def test_build_diagnostics_reports_run_id_and_timestamp():

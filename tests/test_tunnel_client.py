@@ -14,6 +14,7 @@ import os
 from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 
 from meridian import tunnel_client as tc
 
@@ -5231,3 +5232,185 @@ def test_owned_process_backend_selects_by_platform(monkeypatch):
 
     monkeypatch.setattr(tc.sys, "platform", "linux")
     assert isinstance(tc._owned_process_backend(), pl.PosixProcessGroupBackend)
+
+
+# ---------------------------------------------------------------------------
+# 315b0a63 — opt-in process_registry lease wiring for owned spawns. Gated
+# OFF by default (MERIDIAN_PROCESS_LEASES_ENABLED != "1") so every test
+# above this section runs with ZERO behavior change and zero disk I/O —
+# these tests exercise the gate itself plus the opted-in path.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLeaseBroker:
+    def __init__(self):
+        self.registered = []
+        self.released = []
+
+    def register(self, client, pid, **kwargs):
+        self.registered.append((client, pid, kwargs))
+        return object()
+
+    def release(self, client, run_id):
+        self.released.append((client, run_id))
+
+
+def test_process_leases_enabled_default_off(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    assert tc._process_leases_enabled() is False
+
+
+@pytest.mark.parametrize("val", ["0", "true", "TRUE", "yes", "", "on"])
+def test_process_leases_enabled_strict(monkeypatch, val):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, val)
+    assert tc._process_leases_enabled() is False
+
+
+def test_process_leases_enabled_one(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    assert tc._process_leases_enabled() is True
+
+
+def test_register_owned_process_lease_noop_when_disabled(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(run_id="r1", pid=1, executable="x", cwd=None, cmdline=["x"])
+    tc._register_owned_process_lease(handle)
+    assert fake_broker.registered == []
+
+
+def test_register_owned_process_lease_noop_for_none_handle(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+    tc._register_owned_process_lease(None)
+    assert fake_broker.registered == []
+
+
+def test_register_owned_process_lease_registers_when_enabled(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(
+        run_id="r1", pid=42, executable="node", cwd="/repo", cmdline=["node", "x.js"],
+        create_time=1.0, group_id=42, job_id=None,
+    )
+    tc._register_owned_process_lease(handle)
+
+    assert len(fake_broker.registered) == 1
+    client, pid, kwargs = fake_broker.registered[0]
+    assert client == tc._LEASE_CLIENT_NAME
+    assert pid == 42
+    assert kwargs["run_id"] == "r1"
+    assert kwargs["executable"] == "node"
+    assert kwargs["cwd"] == "/repo"
+    assert kwargs["cmdline"] == ["node", "x.js"]
+    assert kwargs["create_time"] == 1.0
+    assert kwargs["group_id"] == 42
+    assert kwargs["job_id"] is None
+
+
+def test_register_owned_process_lease_best_effort_on_broker_error(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+
+    class _BoomBroker:
+        def register(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: _BoomBroker())
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(run_id="r1", pid=1, executable="x", cwd=None, cmdline=["x"])
+    tc._register_owned_process_lease(handle)  # must not raise
+
+
+def test_release_owned_process_lease_noop_when_disabled(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(run_id="r1", pid=1, executable="x", cwd=None, cmdline=["x"])
+    tc._release_owned_process_lease(handle)
+    assert fake_broker.released == []
+
+
+def test_release_owned_process_lease_releases_when_enabled(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(run_id="r1", pid=1, executable="x", cwd=None, cmdline=["x"])
+    tc._release_owned_process_lease(handle)
+    assert fake_broker.released == [(tc._LEASE_CLIENT_NAME, "r1")]
+
+
+def test_release_owned_process_lease_best_effort_on_broker_error(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+
+    class _BoomBroker:
+        def release(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: _BoomBroker())
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(run_id="r1", pid=1, executable="x", cwd=None, cmdline=["x"])
+    tc._release_owned_process_lease(handle)  # must not raise
+
+
+def test_spawn_owned_with_cache_retry_registers_lease_when_enabled(monkeypatch):
+    """End-to-end: the real spawn/adopt path also registers a lease when
+    the feature is opted in."""
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _OwnedFakeProc(pid=777))
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    proc, handle = tc._spawn_owned_with_cache_retry(["node", "x.js"], None, "test")
+    assert handle is not None
+    assert len(fake_broker.registered) == 1
+    assert fake_broker.registered[0][1] == 777
+
+
+def test_spawn_owned_with_cache_retry_no_lease_call_when_disabled(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _OwnedFakeProc(pid=778))
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    tc._spawn_owned_with_cache_retry(["node", "x.js"], None, "test")
+    assert fake_broker.registered == []
+
+
+def test_close_owned_process_releases_lease_when_enabled(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    from meridian import process_lifecycle as pl
+
+    class _FakeBackend:
+        def close(self, handle, *, grace_seconds=5.0):
+            return True
+
+    handle = pl.OwnedProcessHandle(run_id="close-me", pid=1, executable="x", cwd=None, cmdline=["x"])
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+
+    ok = tc._close_owned_process(handle)
+    assert ok is True
+    assert fake_broker.released == [(tc._LEASE_CLIENT_NAME, "close-me")]

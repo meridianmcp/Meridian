@@ -2660,7 +2660,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "a tools/list re-discovery is pending. Includes a run_id + timestamp for "
         "correlating with support requests. Tokens/credentials are redacted. "
         "Requires an authenticated hosted tenant (tunnel mode) — self-hosted "
-        "callers with no tenant get an empty, unauthenticated-shaped snapshot.",
+        "callers with no tenant get an empty, unauthenticated-shaped snapshot. "
+        "315b0a63 — also includes process_leases: {available, active, "
+        "unowned_survivors} from this SERVER PROCESS's own local cross-client "
+        "worker-lease registry (meridian/process_registry.py). Meaningful when "
+        "this process shares a machine with the registering client(s) — e.g. a "
+        "self-hosted single-machine install; a remote hosted instance has no "
+        "visibility into your laptop and correctly reports zero here.",
      "inputSchema": {"type": "object", "properties": {
          "hostname": {"type": "string", "description": "Optional: report only this machine's per-host config override instead of the per-tenant default (mirrors get_tunnel_plugins's ?hostname=)."}},
          "required": []}},
