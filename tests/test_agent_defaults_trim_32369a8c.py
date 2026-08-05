@@ -23,7 +23,11 @@ _BEFORE_TRIM_CHAR_COUNT = 16309
 # 31a4a9c8 added a short "Dependency install guard" section (~436 chars) --
 # genuine new-feature content per this test's own documented update path, not
 # a re-inflation of the trimmed prose. Bumped headroom to 16235 (current) + 100.
-_MAX_ALLOWED_CHARS = 16335
+# c95d0c12 added a "Before indexing a repo root, check for nested worktrees"
+# paragraph (~800 chars) -- genuine new-feature content documenting the live
+# 138-nested-worktree 502 reproduction, not prose re-inflation. Bumped
+# headroom to 17136 (current) + 100.
+_MAX_ALLOWED_CHARS = 17236
 
 
 def test_length_decreased_after_trim():
