@@ -34,6 +34,7 @@ import os
 import posixpath
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -576,8 +577,40 @@ def ensure_gitignored(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# File locking (requirement 2)
+# File locking (requirement 2) + process-aware single-writer lease (a52216e2)
 # ---------------------------------------------------------------------------
+#
+# a52216e2 -- "Wave 10D found no confirmed orphan to kill: the lock was held
+# by one of several live concurrent server processes." Investigating that
+# incident surfaced the REAL bug: this environment does not have `portalocker`
+# installed (it is an optional, lazily-imported dependency -- see the
+# original docstring below), so on a real deployment without it, the
+# cross-process branch below used to be a complete no-op: `except ImportError:
+# pass`. Two separate Meridian server processes each running IndexFileLock
+# against the SAME on-disk db_path therefore had ZERO real mutual exclusion --
+# only the in-process threading.Lock protected against contention WITHIN one
+# process. Worse, a genuine (non-ImportError) acquisition failure was caught
+# and silently logged at DEBUG, then treated as "acquired" -- so ANY failure
+# to acquire the cross-process lock, for ANY reason, silently left ownership
+# non-deterministic. Neither gap was ever surfaced anywhere a caller could see.
+#
+# This section closes both gaps:
+#   1. A dependency-free, deterministic fallback lock (`os.O_CREAT |
+#      os.O_EXCL` -- atomic file creation, same guarantee on POSIX and
+#      Windows) is used automatically whenever portalocker is unavailable, so
+#      REAL cross-process exclusivity now always exists, with or without the
+#      optional dependency.
+#   2. A genuine acquisition failure now RAISES IndexLockAcquireError instead
+#      of being silently swallowed -- see that class's docstring.
+#   3. Because the fallback lock's FILE (unlike portalocker's OS-level lock)
+#      is not auto-removed if its owner process crashes, every lock now
+#      carries a small lease (owner pid/hostname/session_id/started_at/
+#      heartbeat_at) written into the lock file, and read_index_lock_owner()
+#      lets any caller distinguish a lock held by a live, active owner from
+#      one left behind by a dead one -- WITHOUT ever touching the recorded
+#      process. Reclaiming a stale LOCK FILE and killing the process that
+#      (legitimately or not) still holds it are two entirely different
+#      things; this module only ever does the former.
 
 # Per-canonical-path threading locks (in-process).
 _THREADING_LOCKS: dict[str, threading.Lock] = {}
@@ -591,13 +624,386 @@ def _get_thread_lock(canonical: str) -> threading.Lock:
         return _THREADING_LOCKS[canonical]
 
 
+# How long a heartbeat may go silent before a recorded lock owner is treated
+# as stale (only relevant when the owner's pid liveness can't be confirmed --
+# e.g. a cross-host lease, or no psutil/ctypes check available). Overridable
+# for tests / unusually slow environments.
+_LOCK_STALE_SECONDS_DEFAULT = 120.0
+_LOCK_STALE_SECONDS_ENV_VAR = "MERIDIAN_OUTPUTS_LOCK_STALE_SECONDS"
+
+# How long the atomic-create fallback lock waits on a confirmed-ACTIVE (not
+# stale) owner before giving up and raising IndexLockAcquireError. Only
+# applies to the fallback mechanism -- the optional portalocker path keeps
+# its historical indefinite-block-by-default behaviour unless a caller
+# explicitly passes a timeout, so an environment where portalocker IS
+# installed sees no behaviour change from this item.
+_LOCK_TIMEOUT_SECONDS_DEFAULT = 60.0
+_LOCK_TIMEOUT_SECONDS_ENV_VAR = "MERIDIAN_OUTPUTS_LOCK_TIMEOUT_SECONDS"
+
+
+def _resolve_lock_stale_seconds() -> float:
+    raw = os.environ.get(_LOCK_STALE_SECONDS_ENV_VAR)
+    if raw is None or not raw.strip():
+        return _LOCK_STALE_SECONDS_DEFAULT
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        _log.warning(
+            "%s=%r is not a valid number -- falling back to default (%.0fs)",
+            _LOCK_STALE_SECONDS_ENV_VAR, raw, _LOCK_STALE_SECONDS_DEFAULT,
+        )
+        return _LOCK_STALE_SECONDS_DEFAULT
+    if value <= 0:
+        _log.warning(
+            "%s=%r must be > 0 -- falling back to default (%.0fs)",
+            _LOCK_STALE_SECONDS_ENV_VAR, raw, _LOCK_STALE_SECONDS_DEFAULT,
+        )
+        return _LOCK_STALE_SECONDS_DEFAULT
+    return value
+
+
+def _resolve_lock_timeout_seconds() -> float | None:
+    raw = os.environ.get(_LOCK_TIMEOUT_SECONDS_ENV_VAR)
+    if raw is None or not raw.strip():
+        return _LOCK_TIMEOUT_SECONDS_DEFAULT
+    stripped = raw.strip()
+    if stripped.lower() in ("0", "none", "unbounded", "infinite"):
+        return None  # explicit opt-in to block indefinitely, like portalocker
+    try:
+        value = float(stripped)
+    except ValueError:
+        _log.warning(
+            "%s=%r is not a valid number -- falling back to default (%.0fs)",
+            _LOCK_TIMEOUT_SECONDS_ENV_VAR, raw, _LOCK_TIMEOUT_SECONDS_DEFAULT,
+        )
+        return _LOCK_TIMEOUT_SECONDS_DEFAULT
+    if value <= 0:
+        return None
+    return value
+
+
+def _current_hostname() -> str:
+    try:
+        return socket.gethostname()
+    except Exception:  # noqa: BLE001 -- diagnostics only, never fatal
+        return "unknown-host"
+
+
+def _pid_alive(pid: Any) -> bool | None:
+    """Best-effort, NEVER-terminating liveness check for ``pid`` on THIS host.
+
+    Returns ``True``/``False`` when determinable, ``None`` when genuinely
+    indeterminate (no usable check available) -- callers must treat ``None``
+    as "unknown", never as "dead". This function only ever OBSERVES process
+    state; it never signals, terminates, or otherwise touches the process
+    (see the module-level note above -- reclaiming a stale lock FILE and
+    killing the process that owns it are different things, and this function
+    is only ever used for the former).
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        import psutil  # noqa: PLC0415 -- optional, already used elsewhere here
+    except ImportError:
+        psutil = None  # type: ignore[assignment]
+    if psutil is not None:
+        try:
+            return bool(psutil.pid_exists(pid))
+        except Exception:  # noqa: BLE001
+            _log.debug("_pid_alive: psutil check failed for pid=%r", pid, exc_info=True)
+    if os.name == "posix":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # exists, just not ours to signal
+        except OSError:
+            return None
+    # Windows without psutil -- best-effort via OpenProcess + GetExitCodeProcess
+    # (never terminates anything: PROCESS_QUERY_LIMITED_INFORMATION is a
+    # read-only query right).
+    #
+    # a52216e2 -- OpenProcess succeeding is NOT sufficient on its own: Windows
+    # keeps a process's kernel object (and its pid) alive for as long as ANY
+    # handle to it remains open ANYWHERE (e.g. this test's own subprocess.
+    # Popen object still holding its creation handle), even after the process
+    # has actually exited -- confirmed live via a real crashed-child test that
+    # OpenProcess(pid) kept succeeding well after Popen.wait() had already
+    # returned a real exit code. GetExitCodeProcess on that SAME handle
+    # distinguishes "kernel object exists" from "process is actually still
+    # running" (STILL_ACTIVE == 259) and is the correct check.
+    try:
+        import ctypes
+        import ctypes.wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        ERROR_ACCESS_DENIED = 5
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(  # type: ignore[attr-defined]
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+        )
+        if not handle:
+            if ctypes.get_last_error() == ERROR_ACCESS_DENIED:
+                return True  # exists, just not ours to query fully
+            return False
+        try:
+            exit_code = ctypes.wintypes.DWORD()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(  # type: ignore[attr-defined]
+                handle, ctypes.byref(exit_code),
+            )
+            if not ok:
+                return None  # indeterminate -- never guess "dead"
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class IndexLockAcquireError(Exception):
+    """Raised when :class:`IndexFileLock` could not obtain REAL cross-process
+    exclusivity for a persistent (non-``:memory:``) ``db_path`` (a52216e2).
+
+    Deliberately distinct from silently proceeding without a lock: earlier
+    revisions of this class caught every acquisition failure at DEBUG level
+    and continued as if the lock had been acquired, which meant two
+    concurrent Meridian server processes could both believe they held
+    exclusive write access whenever the cross-process layer failed for any
+    reason. That silent-success behaviour is exactly the non-determinism
+    a52216e2 was opened to close, so this is raised loudly instead --
+    mirroring :class:`TantivyLockConflict`'s precedent (9a18a2b2) of naming
+    ONE specific, expected failure mode rather than letting it vanish into a
+    broad ``except Exception`` at some unrelated call site.
+
+    ``owner`` (optional): the :class:`IndexLockOwner` snapshot describing who
+    held the lock when acquisition gave up, when known -- lets a caller
+    surface *why* (pid/session/heartbeat age) instead of just "busy".
+    """
+
+    def __init__(self, message: str, *, owner: "IndexLockOwner | None" = None) -> None:
+        super().__init__(message)
+        self.owner = owner
+
+
+@dataclass
+class IndexLockOwner:
+    """Read-only snapshot of who currently holds -- or last held -- the
+    single-writer lock for one ``db_path`` (a52216e2). Produced by
+    :func:`read_index_lock_owner`, which never acquires the real lock and
+    never signals/terminates any process -- this is diagnostics data only.
+
+    ``is_stale`` means the recorded owner is safe to treat as ABANDONED (dead
+    pid on this host, or a silent heartbeat past the configured threshold when
+    liveness can't be checked directly) -- i.e. the lock FILE may be safely
+    reclaimed. It is never a signal to kill anything: a stale reading only
+    ever justifies deleting the leftover lock file, exactly like a crashed
+    process's OS-level lock would already have been released automatically
+    had portalocker's lock been in use instead.
+    """
+
+    db_path: str
+    lock_path: str | None
+    held: bool
+    pid: int | None = None
+    hostname: str | None = None
+    session_id: str | None = None
+    started_at: float | None = None
+    heartbeat_at: float | None = None
+    age_seconds: float | None = None
+    lock_mode: str | None = None
+    pid_alive: bool | None = None
+    is_stale: bool = False
+    stale_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _write_lease_to_handle(
+    fh: Any, *, pid: int, hostname: str, session_id: str | None,
+    started_at: float, heartbeat_at: float, lock_mode: str,
+) -> None:
+    """Overwrite ``fh`` (already positioned at a lock file this caller owns)
+    with the current lease payload. Best-effort by design -- a lease-write
+    failure must never take down the caller that just acquired the real
+    lock; see the callers' own ``try/except`` wrapping.
+
+    Deliberately does NOT ``os.fsync`` -- the lease is diagnostics-only
+    (read_index_lock_owner never trusts it for the actual exclusivity
+    guarantee, only the atomic-create/portalocker primitive does that), and
+    on the SAME live machine a plain ``flush()`` is already immediately
+    visible to any other process reading the file through the shared OS page
+    cache. ``fsync`` would only buy durability across a hard crash/power-loss
+    of a value nobody reads across restarts, at a real, measured per-call
+    cost (called on every lock acquire AND every heartbeat -- see a52216e2's
+    investigation notes for the tight-rebuild-budget regression this caused
+    when it was here)."""
+    payload = json.dumps({
+        "pid": pid, "hostname": hostname, "session_id": session_id,
+        "started_at": started_at, "heartbeat_at": heartbeat_at,
+        "lock_mode": lock_mode,
+    })
+    fh.seek(0)
+    fh.write(payload)
+    fh.truncate()
+    fh.flush()
+
+
+def _read_lease_from_path(path: str) -> dict[str, Any] | None:
+    """Best-effort parse of a lock file's lease payload. ``None`` for a
+    missing file, an unreadable file, or content that isn't a JSON object
+    (e.g. a lock file whose owner acquired it but hasn't written its lease
+    yet -- a narrow, harmless race window)."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    if not text.strip():
+        return None
+    try:
+        obj = json.loads(text)
+    except Exception:  # noqa: BLE001
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _probe_portalocker_held(lock_path: str, portalocker_module: Any) -> bool | None:
+    """Best-effort, side-effect-minimal check: is ``lock_path`` CURRENTLY
+    locked via portalocker by ANY process (including this one, via a
+    different handle)? A non-blocking probe lock/unlock cycle on a fresh
+    handle is the standard technique for this -- if the probe itself
+    succeeds, nobody holds the real lock right now (the probe never keeps
+    it). Returns ``None`` on any I/O error -- genuinely indeterminate, never
+    guessed."""
+    try:
+        # Ensure the file exists so the probe targets the same path a real
+        # acquirer would -- mirrors the original acquire() path (which always
+        # opened the lock file in "w" mode on every attempt).
+        with open(lock_path, "a", encoding="utf-8"):
+            pass
+        probe = open(lock_path, "r+", encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        try:
+            portalocker_module.lock(
+                probe, portalocker_module.LOCK_EX | portalocker_module.LOCK_NB,
+            )
+        except Exception:  # noqa: BLE001 -- LockException or a platform OSError
+            return True
+        try:
+            portalocker_module.unlock(probe)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+    finally:
+        try:
+            probe.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def read_index_lock_owner(
+    db_path: str, *, stale_seconds: float | None = None,
+) -> IndexLockOwner:
+    """Read-only snapshot of the single-writer lock/lease state for
+    ``db_path`` (a52216e2). Never acquires the real write lock, never blocks
+    on contention, and never signals/terminates any process -- safe to call
+    from any read path (search, diagnostics, get_convergence_state) without
+    disturbing a live writer. See :class:`IndexLockOwner` for field meanings.
+    """
+    if not db_path or db_path == ":memory:":
+        return IndexLockOwner(db_path=db_path, lock_path=None, held=False)
+    canonical = os.path.abspath(db_path)
+    lock_path = canonical + ".lock"
+    meta = _read_lease_from_path(lock_path)
+    threshold = stale_seconds if stale_seconds is not None else _resolve_lock_stale_seconds()
+    now = time.time()
+
+    try:
+        import portalocker  # noqa: PLC0415 -- optional
+    except ImportError:
+        held: bool | None = os.path.exists(lock_path)
+    else:
+        held = _probe_portalocker_held(lock_path, portalocker)
+
+    if meta is None:
+        # No lease content -- either never used, cleanly released (atomic
+        # mode always removes the file on release; see IndexFileLock.release),
+        # or a narrow race where the file was just created but its owner
+        # hasn't written a lease yet. None of those are "stale" -- there is
+        # nothing here to reclaim.
+        return IndexLockOwner(
+            db_path=db_path, lock_path=lock_path, held=bool(held) if held is not None else False,
+        )
+
+    pid = meta.get("pid")
+    hostname = meta.get("hostname")
+    session_id = meta.get("session_id")
+    started_at = meta.get("started_at")
+    heartbeat_at = meta.get("heartbeat_at")
+    age = (
+        now - heartbeat_at if isinstance(heartbeat_at, (int, float)) else None
+    )
+
+    pid_alive: bool | None = None
+    if isinstance(pid, int) and hostname == _current_hostname():
+        pid_alive = _pid_alive(pid)
+
+    is_stale = False
+    stale_reason: str | None = None
+    if held is False:
+        # OS/atomic-file-confirmed: nobody holds it right now. Leftover
+        # metadata here is purely historical (portalocker mode leaves the
+        # file in place after a clean release) -- nothing to reclaim.
+        is_stale = False
+    elif pid_alive is False:
+        is_stale = True
+        stale_reason = f"recorded owner pid={pid} on this host is no longer running"
+    elif age is not None and age > threshold:
+        is_stale = True
+        stale_reason = f"heartbeat is {age:.1f}s old (> {threshold:.0f}s threshold)"
+
+    return IndexLockOwner(
+        db_path=db_path, lock_path=lock_path,
+        held=bool(held) if held is not None else True,
+        pid=pid, hostname=hostname, session_id=session_id,
+        started_at=started_at, heartbeat_at=heartbeat_at, age_seconds=age,
+        lock_mode=meta.get("lock_mode"), pid_alive=pid_alive,
+        is_stale=is_stale, stale_reason=stale_reason,
+    )
+
+
 class IndexFileLock:
     """Exclusive write lock for one index DB file.
 
-    Uses a per-path threading.Lock for in-process safety (always) plus
-    portalocker for cross-process safety (when available).  If portalocker is
-    absent the cross-process layer is skipped gracefully -- the in-process
-    layer still prevents concurrent writes within one Python process.
+    Uses a per-path threading.Lock for in-process safety (always) PLUS one of
+    two real cross-process mechanisms for a persistent (non-``:memory:``)
+    path:
+
+    * ``portalocker`` (when importable) -- an OS-level advisory lock, kernel-
+      released automatically if the owning process dies. Unchanged from the
+      historical behaviour: blocks indefinitely by default.
+    * An atomic-create fallback (``os.O_CREAT | os.O_EXCL``) used whenever
+      portalocker is unavailable (a52216e2) -- a real, deterministic,
+      dependency-free mutual-exclusion primitive on both POSIX and Windows.
+      Bounded by ``timeout`` (default :func:`_resolve_lock_timeout_seconds`)
+      against a confirmed-ACTIVE owner; a confirmed-STALE owner's lock file is
+      reclaimed automatically (never its process -- see
+      :func:`read_index_lock_owner`).
+
+    Both mechanisms write a small lease (owner pid/hostname/session_id/
+    started_at/heartbeat_at) into the lock file once acquired, readable via
+    :func:`read_index_lock_owner` without holding the lock.
+
+    A genuine acquisition failure now raises :class:`IndexLockAcquireError`
+    instead of being silently treated as success (a52216e2) -- callers that
+    need to degrade gracefully (rather than let this propagate) should catch
+    it explicitly, the same way :class:`TantivyLockConflict` is already
+    handled at its call sites.
 
     Usage::
 
@@ -606,45 +1012,185 @@ class IndexFileLock:
             ...
     """
 
-    def __init__(self, db_path: str) -> None:
+    _ATOMIC_POLL_INITIAL = 0.05
+    _ATOMIC_POLL_MAX = 0.5
+
+    def __init__(
+        self, db_path: str, *, session_id: str | None = None,
+        timeout: float | None = None,
+    ) -> None:
         self._db_path = db_path
         self._canonical = os.path.abspath(db_path) if db_path != ":memory:" else db_path
         self._thread_lock = _get_thread_lock(self._canonical)
         self._file_handle: Any = None
+        self._session_id = session_id
+        self._timeout = timeout
+        self._lock_mode: str | None = None
+        self._started_at: float | None = None
+        self._last_heartbeat_write: float | None = None
 
-    def acquire(self) -> None:
+    @property
+    def session_id(self) -> str | None:
+        return self._session_id
+
+    def acquire(self, *, timeout: float | None = None) -> None:
         self._thread_lock.acquire()
         if self._canonical == ":memory:":
             return
+        lock_path = self._canonical + ".lock"
         try:
             import portalocker  # noqa: PLC0415 -- optional
-            lock_path = self._canonical + ".lock"
+        except ImportError:
+            portalocker = None  # type: ignore[assignment]
+
+        try:
+            if portalocker is not None:
+                self._acquire_portalocker(portalocker, lock_path)
+            else:
+                self._acquire_atomic(lock_path, timeout)
+        except BaseException:
+            self._thread_lock.release()
+            raise
+
+        now = time.time()
+        self._started_at = now
+        self._write_lease(now)
+
+    def _acquire_portalocker(self, portalocker: Any, lock_path: str) -> None:
+        try:
             self._file_handle = open(lock_path, "w", encoding="utf-8")  # noqa: WPS515
             portalocker.lock(self._file_handle, portalocker.LOCK_EX)
-        except ImportError:
-            pass  # portalocker absent -- in-process lock only
-        except Exception:  # noqa: BLE001
-            _log.debug("IndexFileLock: portalocker acquire failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 -- a52216e2: no longer swallowed
             if self._file_handle is not None:
                 try:
                     self._file_handle.close()
                 except Exception:  # noqa: BLE001
                     pass
                 self._file_handle = None
+            _log.warning(
+                "IndexFileLock: portalocker acquire failed for %r -- refusing "
+                "to proceed without a real cross-process lock (a52216e2)",
+                lock_path, exc_info=True,
+            )
+            raise IndexLockAcquireError(
+                f"failed to acquire the cross-process lock at {lock_path!r}: {exc}"
+            ) from exc
+        self._lock_mode = "portalocker"
+
+    def _acquire_atomic(self, lock_path: str, timeout: float | None) -> None:
+        effective_timeout = (
+            timeout if timeout is not None
+            else self._timeout if self._timeout is not None
+            else _resolve_lock_timeout_seconds()
+        )
+        deadline = None if effective_timeout is None else time.monotonic() + effective_timeout
+        poll = self._ATOMIC_POLL_INITIAL
+        while True:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            except FileExistsError:
+                owner = read_index_lock_owner(self._db_path)
+                if owner.is_stale:
+                    try:
+                        os.remove(lock_path)
+                    except OSError:
+                        _log.debug(
+                            "IndexFileLock: lost the race reclaiming stale "
+                            "lock %r -- retrying", lock_path,
+                        )
+                    continue
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise IndexLockAcquireError(
+                        f"index lock at {lock_path!r} is held by an active "
+                        f"owner (pid={owner.pid}, session={owner.session_id!r}) "
+                        f"and did not become available within "
+                        f"{effective_timeout}s", owner=owner,
+                    )
+                time.sleep(poll)
+                poll = min(poll * 1.5, self._ATOMIC_POLL_MAX)
+                continue
+            except OSError as exc:
+                raise IndexLockAcquireError(
+                    f"failed to create lock file {lock_path!r}: {exc}"
+                ) from exc
+            else:
+                self._file_handle = os.fdopen(fd, "r+", encoding="utf-8")
+                self._lock_mode = "atomic_create"
+                return
+
+    # a52216e2 -- heartbeat() is called from inside rebuild()'s write-lock
+    # section on every Phase 2 pass that reaches the Tantivy commit step, so
+    # it must be cheap on the common (fast, uncontended) call -- a full lease
+    # rewrite on every single call measurably ate into tight rebuild budgets
+    # (see the investigation notes on _write_lease_to_handle re: fsync).
+    # Skipping a redundant rewrite when the lease is already fresh keeps the
+    # steady-state cost near zero while still refreshing promptly whenever a
+    # call is slow enough to actually need it.
+    _HEARTBEAT_MIN_INTERVAL_SECONDS = 1.0
+
+    def _write_lease(self, heartbeat_at: float) -> None:
+        if self._file_handle is None:
+            return
+        try:
+            _write_lease_to_handle(
+                self._file_handle,
+                pid=os.getpid(), hostname=_current_hostname(),
+                session_id=self._session_id,
+                started_at=self._started_at or heartbeat_at,
+                heartbeat_at=heartbeat_at, lock_mode=self._lock_mode or "unknown",
+            )
+            self._last_heartbeat_write = heartbeat_at
+        except Exception:  # noqa: BLE001 -- diagnostics-only, never fatal
+            _log.debug("IndexFileLock: failed to write lease metadata", exc_info=True)
+
+    def heartbeat(self, *, force: bool = False) -> None:
+        """Refresh this lease's heartbeat timestamp (best-effort, never
+        raises). Call periodically during a long-held lock so a sibling
+        process's staleness check (:func:`read_index_lock_owner`) never
+        mistakes a slow-but-alive writer for an abandoned one.
+
+        A no-op (skips the write entirely) when the lease was already
+        refreshed within :attr:`_HEARTBEAT_MIN_INTERVAL_SECONDS` -- pass
+        ``force=True`` to bypass that and always write."""
+        if self._file_handle is None:
+            return
+        now = time.time()
+        if not force and self._last_heartbeat_write is not None:
+            if now - self._last_heartbeat_write < self._HEARTBEAT_MIN_INTERVAL_SECONDS:
+                return
+        try:
+            self._write_lease(now)
+        except Exception:  # noqa: BLE001
+            _log.debug("IndexFileLock.heartbeat failed", exc_info=True)
 
     def release(self) -> None:
         try:
             if self._file_handle is not None:
-                try:
-                    import portalocker  # noqa: PLC0415
-                    portalocker.unlock(self._file_handle)
-                except Exception:  # noqa: BLE001
-                    pass
+                if self._lock_mode == "portalocker":
+                    try:
+                        import portalocker  # noqa: PLC0415
+                        portalocker.unlock(self._file_handle)
+                    except Exception:  # noqa: BLE001
+                        pass
                 try:
                     self._file_handle.close()
                 except Exception:  # noqa: BLE001
                     pass
+                if self._lock_mode == "atomic_create":
+                    # a52216e2 -- unlike portalocker's OS-level lock, this is
+                    # a plain file: it is NOT released just by closing the
+                    # handle, so a clean release must remove it explicitly to
+                    # make the path available to the next acquirer. Best-
+                    # effort: if this races a concurrent stale-reclaim from
+                    # another process, both sides converge on the same "free"
+                    # end state regardless of who wins.
+                    try:
+                        os.remove(self._canonical + ".lock")
+                    except OSError:
+                        pass
                 self._file_handle = None
+                self._lock_mode = None
+                self._last_heartbeat_write = None
         finally:
             self._thread_lock.release()
 
@@ -1271,6 +1817,12 @@ class ConvergenceState:
     last_error: str | None
     fts_pending: bool
     partial: bool
+    # a52216e2 -- read-only single-writer lock/lease diagnostics (see
+    # IndexLockOwner/read_index_lock_owner): who holds this index's write
+    # lock right now (pid/hostname/session_id/started_at/heartbeat_at), and
+    # whether that owner looks active or stale. None only for an in-memory
+    # (":memory:") index, which has no persistent lock to report on.
+    index_lock: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1575,10 +2127,15 @@ class OutputsFtsIndex:
         tantivy_heap_bytes: int | None = None,
         max_batch: int | None = None,
         write_chunk: int | None = None,
+        session_id: str | None = None,
     ) -> None:
         self.outputs_dir = outputs_dir
         self._db_path = db_path
         self._hasher = hasher
+        # a52216e2 -- optional caller-supplied identity (e.g. a Meridian
+        # session_id) attributed to this instance's write-lock lease, purely
+        # for diagnostics (see lock_diagnostics()/read_index_lock_owner()).
+        self.session_id = session_id
         # acac2599 -- Phase-1 ThreadPoolExecutor worker cap: explicit param >
         # MERIDIAN_OUTPUTS_MAX_WORKERS env var > hardcoded default (8, the
         # previous unconfigurable behaviour).
@@ -1609,8 +2166,12 @@ class OutputsFtsIndex:
             tuple(exclude_patterns) if exclude_patterns is not None
             else _default_exclude_patterns()
         )
-        self._write_lock = IndexFileLock(db_path)
+        self._write_lock = IndexFileLock(db_path, session_id=session_id)
         self._read_lock = threading.RLock()  # in-process query serialisation
+        # a52216e2 -- set when the write lock could not be acquired this
+        # call (IndexLockAcquireError). Reset at the top of every rebuild(),
+        # mirroring last_db_write_error's contract.
+        self.last_lock_error: str | None = None
         self._con = connection
         self._owns_con = connection is None
         self._fts_built = False
@@ -2624,6 +3185,9 @@ class OutputsFtsIndex:
         self.last_rebuild_metrics = {}
         # 1a799e52 -- reset per-call; set below if Phase 2's DB write fails.
         self.last_db_write_error = None
+        # a52216e2 -- reset per-call; set below if the write lock itself
+        # could not be acquired this call.
+        self.last_lock_error = None
         deadline = (None if max_seconds is None
                     else time.monotonic() + max_seconds)
         # 5845cc6d — Phase 1 gets its own, earlier sub-deadline so it can never
@@ -3004,7 +3568,31 @@ class OutputsFtsIndex:
         # Phase 2: targeted write (write_lock held)
         # ------------------------------------------------------------------
         write_started = time.monotonic()
-        with self._write_lock:
+        # a52216e2 -- acquire() is split from the `with` sugar here so a
+        # genuine IndexLockAcquireError (real cross-process contention, or an
+        # unexpected acquisition failure) degrades this call gracefully
+        # instead of propagating out of rebuild() entirely: nothing below has
+        # run yet, so no in-memory/on-disk state has been touched this call --
+        # the next rebuild() (this process or a sibling) simply retries.
+        try:
+            self._write_lock.acquire()
+        except IndexLockAcquireError as _lock_exc:
+            self.last_lock_error = str(_lock_exc)
+            self.last_rebuild_partial = True
+            _log.warning("OutputsFtsIndex.rebuild: %s", _lock_exc)
+            self.last_rebuild_metrics["write_seconds"] = round(
+                time.monotonic() - write_started, 6,
+            )
+            self.last_rebuild_metrics.update({
+                "rebuild_seconds": round(time.monotonic() - rebuild_started, 6),
+                "rows_returned": len(self._row_cache),
+                "rows_changed": 0,
+                "rows_deleted": 0,
+                "partial": True,
+                "fts_pending": bool(self._fts_pending),
+            })
+            return len(self._row_cache)
+        try:
             self._ingest_meridian_notes(all_paths)
             rows, changed, paths_to_delete, new_rows = (
                 self._apply_precomputed(
@@ -3194,6 +3782,13 @@ class OutputsFtsIndex:
                         # until the next call with enough remaining budget.)
                     else:
                         self._fts_pending = False
+                        # a52216e2 -- refresh the lease heartbeat before the
+                        # (potentially slow, on a large delta) Tantivy commit
+                        # below, so a sibling process's staleness check never
+                        # mistakes a genuinely-still-working writer for an
+                        # abandoned one just because the DB write above alone
+                        # took a while.
+                        self._write_lock.heartbeat()
                         fts_started = time.monotonic()
                         self._rebuild_fts(con)
                         self.last_rebuild_metrics["fts_seconds"] = round(
@@ -3308,6 +3903,8 @@ class OutputsFtsIndex:
                 "fts_pending": bool(self._fts_pending),
             })
             return len(rows)
+        finally:
+            self._write_lock.release()
 
     def _apply_precomputed(
         self,
@@ -3643,7 +4240,10 @@ class OutputsFtsIndex:
                 self._walk_state is not None
                 or not self._walk_pass_confirmed_complete
             )
-            last_error = self.last_db_write_error or self._last_walk_error
+            last_error = (
+                self.last_db_write_error or self._last_walk_error
+                or self.last_lock_error
+            )
             if subtree is None:
                 pending = len(self._pending_stale)
                 converged = (
@@ -3681,7 +4281,23 @@ class OutputsFtsIndex:
                 last_error=last_error,
                 fts_pending=bool(self._fts_pending),
                 partial=bool(self.last_rebuild_partial),
+                index_lock=self.lock_diagnostics(),
             )
+
+    def lock_diagnostics(self) -> dict[str, Any] | None:
+        """Read-only snapshot of this index's write-lock/lease state
+        (a52216e2). Never acquires the write lock itself -- safe to call from
+        any read path (search, get_convergence_state) without blocking on, or
+        disturbing, a live writer. ``None`` for an in-memory (``:memory:``)
+        index, which has no persistent lock to report on.
+        """
+        if self._db_path == ":memory:":
+            return None
+        try:
+            return read_index_lock_owner(self._db_path).to_dict()
+        except Exception:  # noqa: BLE001 -- diagnostics must never break a caller
+            _log.debug("OutputsFtsIndex.lock_diagnostics failed", exc_info=True)
+            return {"db_path": self._db_path, "held": None, "error": "lock diagnostics unavailable"}
 
     # ------------------------------------------------------------------
     # Provenance-triggered targeted registration (item 6af1518d,
@@ -4112,13 +4728,26 @@ def _resolve_index_db_path(outputs_dir: str) -> str:
     return os.path.join(cache_dir, "index.duckdb")
 
 
-def _get_cached_index(outputs_dir: str) -> OutputsFtsIndex:
-    """Look up (or create) the cached OutputsFtsIndex for a directory."""
+def _get_cached_index(
+    outputs_dir: str, *, session_id: str | None = None,
+) -> OutputsFtsIndex:
+    """Look up (or create) the cached OutputsFtsIndex for a directory.
+
+    ``session_id`` (a52216e2, optional): attributed to the index's write-lock
+    lease for diagnostics (see ``lock_diagnostics()``/``read_index_lock_
+    owner()``). Only applied when a NEW instance is created for this
+    directory -- an already-cached instance keeps whatever session_id it was
+    first constructed with, since the lease identity should stay stable for
+    the lifetime of one process's index rather than flapping between callers.
+    """
     key = _cache_key(outputs_dir)
     with _index_cache_lock:
         idx = _index_cache.pop(key, None)
         if idx is None:
-            idx = OutputsFtsIndex(outputs_dir, db_path=_resolve_index_db_path(outputs_dir))
+            idx = OutputsFtsIndex(
+                outputs_dir, db_path=_resolve_index_db_path(outputs_dir),
+                session_id=session_id,
+            )
         _index_cache[key] = idx
         while len(_index_cache) > _MAX_CACHED_INDEXES:
             _, evicted = _index_cache.popitem(last=False)
@@ -4139,7 +4768,10 @@ def get_convergence_state(
     whole ``outputs_dir`` -- see :meth:`OutputsFtsIndex.get_convergence_state`.
 
     Returns ``{"error": ...}`` if ``outputs_dir`` doesn't exist; otherwise
-    the :class:`ConvergenceState` as a dict.
+    the :class:`ConvergenceState` as a dict -- including ``index_lock``
+    (a52216e2): who currently holds this index's write lock (pid/hostname/
+    session_id/started_at/heartbeat_at) and whether that owner looks active
+    or stale. Never triggers any indexing and never disturbs a live writer.
     """
     if not outputs_dir or not os.path.isdir(outputs_dir):
         return {"error": f"outputs_dir does not exist: {outputs_dir}"}
@@ -4426,6 +5058,15 @@ def search_outputs(
         # hits with no indication why isn't actionable -- surface the same
         # clear message OutputsFtsIndex already logged at WARNING.
         result["tantivy_lock_warning"] = index._last_tantivy_error
+    if index.last_lock_error:
+        # a52216e2 -- the write lock itself could not be acquired this call
+        # (real cross-process contention against an active owner, or an
+        # unexpected acquisition failure) -- rebuild() already degraded
+        # gracefully (returned the last-known row count rather than raising),
+        # but a caller silently getting a stale/empty result with no
+        # indication why isn't actionable. Same precedent as
+        # tantivy_lock_warning (9a18a2b2): surface it, don't hide it.
+        result["index_lock_warning"] = index.last_lock_error
     # 6af1518d requirement 1 -- explicit, structured convergence state,
     # additive alongside the ad hoc partial/fts_pending/pending_stale_count
     # fields above (unchanged, for backwards compatibility). When `subtree`

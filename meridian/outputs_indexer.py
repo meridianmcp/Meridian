@@ -687,6 +687,27 @@ class OutputsFtsIndex:
     ``connection`` / ``hasher`` are injectable for tests; production leaves them
     default. Thread-safe: every DB op holds an internal lock so the watchdog
     thread and a query thread never touch the connection concurrently.
+
+    a52216e2 -- NO process-aware cross-process locking here (deliberately):
+    the only production caller of this class (``meridian/mcp/handlers/
+    notes_decisions.py``) always constructs it with the default
+    ``db_path=":memory:"`` -- a fresh, per-call, per-process in-memory DB, so
+    there is no shared on-disk file for two Meridian server processes to
+    contend over in the first place. The real cross-process ownership/lease
+    problem this item was opened to fix lives in the SEPARATE, standalone
+    ``extensions/meridian-outputs`` package (its own copy of this class,
+    persisted to ``<outputs_dir>/.meridian-outputs-cache/index.duckdb`` and
+    shared across however many ``meridian-outputs-mcp`` server processes are
+    running against the same outputs_dir) -- see
+    ``extensions/meridian-outputs/meridian_outputs/outputs_local.py``'s
+    ``IndexFileLock`` / ``read_index_lock_owner`` / ``IndexLockOwner`` for the
+    process-aware single-writer lease (owner pid/hostname/session_id/
+    started_at/heartbeat_at, active-vs-stale distinction, and a genuine
+    acquisition failure that raises instead of being silently swallowed). If
+    a caller ever DOES construct this class against a real, persistent,
+    multi-process-shared ``db_path``, it should use that implementation's
+    locking primitives rather than assuming this one provides any -- it does
+    not.
     """
 
     _COLUMNS = (

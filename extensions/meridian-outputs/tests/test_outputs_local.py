@@ -19,6 +19,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -311,6 +313,424 @@ class TestIndexFileLock:
         acquired = lock._thread_lock.acquire(blocking=False)
         assert acquired, "Lock not released after exception"
         lock._thread_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# a52216e2 -- process-aware single-writer lease/lock: ownership diagnostics,
+# the correctness fix (a genuine acquisition failure now raises instead of
+# being silently swallowed), and real multiprocess mutual exclusion.
+# ---------------------------------------------------------------------------
+
+# Extracted once so worker subprocesses (which start with a fresh sys.path)
+# can import the module under test the same way conftest.py does for the
+# main test process.
+_EXT_ROOT = str(Path(__file__).parent.parent)
+
+# A standalone script (run via `python -c`) so these tests exercise REAL,
+# separate OS processes -- not threads -- racing on the same lock file. Modes:
+#   race_append          -- acquire, append start/end markers to a shared log
+#                            around a short sleep, release. Used to prove two
+#                            REAL processes never interleave inside the
+#                            critical section (the multiprocess counterpart of
+#                            TestIndexFileLock.test_thread_exclusion above).
+#   hold_until_signal     -- acquire, signal readiness, then hold the lock
+#                            until a signal file appears (or a generous
+#                            internal timeout), then release cleanly.
+#   crash_without_release -- acquire, signal readiness, then os._exit()
+#                            WITHOUT releasing -- simulates a crashed owner,
+#                            leaving a real-but-now-dead pid in the lease.
+_LOCK_WORKER_SCRIPT = r"""
+import os, sys, time
+
+ext_dir, db_path, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.path.insert(0, ext_dir)
+from meridian_outputs import outputs_local as OL
+
+if mode == "race_append":
+    ready_path, log_path, session_id, sleep_s = (
+        sys.argv[4], sys.argv[5], sys.argv[6], float(sys.argv[7]),
+    )
+    lock = OL.IndexFileLock(db_path, session_id=session_id)
+    lock.acquire()
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(session_id + "-start\n")
+    time.sleep(sleep_s)
+    with open(log_path, "a", encoding="utf-8") as fh:
+        fh.write(session_id + "-end\n")
+    lock.release()
+    with open(ready_path, "w", encoding="utf-8") as fh:
+        fh.write("done")
+elif mode == "hold_until_signal":
+    ready_path, signal_path, session_id = sys.argv[4], sys.argv[5], sys.argv[6]
+    lock = OL.IndexFileLock(db_path, session_id=session_id)
+    lock.acquire()
+    with open(ready_path, "w", encoding="utf-8") as fh:
+        fh.write(str(os.getpid()))
+    deadline = time.monotonic() + 30.0
+    while not os.path.exists(signal_path) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    lock.release()
+elif mode == "crash_without_release":
+    ready_path, session_id = sys.argv[4], sys.argv[5]
+    lock = OL.IndexFileLock(db_path, session_id=session_id)
+    lock.acquire()
+    with open(ready_path, "w", encoding="utf-8") as fh:
+        fh.write(str(os.getpid()))
+    os._exit(1)
+else:
+    raise SystemExit(f"unknown mode {mode!r}")
+"""
+
+
+def _spawn_worker(db_path: str, mode: str, *extra_args: str) -> subprocess.Popen:
+    """Launch one REAL child process racing on ``db_path``'s lock file."""
+    return subprocess.Popen(
+        [sys.executable, "-c", _LOCK_WORKER_SCRIPT, _EXT_ROOT, db_path, mode, *extra_args],
+    )
+
+
+def _wait_for_file(path: str, *, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not os.path.exists(path):
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"{path!r} was never created within {timeout}s")
+        time.sleep(0.02)
+
+
+class TestReadIndexLockOwner:
+    """read_index_lock_owner (a52216e2): read-only, never acquires the real
+    lock, never signals/terminates any process."""
+
+    def test_memory_db_reports_not_held(self) -> None:
+        owner = OL.read_index_lock_owner(":memory:")
+        assert owner.held is False
+        assert owner.lock_path is None
+        assert owner.is_stale is False
+
+    def test_no_lock_file_reports_not_held(self, tmp_path: Path) -> None:
+        db_path = str(tmp_path / "index.duckdb")
+        owner = OL.read_index_lock_owner(db_path)
+        assert owner.held is False
+        assert owner.pid is None
+        assert owner.is_stale is False
+
+    def test_self_acquired_lock_reports_held_with_pid_and_hostname(
+        self, tmp_path: Path,
+    ) -> None:
+        db_path = str(tmp_path / "index.duckdb")
+        lock = OL.IndexFileLock(db_path, session_id="test-session")
+        lock.acquire()
+        try:
+            owner = OL.read_index_lock_owner(db_path)
+            assert owner.held is True
+            assert owner.pid == os.getpid()
+            assert owner.hostname == socket.gethostname()
+            assert owner.session_id == "test-session"
+            assert owner.started_at is not None
+            assert owner.heartbeat_at is not None
+            assert owner.pid_alive is True
+            assert owner.is_stale is False
+            assert owner.stale_reason is None
+            assert owner.lock_mode in ("atomic_create", "portalocker")
+        finally:
+            lock.release()
+
+    def test_released_lock_reports_not_held(self, tmp_path: Path) -> None:
+        db_path = str(tmp_path / "index.duckdb")
+        lock = OL.IndexFileLock(db_path)
+        lock.acquire()
+        lock.release()
+        owner = OL.read_index_lock_owner(db_path)
+        assert owner.held is False
+
+    def test_fresh_heartbeat_with_dead_pid_is_still_stale(
+        self, tmp_path: Path,
+    ) -> None:
+        """A confirmed-dead pid on THIS host overrides a fresh heartbeat --
+        never trust the heartbeat alone once liveness is checkable."""
+        db_path = str(tmp_path / "index.duckdb")
+        lock_path = db_path + ".lock"
+        # A real process, run to completion and its handle fully released
+        # (the `with` closes Popen's own handle -- see _pid_alive's Windows
+        # docstring note on why a lingering handle would otherwise make this
+        # pid look deceptively "alive"), so its pid is now genuinely dead.
+        with subprocess.Popen([sys.executable, "-c", "pass"]) as proc:
+            proc.wait(timeout=15)
+            dead_pid = proc.pid
+        with open(lock_path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "pid": dead_pid, "hostname": socket.gethostname(),
+                "session_id": "stale-sim", "started_at": time.time(),
+                "heartbeat_at": time.time(),  # deliberately FRESH
+                "lock_mode": "atomic_create",
+            }, fh)
+        owner = OL.read_index_lock_owner(db_path)
+        assert owner.pid_alive is False
+        assert owner.is_stale is True
+        assert owner.stale_reason is not None and "no longer running" in owner.stale_reason
+
+    def test_old_heartbeat_with_indeterminate_pid_is_stale(
+        self, tmp_path: Path,
+    ) -> None:
+        """A different (unreachable) hostname makes pid liveness
+        indeterminate -- staleness then falls back to heartbeat age."""
+        db_path = str(tmp_path / "index.duckdb")
+        lock_path = db_path + ".lock"
+        with open(lock_path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "pid": 4, "hostname": "some-other-host-entirely",
+                "session_id": None, "started_at": time.time() - 10_000,
+                "heartbeat_at": time.time() - 10_000,
+                "lock_mode": "atomic_create",
+            }, fh)
+        owner = OL.read_index_lock_owner(db_path, stale_seconds=5.0)
+        assert owner.pid_alive is None
+        assert owner.is_stale is True
+        assert owner.stale_reason is not None and "heartbeat" in owner.stale_reason
+
+    def test_alive_pid_fresh_heartbeat_never_stale(self, tmp_path: Path) -> None:
+        db_path = str(tmp_path / "index.duckdb")
+        lock_path = db_path + ".lock"
+        with open(lock_path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "pid": os.getpid(), "hostname": socket.gethostname(),
+                "session_id": None, "started_at": time.time(),
+                "heartbeat_at": time.time(),
+                "lock_mode": "atomic_create",
+            }, fh)
+        owner = OL.read_index_lock_owner(db_path)
+        assert owner.pid_alive is True
+        assert owner.is_stale is False
+
+
+class TestIndexFileLockCorrectnessFix:
+    """a52216e2's core correctness fix: a genuine acquisition failure must
+    raise, never be silently swallowed and treated as 'acquired'."""
+
+    def test_unexpected_portalocker_failure_raises_not_silently_succeeds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression test for the pre-a52216e2 bug: ANY exception during
+        portalocker acquisition (not just ImportError) used to be caught at
+        DEBUG level and treated as success, letting the caller believe it
+        held exclusive access when it did not."""
+        fake_portalocker = MagicMock()
+        fake_portalocker.LOCK_EX = 2
+        fake_portalocker.lock.side_effect = OSError("simulated permission denied")
+        monkeypatch.setitem(sys.modules, "portalocker", fake_portalocker)
+
+        db_path = str(tmp_path / "index.duckdb")
+        lock = OL.IndexFileLock(db_path)
+        with pytest.raises(OL.IndexLockAcquireError):
+            lock.acquire()
+        # The in-process thread lock must be released on failure too, so a
+        # later legitimate acquire in this same process isn't wedged forever.
+        acquired = lock._thread_lock.acquire(blocking=False)
+        assert acquired, "thread lock was not released after a failed acquire"
+        lock._thread_lock.release()
+
+    def test_import_error_is_not_an_error_uses_atomic_fallback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """portalocker simply being ABSENT is the documented, supported
+        degrade path -- it must never raise, and must still provide real
+        exclusivity via the atomic-create fallback."""
+        monkeypatch.setitem(sys.modules, "portalocker", None)
+        db_path = str(tmp_path / "index.duckdb")
+        lock = OL.IndexFileLock(db_path)
+        lock.acquire()
+        try:
+            assert lock._lock_mode == "atomic_create"
+            assert os.path.exists(db_path + ".lock")
+        finally:
+            lock.release()
+        assert not os.path.exists(db_path + ".lock")
+
+
+class TestIndexFileLockAtomicFallback:
+    """Real, dependency-free cross-process exclusivity (a52216e2) -- exercised
+    end-to-end against real subprocesses, not mocks, since the whole point is
+    that TWO SEPARATE OS PROCESSES with zero shared memory must never both
+    believe they hold the lock at once."""
+
+    def test_acquire_writes_lease_release_removes_file(self, tmp_path: Path) -> None:
+        db_path = str(tmp_path / "index.duckdb")
+        lock_path = db_path + ".lock"
+        lock = OL.IndexFileLock(db_path, session_id="s1")
+        assert not os.path.exists(lock_path)
+        lock.acquire()
+        assert os.path.exists(lock_path)
+        with open(lock_path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+        assert meta["pid"] == os.getpid()
+        assert meta["session_id"] == "s1"
+        lock.release()
+        assert not os.path.exists(lock_path)
+
+    def test_two_real_processes_never_interleave_critical_section(
+        self, tmp_path: Path,
+    ) -> None:
+        """The multiprocess counterpart of TestIndexFileLock.test_thread_
+        exclusion: two REAL OS processes race to acquire the SAME lock file
+        and both wrap a sleep between a start/end marker inside the critical
+        section. Deterministic single-writer ownership means the log can
+        never show one process's start before the other's matching end."""
+        db_path = str(tmp_path / "index.duckdb")
+        log_path = str(tmp_path / "race.log")
+        ready_a = str(tmp_path / "ready_a")
+        ready_b = str(tmp_path / "ready_b")
+        proc_a = _spawn_worker(db_path, "race_append", ready_a, log_path, "A", "0.1")
+        proc_b = _spawn_worker(db_path, "race_append", ready_b, log_path, "B", "0.1")
+        try:
+            assert proc_a.wait(timeout=15) == 0
+            assert proc_b.wait(timeout=15) == 0
+        finally:
+            proc_a.kill()
+            proc_b.kill()
+
+        with open(log_path, encoding="utf-8") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+        assert lines.count("A-start") == 1 and lines.count("A-end") == 1
+        assert lines.count("B-start") == 1 and lines.count("B-end") == 1
+        for i, entry in enumerate(lines):
+            if entry.endswith("-start"):
+                label = entry.split("-")[0]
+                end_idx = lines.index(f"{label}-end")
+                between = lines[i + 1:end_idx]
+                assert not any(e.endswith("-start") for e in between), (
+                    f"lock not exclusive across processes: {lines}"
+                )
+
+    def test_active_owner_is_never_stolen_and_process_is_never_touched(
+        self, tmp_path: Path,
+    ) -> None:
+        """A live, actively-heartbeating owner must block a second acquirer
+        (never be silently stolen), and diagnostics reads must never signal,
+        terminate, or otherwise disturb that owning process."""
+        db_path = str(tmp_path / "index.duckdb")
+        ready_path = str(tmp_path / "ready")
+        signal_path = str(tmp_path / "release_signal")
+        child = _spawn_worker(db_path, "hold_until_signal", ready_path, signal_path, "child")
+        try:
+            _wait_for_file(ready_path)
+            with open(ready_path, encoding="utf-8") as fh:
+                child_pid = int(fh.read().strip())
+            assert child_pid == child.pid
+
+            owner = OL.read_index_lock_owner(db_path)
+            assert owner.held is True
+            assert owner.is_stale is False
+            assert owner.pid == child_pid
+
+            # A bounded acquire against the still-live owner must raise, not
+            # steal the lock or hang past its timeout.
+            contender = OL.IndexFileLock(db_path, timeout=0.4)
+            start = time.monotonic()
+            with pytest.raises(OL.IndexLockAcquireError) as exc_info:
+                contender.acquire()
+            elapsed = time.monotonic() - start
+            assert elapsed < 3.0, "acquire() blocked well past its own timeout"
+            assert exc_info.value.owner is not None
+            assert exc_info.value.owner.pid == child_pid
+
+            # Diagnostics must never disturb the live owner.
+            assert child.poll() is None, "child process was touched/terminated by diagnostics"
+        finally:
+            with open(signal_path, "w", encoding="utf-8") as fh:
+                fh.write("release")
+            assert child.wait(timeout=15) == 0
+
+        # Once the real owner released, the lock is free again.
+        final_owner = OL.read_index_lock_owner(db_path)
+        assert final_owner.held is False
+
+    def test_stale_lock_from_crashed_process_is_reclaimed_promptly(
+        self, tmp_path: Path,
+    ) -> None:
+        """A process that acquires and then crashes (never releases) leaves
+        a real-but-now-dead pid in the lease. A later acquirer must reclaim
+        the abandoned lock FILE promptly (well under the acquire timeout) --
+        and must never attempt to touch the (already-dead) process to do so."""
+        db_path = str(tmp_path / "index.duckdb")
+        ready_path = str(tmp_path / "ready")
+        crasher = _spawn_worker(db_path, "crash_without_release", ready_path, "crasher")
+        _wait_for_file(ready_path)
+        assert crasher.wait(timeout=15) != 0  # os._exit(1) -- confirmed dead
+
+        owner = OL.read_index_lock_owner(db_path)
+        assert owner.held is True  # the lock FILE is still there
+        assert owner.is_stale is True
+        assert owner.stale_reason is not None and "no longer running" in owner.stale_reason
+
+        contender = OL.IndexFileLock(db_path, timeout=5.0)
+        start = time.monotonic()
+        contender.acquire()
+        elapsed = time.monotonic() - start
+        contender.release()
+        assert elapsed < 2.0, (
+            f"reclaiming a stale lock took {elapsed:.2f}s -- looks like it "
+            "waited out (most of) the timeout instead of reclaiming promptly"
+        )
+
+
+class TestOutputsFtsIndexLockDiagnostics:
+    """Wiring: OutputsFtsIndex/ConvergenceState/search_outputs surface the
+    lock lease diagnostics (a52216e2) rather than hiding lock state."""
+
+    def test_lock_diagnostics_none_for_memory_index(self) -> None:
+        idx = OL.OutputsFtsIndex(":memory:")
+        assert idx.lock_diagnostics() is None
+
+    def test_lock_diagnostics_reflects_live_acquire_and_release(
+        self, tmp_path: Path,
+    ) -> None:
+        idx = OL.OutputsFtsIndex(
+            str(tmp_path), db_path=str(tmp_path / "index.duckdb"),
+            session_id="sess-abc",
+        )
+        try:
+            assert idx.lock_diagnostics()["held"] is False
+            idx._write_lock.acquire()
+            try:
+                diag = idx.lock_diagnostics()
+                assert diag["held"] is True
+                assert diag["session_id"] == "sess-abc"
+                assert diag["pid"] == os.getpid()
+            finally:
+                idx._write_lock.release()
+            assert idx.lock_diagnostics()["held"] is False
+        finally:
+            idx.close()
+
+    def test_get_convergence_state_includes_index_lock_field(
+        self, tmp_path: Path,
+    ) -> None:
+        idx = OL.OutputsFtsIndex(
+            str(tmp_path), db_path=str(tmp_path / "index.duckdb"),
+        )
+        try:
+            state = idx.get_convergence_state()
+            assert "index_lock" in state.to_dict()
+            assert state.index_lock is not None
+            assert state.index_lock["held"] is False
+        finally:
+            idx.close()
+
+    def test_search_outputs_surfaces_index_lock_warning_on_acquire_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+
+        def _boom(self, *, timeout=None):  # noqa: ANN001, ARG001
+            raise OL.IndexLockAcquireError("simulated: lock busy")
+
+        monkeypatch.setattr(OL.IndexFileLock, "acquire", _boom)
+        result = OL.search_outputs(str(tmp_path), "col")
+        assert "index_lock_warning" in result
+        assert "simulated" in result["index_lock_warning"]
+        # Must degrade gracefully -- never raise out of the module API.
+        assert result["hits"] == []
+        assert result["convergence"]["partial"] is True
 
 
 # ---------------------------------------------------------------------------
