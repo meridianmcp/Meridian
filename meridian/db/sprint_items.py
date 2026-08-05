@@ -3924,6 +3924,33 @@ def pack_groups_into_macro_waves(
     return macro_waves
 
 
+def _predict_resource_granularity(resource: str) -> str:
+    """2a176d6d — STATIC, planning-time classification of one normalized
+    ``touches_resources`` entry, based purely on its string shape (never an
+    actual claim attempt — ``get_parallelizable_groups`` runs before any
+    worker launches, so no ``resource_contents``/file existence is known
+    yet). Distinct from :func:`_claim_batch_resource`'s ``claim_granularity``,
+    which classifies the ACTUAL outcome of a real claim attempt at batch-
+    claim time; this is a cheaper, earlier prediction so an orchestrator can
+    see a malformed declaration before it ever tries to launch a worker.
+
+    Returns one of:
+      * ``"file"``   — a well-formed ``file:<path>`` resource.
+      * ``"symbol"`` — a well-formed ``symbol:<path>::<name>`` resource.
+      * ``"malformed_symbol"`` — a bare ``symbol:<name>`` with no ``::`` file
+        scope (finding 3's zero-lock case) — will acquire NO lock at claim
+        time no matter what, so it can never be symbol-safe.
+      * ``"other"``  — any other typed resource (``db:``, ``route:``, ...).
+    """
+    if resource.startswith("file:"):
+        return "file"
+    if resource.startswith("symbol:"):
+        value = resource[len("symbol:"):]
+        _path, sep, _sym = value.partition("::")
+        return "symbol" if (sep and _sym and _path) else "malformed_symbol"
+    return "other"
+
+
 async def get_parallelizable_groups(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4035,7 +4062,15 @@ async def get_parallelizable_groups(
                     "blocked_by_status": parent_block.get("status"),
                 })
                 continue
-        enriched = {**it, "resources": parse_touches_resources(it.get("touches_resources"))}
+        _res = parse_touches_resources(it.get("touches_resources"))
+        enriched = {
+            **it,
+            "resources": _res,
+            # 2a176d6d — additive: static per-resource granularity prediction
+            # (see _predict_resource_granularity). Does not affect coloring —
+            # the conflict graph below still colors purely on `resources`.
+            "predicted_granularity": {r: _predict_resource_granularity(r) for r in _res},
+        }
         eligible.append(enriched)
     # Stable order: highest-priority first (e08fee30), then oldest, then id, so
     # coloring is deterministic AND urgent work colors into the earliest groups.
@@ -4205,9 +4240,32 @@ async def _claim_batch_resource(
     than imported, since meridian.db must not depend on meridian.mcp.
 
     Returns ``{"acquired": True, "newly_acquired": bool, "scope": "file"|
-    "symbol"|"generic"|"none", "resource": resource, ...}`` on success, or
+    "symbol"|"generic"|"none", "resource": resource, "claim_granularity":
+    "file"|"symbol"|"coarse"|"unresolved"|"n/a", ...}`` on success, or
     ``{"acquired": False, "scope": ..., "resource": resource,
-    "holder_session_id": ..., "reason": ...}`` on conflict.
+    "holder_session_id": ..., "reason": ..., "claim_granularity": ...}`` on
+    conflict/rejection.
+
+    2a176d6d (findings 3 + 4) — ``claim_granularity`` classifies what was
+    ACTUALLY acquired, independent of the coarser ``scope`` field, so a
+    caller never has to infer real precision from ``fallback_reason``
+    presence/absence:
+      * ``"file"``  — a genuinely-declared ``file:`` resource (real
+        whole-file intent, not a fallback).
+      * ``"symbol"`` — a real AST/tree-sitter-resolved symbol-range claim.
+      * ``"coarse"`` — a ``symbol:`` resource that widened to a whole-file
+        lock (no source supplied, unparseable, symbol not found, or
+        ambiguous). The lock IS real/safe, but it must never be reported or
+        relied upon as symbol-safe — that is exactly the granularity
+        mismatch the 2026-08-04 V026-batch6 audit flagged.
+      * ``"unresolved"`` — nothing was locked at all (a malformed/bare
+        ``symbol:<name>`` with no resolvable file scope). Previously this
+        silently returned ``acquired: True`` (finding 3) even though zero
+        lock was taken; it is now a hard ``acquired: False`` failure so
+        ``claim_parallel_batch`` rolls back and refuses the batch instead of
+        calling a zero-lock resource "claimed".
+      * ``"n/a"`` — a non-code typed resource (``db:``, ``route:``, ...)
+        where the file/symbol distinction does not apply.
     """
     from meridian.db import (  # noqa: PLC0415
         claim_file, claim_symbol, claim_resource,
@@ -4223,22 +4281,32 @@ async def _claim_batch_resource(
             return {
                 "acquired": True, "scope": "file", "resource": resource,
                 "file_path": file_path, "newly_acquired": not pre_held,
+                "claim_granularity": "file",
             }
         return {
             "acquired": False, "scope": "file", "resource": resource,
             "file_path": file_path,
             "holder_session_id": result.get("holder_session_id"),
             "reason": result.get("reason") or "locked",
+            "claim_granularity": "file",
         }
 
     if resource.startswith("symbol:"):
         value = resource[len("symbol:"):]
         file_path, sep, symbol_name = value.partition("::")
         if not sep or not symbol_name or not file_path:
-            # Bare symbol id with no resolvable file scope — nothing to lock.
+            # 2a176d6d (finding 3) — a bare symbol id with no resolvable file
+            # scope acquires NO lock at all. Previously this returned
+            # acquired=True/scope='none' as a benign no-op, which let a
+            # multi-item batch believe this resource was "claimed" when
+            # nothing was ever locked for it. Reject it outright so
+            # claim_parallel_batch's existing acquired-check rolls the whole
+            # batch back (BATCH_RESOURCE_CONFLICT) instead of silently
+            # treating a zero-lock resource as safe.
             return {
-                "acquired": True, "scope": "none", "resource": resource,
-                "newly_acquired": False, "fallback_reason": "no_file_scope",
+                "acquired": False, "scope": "none", "resource": resource,
+                "newly_acquired": False, "reason": "no_file_scope",
+                "claim_granularity": "unresolved",
             }
 
         content = _batch_resource_content_lookup(resource_contents, file_path)
@@ -4255,6 +4323,7 @@ async def _claim_batch_resource(
                     "acquired": True, "scope": "symbol", "resource": resource,
                     "file_path": file_path, "symbol": symbol_name,
                     "newly_acquired": not pre_held,
+                    "claim_granularity": "symbol",
                 }
             if symbol_result.get("reason") in ("symbol_conflict", "file_locked"):
                 holder = symbol_result.get("holder_session_id")
@@ -4266,8 +4335,10 @@ async def _claim_batch_resource(
                     "file_path": file_path, "symbol": symbol_name,
                     "holder_session_id": holder,
                     "reason": symbol_result.get("reason"),
+                    "claim_granularity": "symbol",
                 }
-            # unparseable / symbol_not_found — explicit fallback, recorded below.
+            # unparseable / symbol_not_found / ambiguous_symbol — explicit
+            # fallback, recorded below and classified "coarse".
             fallback_reason = symbol_result.get("reason") or "unparseable"
         else:
             fallback_reason = "no_source_supplied"
@@ -4283,6 +4354,7 @@ async def _claim_batch_resource(
                 "file_path": file_path, "symbol": symbol_name,
                 "newly_acquired": not pre_held_file,
                 "fallback_reason": fallback_reason,
+                "claim_granularity": "coarse",
             }
         return {
             "acquired": False, "scope": "file", "resource": resource,
@@ -4290,6 +4362,7 @@ async def _claim_batch_resource(
             "holder_session_id": file_result.get("holder_session_id"),
             "reason": file_result.get("reason") or "locked",
             "fallback_reason": fallback_reason,
+            "claim_granularity": "coarse",
         }
 
     # Other typed resources (db:, route:, mcp_tool:, pypi:, github:, note:,
@@ -4301,11 +4374,13 @@ async def _claim_batch_resource(
         return {
             "acquired": True, "scope": "generic", "resource": resource,
             "newly_acquired": not pre_held,
+            "claim_granularity": "n/a",
         }
     return {
         "acquired": False, "scope": "generic", "resource": resource,
         "holder_session_id": result.get("holder_session_id"),
         "reason": "locked",
+        "claim_granularity": "n/a",
     }
 
 
@@ -4519,6 +4594,10 @@ async def claim_parallel_batch(
     # declared resource. All-or-nothing across the whole batch. ──
     claimed_items: list[tuple[str, str, str | None]] = []  # (item_id, orig_status, orig_actor)
     acquired_resources: list[dict[str, Any]] = []
+    # 2a176d6d (finding 4) — per-resource claim_granularity record for every
+    # resource actually attempted in this batch (additive; does not affect
+    # the "resources" union field below).
+    resource_claims: list[dict[str, Any]] = []
 
     async def _rollback_and_fail(error_code: str, message: str, **extra: Any) -> dict[str, Any]:
         for entry in reversed(acquired_resources):
@@ -4559,6 +4638,22 @@ async def claim_parallel_batch(
         for resource in item_resources[iid]:
             outcome = await _claim_batch_resource(db, resource, claim_session, resource_contents)
             if not outcome.get("acquired"):
+                # 2a176d6d (finding 3) — a resource with claim_granularity
+                # "unresolved" (bare symbol:<name>, no '::' file scope) was
+                # never held by anyone; "locked by another live session" would
+                # be a misleading message for it. Give it its own error code
+                # so a caller can tell "malformed declaration" apart from a
+                # real cross-session conflict.
+                if outcome.get("claim_granularity") == "unresolved":
+                    return await _rollback_and_fail(
+                        "MALFORMED_RESOURCE",
+                        f"resource {resource!r} (item {iid!r}) has no resolvable "
+                        "file scope (bare 'symbol:<name>' with no "
+                        "'<path>::<symbol>' form), so no lock could be acquired "
+                        "for it. Fix the touches_resources declaration to "
+                        "'symbol:<path>::<symbol>'.",
+                        item_id=iid, resource=resource,
+                    )
                 return await _rollback_and_fail(
                     "BATCH_RESOURCE_CONFLICT",
                     f"resource {resource!r} (item {iid!r}) is locked by another "
@@ -4566,6 +4661,19 @@ async def claim_parallel_batch(
                     item_id=iid, resource=resource,
                     holder_session_id=outcome.get("holder_session_id"),
                 )
+            # 2a176d6d (finding 4) — record what granularity was ACTUALLY
+            # acquired for every resource in the batch (not just newly-
+            # acquired ones), so the launcher/orchestrator can see which
+            # resources landed a real symbol-range claim vs. a coarse
+            # whole-file fallback, rather than inferring it from
+            # fallback_reason presence/absence downstream.
+            resource_claims.append({
+                "item_id": iid,
+                "resource": resource,
+                "scope": outcome.get("scope"),
+                "claim_granularity": outcome.get("claim_granularity"),
+                "fallback_reason": outcome.get("fallback_reason"),
+            })
             if outcome.get("newly_acquired"):
                 outcome["_item_id"] = iid
                 outcome["_session_id"] = claim_session
@@ -4580,6 +4688,11 @@ async def claim_parallel_batch(
         "claimed_item_ids": ordered_ids,
         "items": result_items,
         "resources": resources_union,
+        # 2a176d6d (finding 4) — additive: per-resource claim_granularity so
+        # a caller can see which resources landed a real symbol-range claim
+        # vs. a coarse whole-file fallback, without changing "resources"
+        # (still the plain sorted-string union other callers already parse).
+        "resource_claims": resource_claims,
         "manifest": final_manifest,
     }
 

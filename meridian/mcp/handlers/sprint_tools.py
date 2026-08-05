@@ -817,6 +817,41 @@ async def handle_claim_sprint_item(
                 "conflicts": _file_conflicts,
             }
 
+    # 2a176d6d (finding 1) — require an explicit execution identity before
+    # attempting a mutating resource-lock acquisition. The low-level gate
+    # (_sprint_item_resource_claim_gate, meridian/mcp/handler.py)
+    # deliberately fail-opens (ok=True, nothing acquired) when session_id is
+    # missing, so every legacy caller of db_module.claim_sprint_item() that
+    # never threads a session_id through sees zero behavior change — that
+    # fail-open contract is pinned by that function's own direct unit tests
+    # and is left unchanged here. But THIS is the real production entry point
+    # for the MCP claim_sprint_item tool, and a caller with no identity to
+    # acquire locks under must not be allowed to believe declared resources
+    # were protected. Fail closed here, before the fail-open gate ever runs,
+    # whenever the item actually declares resources that would need a lock —
+    # an item with nothing declared has nothing to protect, so it is still a
+    # no-op (matches the gate's own "genuinely nothing to enforce" carve-out).
+    if not args.get("session_id"):
+        _identity_item = await db_module.get_sprint_item(db, args["item_id"])
+        if _identity_item is not None and _identity_item.get("project_id") == args["project_id"]:
+            _declared_for_identity = db_module.parse_touches_resources(
+                _identity_item.get("touches_resources")
+            )
+            if _declared_for_identity:
+                return {
+                    "ok": False,
+                    "error": "MISSING_EXECUTION_IDENTITY",
+                    "message": (
+                        "Cannot claim sprint item: it declares "
+                        f"{len(_declared_for_identity)} touches_resources "
+                        "entry(ies) but no session_id was supplied to acquire "
+                        "locks under, so the claim would be non-executable "
+                        "(no lock protection). Pass session_id."
+                    ),
+                    "item_id": args["item_id"],
+                    "declared_resources": _declared_for_identity,
+                }
+
     # 18c488b6 — symbol-scoped resource-lock gate: ACQUIRES (not just checks)
     # a file or symbol claim for every touches_resources entry the item
     # declares, under the caller's session_id. Unlike the touches_files
@@ -829,6 +864,37 @@ async def handle_claim_sprint_item(
     )
     if not _resource_lock_gate.get("ok"):
         return _resource_lock_gate
+
+    # 2a176d6d (finding 3) — the gate itself still fail-softens a bare
+    # 'symbol:<name>' resource (scope='none', acquired=False) into an
+    # overall ok=True result (it just `continue`s past it in its per-resource
+    # loop) — that is pinned by its own direct unit test and left unchanged.
+    # But at THIS call site — the real claim_sprint_item path — a resource
+    # that acquired NO lock must never be silently treated as "claimed".
+    # Detect it and hard-block, rolling back anything else this call DID
+    # acquire (the all-or-nothing contract the gate itself already applies
+    # to genuine conflicts).
+    _malformed_scope = [
+        e for e in (_resource_lock_gate.get("lock_scope") or [])
+        if e.get("scope") == "none"
+    ]
+    if _malformed_scope:
+        await _rollback_sprint_item_resource_locks(
+            db, args.get("session_id"), _resource_lock_gate
+        )
+        return {
+            "ok": False,
+            "error": "MALFORMED_RESOURCE",
+            "message": (
+                "Cannot claim sprint item: declared resource(s) "
+                f"{', '.join(e.get('resource', '?') for e in _malformed_scope)} "
+                "have no resolvable file scope (bare 'symbol:<name>' with no "
+                "'<path>::<symbol>' form), so no lock could be acquired for "
+                "them. Fix the touches_resources declaration to "
+                "'symbol:<path>::<symbol>'."
+            ),
+            "malformed_resources": [e.get("resource") for e in _malformed_scope],
+        }
 
     try:
         # 5823db0b — actor attribution: record who claimed the item (explicit
@@ -976,6 +1042,21 @@ async def handle_claim_sprint_item(
     if _resource_lock_gate.get("lock_scope"):
         item = dict(item)
         item["resource_lock_scope"] = _resource_lock_gate["lock_scope"]
+        # 2a176d6d (finding 4) — mirror sprint_items._claim_batch_resource's
+        # claim_granularity classification for the single-item claim path, so
+        # a symbol: resource that widened to a whole-file lock (fallback_reason
+        # set) is never reported as symbol-safe just because "scope": "file"
+        # looks the same as a genuinely-declared file: resource.
+        item["claim_granularity"] = {
+            e.get("resource"): (
+                "coarse" if e.get("fallback_reason")
+                else "symbol" if e.get("scope") == "symbol"
+                else "file" if e.get("scope") == "file"
+                else "unresolved" if e.get("scope") == "none"
+                else "n/a"
+            )
+            for e in _resource_lock_gate["lock_scope"] if e.get("resource")
+        }
 
     _bc_claim = await _board_change_for_session(
         db, args["project_id"], args.get("session_id")

@@ -61,14 +61,33 @@ def _cutoff_dt(hours: int) -> str:
 
 
 def _normalize_file_path(file_path: str | None) -> str:
-    """Normalize a file path the same way ``claim_file`` stores it.
+    """Normalize a file path the same way every file/symbol claim function
+    in this module stores and looks it up.
 
     claim_file stores ``(file_path or "").strip()`` verbatim — no separator
     rewriting — so code-anchored notes (771c00d7) must apply the *identical*
     rule for their ``file_path`` anchor to match a claim. Centralized here so
     the anchor and the lock can never drift apart.
+
+    2a176d6d (finding 6) — every read/write/release path in this module now
+    routes through this single function (previously several call sites used a
+    bare ``.strip()`` directly instead), so at least the STRIP rule can never
+    drift apart across functions. Deliberately staying strip-only rather than
+    also canonicalizing separators (backslash -> slash, leading "./"): a prior
+    author's :func:`meridian.db._normalize_resource_file_path` docstring
+    explicitly documents "distinct from _normalize_file_path ... do not merge
+    the two" precisely because THIS function matches how claim_file already
+    STORES existing rows -- changing its output would silently stop matching
+    any row already written under the old strip-only rule, with no
+    accompanying backfill of file_locks/file_symbol_claims/code-anchored-note
+    anchors for existing data. Given this module coordinates OTHER live,
+    concurrent sessions' locks right now, that migration risk was judged not
+    worth the marginal benefit (no caller observed in practice ever passing a
+    backslash-style path here) -- left as documented, understood follow-up
+    debt for a session that can pair the merge with a real data migration.
     """
-    return (file_path or "").strip()
+    value = (file_path or "").strip()
+    return value
 
 
 async def _code_notes_for_session_file(
@@ -555,7 +574,7 @@ async def release_file(
     session_id: str,
 ) -> bool:
     """Release a file lock only when it is owned by ``session_id``."""
-    normalized = (file_path or "").strip()
+    normalized = _normalize_file_path(file_path)
     if not normalized:
         return False
     cursor = await db.execute(
@@ -953,7 +972,7 @@ async def claim_symbol(
     """
     from ..symbols import extract_symbols
 
-    normalized = (file_path or "").strip()
+    normalized = _normalize_file_path(file_path)
     symbol = (symbol or "").strip()
     if not normalized:
         raise ValueError("file_path is required")
@@ -995,8 +1014,8 @@ async def claim_symbol(
             ),
         }
 
-    target = next((s for s in symbols if s["name"] == symbol), None)
-    if target is None:
+    matches = [s for s in symbols if s["name"] == symbol]
+    if not matches:
         return {
             "claimed": False,
             "reason": "symbol_not_found",
@@ -1007,6 +1026,45 @@ async def claim_symbol(
                 f"Available: {', '.join(s['name'] for s in symbols) or '(none)'}"
             ),
         }
+    # 2a176d6d (finding 5) — reject ambiguity instead of silently claiming the
+    # FIRST match. extract_symbols' ``name`` is the canonical qualified name
+    # for methods (``Class.method``, disambiguating same-named methods across
+    # DIFFERENT classes), but it is still just a flat string: two nodes can
+    # legitimately extract to the exact same name (e.g. two conditionally-
+    # defined top-level functions/classes with the same name, or two classes
+    # with the same name each defining a same-named method — "ClassA.method"
+    # collides with itself). Silently taking symbols[0] in that case claimed
+    # an ARBITRARY one of the candidates' line ranges under the caller's
+    # belief that it uniquely owns "symbol", which can make the overlap check
+    # above compare against the wrong range entirely. Refuse instead, and
+    # report every candidate's location so the caller (or a human) can
+    # disambiguate — e.g. by claiming a narrower/qualified name once
+    # extract_symbols is extended to emit one, tracked as a follow-up since
+    # meridian/symbols.py is outside this fix's scope.
+    if len(matches) > 1:
+        _ranges_desc = ", ".join(f"{m['line_start']}-{m['line_end']}" for m in matches)
+        return {
+            "claimed": False,
+            "reason": "ambiguous_symbol",
+            "file_path": normalized,
+            "symbol": symbol,
+            "matches": [
+                {
+                    "type": m["type"],
+                    "line_start": m["line_start"],
+                    "line_end": m["line_end"],
+                }
+                for m in matches
+            ],
+            "message": (
+                f"'{symbol}' matches {len(matches)} distinct definitions in "
+                f"{normalized} (lines {_ranges_desc})"
+                " — cannot determine which one to claim. Rename the "
+                "duplicate/nested definition so it resolves to a unique name, "
+                "or claim the whole file instead."
+            ),
+        }
+    target = matches[0]
 
     others = await _live_symbol_claims_for_file(db, normalized, session_id)
     conflicts = [
@@ -1091,7 +1149,7 @@ async def get_symbol_claims(
         "LEFT JOIN sessions s ON s.id = fsc.session_id "
         "WHERE fsc.file_path = ? AND fsc.released_at IS NULL "
         "ORDER BY fsc.claimed_at DESC",
-        ((file_path or "").strip(),),
+        (_normalize_file_path(file_path),),
     ) as cur:
         rows = await cur.fetchall()
     return [r for r in (_row_to_dict(row) for row in rows) if r]
@@ -1111,7 +1169,7 @@ async def release_symbol_claims_for_session(
         cur = await db.execute(
             "UPDATE file_symbol_claims SET released_at = datetime('now') "
             "WHERE session_id = ? AND file_path = ? AND released_at IS NULL",
-            (session_id, (file_path or "").strip()),
+            (session_id, _normalize_file_path(file_path)),
         )
     else:
         cur = await db.execute(
@@ -1143,7 +1201,7 @@ async def release_symbol(
     True if a live claim was actually released, False if none matched
     (already released / never claimed).
     """
-    normalized = (file_path or "").strip()
+    normalized = _normalize_file_path(file_path)
     sym = (symbol_name or "").strip()
     if not normalized or not sym:
         return False
@@ -1174,7 +1232,7 @@ async def get_symbol_hotspots(
     where = "WHERE claimed_at > datetime('now', ?)"
     if file_path:
         where += " AND file_path = ?"
-        params.append((file_path or "").strip())
+        params.append(_normalize_file_path(file_path))
     sql = (
         "SELECT file_path, symbol_name, symbol_type, "
         "COUNT(DISTINCT session_id) AS session_count "
@@ -1367,7 +1425,7 @@ async def flag_file_refactor(
 
     Creates the row if absent (idempotent). Returns the updated counter row.
     """
-    normalized = (file_path or "").strip()
+    normalized = _normalize_file_path(file_path)
     if not normalized:
         raise ValueError("file_path is required")
     await db.execute(

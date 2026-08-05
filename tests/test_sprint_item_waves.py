@@ -296,3 +296,35 @@ async def test_topo_depth_map_external_dep_is_root():
     dm = db_module._topo_depth_map(items)
     assert dm["a"] == 0  # external dep → root
     assert dm["b"] == 1  # in-set dep on a → wave 1
+
+
+# ---------------------------------------------------------------------------
+# 2a176d6d — regression tied directly to the 2026-08-04 V026-batch6 audit's
+# literal example: assign_sprint_waves must split two items that each
+# declare "file:<path>:<symbol>" (a single extra colon, NOT the "::"
+# symbol: convention) on the SAME real file into DIFFERENT waves, not
+# co-batch them as if the trailing ":<symbol>" suffix made them disjoint
+# files. Exercises the same wave-coloring path assign_sprint_waves shares
+# with get_parallelizable_groups (both color via _resource_sets_conflict).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_assign_sprint_waves_splits_colon_symbol_suffixed_same_file(db):
+    pid = await _project(db)
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "touch funcA on sprint_items.py",
+        touches_resources=["file:sprint_items.py:funcA"],
+    )
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "touch funcB on sprint_items.py",
+        touches_resources=["file:sprint_items.py:funcB"], force=True,
+    )
+    result = await db_module.assign_sprint_waves(db, pid)
+    assert result["assigned"] == 2
+
+    ra = await db_module.get_sprint_item(db, a["id"])
+    rb = await db_module.get_sprint_item(db, b["id"])
+    # Both real declarations touch the SAME file, so they must NOT land in
+    # the same wave despite the different trailing ":<symbol>" suffix.
+    assert ra["wave"] != rb["wave"]

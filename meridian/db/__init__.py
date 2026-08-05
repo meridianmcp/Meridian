@@ -6889,9 +6889,31 @@ def normalize_resource_id(identifier: str) -> str:
 
 def _resource_file_of(rid: str) -> "str | None":
     """Return the file path a ``file:`` / ``symbol:`` resource id refers to, or
-    None for other resource types. (63b030a6 — cross-type conflict detection.)"""
+    None for other resource types. (63b030a6 — cross-type conflict detection.)
+
+    2a176d6d — a ``file:<path>:<symbol>`` declaration (a single extra colon,
+    NOT the ``::`` double-colon ``symbol:`` convention) is a widely-used,
+    accepted shorthand elsewhere in this codebase (see the SYMBOL_SCOPE_HINT
+    helper, which treats it as the *preferred* form and is why it is never
+    rewritten/rejected at declaration time by ``normalize_resource_id``). But
+    left as an opaque ``file:`` value, the trailing ``:<symbol>`` suffix became
+    part of the "file identity" this function returns — so two items each
+    using this shape with DIFFERENT trailing symbols on the SAME real file
+    (e.g. ``file:x.py:funcA`` and ``file:x.py:funcB``) resolved to two
+    DIFFERENT file identities and were treated as disjoint, unconflicting
+    resources. That is exactly the false-negative the 2026-08-04 V026-batch6
+    audit flagged ("Group 0 contains items with overlapping ... resources").
+    Strip a trailing ``:<symbol>`` suffix here — for CONFLICT COMPARISON ONLY,
+    never for the stored/serialized resource string — so both declarations
+    correctly resolve to the same real file ``x.py`` and conflict like any
+    other pair of whole-file claims on it. A genuine Windows drive-letter path
+    (``C:/...``) is exempted so it is never mistaken for this pattern.
+    """
     if rid.startswith("file:"):
-        return rid[len("file:"):]
+        value = rid[len("file:"):]
+        if ":" in value and not re.match(r"^[A-Za-z]:[/\\]", value):
+            value = value.split(":", 1)[0]
+        return value
     if rid.startswith("symbol:"):
         return rid[len("symbol:"):].partition("::")[0]
     return None

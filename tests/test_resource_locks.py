@@ -1111,6 +1111,185 @@ async def test_sprint_item_resource_claim_gate_rolls_back_earlier_resource_in_sa
 
 
 # ---------------------------------------------------------------------------
+# 2a176d6d — lifecycle-audit findings (1)/(3)/(4) enforced at the
+# claim_sprint_item (handle_claim_sprint_item) call site, layered ON TOP of
+# the low-level gate (_sprint_item_resource_claim_gate) rather than changing
+# that function's own fail-open/fail-soft contract, which is pinned by its
+# own direct unit tests above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_missing_session_id_with_declared_resources_is_refused(db):
+    """2a176d6d (finding 1) — the real MCP claim_sprint_item entry point must
+    fail CLOSED when no session_id is supplied and the item declares
+    touches_resources, instead of silently walking away with zero lock
+    protection (the low-level gate's own fail-open behavior)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "2a176d6d-no-identity")
+    pid = p["id"]
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "no identity supplied",
+        touches_resources=["symbol:pkg/mod.py::foo"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": pid, "item_id": item["id"]},  # no session_id
+        db, "/tmp",
+    )
+    assert result.get("ok") is False
+    assert result["error"] == "MISSING_EXECUTION_IDENTITY"
+    reread = await db_module.get_sprint_item(db, item["id"])
+    assert reread["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_missing_session_id_no_resources_is_unaffected(db):
+    """2a176d6d (finding 1) — an item with NOTHING declared has nothing to
+    protect, so the new identity gate must stay a no-op for it (matches the
+    low-level gate's own 'genuinely nothing to enforce' carve-out)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "2a176d6d-no-identity-noop")
+    pid = p["id"]
+    item = await db_module.add_sprint_item(db, pid, "v1", "nothing declared")
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": pid, "item_id": item["id"]},  # no session_id
+        db, "/tmp",
+    )
+    assert result.get("error") != "MISSING_EXECUTION_IDENTITY"
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_bare_symbol_resource_is_rejected(db):
+    """2a176d6d (finding 3) — a bare 'symbol:<name>' declaration (no '::'
+    file scope) acquires zero lock; the real claim_sprint_item path must hard
+    -block it (MALFORMED_RESOURCE) rather than silently reporting an
+    'ok' claim with no actual protection."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "2a176d6d-bare-symbol-claim")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "bare symbol declared",
+        touches_resources=["symbol:_helper_fn"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]},
+        db, "/tmp",
+    )
+    assert result.get("ok") is False
+    assert result["error"] == "MALFORMED_RESOURCE"
+    assert "symbol:_helper_fn" in result["malformed_resources"]
+    reread = await db_module.get_sprint_item(db, item["id"])
+    assert reread["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_bare_symbol_rolls_back_earlier_resource(db):
+    """2a176d6d (finding 3) — an item declaring a GOOD file: resource AND a
+    malformed bare symbol: resource must roll back the good one too: the
+    whole claim is refused, all-or-nothing, exactly like a real conflict."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "2a176d6d-bare-symbol-rollback")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "mixed good and malformed",
+        touches_resources=["file:a.py", "symbol:_helper_fn"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]},
+        db, "/tmp",
+    )
+    assert result.get("ok") is False
+    assert result["error"] == "MALFORMED_RESOURCE"
+    # a.py must NOT have been left locked behind the refused claim.
+    file_claims = await db_module.get_file_claims(db, "a.py")
+    assert file_claims["file_lock"] is None
+    reread = await db_module.get_sprint_item(db, item["id"])
+    assert reread["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_claim_granularity_marks_fallback_as_coarse(db):
+    """2a176d6d (finding 4) — a symbol: resource that widened to a whole-file
+    lock (no resource_contents supplied) must be classified 'coarse' in
+    claim_granularity, never 'symbol' or bare 'file' (which would look
+    indistinguishable from a genuinely-declared file: resource)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "2a176d6d-granularity-coarse")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "symbol without source",
+        touches_resources=["symbol:pkg/mod.py::foo"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]},
+        db, "/tmp",
+    )
+    assert "error" not in result and not result.get("blocked")
+    assert result["claim_granularity"]["symbol:pkg/mod.py::foo"] == "coarse"
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_claim_granularity_marks_real_symbol_claim(db):
+    """2a176d6d (finding 4) — a REAL AST-resolved symbol claim (source
+    supplied) must be classified 'symbol', not 'coarse'."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "2a176d6d-granularity-symbol")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "symbol with source",
+        touches_resources=["symbol:pkg/mod.py::foo"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {
+            "project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+            "resource_contents": {"pkg/mod.py": _FOO_BAR_SRC},
+        },
+        db, "/tmp",
+    )
+    assert "error" not in result and not result.get("blocked")
+    assert result["claim_granularity"]["symbol:pkg/mod.py::foo"] == "symbol"
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_claim_granularity_marks_real_file_claim(db):
+    """2a176d6d (finding 4) — a genuinely-declared file: resource must be
+    classified 'file', distinct from a symbol: resource that fell back to a
+    file lock ('coarse')."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "2a176d6d-granularity-file")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "whole file declared",
+        touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]},
+        db, "/tmp",
+    )
+    assert "error" not in result and not result.get("blocked")
+    assert result["claim_granularity"]["file:a.py"] == "file"
+
+
+# ---------------------------------------------------------------------------
 # 22cad9b8 — atomic batch claim: claim_parallel_batch reserves an ENTIRE
 # parallel-safe batch (every item's status AND every declared resource)
 # atomically, before workers launch. Closes the gap between
@@ -1504,3 +1683,228 @@ async def test_claim_parallel_batch_end_to_end_from_parallelizable_groups(db):
     # The batch no longer shows up as eligible (both items are in_progress now).
     groups_after = await db_module.get_parallelizable_groups(db, pid, version="v1")
     assert groups_after["eligible_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 2a176d6d (finding 6) — claim_file / claim_symbol / release_symbol now all
+# route through the same _normalize_file_path (previously several call sites
+# used a bare .strip() directly instead) so the STRIP rule can never drift
+# apart across functions. _normalize_file_path deliberately stays strip-only
+# (no separator canonicalization) — see its docstring: this module
+# coordinates OTHER live, concurrent sessions' locks, and matching how
+# claim_file already stores existing rows matters more here than collapsing
+# a Windows-style path onto a forward-slash one, which would need a real data
+# migration to be safe. No dedicated test for the strip-only consolidation
+# itself beyond the existing claim_file/claim_symbol/release_symbol coverage
+# elsewhere in this file, which already exercises it implicitly.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# 2a176d6d (finding 5) — claim_symbol rejects ambiguous symbol names instead
+# of silently claiming the first match's line range.
+# ---------------------------------------------------------------------------
+
+_DUP_NAME_SRC = (
+    "def helper():\n"
+    "    return 1\n"
+    "\n"
+    "\n"
+    "def helper():\n"
+    "    return 2\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_claim_symbol_rejects_ambiguous_duplicate_top_level_name(db):
+    """2a176d6d (finding 5) — two top-level function defs that share the exact
+    name 'helper' (a redefinition — syntactically legal Python; ast.parse
+    still produces two distinct FunctionDef nodes) must be refused as
+    ambiguous rather than silently claiming symbols[0]'s line range."""
+    p = await db_module.create_project(db, "2a176d6d-ambiguous-symbol")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "sess-a")
+    result = await db_module.claim_symbol(
+        db, sess["id"], "dup.py", "helper", _DUP_NAME_SRC
+    )
+    assert result["claimed"] is False
+    assert result["reason"] == "ambiguous_symbol"
+    assert len(result["matches"]) == 2
+    # Nothing was actually claimed for the ambiguous name.
+    live = await db_module.get_symbol_claims(db, "dup.py")
+    assert live == []
+
+
+@pytest.mark.asyncio
+async def test_claim_symbol_unambiguous_name_still_claims_normally(db):
+    """2a176d6d (finding 5) — a non-duplicate name in the SAME file with
+    duplicates present must still claim normally (only the ambiguous name is
+    refused, not the whole file)."""
+    src = _DUP_NAME_SRC + "\ndef unique():\n    return 3\n"
+    p = await db_module.create_project(db, "2a176d6d-unambiguous-symbol")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "sess-a")
+    result = await db_module.claim_symbol(db, sess["id"], "dup2.py", "unique", src)
+    assert result["claimed"] is True
+
+
+# ---------------------------------------------------------------------------
+# 2a176d6d — bonus root-cause fix (audit's literal example): a
+# "file:<path>:<symbol>" declaration (single extra colon, the widely-used
+# "preferred form" per the SYMBOL_SCOPE_HINT helper — NOT the "::" symbol:
+# convention) must still be recognised as touching the SAME real file as
+# another "file:<path>:<other_symbol>" declaration for CONFLICT purposes,
+# even though the stored/serialized resource string is left untouched.
+# ---------------------------------------------------------------------------
+
+
+def test_resource_file_of_strips_colon_symbol_suffix():
+    assert db_module._resource_file_of("file:x.py:funcA") == "x.py"
+    assert db_module._resource_file_of("file:x.py:funcB") == "x.py"
+    # Plain file: (no embedded colon) is unaffected.
+    assert db_module._resource_file_of("file:x.py") == "x.py"
+    # symbol: is unaffected (already handled via "::").
+    assert db_module._resource_file_of("symbol:x.py::foo") == "x.py"
+    # A genuine Windows drive-letter path is exempted, not mistaken for the
+    # "file:<path>:<symbol>" pattern.
+    assert db_module._resource_file_of("file:C:/repo/x.py") == "C:/repo/x.py"
+
+
+def test_two_resources_conflict_file_colon_symbol_suffix_same_file():
+    """The audit's literal example: two DIFFERENT 'file:<path>:<symbol>'
+    declarations on the SAME real file must conflict."""
+    c = db_module._two_resources_conflict
+    assert c("file:x.py:funcA", "file:x.py:funcB") is True
+    # Different real files still don't conflict even with the suffix present.
+    assert c("file:x.py:funcA", "file:y.py:funcB") is False
+    # The stored string is untouched by normalize_resource_id (still the
+    # "preferred form" per the SYMBOL_SCOPE_HINT helper).
+    assert db_module.normalize_resource_id("file:x.py:funcA") == "file:x.py:funcA"
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_splits_colon_symbol_suffixed_same_file_items(db):
+    """22cad9b8/2a176d6d — the exact 2026-08-04 V026-batch6 audit scenario:
+    two items each declaring 'file:<path>:<symbol>' on the SAME real file
+    must be split into separate groups, not co-scheduled as if disjoint."""
+    p = await db_module.create_project(db, "2a176d6d-colon-suffix-groups")
+    pid = p["id"]
+    await db_module.add_sprint_item(
+        db, pid, "v1", "touch funcA",
+        touches_resources=["file:sprint_items.py:funcA"],
+    )
+    await db_module.add_sprint_item(
+        db, pid, "v1", "touch funcB",
+        touches_resources=["file:sprint_items.py:funcB"], force=True,
+    )
+    res = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert res["group_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 2a176d6d (finding 3 + 4) — bare symbol:<name> rejection and claim_granularity
+# classification in the ATOMIC BATCH path (claim_parallel_batch /
+# _claim_batch_resource), mirroring the single-item-path coverage above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_bare_symbol_resource_rejected(db):
+    """2a176d6d (finding 3) — a bare symbol:<name> resource in a batch item
+    acquires no lock; the batch must be refused (MALFORMED_RESOURCE), not
+    treated as claimed."""
+    p = await db_module.create_project(db, "2a176d6d-batch-bare-symbol")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "bare symbol solo",
+        touches_resources=["symbol:_helper_fn"], prospect_bypass=True,
+    )
+    result = await db_module.claim_parallel_batch(db, pid, sess["id"], [item["id"]])
+    assert result["ok"] is False
+    assert result["error"] == "MALFORMED_RESOURCE"
+    assert (await db_module.get_sprint_item(db, item["id"]))["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_resource_claims_report_granularity(db):
+    """2a176d6d (finding 4) — a successful batch claim's resource_claims must
+    correctly distinguish a real symbol claim, a coarse fallback, and a
+    genuine file: declaration."""
+    p = await db_module.create_project(db, "2a176d6d-batch-granularity")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    item_symbol = await db_module.add_sprint_item(
+        db, pid, "v1", "real symbol claim",
+        touches_resources=["symbol:pkg/mod.py::foo"], prospect_bypass=True,
+    )
+    item_file = await db_module.add_sprint_item(
+        db, pid, "v1", "real file claim",
+        touches_resources=["file:other.py"], prospect_bypass=True, force=True,
+    )
+    result = await db_module.claim_parallel_batch(
+        db, pid, sess["id"], [item_symbol["id"], item_file["id"]],
+        resource_contents={"pkg/mod.py": _FOO_BAR_SRC},
+    )
+    assert result["ok"] is True
+    by_resource = {c["resource"]: c for c in result["resource_claims"]}
+    assert by_resource["symbol:pkg/mod.py::foo"]["claim_granularity"] == "symbol"
+    assert by_resource["file:other.py"]["claim_granularity"] == "file"
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_resource_claims_coarse_fallback(db):
+    """2a176d6d (finding 4) — a symbol: resource in a batch with NO
+    resource_contents supplied for it must be reported claim_granularity
+    'coarse', not 'symbol'."""
+    p = await db_module.create_project(db, "2a176d6d-batch-granularity-coarse")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "symbol no source",
+        touches_resources=["symbol:pkg/mod.py::foo"], prospect_bypass=True,
+    )
+    result = await db_module.claim_parallel_batch(db, pid, sess["id"], [item["id"]])
+    assert result["ok"] is True
+    assert result["resource_claims"][0]["claim_granularity"] == "coarse"
+    assert result["resource_claims"][0]["fallback_reason"] == "no_source_supplied"
+
+
+# ---------------------------------------------------------------------------
+# 2a176d6d — additive scheduling-granularity redesign piece: STATIC
+# (planning-time) predicted_granularity on each get_parallelizable_groups
+# item, purely a resource-id-shape classification. Does not change the
+# coloring/grouping algorithm at all.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_predicted_granularity_shapes(db):
+    p = await db_module.create_project(db, "2a176d6d-predicted-granularity")
+    pid = p["id"]
+    await db_module.add_sprint_item(
+        db, pid, "v1", "mixed resources",
+        touches_resources=["file:a.py", "symbol:b.py::foo", "db:migrations"],
+    )
+    res = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    item = res["groups"][0][0]
+    pg = item["predicted_granularity"]
+    assert pg["file:a.py"] == "file"
+    assert pg["symbol:b.py::foo"] == "symbol"
+    assert pg["db:migrations"] == "other"
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_predicted_granularity_flags_malformed_symbol(db):
+    """2a176d6d — a bare symbol:<name> (no '::' file scope) is flagged
+    'malformed_symbol' at PLANNING time, before any worker ever attempts to
+    claim it, so an orchestrator can catch it before launch."""
+    p = await db_module.create_project(db, "2a176d6d-predicted-malformed")
+    pid = p["id"]
+    await db_module.add_sprint_item(
+        db, pid, "v1", "bare symbol declared",
+        touches_resources=["symbol:_helper_fn"],
+    )
+    res = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    item = res["groups"][0][0]
+    assert item["predicted_granularity"]["symbol:_helper_fn"] == "malformed_symbol"

@@ -14878,26 +14878,39 @@ async def test_claim_returns_code_context_from_touches_resources(db):
     import meridian.server as srv
 
     p = await db_module.create_project(db, "prospect-tr")
+    sess = await db_module.register_session(db, p["id"], "prospect-tr-sess")
     # 94c26322 — prospect_bypass=True so the claim gate passes (not testing the gate here)
     item = await db_module.add_sprint_item(
         db, p["id"], "v1", "Fix the registry proxy", prospect_bypass=True
     )
+    # 2a176d6d (finding 3) — a bare "symbol:<name>" with no "<path>::<symbol>"
+    # file scope is now hard-rejected (MALFORMED_RESOURCE) instead of silently
+    # acquiring zero lock, so this declares the well-formed claim-system form.
     await db.execute(
         "UPDATE sprint_items SET touches_resources = ? WHERE id = ?",
-        (_json.dumps(["file:meridian/routes/tunnel.py", "symbol:get_mcp_registry"]), item["id"]),
+        (
+            _json.dumps([
+                "file:meridian/routes/tunnel.py",
+                "symbol:meridian/routes/tunnel.py::get_mcp_registry",
+            ]),
+            item["id"],
+        ),
     )
     await db.commit()
 
+    # 2a176d6d (finding 1) — claim_sprint_item now requires an explicit
+    # session_id when the item declares real file:/symbol: resources, so the
+    # resource-claim gate can never fail-open for an unidentified caller.
     result = await srv._dispatch_mcp_tool(
         "claim_sprint_item",
-        {"project_id": p["id"], "item_id": item["id"]},
+        {"project_id": p["id"], "item_id": item["id"], "session_id": sess["id"]},
         db, "/tmp",
     )
     ctx = result.get("code_context")
     assert ctx is not None
     assert ctx["source"] == "touches_resources"
     assert ctx["files"] == ["meridian/routes/tunnel.py"]
-    assert ctx["symbols"] == ["get_mcp_registry"]
+    assert ctx["symbols"] == ["meridian/routes/tunnel.py::get_mcp_registry"]
     assert any("get_mcp_registry" in c for c in ctx["find_symbol_calls"])
     assert any("tunnel.py" in c for c in ctx["search_graph_calls"])
 
