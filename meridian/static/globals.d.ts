@@ -92,6 +92,9 @@ declare global {
   const loadFilesTab: any;
   const loadNotesTab: any;
   const loadRewindTab: any;
+  const loadDocumentReview: any;
+  const renderDocumentReview: any;
+  const wireDocumentReviewButtons: any;
   const loadTimeline: any;
   const loadSprintBoard: any;
   const saveFile: any;

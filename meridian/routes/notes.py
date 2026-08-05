@@ -80,6 +80,96 @@ async def document_structure_endpoint(
         return {"error": f"could not parse document: {exc}"}
 
 
+def _resolve_document_review_builder():
+    """b67ec6b5 -- best-effort import of
+    ``meridian_docs.docs_intel.build_document_review``.
+
+    Mirrors ``meridian.docx_integrity_gate._import_optional_meridian_docs_submodule``:
+    ``extensions/meridian-docs`` is an independently installable extension,
+    NOT a core ``[pypi-dependencies]`` entry (see that module's docstring for
+    why), so ``import meridian_docs`` legitimately fails in most self-hosted
+    checkouts and this repo's own core test env. Returns ``None`` (never
+    raises) when the extension isn't installed or is broken — the caller
+    degrades to a structured ``{"error": ...}`` response, never a 500.
+
+    A module-level function (not inlined in the route) so tests can inject a
+    stub builder via ``monkeypatch.setattr`` without installing the real
+    extension — the same injectable-dependency pattern
+    ``docx_integrity_gate.build_docx_integrity_gate`` uses for its
+    render_checker/equation_auditor/snapshot_reader params.
+    """
+    try:
+        from meridian_docs import docs_intel as _meridian_docs_intel  # noqa: PLC0415
+    except ModuleNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001 — a broken extension must never break this route
+        return None
+    fn = getattr(_meridian_docs_intel, "build_document_review", None)
+    return fn if callable(fn) else None
+
+
+@router.get("/projects/{project_id}/document-review")
+async def document_review_endpoint(
+    project_id: str,
+    request: Request,
+    path: str,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """b67ec6b5 — non-mutating DOCX review for the dashboard review panel.
+
+    Extends the same server-side-path contract ``document_structure_endpoint``
+    above already established (works for self-hosted/tunnel setups; a hosted
+    server has no filesystem access to the caller's document and returns an
+    error). Delegates to ``meridian_docs.docs_intel.build_document_review`` —
+    never re-derives finding detection or anchor-resolution logic here — so
+    the response shape is exactly that function's contract: findings grouped
+    by category (structure/equation/caption/section_page/ownership/
+    provenance/render_integrity) and severity, each carrying a
+    locate_anchor-style locator instead of a raw paragraph id alone.
+
+    Pass ``expected_source_fingerprint`` (a value previously returned as
+    ``source_fingerprint``) to detect the document changing since a stashed
+    review — a mismatch returns ``{"status": "stale", ...}`` rather than
+    resolving findings against what may now be the wrong document.
+
+    Returns ``{"error": ...}`` (never a 500) when: the project doesn't
+    exist (404 instead — same as document_structure_endpoint), ``path`` is
+    missing, the file can't be read/parsed, or the meridian-docs extension
+    is not installed on this server.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    fp = (path or "").strip()
+    validate_input_size(fp, "path", 2000)
+    if not fp:
+        return {"error": "path is required"}
+    fingerprint = (expected_source_fingerprint or "").strip() or None
+    if fingerprint is not None:
+        validate_input_size(fingerprint, "expected_source_fingerprint", 200)
+
+    builder = _resolve_document_review_builder()
+    if builder is None:
+        return {
+            "error": (
+                "the meridian-docs extension is not installed on this server; "
+                "document review is unavailable. Install it "
+                "(pip install -e extensions/meridian-docs) or run the review "
+                "via the meridian-docs MCP server's get_document_review tool."
+            ),
+        }
+    try:
+        result = builder(fp, expected_source_fingerprint=fingerprint)
+    except FileNotFoundError:
+        return {"error": f"file not found on server: {fp}"}
+    except Exception as exc:  # noqa: BLE001 — surface parse errors inline, never a 500
+        return {"error": f"could not build document review: {exc}"}
+    if not isinstance(result, dict):
+        return {"error": "document review builder returned an unexpected result"}
+    return result
+
+
 @router.post("/projects/{project_id}/notes", status_code=201)
 async def create_project_note_endpoint(
     project_id: str, body: dict[str, Any], request: Request

@@ -991,6 +991,7 @@ No auth required.
 | `PATCH` | `/projects/{project_id}/decisions-pinned/{decision_id}` | Patch fields, or supersede (pass new_title + new_body to atomically retire+create) |
 | `POST` | `/projects/{project_id}/decisions/consolidate` | Call an external LLM to deduplicate and consolidate pinned decisions |
 | `POST` | `/projects/{project_id}/devlog` | Append a user-written line to DEVLOG.md via the devlog anchor |
+| `GET` | `/projects/{project_id}/document-review` | b67ec6b5 — non-mutating DOCX review for the dashboard review panel |
 | `GET` | `/projects/{project_id}/document-structure` | 3f596f81 — heading-tree structure of an ingested .docx for the Documents |
 | `POST` | `/projects/{project_id}/documents/upload` | f1c7e7d1 — tunnel-free document upload (plain .txt/.md only, v1) |
 | `POST` | `/projects/{project_id}/events` | Normalize a framework event into Meridian's task_log |
