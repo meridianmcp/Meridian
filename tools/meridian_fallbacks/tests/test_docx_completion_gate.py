@@ -960,8 +960,10 @@ def test_legacy_alias_points_at_run_completion_gate():
 def test_module_has_no_hard_dependency_on_package_init():
     """This module must be importable standalone (as done at the top of this
     file, off its own file path) without tools/meridian_fallbacks/__init__.py
-    existing or being importable -- confirmed by the very fact this test file
-    successfully imported `docx_completion_gate` above without ever importing
-    `tools` or `tools.meridian_fallbacks` as packages."""
-    assert "tools" not in sys.modules
-    assert "tools.meridian_fallbacks" not in sys.modules
+    existing or being importable. Asserting on `gate`'s own identity (rather
+    than global `sys.modules` membership, which a sibling test file importing
+    the real `tools.meridian_fallbacks` package in the same pytest session can
+    legitimately populate) is what actually proves this module itself was
+    loaded as a bare top-level module, not as a package submodule."""
+    assert gate.__name__ == "docx_completion_gate"
+    assert not gate.__package__
