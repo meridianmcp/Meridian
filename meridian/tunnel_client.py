@@ -39,6 +39,7 @@ from pathlib import Path
 
 from . import __version__
 from . import process_lifecycle as _process_lifecycle
+from . import process_registry as _process_registry
 from . import serena_pool as _serena_pool
 from .serena_pool import SerenaDaemonPool, SERENA_POOL_BASE_PORT
 
@@ -2942,7 +2943,25 @@ def _spawn_with_cache_retry(
 # process already spawned through them (every current slot) do not change.
 # Adopting a new spawn site into the owned-tracking path (job-object on
 # Windows / process-group on POSIX) is opt-in per call site.
+#
+# 315b0a63 — additionally, best-effort register/release each owned spawn as
+# a lease in meridian/process_registry.py (client="meridian-tunnel_client")
+# so this process's OWN spawns show up in the same cross-client lease view
+# external clients (Claude Code/Codex/Claude Desktop) register into. Gated
+# OFF by default via MERIDIAN_PROCESS_LEASES_ENABLED (mirrors dispatcher.py's
+# own "ships disabled unless explicitly opted in" guardrail) so this never
+# changes existing behaviour, never touches disk, and never affects any
+# existing test unless a test explicitly opts in.
 # ---------------------------------------------------------------------------
+
+# Env var gate for the lease-registry integration below — strict "1" check,
+# same pattern as dispatcher.ENABLE_ENV_VAR.
+_PROCESS_LEASES_ENABLED_ENV_VAR = "MERIDIAN_PROCESS_LEASES_ENABLED"
+_LEASE_CLIENT_NAME = "meridian-tunnel_client"
+
+
+def _process_leases_enabled() -> bool:
+    return os.environ.get(_PROCESS_LEASES_ENABLED_ENV_VAR) == "1"
 
 
 def _owned_process_backend() -> "_process_lifecycle.PosixProcessGroupBackend | _process_lifecycle.WindowsJobObjectBackend":
@@ -2950,6 +2969,45 @@ def _owned_process_backend() -> "_process_lifecycle.PosixProcessGroupBackend | _
     A fresh instance per call — both backends are stateless aside from the
     (lazily-invoked) Windows job-API loader, so there is nothing to cache."""
     return _process_lifecycle.get_default_backend()
+
+
+def _register_owned_process_lease(
+    handle: "_process_lifecycle.OwnedProcessHandle | None",
+) -> None:
+    """Best-effort: register *handle* with the local process-lease broker
+    (315b0a63) when MERIDIAN_PROCESS_LEASES_ENABLED=1. A no-op (including
+    when the handle is None, the feature is disabled, or the broker raises
+    for any reason) — this must never turn a working spawn into a failed
+    one, matching _spawn_owned_with_cache_retry's own "best-effort" clause."""
+    if handle is None or not _process_leases_enabled():
+        return
+    try:
+        _process_registry.get_broker().register(
+            _LEASE_CLIENT_NAME,
+            handle.pid,
+            run_id=handle.run_id,
+            executable=handle.executable,
+            cwd=handle.cwd,
+            cmdline=list(handle.cmdline),
+            create_time=handle.create_time,
+            group_id=handle.group_id,
+            job_id=handle.job_id,
+        )
+    except Exception:  # noqa: BLE001 — best-effort, never raise
+        pass
+
+
+def _release_owned_process_lease(
+    handle: "_process_lifecycle.OwnedProcessHandle | None",
+) -> None:
+    """Best-effort counterpart to :func:`_register_owned_process_lease`,
+    called from :func:`_close_owned_process`. Never raises."""
+    if handle is None or not _process_leases_enabled():
+        return
+    try:
+        _process_registry.get_broker().release(_LEASE_CLIENT_NAME, handle.run_id)
+    except Exception:  # noqa: BLE001 — best-effort, never raise (already-released,
+        pass         # never-registered, etc. are all fine to silently ignore here)
 
 
 def _spawn_owned_with_cache_retry(
@@ -2989,6 +3047,7 @@ def _spawn_owned_with_cache_retry(
         handle = _owned_process_backend().adopt(proc, cmd=cmd)
     except Exception:  # noqa: BLE001 — best-effort; the spawn itself already succeeded
         handle = None
+    _register_owned_process_lease(handle)
     return proc, handle
 
 
@@ -3002,7 +3061,9 @@ def _close_owned_process(
     no-op contract so callers can pass either interchangeably."""
     if handle is None:
         return True
-    return _owned_process_backend().close(handle, grace_seconds=grace_seconds)
+    result = _owned_process_backend().close(handle, grace_seconds=grace_seconds)
+    _release_owned_process_lease(handle)
+    return result
 
 
 def _plugin_spawn_env(env: object) -> "dict[str, str] | None":

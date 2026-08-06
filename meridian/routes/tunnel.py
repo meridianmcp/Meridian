@@ -38,6 +38,7 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
 from .. import db as db_module
+from .. import process_registry as process_registry_module
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
@@ -2242,13 +2243,46 @@ def _config_manifest_hash(config: Any) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def _local_process_lease_summary() -> dict:
+    """315b0a63 — best-effort summary of THIS SERVER PROCESS's own local
+    worker-lease registry (meridian/process_registry.py).
+
+    Only meaningful when this FastAPI process shares a filesystem/host with
+    the client(s) that registered leases — e.g. a self-hosted, single-
+    machine install running the dashboard alongside ``--mcp``/``--tunnel``.
+    A remote, multi-tenant hosted instance (Fly.io) has no visibility into
+    a developer's local laptop and correctly reports zero leases here; it
+    is NOT a promise about the tenant's own machine, only about this
+    server process's local disk. Never raises — a registry read failure
+    degrades to an unavailable-shaped summary rather than breaking
+    diagnostics."""
+    try:
+        broker = process_registry_module.get_broker()
+        active = broker.list_leases()
+        survivors = broker.report_unowned_survivors()
+        return {
+            "available": True,
+            "active": len(active),
+            "unowned_survivors": len(survivors),
+        }
+    except Exception:  # noqa: BLE001 — diagnostics must never fail on this
+        return {"available": False, "active": 0, "unowned_survivors": 0}
+
+
 def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = None) -> dict:
     """Assemble the full layered diagnostic snapshot for one tenant (f1e0df55).
 
     Shared by the ``GET /tunnel/diagnostics/{tenant_id}`` HTTP route and the
     ``get_tunnel_diagnostics`` MCP tool so both surfaces report identically.
     Returns an unauthenticated-shaped stub (empty slots, no tenant) when
-    ``tenant`` is None, mirroring ``get_tunnel_plugins``'s existing contract."""
+    ``tenant`` is None, mirroring ``get_tunnel_plugins``'s existing contract.
+
+    315b0a63 — both branches include ``process_leases``: a best-effort local
+    summary of this server process's own worker-lease registry (see
+    :func:`_local_process_lease_summary`). Included even in the
+    unauthenticated/no-tenant branch because that is exactly the shape
+    self-hosted callers get — the case where this field is actually most
+    useful."""
     run_id = uuid.uuid4().hex
     generated_at = time.time()
     if tenant is None:
@@ -2266,6 +2300,7 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
                 "manifest_hash": _config_manifest_hash(None),
                 "tools_list_stale": False,
             },
+            "process_leases": _local_process_lease_summary(),
         }
 
     tid = tenant.get("id")
@@ -2336,6 +2371,7 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
             "manifest_hash": _config_manifest_hash(parsed),
             "tools_list_stale": tid in _tools_list_changed_pending,
         },
+        "process_leases": _local_process_lease_summary(),
     }
 
 
