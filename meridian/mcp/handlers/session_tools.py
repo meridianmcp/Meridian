@@ -707,6 +707,41 @@ async def handle_search_synthesis(
     return {"query": args["query"], **synth, "results": results}
 
 
+async def handle_planning_search(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: planning_search.
+
+    0dc5a35d — a SEPARATE ranked, scoped retrieval operation from
+    search_all/search_synthesis (neither of those two is touched by this
+    handler; both keep their exact pre-existing behavior). Thin argument
+    adapter over :func:`meridian.db.planning_search` — see that function's
+    docstring for the full result contract (ranking score + explanation,
+    source_type/version/status filters, pagination cursor, backend/
+    freshness metadata). No LLM or embedding call in this path.
+
+    Not yet wired into the MCP tool dispatch table / tools-list schema
+    (meridian/mcp/handler.py, meridian/mcp_tools.py) — those files are
+    outside this handler module's scope; a follow-up item registers
+    "planning_search" -> handle_planning_search the same one-line way
+    "search_all"/"search_synthesis" are registered today.
+    """
+    if "query" not in args or args.get("project_id") is None:
+        return {"error": "project_id and query are required"}
+    return await db_module.planning_search(
+        db, args["project_id"], args.get("query", ""),
+        source_types=args.get("source_types"),
+        version=args.get("version"),
+        status=args.get("status"),
+        limit=args.get("limit", 20),
+        cursor=args.get("cursor", 0),
+    )
+
+
 async def handle_paper_search(
     args: dict[str, Any],
     db: Any,

@@ -361,3 +361,75 @@ def test_search_all_takes_pg_path_for_postgres_shaped_db():
     multi_pos = code_src.index("_multiword_or_ranked_clause")
     assert is_pg_pos < ts_rank_pos, "is_pg guard must precede the ts_rank branch"
     assert is_pg_pos < multi_pos, "is_pg guard must precede the _multiword_or_ranked_clause branch"
+
+
+# ---------------------------------------------------------------------------
+# 0dc5a35d — backward compatibility: search_all / search_synthesis must be
+# byte-for-byte unchanged by the addition of the separate planning_search
+# ranked-retrieval operation (meridian/db/__init__.py, same module).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_search_all_unchanged_by_planning_search_addition(anydb):
+    """Calling the new planning_search does not alter search_all's own
+    grouped, ungraded result contract or its actual matches."""
+    db = anydb
+    p = await db_module.create_project(db, "sa-compat")
+    await db_module.add_sprint_item(db, p["id"], "v1", "img127 coverage gap")
+
+    # Exercise the new function first, on the SAME project/db — if it shared
+    # any mutable module state with search_all this would be where it leaks.
+    assert hasattr(db_module, "planning_search")
+    await db_module.planning_search(db, p["id"], "img127 coverage")
+
+    result = await db_module.search_all(db, p["id"], _LONG_QUERY)
+    assert set(result.keys()) == {
+        "query", "tasks", "notes", "decisions", "sprint_items", "total"
+    }
+    assert any(
+        i["title"] == "img127 coverage gap" for i in result["sprint_items"]
+    ), "search_all's own graceful-degradation behavior must be unaffected"
+
+
+def test_search_synthesis_handler_still_calls_search_all():
+    """handle_search_synthesis must still retrieve via db_module.search_all —
+    planning_search is a SEPARATE operation search_synthesis does not adopt
+    in this item (per the acceptance criteria: 'do not silently change
+    search_all semantics' / search_synthesis is not required to change)."""
+    import inspect
+
+    from meridian.mcp.handlers import session_tools as st_mod
+
+    src = inspect.getsource(st_mod.handle_search_synthesis)
+    assert "db_module.search_all" in src
+    assert "planning_search" not in src
+
+
+def test_planning_search_is_a_distinct_function_from_search_all():
+    """planning_search must be a separate top-level function — search_all's
+    own source must not reference or delegate to it."""
+    import inspect
+
+    assert db_module.planning_search is not db_module.search_all
+    assert callable(db_module.planning_search)
+    search_all_src = inspect.getsource(db_module.search_all)
+    assert "planning_search" not in search_all_src, (
+        "search_all must not be rewritten to call the new planning_search — "
+        "the two are separate operations by design"
+    )
+
+
+def test_handle_planning_search_handler_is_importable_and_async():
+    """0dc5a35d — the new MCP tool handler exists in session_tools.py
+    alongside handle_search_all/handle_search_synthesis, without disturbing
+    either of them (module still imports cleanly, existing handlers intact)."""
+    import asyncio
+
+    from meridian.mcp.handlers import session_tools as st_mod
+
+    assert hasattr(st_mod, "handle_planning_search")
+    assert asyncio.iscoroutinefunction(st_mod.handle_planning_search)
+    # Existing handlers remain present and untouched.
+    assert asyncio.iscoroutinefunction(st_mod.handle_search_all)
+    assert asyncio.iscoroutinefunction(st_mod.handle_search_synthesis)
