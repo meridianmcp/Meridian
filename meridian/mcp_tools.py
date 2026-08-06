@@ -2026,10 +2026,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "left untouched (re-run once they clear). Idempotent — recomputes from the live "
         "board each call. Hand-override any item afterwards with update_sprint_item(wave=...). "
         "Returns {version, wave_count, assigned, waves: {'wave-1': [ids...], ...}, "
-        "blocked_count, undeclared_count}. 605ca2c4 — if active executor sessions are "
-        "detected, the response also includes active_session_warning: re-labeling wave "
-        "numbers while a session is mid-flight can desync it from a /goal string that "
-        "already references specific wave labels.",
+        "blocked_count, undeclared_count, cycles, graph_digest}. 605ca2c4 — if active "
+        "executor sessions are detected, the response also includes "
+        "active_session_warning: re-labeling wave numbers while a session is mid-flight "
+        "can desync it from a /goal string that already references specific wave labels. "
+        "05553946 — cycles lists any depends_on cycle found among the eligible items "
+        "(full closed path per cycle); a non-empty list means the affected items' wave "
+        "labels are a lenient best-effort fallback, not a real topological position — fix "
+        "via update_sprint_item(depends_on=...), which rejects new cycles outright. "
+        "graph_digest is a deterministic digest of the eligible set's dependency edges.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string", "description": "Optional: only assign waves to items in this sprint-version bucket."}},
