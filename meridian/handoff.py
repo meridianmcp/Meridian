@@ -60,7 +60,16 @@ _env = Environment(
     autoescape=select_autoescape(disabled_extensions=("md", "j2")),
     keep_trailing_newline=True,
 )
-_DEFAULT_GOAL_TEST_FLOOR = 2150
+# abac2298 — there is deliberately NO sibling "_DEFAULT_GOAL_TEST_FLOOR" numeric
+# constant (a prior revision had one, hardcoded to 2150 — Meridian's OWN
+# historical dev-repo pass count). That constant was silently applied as the
+# completion-criteria test floor for EVERY project, including unrelated
+# receiving repositories that never configured executor_config.test_min: a
+# thesis repo with a genuine 88-test suite was told its floor was "2150+", a
+# number nobody had ever validated against that repository. See
+# _test_floor_from_settings / _render_test_floor_clause below — an
+# unconfigured floor now renders an explicit "run --collect-only first and
+# establish your own baseline" instruction instead of inventing a count.
 # 6cfdabd7 — fallback test invocation when a project has no executor_config.
 # test_cmd set. Deliberately NOT hardcoding a `-n <value>` parallelism flag
 # here: baking in a fixed flag is exactly the staleness bug this constant
@@ -1831,7 +1840,14 @@ def _test_cmd_from_settings(proj_settings: dict[str, Any] | None) -> str:
     """Extract executor_config.test_cmd (6cfdabd7). Sibling of
     _max_turns_from_settings — same two-input read pattern, same fail-safe
     convention: a missing/non-dict executor_config or a blank test_cmd
-    returns _DEFAULT_GOAL_TEST_CMD rather than raising or returning empty."""
+    returns _DEFAULT_GOAL_TEST_CMD rather than raising or returning empty.
+
+    abac2298 — this ONLY extracts the configured string; it never validates
+    that the command actually resolves in the receiving repo/worktree (this
+    server has no filesystem access to it). See _is_plausible_test_cmd for
+    the cheapest, purely-lexical sanity check available at generation time,
+    and classify_test_gate_result for the post-run classification an
+    executor (or future tooling) applies to the ACTUAL command output."""
     cfg = (proj_settings or {}).get("executor_config") or {}
     if not isinstance(cfg, dict):
         return _DEFAULT_GOAL_TEST_CMD
@@ -1839,6 +1855,27 @@ def _test_cmd_from_settings(proj_settings: dict[str, Any] | None) -> str:
     if isinstance(raw, str) and raw.strip():
         return raw.strip()
     return _DEFAULT_GOAL_TEST_CMD
+
+
+def _test_floor_from_settings(proj_settings: dict[str, Any] | None) -> "int | None":
+    """Extract executor_config.test_min (abac2298). Sibling of
+    _branch_from_settings: an unset/invalid value returns None so a caller
+    renders an explicit "unknown baseline" instead of silently asserting
+    Meridian's OWN historical pass count against an unrelated receiving
+    repository — the exact bug this fixes (a thesis repo with a real 88-test
+    suite was told its floor was "2150+", a number never validated against
+    it; see the abac2298 sprint notes). A non-dict/missing executor_config, a
+    non-numeric value, or a value <= 0 all degrade to None rather than
+    raising or inventing a count."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    if not isinstance(cfg, dict):
+        return None
+    raw = cfg.get("test_min")
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None
 
 
 def _branch_from_settings(proj_settings: dict[str, Any] | None) -> str | None:
@@ -1889,8 +1926,227 @@ def _strip_parallelism_flag(test_cmd: str) -> str:
     return f"{base} -p no:xdist"
 
 
+# ---------------------------------------------------------------------------
+# abac2298 — repository-aware test-gate resolution and honest xdist-outcome
+# recovery. Meridian's server has NO filesystem access to a receiving repo's
+# worktree, so none of the below can literally execute the configured
+# test_cmd — it can only (a) sanity-check the CONFIGURED STRING itself
+# (_is_plausible_test_cmd), and (b) classify output an executor (or future
+# tooling) already captured from an ACTUAL run (classify_test_gate_result).
+# Both feed the machine-readable <test_gate_config>/<test_gate_recovery>
+# tags and the <test_gate_note> prose _build_quick_start_goal renders, so a
+# receiving executor never has to improvise the same triage from scratch.
+# ---------------------------------------------------------------------------
+
+_RECOGNIZED_TEST_RUNNER_TOKENS = ("pytest", "test", "tox", "nox", "unittest", "jest")
+
+
+def _is_plausible_test_cmd(test_cmd: str) -> bool:
+    """abac2298 — lightweight, PURELY LEXICAL sanity check: does this string
+    even look like a test invocation? This can never confirm the command
+    actually works (that requires the executor's own collect-only probe —
+    see _render_test_floor_clause) — it only catches the cheapest class of
+    misconfiguration: an executor_config.test_cmd that doesn't mention any
+    recognized test-runner token at all (e.g. was accidentally set to a
+    build/deploy command). Never raises; a blank command is never plausible.
+    """
+    cmd = (test_cmd or "").strip().lower()
+    if not cmd:
+        return False
+    return any(token in cmd for token in _RECOGNIZED_TEST_RUNNER_TOKENS)
+
+
+def _render_test_floor_clause(test_cmd: str, test_floor: "int | None") -> str:
+    """abac2298 — render the "<cmd> passes N+" completion-criteria fragment
+    shared by _build_quick_start_goal and build_item_briefing.
+
+    A configured, positive ``test_floor`` (sourced from a project's OWN
+    ``executor_config.test_min`` via ``_test_floor_from_settings``, or an
+    explicit caller override) renders the literal historical "N+" claim,
+    byte-for-byte unchanged from before this helper existed. An unset/
+    invalid ``test_floor`` NEVER falls back to a fabricated number — that
+    silent fallback (to Meridian's own dev-repo test count) is the exact bug
+    reported against a receiving thesis repo with a real 88-test suite
+    (abac2298): instead it asks the executor to establish an HONEST baseline
+    itself via a bounded collect-only probe before trusting any count.
+    """
+    if isinstance(test_floor, int) and not isinstance(test_floor, bool) and test_floor > 0:
+        return f"{test_cmd} passes {test_floor}+"
+    return (
+        f"{test_cmd} passes (no test floor is configured for this project — "
+        f"run `{test_cmd} --collect-only -q` first and use the ACTUAL "
+        "collected-item count reported for THIS repository as the honest "
+        "baseline; never assume a fixed number of tests must pass)"
+    )
+
+
+# abac2298 — text markers a worker-level pytest-xdist infrastructure crash
+# leaves behind. Distinct from a normal "INTERNALERROR>" produced by an
+# assertion/exception INSIDE a single test that xdist still manages to
+# attribute to a worker: these markers mean the worker process itself died
+# (or the controller lost track of it) before/while reporting a result, so
+# there may be NO "<path>::<test>" identity to isolate at all — e.g. a
+# MemoryError raised while xdist was formatting a collection-error
+# traceback, or the node-bookkeeping KeyError xdist raises when a worker
+# vanishes mid-run.
+_XDIST_WORKER_CRASH_MARKERS = ("INTERNALERROR>", "MemoryError", "WorkerController")
+
+# abac2298 — shell/task-runner phrasing that means the configured command
+# never actually ran at all (unresolved pixi task, missing legacy script,
+# unknown binary) — a MISSING_COMMAND diagnostic, not a test failure.
+_MISSING_COMMAND_MARKERS = (
+    "command not found",
+    "is not recognized as an internal or external command",  # Windows cmd.exe
+    "no such file or directory",
+    "could not find task",
+    "no task named",
+    "no such task",
+)
+
+# abac2298 — the AssertionError tuple pytest-xdist emits when it CAN still
+# attribute an INTERNALERROR to a specific worker/test, e.g.:
+#   INTERNALERROR> AssertionError: ('tests/test_foo.py::test_bar',
+#                  <WorkerController gw3>)
+# Only present for SOME worker crashes; absence is the common case this item
+# fixes (a MemoryError while formatting a collection-error traceback carries
+# no such tuple — there is genuinely nothing to isolate).
+_XDIST_ISOLATABLE_TEST_RE = re.compile(
+    r"AssertionError:\s*\('([^']+)',\s*<WorkerController"
+)
+
+
+def classify_test_gate_result(
+    *,
+    test_cmd: str,
+    exit_code: "int | None",
+    stdout: str = "",
+    stderr: str = "",
+    timed_out: bool = False,
+    command_found: "bool | None" = None,
+) -> dict[str, Any]:
+    """abac2298 — classify a COMPLETED (or aborted) test-gate run into one of
+    five outcome categories, so recovery guidance is DERIVED from what
+    actually happened rather than a one-size-fits-all "isolate the crashed
+    test" instruction that silently assumes a test identity exists.
+
+    Never executes anything — this is a pure classifier over output an
+    executor (or future tooling) already captured. Preserves ``test_cmd``
+    and ``exit_code`` VERBATIM on the result (never re-derives or collapses
+    them), per the item's "preserve the configured command verbatim /
+    exit-code preservation" acceptance criteria.
+
+    Categories (``result["category"]``)
+    ------------------------------------
+    ``missing_command``
+        The configured test_cmd itself could not be resolved/executed at all
+        (an unknown pixi task, a missing legacy script, "command not
+        found"). No test ever ran — the fix is correcting
+        executor_config.test_cmd, not retrying with different parallelism.
+    ``timeout``
+        The run was killed by an external bound before pytest reported a
+        result. Not a code-regression signal by itself.
+    ``worker_crash``
+        pytest-xdist's OWN worker process died (see
+        ``_XDIST_WORKER_CRASH_MARKERS``). ``isolatable_test_id`` is populated
+        ONLY when the output actually names one (see
+        ``_XDIST_ISOLATABLE_TEST_RE``); otherwise it stays ``None`` — the
+        caller must NOT invent a "<path>::<test>" target. Either way,
+        ``recommend_serial_fallback`` is always True: the serial rerun
+        (``serial_fallback_cmd``) is the deterministic recovery step.
+    ``collection_failure``
+        pytest itself started and reported collection errors against one or
+        more files, but no worker died. ``errored_files`` lists the real,
+        actionable file paths.
+    ``test_failure``
+        A normal "M failed, N passed" (or all-pass) outcome — the everyday
+        case. Never raises: unrecognized output degrades to this least-
+        presumptuous category rather than guessing at a scarier one.
+    """
+    combined = f"{stdout or ''}\n{stderr or ''}"
+    result: dict[str, Any] = {
+        "test_cmd": test_cmd,
+        "exit_code": exit_code,
+        "command_valid": True,
+        "collected_count": None,
+        "errored_files": [],
+        "runner_version": None,
+        "category": "test_failure",
+        "recommend_serial_fallback": False,
+        "serial_fallback_cmd": _strip_parallelism_flag(test_cmd),
+        "isolatable_test_id": None,
+        "detail": "",
+    }
+    if command_found is False:
+        _missing = True
+    elif command_found is True:
+        _missing = False
+    else:
+        _lower = combined.lower()
+        _missing = any(marker in _lower for marker in _MISSING_COMMAND_MARKERS)
+    if _missing:
+        result["command_valid"] = False
+        result["category"] = "missing_command"
+        result["detail"] = (
+            f"`{test_cmd}` could not be resolved/executed (unknown task, "
+            "missing script, or 'command not found'). No tests ran — fix "
+            "executor_config.test_cmd before rerunning anything."
+        )
+        return result
+    if timed_out:
+        result["category"] = "timeout"
+        result["detail"] = (
+            "The run was killed by an external time limit before pytest "
+            "reported a result. Not a code-regression signal by itself; "
+            "rerun with a longer bound or a narrower test selection."
+        )
+        return result
+    _collected = re.search(r"collected (\d+) item", combined)
+    if _collected:
+        result["collected_count"] = int(_collected.group(1))
+    _runner = re.search(r"pytest-([\w.]+)", combined)
+    if _runner:
+        result["runner_version"] = _runner.group(1)
+    _errored = set(re.findall(r"^ERROR\s+(\S+)", combined, re.MULTILINE))
+    _errored |= set(re.findall(r"ERROR collecting (\S+)", combined))
+    result["errored_files"] = sorted(_errored)
+    if any(marker in combined for marker in _XDIST_WORKER_CRASH_MARKERS):
+        result["category"] = "worker_crash"
+        result["recommend_serial_fallback"] = True
+        _iso = _XDIST_ISOLATABLE_TEST_RE.search(combined)
+        if _iso:
+            result["isolatable_test_id"] = _iso.group(1)
+            result["detail"] = (
+                "pytest-xdist's worker process crashed; the output names "
+                f"{_iso.group(1)} as the likely trigger. You may isolate "
+                "that one test first, but the serial fallback is the "
+                "deterministic recovery step either way."
+            )
+        else:
+            result["detail"] = (
+                "pytest-xdist's worker process crashed with NO reported "
+                "test identity (e.g. a MemoryError while formatting a "
+                "collection-error traceback, or an xdist node-bookkeeping "
+                "KeyError). There is no single test to isolate — go "
+                "straight to the serial fallback."
+            )
+        return result
+    if result["errored_files"] or re.search(
+        r"errors?\s+during\s+collection", combined, re.IGNORECASE
+    ):
+        result["category"] = "collection_failure"
+        result["detail"] = (
+            "pytest reported collection errors — the named file(s) failed "
+            "to import. These are real, actionable diagnostics; report "
+            "them rather than retrying blindly."
+        )
+        return result
+    result["detail"] = "Normal pytest pass/fail outcome; no infra crash detected."
+    return result
+
+
 def _build_test_gate_config_clause(
     *, test_cmd: str, branch: str | None, version: str | None,
+    test_floor: "int | None" = None,
 ) -> str:
     """6cfdabd7 — render the resolved test_cmd/parallelism/branch/version as
     one machine-readable ``<test_gate_config>`` tag, sourced from the
@@ -1901,15 +2157,48 @@ def _build_test_gate_config_clause(
     modes can never disagree on these values. ``branch``/``version`` fall
     back to a clearly-labeled 'unset'/'unscoped' rather than silently
     omitting the attribute or guessing a value.
+
+    abac2298 — ``test_floor``/``baseline`` and ``test_cmd_plausible`` are
+    the machine-readable twins of ``_render_test_floor_clause``'s prose and
+    ``_is_plausible_test_cmd``'s sanity check, so a tool can read the exact
+    same verdict the completion-criteria text asserts without re-parsing it.
     """
     _attr_escape = {chr(34): "&quot;"}
     _parallelism = _parallelism_policy_from_test_cmd(test_cmd)
     _branch = _xml_escape(branch, _attr_escape) if branch else "unset"
     _version = _xml_escape(str(version), _attr_escape) if version else "unscoped"
+    _floor_configured = (
+        isinstance(test_floor, int) and not isinstance(test_floor, bool) and test_floor > 0
+    )
+    _floor_attr = str(test_floor) if _floor_configured else "unknown"
+    _baseline = "configured" if _floor_configured else "unknown_validate_via_collect_only"
+    _plausible = "true" if _is_plausible_test_cmd(test_cmd) else "false"
     return (
         f'\n<test_gate_config test_cmd="{_xml_escape(test_cmd, _attr_escape)}" '
         f'parallelism="{_xml_escape(_parallelism, _attr_escape)}" '
-        f'branch="{_branch}" version="{_version}" />'
+        f'branch="{_branch}" version="{_version}" '
+        f'test_floor="{_floor_attr}" baseline="{_baseline}" '
+        f'test_cmd_plausible="{_plausible}" />'
+    )
+
+
+def _build_test_gate_recovery_clause(test_cmd: str) -> str:
+    """abac2298 — machine-readable companion to <test_gate_note>'s prose: the
+    same triage protocol as ONE self-closing tag with typed attributes, so a
+    tool (or a future executor) can act on it without parsing prose.
+    ``categories`` enumerates the five xdist-outcome classifications
+    ``classify_test_gate_result`` returns; ``serial_fallback_cmd`` is the
+    SAME derived command ``_strip_parallelism_flag`` computes for the prose
+    note — never a second, independently-hardcoded fallback.
+    """
+    _attr_escape = {chr(34): "&quot;"}
+    _fallback = _xml_escape(_strip_parallelism_flag(test_cmd), _attr_escape)
+    return (
+        "\n<test_gate_recovery "
+        'categories="test_failure,collection_failure,worker_crash,timeout,missing_command" '
+        f'serial_fallback_cmd="{_fallback}" '
+        'worker_crash_action="run serial_fallback_cmd; never require a per-test '
+        'isolation target that may not exist" />'
     )
 
 
@@ -2288,7 +2577,7 @@ def _build_execution_policy_clause(policy: dict[str, Any] | None) -> str:
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
-    test_floor: int = _DEFAULT_GOAL_TEST_FLOOR,
+    test_floor: "int | None" = None,
     test_cmd: str = _DEFAULT_GOAL_TEST_CMD,
     branch: str | None = None,
     version: str | None = None,
@@ -2418,6 +2707,14 @@ def _build_quick_start_goal(
     by the caller via ``_branch_from_settings``. ``None`` renders as an
     explicit ``branch="unset"`` on ``<test_gate_config>`` rather than being
     omitted or guessed.
+
+    ``test_floor`` (abac2298) — the project's ``executor_config.test_min``,
+    sourced by the caller via ``_test_floor_from_settings``. ``None`` (the
+    default, and every project that has not explicitly configured
+    ``test_min``) NEVER falls back to a hardcoded number — see
+    ``_render_test_floor_clause``. This is the fix for the reported bug: a
+    receiving repo used to be told its floor was Meridian's own historical
+    "2150+" pass count regardless of how many tests it actually had.
     """
     _completion_override = (
         completion_criteria_override.strip()
@@ -2830,8 +3127,8 @@ def _build_quick_start_goal(
     else:
         _completion_text = (
             "Done when all listed sprint items are marked complete via "
-            f"complete_sprint_item(), {_effective_test_cmd} passes "
-            f"{test_floor}+ (run the full suite ONCE at the very end of the "
+            f"complete_sprint_item(), {_render_test_floor_clause(_effective_test_cmd, test_floor)} "
+            "(run the full suite ONCE at the very end of the "
             "entire megasprint as the single deploy gate -- not per item; "
             "per-item verification uses targeted tests for that item only), "
             "and generate_handoff() is called at the end."
@@ -2872,8 +3169,14 @@ def _build_quick_start_goal(
             # hardcoded command string.
             else _build_test_gate_config_clause(
                 test_cmd=_effective_test_cmd, branch=branch, version=version,
+                test_floor=test_floor,
             )
             + "\n<test_gate_note>" + _xml_escape(
+            f"If `{_effective_test_cmd}` cannot even be resolved/executed "
+            "(unknown pixi task, missing legacy script, 'command not found') "
+            "that is a missing-command diagnostic: no tests ran at all, so fix "
+            "executor_config.test_cmd first -- do not retry with different "
+            "parallelism or treat it as a test failure. "
             f"If `{_effective_test_cmd}` produces an INTERNALERROR "
             "or worker crash (a line starting with 'INTERNALERROR>' rather than a "
             "normal 'FAILED tests/...' line), this is very likely a parallel-execution "
@@ -2884,8 +3187,20 @@ def _build_quick_start_goal(
             "very likely fine — restore your changes (`git stash pop`) and re-run the "
             "full suite WITHOUT the configured parallelism flag (`"
             f"{_strip_parallelism_flag(_effective_test_cmd)}`) "
-            "for a clean, honest count before deciding pass/fail."
+            "for a clean, honest count before deciding pass/fail. "
+            "IMPORTANT: step (2)'s single-test isolation only applies when the "
+            "crash output actually NAMES a specific test id (an AssertionError "
+            "tuple like the one above). A MemoryError while formatting a "
+            "collection-error traceback, or an xdist node-bookkeeping KeyError, "
+            "carries NO such identity -- there is nothing to isolate, so skip "
+            "straight to step (3)'s serial rerun. Separately: a 'N error(s) "
+            "during collection' report with NO worker crash marker is a plain "
+            "collection failure, not a worker crash -- the named file(s) failed "
+            "to import; report them as-is rather than retrying blindly. A run "
+            "killed by an external time limit before pytest reports anything is "
+            "a timeout, not a code regression either way."
             ) + "</test_gate_note>"
+            + _build_test_gate_recovery_clause(_effective_test_cmd)
         )
         + f"{_not_done_until}\n"
         f"<stop_conditions>Stop after {_turns} turns "
@@ -3262,7 +3577,8 @@ def _build_workspace_tool_priority_clause(
 def build_item_briefing(
     item: dict[str, Any],
     *,
-    test_floor: int = _DEFAULT_GOAL_TEST_FLOOR,
+    test_cmd: str = _DEFAULT_GOAL_TEST_CMD,
+    test_floor: "int | None" = None,
     max_turns: int = _DEFAULT_GOAL_MAX_TURNS,
     hitl_auto_answer_mode: int = 0,
 ) -> str:
@@ -3278,8 +3594,19 @@ def build_item_briefing(
     ----------
     item:
         A sprint_item row dict (as returned by ``db.get_sprint_item``).
+    test_cmd:
+        abac2298 — the project's EFFECTIVE test invocation (a caller
+        resolves this from ``executor_config.test_cmd`` via
+        ``_test_cmd_from_settings``, mirroring ``_build_quick_start_goal``).
+        Defaults to the bare ``_DEFAULT_GOAL_TEST_CMD`` — this briefing used
+        to hardcode the literal string "pixi run test" regardless of what a
+        project actually had configured; that hardcoding is fixed here too.
     test_floor:
-        Minimum passing test count required for completion (default 2150).
+        abac2298 — minimum passing test count required for completion.
+        ``None`` (the default) never invents a number — see
+        ``_render_test_floor_clause``; only an explicit positive int (a
+        caller-resolved ``executor_config.test_min``) renders a literal
+        "N+" claim.
     max_turns:
         Maximum turns ceiling — same semantics as ``_build_quick_start_goal``.
     hitl_auto_answer_mode:
@@ -3287,6 +3614,11 @@ def build_item_briefing(
 
     Returns a ``/goal``-prefixed XML string ready to paste as a session goal.
     """
+    _effective_test_cmd = (
+        test_cmd.strip()
+        if isinstance(test_cmd, str) and test_cmd.strip()
+        else _DEFAULT_GOAL_TEST_CMD
+    )
     try:
         _turns = int(max_turns)
         if _turns <= 0:
@@ -3382,7 +3714,8 @@ def build_item_briefing(
     # questions prefer CI history over repeated local runs.
     completion_text = (
         f"Done when complete_sprint_item({iid!r}) is called, "
-        f"targeted tests for this item pass (run pixi run test passes {test_floor}+ "
+        "targeted tests for this item pass (run "
+        f"{_render_test_floor_clause(_effective_test_cmd, test_floor)} "
         "only ONCE at the very end of the whole megasprint -- not after each item; "
         "per-item verification: run only the specific tests relevant to this change), "
         "and generate_handoff() is called at the end."
@@ -7541,6 +7874,10 @@ async def generate_handoff(
         # <test_gate_config>/<test_gate_note> agree with what this project
         # actually has configured via set_executor_config.
         test_cmd=_test_cmd_from_settings(proj_settings),
+        # abac2298 — EFFECTIVE test floor (executor_config.test_min); None
+        # (unconfigured) renders an honest "unknown baseline" instead of a
+        # fabricated pass count — see _render_test_floor_clause.
+        test_floor=_test_floor_from_settings(proj_settings),
         branch=_branch_from_settings(proj_settings),
         hitl_auto_answer_mode=_hitl_aa_mode,
         completion_mode=_completion_mode_from_settings(proj_settings),
@@ -8273,6 +8610,8 @@ async def _generate_starter_handoff(
         # actual executor_config so starter/compact never disagrees with the
         # other three handoff modes.
         test_cmd=_test_cmd_from_settings(settings),
+        # abac2298 — same EFFECTIVE test floor as the other three modes.
+        test_floor=_test_floor_from_settings(settings),
         branch=_branch_from_settings(settings),
         version=version,
         hitl_auto_answer_mode=_s_hitl_mode,
@@ -8551,6 +8890,8 @@ async def _generate_goal_only_handoff(
         # full/delta and starter call sites (version is already threaded
         # below via the pre-existing belt-and-suspenders param).
         test_cmd=_test_cmd_from_settings(proj_settings),
+        # abac2298 — same EFFECTIVE test floor as the other three modes.
+        test_floor=_test_floor_from_settings(proj_settings),
         branch=_branch_from_settings(proj_settings),
         hitl_auto_answer_mode=_hitl_mode,
         completion_mode=_completion_mode_from_settings(proj_settings),

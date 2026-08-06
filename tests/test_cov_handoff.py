@@ -102,14 +102,20 @@ def test_build_quick_start_goal_with_and_without_items():
     # tag whose body is the executor directive.
     assert full.startswith("/goal\n<executor_directive>You are an executor. Claim and execute")
     assert "<executor_directive>You are an executor. Claim and execute" in full
-    # 4cfaecc2 — the items /goal instructs a live board query up front, and the
-    # test floor tracks the real suite size (524 -> 2150).
+    # 4cfaecc2 — the items /goal instructs a live board query up front.
     # 0d5453bc — full suite runs ONCE at the end of the megasprint, not per item.
     assert 'get_sprint_items(status="pending")' in full
-    assert "pixi run test passes 2150+" in full
+    # abac2298 — NO test_floor was configured/passed for this call, so the
+    # completion criteria must NOT invent a numeric pass count (the exact bug
+    # this item fixes: a receiving repo used to be silently told its floor
+    # was Meridian's own historical "2150+", regardless of how many tests it
+    # actually had). It must instead ask for an honest collect-only baseline.
+    assert "pixi run test passes 2150+" not in full
+    assert "pixi run test passes (no test floor is configured" in full
+    assert "--collect-only -q" in full
+    assert not hasattr(handoff_module, "_DEFAULT_GOAL_TEST_FLOOR")
     assert "ONCE at the very end of the entire" in full
     assert "not per item" in full
-    assert handoff_module._DEFAULT_GOAL_TEST_FLOOR == 2150
 
 
 def test_build_quick_start_goal_uses_executor_directive_not_role():
@@ -651,6 +657,55 @@ def test_test_cmd_from_settings():
     assert f({"executor_config": "notadict"}) == "pixi run test"
 
 
+# ---------------------------------------------------------------------------
+# abac2298 — repository-aware test floor: executor_config.test_min flows
+# into the completion criteria as an honest, project-scoped number instead
+# of Meridian's own historical "2150+" being silently applied everywhere.
+# ---------------------------------------------------------------------------
+
+
+def test_test_floor_from_settings():
+    """Sibling of _branch_from_settings: unset/invalid all degrade to None
+    (never a fabricated fallback number) rather than raising."""
+    f = handoff_module._test_floor_from_settings
+    assert f(None) is None
+    assert f({"executor_config": {}}) is None
+    assert f({"executor_config": {"test_min": 42}}) == 42
+    assert f({"executor_config": {"test_min": "88"}}) == 88
+    # Non-numeric / non-positive / non-dict all degrade to None, never raise.
+    assert f({"executor_config": {"test_min": "not-a-number"}}) is None
+    assert f({"executor_config": {"test_min": 0}}) is None
+    assert f({"executor_config": {"test_min": -5}}) is None
+    assert f({"executor_config": "notadict"}) is None
+
+
+def test_render_test_floor_clause_configured_vs_unknown():
+    f = handoff_module._render_test_floor_clause
+    # A configured, positive floor renders the literal historical "N+" claim.
+    assert f("pixi run test -n auto", 88) == "pixi run test -n auto passes 88+"
+    # Unset/invalid floors never invent a number -- they ask for an honest
+    # collect-only baseline instead (abac2298: the exact bug this fixes).
+    for bad in (None, 0, -1):
+        clause = f("pixi run test", bad)
+        assert clause.startswith("pixi run test passes (")
+        assert "no test floor is configured" in clause
+        assert "--collect-only -q" in clause
+        assert "2150" not in clause
+
+
+def test_is_plausible_test_cmd():
+    f = handoff_module._is_plausible_test_cmd
+    assert f("pixi run test -n auto") is True
+    assert f("pytest tests/ -q") is True
+    assert f("npx jest") is True
+    # Blank, or a command mentioning no recognized test-runner token at all
+    # (e.g. accidentally configured to a build/deploy command), is flagged.
+    assert f("") is False
+    assert f("   ") is False
+    assert f("pixi run build") is False
+    assert f("npm run deploy") is False
+
+
 def test_branch_from_settings():
     f = handoff_module._branch_from_settings
     assert f(None) is None
@@ -687,19 +742,35 @@ def test_build_test_gate_config_clause_renders_effective_values():
     from meridian.handoff import _build_test_gate_config_clause
 
     clause = _build_test_gate_config_clause(
-        test_cmd="pixi run test -n auto", branch="dev", version="v0.3.1",
+        test_cmd="pixi run test -n auto", branch="dev", version="v0.3.1", test_floor=88,
     )
     assert clause.startswith("\n<test_gate_config ")
     assert 'test_cmd="pixi run test -n auto"' in clause
     assert 'parallelism="-n auto"' in clause
     assert 'branch="dev"' in clause
     assert 'version="v0.3.1"' in clause
+    # abac2298 — a configured test_floor is machine-readable too, not just
+    # in the completion-criteria prose.
+    assert 'test_floor="88"' in clause
+    assert 'baseline="configured"' in clause
+    assert 'test_cmd_plausible="true"' in clause
     assert clause.endswith(" />")
 
     # Unset branch/version render a clearly-labeled fallback, not omission.
     unset = _build_test_gate_config_clause(test_cmd="pixi run test", branch=None, version=None)
     assert 'branch="unset"' in unset
     assert 'version="unscoped"' in unset
+    # abac2298 — no test_floor passed at all -> honest "unknown" baseline,
+    # never a silently-invented default.
+    assert 'test_floor="unknown"' in unset
+    assert 'baseline="unknown_validate_via_collect_only"' in unset
+
+    # abac2298 — a test_cmd with no recognized test-runner token is flagged
+    # implausible on the SAME machine-readable tag.
+    implausible = _build_test_gate_config_clause(
+        test_cmd="pixi run build", branch=None, version=None,
+    )
+    assert 'test_cmd_plausible="false"' in implausible
 
 
 def test_build_quick_start_goal_renders_effective_test_cmd_not_hardcoded():
@@ -749,7 +820,13 @@ async def test_handoff_modes_render_same_effective_test_cmd_parallelism_branch_v
     executor_config -- proving the four modes can never disagree, because
     they all resolve settings via the SAME _test_cmd_from_settings/
     _branch_from_settings helpers into the SAME shared _build_quick_start_goal
-    call."""
+    call.
+
+    abac2298 — this project's executor_config ALSO sets test_min=42; before
+    this fix, _build_quick_start_goal never read test_min at all (there was
+    no such wiring), so every mode silently rendered Meridian's own
+    hardcoded "2150+" instead of the 42 this project actually configured.
+    All four modes must now agree on "passes 42+" too."""
     p = await db_module.create_project(db, "test-cmd-parity")
     await db_module.set_executor_config(
         db, p["id"],
@@ -765,6 +842,11 @@ async def test_handoff_modes_render_same_effective_test_cmd_parallelism_branch_v
         # No explicit version scope was requested for any mode below, so all
         # four must agree on the SAME unscoped fallback label too.
         'version="unscoped"',
+        # abac2298 — the configured test_min=42 must flow through as the
+        # REAL floor, both in prose and on the machine-readable tag.
+        "pixi run test -n auto passes 42+",
+        'test_floor="42"',
+        'baseline="configured"',
     ]
 
     for mode in ("full", "delta", "starter", "goal"):
@@ -775,10 +857,14 @@ async def test_handoff_modes_render_same_effective_test_cmd_parallelism_branch_v
         for snippet in expected_snippets:
             assert snippet in content, (
                 f"mode={mode!r} missing {snippet!r} -- handoff modes disagree "
-                "on the effective test_cmd/parallelism/branch"
+                "on the effective test_cmd/parallelism/branch/test_floor"
             )
-        # No mode should ever surface the old hardcoded, now-stale value.
+        # No mode should ever surface the old hardcoded, now-stale values.
         assert "-n 3" not in content, f"mode={mode!r} leaked stale '-n 3' text"
+        assert "2150" not in content, (
+            f"mode={mode!r} leaked Meridian's own historical test count "
+            "instead of this project's configured test_min=42"
+        )
 
 
 def test_build_quick_start_goal_execution_policy_default_immediate():
