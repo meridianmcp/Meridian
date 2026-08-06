@@ -114,6 +114,7 @@ __all__ = [
     "UNKNOWN",
     "STALE_BY_SCRIPT",
     "get_provenance_status",
+    "get_manifest_backed_provenance_status",
 ]
 
 EXACT = "exact"
@@ -361,4 +362,118 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
         "archival": indexed["archival"],
         "convergence": indexed["convergence"],
         "inconclusive": inconclusive,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3b3020ac -- execution-manifest-backed provenance status.
+#
+# meridian.executor_contract.aggregate_worker_completions() (a hash-pinned,
+# fail-closed aggregation over a scientific fan-out run's per-worker
+# completion records) is consumed here as a PLAIN DICT, duck-typed --
+# this package does not depend on Meridian core being importable (it is a
+# separate, optionally-installed extension; see pixi.toml's 52cbe5d8 note),
+# so it cannot import meridian.executor_contract even if it wanted to. A
+# caller in the thesis project (or Meridian core itself) builds the
+# aggregation and passes it straight in.
+#
+# Per the sprint spec, "completion/provenance gates must consume the
+# manifest rather than trusting narrative notes or directory presence" --
+# this is that consumption point for meridian-outputs' own authoritative
+# per-file provenance answer specifically.
+# ---------------------------------------------------------------------------
+
+def get_manifest_backed_provenance_status(
+    outputs_dir: str, path: str, aggregation: "dict[str, Any] | None",
+) -> dict[str, Any]:
+    """:func:`get_provenance_status`, PLUS an additive ``manifest_status``
+    key answering a stronger question than any of that function's existing
+    branches can: "does a hash-pinned execution-manifest aggregation
+    actually vouch for this exact file's current content?"
+
+    ``aggregation`` is the dict returned by
+    ``meridian.executor_contract.aggregate_worker_completions`` (or an
+    equivalent caller-built dict with the same ``{ok, status,
+    worker_records: {worker_id: {output_hashes: {path: sha256}, ...}}}``
+    shape). This function never re-derives aggregation logic -- it only
+    cross-references the ALREADY-COMPUTED verdict against this one path.
+
+    Returns ``get_provenance_status(outputs_dir, path)``'s exact dict (or
+    its ``{"error": ...}`` shape, unchanged, when ``outputs_dir``/``path``
+    are missing) with one additive key:
+
+      ``manifest_status``: ``{"manifest_verified": bool, "reason": str|None,
+      "recorded_output_hash": str|None, "current_content_hash": str|None}``
+
+    ``manifest_verified`` is ``True`` ONLY when ALL of: ``aggregation`` is a
+    dict with ``ok=True``; ``path`` (normalized via
+    ``annotate._normalize_path``, so a differently-spelled but equivalent
+    path still matches) appears among the aggregation's recorded worker
+    ``output_hashes``; and the file's CURRENT content hash
+    (:func:`fingerprint.script_content_hash` -- the SAME sha256 hasher this
+    package already uses elsewhere, never a new hash scheme) matches the
+    recorded one. Fail-closed on every other combination (missing/not-ok
+    aggregation, path not recorded, unreadable file, hash mismatch) — never
+    silently treats "we could not check" as "verified". Never raises.
+    """
+    base = get_provenance_status(outputs_dir, path)
+    if "error" in base:
+        return base
+
+    if not isinstance(aggregation, dict) or not aggregation.get("ok"):
+        status = aggregation.get("status") if isinstance(aggregation, dict) else None
+        return {
+            **base,
+            "manifest_status": {
+                "manifest_verified": False,
+                "reason": (
+                    "no ok execution-manifest aggregation supplied "
+                    f"(status={status!r})"
+                ),
+                "recorded_output_hash": None,
+                "current_content_hash": None,
+            },
+        }
+
+    target = annotate._normalize_path(path)
+    recorded_hash: "str | None" = None
+    for rec in (aggregation.get("worker_records") or {}).values():
+        if not isinstance(rec, dict):
+            continue
+        for out_path, out_hash in (rec.get("output_hashes") or {}).items():
+            if annotate._normalize_path(out_path) == target:
+                recorded_hash = out_hash
+                break
+        if recorded_hash is not None:
+            break
+
+    if recorded_hash is None:
+        return {
+            **base,
+            "manifest_status": {
+                "manifest_verified": False,
+                "reason": (
+                    f"{path!r} is not among the execution-manifest "
+                    "aggregation's recorded worker output hashes"
+                ),
+                "recorded_output_hash": None,
+                "current_content_hash": None,
+            },
+        }
+
+    current_hash = fingerprint.script_content_hash(path)
+    verified = current_hash is not None and current_hash == recorded_hash
+    return {
+        **base,
+        "manifest_status": {
+            "manifest_verified": verified,
+            "reason": (
+                None if verified else (
+                    "current content hash does not match the manifest-recorded "
+                    "output hash (file changed, or is unreadable)"
+                )
+            ),
+            "recorded_output_hash": recorded_hash,
+            "current_content_hash": current_hash,
+        },
     }
