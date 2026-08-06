@@ -2359,6 +2359,58 @@
   }
 
   // meridian/static/dashboard-settings.ts
+  function formatTunnelConfigGenerationStatus(info) {
+    if (!info || typeof info !== "object" || info.generation == null) {
+      return {
+        label: "Unknown",
+        tone: "unknown",
+        detail: "No runtime configuration generation has been reported for this tunnel yet."
+      };
+    }
+    const gen = info.generation;
+    const hash = info.config_hash ? String(info.config_hash).slice(0, 8) : "unknown";
+    if (info.restart_required) {
+      return {
+        label: `Restart required (generation ${gen})`,
+        tone: "warn",
+        detail: `Settings changed to generation ${gen} (config ${hash}) while a tunnel was actively connected. Restart "meridian --tunnel" to apply it \u2014 the running process is still serving the previous configuration.`
+      };
+    }
+    return {
+      label: `Applied (generation ${gen})`,
+      tone: "ok",
+      detail: `Runtime configuration generation ${gen} (config ${hash}) is the latest saved configuration and is what the next tunnel connection will load.`
+    };
+  }
+  window.formatTunnelConfigGenerationStatus = formatTunnelConfigGenerationStatus;
+  async function _renderTunnelConfigGenerationBanner(projectId) {
+    const host = document.getElementById(`settings-body-${projectId}`);
+    if (!host) return;
+    const bannerId = `tunnel-config-gen-banner-${projectId}`;
+    const existing = document.getElementById(bannerId);
+    if (existing) existing.remove();
+    let status;
+    try {
+      status = await api(`/tunnel/status/${projectId}`);
+    } catch (e3) {
+      return;
+    }
+    const info = status && status.config_generation && status.config_generation.default;
+    const formatted = formatTunnelConfigGenerationStatus(info);
+    if (formatted.tone !== "warn") return;
+    const esc = window.escapeHtml || String;
+    const banner = document.createElement("div");
+    banner.id = bannerId;
+    banner.style.cssText = "margin-top:18px;padding:8px 10px;border-radius:4px;font-size:10px;line-height:1.5;background:#f59e0b1a;border:1px solid #f59e0b55";
+    banner.innerHTML = `<strong style="color:#f59e0b">${esc(formatted.label)}</strong><div style="margin-top:3px;color:var(--muted)">${esc(formatted.detail)}</div>`;
+    const section = document.getElementById(`tunnel-plugins-section-${projectId}`);
+    if (section && section.parentElement === host) {
+      host.insertBefore(banner, section);
+    } else {
+      host.appendChild(banner);
+    }
+  }
+  window._renderTunnelConfigGenerationBanner = _renderTunnelConfigGenerationBanner;
   function suggestNtfyTopic2(projectId) {
     const proj = (window.state?.projects || []).find((p3) => p3.id === projectId);
     const slug = (proj?.name || "meridian").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "meridian";
@@ -4052,7 +4104,12 @@ project_id = "${displayPid}"`;
     </div>
 
     <!-- b970fe07 \u2014 Serena default repo path (code-extractor slot). Single value;
-         used at tunnel start only when --repo is not passed on the CLI. -->
+         used at tunnel start only when --repo is not passed on the CLI.
+         9d9a92cc \u2014 this same slot feeds Claude Desktop/Code/Cursor uniformly
+         (they all reach it through the tunnel's local proxy port, see
+         docs/mcp-tool-surface.md); a missing/cleared command override now
+         correctly falls back to the current default (Serena), never the
+         retired mcp-server-code-extractor package. -->
     <div style="margin-bottom:10px">
 
       <div style="font-size:10px;color:var(--muted);margin-bottom:4px">Serena Repo Path<br><span style="font-size:9px;color:var(--muted)">Default <code>--project</code> for the tunnel's code-extractor (Serena). Used only when <code>--repo</code> is not passed at tunnel start.</span></div>
@@ -4066,6 +4123,22 @@ project_id = "${displayPid}"`;
     <div style="margin-bottom:10px">
 
       <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:10px;color:var(--muted)"><input type="checkbox" id="exec-enrich_prospect-${projectId}" ${execCfg.enrich_handoffs_with_code_pointers !== false ? "checked" : ""} style="cursor:pointer"> Auto-prospect code pointers on handoff <span style="font-size:9px">(attaches file/symbol pointers to sprint items; ON by default)</span></label>
+
+    </div>
+
+    <!-- f7084ed0 \u2014 orphan-process-reaper Stop hook toggle. OFF by default;
+         enabling registers a project-scoped Stop hook (meridian/orphan_reaper.py)
+         that reaps dangling pixi/python/node/cmd/uv/conhost processes still
+         rooted in a worktree whose sprint item/session is done, after
+         validating PID + start-time ownership and killing the whole process
+         tree. Saves immediately on change (not batched into "Save defaults")
+         because disabling has an immediate side effect: it deletes any
+         already-written .claude/hooks/orphan_reaper.* files right away
+         instead of waiting for the next generate_handoff. -->
+    <div style="margin-bottom:10px">
+
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:10px;color:var(--muted)"><input type="checkbox" id="exec-orphan-reaper-${projectId}" style="cursor:pointer"> Auto-reap dangling processes from dead worktree sessions <span id="exec-orphan-reaper-status-${projectId}" style="font-size:9px"></span></label>
+      <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Off by default. Registers <code>.claude/hooks/orphan_reaper.sh</code>/<code>.ps1</code>, ownership-validated (PID + start time) before anything is signalled \u2014 never touches a process it can't confirm identity for. (Applies on the machine running the tunnel/server.)</span>
 
     </div>
 
@@ -4332,6 +4405,38 @@ project_id = "${displayPid}"`;
             _addCodeDir();
           }
         });
+        const _orphanReaperCb = document.getElementById(`exec-orphan-reaper-${projectId}`);
+        const _orphanReaperStatus = document.getElementById(`exec-orphan-reaper-status-${projectId}`);
+        if (_orphanReaperCb) {
+          api(`/projects/${projectId}/orphan_reaper`).then((s3) => {
+            _orphanReaperCb.checked = !!(s3 && s3.enabled);
+          }).catch(() => {
+          });
+          _orphanReaperCb.addEventListener("change", async () => {
+            const desired = _orphanReaperCb.checked;
+            _orphanReaperCb.disabled = true;
+            if (_orphanReaperStatus) _orphanReaperStatus.textContent = "saving\u2026";
+            try {
+              const res = await api(`/projects/${projectId}/orphan_reaper/toggle`, {
+                method: "POST",
+                body: JSON.stringify({ enabled: desired })
+              });
+              const removedCount = Array.isArray(res?.removed_files) ? res.removed_files.length : 0;
+              _orphanReaperCb.checked = !!res?.enabled;
+              if (_orphanReaperStatus) {
+                _orphanReaperStatus.textContent = res?.enabled ? "(enabled)" : removedCount ? `(disabled \u2014 removed ${removedCount} hook file${removedCount === 1 ? "" : "s"})` : "(disabled)";
+                setTimeout(() => {
+                  if (_orphanReaperStatus) _orphanReaperStatus.textContent = "";
+                }, 4e3);
+              }
+            } catch (e3) {
+              _orphanReaperCb.checked = !desired;
+              if (_orphanReaperStatus) _orphanReaperStatus.textContent = e3?.message || "(failed to save)";
+            } finally {
+              _orphanReaperCb.disabled = false;
+            }
+          });
+        }
         saveBtn.onclick = async () => {
           saveBtn.disabled = true;
           const fields = ["env_file", "test_cmd", "deploy_cmd", "branch"];
@@ -5264,6 +5369,11 @@ project_id = "${displayPid}"`;
       }
       try {
         window.loadTunnelPluginsSection?.(projectId);
+      } catch (e3) {
+      }
+      try {
+        _renderTunnelConfigGenerationBanner(projectId).catch(() => {
+        });
       } catch (e3) {
       }
       if (isDemoMode()) hideDemoAdminControls();
@@ -7131,6 +7241,264 @@ ${n2.tags || ""}`.toLowerCase();
   }
   try {
     Object.assign(window, { loadNotesTab: loadNotesTab2 });
+  } catch (e3) {
+  }
+
+  // meridian/static/dashboard-documents.ts
+  var REVIEW_CATEGORY_LABELS = {
+    structure: "Structure",
+    section_page: "Sections & pages",
+    caption: "Captions",
+    equation: "Equations",
+    ownership: "Ownership",
+    provenance: "Provenance",
+    render_integrity: "Render & integrity"
+  };
+  var REVIEW_CATEGORY_ORDER = Object.keys(REVIEW_CATEGORY_LABELS);
+  var REVIEW_SEVERITY_ORDER = { error: 0, warning: 1, info: 2 };
+  var REVIEW_SEVERITY_LABELS = { error: "Error", warning: "Warning", info: "Info" };
+  var REVIEW_SEVERITY_COLOR = {
+    error: "var(--error, #f85149)",
+    warning: "var(--warning, #d29922)",
+    info: "var(--muted)"
+  };
+  var MAX_PREVIEW_CHARS = 140;
+  function truncatePreview(text, max = MAX_PREVIEW_CHARS) {
+    const s3 = String(text || "");
+    if (s3.length <= max) return { text: s3, truncated: false, fullText: s3 };
+    return { text: s3.slice(0, max).trimEnd() + "\u2026", truncated: true, fullText: s3 };
+  }
+  function groupFindingsByCategory(findings, categories) {
+    const cats = categories && categories.length ? categories.slice() : REVIEW_CATEGORY_ORDER.slice();
+    const byCat = /* @__PURE__ */ new Map();
+    for (const c3 of cats) byCat.set(c3, []);
+    for (const f4 of findings || []) {
+      if (!f4) continue;
+      if (!byCat.has(f4.category)) byCat.set(f4.category, []);
+      byCat.get(f4.category).push(f4);
+    }
+    const ordered = [...byCat.keys()].sort((a3, b2) => {
+      const ia = REVIEW_CATEGORY_ORDER.indexOf(a3);
+      const ib = REVIEW_CATEGORY_ORDER.indexOf(b2);
+      if (ia === -1 && ib === -1) return a3.localeCompare(b2);
+      if (ia === -1) return 1;
+      if (ib === -1) return -1;
+      return ia - ib;
+    });
+    return ordered.map((category) => ({
+      category,
+      label: REVIEW_CATEGORY_LABELS[category] || category,
+      findings: byCat.get(category).slice().sort(
+        (a3, b2) => (REVIEW_SEVERITY_ORDER[a3.severity] ?? 9) - (REVIEW_SEVERITY_ORDER[b2.severity] ?? 9)
+      )
+    }));
+  }
+  function isReviewEmpty(review) {
+    if (!review || review.error) return false;
+    if (review.status && review.status !== "ok") return false;
+    return !(review.findings && review.findings.length);
+  }
+  function isReviewStale(review) {
+    return !!review && review.status === "stale";
+  }
+  function isReviewError(review) {
+    return !!review && !!review.error;
+  }
+  function summarizeLocator(locator) {
+    const status = locator && locator.status || "unknown";
+    if (status === "resolved") {
+      const raw = locator.quoted_text || locator.leading_text_preview || locator.first_words || "";
+      const { text, truncated, fullText } = truncatePreview(raw);
+      return {
+        kind: "resolved",
+        sectionPath: locator.section_path || "(document root)",
+        preview: text,
+        fullText,
+        truncated,
+        wordSearchLocator: locator.word_search_locator || locator.first_words || "",
+        bookmarkExists: !!locator.bookmark_exists,
+        candidateCount: 0,
+        candidates: [],
+        reason: ""
+      };
+    }
+    if (status === "ambiguous") {
+      const candidates = (locator?.candidates || []).map((c3) => ({
+        label: c3.target_para_id || c3.element_type || "candidate",
+        sectionPath: c3.section_path || "(document root)",
+        preview: truncatePreview(c3.leading_text_preview).text
+      }));
+      return {
+        kind: "ambiguous",
+        sectionPath: "",
+        preview: "",
+        fullText: "",
+        truncated: false,
+        wordSearchLocator: "",
+        bookmarkExists: false,
+        candidateCount: candidates.length,
+        candidates,
+        reason: locator?.reason || "multiple elements matched this location \u2014 showing candidates instead of guessing"
+      };
+    }
+    if (status === "stale") {
+      return {
+        kind: "stale",
+        sectionPath: "",
+        preview: "",
+        fullText: "",
+        truncated: false,
+        wordSearchLocator: "",
+        bookmarkExists: false,
+        candidateCount: 0,
+        candidates: [],
+        reason: locator?.reason || "the document changed since this location was resolved"
+      };
+    }
+    if (status === "not_applicable") {
+      return {
+        kind: "not_applicable",
+        sectionPath: "",
+        preview: "",
+        fullText: "",
+        truncated: false,
+        wordSearchLocator: "",
+        bookmarkExists: false,
+        candidateCount: 0,
+        candidates: [],
+        reason: "this finding has no single paragraph-level location"
+      };
+    }
+    return {
+      kind: "not_found",
+      sectionPath: "",
+      preview: "",
+      fullText: "",
+      truncated: false,
+      wordSearchLocator: "",
+      bookmarkExists: false,
+      candidateCount: 0,
+      candidates: [],
+      reason: locator?.reason || "location could not be resolved"
+    };
+  }
+  var _reviewFingerprints = /* @__PURE__ */ new Map();
+  function _findingRow(f4) {
+    const sev = String(f4.severity || "info");
+    const color = REVIEW_SEVERITY_COLOR[sev] || "var(--muted)";
+    const loc = summarizeLocator(f4.locator);
+    let locHtml;
+    if (loc.kind === "resolved") {
+      const copyText = escapeHtml(loc.wordSearchLocator || "");
+      locHtml = `<div style="margin-top:4px;font-size:9px;color:var(--muted)">${escapeHtml(loc.sectionPath)}</div>
+      <div style="margin-top:2px;font-size:10px;color:var(--text);font-style:italic">&ldquo;${escapeHtml(loc.preview)}&rdquo;${loc.truncated ? ' <span style="color:var(--muted);font-style:normal">(truncated)</span>' : ""}</div>
+      <div style="margin-top:4px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <button class="review-copy-locator-btn secondary" data-locator="${copyText}" style="font-size:8px;padding:1px 6px">Copy Word Ctrl+F text</button>
+        <span style="font-size:8px;color:var(--muted)">${loc.bookmarkExists ? "bookmark/REF found" : "no bookmark/REF"}</span>
+      </div>`;
+    } else if (loc.kind === "ambiguous") {
+      locHtml = `<div style="margin-top:4px;font-size:9px;color:var(--warning,#d29922)">${escapeHtml(loc.reason)}</div>
+      <div style="margin-top:2px">${loc.candidates.map(
+        (c3) => `<div style="font-size:9px;color:var(--muted);padding:2px 0 2px 8px;border-left:2px solid var(--border)">${escapeHtml(c3.sectionPath)} &mdash; &ldquo;${escapeHtml(c3.preview)}&rdquo;</div>`
+      ).join("")}</div>`;
+    } else {
+      locHtml = `<div style="margin-top:4px;font-size:9px;color:var(--muted)">${escapeHtml(loc.reason)}</div>`;
+    }
+    return `<div style="border:1px solid var(--border);border-left:3px solid ${color};border-radius:0 4px 4px 0;padding:6px 10px;margin-bottom:6px;background:var(--surface-1)">
+    <div style="display:flex;align-items:center;gap:6px">
+      <span style="font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:${color}">${escapeHtml(REVIEW_SEVERITY_LABELS[sev] || sev)}</span>
+      <span style="font-size:10px;color:var(--text);font-weight:600">${escapeHtml(String(f4.type || "").replace(/_/g, " "))}</span>
+    </div>
+    ${locHtml}
+  </div>`;
+  }
+  function renderDocumentReview(review, targetId) {
+    const target = document.getElementById(targetId);
+    if (!target) return;
+    if (isReviewError(review)) {
+      target.innerHTML = `<div style="font-size:9px;color:var(--error)">${escapeHtml(String(review.error))}</div>`;
+      return;
+    }
+    if (isReviewStale(review)) {
+      _reviewFingerprints.delete(targetId);
+      target.innerHTML = `<div style="font-size:9px;color:var(--warning,#d29922)">Document changed since the last review (${escapeHtml(String(review.reason || "stale snapshot"))}). <button class="review-recheck-btn secondary" data-target="${escapeHtml(targetId)}" style="font-size:8px;padding:1px 6px;margin-left:4px">Re-check</button></div>`;
+      return;
+    }
+    if (review && review.source_fingerprint) _reviewFingerprints.set(targetId, review.source_fingerprint);
+    const banner = `<div style="font-size:8px;color:var(--muted);margin-bottom:6px;padding:3px 6px;border:1px solid var(--border);border-radius:3px;display:inline-block">READ-ONLY RECOMMENDATION &mdash; no DOCX writes; draft-overlay and committed-mutation review tiers are not yet available</div>`;
+    if (isReviewEmpty(review)) {
+      target.innerHTML = `${banner}<div class="empty" style="color:var(--muted);padding:6px 0">No findings \u2014 this document looks clean across every checked category.</div>`;
+      return;
+    }
+    const groups = groupFindingsByCategory(review.findings, review.categories);
+    let html = banner;
+    html += `<div style="font-size:9px;color:var(--muted);margin-bottom:8px">${review.finding_count ?? (review.findings || []).length} finding(s) across ${groups.filter((g2) => g2.findings.length).length} categor${groups.filter((g2) => g2.findings.length).length === 1 ? "y" : "ies"}.</div>`;
+    for (const g2 of groups) {
+      if (!g2.findings.length) continue;
+      html += `<div style="margin:8px 0 4px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--accent)">${escapeHtml(g2.label)} <span style="color:var(--muted);font-weight:400">${g2.findings.length}</span></div>`;
+      for (const f4 of g2.findings) html += _findingRow(f4);
+    }
+    target.innerHTML = html;
+    target.querySelectorAll(".review-copy-locator-btn").forEach((el2) => {
+      el2.addEventListener("click", () => {
+        const txt = el2.getAttribute("data-locator") || "";
+        try {
+          navigator.clipboard.writeText(txt);
+        } catch (_2) {
+        }
+        const prev = el2.textContent;
+        el2.textContent = "Copied \u2713";
+        setTimeout(() => {
+          el2.textContent = prev || "Copy Word Ctrl+F text";
+        }, 1500);
+      });
+    });
+  }
+  async function loadDocumentReview(projectId, filePath, targetId, expectedFingerprint) {
+    const target = document.getElementById(targetId);
+    if (!target) return;
+    target.innerHTML = '<span style="font-size:9px;color:var(--muted)">loading review\u2026</span>';
+    try {
+      let url = `/projects/${projectId}/document-review?path=${encodeURIComponent(filePath)}`;
+      if (expectedFingerprint) url += `&expected_source_fingerprint=${encodeURIComponent(expectedFingerprint)}`;
+      const review = await api(url);
+      renderDocumentReview(review, targetId);
+    } catch (e3) {
+      target.innerHTML = `<span style="font-size:9px;color:var(--error)">Review failed: ${escapeHtml(String(e3))}</span>`;
+    }
+  }
+  function wireDocumentReviewButtons2(projectId, root = document) {
+    root.querySelectorAll(".doc-review-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const fp = btn.getAttribute("data-fp") || "";
+        const did = btn.getAttribute("data-did") || "";
+        const targetId = `doc-review-${did}`;
+        await loadDocumentReview(projectId, fp, targetId);
+      });
+    });
+    root.querySelectorAll(".review-recheck-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const targetId = btn.getAttribute("data-target") || "";
+        const target = document.getElementById(targetId);
+        const fp = target ? target.getAttribute("data-fp") || "" : "";
+        if (!fp) return;
+        const prevFingerprint = _reviewFingerprints.get(targetId) || null;
+        await loadDocumentReview(projectId, fp, targetId, prevFingerprint);
+      });
+    });
+  }
+  try {
+    Object.assign(window, {
+      groupFindingsByCategory,
+      summarizeLocator,
+      truncatePreview,
+      isReviewEmpty,
+      isReviewStale,
+      isReviewError,
+      renderDocumentReview,
+      loadDocumentReview,
+      wireDocumentReviewButtons: wireDocumentReviewButtons2
+    });
   } catch (e3) {
   }
 
@@ -14063,7 +14431,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         </div>
         ${fp ? `<div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px;word-break:break-all">${escapeHtml(String(fp))}</div>` : ""}
         ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t3) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(String(t3))}</span>`).join("")}</div>` : ""}
-        ${fp ? `<div style="margin-top:6px"><button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button></div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div>` : '<div style="font-size:9px;color:var(--muted);margin-top:4px">No server-side file_path \u2014 structure view unavailable.</div>'}
+        ${fp ? `<div style="margin-top:6px;display:flex;gap:6px">
+              <button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button>
+              ${String(fp).toLowerCase().endsWith(".docx") ? `<button class="doc-review-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">Review findings</button>` : ""}
+            </div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div><div id="doc-review-${escapeHtml(did)}" data-fp="${escapeHtml(String(fp))}" style="margin-top:6px"></div>` : '<div style="font-size:9px;color:var(--muted);margin-top:4px">No server-side file_path \u2014 structure view unavailable.</div>'}
       </div>`;
       }
       html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
@@ -14175,6 +14546,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         }
       });
     });
+    wireDocumentReviewButtons(projectId, body);
   }
   async function loadCodeIntelTab(projectId) {
     const body = document.getElementById(`codeintel-body-${projectId}`);

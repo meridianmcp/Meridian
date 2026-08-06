@@ -15,6 +15,7 @@ import "./dashboard-settings";
 import "./dashboard-plugins";
 
 import "./dashboard-notes";
+import "./dashboard-documents";
 import "./dashboard-files";
 import "./dashboard-rewind";
 // e553fa7a — workspace Blog tab editor/card builders (edit-in-place for drafts).
@@ -7891,7 +7892,12 @@ async function loadDocumentsTab(projectId: any) {
         ${fp ? `<div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px;word-break:break-all">${escapeHtml(String(fp))}</div>` : ''}
         ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t: any) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(String(t))}</span>`).join('')}</div>` : ''}
         ${fp
-          ? `<div style="margin-top:6px"><button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button></div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div>`
+          ? `<div style="margin-top:6px;display:flex;gap:6px">
+              <button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button>
+              ${String(fp).toLowerCase().endsWith('.docx')
+                ? `<button class="doc-review-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">Review findings</button>`
+                : ''}
+            </div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div><div id="doc-review-${escapeHtml(did)}" data-fp="${escapeHtml(String(fp))}" style="margin-top:6px"></div>`
           : '<div style="font-size:9px;color:var(--muted);margin-top:4px">No server-side file_path — structure view unavailable.</div>'}
       </div>`;
     }
@@ -8011,6 +8017,11 @@ async function loadDocumentsTab(projectId: any) {
       }
     });
   });
+
+  // b67ec6b5 — "Review findings": non-mutating DOCX review panel (grouped
+  // findings + human-readable locators). Toggle-loads on first click so a
+  // Documents tab with many docs doesn't eagerly review every one of them.
+  wireDocumentReviewButtons(projectId, body);
 }
 
 

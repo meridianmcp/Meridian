@@ -15211,14 +15211,236 @@ def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[st
     }
 
 
-def read_document_snapshot(
+# ---------------------------------------------------------------------------
+# b67ec6b5 -- non-mutating DOCX review: aggregate existing read-only finding
+# primitives into ONE grouped, locator-enriched result for the dashboard
+# review panel. Every finding is enriched via _resolve_anchor_query -- the
+# SAME resolver locate_anchor itself calls -- so this never re-derives
+# anchor-resolution logic; it only decides WHICH para_id to ask about.
+# ---------------------------------------------------------------------------
+
+#: Fixed category set the dashboard groups findings by. Always present in
+#: ``findings_by_category`` (count 0 when nothing was found/checked) so a
+#: caller can render a stable set of section headers rather than guessing
+#: which categories exist for a given document profile -- "structure",
+#: "section_page", and "ownership" have no v1 detector yet (framework-
+#: agnostic first version -- see the sprint item notes) and always report 0
+#: until a future item adds one.
+REVIEW_CATEGORIES: tuple[str, ...] = (
+    "structure", "equation", "caption", "section_page", "ownership",
+    "provenance", "render_integrity",
+)
+
+
+def _legacy_plaintext_caption_findings(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Read-only DETECTION half of :func:`retrofit_plaintext_captions` --
+    flags a body paragraph (``element_kind == "paragraph"``, i.e. NOT already
+    classified as a native ``figure_caption``/``table_caption`` record by
+    :func:`_iter_anchor_records`, which only happens when a SEQ field is
+    present) whose visible text opens with "Figure <N>" / "Table <N>" -- the
+    exact text pattern :func:`retrofit_plaintext_captions` migrates. Never
+    mutates the document; only reports what that primitive WOULD convert, so
+    "mixed native/legacy captions" is visible without running the write.
+    """
+    out: list[dict[str, Any]] = []
+    for record in records:
+        if record.get("element_kind") != "paragraph":
+            continue
+        text = record.get("text") or ""
+        kind = "Figure"
+        m = _PLAINTEXT_FIGURE_RE.match(text)
+        if m is None:
+            kind = "Table"
+            m = _PLAINTEXT_TABLE_RE.match(text)
+        if m is None:
+            continue
+        out.append({
+            "type": "legacy_plaintext_caption",
+            "para_id": record.get("para_id"),
+            "kind": kind,
+            "old_cached_number": m.group(1),
+            "label_text": m.group(2).strip(),
+        })
+    return out
+
+
+def _review_finding_severity(category: str, finding_type: str) -> str:
+    if category == "equation" and finding_type in (
+        "duplicate_equation_number", "equation_number_gap",
+    ):
+        return "error"
+    if category == "render_integrity":
+        return "error"
+    if category == "provenance":
+        return "info"
+    return "warning"
+
+
+def build_document_review(
     docx_path: str,
     *,
-    page_size: int | None = None,
-    cursor: str | None = None,
-    section_anchor: str | None = None,
-    index_db_path: str | None = None,
+    expected_source_fingerprint: str | None = None,
+    style_policy: dict[str, Any] | None = None,
+    include_render_check: bool = False,
 ) -> dict[str, Any]:
+    """b67ec6b5 -- non-mutating DOCX review for the dashboard review panel.
+
+    Re-parses ``docx_path`` fresh on every call (same "no sidecar index, so
+    nothing can go stale between calls" discipline as :func:`locate_anchor`)
+    and composes EXISTING read-only finding primitives instead of
+    re-implementing detection logic:
+
+    * ``equation``   -- :func:`audit_equation_style` findings (alignment,
+                        trailing punctuation, numbering).
+    * ``caption``     -- :func:`_legacy_plaintext_caption_findings` (a
+                        plain-text "Figure N"/"Table N" paragraph with no SEQ
+                        field -- what :func:`retrofit_plaintext_captions`
+                        would convert, reported without mutating).
+    * ``provenance``  -- :func:`scan_stale_notes` findings (placeholder/TODO
+                        text that may now be outdated).
+    * ``render_integrity`` -- :func:`render_gate.check_render_capability`,
+                        ONLY when ``include_render_check=True`` (a live
+                        render probe is slow/backend-dependent, so it is
+                        never invoked implicitly; a "failed" status becomes a
+                        finding, "rendered"/"unavailable-with-reason" do
+                        not -- mirrors ``docx_integrity_gate``'s "can't
+                        confirm never manufactures a finding" rule).
+    * ``structure`` / ``section_page`` / ``ownership`` -- reserved, always 0
+                        in this first version (see :data:`REVIEW_CATEGORIES`).
+
+    Every finding with a ``para_id`` is enriched with a ``locator`` --
+    resolved via :func:`_resolve_anchor_query` (the SAME function
+    :func:`locate_anchor` itself calls) against ONE shared parse of the
+    document, never a second re-derivation of anchor logic. A finding with no
+    ``para_id`` (e.g. a document-level render finding) gets
+    ``{"status": "not_applicable", ...}`` instead of a fabricated locator.
+    This is deliberate: a caller must never show a raw paragraph id alone --
+    the locator always carries ``section_path``/``quoted_text`` alongside
+    ``target_para_id``, and an ambiguous/not-found match surfaces
+    ``candidates``/a reason instead of guessing.
+
+    Pass ``expected_source_fingerprint`` (a value previously returned as
+    ``source_fingerprint``) to detect the document having changed underneath
+    a stashed review before trusting it again -- a mismatch short-circuits to
+    ``{"status": "stale", ...}`` with empty findings, exactly like
+    :func:`locate_anchor`.
+
+    Returns ``{status: "ok", docx_path, source_fingerprint, findings,
+    finding_count, findings_by_category, findings_by_severity, categories}``
+    on success, ``{status: "stale", ...}`` on a fingerprint mismatch, or
+    ``{"error": <message>}`` when the file cannot be read or parsed. Never
+    mutates ``docx_path``.
+    """
+    try:
+        with open(docx_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    source_fingerprint = _source_fingerprint(raw)
+    if expected_source_fingerprint and expected_source_fingerprint != source_fingerprint:
+        return {
+            "status": "stale",
+            "docx_path": docx_path,
+            "reason": "source_fingerprint_mismatch",
+            "expected_source_fingerprint": expected_source_fingerprint,
+            "source_fingerprint": source_fingerprint,
+            "findings": [],
+            "finding_count": 0,
+            "findings_by_category": {c: 0 for c in REVIEW_CATEGORIES},
+            "findings_by_severity": {},
+            "categories": list(REVIEW_CATEGORIES),
+        }
+
+    try:
+        records, _tree = _iter_anchor_records(raw)
+        equations = parse_docx_equations_local(raw)
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return {"error": str(exc)}
+
+    findings: list[dict[str, Any]] = []
+
+    eq_audit = audit_equation_style(docx_path, style_policy)
+    if isinstance(eq_audit, dict) and not eq_audit.get("error"):
+        for f in eq_audit.get("findings", []):
+            findings.append({
+                "category": "equation",
+                "severity": _review_finding_severity("equation", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
+
+    for f in _legacy_plaintext_caption_findings(records):
+        findings.append({
+            "category": "caption",
+            "severity": _review_finding_severity("caption", f["type"]),
+            "type": f["type"],
+            "para_id": f.get("para_id"),
+            "detail": f,
+        })
+
+    stale_notes = scan_stale_notes(docx_path)
+    if isinstance(stale_notes, dict) and not stale_notes.get("error"):
+        for f in stale_notes.get("findings", []):
+            findings.append({
+                "category": "provenance",
+                "severity": _review_finding_severity("provenance", "stale_note"),
+                "type": "stale_note",
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
+
+    if include_render_check:
+        try:
+            render_result = render_gate.check_render_capability(docx_path)
+        except Exception:  # noqa: BLE001 -- a broken backend must never break the review
+            render_result = None
+        if isinstance(render_result, dict) and render_result.get("status") == "failed":
+            findings.append({
+                "category": "render_integrity",
+                "severity": _review_finding_severity("render_integrity", "render_failed"),
+                "type": "render_failed",
+                "para_id": None,
+                "detail": render_result,
+            })
+
+    for finding in findings:
+        para_id = finding.pop("para_id", None)
+        if para_id:
+            finding["locator"] = _resolve_anchor_query(
+                records, equations, {"para_id": para_id},
+                document_path=docx_path, source_fingerprint=source_fingerprint,
+            )
+        else:
+            finding["locator"] = {
+                "status": "not_applicable",
+                "document_path": docx_path,
+                "source_fingerprint": source_fingerprint,
+                "candidates": [],
+            }
+
+    findings_by_category = {c: 0 for c in REVIEW_CATEGORIES}
+    findings_by_severity: dict[str, int] = {}
+    for f in findings:
+        findings_by_category[f["category"]] = findings_by_category.get(f["category"], 0) + 1
+        findings_by_severity[f["severity"]] = findings_by_severity.get(f["severity"], 0) + 1
+
+    return {
+        "status": "ok",
+        "docx_path": docx_path,
+        "source_fingerprint": source_fingerprint,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_category": findings_by_category,
+        "findings_by_severity": findings_by_severity,
+        "categories": list(REVIEW_CATEGORIES),
+    }
+
+
+def read_document_snapshot(docx_path: str) -> dict[str, Any]:
     """Read the saved DOCX snapshot without writing or requiring a close.
 
     Word normally leaves a sibling ~$ lock file while a document is open.

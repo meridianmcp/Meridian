@@ -56,6 +56,17 @@ async def planner_handoff_endpoint(
     docx_integrity = await handoff_module.build_docx_integrity_gate_for_handoff(
         db, project_id, proposal_evidence=proposal_evidence,
     )
+    # 9154aa9a — machine-readable pointer to the latest durable executor
+    # report, mirroring the capability_contract/proposal_evidence pattern
+    # above; best-effort, never breaks the planner handoff. The prose
+    # rendering of this same data already lives in `content` (see
+    # handoff_module._generate_planner_handoff's "Latest executor report"
+    # section) — this is the structured projection for a machine reader.
+    try:
+        _reports = await db_module.list_executor_reports(db, project_id, limit=1)
+        latest_executor_report = _reports[0] if _reports else None
+    except Exception:  # noqa: BLE001
+        latest_executor_report = None
     return {
         # a5e8aa74 — route through the same shared helper the MCP handler/stdio
         # transports use so all transports share one raw-text contract (this
@@ -66,6 +77,7 @@ async def planner_handoff_endpoint(
         "capability_contract": capability_contract,
         "proposal_evidence": proposal_evidence,
         "docx_integrity": docx_integrity,
+        "latest_executor_report": latest_executor_report,
     }
 
 

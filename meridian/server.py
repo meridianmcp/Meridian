@@ -836,6 +836,10 @@ async def lifespan(app: FastAPI):
             await keepalive_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
+        try:
+            await version_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
         # 57f7f7ba — stop the autonomous dispatcher if it was enabled.
         _disp = getattr(app.state, "dispatcher", None)
         if _disp is not None:
@@ -5055,6 +5059,26 @@ async def _build_continue_payload(
         }
         for it in pending
     ]
+    # 9154aa9a — best-effort informational pointer to the latest durable
+    # executor report (meridian.handoff.record_executor_report), scoped to
+    # this session's own version bucket, so a resuming executor can see
+    # whether a prior report is still awaiting planner review — never blocks
+    # or alters continuation itself; a lookup failure (or a pre-migration
+    # DB) degrades to None.
+    try:
+        _reports = await db_module.list_executor_reports(
+            db, project_id, version=scoped_version, limit=1,
+        )
+        latest_executor_report = (
+            {
+                "id": _reports[0].get("id"),
+                "status": _reports[0].get("status"),
+                "accepted_handoff_id": _reports[0].get("accepted_handoff_id"),
+            }
+            if _reports else None
+        )
+    except Exception:  # noqa: BLE001
+        latest_executor_report = None
     return {
         "continuation": True,
         "mode": "continue",
@@ -5066,6 +5090,7 @@ async def _build_continue_payload(
         "pending_count": len(pending_slim),
         "goal_string": goal_string,
         "recent_tasks": recent,
+        "latest_executor_report": latest_executor_report,
         "note": (
             "Continue mode — resumed without re-reading L0/L1/L2 context. Claim "
             "the first pending item and keep going; call "

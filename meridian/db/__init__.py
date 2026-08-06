@@ -1132,6 +1132,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_handoff_corrections_table(db)
     await _migrate_vector_index_state(db)
     await _migrate_pixi_env_roots(db)
+    await _migrate_executor_reports_table(db)
     return db
 
 
@@ -12208,4 +12209,21 @@ from .worktrees import (  # noqa: F401
     get_pixi_env_root_for_worktree,
     list_unreclaimed_pixi_env_roots,
     mark_pixi_env_root_reclaimed,
+)
+
+
+# 9154aa9a — durable executor_report / planner_checkpoint records + corrective
+# lineage. Imported last (after board_snapshot, needed by
+# meridian.handoff.record_executor_report's board_revision_hash capture, and
+# after sprint_items, needed by get_project_item_index) — a single-table,
+# no-state-machine shape, mirroring the verification_runs import above.
+from .executor_reports import (  # noqa: F401
+    EXECUTOR_REPORT_STATUSES,
+    canonical_report_hash,
+    _migrate_executor_reports_table,
+    create_executor_report,
+    get_executor_report,
+    list_executor_reports,
+    update_executor_report_status,
+    mark_executor_report_accepted,
 )

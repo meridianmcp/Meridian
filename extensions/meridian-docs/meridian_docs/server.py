@@ -301,6 +301,39 @@ def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[st
 
 
 @mcp.tool()
+def get_document_review(
+    docx_path: str,
+    expected_source_fingerprint: str | None = None,
+    include_render_check: bool = False,
+) -> dict[str, Any]:
+    """b67ec6b5 -- non-mutating DOCX review: findings grouped by category
+    (structure/equation/caption/section_page/ownership/provenance/
+    render_integrity) and severity, each carrying a locate_anchor-style
+    locator (section_path, target_para_id, document_order, quoted_text,
+    word_search_locator, bookmark/REF status) instead of a raw paragraph id
+    alone.
+
+    Composes existing read-only primitives (audit_equation_style,
+    scan_stale_notes, a read-only legacy-plaintext-caption detector, and
+    optionally check_render_capability) rather than re-deriving detection or
+    anchor-resolution logic. Pass expected_source_fingerprint (a value
+    previously returned as source_fingerprint) to detect the document having
+    changed since a stashed review -- a mismatch returns
+    ``{"status": "stale", ...}`` with empty findings instead of resolving
+    against what may now be the wrong document. include_render_check opts
+    into a live render-capability probe (slow/backend-dependent -- never run
+    implicitly); only a "failed" render status becomes a finding. See
+    :func:`meridian_docs.docs_intel.build_document_review` for the full
+    contract. No DOCX writes -- read-only in every code path.
+    """
+    return docs_intel.build_document_review(
+        docx_path,
+        expected_source_fingerprint=expected_source_fingerprint,
+        include_render_check=include_render_check,
+    )
+
+
+@mcp.tool()
 def check_render_capability(docx_path: str) -> dict[str, Any]:
     """93cd9798 -- lightweight render-capability detection for visual QA.
 

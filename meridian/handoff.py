@@ -1090,6 +1090,396 @@ async def load_handoff_correction(
 
 
 # ---------------------------------------------------------------------------
+# 9154aa9a — durable executor_report / planner_checkpoint lifecycle.
+#
+# handoff_corrections (above) is a correction to a HANDOFF BODY — it exists
+# for a blocked executor to hand a planner a targeted patch (pointer/scope
+# fix) to a specific rendered /goal. It is not a general-purpose "here is
+# what actually happened this session" report: it has no notion of test
+# results, tool availability, or a list of item outcomes, and it always
+# requires a source_handoff_id to anchor to.
+#
+# executor_reports (meridian.db.executor_reports) is the missing first-class
+# piece: a durable, NON-EXECUTABLE record an executor submits when it
+# finishes (or blocks on) a batch of work, and a planner reads
+# conversationally — what changed, what passed/failed, what's still open,
+# and what the executor recommends next. Corrections to a REPORT (a planner
+# asked a follow-up, or a later session discovered the report was wrong)
+# chain via parent_report_id — the parent is marked superseded, never
+# rewritten, exactly like handoff_corrections' own auto-supersede discipline.
+#
+# The two features compose rather than merge: accept_executor_report's
+# planner-promotion step calls the SAME generate_handoff renderer every
+# other handoff path uses (never a parallel rendering path), so an accepted
+# report's resulting handoff is indistinguishable, to a receiving executor,
+# from any other handoff — it is simply evidence that a planner reviewed
+# real reported outcomes before authorizing the next batch of executable
+# scope. Recording or correcting a report NEVER touches sprint_items itself
+# — only the explicit accept step renders a handoff, and even that never
+# creates/edits sprint items directly (per the sprint-item spec: "only the
+# planner promotion step may create or update executable sprint scope").
+# ---------------------------------------------------------------------------
+
+
+class ExecutorReportError(ValueError):
+    """Raised for an invalid executor-report / corrective-report request:
+    unknown project, an unresolved ``parent_report_id`` or cross-project/
+    cross-version correction lineage, sprint-item pointers in
+    ``item_outcomes`` that don't resolve on the live board, or an acceptance
+    attempt against a report carrying no reportable evidence. Subclasses
+    ``ValueError`` — same ``except ValueError`` convention as
+    :class:`HandoffCorrectionError`.
+    """
+
+
+def _unresolved_item_outcome_ids(
+    item_outcomes: "list[dict[str, Any]] | None",
+    item_index: dict[str, Any],
+) -> list[str]:
+    """Sorted, deduped ``item_id`` values in ``item_outcomes`` that are NOT
+    present in ``item_index`` (a :func:`board_snapshot.get_project_item_index`
+    result) — i.e. pointers a report claims to speak about but that don't
+    resolve to a real sprint item on this project/version's live board."""
+    return sorted({
+        str(o.get("item_id")) for o in (item_outcomes or [])
+        if o.get("item_id") and str(o.get("item_id")) not in item_index
+    })
+
+
+async def record_executor_report(
+    db: Any,
+    project_id: str,
+    *,
+    version: str | None = None,
+    session_id: str | None = None,
+    source_handoff_id: str | None = None,
+    item_outcomes: "list[dict[str, Any]] | None" = None,
+    changed_resources: "list[Any] | None" = None,
+    commits: "list[Any] | None" = None,
+    tests: "dict[str, Any] | None" = None,
+    tool_availability: "list[dict[str, Any]] | None" = None,
+    artifact_evidence: Any = None,
+    blockers: "list[dict[str, Any]] | None" = None,
+    unresolved_questions: "list[Any] | None" = None,
+    recommended_next_actions: "list[Any] | None" = None,
+    board_revision_hash: str | None = None,
+    parent_report_id: str | None = None,
+    correction_reason: str | None = None,
+    idempotency_key: str | None = None,
+    enrich_contract_hashes: bool = False,
+) -> dict[str, Any]:
+    """Record a durable, non-executable executor-to-planner completion report.
+
+    This is the data-capture half of the feature — it never renders or
+    invalidates a handoff and never touches ``sprint_items`` (see the module
+    docstring above); call :func:`accept_executor_report` separately for the
+    planner-promotion step that produces a fresh executable handoff FROM an
+    accepted report.
+
+    ``parent_report_id`` (correction lineage) — when given, this report
+    supersedes an earlier one without rewriting it. Fails closed
+    (:class:`ExecutorReportError`) when the parent:
+
+    * does not exist,
+    * belongs to a different project (cross-project correction), or
+    * is scoped to a different, non-null ``version`` than this report's own
+      non-null ``version`` (cross-version correction).
+
+    When ``version`` is omitted and a parent is given, the parent's own
+    version is inherited.
+
+    ``board_revision_hash`` — when omitted, captured automatically via
+    :func:`meridian.db.build_board_snapshot` for ``(project_id, version)`` at
+    record time, so a report always carries real, live evidence of what the
+    board looked like — never a caller-fabricated value the caller forgot to
+    (or couldn't) compute. Best-effort: a snapshot failure degrades to
+    ``None`` rather than blocking report capture.
+
+    Fails closed (:class:`ExecutorReportError`) when any ``item_outcomes``
+    entry's ``item_id`` does not resolve against
+    :func:`meridian.db.get_project_item_index` for this project/version —
+    a report's claimed outcomes must point at REAL sprint items, never an
+    unresolved/typo'd id that a planner would otherwise have no way to
+    detect from prose alone.
+
+    ``enrich_contract_hashes`` (opt-in, default False) — when True, every
+    ``item_outcomes`` entry missing its own ``contract_hash`` is enriched,
+    best-effort, with the live ``executor_contract`` hash for that item (see
+    :func:`meridian.executor_contract.summarize_contract_for_report`) — a
+    durable tie between a reported outcome and the EXACT executor_contract
+    the executor was working against. Never raises: a lookup failure simply
+    leaves that entry's ``contract_hash`` unset.
+    """
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise ExecutorReportError(f"project {project_id!r} not found")
+
+    if source_handoff_id:
+        source = await db_module.get_handoff(db, source_handoff_id)
+        if source is None or source.get("project_id") != project_id:
+            raise ExecutorReportError(
+                f"source_handoff_id {source_handoff_id!r} does not name an "
+                f"existing handoff belonging to project {project_id!r}"
+            )
+
+    if parent_report_id:
+        parent = await db_module.get_executor_report(db, parent_report_id)
+        if parent is None:
+            raise ExecutorReportError(
+                f"parent_report_id {parent_report_id!r} not found — a "
+                "correction must reference a real, previously recorded report"
+            )
+        if parent.get("project_id") != project_id:
+            raise ExecutorReportError(
+                f"parent report {parent_report_id!r} belongs to project "
+                f"{parent.get('project_id')!r}, not {project_id!r} — "
+                "refusing a cross-project correction"
+            )
+        parent_version = parent.get("version")
+        if version and parent_version and version != parent_version:
+            raise ExecutorReportError(
+                f"parent report {parent_report_id!r} is scoped to version "
+                f"{parent_version!r}, not {version!r} — refusing a "
+                "cross-version correction"
+            )
+        if version is None:
+            version = parent_version
+
+    if board_revision_hash is None:
+        try:
+            snapshot = await db_module.build_board_snapshot(db, project_id, version=version)
+            board_revision_hash = snapshot.get("revision_hash")
+        except Exception:  # noqa: BLE001 — best-effort; never block report capture
+            board_revision_hash = None
+
+    try:
+        item_index = await db_module.get_project_item_index(db, project_id, version=version)
+    except Exception:  # noqa: BLE001 — degrade to "nothing resolves" rather than crash
+        item_index = {}
+    unresolved = _unresolved_item_outcome_ids(item_outcomes, item_index)
+    if unresolved:
+        raise ExecutorReportError(
+            f"item_outcomes reference sprint-item id(s) not present on this "
+            f"project/version's live board: {unresolved} — a report's item "
+            "outcomes must point at real, resolvable sprint items"
+        )
+
+    outcomes = item_outcomes or []
+    if enrich_contract_hashes and outcomes:
+        from . import executor_contract as executor_contract_module  # noqa: PLC0415
+        enriched: list[dict[str, Any]] = []
+        for outcome in outcomes:
+            o = dict(outcome)
+            if not o.get("contract_hash") and o.get("item_id"):
+                try:
+                    summary = await executor_contract_module.summarize_contract_for_report(
+                        db, project_id, o["item_id"],
+                    )
+                except Exception:  # noqa: BLE001 — best-effort enrichment only
+                    summary = None
+                if summary:
+                    o["contract_hash"] = summary.get("contract_hash")
+            enriched.append(o)
+        outcomes = enriched
+
+    return await db_module.create_executor_report(
+        db, project_id,
+        version=version, session_id=session_id, source_handoff_id=source_handoff_id,
+        board_revision_hash=board_revision_hash,
+        item_outcomes=outcomes, changed_resources=changed_resources, commits=commits,
+        tests=tests, tool_availability=tool_availability,
+        artifact_evidence=artifact_evidence, blockers=blockers,
+        unresolved_questions=unresolved_questions,
+        recommended_next_actions=recommended_next_actions,
+        parent_report_id=parent_report_id, correction_reason=correction_reason,
+        idempotency_key=idempotency_key,
+    )
+
+
+async def accept_executor_report(
+    db: Any,
+    project_id: str,
+    report_id: str,
+    output_dir: str,
+    *,
+    session_id: str | None = None,
+    mode: str = "full",
+    accepted_by: str | None = None,
+    **generate_handoff_kwargs: Any,
+) -> dict[str, Any]:
+    """The ONE planner-promotion step: turn an accepted executor report into
+    a fresh, executable handoff.
+
+    Per the sprint-item spec, this is the ONLY path that may produce a new
+    executable handoff from a report — :func:`record_executor_report` itself
+    never does. Steps, in order:
+
+    1. Load the report; fail closed (:class:`ExecutorReportError`) if it
+       doesn't exist, belongs to a different project, or has status
+       ``superseded`` (a correction replaced it — accept the latest report
+       in its lineage instead, via ``list_executor_reports(parent_report_id=...)``).
+    2. **Idempotent retry**: if this report was already accepted
+       (``accepted_handoff_id`` set), return that same linkage again without
+       generating a second handoff for the same acceptance.
+    3. **Missing-evidence gate**: refuse a report with BOTH empty
+       ``item_outcomes`` and empty ``blockers`` — nothing was reported, so
+       there is nothing to promote.
+    4. **Unresolved-pointer gate**: re-validate every ``item_outcomes`` entry
+       against a FRESH :func:`meridian.db.get_project_item_index` (the board
+       may have moved since the report was recorded) — fails closed on any
+       id that no longer resolves.
+    5. **Rebuild from live state, never from the report's own stored text**:
+       calls :func:`generate_handoff` (the SAME renderer every other handoff
+       path uses) scoped to the report's own ``version`` — which applies its
+       own existing stale-``depends_on`` fail-closed gate
+       (:class:`HandoffStaleReferenceError`) against the live board.
+    6. Stamps the report ``accepted`` with the new handoff's id
+       (:func:`meridian.db.mark_executor_report_accepted`).
+
+    The new handoff's id is recovered via a before/after id-diff against
+    ``get_handoffs`` (never by re-querying "the latest handoff", which is
+    only second-granularity-ordered on SQLite and can return the wrong row —
+    the same b7f41c73-family gotcha :func:`regenerate_handoff_correction`
+    documents).
+    """
+    report = await db_module.get_executor_report(db, report_id)
+    if report is None:
+        raise ExecutorReportError(f"executor report {report_id!r} not found")
+    if report.get("project_id") != project_id:
+        raise ExecutorReportError(
+            f"executor report {report_id!r} belongs to a different project"
+        )
+    if report.get("status") == "superseded":
+        raise ExecutorReportError(
+            f"executor report {report_id!r} was superseded by a correction "
+            "— accept the latest report in its lineage instead (see "
+            "list_executor_reports(parent_report_id=...))"
+        )
+    if report.get("accepted_handoff_id"):
+        return {
+            "report": report,
+            "already_accepted": True,
+            "new_handoff_id": report.get("accepted_handoff_id"),
+            "new_handoff_path": None,
+            "new_handoff_content": None,
+            "amended": None,
+        }
+
+    outcomes = report.get("item_outcomes") or []
+    blockers = report.get("blockers") or []
+    if not outcomes and not blockers:
+        raise ExecutorReportError(
+            f"executor report {report_id!r} carries no item_outcomes and no "
+            "blockers — refusing to promote a report with no reportable "
+            "evidence into an executable handoff"
+        )
+
+    version = report.get("version")
+    try:
+        item_index = await db_module.get_project_item_index(db, project_id, version=version)
+    except Exception:  # noqa: BLE001
+        item_index = {}
+    unresolved = _unresolved_item_outcome_ids(outcomes, item_index)
+    if unresolved:
+        raise ExecutorReportError(
+            f"executor report {report_id!r} references sprint-item id(s) no "
+            f"longer resolvable on this project/version's live board: "
+            f"{unresolved}"
+        )
+
+    # edd9c54b interaction (see regenerate_handoff_correction's own comment
+    # above): pop pending_goal first so generate_handoff lands on its
+    # fresh-insert path rather than amending an unrelated prior row in place.
+    try:
+        await db_module.pop_pending_goal(db, project_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    _before_ids = {
+        r["id"] for r in await db_module.get_handoffs(db, project_id, limit=10)
+    }
+    path, content, amended = await generate_handoff(
+        db, project_id, output_dir,
+        session_id=session_id, version=version, mode=mode,
+        **generate_handoff_kwargs,
+    )
+    _after_rows = await db_module.get_handoffs(db, project_id, limit=10)
+    new_handoff = next(
+        (r for r in _after_rows if r["id"] not in _before_ids),
+        _after_rows[0] if _after_rows else None,
+    )
+    new_handoff_id = new_handoff.get("id") if new_handoff else None
+
+    updated_report = await db_module.mark_executor_report_accepted(
+        db, report_id,
+        accepted_handoff_id=new_handoff_id,
+        accepted_by=accepted_by or session_id,
+    )
+
+    return {
+        "report": updated_report,
+        "already_accepted": False,
+        "new_handoff_id": new_handoff_id,
+        "new_handoff_path": path,
+        "new_handoff_content": content,
+        "amended": amended,
+    }
+
+
+def _render_executor_report_planner_section(
+    latest_report: "dict[str, Any] | None",
+    corrections: "list[dict[str, Any]]",
+) -> list[str]:
+    """Pure renderer: the '## Latest executor report' planner-handoff section.
+
+    Deliberately informational-only — every line here is read-only evidence
+    for the planner to review, never an instruction the planner (or a
+    downstream automated reader) could mistake for executable /goal content.
+    Returns an empty list when there is nothing to report (a project with no
+    executor reports yet), so callers can splice this in unconditionally.
+    """
+    if latest_report is None:
+        return []
+    lines = ["## Latest executor report (informational — not executable)", ""]
+    rid = (latest_report.get("id") or "")[:8]
+    status = latest_report.get("status", "?")
+    ver = latest_report.get("version") or "(unscoped)"
+    lines.append(f"- Report `{rid}` — status **{status}**, version `{ver}`")
+    outcomes = latest_report.get("item_outcomes") or []
+    blockers = latest_report.get("blockers") or []
+    lines.append(f"- {len(outcomes)} item outcome(s), {len(blockers)} blocker(s)")
+    tests = latest_report.get("tests")
+    if isinstance(tests, dict) and tests:
+        lines.append(
+            f"- Tests: exit_code={tests.get('exit_code')} "
+            f"passed={tests.get('passed')} failed={tests.get('failed')}"
+        )
+    unresolved_qs = latest_report.get("unresolved_questions") or []
+    for q in unresolved_qs[:5]:
+        lines.append(f"- Open question: {_clip_body(q, 150)}")
+    next_actions = latest_report.get("recommended_next_actions") or []
+    for a in next_actions[:5]:
+        lines.append(f"- Recommended next action: {_clip_body(a, 150)}")
+    if not latest_report.get("accepted_handoff_id"):
+        lines.append(
+            "- **Awaiting planner review** — call "
+            "`accept_executor_report(...)` to promote this report to a "
+            "fresh executable handoff, or record a correction via "
+            "`record_executor_report(parent_report_id=...)` first."
+        )
+    if corrections:
+        lines.append("")
+        lines.append("### Correction lineage (superseded by the report above)")
+        for c in corrections[:5]:
+            cid = (c.get("id") or "")[:8]
+            cstatus = c.get("status", "?")
+            reason = _clip_body(c.get("correction_reason"), 120)
+            lines.append(f"- `{cid}` [{cstatus}] {reason}")
+    lines.append("")
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # amend_handoff (63b602ff) — explicit, scoped handoff amendment.
 #
 # generate_handoff's own amend-vs-fresh detection (edd9c54b, further below in
@@ -8438,6 +8828,34 @@ async def _generate_planner_handoff(
     span_block = _render_session_span_block(span)
     if span_block:
         lines += [span_block, ""]
+
+    # 9154aa9a — latest durable executor report + its correction lineage
+    # (informational only, see _render_executor_report_planner_section's own
+    # docstring). Guarded/best-effort so a project with no reports, or a
+    # pre-migration DB, still renders a clean prompt.
+    reports = await _safe(db_module.list_executor_reports(db, project_id, limit=1), [])
+    latest_report = reports[0] if reports else None
+    # Walk the correction lineage BACKWARD (parent_report_id) from the
+    # latest report — this is "what this report superseded to get here",
+    # not "what superseded it" (nothing supersedes the latest report by
+    # definition). Bounded hop count so a malformed/cyclical chain can never
+    # hang the planner-handoff render.
+    correction_lineage: list[dict[str, Any]] = []
+    if latest_report is not None:
+        _parent_id = latest_report.get("parent_report_id")
+        _hops = 0
+        while _parent_id and _hops < 5:
+            _ancestor = await _safe(db_module.get_executor_report(db, _parent_id), None)
+            if _ancestor is None:
+                break
+            correction_lineage.append(_ancestor)
+            _parent_id = _ancestor.get("parent_report_id")
+            _hops += 1
+    report_section = _render_executor_report_planner_section(
+        latest_report, correction_lineage,
+    )
+    if report_section:
+        lines += report_section
 
     # Thinking scaffold — empty labelled sections for the planner to fill in.
     lines += [
