@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from meridian_docs import docs_intel
+from meridian_docs import docs_intel, server
 
 
 # ---------------------------------------------------------------------------
@@ -441,3 +441,202 @@ def test_chunk_body_text_is_paragraphs_only_no_table_fabrication(tmp_path):
     assert "TableCellContent" not in chunk["body_text"]
     # The paragraph after the table IS present.
     assert "Paragraph after table" in chunk["body_text"]
+
+
+# ---------------------------------------------------------------------------
+# 1dff1300 -- read_document_snapshot pagination + section scoping. Grouped
+# in this file since section scoping resolves against the SAME heading-
+# stack structure _build_chunks_from_paras uses for chunk boundaries
+# (_resolve_section_anchor_bounds / _annotate_section_paths mirror that
+# algorithm applied to whole-section bounds / per-paragraph section paths
+# instead of per-chunk aggregation).
+# ---------------------------------------------------------------------------
+
+
+def _write_docx(tmp_path, xml: str, name: str = "doc.docx") -> str:
+    path = str(tmp_path / name)
+    with open(path, "wb") as fh:
+        fh.write(_make_docx(xml))
+    return path
+
+
+# H1 Introduction -> body
+#   H2 Design -> body (no native paraId)
+# H1 Conclusion -> body
+_NESTED_SECTIONS_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="00000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="00000002">
+      <w:r><w:t>Intro body.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="00000003">
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>Design</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="00000004">
+      <w:r><w:t>Design body.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="00000005">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Conclusion</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="00000006">
+      <w:r><w:t>Conclusion body.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+
+def test_read_document_snapshot_default_call_is_backward_compatible(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+
+    result = docs_intel.read_document_snapshot(path)
+
+    assert set(result.keys()) == {
+        "status", "docx_path", "byte_size", "saved_mtime", "source_sha256",
+        "word_lock_hint", "xml_parts", "limitations", "paragraph_count",
+        "heading_count", "paragraphs",
+    }
+    assert result["paragraph_count"] == 6
+    assert "section_path" not in result["paragraphs"][0]
+    assert "cursor" not in result
+
+
+def test_read_document_snapshot_pagination_first_and_second_page(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+    full = docs_intel.read_document_snapshot(path)
+
+    page1 = docs_intel.read_document_snapshot(path, page_size=4)
+    assert page1["total"] == 6
+    assert page1["has_more"] is True
+    assert page1["cursor"] is not None
+    assert len(page1["paragraphs"]) == 4
+
+    page2 = docs_intel.read_document_snapshot(path, cursor=page1["cursor"])
+    assert page2["has_more"] is False
+    assert page2["cursor"] is None
+    assert len(page2["paragraphs"]) == 2
+
+    reconstructed_text = [p["text"] for p in page1["paragraphs"] + page2["paragraphs"]]
+    assert reconstructed_text == [p["text"] for p in full["paragraphs"]]
+
+
+def test_read_document_snapshot_paginated_paragraphs_carry_section_path(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+
+    page = docs_intel.read_document_snapshot(path, page_size=100)
+
+    by_text = {p["text"]: p for p in page["paragraphs"]}
+    assert by_text["Introduction"]["section_path"] == ["Introduction"]
+    assert by_text["Intro body."]["section_path"] == ["Introduction"]
+    assert by_text["Design"]["section_path"] == ["Introduction", "Design"]
+    assert by_text["Design body."]["section_path"] == ["Introduction", "Design"]
+    assert by_text["Conclusion"]["section_path"] == ["Conclusion"]
+    assert by_text["Design body."]["heading_para_id"] == by_text["Design"]["para_id"]
+
+
+def test_read_document_snapshot_section_anchor_scopes_to_subsection(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+    intro_id = docs_intel.document_outline(path)["headings"][0]["para_id"]
+
+    result = docs_intel.read_document_snapshot(path, section_anchor=intro_id)
+
+    assert "error" not in result
+    texts = [p["text"] for p in result["paragraphs"]]
+    # "Introduction"'s own subsection = itself + body + nested "Design" +
+    # its body -- stops before the sibling "Conclusion" H1.
+    assert texts == ["Introduction", "Intro body.", "Design", "Design body."]
+
+
+def test_read_document_snapshot_section_anchor_not_found(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+
+    result = docs_intel.read_document_snapshot(path, section_anchor="Nowhere")
+
+    assert "error" in result
+    assert result["reason"] == "section_not_found"
+
+
+def test_read_document_snapshot_rejects_invalid_page_size(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+
+    result = docs_intel.read_document_snapshot(path, page_size=-1)
+
+    assert "error" in result
+    assert result["reason"] == "invalid_page_size"
+
+
+def test_read_document_snapshot_rejects_malformed_cursor(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+
+    result = docs_intel.read_document_snapshot(path, cursor="!!!not-base64-json!!!")
+
+    assert "error" in result
+    assert result["reason"] == "invalid_cursor"
+
+
+def test_read_document_snapshot_outline_cursor_rejected(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+    outline_page = docs_intel.document_outline(path, page_size=1)
+
+    result = docs_intel.read_document_snapshot(path, cursor=outline_page["cursor"])
+
+    assert "error" in result
+    assert result["reason"] == "invalid_cursor"
+
+
+def test_read_document_snapshot_index_db_path_attaches_stale_index_and_structure(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+    db = str(tmp_path / "structure.sqlite")
+    docs_intel.index_docx_structure(path, db)
+
+    result = docs_intel.read_document_snapshot(path, index_db_path=db)
+
+    assert "error" not in result
+    assert result["stale_index"]["trustworthy"] is True
+    assert result["stale_index"]["stale"] is False
+    assert "tables" in result and "figures" in result and "equations" in result
+
+
+def test_read_document_snapshot_index_db_path_reports_stale_after_edit(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+    db = str(tmp_path / "structure.sqlite")
+    docs_intel.index_docx_structure(path, db)
+
+    # Edit the document without re-indexing the structural sidecar.
+    intro_id = docs_intel.document_outline(path)["headings"][0]["para_id"]
+    conclusion_id = docs_intel.document_outline(path)["headings"][1]["para_id"]
+    docs_intel.move_section(path, conclusion_id, intro_id, destination_position="before")
+
+    result = docs_intel.read_document_snapshot(path, index_db_path=db)
+
+    assert result["stale_index"]["stale"] is True
+    assert result["stale_index"]["trustworthy"] is False
+
+
+def test_read_document_snapshot_index_db_path_missing_sidecar_is_never_a_hard_failure(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+    db = str(tmp_path / "never_built.sqlite")
+
+    result = docs_intel.read_document_snapshot(path, index_db_path=db)
+
+    assert "error" not in result
+    assert result["stale_index"]["indexed"] is False
+    assert result["tables"] == []
+    assert result["figures"] == []
+
+
+def test_read_document_snapshot_server_wrapper_supports_pagination(tmp_path):
+    path = _write_docx(tmp_path, _NESTED_SECTIONS_XML)
+
+    page = server.read_document_snapshot(path, page_size=2)
+
+    assert page["has_more"] is True
+    assert len(page["paragraphs"]) == 2

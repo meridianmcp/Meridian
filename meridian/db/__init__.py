@@ -16,6 +16,7 @@ import asyncio
 import datetime as _dt
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -4885,6 +4886,692 @@ async def search_all(
 
 
 # ---------------------------------------------------------------------------
+# 0dc5a35d — planning_search: a ranked, scoped planning-search operation.
+#
+# search_all (above) is a COMPATIBILITY universal-search surface: LIKE/ILIKE
+# on SQLite, additive tsvector on Postgres, no stable ranked-result contract,
+# no source-type/status/version filters, no explainable scores, no
+# pagination. search_synthesis calls the exact same retrieval and only adds
+# optional LLM summarization on top — it does not fix any of that either.
+# search_all's semantics are left completely untouched by this section; this
+# is a SEPARATE operation with its own contract:
+#
+#   - query tokens AND quoted "..." phrases (honoured on every backend)
+#   - project + version + status + source-type filters
+#   - a deterministic per-result ranking score plus a human-readable
+#     rank_explanation describing how it was computed
+#   - source_type / source_id / title / bounded context snippet per result
+#   - a stable tie-break order (score DESC, created_at DESC, source_type ASC,
+#     source_id ASC) so pagination never repeats or drops a row
+#   - an integer pagination cursor — an offset into the fully-ranked, deduped
+#     result list, mirroring get_project_notes_page's cursor contract
+#   - explicit backend + freshness metadata on every response
+#
+# Backend selection (deliberately zero persistent schema change — this
+# item's touches_resources does not include migrations.py / pg_adapter.py,
+# and any persisted index would need a guarded migration in both):
+#
+#   Postgres — on-the-fly to_tsvector / websearch_to_tsquery / ts_rank, the
+#              same "zero schema / zero index, evaluated per query" pattern
+#              search_all / _hybrid_lexical_candidates already use.
+#   SQLite   — prefers a REAL FTS5 index: a TEMP (connection-local, never
+#              written to the database file) virtual table is built fresh
+#              for every call from the already project/version/status
+#              scoped candidate rows, tokenized with 'porter unicode61'
+#              (real stemming) and ranked with bm25(). TEMP tables are not
+#              part of the persistent schema, so this needs no migration and
+#              can never go stale — it is rebuilt from scratch every call.
+#              When the sqlite3 build lacks the FTS5 module (some minimal
+#              self-hosted builds), this degrades to a clearly-documented
+#              fallback: the same project/version/status-scoped candidate
+#              pool, ranked with a locally-computed Okapi BM25 pass (the
+#              "parity FTS/BM25 implementation" for that case) instead of
+#              plain substring matching. Both SQLite tiers are exercised by
+#              tests (test_new_v25.py forces the fallback tier by
+#              monkeypatching FTS5 unavailable).
+#
+# No LLM or embedding call anywhere in this path.
+# ---------------------------------------------------------------------------
+
+_PLANNING_SEARCH_POOL_CAP = 200  # per-source-type candidate pool cap (mirrors _SEMANTIC_CORPUS_CAP)
+_PLANNING_BM25_K1 = 1.2
+_PLANNING_BM25_B = 0.75
+_PLANNING_FTS5_TEMP_TABLE = "_meridian_planning_search_fts5"
+_PLANNING_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+# Best-effort suffix list for the SQLite BM25-fallback tier's naive stemmer —
+# see _planning_naive_stem for why/when this is used.
+_PLANNING_NAIVE_STEM_SUFFIXES = ("ing", "ion", "ed", "es", "s")
+
+# table/column shape for each source type planning_search knows how to
+# retrieve. ``status_col``/``version_col`` are None when the table has no
+# such column (a status/version filter for that type is then a no-op).
+# ``scope_col`` is "project_id" for every type except workspace_proposal,
+# which is workspace(tenant)-scoped, not project-scoped (5c4dcc0f) — see
+# _resolve the tenant via get_tenant_id_for_project below.
+_PLANNING_SOURCE_SPECS: dict[str, dict[str, Any]] = {
+    "task": {
+        "table": "task_log", "id_col": "id", "text_cols": ("description",),
+        "title_col": None, "body_col": "description", "created_col": "created_at",
+        "status_col": "status", "version_col": None, "scope_col": "project_id",
+    },
+    "note": {
+        "table": "project_notes", "id_col": "id", "text_cols": ("title", "body"),
+        "title_col": "title", "body_col": "body", "created_col": "created_at",
+        "status_col": None, "version_col": None, "scope_col": "project_id",
+    },
+    "decision": {
+        "table": "decisions_pinned", "id_col": "id", "text_cols": ("title", "body"),
+        "title_col": "title", "body_col": "body", "created_col": "created_at",
+        "status_col": "status", "version_col": None, "scope_col": "project_id",
+    },
+    "sprint_item": {
+        "table": "sprint_items", "id_col": "id", "text_cols": ("title", "notes"),
+        "title_col": "title", "body_col": "notes", "created_col": "added_at",
+        "status_col": "status", "version_col": "version", "scope_col": "project_id",
+    },
+    "workspace_proposal": {
+        "table": "workspace_proposals", "id_col": "id", "text_cols": ("title", "body"),
+        "title_col": "title", "body_col": "body", "created_col": "created_at",
+        "status_col": "status", "version_col": None, "scope_col": "tenant_id",
+    },
+    "finding": {
+        "table": "session_findings", "id_col": "id", "text_cols": ("title", "content"),
+        "title_col": "title", "body_col": "content", "created_col": "created_at",
+        "status_col": None, "version_col": None, "scope_col": "project_id",
+    },
+}
+_PLANNING_SOURCE_TYPES: "tuple[str, ...]" = tuple(_PLANNING_SOURCE_SPECS.keys())
+
+
+def _planning_resolve_source_types(source_types: "list[str] | None") -> "list[str]":
+    """Validate/dedupe a requested source-type filter, preserving order.
+
+    ``None`` means "every known type". An explicit list that resolves to no
+    valid type (all unknown/typo'd) deliberately returns an EMPTY list — the
+    filter itself is honoured (zero results), it is not silently ignored.
+    """
+    if source_types is None:
+        return list(_PLANNING_SOURCE_TYPES)
+    seen: list[str] = []
+    for s in source_types:
+        if s in _PLANNING_SOURCE_SPECS and s not in seen:
+            seen.append(s)
+    return seen
+
+
+def _planning_normalize_status(status: "str | list[str] | None") -> "list[str] | None":
+    """Normalize the ``status`` filter to ``None`` or a non-empty list[str]."""
+    if status is None:
+        return None
+    if isinstance(status, str):
+        return [status] if status else None
+    normalized = [s for s in status if s]
+    return normalized or None
+
+
+def _planning_parse_query(query: str) -> "tuple[list[str], list[str]]":
+    """Split a free-text query into bare terms and quoted "phrases".
+
+    Quoted substrings are extracted as phrases (matched literally/
+    contiguously); everything outside quotes is tokenized into terms the
+    same way :func:`_search_terms` does. Used by every SQLite ranking tier.
+    Postgres gets the raw query string instead and relies on
+    websearch_to_tsquery's own native phrase syntax (see
+    :func:`_planning_pg_tsquery_source`).
+    """
+    phrases = [p.strip() for p in re.findall(r'"([^"]+)"', query or "")]
+    phrases = [p for p in phrases if p]
+    remainder = re.sub(r'"[^"]*"', " ", query or "")
+    terms = _search_terms(remainder)
+    return terms, phrases
+
+
+def _planning_pg_tsquery_source(query: str) -> str:
+    """Build a websearch_to_tsquery source string for planning_search.
+
+    Differs from :func:`_or_tsquery_source` (search_all's graceful-
+    degradation helper) in one deliberate way: quoted ``"phrase"`` spans are
+    preserved VERBATIM — websearch_to_tsquery's own parser turns a quoted
+    span into a phrase (FOLLOWED BY) tsquery — instead of being split into
+    individually OR'd words. Bare terms outside quotes are still OR'd
+    together so a multi-word query degrades gracefully instead of requiring
+    every bare term (websearch's default whitespace join is AND).
+    """
+    phrases = re.findall(r'"[^"]+"', query or "")
+    remainder = re.sub(r'"[^"]+"', " ", query or "")
+    bare = [
+        t.lstrip("-") for t in remainder.split()
+        if t.lstrip("-") and t.lstrip("-").lower() not in ("or", "and")
+    ]
+    parts = phrases + bare
+    if len(parts) <= 1:
+        return (query or "").strip() or (query or "")
+    return " or ".join(parts)
+
+
+def _planning_derive_title(body: str | None, max_len: int = 80) -> str:
+    """Fallback title for source types with no (or a null) title column: the
+    first line of the body text, truncated. Used for ``task``/``finding``."""
+    if not body:
+        return ""
+    first_line = body.strip().splitlines()[0].strip()
+    if len(first_line) <= max_len:
+        return first_line
+    return first_line[: max_len - 1].rstrip() + "…"
+
+
+def _fts5_quote(term: str) -> str:
+    """Quote a token/phrase for a safe, literal SQLite FTS5 MATCH clause."""
+    return '"' + term.replace('"', '""') + '"'
+
+
+def _planning_naive_stem(word: str) -> str:
+    """Best-effort suffix-stripping stemmer for the SQLite BM25-fallback tier
+    ONLY (used when the sqlite3 build lacks FTS5's real 'porter' tokenizer).
+
+    This is not a real Porter stemmer — it strips at most one common English
+    suffix, and only when the remaining stem is still >=3 chars, e.g.
+    "authenticating"/"authentication" both reduce to "authenticat". That is
+    enough to bridge the common verb/noun-form pairs planning_search's tests
+    exercise. Postgres (websearch_to_tsquery) and SQLite-FTS5
+    (tokenize='porter') both do real linguistic stemming and never call
+    this function at all.
+    """
+    low = word.lower()
+    for suf in _PLANNING_NAIVE_STEM_SUFFIXES:
+        if low.endswith(suf) and len(low) - len(suf) >= 3:
+            return low[: -len(suf)]
+    return low
+
+
+def _planning_tokenize_and_stem(text: str) -> "list[str]":
+    """Word-tokenize ``text`` and naive-stem each token (fallback tier)."""
+    return [_planning_naive_stem(w) for w in _PLANNING_WORD_RE.findall(text)]
+
+
+def _planning_bm25_scores(docs: "list[str]", terms: "list[str]") -> "list[float]":
+    """Okapi BM25 (k1=1.2, b=0.75) over an in-memory, already-scoped corpus.
+
+    ``docs`` is a source type's bounded candidate pool (title+body text,
+    lowercased); ``terms`` are the bare (non-phrase) query terms. Word-
+    tokenized + naive-stemmed (see :func:`_planning_tokenize_and_stem`) so
+    this tier still gets an approximate stemming match even without SQLite's
+    FTS5 module. Returns one score per doc, in ``docs`` order; a term that
+    matches nothing in the corpus (idf undefined/zero-signal) contributes 0.
+    """
+    n = len(docs)
+    if n == 0 or not terms:
+        return [0.0] * n
+    stemmed_terms = [_planning_naive_stem(t) for t in terms]
+    doc_tokens = [_planning_tokenize_and_stem(d) for d in docs]
+    lengths = [len(toks) or 1 for toks in doc_tokens]
+    avgdl = sum(lengths) / n
+    scores = [0.0] * n
+    for term in stemmed_terms:
+        doc_freq = sum(1 for toks in doc_tokens if term in toks)
+        if doc_freq == 0:
+            continue
+        idf = math.log(1 + (n - doc_freq + 0.5) / (doc_freq + 0.5))
+        for i, toks in enumerate(doc_tokens):
+            tf = toks.count(term)
+            if tf == 0:
+                continue
+            denom = tf + _PLANNING_BM25_K1 * (
+                1 - _PLANNING_BM25_B + _PLANNING_BM25_B * (lengths[i] / avgdl)
+            )
+            scores[i] += idf * (tf * (_PLANNING_BM25_K1 + 1)) / denom
+    return scores
+
+
+async def _sqlite_fts5_available(db: Any) -> bool:
+    """Best-effort probe: can this SQLite build create an FTS5 virtual table?
+
+    Cheap (in-memory TEMP table, dropped immediately) and safe to call once
+    per planning_search invocation — SQLite compiles FTS5 in on most modern
+    builds (confirmed available in this project's own pixi env), but some
+    minimal self-hosted builds omit it, so this must never be assumed.
+    """
+    try:
+        await db.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS temp._meridian_fts5_probe "
+            "USING fts5(x)"
+        )
+        await db.execute("DROP TABLE IF EXISTS temp._meridian_fts5_probe")
+        return True
+    except Exception:  # noqa: BLE001 — any failure means "not available"
+        return False
+
+
+async def _planning_sqlite_fts5_rank(
+    db: Any, rows: "list[dict[str, Any]]", terms: "list[str]", phrases: "list[str]",
+) -> "list[tuple[dict[str, Any], float, str]]":
+    """Rank ``rows`` with a fresh connection-local TEMP FTS5 index.
+
+    TEMP tables live only on this connection (never written to the actual
+    database file), so building one needs no schema migration — it is
+    dropped again before returning, and rebuilt from scratch on every call,
+    which is also why planning_search's freshness metadata always reports
+    ``stale: False`` for this backend: there is no persisted index that
+    could go stale in the first place.
+    """
+    match_terms = phrases + terms
+    if not match_terms:
+        return []
+    try:
+        await db.execute(f"DROP TABLE IF EXISTS temp.{_PLANNING_FTS5_TEMP_TABLE}")
+        await db.execute(
+            f"CREATE VIRTUAL TABLE temp.{_PLANNING_FTS5_TEMP_TABLE} USING fts5("
+            "title, body, tokenize='porter unicode61')"
+        )
+    except Exception:  # noqa: BLE001 — defensive: _sqlite_fts5_available already checked this
+        return _planning_sqlite_bm25_rank(rows, terms, phrases)
+    try:
+        for i, r in enumerate(rows):
+            await db.execute(
+                f"INSERT INTO {_PLANNING_FTS5_TEMP_TABLE}(rowid, title, body) VALUES (?, ?, ?)",
+                (i, r.get("_title") or "", r.get("_body") or ""),
+            )
+        match_query = " OR ".join(_fts5_quote(t) for t in match_terms)
+        async with db.execute(
+            f"SELECT rowid, bm25({_PLANNING_FTS5_TEMP_TABLE}) AS _bm25 "
+            f"FROM {_PLANNING_FTS5_TEMP_TABLE} "
+            f"WHERE {_PLANNING_FTS5_TEMP_TABLE} MATCH ?",
+            (match_query,),
+        ) as cur:
+            matches = await cur.fetchall()
+    finally:
+        await db.execute(f"DROP TABLE IF EXISTS temp.{_PLANNING_FTS5_TEMP_TABLE}")
+    out: "list[tuple[dict[str, Any], float, str]]" = []
+    for m in matches:  # type: ignore[assignment]
+        d = _row_to_dict(m)  # type: ignore[arg-type]
+        if d is None:
+            continue
+        idx = int(d["rowid"])
+        raw_bm25 = float(d["_bm25"])
+        score = -raw_bm25  # SQLite bm25(): more negative == more relevant
+        explanation = (
+            f"bm25={score:.6f} via SQLite FTS5 (tokenize='porter unicode61') "
+            f"MATCH {match_query!r}"
+        )
+        out.append((rows[idx], score, explanation))
+    out.sort(key=lambda t: -t[1])
+    return out
+
+
+def _planning_sqlite_bm25_rank(
+    rows: "list[dict[str, Any]]", terms: "list[str]", phrases: "list[str]",
+) -> "list[tuple[dict[str, Any], float, str]]":
+    """Computed Okapi BM25 over the already-scoped candidate pool — the
+    "parity FTS/BM25 implementation" used when the sqlite3 build lacks the
+    FTS5 extension. Quoted phrases are a hard literal-substring filter (a row
+    must contain every phrase to be a candidate at all); bare terms then
+    drive BM25 ranking (with naive stemming — see
+    :func:`_planning_bm25_scores`). A row matching neither any term nor any
+    phrase is excluded, matching search_all's "wholly unrelated query still
+    matches no rows" contract.
+    """
+    docs = [
+        f"{(r.get('_title') or '')} {(r.get('_body') or '')}".strip() for r in rows
+    ]
+    lowered = [d.lower() for d in docs]
+    keep_idx = [
+        i for i, d in enumerate(lowered) if all(p.lower() in d for p in phrases)
+    ]
+    if not keep_idx:
+        return []
+    kept_docs = [lowered[i] for i in keep_idx]
+    term_scores = _planning_bm25_scores(kept_docs, terms) if terms else [0.0] * len(kept_docs)
+    out: "list[tuple[dict[str, Any], float, str]]" = []
+    for local_i, orig_i in enumerate(keep_idx):
+        term_score = term_scores[local_i]
+        if terms and term_score <= 0.0 and not phrases:
+            continue  # matched no term and no phrase — not a hit
+        phrase_freq = sum(kept_docs[local_i].count(p.lower()) for p in phrases)
+        score = term_score + phrase_freq
+        explanation = (
+            f"bm25={term_score:.6f} (python fallback, k1={_PLANNING_BM25_K1}, "
+            f"b={_PLANNING_BM25_B}, naive-stemmed) over terms={terms!r}"
+            + (f"; +{phrase_freq} literal phrase hit(s) of {phrases!r}" if phrases else "")
+            + " — LIKE/substring candidate discovery, FTS5 unavailable"
+        )
+        out.append((rows[orig_i], score, explanation))
+    out.sort(key=lambda t: -t[1])
+    return out
+
+
+async def _planning_pg_source_results(
+    db: Any,
+    scope_col: str,
+    scope_value: str,
+    spec: dict[str, Any],
+    stype: str,
+    query: str,
+    version: str | None,
+    status_list: "list[str] | None",
+) -> "tuple[list[dict[str, Any]], bool]":
+    """Postgres candidate + rank for one source type: on-the-fly tsvector /
+    websearch_to_tsquery / ts_rank — the same zero-schema pattern search_all
+    already uses. Returns ``(results, capped)``."""
+    table = spec["table"]
+    text_cols = spec["text_cols"]
+    title_col = spec["title_col"]
+    body_col = spec["body_col"]
+    created_col = spec["created_col"]
+    status_col = spec["status_col"]
+    version_col = spec["version_col"]
+    id_col = spec["id_col"]
+
+    tv_expr = "to_tsvector('english', " + " || ' ' || ".join(
+        f"coalesce({c}, '')" for c in text_cols
+    ) + ")"
+    title_select = f"{title_col} AS _title" if title_col else "NULL AS _title"
+    body_select = f"{body_col} AS _body" if body_col else "NULL AS _body"
+    status_select = f"{status_col} AS _status" if status_col else "NULL AS _status"
+    version_select = f"{version_col} AS _version" if version_col else "NULL AS _version"
+
+    where_parts = [f"{scope_col} = ?"]
+    params: list[Any] = [scope_value]
+    if version is not None and version_col is not None:
+        where_parts.append(f"{version_col} = ?")
+        params.append(version)
+    if status_list is not None and status_col is not None:
+        placeholders = ", ".join("?" for _ in status_list)
+        where_parts.append(f"{status_col} IN ({placeholders})")
+        params.extend(status_list)
+    elif status_list is None and status_col is not None and stype == "decision":
+        # Preserve the convention every other read path in this module uses:
+        # decisions default to active-only unless a status is explicitly given.
+        where_parts.append("status = 'active'")
+
+    tsq = _planning_pg_tsquery_source(query)
+    where_parts.append(f"{tv_expr} @@ websearch_to_tsquery('english', ?)")
+    params.append(tsq)
+    where_sql = " AND ".join(where_parts)
+
+    sql = (
+        f"SELECT {id_col} AS _id, {title_select}, {body_select}, {status_select}, "
+        f"{version_select}, {created_col} AS _created, "
+        f"ts_rank({tv_expr}, websearch_to_tsquery('english', ?)) AS _score "
+        f"FROM {table} WHERE {where_sql} "
+        f"ORDER BY _score DESC, {created_col} DESC, {id_col} ASC LIMIT ?"
+    )
+    bound = [tsq, *params, _PLANNING_SEARCH_POOL_CAP + 1]
+    async with db.execute(sql, bound) as cur:
+        raw_rows = await cur.fetchall()
+    rows = [_row_to_dict(r) for r in raw_rows if r is not None]  # type: ignore[misc]
+    capped = len(rows) > _PLANNING_SEARCH_POOL_CAP
+    rows = rows[:_PLANNING_SEARCH_POOL_CAP]
+
+    results: list[dict[str, Any]] = []
+    for r in rows:
+        score = float(r.get("_score") or 0.0)
+        body = r.get("_body")
+        title = r.get("_title") or _planning_derive_title(body)
+        results.append({
+            "source_type": stype,
+            "source_id": r.get("_id"),
+            "title": title,
+            "snippet": _search_snippet(body, query),
+            "score": score,
+            "rank_explanation": (
+                f"ts_rank={score:.6f} via to_tsvector('english', ...) "
+                f"@@ websearch_to_tsquery('english', {tsq!r})"
+            ),
+            "status": r.get("_status"),
+            "version": r.get("_version"),
+            "created_at": r.get("_created"),
+        })
+    return results, capped
+
+
+async def _planning_sqlite_source_results(
+    db: Any,
+    scope_col: str,
+    scope_value: str,
+    spec: dict[str, Any],
+    stype: str,
+    terms: "list[str]",
+    phrases: "list[str]",
+    version: str | None,
+    status_list: "list[str] | None",
+    *,
+    fts5_ok: bool,
+) -> "tuple[list[dict[str, Any]], bool]":
+    """SQLite candidate + rank for one source type.
+
+    Always fetches a bounded, project/version/status-scoped candidate pool
+    first (``ORDER BY created DESC LIMIT cap+1`` — no text filter yet), then
+    ranks/filters that pool by the query: a fresh TEMP FTS5 index + bm25()
+    when the sqlite3 build supports FTS5 (``fts5_ok``), else the locally-
+    computed BM25 fallback (see :func:`_planning_sqlite_bm25_rank`).
+    """
+    table = spec["table"]
+    id_col = spec["id_col"]
+    title_col = spec["title_col"]
+    body_col = spec["body_col"]
+    created_col = spec["created_col"]
+    status_col = spec["status_col"]
+    version_col = spec["version_col"]
+
+    where_parts = [f"{scope_col} = ?"]
+    params: list[Any] = [scope_value]
+    if version is not None and version_col is not None:
+        where_parts.append(f"{version_col} = ?")
+        params.append(version)
+    if status_list is not None and status_col is not None:
+        placeholders = ", ".join("?" for _ in status_list)
+        where_parts.append(f"{status_col} IN ({placeholders})")
+        params.extend(status_list)
+    elif status_list is None and status_col is not None and stype == "decision":
+        where_parts.append("status = 'active'")
+    where_sql = " AND ".join(where_parts)
+
+    title_select = f"{title_col} AS _title" if title_col else "NULL AS _title"
+    status_select = f"{status_col} AS _status" if status_col else "NULL AS _status"
+    version_select = f"{version_col} AS _version" if version_col else "NULL AS _version"
+    body_select = f"{body_col} AS _body" if body_col else "NULL AS _body"
+
+    sql = (
+        f"SELECT {id_col} AS _id, {title_select}, {body_select}, {status_select}, "
+        f"{version_select}, {created_col} AS _created "
+        f"FROM {table} WHERE {where_sql} "
+        f"ORDER BY {created_col} DESC LIMIT ?"
+    )
+    async with db.execute(sql, (*params, _PLANNING_SEARCH_POOL_CAP + 1)) as cur:
+        raw_rows = await cur.fetchall()
+    rows = [_row_to_dict(r) for r in raw_rows if r is not None]  # type: ignore[misc]
+    capped = len(rows) > _PLANNING_SEARCH_POOL_CAP
+    rows = rows[:_PLANNING_SEARCH_POOL_CAP]
+    if not rows:
+        return [], capped
+
+    if fts5_ok:
+        scored = await _planning_sqlite_fts5_rank(db, rows, terms, phrases)
+    else:
+        scored = _planning_sqlite_bm25_rank(rows, terms, phrases)
+
+    query_text = " ".join([*phrases, *terms])
+    results: list[dict[str, Any]] = []
+    for r, score, explanation in scored:
+        body = r.get("_body")
+        title = r.get("_title") or _planning_derive_title(body)
+        results.append({
+            "source_type": stype,
+            "source_id": r.get("_id"),
+            "title": title,
+            "snippet": _search_snippet(body, query_text),
+            "score": score,
+            "rank_explanation": explanation,
+            "status": r.get("_status"),
+            "version": r.get("_version"),
+            "created_at": r.get("_created"),
+        })
+    return results, capped
+
+
+async def planning_search(
+    db: Any,
+    project_id: str,
+    query: str,
+    *,
+    source_types: "list[str] | None" = None,
+    version: str | None = None,
+    status: "str | list[str] | None" = None,
+    limit: int = 20,
+    cursor: int = 0,
+) -> dict[str, Any]:
+    """0dc5a35d — ranked, scoped planning search (v1).
+
+    A separate operation from :func:`search_all` (never mutates its
+    semantics — see the module comment above this section for the full
+    rationale). Searches tasks, notes, decisions, sprint items, workspace
+    proposals, and findings for ``project_id``, returning a stable, ranked,
+    paginated, explainable result contract instead of search_all's grouped
+    raw-row dump.
+
+    Args:
+        source_types: restrict to a subset of {task, note, decision,
+            sprint_item, workspace_proposal, finding}; ``None`` = all. An
+            explicit list containing only unknown values yields zero results
+            (the filter is honoured, not silently dropped).
+        version: exact match against sprint_items.version; a no-op for every
+            other source type (they have no version column).
+        status: exact match (single value or list) against each type's
+            status column; a no-op for types with no status column (note,
+            finding). ``decision`` still defaults to active-only when status
+            is omitted, matching the convention every other read path in
+            this module already uses (see _HYBRID_SOURCE_SPECS); every other
+            type is unfiltered by status when omitted.
+        limit: page size, clamped to 1..100.
+        cursor: zero-based OFFSET into the fully-ranked result list (mirrors
+            get_project_notes_page's cursor contract). Pass the previous
+            response's ``next_cursor`` to fetch the next page.
+
+    Returns a dict with ``query``, ``filters``, ``results`` (each carrying
+    source_type/source_id/title/snippet/score/rank_explanation/status/
+    version/created_at), ``total_matched``, ``has_more``, ``next_cursor``,
+    ``backend``, ``freshness`` (index_type/generated_at/stale/capped/
+    capped_source_types/pool_cap), and ``skipped_source_types`` (a
+    type -> reason map for e.g. workspace_proposal when no tenant can be
+    resolved for this project).
+
+    No LLM or embedding call anywhere in this function.
+    """
+    limit = max(1, min(int(limit or 20), 100))
+    cursor = max(0, int(cursor or 0))
+    types = _planning_resolve_source_types(source_types)
+    status_list = _planning_normalize_status(status)
+    is_pg = hasattr(db, "_pool")
+    generated_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+    terms, phrases = _planning_parse_query(query or "")
+    has_query_content = bool(terms or phrases)
+
+    sqlite_fts5_ok = False
+    if not is_pg and has_query_content and types:
+        sqlite_fts5_ok = await _sqlite_fts5_available(db)
+
+    all_results: list[dict[str, Any]] = []
+    capped_types: list[str] = []
+    skipped_types: dict[str, str] = {}
+    tenant_cache: dict[str, Any] = {}
+
+    if has_query_content:
+        for stype in types:
+            spec = _PLANNING_SOURCE_SPECS[stype]
+            scope_col = spec["scope_col"]
+            if scope_col == "tenant_id":
+                if "id" not in tenant_cache:
+                    tenant_cache["id"] = await get_tenant_id_for_project(db, project_id)
+                scope_value = tenant_cache["id"]
+                if scope_value is None:
+                    skipped_types[stype] = (
+                        "no tenant resolved for this project — workspace_proposals "
+                        "are workspace(tenant)-scoped, not project-scoped; self-hosted "
+                        "installs or projects with no creator_human_id have nothing to "
+                        "resolve, so this source type is skipped rather than guessed"
+                    )
+                    continue
+            else:
+                scope_value = project_id
+
+            if is_pg:
+                rows, capped = await _planning_pg_source_results(
+                    db, scope_col, scope_value, spec, stype, query or "",
+                    version, status_list,
+                )
+            else:
+                rows, capped = await _planning_sqlite_source_results(
+                    db, scope_col, scope_value, spec, stype, terms, phrases,
+                    version, status_list, fts5_ok=sqlite_fts5_ok,
+                )
+            if capped:
+                capped_types.append(stype)
+            all_results.extend(rows)
+
+    # Deterministic, stable tie-break: score DESC, created_at DESC,
+    # source_type ASC, source_id ASC. Python's sort() is stable, so applying
+    # ascending sorts in REVERSE priority order and finishing with the score
+    # sort (also reverse=True) produces the full combined ordering.
+    all_results.sort(key=lambda r: str(r["source_id"]))
+    all_results.sort(key=lambda r: r["source_type"])
+    all_results.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    all_results.sort(key=lambda r: r["score"], reverse=True)
+
+    total_matched = len(all_results)
+    page = all_results[cursor: cursor + limit]
+    has_more = (cursor + limit) < total_matched
+    next_cursor = cursor + len(page) if has_more else None
+
+    if is_pg:
+        backend = "postgres_tsvector_ts_rank"
+        index_type = "on_the_fly_tsvector"
+    elif sqlite_fts5_ok:
+        backend = "sqlite_fts5_bm25"
+        index_type = "ephemeral_fts5_temp_table"
+    else:
+        backend = "sqlite_bm25_like_fallback"
+        index_type = "computed_bm25_over_candidate_pool"
+
+    return {
+        "query": query,
+        "filters": {
+            "project_id": project_id,
+            "source_types": types,
+            "version": version,
+            "status": status_list,
+        },
+        "results": [
+            {
+                "source_type": r["source_type"],
+                "source_id": r["source_id"],
+                "title": r["title"],
+                "snippet": r["snippet"],
+                "score": round(float(r["score"]), 6),
+                "rank_explanation": r["rank_explanation"],
+                "status": r.get("status"),
+                "version": r.get("version"),
+                "created_at": r.get("created_at"),
+            }
+            for r in page
+        ],
+        "total_matched": total_matched,
+        "has_more": has_more,
+        "next_cursor": next_cursor,
+        "backend": backend,
+        "freshness": {
+            "index_type": index_type,
+            "generated_at": generated_at,
+            "stale": False,
+            "capped": bool(capped_types),
+            "capped_source_types": sorted(capped_types),
+            "pool_cap": _PLANNING_SEARCH_POOL_CAP,
+        },
+        "skipped_source_types": skipped_types,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Distributed task locking (v0.3.3)
 # ---------------------------------------------------------------------------
 
@@ -6889,9 +7576,31 @@ def normalize_resource_id(identifier: str) -> str:
 
 def _resource_file_of(rid: str) -> "str | None":
     """Return the file path a ``file:`` / ``symbol:`` resource id refers to, or
-    None for other resource types. (63b030a6 — cross-type conflict detection.)"""
+    None for other resource types. (63b030a6 — cross-type conflict detection.)
+
+    2a176d6d — a ``file:<path>:<symbol>`` declaration (a single extra colon,
+    NOT the ``::`` double-colon ``symbol:`` convention) is a widely-used,
+    accepted shorthand elsewhere in this codebase (see the SYMBOL_SCOPE_HINT
+    helper, which treats it as the *preferred* form and is why it is never
+    rewritten/rejected at declaration time by ``normalize_resource_id``). But
+    left as an opaque ``file:`` value, the trailing ``:<symbol>`` suffix became
+    part of the "file identity" this function returns — so two items each
+    using this shape with DIFFERENT trailing symbols on the SAME real file
+    (e.g. ``file:x.py:funcA`` and ``file:x.py:funcB``) resolved to two
+    DIFFERENT file identities and were treated as disjoint, unconflicting
+    resources. That is exactly the false-negative the 2026-08-04 V026-batch6
+    audit flagged ("Group 0 contains items with overlapping ... resources").
+    Strip a trailing ``:<symbol>`` suffix here — for CONFLICT COMPARISON ONLY,
+    never for the stored/serialized resource string — so both declarations
+    correctly resolve to the same real file ``x.py`` and conflict like any
+    other pair of whole-file claims on it. A genuine Windows drive-letter path
+    (``C:/...``) is exempted so it is never mistaken for this pattern.
+    """
     if rid.startswith("file:"):
-        return rid[len("file:"):]
+        value = rid[len("file:"):]
+        if ":" in value and not re.match(r"^[A-Za-z]:[/\\]", value):
+            value = value.split(":", 1)[0]
+        return value
     if rid.startswith("symbol:"):
         return rid[len("symbol:"):].partition("::")[0]
     return None

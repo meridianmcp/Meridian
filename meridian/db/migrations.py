@@ -2650,7 +2650,8 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
                 slug TEXT,
                 nickname TEXT,
                 github_issue_number INTEGER,
-                github_issue_url TEXT
+                github_issue_url TEXT,
+                idempotency_key TEXT
             )"""
         )
         preserved_columns = (
@@ -2659,6 +2660,7 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
             "family_id", "updated_at", "last_activity_at", "created_seq",
             "slug", "nickname",
             "github_issue_number", "github_issue_url",
+            "idempotency_key",
         )
         expressions = []
         for column in preserved_columns:
@@ -2749,6 +2751,21 @@ async def _migrate_workspace_proposals(db: aiosqlite.Connection) -> None:
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_family "
         "ON workspace_proposals(tenant_id, family_id)"
+    )
+    # 867317f6 — idempotency_key: an optional caller-supplied dedup key so
+    # add_workspace_proposal is safe to retry (mirrors handoff_corrections'
+    # idempotency_key pattern in _migrate_handoff_corrections_table). The
+    # unique index is scoped by COALESCE(tenant_id, '') rather than raw
+    # tenant_id so self-host rows (tenant_id always NULL) get a real
+    # duplicate-prevention guarantee too -- plain NULL columns are never
+    # considered equal by a UNIQUE index/constraint in SQLite or Postgres.
+    await _migrate_add_column_if_missing(
+        db, "workspace_proposals", "idempotency_key", "TEXT"
+    )
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_proposals_idempotency "
+        "ON workspace_proposals(COALESCE(tenant_id, ''), idempotency_key) "
+        "WHERE idempotency_key IS NOT NULL"
     )
     await db.commit()
 

@@ -19,8 +19,14 @@ module exists to report honestly rather than assume away.
 from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
+import sys
+import time
 import zipfile
 from typing import Any, Callable
+
+import pytest
 
 from meridian_docs import render_gate, server
 
@@ -483,3 +489,659 @@ def test_verify_promotion_readiness_fails_closed_on_missing_files(tmp_path):
     )
     assert draft_missing["ready"] is False
     assert draft_missing["structural_check"]["error"]
+
+
+# ---------------------------------------------------------------------------
+# c44d245d -- bounded, diagnostic failure classification (timeout / transport
+# / corruption), stderr/exit-code capture, and bounded retry of retryable-only
+# failures on top of the three-state contract above (unchanged).
+# ---------------------------------------------------------------------------
+
+
+def test_render_capability_error_defaults_are_backward_compatible():
+    """Existing ``raise RenderCapabilityError("message")`` call sites (no
+    classification kwargs) must keep working -- default to UNKNOWN_ERROR,
+    non-retryable, no exit_code/stderr/timed_out evidence."""
+    exc = render_gate.RenderCapabilityError("plain message")
+    assert str(exc) == "plain message"
+    assert exc.error_class == render_gate.UNKNOWN_ERROR
+    assert exc.exit_code is None
+    assert exc.stderr is None
+    assert exc.timed_out is False
+    assert exc.retryable is False
+
+
+def test_render_capability_error_rejects_unknown_error_class():
+    exc = render_gate.RenderCapabilityError("msg", error_class="not-a-real-class")
+    assert exc.error_class == render_gate.UNKNOWN_ERROR
+
+
+def test_failure_classes_constant_has_the_four_expected_members():
+    assert render_gate.FAILURE_CLASSES == (
+        render_gate.TIMEOUT_ERROR,
+        render_gate.TRANSPORT_ERROR,
+        render_gate.CORRUPTION_ERROR,
+        render_gate.UNKNOWN_ERROR,
+    )
+    assert render_gate.TIMEOUT_ERROR == "timeout"
+    assert render_gate.TRANSPORT_ERROR == "transport"
+    assert render_gate.CORRUPTION_ERROR == "corruption"
+    assert render_gate.UNKNOWN_ERROR == "unknown"
+
+
+# --- check_render_capability: generic (backend-agnostic) retry contract ----
+
+
+def test_check_render_capability_retries_a_retryable_failure_and_recovers(tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+    calls: list[int] = []
+
+    def _render(path: str) -> dict[str, Any]:
+        calls.append(1)
+        if len(calls) == 1:
+            raise render_gate.RenderCapabilityError(
+                "transient hiccup", error_class=render_gate.TRANSPORT_ERROR, retryable=True
+            )
+        return {"converted_via": "fake", "attempt": len(calls)}
+
+    backend = _fake_backend("flaky", available=True, render=_render)
+
+    result = render_gate.check_render_capability(docx_path, backends=[backend])
+
+    assert result["status"] == render_gate.RENDERED
+    assert result["detail"]["attempt"] == 2
+    assert len(calls) == 2
+
+
+def test_check_render_capability_never_retries_a_non_retryable_failure(tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+    calls: list[int] = []
+
+    def _render(path: str) -> dict[str, Any]:
+        calls.append(1)
+        raise render_gate.RenderCapabilityError(
+            "document is corrupt", error_class=render_gate.CORRUPTION_ERROR, retryable=False
+        )
+
+    backend = _fake_backend("broken-doc", available=True, render=_render)
+
+    result = render_gate.check_render_capability(docx_path, backends=[backend], max_retries=5)
+
+    assert result["status"] == render_gate.FAILED
+    assert len(calls) == 1, "a non-retryable failure must never be retried, regardless of max_retries"
+    assert result["detail"]["error_class"] == render_gate.CORRUPTION_ERROR
+    assert result["detail"]["attempts"] == 1
+
+
+def test_check_render_capability_bounds_retries_at_max_retries(tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+    calls: list[int] = []
+
+    def _render(path: str) -> dict[str, Any]:
+        calls.append(1)
+        raise render_gate.RenderCapabilityError(
+            "always transient", error_class=render_gate.TRANSPORT_ERROR, retryable=True
+        )
+
+    backend = _fake_backend("always-flaky", available=True, render=_render)
+
+    result = render_gate.check_render_capability(docx_path, backends=[backend], max_retries=2)
+
+    assert result["status"] == render_gate.FAILED
+    assert len(calls) == 3, "max_retries=2 means 1 initial attempt + 2 retries = 3 total calls"
+    assert result["detail"]["attempts"] == 3
+    assert result["detail"]["error_class"] == render_gate.TRANSPORT_ERROR
+
+
+def test_check_render_capability_default_max_retries_is_one(tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+    calls: list[int] = []
+
+    def _render(path: str) -> dict[str, Any]:
+        calls.append(1)
+        raise render_gate.RenderCapabilityError(
+            "always transient", error_class=render_gate.TRANSPORT_ERROR, retryable=True
+        )
+
+    backend = _fake_backend("always-flaky", available=True, render=_render)
+
+    result = render_gate.check_render_capability(docx_path, backends=[backend])
+
+    assert result["status"] == render_gate.FAILED
+    assert len(calls) == 2, "default max_retries=1 means 1 initial attempt + 1 retry = 2 total calls"
+
+
+def test_check_render_capability_timeout_failure_detail_is_never_retried(tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+    calls: list[int] = []
+
+    def _render(path: str) -> dict[str, Any]:
+        calls.append(1)
+        raise render_gate.RenderCapabilityError(
+            "hung", error_class=render_gate.TIMEOUT_ERROR, timed_out=True, retryable=False
+        )
+
+    backend = _fake_backend("hangs", available=True, render=_render)
+
+    result = render_gate.check_render_capability(docx_path, backends=[backend], max_retries=5)
+
+    assert result["status"] == render_gate.FAILED
+    assert len(calls) == 1
+    assert result["detail"]["error_class"] == render_gate.TIMEOUT_ERROR
+    assert result["detail"]["timed_out"] is True
+
+
+def test_check_render_capability_failed_detail_carries_exit_code_and_stderr(tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+
+    def _render(path: str) -> dict[str, Any]:
+        raise render_gate.RenderCapabilityError(
+            "exit 1", error_class=render_gate.CORRUPTION_ERROR, exit_code=1, stderr="bad zip"
+        )
+
+    backend = _fake_backend("bad-exit", available=True, render=_render)
+
+    result = render_gate.check_render_capability(docx_path, backends=[backend])
+
+    assert result["detail"]["exit_code"] == 1
+    assert result["detail"]["stderr"] == "bad zip"
+
+
+def test_check_render_capability_unclassified_exception_is_never_retried(tmp_path):
+    """An exception that ISN'T a RenderCapabilityError (a genuine backend
+    bug) has no classification/retryable signal at all -- never retried,
+    reported as UNKNOWN_ERROR with the raw exception type recorded."""
+    docx_path = _write_dummy_docx(tmp_path)
+    calls: list[int] = []
+
+    def _render(path: str) -> dict[str, Any]:
+        calls.append(1)
+        raise ValueError("totally unexpected bug")
+
+    backend = _fake_backend("buggy", available=True, render=_render)
+
+    result = render_gate.check_render_capability(docx_path, backends=[backend], max_retries=5)
+
+    assert result["status"] == render_gate.FAILED
+    assert len(calls) == 1
+    assert result["detail"]["error_class"] == render_gate.UNKNOWN_ERROR
+    assert result["detail"]["exception_type"] == "ValueError"
+
+
+# --- _soffice_render: real classification behavior -------------------------
+
+
+class _FakeCompletedProcess:
+    def __init__(self, returncode: int, stderr: bytes = b""):
+        self.returncode = returncode
+        self.stderr = stderr
+        self.stdout = b""
+
+
+def test_classify_soffice_failure_corruption_marker():
+    error_class, retryable = render_gate._classify_soffice_failure(
+        "Error: source file could not be loaded!"
+    )
+    assert error_class == render_gate.CORRUPTION_ERROR
+    assert retryable is False
+
+
+def test_classify_soffice_failure_default_is_transport_and_retryable():
+    error_class, retryable = render_gate._classify_soffice_failure(
+        "convert /tmp/profile: lock held by another instance"
+    )
+    assert error_class == render_gate.TRANSPORT_ERROR
+    assert retryable is True
+
+
+def test_classify_soffice_failure_empty_stderr_is_transport():
+    error_class, retryable = render_gate._classify_soffice_failure("")
+    assert error_class == render_gate.TRANSPORT_ERROR
+    assert retryable is True
+
+
+def test_soffice_render_timeout_is_classified_and_carries_stderr(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+
+    def _fake_run(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"), output=b"", stderr=b"stuck")
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    with pytest.raises(render_gate.RenderCapabilityError) as excinfo:
+        render_gate._soffice_render(docx_path)
+
+    exc = excinfo.value
+    assert exc.error_class == render_gate.TIMEOUT_ERROR
+    assert exc.timed_out is True
+    assert exc.retryable is False
+    assert exc.stderr == "stuck"
+
+
+def test_soffice_render_spawn_failure_is_transport_and_retryable(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+    monkeypatch.setattr(
+        render_gate.subprocess, "run",
+        lambda cmd, **kwargs: (_ for _ in ()).throw(OSError("could not spawn")),
+    )
+
+    with pytest.raises(render_gate.RenderCapabilityError) as excinfo:
+        render_gate._soffice_render(docx_path)
+
+    exc = excinfo.value
+    assert exc.error_class == render_gate.TRANSPORT_ERROR
+    assert exc.retryable is True
+
+
+def test_soffice_render_nonzero_exit_with_corruption_marker(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+    monkeypatch.setattr(
+        render_gate.subprocess, "run",
+        lambda cmd, **kwargs: _FakeCompletedProcess(1, stderr=b"source file could not be loaded"),
+    )
+
+    with pytest.raises(render_gate.RenderCapabilityError) as excinfo:
+        render_gate._soffice_render(docx_path)
+
+    exc = excinfo.value
+    assert exc.error_class == render_gate.CORRUPTION_ERROR
+    assert exc.retryable is False
+    assert exc.exit_code == 1
+    assert exc.stderr == "source file could not be loaded"
+
+
+def test_soffice_render_retries_through_check_render_capability_and_recovers(tmp_path, monkeypatch):
+    """End-to-end: a transient soffice spawn failure followed by a successful
+    conversion recovers via check_render_capability's retry, exercising the
+    REAL _soffice_render backend (not a fake stand-in)."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_executable", lambda: "/usr/bin/soffice")
+
+    calls: list[int] = []
+
+    def _fake_run(cmd, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("transient spawn failure")
+        out_dir = cmd[5]
+        with open(os.path.join(out_dir, "doc.pdf"), "wb") as fh:
+            fh.write(b"%PDF-1.4 fake")
+        return _FakeCompletedProcess(0)
+
+    monkeypatch.setattr(render_gate.subprocess, "run", _fake_run)
+
+    result = render_gate.check_render_capability(docx_path, backends=[render_gate._SOFFICE_BACKEND])
+
+    assert result["status"] == render_gate.RENDERED
+    assert result["detail"]["converted_via"] == "soffice"
+    assert len(calls) == 2
+
+
+# --- _word_com_render: bounded timeout, owned-process cleanup, COM error ---
+# classification. No real pywin32/Word dependency needed -- fake win32com /
+# win32process modules are injected directly into sys.modules so this is
+# fully deterministic on any platform/machine.
+
+
+class _FakeWordDocument:
+    def __init__(self, on_save):
+        self._on_save = on_save
+        self.closed_with = None
+
+    def SaveAs(self, path, FileFormat):
+        self._on_save(path)
+
+    def Close(self, save_changes):
+        self.closed_with = save_changes
+
+
+class _FakeWordApplication:
+    def __init__(self, hwnd, open_document):
+        self.Hwnd = hwnd
+        self.Visible = None
+        self._open_document = open_document
+        self.quit_called = False
+
+    class _Documents:
+        def __init__(self, outer):
+            self._outer = outer
+
+        def Open(self, path, ReadOnly=True):
+            return self._outer._open_document(path)
+
+    @property
+    def Documents(self):
+        return self._Documents(self)
+
+    def Quit(self):
+        self.quit_called = True
+
+
+def _install_fake_win32com(monkeypatch, open_document, hwnd=4242):
+    """Inject fake ``win32com.client`` / ``win32process`` modules into
+    sys.modules so ``_word_com_render``'s local ``import win32com.client``
+    (and ``_word_application_pid``'s local ``import win32process``) bind to
+    these fakes instead of requiring real pywin32 -- works on any platform.
+    """
+    import types
+
+    fake_client = types.ModuleType("win32com.client")
+    app_holder: dict[str, Any] = {}
+
+    def _dispatch_ex(prog_id):
+        app = _FakeWordApplication(hwnd, open_document)
+        app_holder["app"] = app
+        return app
+
+    fake_client.DispatchEx = _dispatch_ex
+
+    fake_win32com = types.ModuleType("win32com")
+    fake_win32com.client = fake_client
+
+    fake_win32process = types.ModuleType("win32process")
+    fake_win32process.GetWindowThreadProcessId = lambda hwnd_arg: (0, hwnd_arg)
+
+    monkeypatch.setitem(sys.modules, "win32com", fake_win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
+    monkeypatch.setitem(sys.modules, "win32process", fake_win32process)
+    return app_holder
+
+
+def test_word_com_render_happy_path_produces_pdf(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+
+    def _open_document(path):
+        def _on_save(pdf_path):
+            with open(pdf_path, "wb") as fh:
+                fh.write(b"%PDF-1.4 fake")
+        return _FakeWordDocument(_on_save)
+
+    app_holder = _install_fake_win32com(monkeypatch, _open_document)
+    terminate_calls: list[int] = []
+    monkeypatch.setattr(render_gate, "_terminate_owned_process", lambda pid: terminate_calls.append(pid) or True)
+
+    result = render_gate._word_com_render(docx_path)
+
+    assert result["converted_via"] == "word-com"
+    assert app_holder["app"].quit_called is True
+    assert terminate_calls == [], "a successful render must never trigger owned-process cleanup"
+
+
+def test_word_com_render_bounded_timeout_terminates_owned_process(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_WORD_COM_TIMEOUT_SECONDS", 0.05)
+
+    def _open_document(path):
+        time.sleep(2.0)  # exceeds the shrunk bound -- watchdog must fire first
+        return _FakeWordDocument(lambda pdf_path: None)
+
+    _install_fake_win32com(monkeypatch, _open_document)
+    terminate_calls: list[int] = []
+    monkeypatch.setattr(
+        render_gate, "_terminate_owned_process",
+        lambda pid: terminate_calls.append(pid) or True,
+    )
+
+    with pytest.raises(render_gate.RenderCapabilityError) as excinfo:
+        render_gate._word_com_render(docx_path)
+
+    exc = excinfo.value
+    assert exc.error_class == render_gate.TIMEOUT_ERROR
+    assert exc.timed_out is True
+    assert exc.retryable is False
+    assert terminate_calls == [4242], (
+        "timeout must terminate ONLY the exact owned pid this call resolved, "
+        "never a process sweep"
+    )
+
+
+def test_word_com_render_no_owned_pid_skips_cleanup_but_still_times_out(tmp_path, monkeypatch):
+    """When the owned pid can't be resolved (e.g. win32process unavailable),
+    cleanup must be skipped gracefully -- never raise -- while the timeout
+    itself is still reported."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_WORD_COM_TIMEOUT_SECONDS", 0.05)
+
+    def _open_document(path):
+        time.sleep(2.0)
+        return _FakeWordDocument(lambda pdf_path: None)
+
+    _install_fake_win32com(monkeypatch, _open_document)
+    monkeypatch.setattr(render_gate, "_word_application_pid", lambda word: None)
+    terminate_calls: list[int] = []
+    monkeypatch.setattr(
+        render_gate, "_terminate_owned_process",
+        lambda pid: terminate_calls.append(pid) or True,
+    )
+
+    with pytest.raises(render_gate.RenderCapabilityError) as excinfo:
+        render_gate._word_com_render(docx_path)
+
+    assert excinfo.value.error_class == render_gate.TIMEOUT_ERROR
+    assert terminate_calls == []
+
+
+def test_word_com_render_document_open_raises_is_classified(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+
+    def _open_document(path):
+        raise Exception("RPC server is unavailable.")
+
+    _install_fake_win32com(monkeypatch, _open_document)
+
+    with pytest.raises(render_gate.RenderCapabilityError) as excinfo:
+        render_gate._word_com_render(docx_path)
+
+    assert excinfo.value.error_class == render_gate.TRANSPORT_ERROR
+    assert excinfo.value.retryable is True
+
+
+def test_word_com_render_no_pdf_written_is_unknown_not_rendered(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+
+    def _open_document(path):
+        return _FakeWordDocument(lambda pdf_path: None)  # never writes the PDF
+
+    _install_fake_win32com(monkeypatch, _open_document)
+
+    with pytest.raises(render_gate.RenderCapabilityError) as excinfo:
+        render_gate._word_com_render(docx_path)
+
+    assert excinfo.value.error_class == render_gate.UNKNOWN_ERROR
+    assert excinfo.value.retryable is False
+
+
+def test_classify_word_com_exception_transient():
+    error_class, retryable = render_gate._classify_word_com_exception(
+        Exception("The RPC server is unavailable.")
+    )
+    assert error_class == render_gate.TRANSPORT_ERROR
+    assert retryable is True
+
+
+def test_classify_word_com_exception_corruption():
+    error_class, retryable = render_gate._classify_word_com_exception(
+        Exception("Word cannot open the document: converter not found")
+    )
+    assert error_class == render_gate.CORRUPTION_ERROR
+    assert retryable is False
+
+
+def test_classify_word_com_exception_unknown_default():
+    error_class, retryable = render_gate._classify_word_com_exception(
+        Exception("something completely unrelated")
+    )
+    assert error_class == render_gate.UNKNOWN_ERROR
+    assert retryable is False
+
+
+def test_word_application_pid_returns_none_when_win32process_missing(monkeypatch):
+    monkeypatch.delitem(sys.modules, "win32process", raising=False)
+
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _blocked_import(name, *args, **kwargs):
+        if name == "win32process":
+            raise ImportError("no pywin32 in this test environment")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_import)
+
+    class _FakeApp:
+        Hwnd = 1
+
+    assert render_gate._word_application_pid(_FakeApp()) is None
+
+
+def test_word_application_pid_resolves_via_win32process(monkeypatch):
+    import types
+
+    fake_win32process = types.ModuleType("win32process")
+    fake_win32process.GetWindowThreadProcessId = lambda hwnd: (11, 9988)
+    monkeypatch.setitem(sys.modules, "win32process", fake_win32process)
+
+    class _FakeApp:
+        Hwnd = 1
+
+    assert render_gate._word_application_pid(_FakeApp()) == 9988
+
+
+def test_terminate_owned_process_success(monkeypatch):
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(render_gate.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    assert render_gate._terminate_owned_process(555) is True
+    assert killed == [(555, render_gate.signal.SIGTERM)]
+
+
+def test_terminate_owned_process_failure_returns_false_never_raises(monkeypatch):
+    def _boom(pid, sig):
+        raise OSError("no such process")
+
+    monkeypatch.setattr(render_gate.os, "kill", _boom)
+
+    assert render_gate._terminate_owned_process(555) is False
+
+
+# --- server.py wiring: max_retries stays optional / defaulted through -----
+
+
+def test_server_check_render_capability_still_works_with_new_retry_param(tmp_path, monkeypatch):
+    """server.check_render_capability's signature is unchanged (docx_path
+    only) -- max_retries is an internal render_gate default, not something
+    every MCP caller needs to know about."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(
+        render_gate, "check_render_capability",
+        lambda path, **kwargs: {"status": render_gate.FAILED, "reason": "sentinel"},
+    )
+
+    result = server.check_render_capability(docx_path)
+
+    assert result["status"] == render_gate.FAILED
+
+
+# ---------------------------------------------------------------------------
+# check_word_com_render_receipt (8419f55f) -- scopes check_render_capability
+# to ONLY the word-com backend, for tools/meridian_fallbacks/
+# docx_completion_gate.py's stricter "Word/COM rendering only counts as an
+# external verification receipt" contract.
+#
+# Every test here monkeypatches render_gate._WORD_COM_BACKEND (or sys.platform,
+# which the REAL backend's unavailable_reason() consults at call time) rather
+# than actually exercising pywin32 / a real Word install -- exactly the same
+# discipline the rest of this file already follows, and load-bearing on any
+# machine that (like this one) genuinely has Word installed: a test that
+# didn't inject a fake backend here would launch real Word COM automation.
+# ---------------------------------------------------------------------------
+
+def test_word_com_render_receipt_never_consults_soffice_even_when_available(tmp_path, monkeypatch):
+    """Restricted to word-com only -- soffice being available/winning the
+    general chain must have zero effect on this function."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_unavailable_reason", lambda: None)
+    monkeypatch.setattr(
+        render_gate,
+        "_soffice_render",
+        lambda path: (_ for _ in ()).throw(AssertionError("soffice must never be consulted")),
+    )
+    fake_word_backend = _fake_backend(
+        "word-com", available=True, render=lambda path: {"converted_via": "word-com"}
+    )
+    monkeypatch.setattr(render_gate, "_WORD_COM_BACKEND", fake_word_backend)
+
+    result = render_gate.check_word_com_render_receipt(docx_path)
+
+    assert result["status"] == render_gate.RENDERED
+    assert result["backend"] == "word-com"
+
+
+def test_word_com_render_receipt_success(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+    fake_word_backend = _fake_backend(
+        "word-com", available=True, render=lambda path: {"converted_via": "word-com"}
+    )
+    monkeypatch.setattr(render_gate, "_WORD_COM_BACKEND", fake_word_backend)
+
+    result = render_gate.check_word_com_render_receipt(docx_path)
+
+    assert result["status"] == render_gate.RENDERED
+    assert result["status"] == "rendered"
+
+
+def test_word_com_render_receipt_off_windows_is_unavailable_not_success(monkeypatch, tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate.sys, "platform", "linux")
+
+    result = render_gate.check_word_com_render_receipt(docx_path)
+
+    assert result["status"] == render_gate.UNAVAILABLE_WITH_REASON
+    assert "win32" in result["reason"].lower()
+    assert result["status"] != render_gate.RENDERED
+
+
+def test_word_com_render_receipt_pywin32_missing_is_unavailable(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+    fake_word_backend = _fake_backend(
+        "word-com", available=False, reason="pywin32 (win32com) is not installed"
+    )
+    monkeypatch.setattr(render_gate, "_WORD_COM_BACKEND", fake_word_backend)
+
+    result = render_gate.check_word_com_render_receipt(docx_path)
+
+    assert result["status"] == render_gate.UNAVAILABLE_WITH_REASON
+    assert "pywin32" in result["reason"]
+    assert result["status"] != render_gate.RENDERED
+
+
+def test_word_com_render_receipt_failure_is_failed_not_rendered(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+
+    def _boom(path: str) -> dict[str, Any]:
+        raise render_gate.RenderCapabilityError("Word COM render failed: mock com_error")
+
+    fake_word_backend = _fake_backend("word-com", available=True, render=_boom)
+    monkeypatch.setattr(render_gate, "_WORD_COM_BACKEND", fake_word_backend)
+
+    result = render_gate.check_word_com_render_receipt(docx_path)
+
+    assert result["status"] == render_gate.FAILED
+    assert "mock com_error" in result["reason"]
+    assert result["status"] != render_gate.RENDERED
+    assert result["status"] != render_gate.UNAVAILABLE_WITH_REASON
+
+
+def test_word_com_render_receipt_missing_file_is_failed():
+    result = render_gate.check_word_com_render_receipt("does_not_exist_anywhere.docx")
+
+    assert result["status"] == render_gate.FAILED
+    assert "no such file" in result["reason"]
+
+
+def test_check_word_com_render_receipt_exported_in_all():
+    assert "check_word_com_render_receipt" in render_gate.__all__

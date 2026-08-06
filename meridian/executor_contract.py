@@ -61,9 +61,10 @@ from . import artifact_declaration as _artifact_declaration
 from . import capability_availability as _capability_availability
 from . import capability_contract as _capability_contract
 from . import db as db_module
+from . import tool_discovery as _tool_discovery
 from . import tool_requirements as _tool_requirements
 
-EXECUTOR_CONTRACT_SCHEMA_VERSION = 1
+EXECUTOR_CONTRACT_SCHEMA_VERSION = 2
 
 ToolAvailabilityChecker = Callable[[list[dict[str, Any]]], dict[Any, dict[str, Any]]]
 
@@ -724,6 +725,8 @@ async def build_executor_contract(
     node_resolver: "Any | None" = None,
     wave_gate_configs: "list[dict[str, Any]] | None" = None,
     project: "dict[str, Any] | None" = None,
+    session_id: "str | None" = None,
+    tenant: "dict[str, Any] | None" = None,
 ) -> dict[str, Any]:
     """Build the canonical executor_contract for ONE sprint item.
 
@@ -764,6 +767,23 @@ async def build_executor_contract(
     else:
         availability_by_key = default_tool_availability(requirements, inventory=tool_inventory)
     allowed_tools, forbidden_tools = _build_tool_sections(requirements, availability_by_key)
+
+    # 86b36617 -- compiled ToolSearch-style discovery request + required/
+    # preferred availability & fallback telemetry + the pre-edit
+    # codebase-memory/Serena receipt gate, composed into ONE stable-shaped
+    # object (requested/selected/first_call/availability/fallback/receipt).
+    # Reuses the SAME availability_by_key just computed above for
+    # allowed_tools/forbidden_tools (never a second, independently-computed
+    # classification that could disagree with it). Guarded: a failure here
+    # must never break the mandatory contract this feeds.
+    try:
+        tool_discovery = await _tool_discovery.build_tool_discovery_state(
+            db, project_id, item,
+            availability_by_key=availability_by_key,
+            session_id=session_id, tenant=tenant,
+        )
+    except Exception:  # noqa: BLE001 — tool_discovery is best-effort enrichment
+        tool_discovery = None
 
     # 4e44139e/665 follow-up -- typed pointer resolution + provenance, reused
     # verbatim from capability_contract's own per-item extraction (the SAME
@@ -863,6 +883,15 @@ async def build_executor_contract(
         "mode": resolved_mode,
         "allowed_tools": allowed_tools,
         "forbidden_tools": forbidden_tools,
+        # 86b36617 -- compiled discovery request + availability/fallback
+        # telemetry + pre-edit receipt gate. Deliberately NOT folded into the
+        # top-level `executable`/`executable_reasons` above: those reflect
+        # the pre-existing "can this item be claimed" gate (dependency/wave
+        # gate/missing required tool). `tool_discovery.executable` is a
+        # SEPARATE, explicitly-surfaced discovery-side signal — see
+        # tool_discovery.py's module docstring for why this stays distinct
+        # from meridian.code_intel_receipt's completion-time gate.
+        "tool_discovery": tool_discovery,
         "scheduling": scheduling,
         "steps": steps,
         "gate_after": gate_after,

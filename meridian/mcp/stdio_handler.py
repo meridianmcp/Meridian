@@ -1961,6 +1961,11 @@ def build_mcp_server():
                     "required": ["sprint_item_id"],
                 },
             ),
+            # 627187b8 — _shared_tool() pulls the exact same schema HTTP/MCP
+            # already advertises (meridian/mcp_tools.py's _MCP_TOOLS_LIST) so
+            # execute_batch's request/response contract can never drift between
+            # transports — see meridian/batch_ops.py's module docstring.
+            _shared_tool("execute_batch"),
             Tool(
                 name="start_session",
                 description=(
@@ -2454,6 +2459,7 @@ def build_mcp_server():
                 "add_sprint_item",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
+                "execute_batch",
                 "add_workspace_note", "get_workspace_notes",
                 "get_workspace_proposals",
                 "pin_workspace_decision", "get_workspace_decisions",

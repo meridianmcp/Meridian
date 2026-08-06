@@ -28,8 +28,13 @@ keywords = ["mcp", "docx", "ooxml", "documents", "thesis"]
 # (meridian_docs/_vendored_content_tree.py), not a cross-package docparse
 # dependency -- uvx's isolated --from <path> environments do not reliably
 # resolve path-based [tool.uv.sources] dependencies (confirmed live, 2026-07-14).
+# 106caa76 — mcp was previously >=1.0 with no upper bound. Live tunnel evidence:
+# an isolated `uvx --from <path>` child resolved mcp==2.0.0, which removed the
+# `mcp.server.fastmcp` import this server uses (see server.py), crashing on
+# startup. Pinned below the v2 major so uvx cannot resolve an incompatible SDK;
+# see tests/test_tunnel_extension_dependencies.py for the regression coverage.
 version = "0.1.2"
-dependencies = ["mcp>=1.0", "latex2mathml>=2.0"]
+dependencies = ["mcp>=1.27,<2", "latex2mathml>=2.0"]
 
 [project.scripts]
 # 58a044c7 — renamed from "meridian-docs" to "meridian-docs-mcp" to avoid the

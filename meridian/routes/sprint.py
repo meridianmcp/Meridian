@@ -1,6 +1,7 @@
 """Sprint items routes — extracted from server.py."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import threading
@@ -270,6 +271,64 @@ async def add_sprint_item_endpoint(
     if isinstance(result, dict) and result.get("error") == "duplicate":
         raise HTTPException(status_code=409, detail=result)
     return result
+
+
+@router.post("/projects/{project_id}/sprint-batch")
+async def execute_batch_endpoint(
+    project_id: str, body: dict[str, Any], request: Request
+) -> dict[str, Any]:
+    """Run a homogeneous batch of sprint-management writes.
+
+    627187b8 — the HTTP transport for ``meridian.db.batch_management``'s
+    shared batch engine (86e4ae44), sharing ``meridian.batch_ops`` with the
+    MCP tool ``execute_batch`` (meridian/mcp/handlers/sprint_tools.py) so
+    both transports validate and execute identically. Body:
+    ``{operation, entries, mode, idempotency_key, session_id?, max_entries?}``
+    — ``operation`` is one of ``sprint_items`` | ``item_updates`` | ``pointers``
+    | ``notes``; ``mode`` and ``idempotency_key`` are REQUIRED keys (pass
+    ``idempotency_key: null`` to explicitly opt out of idempotency
+    protection). See ``execute_batch``'s MCP tool description
+    (``meridian/mcp_tools.py``) for the full per-operation entry shape and
+    response contract — this endpoint returns the exact same JSON shape.
+    """
+    from .. import batch_ops  # noqa: PLC0415
+    from ..db import batch_management  # noqa: PLC0415
+
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        batch_ops.validate_batch_request_shape(body)
+    except batch_ops.BatchRequestError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    entries = body.get("entries") or []
+    validate_input_size(json.dumps(entries, default=str), "batch entries", 2_000_000)
+    max_entries_raw = body.get("max_entries")
+    try:
+        max_entries = (
+            int(max_entries_raw) if max_entries_raw else batch_ops.DEFAULT_MAX_BATCH_ENTRIES
+        )
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="max_entries must be an integer")
+    tenant = await _get_tenant_from_request(request)
+    tenant_id = tenant.get("id") if tenant else None
+    session_id = body.get("session_id")
+    try:
+        return await batch_ops.execute_batch_operation(
+            db,
+            project_id=project_id,
+            operation=body["operation"],
+            entries=entries,
+            mode=body["mode"],
+            idempotency_key=body.get("idempotency_key") or None,
+            tenant_id=tenant_id,
+            actor=session_id,
+            session_id=session_id,
+            max_entries=max_entries,
+        )
+    except (batch_ops.BatchRequestError, batch_management.BatchEngineError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post("/projects/{project_id}/sprint-items/{item_id}/complete")

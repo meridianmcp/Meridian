@@ -2843,6 +2843,24 @@ async def _handle_task_tools(
             )
         except Exception:  # noqa: BLE001
             _graph_searcher = None
+        # 2026-08-05 pointer-resolution follow-up: handoff enrichment used to
+        # resolve durable symbol pointers through pointers.resolve_pointer's
+        # cached snapshot default, even though the same request already had a
+        # live tenant-aware graph/Serena resolver available for code-pointer
+        # enrichment. Thread that resolver into the pointer pass as well. The
+        # optional root_dir enables the local semantic fallback when no tunnel
+        # is available; it is request-scoped and never persisted.
+        _pointer_symbol_resolver = None
+        try:
+            from ..prospect import build_symbol_resolver  # noqa: PLC0415
+            _pointer_root_dir = str(args.get("root_dir") or "").strip()
+            _pointer_symbol_resolver = build_symbol_resolver(
+                tenant=tenant,
+                root_dir=_pointer_root_dir,
+                data_dir=data_dir,
+            )
+        except Exception:  # noqa: BLE001
+            _pointer_symbol_resolver = None
         # 65c8b426 — Part 2: default skip_ai_summary=True for the MCP tool path
         # so the 3 serial Haiku calls (summarize_session fan-out, ai_summary blurb,
         # sprint retrospective) are skipped unless the caller explicitly opts in.
@@ -2899,6 +2917,7 @@ async def _handle_task_tools(
                     session_id=session_id,
                     commit_messages=[c["message"] for c in _gh_commits],
                     graph_searcher=_graph_searcher,
+                    pointer_symbol_resolver=_pointer_symbol_resolver,
                     identity=_resolve_caller_identity(tenant),
                     force_include_ids=_force_include_ids,
                     skip_ai_summary=_skip_ai,
@@ -3950,7 +3969,7 @@ async def _handle_sprint_tools(
     analyze_sprint, claim_sprint_item, claim_parallel_batch, add_subtask, split_sprint_item,
     merge_sprint_items, complete_sprint_item, add_sprint_item_pointer,
     get_sprint_item_pointers, resolve_sprint_item_pointers,
-    delete_sprint_item_pointer, complete_wave_gate, configure_wave_gate,
+    delete_sprint_item_pointer, execute_batch, complete_wave_gate, configure_wave_gate,
     start_wave_run, finalize_wave_run, resume_wave.
 
     ba4f879b — the original if/elif chain has been replaced with a per-tool
@@ -3982,6 +4001,7 @@ async def _handle_sprint_tools(
         handle_get_sprint_item_pointers,
         handle_resolve_sprint_item_pointers,
         handle_delete_sprint_item_pointer,
+        handle_execute_batch,
         handle_complete_wave_gate,
         handle_configure_wave_gate,
         handle_start_wave_run,
@@ -4011,6 +4031,7 @@ async def _handle_sprint_tools(
         "get_sprint_item_pointers": handle_get_sprint_item_pointers,
         "resolve_sprint_item_pointers": handle_resolve_sprint_item_pointers,
         "delete_sprint_item_pointer": handle_delete_sprint_item_pointer,
+        "execute_batch": handle_execute_batch,
         "complete_wave_gate": handle_complete_wave_gate,
         "configure_wave_gate": handle_configure_wave_gate,
         "start_wave_run": handle_start_wave_run,

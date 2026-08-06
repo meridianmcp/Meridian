@@ -28,7 +28,7 @@ from __future__ import annotations
 import io
 import zipfile
 
-from meridian_docs import docs_intel
+from meridian_docs import docs_intel, server
 from meridian_docs._vendored_content_tree import _build_synth_id_map
 
 
@@ -145,3 +145,264 @@ def test_copy_section_accepts_document_outline_discovered_id(tmp_path):
     texts = [h["text"] for h in outline_after["headings"]]
     assert texts.count("Introduction") == 2
     assert texts == ["Introduction", "Setup", "Conclusion", "Introduction"]
+
+
+# ---------------------------------------------------------------------------
+# 1dff1300 -- cursor-based pagination for document_outline. Grouped in this
+# file since pagination must preserve the SAME identity guarantees
+# (para_id/index) the fix above established -- a paginated page's headings
+# must be byte-for-byte identical (same ids, same order) to the
+# corresponding slice of an unpaginated call.
+# ---------------------------------------------------------------------------
+
+
+def _three_heading_docx(tmp_path) -> str:
+    return _write_docx(tmp_path, _NO_NATIVE_IDS_XML, name="three_headings.docx")
+
+
+def test_document_outline_default_call_is_backward_compatible(tmp_path):
+    path = _three_heading_docx(tmp_path)
+
+    outline = docs_intel.document_outline(path)
+
+    assert set(outline.keys()) == {
+        "paragraph_count", "heading_count", "headings", "section_regions",
+        "document_fingerprint",
+    }
+    assert outline["heading_count"] == 3
+    assert len(outline["headings"]) == 3
+    assert "cursor" not in outline
+    assert isinstance(outline["document_fingerprint"], str) and outline["document_fingerprint"]
+    # Each heading also now carries its own paragraph index (additive field).
+    for h in outline["headings"]:
+        assert isinstance(h["index"], int)
+
+
+def test_document_outline_pagination_first_and_second_page_reconstruct_full_set(tmp_path):
+    path = _three_heading_docx(tmp_path)
+    full = docs_intel.document_outline(path)
+
+    page1 = docs_intel.document_outline(path, page_size=2)
+    assert page1["total"] == 3
+    assert page1["has_more"] is True
+    assert page1["cursor"] is not None
+    assert [h["text"] for h in page1["headings"]] == ["Introduction", "Setup"]
+
+    page2 = docs_intel.document_outline(path, cursor=page1["cursor"])
+    assert page2["has_more"] is False
+    assert page2["cursor"] is None
+    assert [h["text"] for h in page2["headings"]] == ["Conclusion"]
+
+    reconstructed = page1["headings"] + page2["headings"]
+    assert reconstructed == full["headings"]
+
+
+def test_document_outline_paginated_heading_ids_match_unpaginated_ids(tmp_path):
+    """The core identity guarantee this file exists for, applied across a
+    pagination boundary: a heading's id must be IDENTICAL whether fetched
+    via a full call or via a paginated page."""
+    path = _three_heading_docx(tmp_path)
+    full = docs_intel.document_outline(path)
+    full_by_text = {h["text"]: h["para_id"] for h in full["headings"]}
+
+    page1 = docs_intel.document_outline(path, page_size=1)
+    page2 = docs_intel.document_outline(path, cursor=page1["cursor"])
+    page3 = docs_intel.document_outline(path, cursor=page2["cursor"])
+
+    for page in (page1, page2, page3):
+        for h in page["headings"]:
+            assert h["para_id"] == full_by_text[h["text"]]
+            assert h["para_id"].startswith("sp")
+
+
+def test_document_outline_page_size_one_visits_every_heading_exactly_once(tmp_path):
+    path = _three_heading_docx(tmp_path)
+    seen: list[str] = []
+    cursor = None
+    page_size = 1
+    for _ in range(10):  # bounded loop -- must terminate well before this
+        page = docs_intel.document_outline(
+            path, page_size=page_size if cursor is None else None, cursor=cursor
+        )
+        assert "error" not in page
+        seen.extend(h["text"] for h in page["headings"])
+        if not page["has_more"]:
+            break
+        cursor = page["cursor"]
+    else:
+        raise AssertionError("pagination did not terminate within 10 pages")
+    assert seen == ["Introduction", "Setup", "Conclusion"]
+
+
+def test_document_outline_rejects_invalid_page_size(tmp_path):
+    path = _three_heading_docx(tmp_path)
+
+    result = docs_intel.document_outline(path, page_size=0)
+
+    assert "error" in result
+    assert result["reason"] == "invalid_page_size"
+
+
+def test_document_outline_rejects_malformed_cursor(tmp_path):
+    path = _three_heading_docx(tmp_path)
+
+    result = docs_intel.document_outline(path, cursor="not-a-real-cursor")
+
+    assert "error" in result
+    assert result["reason"] == "invalid_cursor"
+
+
+def _raw_cursor(payload: dict) -> str:
+    """Build a cursor token bypassing _encode_page_cursor's own validation
+    -- used to exercise _decode_page_cursor's individual structural checks
+    directly (missing/wrong-typed fields), not just "not base64 at all"."""
+    raw = docs_intel.json.dumps(payload).encode("utf-8")
+    return docs_intel.base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def test_document_outline_rejects_cursor_missing_fingerprint(tmp_path):
+    path = _three_heading_docx(tmp_path)
+    cursor = _raw_cursor({"v": 1, "kind": "outline", "off": 0, "ps": 2, "sa": None})
+
+    result = docs_intel.document_outline(path, cursor=cursor)
+
+    assert "error" in result
+    assert result["reason"] == "invalid_cursor"
+
+
+def test_document_outline_rejects_cursor_with_negative_offset(tmp_path):
+    path = _three_heading_docx(tmp_path)
+    cursor = _raw_cursor(
+        {"v": 1, "kind": "outline", "fp": "deadbeef", "off": -5, "ps": 2, "sa": None}
+    )
+
+    result = docs_intel.document_outline(path, cursor=cursor)
+
+    assert "error" in result
+    assert result["reason"] == "invalid_cursor"
+
+
+def test_document_outline_rejects_cursor_with_non_positive_page_size(tmp_path):
+    path = _three_heading_docx(tmp_path)
+    cursor = _raw_cursor(
+        {"v": 1, "kind": "outline", "fp": "deadbeef", "off": 0, "ps": 0, "sa": None}
+    )
+
+    result = docs_intel.document_outline(path, cursor=cursor)
+
+    assert "error" in result
+    assert result["reason"] == "invalid_cursor"
+
+
+def test_document_outline_rejects_cursor_with_non_string_section_anchor(tmp_path):
+    path = _three_heading_docx(tmp_path)
+    cursor = _raw_cursor(
+        {"v": 1, "kind": "outline", "fp": "deadbeef", "off": 0, "ps": 2, "sa": 123}
+    )
+
+    result = docs_intel.document_outline(path, cursor=cursor)
+
+    assert "error" in result
+    assert result["reason"] == "invalid_cursor"
+
+
+def test_document_outline_rejects_cursor_wrong_version(tmp_path):
+    path = _three_heading_docx(tmp_path)
+    cursor = _raw_cursor(
+        {"v": 99, "kind": "outline", "fp": "deadbeef", "off": 0, "ps": 2, "sa": None}
+    )
+
+    result = docs_intel.document_outline(path, cursor=cursor)
+
+    assert "error" in result
+    assert result["reason"] == "invalid_cursor"
+
+
+def test_document_outline_explicit_invalid_page_size_override_with_valid_cursor(tmp_path):
+    """page_size can be passed ALONGSIDE a cursor to override the cursor's
+    own embedded page_size -- an invalid override must still be rejected,
+    not silently fall back to the cursor's original page_size."""
+    path = _three_heading_docx(tmp_path)
+    page1 = docs_intel.document_outline(path, page_size=1)
+    assert page1["has_more"] is True
+
+    result = docs_intel.document_outline(path, cursor=page1["cursor"], page_size=0)
+
+    assert "error" in result
+    assert result["reason"] == "invalid_page_size"
+
+
+def test_document_outline_rejects_stale_cursor_after_document_changes(tmp_path):
+    path = _three_heading_docx(tmp_path)
+    page1 = docs_intel.document_outline(path, page_size=2)
+    assert page1["has_more"] is True
+
+    # The document changes on disk between page requests (e.g. a concurrent
+    # editor session saved a real edit).
+    docs_intel.move_section(path, *[
+        h["para_id"] for h in docs_intel.document_outline(path)["headings"][:2]
+    ], destination_position="before")
+
+    result = docs_intel.document_outline(path, cursor=page1["cursor"])
+
+    assert "error" in result
+    assert result["reason"] == "stale_cursor"
+
+
+def test_document_outline_cursor_offset_beyond_current_total_is_stale(tmp_path):
+    path = _three_heading_docx(tmp_path)
+    full = docs_intel.document_outline(path, page_size=100)
+    assert full["has_more"] is False
+
+    # Manually mint a cursor pointing past the end for THIS document's real
+    # fingerprint -- simulates a cursor issued against a longer prior
+    # revision of the same content-identity window.
+    forged_cursor = docs_intel._encode_page_cursor(
+        kind="outline", fingerprint=full["document_fingerprint"],
+        offset=999, page_size=10, section_anchor=None,
+    )
+
+    result = docs_intel.document_outline(path, cursor=forged_cursor)
+
+    assert "error" in result
+    assert result["reason"] == "stale_cursor"
+
+
+def test_document_outline_snapshot_cursor_rejected_by_outline(tmp_path):
+    """A cursor minted by read_document_snapshot must never be accepted by
+    document_outline -- each pagination cursor is bound to its own kind."""
+    path = _three_heading_docx(tmp_path)
+    snapshot_page = docs_intel.read_document_snapshot(path, page_size=1)
+
+    result = docs_intel.document_outline(path, cursor=snapshot_page["cursor"])
+
+    assert "error" in result
+    assert result["reason"] == "invalid_cursor"
+
+
+def test_document_outline_section_anchor_scopes_to_subsection(tmp_path):
+    path = _three_heading_docx(tmp_path)
+    by_text = {h["text"]: h["para_id"] for h in docs_intel.document_outline(path)["headings"]}
+
+    result = docs_intel.document_outline(path, section_anchor=by_text["Setup"])
+
+    assert "error" not in result
+    assert [h["text"] for h in result["headings"]] == ["Setup"]
+
+
+def test_document_outline_section_anchor_not_found_returns_clear_error(tmp_path):
+    path = _three_heading_docx(tmp_path)
+
+    result = docs_intel.document_outline(path, section_anchor="Nonexistent Heading")
+
+    assert "error" in result
+    assert result["reason"] == "section_not_found"
+
+
+def test_document_outline_server_wrapper_supports_pagination(tmp_path):
+    path = _three_heading_docx(tmp_path)
+
+    page1 = server.document_outline(path, page_size=2)
+
+    assert page1["has_more"] is True
+    assert len(page1["headings"]) == 2

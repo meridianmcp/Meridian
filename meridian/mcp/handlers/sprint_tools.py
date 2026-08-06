@@ -39,7 +39,17 @@ async def handle_add_sprint_note(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: add_sprint_note."""
+    """MCP tool: add_sprint_note.
+
+    86e4ae44 — this remains a single-entry tool; ``meridian.db.batch_management``
+    (new shared batch engine) already has a ``sprint_note`` entry kind whose
+    mutation step calls the exact same ``add_session_note`` this handler
+    calls, so a future atomic/idempotent multi-note tool needs no new
+    validation logic. Exposing THAT as a new MCP tool (schemas across
+    mcp_tools.py / handler.py / stdio_handler.py / HTTP routes) is explicitly
+    out of scope for 86e4ae44 and is sprint item 627187b8's job — this
+    handler's external contract is unchanged here.
+    """
     validate_input_size(args.get("title"), "note title", 500)
     validate_input_size(args.get("body"), "note body", 10_000_000)
     return await db_module.add_session_note(
@@ -223,7 +233,20 @@ async def handle_fan_out_sprint_items(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: fan_out_sprint_items."""
+    """MCP tool: fan_out_sprint_items.
+
+    86e4ae44 — this handler's call to ``db_module.fan_out_sprint_items`` below
+    is deliberately UNCHANGED: that function's docstring documents a contract
+    (no duplicate-title guard -- "the orchestrator is assumed to have already
+    deduped") that the new ``meridian.db.batch_management`` shared batch
+    engine's ``sprint_item`` entry kind does NOT share (it creates via
+    ``add_sprint_item``, which DOES enforce the duplicate guard). Rerouting
+    this handler through the new engine would silently reject near-duplicate
+    titles this tool accepts today -- a real behavior change for every
+    existing caller. See ``batch_management``'s module docstring for the
+    full reasoning; exposing the new engine as an atomic/idempotent
+    alternative tool is sprint item 627187b8's job, not this one's.
+    """
     from ..handler import (  # noqa: PLC0415
         _infer_touches_resources,
         _active_executor_session_warnings,
@@ -817,6 +840,41 @@ async def handle_claim_sprint_item(
                 "conflicts": _file_conflicts,
             }
 
+    # 2a176d6d (finding 1) — require an explicit execution identity before
+    # attempting a mutating resource-lock acquisition. The low-level gate
+    # (_sprint_item_resource_claim_gate, meridian/mcp/handler.py)
+    # deliberately fail-opens (ok=True, nothing acquired) when session_id is
+    # missing, so every legacy caller of db_module.claim_sprint_item() that
+    # never threads a session_id through sees zero behavior change — that
+    # fail-open contract is pinned by that function's own direct unit tests
+    # and is left unchanged here. But THIS is the real production entry point
+    # for the MCP claim_sprint_item tool, and a caller with no identity to
+    # acquire locks under must not be allowed to believe declared resources
+    # were protected. Fail closed here, before the fail-open gate ever runs,
+    # whenever the item actually declares resources that would need a lock —
+    # an item with nothing declared has nothing to protect, so it is still a
+    # no-op (matches the gate's own "genuinely nothing to enforce" carve-out).
+    if not args.get("session_id"):
+        _identity_item = await db_module.get_sprint_item(db, args["item_id"])
+        if _identity_item is not None and _identity_item.get("project_id") == args["project_id"]:
+            _declared_for_identity = db_module.parse_touches_resources(
+                _identity_item.get("touches_resources")
+            )
+            if _declared_for_identity:
+                return {
+                    "ok": False,
+                    "error": "MISSING_EXECUTION_IDENTITY",
+                    "message": (
+                        "Cannot claim sprint item: it declares "
+                        f"{len(_declared_for_identity)} touches_resources "
+                        "entry(ies) but no session_id was supplied to acquire "
+                        "locks under, so the claim would be non-executable "
+                        "(no lock protection). Pass session_id."
+                    ),
+                    "item_id": args["item_id"],
+                    "declared_resources": _declared_for_identity,
+                }
+
     # 18c488b6 — symbol-scoped resource-lock gate: ACQUIRES (not just checks)
     # a file or symbol claim for every touches_resources entry the item
     # declares, under the caller's session_id. Unlike the touches_files
@@ -829,6 +887,37 @@ async def handle_claim_sprint_item(
     )
     if not _resource_lock_gate.get("ok"):
         return _resource_lock_gate
+
+    # 2a176d6d (finding 3) — the gate itself still fail-softens a bare
+    # 'symbol:<name>' resource (scope='none', acquired=False) into an
+    # overall ok=True result (it just `continue`s past it in its per-resource
+    # loop) — that is pinned by its own direct unit test and left unchanged.
+    # But at THIS call site — the real claim_sprint_item path — a resource
+    # that acquired NO lock must never be silently treated as "claimed".
+    # Detect it and hard-block, rolling back anything else this call DID
+    # acquire (the all-or-nothing contract the gate itself already applies
+    # to genuine conflicts).
+    _malformed_scope = [
+        e for e in (_resource_lock_gate.get("lock_scope") or [])
+        if e.get("scope") == "none"
+    ]
+    if _malformed_scope:
+        await _rollback_sprint_item_resource_locks(
+            db, args.get("session_id"), _resource_lock_gate
+        )
+        return {
+            "ok": False,
+            "error": "MALFORMED_RESOURCE",
+            "message": (
+                "Cannot claim sprint item: declared resource(s) "
+                f"{', '.join(e.get('resource', '?') for e in _malformed_scope)} "
+                "have no resolvable file scope (bare 'symbol:<name>' with no "
+                "'<path>::<symbol>' form), so no lock could be acquired for "
+                "them. Fix the touches_resources declaration to "
+                "'symbol:<path>::<symbol>'."
+            ),
+            "malformed_resources": [e.get("resource") for e in _malformed_scope],
+        }
 
     try:
         # 5823db0b — actor attribution: record who claimed the item (explicit
@@ -976,6 +1065,21 @@ async def handle_claim_sprint_item(
     if _resource_lock_gate.get("lock_scope"):
         item = dict(item)
         item["resource_lock_scope"] = _resource_lock_gate["lock_scope"]
+        # 2a176d6d (finding 4) — mirror sprint_items._claim_batch_resource's
+        # claim_granularity classification for the single-item claim path, so
+        # a symbol: resource that widened to a whole-file lock (fallback_reason
+        # set) is never reported as symbol-safe just because "scope": "file"
+        # looks the same as a genuinely-declared file: resource.
+        item["claim_granularity"] = {
+            e.get("resource"): (
+                "coarse" if e.get("fallback_reason")
+                else "symbol" if e.get("scope") == "symbol"
+                else "file" if e.get("scope") == "file"
+                else "unresolved" if e.get("scope") == "none"
+                else "n/a"
+            )
+            for e in _resource_lock_gate["lock_scope"] if e.get("resource")
+        }
 
     _bc_claim = await _board_change_for_session(
         db, args["project_id"], args.get("session_id")
@@ -1610,6 +1714,14 @@ async def handle_add_sprint_item_pointer(
     2976e168 — attach a GENERIC POINTER to a sprint item. Validation lives in
     db.add_sprint_item_pointer (via meridian.pointers.validate_pointer); a
     malformed pointer raises ValueError, surfaced here as a clean {error}.
+
+    86e4ae44 — this remains a single-entry tool; ``meridian.db.batch_management``
+    (new shared batch engine) already has a ``sprint_item_pointer`` entry kind
+    whose mutation step calls this exact same ``db_module.add_sprint_item_pointer``
+    function, so a future atomic/idempotent multi-pointer tool needs no new
+    validation logic. Exposing THAT as a new MCP tool is sprint item
+    627187b8's job (explicitly out of scope for 86e4ae44) -- this handler's
+    external contract is unchanged here.
     """
     if not args.get("project_id"):
         return {"error": "project_id is required (or pass project_name)"}
@@ -1767,6 +1879,58 @@ async def handle_delete_sprint_item_pointer(
         return {"error": "pointer_id is required"}
     removed = await db_module.delete_sprint_item_pointer(db, args["pointer_id"])
     return {"pointer_id": args["pointer_id"], "deleted": removed}
+
+
+async def handle_execute_batch(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: execute_batch.
+
+    627187b8 — multi-transport exposure of meridian.db.batch_management's
+    shared batch engine (86e4ae44). All request-shape validation (operation/
+    mode/idempotency_key) and the operation-name -> entry_kind translation
+    live in meridian.batch_ops, shared verbatim with the HTTP route
+    (meridian/routes/sprint.py's execute_batch_endpoint) and the stdio
+    transport (which routes this exact tool name through the same
+    _dispatch_mcp_tool -> _handle_sprint_tools path handler.py uses) — so all
+    three transports can never advertise or execute divergent semantics.
+    """
+    from ... import batch_ops  # noqa: PLC0415
+
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    try:
+        batch_ops.validate_batch_request_shape(args)
+    except batch_ops.BatchRequestError as exc:
+        return {"error": str(exc)}
+    entries = args.get("entries") or []
+    validate_input_size(json.dumps(entries, default=str), "batch entries", 2_000_000)
+    max_entries_raw = args.get("max_entries")
+    try:
+        max_entries = (
+            int(max_entries_raw) if max_entries_raw else batch_ops.DEFAULT_MAX_BATCH_ENTRIES
+        )
+    except (TypeError, ValueError):
+        return {"error": "max_entries must be an integer"}
+    try:
+        return await batch_ops.execute_batch_operation(
+            db,
+            project_id=args["project_id"],
+            operation=args["operation"],
+            entries=entries,
+            mode=args["mode"],
+            idempotency_key=args.get("idempotency_key") or None,
+            tenant_id=_mcp_tenant_id,
+            actor=args.get("session_id"),
+            session_id=args.get("session_id"),
+            max_entries=max_entries,
+        )
+    except (batch_ops.BatchRequestError, batch_ops.batch_management.BatchEngineError) as exc:
+        return {"error": str(exc)}
 
 
 async def handle_complete_wave_gate(

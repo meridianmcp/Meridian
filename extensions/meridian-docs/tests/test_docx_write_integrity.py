@@ -23,6 +23,7 @@ Two layers of coverage:
 from __future__ import annotations
 
 import io
+import os
 import zipfile
 
 from meridian_docs import docs_intel
@@ -379,3 +380,127 @@ def test_copy_section_rejects_rid28_reuse_in_figure_a4_and_rolls_back(tmp_path):
     ids = _body_ids(path)
     img_idx = ids.index("IMG0A0004")
     assert ids[img_idx + 1] == "CAP0A0004"
+
+
+# ---------------------------------------------------------------------------
+# a2cd9f54 -- the new table structural-edit primitives (insert_column /
+# split_cell / transpose_table) must route through the SAME disposable-copy,
+# byte/zip/XML-integrity write pipeline every other writer in this module
+# uses (_save_docx_xml_stdlib / _atomic_write_docx_bytes / _verify_docx_write
+# / the CAS-safe restore-on-failure discipline) -- never an unsafe
+# whole-document native rewrite. Their own dedicated behavioral coverage
+# lives in test_table_structural_edits.py; this section is specifically
+# about the disposable-copy/backup/rollback integrity guarantee, which is
+# this file's focus.
+# ---------------------------------------------------------------------------
+
+_TABLE_DOC_XML = f'''<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="{_W}" xmlns:w14="{_W14}">
+  <w:body>
+    <w:tbl>
+      <w:tblGrid>
+        <w:gridCol w:w="2000"/>
+        <w:gridCol w:w="2000"/>
+      </w:tblGrid>
+      <w:tr>
+        <w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>A1</w:t></w:r></w:p></w:tc>
+        <w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>B1</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>A2</w:t></w:r></w:p></w:tc>
+        <w:tc><w:tcPr><w:tcW w:w="2000" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>B2</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+    <w:sectPr/>
+  </w:body>
+</w:document>'''
+
+
+def _rendered_ok(monkeypatch):
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda p, **kwargs: {"status": "rendered", "backend": "test-stub", "detail": {}},
+    )
+
+
+def test_insert_column_false_success_is_caught_and_rolled_back(tmp_path, monkeypatch):
+    """A staged write that -- hypothetically -- didn't actually land the
+    expected content (a "false success" bug in the mutation logic itself)
+    must be caught by post-write verification and rolled back, never
+    reported as a success. Simulated by forcing _verify_docx_write to always
+    report a mismatch, independent of whether the real mutation was correct."""
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _TABLE_DOC_XML, name="table.docx")
+    original_bytes = (tmp_path / "table.docx").read_bytes()
+
+    monkeypatch.setattr(
+        docs_intel, "_verify_docx_write",
+        lambda *a, **kw: {
+            "error": "post-write verification failed: simulated mismatch",
+            "count_mismatches": {"paragraph_count": {"expected": 999, "actual": 0}},
+            "content_hash_mismatch": None,
+        },
+    )
+
+    result = docs_intel.insert_column(path, table_index=0, col_index=0)
+
+    assert "error" in result
+    assert result["file_restored"] is True
+    assert result["concurrent_write_detected"] is False
+    with open(path, "rb") as fh:
+        assert fh.read() == original_bytes
+
+
+def test_transpose_table_backup_matches_pre_write_bytes_exactly(tmp_path, monkeypatch):
+    """After a SUCCESSFUL transpose_table write, the .bak backup
+    _save_docx_xml_stdlib leaves behind must be byte-identical to the
+    document as it existed immediately before the write -- proving the
+    disposable-copy discipline (stage -> verify -> promote, backing up the
+    live file first) was actually used, not an in-place mutation."""
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _TABLE_DOC_XML, name="table.docx")
+    original_bytes = (tmp_path / "table.docx").read_bytes()
+
+    result = docs_intel.transpose_table(path, table_index=0)
+
+    assert result["status"] == "transposed"
+    backup_path = path + ".bak"
+    assert os.path.exists(backup_path)
+    with open(backup_path, "rb") as fh:
+        assert fh.read() == original_bytes
+
+    # And the live file itself is still a structurally valid ZIP / XML doc.
+    with zipfile.ZipFile(path) as zf:
+        assert zf.testzip() is None
+    docs_intel._load_docx_xml_stdlib(path)  # raises on malformed XML/ZIP
+
+
+def test_split_cell_rejects_unsupported_merge_without_touching_disk_at_all(tmp_path, monkeypatch):
+    """A pre-write validation failure (unsupported_merge / ambiguous_grid)
+    must reject BEFORE any staging/promotion happens -- not just restore
+    after the fact. No .bak file should even be created."""
+    _rendered_ok(monkeypatch)
+    merged_xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="{_W}" xmlns:w14="{_W14}">
+  <w:body>
+    <w:tbl>
+      <w:tblGrid>
+        <w:gridCol w:w="1000"/><w:gridCol w:w="1000"/>
+      </w:tblGrid>
+      <w:tr>
+        <w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>Merged</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+    <w:sectPr/>
+  </w:body>
+</w:document>'''
+    path = _write_docx(tmp_path, merged_xml, name="merged.docx")
+    original_bytes = (tmp_path / "merged.docx").read_bytes()
+
+    result = docs_intel.split_cell(path, table_index=0, row_index=0, col_index=0, cols=2)
+
+    assert "error" in result
+    assert result["reason"] == "unsupported_merge"
+    assert not os.path.exists(path + ".bak")
+    with open(path, "rb") as fh:
+        assert fh.read() == original_bytes

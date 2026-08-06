@@ -354,6 +354,134 @@ _PROPOSAL_TRANSITIONS: dict[str, set[str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 867317f6 — transactional hardening for workspace proposal writes.
+#
+# Every proposal-mutating function below runs MULTIPLE statements (an insert
+# plus an event-append, or a read-check plus a guarded update plus an
+# event-append). On SQLite (aiosqlite, autocommit=False) that sequence is
+# already one implicit transaction until the trailing ``db.commit()`` — a mid
+# sequence exception leaves nothing committed. On Postgres
+# (meridian.pg_adapter.PostgresConnection, autocommit=True — see its
+# docstring) each ``db.execute()`` call grabs its OWN pooled connection and
+# commits immediately; ``db.commit()``/``db.rollback()`` are no-ops there. A
+# failure after the first statement of a multi-statement proposal write would
+# otherwise leave a real partial-write state (e.g. a proposal row with no
+# "created" event, or a promoted proposal with no linked sprint item).
+#
+# The fix mirrors the pattern already established in
+# db/sprint_items.py::merge_sprint_items for the exact same Postgres
+# autocommit gap: detect the backend via ``hasattr(db, "_pool")`` and, on
+# failure, apply compensating statements to undo whatever already committed
+# before re-raising. ``_is_proposal_schema_drift_error`` additionally
+# classifies "missing table/column" failures — a partially-applied migration
+# on this backend — into a deterministic, actionable ``ProposalSchemaError``
+# instead of letting a raw driver exception (sqlite3.OperationalError /
+# psycopg.errors.UndefinedColumn) leak out uninterpreted.
+# ---------------------------------------------------------------------------
+
+
+class ProposalSchemaError(RuntimeError):
+    """Raised when a workspace_proposals / proposal_events write fails
+    because the schema on THIS backend is only partially migrated (a missing
+    table or column). Distinct from ``ValueError`` (bad caller input / an
+    illegal state transition): this means the write itself could not
+    complete safely. Any statements the operation already ran are
+    compensated/rolled back before this is raised — see
+    ``_undo_proposal_writes`` — so the caller never observes a partial row.
+    """
+
+
+def _is_proposal_schema_drift_error(exc: BaseException) -> bool:
+    """Heuristic: does ``exc`` look like a missing table/column rather than
+    a genuine data or logic error?
+
+    Matches sqlite3's ``no such table`` / ``no such column`` message shape
+    and psycopg3's ``UndefinedColumn`` / ``UndefinedTable`` (the exception
+    class name and/or "... does not exist" text both appear in ``str(exc)``).
+    Pure string heuristic — never raises, never imports a driver module
+    (this backend may not have psycopg installed at all, e.g. a SQLite-only
+    test environment)."""
+    msg = str(exc).lower()
+    return (
+        "no such table" in msg
+        or "no such column" in msg
+        or "undefinedcolumn" in msg
+        or "undefinedtable" in msg
+        or ("column" in msg and "does not exist" in msg)
+        or ("relation" in msg and "does not exist" in msg)
+    )
+
+
+def _is_proposal_unique_violation(exc: BaseException) -> bool:
+    """Heuristic: does ``exc`` look like a UNIQUE/duplicate-key violation?
+
+    Matches sqlite3's ``UNIQUE constraint failed`` and psycopg3's
+    ``UniqueViolation`` (``duplicate key value violates unique
+    constraint``). Never raises."""
+    msg = str(exc).lower()
+    return "unique" in msg or "duplicate key" in msg
+
+
+async def _undo_proposal_writes(
+    db: aiosqlite.Connection,
+    compensations: "list[tuple[str, tuple]]",
+) -> None:
+    """Best-effort cleanup for a failed multi-statement proposal write.
+
+    Applies ``compensations`` — ``(sql, params)`` pairs, in order, using the
+    same ``?``-placeholder convention as the rest of this module — to undo
+    whatever THIS call already wrote before the failure. Pass ``[]`` when
+    nothing has been written yet (e.g. the very first statement of an
+    operation failed).
+
+    Used identically on BOTH backends — this deliberately does NOT call
+    ``db.rollback()``. On Postgres (autocommit=True) that call is already a
+    no-op. On SQLite (aiosqlite, autocommit=False) it looked like the right
+    thing at first, but a real ``asyncio.gather`` concurrency test
+    (test_workspace_proposals.py) proved it isn't: SQLite has exactly ONE
+    implicit transaction per connection, and this module's own concurrency
+    tests share ONE connection across coroutines (mirroring how a
+    self-hosted server can share one connection across concurrent MCP
+    calls). A losing caller's ``db.rollback()`` discarded a DIFFERENT,
+    still-in-flight caller's uncommitted work on the SAME connection —
+    turning "exactly one winner" into "sometimes zero winners". Each
+    compensation here instead targets only the row(s) THIS call created (by
+    id), so it can never touch a concurrent sibling's uncommitted rows —
+    safe to run on a shared connection, and still correct on Postgres where
+    every statement is independently committed anyway.
+
+    Never raises: a failure while undoing a partial write must not mask the
+    original error that triggered the cleanup.
+    """
+    for comp_sql, comp_params in compensations:
+        try:
+            await db.execute(comp_sql, comp_params)
+        except Exception:  # noqa: BLE001 -- best-effort; never mask the real error
+            pass
+
+
+async def _find_proposal_by_idempotency_key(
+    db: aiosqlite.Connection, idempotency_key: str, tenant_id: str | None,
+) -> dict[str, Any] | None:
+    """Look up an existing proposal by ``(tenant_id, idempotency_key)``.
+
+    Scoped via ``COALESCE(tenant_id, '')`` so a NULL ``tenant_id`` (self-host)
+    normalizes the same way the unique index does (see
+    ``_migrate_workspace_proposals`` / ``_migrate_pg_workspace_proposals``),
+    giving self-host a real duplicate-prevention guarantee too instead of
+    only the best-effort pre-check every other tenant-scoped helper in this
+    module gets via ``_ws_tenant_clause``'s "NULL matches everything" rule.
+    """
+    async with db.execute(
+        "SELECT * FROM workspace_proposals WHERE idempotency_key = ? "
+        "AND COALESCE(tenant_id, '') = COALESCE(?, '')",
+        (idempotency_key, tenant_id),
+    ) as cur:
+        row = await cur.fetchone()
+    return _row_to_dict(row) if row is not None else None
+
+
 async def _append_proposal_event(
     db: aiosqlite.Connection,
     proposal_id: str,
@@ -416,6 +544,7 @@ async def add_workspace_proposal(
     session_id: str | None = None,
     source: str | None = "workspace",
     family_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Insert a workspace_proposals row with status='raw'.
 
@@ -425,7 +554,33 @@ async def add_workspace_proposal(
     6fb48898 — a kebab-cased ``slug`` and a short memorable ``nickname`` are
     auto-generated from the title, unique per tenant scope, mirroring the
     sprint_items slug/nickname pattern (ae87699d).
+
+    867317f6 — ``idempotency_key`` makes repeat calls safe to retry. When
+    given and a PRIOR call already created a proposal with the same
+    ``(tenant_id, idempotency_key)`` pair (see the unique partial index in
+    ``_migrate_workspace_proposals`` / ``_migrate_pg_workspace_proposals``),
+    that existing row is returned UNCHANGED instead of inserting a second
+    one — no duplicate row, no duplicate "created" event. A genuine
+    concurrent race (two callers passing the pre-check before either
+    commits) is caught via the backing UNIQUE constraint and resolved the
+    same way: the loser re-fetches and returns the winner's row rather than
+    raising.
+
+    Atomic: the proposal insert and its "created" event are compensated
+    together on failure so a partially-applied migration (or any other
+    mid-operation error) on Postgres never leaves an orphan proposal row
+    with no event history — see the module-level note above
+    ``ProposalSchemaError`` for why Postgres needs this and SQLite doesn't.
+    Raises :class:`ProposalSchemaError` when the failure looks like a
+    missing table/column; re-raises the original exception otherwise.
     """
+    if idempotency_key:
+        existing = await _find_proposal_by_idempotency_key(
+            db, idempotency_key, tenant_id
+        )
+        if existing is not None:
+            return existing
+
     pid = _new_id()
     # 6fb48898 — derive human-readable secondary keys from the title.
     _slug = await _unique_proposal_slug(
@@ -434,23 +589,62 @@ async def add_workspace_proposal(
     _nickname = await _unique_proposal_nickname(
         db, tenant_id, _sprint_item_nickname_base(title, pid)
     )
-    await db.execute(
-        "INSERT INTO workspace_proposals "
-        "(id, title, body, tags, tenant_id, family_id, slug, nickname) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (pid, title, body, tags, tenant_id, family_id, _slug, _nickname),
-    )
-    await _append_proposal_event(
-        db,
-        pid,
-        "created",
-        body,
-        payload={"title": title, "tags": tags},
-        actor=actor,
-        session_id=session_id,
-        source=source,
-        tenant_id=tenant_id,
-    )
+    try:
+        await db.execute(
+            "INSERT INTO workspace_proposals "
+            "(id, title, body, tags, tenant_id, family_id, slug, nickname, "
+            "idempotency_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (pid, title, body, tags, tenant_id, family_id, _slug, _nickname,
+             idempotency_key),
+        )
+    except Exception as exc:  # noqa: BLE001 — classified below
+        if idempotency_key and _is_proposal_unique_violation(exc):
+            # Lost a create race against another caller using the same key —
+            # the failed INSERT wrote nothing (SQLite rejects a UNIQUE
+            # violation as a no-op statement, and Postgres never applied it
+            # either), so there is nothing of ours to compensate — just hand
+            # back the winner's row.
+            winner = await _find_proposal_by_idempotency_key(
+                db, idempotency_key, tenant_id
+            )
+            if winner is not None:
+                return winner
+        await _undo_proposal_writes(db, [])
+        if _is_proposal_schema_drift_error(exc):
+            raise ProposalSchemaError(
+                "add_workspace_proposal aborted: workspace_proposals schema "
+                f"looks mid-migration on this backend ({exc}). No row was "
+                "created; run pending migrations and retry."
+            ) from exc
+        raise
+
+    try:
+        await _append_proposal_event(
+            db,
+            pid,
+            "created",
+            body,
+            payload={"title": title, "tags": tags},
+            actor=actor,
+            session_id=session_id,
+            source=source,
+            tenant_id=tenant_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — classified below
+        # The proposal insert above already committed on Postgres — undo it
+        # so a retry doesn't see a phantom proposal with zero event history.
+        await _undo_proposal_writes(
+            db, [("DELETE FROM workspace_proposals WHERE id = ?", (pid,))]
+        )
+        if _is_proposal_schema_drift_error(exc):
+            raise ProposalSchemaError(
+                "add_workspace_proposal aborted: proposal_events schema "
+                f"looks mid-migration on this backend ({exc}). The proposal "
+                "row was rolled back; run pending migrations and retry."
+            ) from exc
+        raise
+
     await db.commit()
     async with db.execute(
         "SELECT * FROM workspace_proposals WHERE id = ?", (pid,)
@@ -476,6 +670,15 @@ async def append_proposal_update(
     Proposal rows are intentionally never edited for evidence or decisions.
     Each update becomes a new event carrying optional structured payload and
     provenance, which makes interrupted investigations resumable.
+
+    Tenant-scoped: returns ``None`` (no read, no write) when ``proposal_id``
+    does not resolve under ``tenant_id``'s scope, so a caller cannot append
+    an event to another tenant's proposal.
+
+    Atomic: the event insert and the ``last_activity_at`` bump are
+    compensated together on failure (see ``ProposalSchemaError``) so
+    Postgres never leaves an event on file whose parent proposal's
+    ``last_activity_at`` wasn't bumped to match.
     """
     if not event_type.strip():
         raise ValueError("Proposal event_type cannot be blank")
@@ -488,26 +691,53 @@ async def append_proposal_update(
         proposal = await cur.fetchone()
     if proposal is None:
         return None
-    event = await _append_proposal_event(
-        db,
-        proposal_id,
-        event_type.strip(),
-        content,
-        payload=payload,
-        actor=actor,
-        session_id=session_id,
-        source=source,
-        tenant_id=(
-            tenant_id
-            if tenant_id is not None
-            else (proposal["tenant_id"] if proposal is not None else None)
-        ),
+    event_tenant_id = (
+        tenant_id
+        if tenant_id is not None
+        else (proposal["tenant_id"] if proposal is not None else None)
     )
-    await db.execute(
-        "UPDATE workspace_proposals SET last_activity_at = datetime('now') "
-        f"WHERE id = ?{scope_sql}",
-        [proposal_id, *scope_params],
-    )
+    try:
+        event = await _append_proposal_event(
+            db,
+            proposal_id,
+            event_type.strip(),
+            content,
+            payload=payload,
+            actor=actor,
+            session_id=session_id,
+            source=source,
+            tenant_id=event_tenant_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — classified below
+        await _undo_proposal_writes(db, [])
+        if _is_proposal_schema_drift_error(exc):
+            raise ProposalSchemaError(
+                "append_proposal_update aborted: proposal_events schema "
+                f"looks mid-migration on this backend ({exc}). No event was "
+                "recorded; run pending migrations and retry."
+            ) from exc
+        raise
+
+    try:
+        await db.execute(
+            "UPDATE workspace_proposals SET last_activity_at = datetime('now') "
+            f"WHERE id = ?{scope_sql}",
+            [proposal_id, *scope_params],
+        )
+    except Exception as exc:  # noqa: BLE001 — classified below
+        # The event above already committed on Postgres — undo it so a
+        # retry doesn't see a stray event with no matching activity bump.
+        await _undo_proposal_writes(
+            db, [("DELETE FROM proposal_events WHERE id = ?", (event["id"],))]
+        )
+        if _is_proposal_schema_drift_error(exc):
+            raise ProposalSchemaError(
+                "append_proposal_update aborted: workspace_proposals schema "
+                f"looks mid-migration on this backend ({exc}). The new "
+                "event was rolled back; run pending migrations and retry."
+            ) from exc
+        raise
+
     await db.commit()
     return event
 
@@ -597,7 +827,15 @@ async def advance_workspace_proposal_status(
         superseded  → (terminal)
 
     Returns the updated row, or None if not found / wrong tenant.
-    Raises ``ValueError`` on an invalid or disallowed transition."""
+    Raises ``ValueError`` on an invalid or disallowed transition, INCLUDING
+    the case where a concurrent caller already changed the proposal's status
+    between this call's read and its write (867317f6 — the write is guarded
+    by ``WHERE status = <the status this call observed>``, so a lost race
+    reports a clear error instead of silently clobbering whatever the other
+    caller just set).
+
+    Atomic: the status update and its transition event are compensated
+    together on failure — see ``ProposalSchemaError``."""
     if new_status not in _VALID_PROPOSAL_STATUSES:
         raise ValueError(
             f"Invalid proposal status '{new_status}'. "
@@ -620,22 +858,70 @@ async def advance_workspace_proposal_status(
             f"Cannot transition proposal from '{current}' to '{new_status}'. "
             f"Allowed from '{current}': {sorted(allowed) or '(none)'}"
         )
-    await db.execute(
+    # 867317f6 — atomic from-state guard: the read above is a classic
+    # read-then-write race (identical shape to fa3e3331 in sprint_items.py).
+    # Re-check `status = current` in the WHERE clause so a concurrent
+    # transition that landed between the read and here is never silently
+    # overwritten.
+    cursor = await db.execute(
         f"UPDATE workspace_proposals SET status = ?, updated_at = datetime('now'), "
-        f"last_activity_at = datetime('now') WHERE id = ?{scope_sql}",
-        [new_status, proposal_id, *scope_params],
+        f"last_activity_at = datetime('now') WHERE id = ? AND status = ?{scope_sql}",
+        [new_status, proposal_id, current, *scope_params],
     )
+    if cursor.rowcount == 0:
+        # Nothing to compensate — the guarded UPDATE affected zero rows, so
+        # this call never wrote anything (see _undo_proposal_writes for why
+        # a blanket rollback() would be actively wrong here: it would erase
+        # a concurrent WINNER's still-uncommitted work on a shared connection).
+        async with db.execute(
+            f"SELECT status FROM workspace_proposals WHERE id = ?{scope_sql}",
+            [proposal_id, *scope_params],
+        ) as cur:
+            raced_row = await cur.fetchone()
+        raced_status = raced_row["status"] if raced_row is not None else None
+        raise ValueError(
+            f"Cannot transition proposal from '{current}' to '{new_status}': "
+            f"another caller already changed its status to "
+            f"{raced_status!r} before this transition could commit. "
+            "Re-fetch the proposal before retrying."
+        )
     event_type = "resumed" if current == "paused" and new_status in {
         "raw", "investigating"
     } else "status_changed"
-    await _append_proposal_event(
-        db,
-        proposal_id,
-        event_type,
-        f"{current} -> {new_status}",
-        payload={"from": current, "to": new_status},
-        tenant_id=(tenant_id if tenant_id is not None else proposal.get("tenant_id")),
-    )
+    try:
+        await _append_proposal_event(
+            db,
+            proposal_id,
+            event_type,
+            f"{current} -> {new_status}",
+            payload={"from": current, "to": new_status},
+            tenant_id=(tenant_id if tenant_id is not None else proposal.get("tenant_id")),
+        )
+    except Exception as exc:  # noqa: BLE001 — classified below
+        # The guarded status UPDATE above already committed on Postgres —
+        # restore the prior status/timestamps so this failure never leaves
+        # the proposal "transitioned" with no matching event on file.
+        await _undo_proposal_writes(
+            db,
+            [(
+                "UPDATE workspace_proposals SET status = ?, "
+                "updated_at = ?, last_activity_at = ? WHERE id = ?",
+                (
+                    current,
+                    proposal.get("updated_at"),
+                    proposal.get("last_activity_at"),
+                    proposal_id,
+                ),
+            )],
+        )
+        if _is_proposal_schema_drift_error(exc):
+            raise ProposalSchemaError(
+                "advance_workspace_proposal_status aborted: proposal_events "
+                f"schema looks mid-migration on this backend ({exc}). The "
+                "status change was rolled back; run pending migrations and "
+                "retry."
+            ) from exc
+        raise
     await db.commit()
     async with db.execute(
         f"SELECT * FROM workspace_proposals WHERE id = ?{scope_sql}",
@@ -662,8 +948,16 @@ async def promote_workspace_proposal(
     default, overrideable via ``sprint_item_title``). Sets the proposal's
     status to 'promoted' and records ``promoted_to_sprint_item_id``.
 
-    Raises ``ValueError`` if the proposal is not found, wrong tenant, or is
-    not in 'raw' or 'investigating' state (cannot promote rejected/promoted)."""
+    Raises ``ValueError`` if the proposal is not found, wrong tenant, is not
+    in 'raw' or 'investigating' state (cannot promote rejected/promoted), or
+    if a concurrent caller promoted (or otherwise transitioned) the SAME
+    proposal between this call's read and its write (867317f6 — the promote
+    UPDATE is guarded by ``WHERE status IN ('raw','investigating')``, so a
+    lost race never creates a second, orphaned sprint item for one proposal).
+
+    Atomic: the sprint-item insert, the promote UPDATE, and the "promoted"
+    event are compensated together on failure — see ``ProposalSchemaError``.
+    """
     scope, scope_params = _ws_tenant_clause(tenant_id)
     scope_sql = f" AND {scope}" if scope else ""
     async with db.execute(
@@ -712,28 +1006,93 @@ async def promote_workspace_proposal(
         )
     # Create the sprint item with inferred resources (or a note flagging the gap).
     si_id = _new_id()
-    await db.execute(
-        "INSERT INTO sprint_items "
-        "(id, project_id, version, title, status, touches_resources, notes) "
-        "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
-        (si_id, project_id, version, title, resources_json, item_notes),
-    )
-    # Mark the proposal promoted.
-    await db.execute(
+    try:
+        await db.execute(
+            "INSERT INTO sprint_items "
+            "(id, project_id, version, title, status, touches_resources, notes) "
+            "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+            (si_id, project_id, version, title, resources_json, item_notes),
+        )
+    except Exception as exc:  # noqa: BLE001 — classified below
+        await _undo_proposal_writes(db, [])
+        if _is_proposal_schema_drift_error(exc):
+            raise ProposalSchemaError(
+                "promote_workspace_proposal aborted: sprint_items schema "
+                f"looks mid-migration on this backend ({exc}). No sprint "
+                "item was created and the proposal was not promoted; run "
+                "pending migrations and retry."
+            ) from exc
+        raise
+
+    # 867317f6 — atomic from-state guard: two concurrent promote calls for
+    # the SAME proposal must not both succeed (that would create two sprint
+    # items — a duplicate/idempotency violation — with only one recorded on
+    # the proposal). Re-check `status IN ('raw','investigating')` in the
+    # UPDATE's WHERE clause itself; a lost race compensates by deleting the
+    # sprint item this call just inserted, rather than leaving an orphan.
+    cursor = await db.execute(
         f"UPDATE workspace_proposals "
         f"SET status = 'promoted', promoted_to_sprint_item_id = ?, "
         f"updated_at = datetime('now'), last_activity_at = datetime('now') "
-        f"WHERE id = ?{scope_sql}",
+        f"WHERE id = ? AND status IN ('raw', 'investigating'){scope_sql}",
         [si_id, proposal_id, *scope_params],
     )
-    await _append_proposal_event(
-        db,
-        proposal_id,
-        "promoted",
-        f"Promoted to sprint item {si_id}",
-        payload={"sprint_item_id": si_id, "touches_resources": resource_candidates},
-        tenant_id=(tenant_id if tenant_id is not None else proposal.get("tenant_id")),
-    )
+    if cursor.rowcount == 0:
+        await _undo_proposal_writes(
+            db, [("DELETE FROM sprint_items WHERE id = ?", (si_id,))]
+        )
+        async with db.execute(
+            f"SELECT status, promoted_to_sprint_item_id FROM workspace_proposals "
+            f"WHERE id = ?{scope_sql}",
+            [proposal_id, *scope_params],
+        ) as cur:
+            raced_row = await cur.fetchone()
+        raced_status = raced_row["status"] if raced_row is not None else None
+        raise ValueError(
+            f"Cannot promote proposal '{proposal_id}': another caller already "
+            f"changed its status to {raced_status!r} before this promotion "
+            "could commit. No duplicate sprint item was created."
+        )
+
+    try:
+        await _append_proposal_event(
+            db,
+            proposal_id,
+            "promoted",
+            f"Promoted to sprint item {si_id}",
+            payload={"sprint_item_id": si_id, "touches_resources": resource_candidates},
+            tenant_id=(tenant_id if tenant_id is not None else proposal.get("tenant_id")),
+        )
+    except Exception as exc:  # noqa: BLE001 — classified below
+        # Both the sprint item insert and the guarded promote UPDATE above
+        # already committed on Postgres — undo both so a retry doesn't see
+        # a "promoted" proposal with no event and no working link.
+        await _undo_proposal_writes(
+            db,
+            [
+                (
+                    "UPDATE workspace_proposals SET status = ?, "
+                    "promoted_to_sprint_item_id = NULL, updated_at = ?, "
+                    "last_activity_at = ? WHERE id = ?",
+                    (
+                        current,
+                        proposal.get("updated_at"),
+                        proposal.get("last_activity_at"),
+                        proposal_id,
+                    ),
+                ),
+                ("DELETE FROM sprint_items WHERE id = ?", (si_id,)),
+            ],
+        )
+        if _is_proposal_schema_drift_error(exc):
+            raise ProposalSchemaError(
+                "promote_workspace_proposal aborted: proposal_events schema "
+                f"looks mid-migration on this backend ({exc}). The "
+                "promotion was rolled back; run pending migrations and "
+                "retry."
+            ) from exc
+        raise
+
     await db.commit()
     async with db.execute(
         f"SELECT * FROM workspace_proposals WHERE id = ?{scope_sql}",

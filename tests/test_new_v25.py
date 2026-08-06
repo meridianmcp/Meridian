@@ -8,6 +8,8 @@ import asyncio
 import pytest
 
 from meridian import db as db_module
+from meridian.db import workspace as ws_module
+from meridian.mcp.handlers import session_tools as st_mod
 
 
 # ---------------------------------------------------------------------------
@@ -2557,3 +2559,613 @@ async def test_search_all_title_only_match_has_empty_snippet(db):
     matches = [i for i in result["sprint_items"] if i["title"] == "Implement rate limiting"]
     assert matches
     assert matches[0]["snippet"] == ""
+
+
+# ---------------------------------------------------------------------------
+# 0dc5a35d — planning_search: ranked, scoped planning search (v1).
+#
+# search_all is a compatibility universal-search surface with no ranked-
+# result contract, no source-type/status/version filters, no explainable
+# scores, and no pagination. planning_search is the SEPARATE operation that
+# fills that gap (see the big module comment above db.planning_search).
+# These tests cover the acceptance criteria's required scenarios: multiword/
+# non-contiguous matches, stemming, phrase behavior, ranking stability,
+# empty/no-result queries, tenant/project/version isolation, pagination,
+# SQLite/Postgres parity, stale-index metadata, and backward compatibility
+# (the search_all/search_synthesis-specific backward-compat tests live in
+# tests/test_search_all.py per this item's touches_resources).
+# ---------------------------------------------------------------------------
+
+
+async def _make_tenant_scoped_project(db, name, email):
+    """Helper: a project whose creator resolves to a real tenant, so
+    workspace_proposal (tenant-scoped, not project-scoped) can be exercised."""
+    tenant = await db_module.upsert_tenant(db, email)
+    project = await db_module.create_project(db, name, human_id=email)
+    return project, tenant
+
+
+# --- contract shape --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_result_contract_shape(db):
+    """Every result carries the full required contract: source entity/id,
+    title, bounded snippet, deterministic score, rank explanation, status,
+    version, created_at — and the envelope carries filters/pagination/
+    backend/freshness metadata."""
+    p = await db_module.create_project(db, "ps-contract")
+    await db_module.add_project_note(
+        db, p["id"], "Ops runbook", "alpha beta content for the contract test"
+    )
+    result = await db_module.planning_search(db, p["id"], "alpha beta")
+
+    assert set(result.keys()) == {
+        "query", "filters", "results", "total_matched", "has_more",
+        "next_cursor", "backend", "freshness", "skipped_source_types",
+    }
+    assert result["filters"]["project_id"] == p["id"]
+    assert result["results"], "expected at least one match"
+    row = result["results"][0]
+    assert set(row.keys()) == {
+        "source_type", "source_id", "title", "snippet", "score",
+        "rank_explanation", "status", "version", "created_at",
+    }
+    assert row["source_type"] == "note"
+    assert isinstance(row["score"], float)
+    assert row["rank_explanation"]  # non-empty, human-readable
+    assert "alpha" in row["snippet"].lower() or "beta" in row["snippet"].lower()
+
+    freshness = result["freshness"]
+    assert set(freshness.keys()) == {
+        "index_type", "generated_at", "stale", "capped",
+        "capped_source_types", "pool_cap",
+    }
+    assert result["backend"] in (
+        "sqlite_fts5_bm25", "sqlite_bm25_like_fallback", "postgres_tsvector_ts_rank",
+    )
+
+
+# --- multiword / non-contiguous matches ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_multiword_non_contiguous_match(anydb):
+    """A record whose text contains several (non-contiguous) query terms but
+    not all of them must still be found and ranked above an unrelated
+    decoy — the same graceful-degradation contract search_all established."""
+    db = anydb
+    p = await db_module.create_project(db, "ps-multiword")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "img127 coverage gap")
+    await db_module.patch_sprint_item(
+        db, p["id"], item["id"],
+        notes="single-path BFS traversal misses a coverage gap around img127",
+    )
+    result = await db_module.planning_search(
+        db, p["id"], "img127 coverage gap single-path BFS x=768 x=1511",
+        source_types=["sprint_item"],
+    )
+    titles = [r["title"] for r in result["results"]]
+    assert "img127 coverage gap" in titles
+
+
+@pytest.mark.asyncio
+async def test_planning_search_partial_match_beats_unrelated_decoy(anydb):
+    db = anydb
+    p = await db_module.create_project(db, "ps-partial")
+    await db_module.add_project_note(
+        db, p["id"], "Relevant", "img127 coverage gap single-path notes"
+    )
+    await db_module.add_project_note(
+        db, p["id"], "Decoy", "completely unrelated content about billing"
+    )
+    result = await db_module.planning_search(
+        db, p["id"], "img127 coverage gap single-path BFS x=768 x=1511",
+        source_types=["note"],
+    )
+    titles = [r["title"] for r in result["results"]]
+    assert "Relevant" in titles
+    assert "Decoy" not in titles
+
+
+# --- stemming ----------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_stemming_sqlite_fts5(db):
+    """'authenticating' must find a row containing 'authentication' — real
+    linguistic stemming via SQLite FTS5's 'porter unicode61' tokenizer."""
+    p = await db_module.create_project(db, "ps-stem-fts5")
+    await db_module.add_project_note(
+        db, p["id"], "Auth note",
+        "authentication for the user is required before checkout",
+    )
+    result = await db_module.planning_search(
+        db, p["id"], "authenticating", source_types=["note"]
+    )
+    assert result["backend"] == "sqlite_fts5_bm25"
+    assert any(r["title"] == "Auth note" for r in result["results"])
+
+
+@pytest.mark.asyncio
+async def test_planning_search_stemming_sqlite_bm25_fallback(db, monkeypatch):
+    """Same stemming behavior must hold on the BM25-fallback tier (naive
+    stemmer) when the sqlite3 build lacks FTS5 — forced via monkeypatch."""
+    async def _unavailable(_db):
+        return False
+
+    monkeypatch.setattr(db_module, "_sqlite_fts5_available", _unavailable)
+    p = await db_module.create_project(db, "ps-stem-fallback")
+    await db_module.add_project_note(
+        db, p["id"], "Auth note",
+        "authentication for the user is required before checkout",
+    )
+    result = await db_module.planning_search(
+        db, p["id"], "authenticating", source_types=["note"]
+    )
+    assert result["backend"] == "sqlite_bm25_like_fallback"
+    assert any(r["title"] == "Auth note" for r in result["results"])
+
+
+def test_planning_search_naive_stem_helper():
+    """0dc5a35d — the fallback tier's naive stemmer bridges the specific
+    verb/noun-form pairs the search tests rely on."""
+    assert db_module._planning_naive_stem("authenticating") == db_module._planning_naive_stem(
+        "authentication"
+    )
+    assert db_module._planning_naive_stem("cats") == db_module._planning_naive_stem("cat")
+    # Short words are left alone (stem would be too short to be meaningful).
+    assert db_module._planning_naive_stem("is") == "is"
+
+
+# --- phrase behavior ---------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_phrase_match_sqlite_fts5(db):
+    """A quoted phrase requires the words CONTIGUOUS and in order; a note
+    with the same words scrambled must not match the phrase query."""
+    p = await db_module.create_project(db, "ps-phrase-fts5")
+    await db_module.add_project_note(
+        db, p["id"], "Contiguous", "single-path BFS misses a coverage gap around img127"
+    )
+    await db_module.add_project_note(
+        db, p["id"], "Scrambled", "gap coverage img127 out of phrase order decoy text"
+    )
+    result = await db_module.planning_search(
+        db, p["id"], '"coverage gap"', source_types=["note"]
+    )
+    titles = [r["title"] for r in result["results"]]
+    assert "Contiguous" in titles
+    assert "Scrambled" not in titles
+
+
+@pytest.mark.asyncio
+async def test_planning_search_phrase_match_sqlite_bm25_fallback(db, monkeypatch):
+    async def _unavailable(_db):
+        return False
+
+    monkeypatch.setattr(db_module, "_sqlite_fts5_available", _unavailable)
+    p = await db_module.create_project(db, "ps-phrase-fallback")
+    await db_module.add_project_note(
+        db, p["id"], "Contiguous", "single-path BFS misses a coverage gap around img127"
+    )
+    await db_module.add_project_note(
+        db, p["id"], "Scrambled", "gap coverage img127 out of phrase order decoy text"
+    )
+    result = await db_module.planning_search(
+        db, p["id"], '"coverage gap"', source_types=["note"]
+    )
+    assert result["backend"] == "sqlite_bm25_like_fallback"
+    titles = [r["title"] for r in result["results"]]
+    assert "Contiguous" in titles
+    assert "Scrambled" not in titles
+
+
+def test_planning_pg_tsquery_source_preserves_phrase_quotes():
+    """0dc5a35d — unlike _or_tsquery_source (search_all's helper, which
+    strips quotes and OR's every word individually), the planning_search
+    helper keeps a quoted phrase intact so websearch_to_tsquery treats it as
+    a FOLLOWED-BY phrase, not two independent OR'd words."""
+    src = db_module._planning_pg_tsquery_source('"coverage gap" single-path')
+    assert '"coverage gap"' in src
+    assert "single-path" in src
+    # Contrast with the OR-degradation helper search_all uses, which would
+    # have split the phrase into independently OR'd words.
+    assert db_module._or_tsquery_source('"coverage gap"') == "coverage or gap"
+
+
+# --- ranking stability / tie-break -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_ranks_more_complete_matches_first(anydb):
+    db = anydb
+    p = await db_module.create_project(db, "ps-rank")
+    await db_module.add_project_note(
+        db, p["id"], "more", "alpha beta gamma appear together here"
+    )
+    await db_module.add_project_note(
+        db, p["id"], "fewer", "alpha appears but not the others at all"
+    )
+    result = await db_module.planning_search(
+        db, p["id"], "alpha beta gamma", source_types=["note"]
+    )
+    titles = [r["title"] for r in result["results"]]
+    assert titles[:2] == ["more", "fewer"], f"expected the fuller match ranked first, got {titles}"
+
+
+@pytest.mark.asyncio
+async def test_planning_search_deterministic_order_across_repeated_calls(db):
+    """Identical queries against unchanged data must return results in the
+    EXACT same order every time — the stable tie-break contract."""
+    p = await db_module.create_project(db, "ps-stable")
+    for i in range(6):
+        await db_module.add_project_note(db, p["id"], f"Note {i}", "alpha shared term")
+    r1 = await db_module.planning_search(db, p["id"], "alpha", source_types=["note"])
+    r2 = await db_module.planning_search(db, p["id"], "alpha", source_types=["note"])
+    ids1 = [r["source_id"] for r in r1["results"]]
+    ids2 = [r["source_id"] for r in r2["results"]]
+    assert ids1 == ids2
+    assert len(ids1) == len(set(ids1)), "no duplicate rows within a single page"
+
+
+# --- empty / no-result queries ----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_empty_query_returns_no_results_no_error(db):
+    p = await db_module.create_project(db, "ps-empty")
+    await db_module.add_project_note(db, p["id"], "N", "alpha beta gamma")
+    result = await db_module.planning_search(db, p["id"], "")
+    assert result["results"] == []
+    assert result["total_matched"] == 0
+    assert result["has_more"] is False
+    assert result["next_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_planning_search_whitespace_only_query_returns_no_results(db):
+    p = await db_module.create_project(db, "ps-whitespace")
+    await db_module.add_project_note(db, p["id"], "N", "alpha beta gamma")
+    result = await db_module.planning_search(db, p["id"], "   ")
+    assert result["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_planning_search_unrelated_query_returns_no_results(anydb):
+    db = anydb
+    p = await db_module.create_project(db, "ps-unrelated")
+    await db_module.add_sprint_item(db, p["id"], "v1", "img127 coverage gap")
+    result = await db_module.planning_search(db, p["id"], "nonexistent zzzzz qqqqq")
+    assert result["total_matched"] == 0
+    assert result["results"] == []
+
+
+# --- project / version / tenant isolation ----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_project_isolation(db):
+    """A row that matches the query but belongs to a DIFFERENT project must
+    never appear — every source type is scoped by project_id (or, for
+    workspace_proposal, by tenant_id — see the tenant test below)."""
+    p1 = await db_module.create_project(db, "ps-iso-1")
+    p2 = await db_module.create_project(db, "ps-iso-2")
+    await db_module.add_project_note(db, p2["id"], "Other project note", "alpha shared secret")
+    result = await db_module.planning_search(db, p1["id"], "alpha", source_types=["note"])
+    assert result["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_planning_search_version_isolation(db):
+    """The version filter scopes sprint_items exactly — a match in a
+    DIFFERENT version must not leak into a version-filtered query."""
+    p = await db_module.create_project(db, "ps-version")
+    await db_module.add_sprint_item(db, p["id"], "v1", "alpha sprint item one")
+    await db_module.add_sprint_item(db, p["id"], "v2", "alpha sprint item two")
+    result = await db_module.planning_search(
+        db, p["id"], "alpha", source_types=["sprint_item"], version="v1"
+    )
+    titles = [r["title"] for r in result["results"]]
+    assert titles == ["alpha sprint item one"]
+
+
+@pytest.mark.asyncio
+async def test_planning_search_workspace_proposal_tenant_scoped_positive(db):
+    """workspace_proposal is workspace(tenant)-scoped, not project-scoped
+    (5c4dcc0f) — a proposal for the project's OWN resolved tenant IS found."""
+    p, tenant = await _make_tenant_scoped_project(db, "ps-tenant-pos", "owner@example.com")
+    await ws_module.add_workspace_proposal(
+        db, "Alpha proposal", "alpha idea body text", tenant_id=tenant["id"]
+    )
+    result = await db_module.planning_search(
+        db, p["id"], "alpha", source_types=["workspace_proposal"]
+    )
+    titles = [r["title"] for r in result["results"]]
+    assert "Alpha proposal" in titles
+    assert result["skipped_source_types"] == {}
+
+
+@pytest.mark.asyncio
+async def test_planning_search_workspace_proposal_cross_tenant_isolation(db):
+    """A proposal that belongs to a DIFFERENT tenant than the querying
+    project's own resolved tenant must never leak into the results."""
+    p, _own_tenant = await _make_tenant_scoped_project(db, "ps-tenant-self", "self@example.com")
+    other_tenant = await db_module.upsert_tenant(db, "other@example.com")
+    await ws_module.add_workspace_proposal(
+        db, "Other tenant proposal", "alpha idea body text", tenant_id=other_tenant["id"]
+    )
+    result = await db_module.planning_search(
+        db, p["id"], "alpha", source_types=["workspace_proposal"]
+    )
+    assert result["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_planning_search_workspace_proposal_skipped_when_no_tenant(db):
+    """A project with no resolvable tenant (self-hosted / no creator_human_id)
+    SKIPS workspace_proposal explicitly rather than erroring or guessing."""
+    p = await db_module.create_project(db, "ps-no-tenant")
+    result = await db_module.planning_search(
+        db, p["id"], "alpha", source_types=["workspace_proposal"]
+    )
+    assert result["results"] == []
+    assert "workspace_proposal" in result["skipped_source_types"]
+
+
+# --- status filter / type filter -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_decision_defaults_to_active_only(db):
+    """Matches search_all's/every other read path's convention: decisions
+    default to active-only unless status is explicitly given."""
+    p = await db_module.create_project(db, "ps-decision-status")
+    await db_module.pin_decision(db, p["id"], "Active decision alpha", "alpha body text")
+    archived = await db_module.pin_decision(db, p["id"], "Archived decision alpha", "alpha body")
+    await db_module.update_pinned_decision(db, archived["id"], status="superseded")
+
+    default_result = await db_module.planning_search(
+        db, p["id"], "alpha", source_types=["decision"]
+    )
+    assert [r["title"] for r in default_result["results"]] == ["Active decision alpha"]
+
+    explicit_result = await db_module.planning_search(
+        db, p["id"], "alpha", source_types=["decision"], status="superseded"
+    )
+    assert [r["title"] for r in explicit_result["results"]] == ["Archived decision alpha"]
+
+
+@pytest.mark.asyncio
+async def test_planning_search_source_type_filter_restricts_results(db):
+    p = await db_module.create_project(db, "ps-type-filter")
+    await db_module.add_project_note(db, p["id"], "Alpha note", "alpha shared term")
+    await db_module.add_sprint_item(db, p["id"], "v1", "alpha shared term sprint")
+    both = await db_module.planning_search(db, p["id"], "alpha")
+    assert {r["source_type"] for r in both["results"]} == {"note", "sprint_item"}
+
+    notes_only = await db_module.planning_search(
+        db, p["id"], "alpha", source_types=["note"]
+    )
+    assert {r["source_type"] for r in notes_only["results"]} == {"note"}
+
+
+@pytest.mark.asyncio
+async def test_planning_search_unknown_source_type_yields_empty_not_ignored(db):
+    """An explicit source_types filter that resolves to no known type is
+    honoured (zero results), not silently treated as 'search everything'."""
+    p = await db_module.create_project(db, "ps-bogus-type")
+    await db_module.add_project_note(db, p["id"], "Alpha note", "alpha shared term")
+    result = await db_module.planning_search(
+        db, p["id"], "alpha", source_types=["not_a_real_type"]
+    )
+    assert result["results"] == []
+    assert result["filters"]["source_types"] == []
+
+
+# --- findings source type ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_finding_source_type(db):
+    p = await db_module.create_project(db, "ps-finding")
+    await db_module.store_finding(
+        db, p["id"], "alpha finding content body", title="Alpha finding"
+    )
+    result = await db_module.planning_search(db, p["id"], "alpha", source_types=["finding"])
+    titles = [r["title"] for r in result["results"]]
+    assert "Alpha finding" in titles
+
+
+# --- pagination --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_pagination_covers_all_rows_no_dupes_no_gaps(db):
+    p = await db_module.create_project(db, "ps-page")
+    for i in range(5):
+        await db_module.add_project_note(db, p["id"], f"Note {i}", f"alpha beta gamma common {i}")
+
+    seen: "list[str]" = []
+    cursor = 0
+    pages = 0
+    while True:
+        result = await db_module.planning_search(
+            db, p["id"], "alpha beta gamma", source_types=["note"], limit=2, cursor=cursor
+        )
+        seen.extend(r["source_id"] for r in result["results"])
+        pages += 1
+        assert pages <= 10, "pagination did not terminate"
+        if not result["has_more"]:
+            assert result["next_cursor"] is None
+            break
+        cursor = result["next_cursor"]
+    assert len(seen) == len(set(seen)) == 5
+
+
+@pytest.mark.asyncio
+async def test_planning_search_cursor_matches_get_project_notes_page_contract(db):
+    """The pagination envelope mirrors get_project_notes_page's existing
+    cursor contract (has_more / next_cursor / integer offset cursor)."""
+    p = await db_module.create_project(db, "ps-page-contract")
+    for i in range(3):
+        await db_module.add_project_note(db, p["id"], f"Note {i}", "alpha term")
+    page1 = await db_module.planning_search(
+        db, p["id"], "alpha", source_types=["note"], limit=2, cursor=0
+    )
+    assert page1["has_more"] is True
+    assert page1["next_cursor"] == 2
+    page2 = await db_module.planning_search(
+        db, p["id"], "alpha", source_types=["note"], limit=2, cursor=page1["next_cursor"]
+    )
+    assert page2["has_more"] is False
+    assert page2["next_cursor"] is None
+    assert len(page1["results"]) + len(page2["results"]) == 3
+
+
+# --- SQLite / Postgres parity ----------------------------------------
+
+
+def test_planning_search_dialect_splits_on_is_pg():
+    """Static structural check (no live Postgres needed, mirrors
+    test_search_all_takes_pg_path_for_postgres_shaped_db): planning_search
+    forks on hasattr(db, '_pool') and the Postgres branch uses ts_rank /
+    websearch_to_tsquery while the SQLite branch uses the FTS5/BM25 helpers."""
+    import inspect
+
+    src = inspect.getsource(db_module.planning_search)
+    assert "_pool" in src
+    assert "_planning_pg_source_results" in src
+    assert "_planning_sqlite_source_results" in src
+
+
+@pytest.mark.asyncio
+async def test_planning_search_same_top_result_across_backends(anydb):
+    """Cross-backend parity: given the same corpus, both backends surface
+    the same best match as the #1 result (exact score formulas legitimately
+    differ — ts_rank vs. bm25 — but relevance ordering must agree on the
+    obvious case)."""
+    db = anydb
+    p = await db_module.create_project(db, "ps-parity")
+    await db_module.add_project_note(
+        db, p["id"], "more", "alpha beta gamma appear together repeatedly here"
+    )
+    await db_module.add_project_note(
+        db, p["id"], "fewer", "alpha appears but not the others at all"
+    )
+    result = await db_module.planning_search(
+        db, p["id"], "alpha beta gamma", source_types=["note"]
+    )
+    assert result["results"][0]["title"] == "more"
+
+
+@pytest.mark.asyncio
+async def test_planning_search_postgres_backend_label(db_pg):
+    """PG-only (auto-skips locally without TEST_DATABASE_URL): the backend
+    metadata correctly reports the Postgres tsvector/ts_rank path."""
+    p = await db_module.create_project(db_pg, "ps-pg-backend")
+    await db_module.add_project_note(db_pg, p["id"], "N", "alpha beta gamma")
+    result = await db_module.planning_search(db_pg, p["id"], "alpha", source_types=["note"])
+    assert result["backend"] == "postgres_tsvector_ts_rank"
+    assert result["freshness"]["index_type"] == "on_the_fly_tsvector"
+
+
+# --- stale-index / freshness metadata --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_freshness_metadata_always_fresh(db):
+    """Every backend here is computed fresh per call (on-the-fly tsvector on
+    PG, an ephemeral connection-local TEMP fts5 index or computed BM25 on
+    SQLite) — there is no persisted index that could go stale, so
+    freshness.stale is always False and generated_at is a real timestamp."""
+    p = await db_module.create_project(db, "ps-fresh")
+    await db_module.add_project_note(db, p["id"], "N", "alpha beta gamma")
+    result = await db_module.planning_search(db, p["id"], "alpha", source_types=["note"])
+    freshness = result["freshness"]
+    assert freshness["stale"] is False
+    assert freshness["generated_at"]
+    assert freshness["capped"] is False
+    assert freshness["capped_source_types"] == []
+    assert freshness["pool_cap"] == db_module._PLANNING_SEARCH_POOL_CAP
+
+
+@pytest.mark.asyncio
+async def test_planning_search_capped_pool_flagged_in_metadata(db, monkeypatch):
+    """When a source type's candidate pool exceeds the bounded cap, the
+    response explicitly flags it as capped (search_all's own 'never return
+    unbounded raw rows' constraint, made visible/inspectable here)."""
+    monkeypatch.setattr(db_module, "_PLANNING_SEARCH_POOL_CAP", 3)
+    p = await db_module.create_project(db, "ps-capped")
+    for i in range(6):
+        await db_module.add_project_note(db, p["id"], f"Note {i}", "alpha shared term")
+    result = await db_module.planning_search(
+        db, p["id"], "alpha", source_types=["note"], limit=100
+    )
+    assert result["freshness"]["capped"] is True
+    assert result["freshness"]["capped_source_types"] == ["note"]
+    assert result["total_matched"] == 3
+
+
+# --- backend selection & fallback plumbing ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_planning_search_backend_reflects_fts5_probe(db, monkeypatch):
+    async def _unavailable(_db):
+        return False
+
+    monkeypatch.setattr(db_module, "_sqlite_fts5_available", _unavailable)
+    p = await db_module.create_project(db, "ps-backend-fallback")
+    await db_module.add_project_note(db, p["id"], "N", "alpha beta gamma")
+    result = await db_module.planning_search(db, p["id"], "alpha", source_types=["note"])
+    assert result["backend"] == "sqlite_bm25_like_fallback"
+    assert result["freshness"]["index_type"] == "computed_bm25_over_candidate_pool"
+
+
+def test_sqlite_fts5_temp_table_never_persists_to_main_schema():
+    """0dc5a35d — the FTS5 index used by planning_search is a connection-
+    local TEMP table (never written to the actual database file), so this
+    feature needed no schema migration. Structural guard against a future
+    change accidentally promoting it to a persistent table."""
+    import inspect
+
+    src = inspect.getsource(db_module._planning_sqlite_fts5_rank)
+    assert "temp." in src, "the FTS5 virtual table must be created in the temp schema"
+    assert "CREATE VIRTUAL TABLE temp." in src
+
+
+# --- MCP handler --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_handle_planning_search_returns_planning_search_contract(db):
+    p = await db_module.create_project(db, "ps-handler")
+    await db_module.add_project_note(db, p["id"], "Handler note", "alpha beta content")
+    result = await st_mod.handle_planning_search(
+        {"project_id": p["id"], "query": "alpha beta", "source_types": ["note"]},
+        db, "/tmp", None, None,
+    )
+    assert result["results"]
+    assert result["results"][0]["title"] == "Handler note"
+
+
+@pytest.mark.asyncio
+async def test_handle_planning_search_requires_project_id(db):
+    result = await st_mod.handle_planning_search(
+        {"query": "alpha"}, db, "/tmp", None, None,
+    )
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_handle_planning_search_accepts_empty_query(db):
+    """An explicitly empty query string is a VALID call (zero results, no
+    error) — only a missing project_id/query key is rejected."""
+    p = await db_module.create_project(db, "ps-handler-empty")
+    result = await st_mod.handle_planning_search(
+        {"project_id": p["id"], "query": ""}, db, "/tmp", None, None,
+    )
+    assert "error" not in result
+    assert result["results"] == []

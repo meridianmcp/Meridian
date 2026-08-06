@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **158 tools** over MCP.
+Meridian exposes **159 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -463,6 +463,7 @@ Read-only: Generate a context handoff document. `mode='full'` writes the complet
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `mode` | string | optional |  |
 | `session_id` | string | optional | Optional session id for auto-delta on repeated calls in the same session. |
+| `root_dir` | string | optional | Optional request-local absolute source-tree root used by live pointer resolution's local semantic fallback when no code tunnel is available. Never persisted. |
 | `version` | string | optional | (b8f89491) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this handoff to — applies to every mode (full/delta/starter/compact/goal), not just starter. Wins over the calling session's own stored sprint_version. Omit to fall back to session_id's scope, or to the whole project's cross-version backlog when neither is set. |
 | `force_include_ids` | array | optional | (45f519a0, validated by 3cab355a) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming. Every id is validated: it must belong to this project, match the effective version scope (when one applies), and be genuinely todo/pending — an unknown/cross-project/cross-version/not-pending id is rejected (reported in the response's force_include_rejected list, never silently dropped) rather than honoured. Accepted ids are also exempt from the code-pointer enrichment cap, so a requested item always gets prospected regardless of how large the pending board is. |
 | `skip_ai_summary` | boolean | optional | 65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time. |
@@ -509,6 +510,28 @@ Bulk-insert sprint items in one call — lets an orchestrator LLM decompose a go
 **Example:**
 ```
 fan_out_sprint_items(project_id="abc-123", items=[{"title": "Design DB schema", "group": "backend"}, {"title": "Build API endpoints", "group": "backend"}, {"title": "Wire up frontend", "group": "frontend"}])
+```
+
+---
+
+
+### `execute_batch`
+Run a homogeneous batch of sprint-management writes (sprint item creates/updates, pointer creates, note creates) with real atomic-or-independent semantics: `mode='all_or_nothing'` validates every entry before mutating anything and rolls back everything already written if a later entry fails; `mode='best_effort'` processes each entry independently. Both `mode` and `idempotency_key` are REQUIRED on every call — a retried call with the same `(project_id, operation, idempotency_key)` replays the first call's result instead of re-executing. Every entry's outcome (`ok` | `error` | `rolled_back` | `not_attempted`) comes back in input order so a caller never has to guess whether a partial write happened. Also available over HTTP as `POST /projects/{project_id}/sprint-batch` with the identical request/response shape.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
+| `operation` | string | required | Stable operation name selecting the entry shape and forced per-entry action (sprint_items=create, item_updates=update). See the tool description for each shape. |
+| `entries` | array | required | Non-empty list of entry objects, ALL matching the chosen operation's shape. Each entry may carry an optional 'correlation_key' string echoed back on its result. |
+| `mode` | string | required | REQUIRED — no default. 'all_or_nothing': validate-then-mutate with compensating rollback on any mutation failure. 'best_effort': every entry processed independently. |
+| `idempotency_key` | string | required | REQUIRED key (value may be null or "" to explicitly opt out). A retried call with the same (project_id, operation, idempotency_key) replays the first call's stored result instead of re-executing. |
+| `session_id` | string | optional | Batch-level default session_id used by 'notes' entries that omit their own session_id. |
+| `max_entries` | integer | optional | Optional cap on len(entries) for this call (default 100). Exceeding it rejects the whole call before anything is attempted. |
+
+**Example:**
+```
+execute_batch(project_id="abc-123", operation="sprint_items", entries=[{"title": "Add rate limiting", "correlation_key": "a"}, {"title": "Add retry backoff", "correlation_key": "b"}], mode="all_or_nothing", idempotency_key="my-2026-08-05-batch-1")
 ```
 
 ---

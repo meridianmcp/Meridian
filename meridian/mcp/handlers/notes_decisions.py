@@ -28,6 +28,11 @@ from typing import Any
 import meridian.server as _server
 from meridian import db as db_module
 from meridian._deps import validate_input_size, _MANUAL_NOTE_LINT
+# 867317f6 — not re-exported through meridian.db's explicit named import
+# list (meridian/db/__init__.py is a high-contention file outside this
+# sprint item's declared scope), so import the new proposal error type
+# directly from the submodule that defines it.
+from meridian.db.workspace import ProposalSchemaError
 
 
 def _hosted_mode() -> bool:
@@ -2225,15 +2230,25 @@ async def handle_add_workspace_proposal(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: add_workspace_proposal (5c4dcc0f — workspace proposals lifecycle)."""
+    """MCP tool: add_workspace_proposal (5c4dcc0f — workspace proposals lifecycle).
+
+    867317f6 — accepts an optional ``idempotency_key`` so a caller that
+    retries after a network blip (or an ambiguous timeout) doesn't create a
+    second proposal for the same intent; a schema-mid-migration failure on
+    this backend comes back as a deterministic ``{"error": ...}`` instead of
+    an unhandled exception."""
     validate_input_size(args.get("title"), "proposal title", 500)
     validate_input_size(args.get("body"), "proposal body", 100_000)
-    return await db_module.add_workspace_proposal(
-        db, args["title"], args["body"],
-        tags=args.get("tags"),
-        tenant_id=_mcp_tenant_id,
-        family_id=args.get("family_id"),
-    )
+    try:
+        return await db_module.add_workspace_proposal(
+            db, args["title"], args["body"],
+            tags=args.get("tags"),
+            tenant_id=_mcp_tenant_id,
+            family_id=args.get("family_id"),
+            idempotency_key=args.get("idempotency_key"),
+        )
+    except ProposalSchemaError as exc:
+        return {"error": str(exc)}
 
 
 async def handle_get_workspace_proposals(
@@ -2267,7 +2282,11 @@ async def handle_advance_proposal_status(
             db, args["proposal_id"], args["status"],
             tenant_id=_mcp_tenant_id,
         )
-    except ValueError as exc:
+    except (ValueError, ProposalSchemaError) as exc:
+        # ValueError covers both an invalid target status and 867317f6's
+        # lost-transition-race case; ProposalSchemaError covers a
+        # mid-migration schema on this backend. Both are deterministic,
+        # actionable {"error": ...} responses rather than a raw exception.
         return {"error": str(exc)}
     return result or {"error": "proposal not found"}
 
@@ -2293,6 +2312,10 @@ async def handle_promote_proposal(
             infer_touches_resources=args.get("infer_touches_resources", False),
             file_github_issue=args.get("file_github_issue", False),
         )
-    except ValueError as exc:
+    except (ValueError, ProposalSchemaError) as exc:
+        # ValueError covers not-found/wrong-state and 867317f6's lost
+        # double-promotion race; ProposalSchemaError covers a mid-migration
+        # schema on this backend. Both come back deterministically instead
+        # of an unhandled exception or a silently-duplicated sprint item.
         return {"error": str(exc)}
     return result

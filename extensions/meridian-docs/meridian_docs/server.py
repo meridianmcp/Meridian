@@ -40,10 +40,37 @@ mcp = FastMCP("meridian-docs")
 
 
 @mcp.tool()
-def document_outline(path: str) -> dict[str, Any]:
+def document_outline(
+    path: str,
+    page_size: int | None = None,
+    cursor: str | None = None,
+    section_anchor: str | None = None,
+) -> dict[str, Any]:
     """Heading outline of a .docx: paragraph_count, heading_count, and an ordered
-    list of headings (level, text, para_id). Stateless — builds no index."""
-    return docs_intel.document_outline(path)
+    list of headings (level, text, para_id, index, section_type). Stateless —
+    builds no index. Every response includes document_fingerprint.
+
+    1dff1300 — cursor-based pagination + section scoping, so a large
+    document's outline can never silently truncate or exceed a token
+    budget. Omitting page_size and cursor (the default) returns the full
+    outline, unchanged from before.
+
+    Pass page_size (no cursor) for the first page: at most page_size
+    headings, plus cursor (opaque token for the next page, or None when
+    this is the last page), has_more, and total. Pass cursor (from a prior
+    call) for the next page. section_anchor (a heading's para_id or exact
+    heading text) scopes the outline to just that heading's own subsection
+    (itself + nested sub-headings + their body).
+
+    A cursor whose embedded fingerprint no longer matches the document's
+    current content, or whose section_anchor doesn't match this call's, or
+    that is malformed, is rejected: {"error": ..., "reason":
+    "stale_cursor" | "invalid_cursor"}. An unresolvable section_anchor
+    returns {"error": ..., "reason": "section_not_found"}.
+    """
+    return docs_intel.document_outline(
+        path, page_size=page_size, cursor=cursor, section_anchor=section_anchor
+    )
 
 
 @mcp.tool()
@@ -199,7 +226,13 @@ def highlight_document(
     )
 
 @mcp.tool()
-def read_document_snapshot(docx_path: str) -> dict[str, Any]:
+def read_document_snapshot(
+    docx_path: str,
+    page_size: int | None = None,
+    cursor: str | None = None,
+    section_anchor: str | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
     """Read the last saved DOCX snapshot without writing or requiring a close.
 
     c7cc9da4 -- the entry point for a Meridian-docs review session: never
@@ -210,10 +243,26 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
     before promoting any later draft/overlay, so a promotion never lands
     against content the review never actually saw -- plus an explicit
     ``limitations`` list spelling out both caveats for a caller that
-    forwards this snapshot into a recommendation or report. See
+    forwards this snapshot into a recommendation or report.
+
+    1dff1300 — cursor-based pagination + section scoping (same contract as
+    document_outline — see its docstring) so a large document's snapshot
+    can never silently truncate or exceed a token budget. Omitting
+    page_size and cursor (the default) returns the full paragraph list,
+    unchanged from before. Each paginated paragraph carries section_path
+    and heading_para_id. index_db_path, when given, attaches stale_index
+    (the structural sidecar's freshness) plus whole-document tables/
+    figures identity and page-scoped equations identity already recorded
+    there, best-effort — never blocks on a missing/stale sidecar. See
     ``docs_intel.read_document_snapshot`` for the full contract.
     """
-    return docs_intel.read_document_snapshot(docx_path)
+    return docs_intel.read_document_snapshot(
+        docx_path,
+        page_size=page_size,
+        cursor=cursor,
+        section_anchor=section_anchor,
+        index_db_path=index_db_path,
+    )
 
 
 @mcp.tool()
@@ -2063,6 +2112,196 @@ def relocate_table(
         allow_bookmark_split=allow_bookmark_split,
         draft_output_path=draft_output_path,
         wave_run_id=wave_run_id,
+    )
+
+
+@mcp.tool()
+def insert_column(
+    docx_path: str,
+    table_index: int,
+    col_index: int,
+    position: str = "before",
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """a2cd9f54 — Insert a new, empty grid column into an existing table.
+
+    col_index addresses an existing GRID column (0-based); position
+    ("before", default, or "after") says which side of it the new column
+    lands on. For each row: if the insertion point falls strictly inside an
+    existing horizontally-merged cell's span, that cell's w:gridSpan is
+    incremented (the new column joins the merge) — otherwise a brand-new,
+    empty cell is spliced in. w:tblGrid always gets exactly one new
+    w:gridCol.
+
+    Refuses (file untouched) with reason="ambiguous_grid" when the table's
+    rows do not consistently account for its declared grid-column count.
+
+    Mandatory post-write structural verification + a real Word/COM (or
+    LibreOffice) render-capability check both run before this reports
+    success — see allow_degraded_render / degraded_render_reason (same
+    audited-opt-in contract as insert_caption).
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      table_index:      0-based body-child position of the <w:tbl> (same
+                        addressing as relocate_table).
+      col_index:        0-based existing grid-column index to insert
+                        relative to.
+      position:         "before" (default) or "after" col_index.
+      index_db_path:    If supplied, sidecar is invalidated after write.
+      allow_degraded_render: Explicit, audited opt-in to accept this write
+                        when no render backend is available. Requires
+                        degraded_render_reason.
+      degraded_render_reason: Required, non-empty when
+                        allow_degraded_render is True.
+      session_id:       273df573 — identifies the calling Meridian session
+                        to the tunnel-layer DOCX region-claim guard. Not
+                        forwarded to docs_intel.
+
+    Returns:
+      {status, table_index, col_index, position, grid_col_count, row_count,
+      col_count, docx_path, render_status, render_verified, render_backend,
+      render_detail} or {error: <message>} (with "reason" one of
+      "ambiguous_grid" when applicable) on failure.
+    """
+    return docs_intel.insert_column(
+        docx_path=docx_path,
+        table_index=table_index,
+        col_index=col_index,
+        position=position,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
+def split_cell(
+    docx_path: str,
+    table_index: int,
+    row_index: int,
+    col_index: int,
+    cols: int = 1,
+    rows: int = 1,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """a2cd9f54 — Split one table cell into `cols` columns and/or `rows` rows.
+
+    row_index is a 0-based <w:tr> index; col_index is the target cell's
+    STARTING grid column. Refuses (file untouched) with
+    reason="unsupported_merge" when the target cell already has
+    w:gridSpan > 1 or any w:vMerge — splitting an already-merged cell is not
+    attempted. Also refuses with reason="ambiguous_grid" (cols > 1 only)
+    under the same inconsistent-table condition insert_column checks.
+
+    Column split (cols > 1): the target cell is replaced by `cols`
+    brand-new, independent cells; every OTHER row is widened by cols - 1
+    grid columns via the same engine insert_column uses, so the whole table
+    stays grid-consistent.
+
+    Row split (rows > 1): rows - 1 brand-new <w:tr> are inserted immediately
+    after the target row. The split cell's own column(s) get independent
+    new content in each new row; every OTHER cell in the target row grows a
+    w:vMerge spanning the new rows so the table stays visually rectangular.
+
+    Mandatory post-write structural verification + a real render-capability
+    check both run before this reports success — see allow_degraded_render.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      table_index:     0-based body-child position of the <w:tbl>.
+      row_index:       0-based <w:tr> index of the target cell.
+      col_index:       Target cell's starting grid column.
+      cols:            Number of columns to split into (default 1 = no
+                       column split).
+      rows:            Number of rows to split into (default 1 = no row
+                       split). At least one of cols/rows must be > 1.
+      index_db_path:   If supplied, sidecar is invalidated after write.
+      allow_degraded_render: Same audited opt-in as insert_column.
+      degraded_render_reason: Required, non-empty when
+                       allow_degraded_render is True.
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard. Not
+                       forwarded to docs_intel.
+
+    Returns:
+      {status, table_index, row_index, col_index, cols, rows, row_count,
+      col_count, docx_path, render_status, render_verified, render_backend,
+      render_detail} or {error: <message>} (with "reason" one of
+      "unsupported_merge" / "ambiguous_grid" when applicable) on failure.
+    """
+    return docs_intel.split_cell(
+        docx_path=docx_path,
+        table_index=table_index,
+        row_index=row_index,
+        col_index=col_index,
+        cols=cols,
+        rows=rows,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
+def transpose_table(
+    docx_path: str,
+    table_index: int,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """a2cd9f54 — Transpose a table's rows and columns in place.
+
+    Supported ONLY for a fully rectangular table with NO w:gridSpan > 1 and
+    NO w:vMerge anywhere — refuses with reason="unsupported_merge"
+    otherwise (a horizontally-merged cell has no single canonical
+    vertically-merged equivalent). Also refuses with reason="ambiguous_grid"
+    if the table's rows do not all have the same cell count.
+
+    Reuses the SAME <w:tc> element objects (never deep-copied), only
+    repositioning them — every relationship id, bookmark, numbering
+    reference, and run of formatted text inside a cell survives verbatim.
+
+    Row heights and column widths have no canonical semantic mapping under
+    a transpose: the new w:tblGrid falls back to the table's original total
+    width divided evenly across the new column count — a documented,
+    honest default. w:trPr (e.g. explicit row heights) is intentionally
+    dropped from the new rows for the same reason.
+
+    Mandatory post-write structural verification + a real render-capability
+    check both run before this reports success — see allow_degraded_render.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      table_index:      0-based body-child position of the <w:tbl>.
+      index_db_path:    If supplied, sidecar is invalidated after write.
+      allow_degraded_render: Same audited opt-in as insert_column.
+      degraded_render_reason: Required, non-empty when
+                        allow_degraded_render is True.
+      session_id:       273df573 — identifies the calling Meridian session
+                        to the tunnel-layer DOCX region-claim guard. Not
+                        forwarded to docs_intel.
+
+    Returns:
+      {status, table_index, row_count, col_count, docx_path, render_status,
+      render_verified, render_backend, render_detail} or {error: <message>}
+      (with "reason" one of "unsupported_merge" / "ambiguous_grid" when
+      applicable) on failure.
+    """
+    return docs_intel.transpose_table(
+        docx_path=docx_path,
+        table_index=table_index,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
     )
 
 

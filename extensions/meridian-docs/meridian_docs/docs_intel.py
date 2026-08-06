@@ -36,6 +36,7 @@ synthetic in-memory .docx (see tests/test_docs_intel.py).
 """
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import io
@@ -381,7 +382,234 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     return paragraphs
 
 
-def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# 1dff1300 -- cursor-based pagination + section scoping shared by
+# document_outline and read_document_snapshot, so neither can silently
+# truncate or exceed a caller's token budget on a large document.
+#
+# The cursor is a small, opaque, self-contained (not server-side-stateful)
+# token: base64(json({v, kind, fp, off, ps, sa})). It is NOT a security
+# boundary (no signing/HMAC -- there is no secret key material anywhere in
+# this stdlib-only, DB-free extension to sign with), only a structural/
+# freshness guard: malformed input or a fingerprint mismatch (the document
+# changed between page requests) is rejected with a clear, explicit reason
+# rather than silently served against stale or fabricated data.
+# ---------------------------------------------------------------------------
+
+_PAGE_CURSOR_VERSION = 1
+
+
+def _encode_page_cursor(
+    *, kind: str, fingerprint: str, offset: int, page_size: int, section_anchor: str | None
+) -> str:
+    payload = {
+        "v": _PAGE_CURSOR_VERSION,
+        "kind": kind,
+        "fp": fingerprint,
+        "off": offset,
+        "ps": page_size,
+        "sa": section_anchor,
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_page_cursor(cursor: str, *, kind: str) -> dict[str, Any] | None:
+    """Decode and structurally validate a page cursor previously minted by
+    :func:`_encode_page_cursor`. Returns ``None`` (never raises) for
+    anything malformed, tampered with, or issued for a different ``kind``
+    (an outline cursor can never be replayed against read_document_snapshot,
+    or vice versa) -- callers turn a ``None`` into a clear, explicit
+    ``"invalid_cursor"`` error rather than a stack trace."""
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("v") != _PAGE_CURSOR_VERSION or payload.get("kind") != kind:
+        return None
+    if not isinstance(payload.get("fp"), str) or not payload["fp"]:
+        return None
+    off = payload.get("off")
+    if not isinstance(off, int) or isinstance(off, bool) or off < 0:
+        return None
+    ps = payload.get("ps")
+    if not isinstance(ps, int) or isinstance(ps, bool) or ps <= 0:
+        return None
+    sa = payload.get("sa")
+    if sa is not None and not isinstance(sa, str):
+        return None
+    return payload
+
+
+def _resolve_pagination_window(
+    *,
+    kind: str,
+    fingerprint: str,
+    total_items: int,
+    page_size: int | None,
+    cursor: str | None,
+    section_anchor: str | None,
+) -> tuple[int, int, None] | tuple[None, None, dict[str, Any]]:
+    """Resolve the ``(offset, page_size)`` window a pagination call should
+    return, validating a caller-supplied ``cursor`` against the CURRENT
+    ``fingerprint``/``section_anchor``. Only called once the caller has
+    already established this IS a paginating call (``page_size is not None
+    or cursor is not None``).
+
+    Returns ``(offset, page_size, None)`` on success, or
+    ``(None, None, error)`` with a clear, explicit ``error["reason"]`` (one
+    of ``"invalid_cursor"``, ``"stale_cursor"``, ``"invalid_page_size"``) on
+    any rejection -- never silently served against stale/mismatched data.
+    """
+    if cursor is not None:
+        decoded = _decode_page_cursor(cursor, kind=kind)
+        if decoded is None:
+            return None, None, {
+                "error": "cursor is malformed, tampered with, or was not issued by this function",
+                "reason": "invalid_cursor",
+            }
+        if decoded["fp"] != fingerprint:
+            return None, None, {
+                "error": (
+                    "cursor is stale: the document's content has changed "
+                    "since this cursor was issued -- restart pagination "
+                    "with page_size (no cursor) to get a fresh sequence"
+                ),
+                "reason": "stale_cursor",
+            }
+        if (decoded.get("sa") or None) != (section_anchor or None):
+            return None, None, {
+                "error": (
+                    "cursor was issued for a different section_anchor than "
+                    "the one passed to this call"
+                ),
+                "reason": "invalid_cursor",
+            }
+        offset = decoded["off"]
+        resolved_page_size = page_size if page_size is not None else decoded["ps"]
+        if not isinstance(resolved_page_size, int) or isinstance(resolved_page_size, bool) or resolved_page_size <= 0:
+            return None, None, {
+                "error": f"page_size must be a positive int, got {resolved_page_size!r}",
+                "reason": "invalid_page_size",
+            }
+        if offset > total_items:
+            return None, None, {
+                "error": (
+                    f"cursor offset {offset} is beyond the current item "
+                    f"count ({total_items}) for this fingerprint -- the "
+                    "cursor is stale"
+                ),
+                "reason": "stale_cursor",
+            }
+        return offset, resolved_page_size, None
+
+    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size <= 0:
+        return None, None, {
+            "error": f"page_size must be a positive int, got {page_size!r}",
+            "reason": "invalid_page_size",
+        }
+    return 0, page_size, None
+
+
+def _paginated_page_result(
+    offset: int,
+    page_size: int,
+    total_items: int,
+    *,
+    kind: str,
+    fingerprint: str,
+    section_anchor: str | None,
+) -> tuple[int, int, str | None, bool]:
+    """Compute ``(page_start, page_end, next_cursor, has_more)`` for an
+    already-resolved ``(offset, page_size)`` pagination window."""
+    page_end = min(offset + page_size, total_items)
+    has_more = page_end < total_items
+    next_cursor = (
+        _encode_page_cursor(
+            kind=kind, fingerprint=fingerprint, offset=page_end,
+            page_size=page_size, section_anchor=section_anchor,
+        )
+        if has_more else None
+    )
+    return offset, page_end, next_cursor, has_more
+
+
+def _resolve_section_anchor_bounds(
+    paras: list[dict[str, Any]], anchor: str
+) -> tuple[int, int] | None:
+    """Resolve ``anchor`` (a heading's ``para_id``, or its exact heading
+    text) against ``paras`` (:func:`parse_docx`'s flat paragraph list) to a
+    ``[start, end)`` PARAGRAPH-INDEX range covering that heading's own
+    paragraph plus its entire subsection (nested sub-headings and their
+    body) -- the same "whole section, not just the heading line" semantics
+    :func:`move_section` / :func:`copy_section` / :func:`relocate_table`
+    already use via :func:`_locate_section_bounds`, resolved here against the
+    flat paragraph list instead of the raw XML body (this module's other
+    section-bounds helper needs a live ``ET.Element`` body; document_outline
+    and read_document_snapshot only ever have :func:`parse_docx`'s output).
+
+    Returns ``None`` when ``anchor`` does not resolve to any heading.
+    """
+    heading_positions = [
+        (i, _heading_level(p.get("style")))
+        for i, p in enumerate(paras)
+        if _is_heading(p.get("style"))
+    ]
+    target_pos = next(
+        (
+            pos
+            for pos, (idx, _level) in enumerate(heading_positions)
+            if paras[idx].get("para_id") == anchor or paras[idx].get("text") == anchor
+        ),
+        None,
+    )
+    if target_pos is None:
+        return None
+    start_idx, target_level = heading_positions[target_pos]
+    end_idx = len(paras)
+    for idx, level in heading_positions[target_pos + 1 :]:
+        if level <= target_level:
+            end_idx = idx
+            break
+    return start_idx, end_idx
+
+
+def _annotate_section_paths(paras: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a NEW list of paragraph dicts (shallow copies), each carrying
+    a ``section_path`` (ancestor heading texts, root first -- ``[]`` for
+    content before the first heading; a heading paragraph's own text is the
+    LAST entry of its own ``section_path``) and ``heading_para_id`` (the
+    innermost ancestor heading's ``para_id``, ``None`` before the first
+    heading). Mirrors the same heading-stack walk :func:`_build_chunks_from_paras`
+    uses for chunk boundaries, applied per-paragraph instead of per-chunk.
+    """
+    heading_stack: list[dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
+    for p in paras:
+        style = p.get("style")
+        if _is_heading(style):
+            lvl = _heading_level(style)
+            while heading_stack and heading_stack[-1]["level"] >= lvl:
+                heading_stack.pop()
+            heading_stack.append(
+                {"level": lvl, "text": p.get("text", ""), "para_id": p.get("para_id")}
+            )
+        section_path = [h["text"] for h in heading_stack]
+        heading_para_id = heading_stack[-1]["para_id"] if heading_stack else None
+        out.append({**p, "section_path": section_path, "heading_para_id": heading_para_id})
+    return out
+
+
+def document_outline(
+    source: str | bytes | bytearray,
+    *,
+    page_size: int | None = None,
+    cursor: str | None = None,
+    section_anchor: str | None = None,
+) -> dict[str, Any]:
     """13462df2 — stateless heading outline of a .docx (path or raw bytes). No
     sidecar index: a pure parse. Returns ``paragraph_count`` + ``heading_count``
     + an ordered ``headings`` list (level/text/para_id/section_type) — the
@@ -391,15 +619,74 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
     4a07e566 — each heading now carries a ``section_type`` field
     (abstract/toc/lof/main/appendix) classifying the document region it belongs
     to. The ``section_regions`` key summarises the distinct regions in order.
+
+    1dff1300 — cursor-based pagination + section scoping, so a large
+    document's outline can never silently truncate or exceed a caller's
+    token budget:
+
+      - Every call (paginated or not) now includes ``document_fingerprint``
+        (SHA-256 of the exact source bytes just parsed -- see
+        :func:`_source_fingerprint`) — the identity a returned ``cursor`` is
+        bound to. Each heading also now carries its ``index`` (position in
+        :func:`parse_docx`'s paragraph list -- deterministic document
+        order, stable across calls on unchanged content).
+      - Pass ``page_size`` (no ``cursor``) for the FIRST page: at most
+        ``page_size`` headings, plus ``cursor`` (an opaque token for the
+        NEXT page, or ``None`` when this is the last page), ``has_more``,
+        and ``total`` (the true heading count, after ``section_anchor``
+        scoping if given).
+      - Pass ``cursor`` (from a prior call) for the NEXT page. Its
+        ``page_size``/``section_anchor`` are remembered from the call that
+        minted it unless explicitly overridden.
+      - ``section_anchor`` (a heading's ``para_id`` or exact heading text)
+        scopes the outline to just that heading's own subsection (itself +
+        nested sub-headings + their body) — the same "whole section" bounds
+        :func:`move_section` / :func:`copy_section` use.
+      - A cursor whose embedded fingerprint no longer matches the
+        document's CURRENT content (it changed between page requests), or
+        whose embedded ``section_anchor`` doesn't match this call's, or
+        that is simply malformed, is rejected with a clear
+        ``{"error": ..., "reason": "stale_cursor" | "invalid_cursor"}`` —
+        never silently served against stale/mismatched data.
+      - Omitting BOTH ``page_size`` and ``cursor`` (the default) returns
+        the ENTIRE outline exactly as before this item — fully backward
+        compatible; ``document_fingerprint`` (and each heading's ``index``)
+        are the only new fields added to that response shape.
+
+    Returns:
+      Non-paginated (default): ``{paragraph_count, heading_count, headings,
+      section_regions, document_fingerprint}``.
+      Paginated: adds ``{cursor, has_more, total, section_anchor}`` —
+      ``headings``/``paragraph_count``/``heading_count`` reflect just the
+      current page / section scope, ``total`` is the true (post-scoping)
+      heading count.
+      ``{"error": ..., "reason": ...}`` on an invalid cursor/page_size
+      (``reason`` one of ``"invalid_cursor"``, ``"stale_cursor"``,
+      ``"invalid_page_size"``) or an unresolvable ``section_anchor``
+      (``reason="section_not_found"``) — never a partial/misleading page.
     """
     paras = parse_docx(source)
+    fingerprint = _source_fingerprint(source)
+
+    scoped_paras = paras
+    if section_anchor is not None:
+        bounds = _resolve_section_anchor_bounds(paras, section_anchor)
+        if bounds is None:
+            return {
+                "error": f"section_anchor {section_anchor!r} does not resolve to any heading",
+                "reason": "section_not_found",
+            }
+        start_idx, end_idx = bounds
+        scoped_paras = paras[start_idx:end_idx]
+
     raw_headings = [
         {
+            "index": p.get("index"),
             "level": _heading_level(p.get("style")),
             "text": p.get("text", ""),
             "para_id": p.get("para_id"),
         }
-        for p in paras
+        for p in scoped_paras
         if _is_heading(p.get("style"))
     ]
     headings = _assign_section_types(raw_headings)
@@ -411,11 +698,42 @@ def document_outline(source: str | bytes | bytearray) -> dict[str, Any]:
         if not seen_regions or seen_regions[-1] != r:
             seen_regions.append(r)
 
+    if page_size is None and cursor is None:
+        return {
+            "paragraph_count": len(scoped_paras),
+            "heading_count": len(headings),
+            "headings": headings,
+            "section_regions": seen_regions,
+            "document_fingerprint": fingerprint,
+        }
+
+    offset, resolved_page_size, error = _resolve_pagination_window(
+        kind="outline",
+        fingerprint=fingerprint,
+        total_items=len(headings),
+        page_size=page_size,
+        cursor=cursor,
+        section_anchor=section_anchor,
+    )
+    if error is not None:
+        return error
+
+    page_start, page_end, next_cursor, has_more = _paginated_page_result(
+        offset, resolved_page_size, len(headings),
+        kind="outline", fingerprint=fingerprint, section_anchor=section_anchor,
+    )
+    page_headings = headings[page_start:page_end]
+
     return {
-        "paragraph_count": len(paras),
-        "heading_count": len(headings),
-        "headings": headings,
+        "paragraph_count": len(scoped_paras),
+        "heading_count": len(page_headings),
+        "headings": page_headings,
         "section_regions": seen_regions,
+        "document_fingerprint": fingerprint,
+        "cursor": next_cursor,
+        "has_more": has_more,
+        "total": len(headings),
+        "section_anchor": section_anchor,
     }
 
 
@@ -11995,6 +12313,1096 @@ def relocate_table(
 
 
 # ---------------------------------------------------------------------------
+# a2cd9f54 -- safe structural table edit primitives: insert_column,
+# split_cell, transpose_table.
+#
+# Word's native table model represents a "column" only implicitly, through
+# w:tblGrid (the column-boundary ruler) plus each row's own w:tc children,
+# whose horizontal extent is governed by w:gridSpan (default 1, meaning "no
+# horizontal merge") and whose VERTICAL continuation is governed by
+# w:vMerge ("restart" starts a merge group, an unadorned/"continue" value
+# extends it). There is no single authoritative "cell (row, col)" address
+# the format hands you directly -- every primitive below derives it by
+# walking a row and accumulating gridSpan (see _row_cell_spans).
+#
+# Scope (explicit, matching this item's "explicit ambiguity and
+# unsupported-merge failures" requirement rather than a general-purpose
+# merge-aware rewrite of arbitrary table geometry):
+#
+#   * insert_column -- supported for ANY table, including ones that already
+#     contain gridSpan/vMerge, AS LONG AS every row's cells consistently
+#     account for the table's declared grid-column count (a genuinely
+#     malformed/ambiguous table is refused with reason="ambiguous_grid").
+#     For each row, the insertion point either (a) lands strictly INSIDE an
+#     existing horizontally-merged cell's span -- its gridSpan is simply
+#     incremented, so the new column becomes part of that merge, matching
+#     what Word itself does when you insert a column through a merged
+#     region -- or (b) lands on a cell boundary -- a brand-new, empty cell
+#     is spliced in for that row.
+#   * split_cell -- supported for the TARGET cell only when it has no
+#     gridSpan>1 and no w:vMerge of its own (neither "restart" nor
+#     "continue"); a target that is already merged is refused with
+#     reason="unsupported_merge" rather than guessing how a split should
+#     interact with an existing merge. A column-split (cols>1) reuses the
+#     exact same grid-widening engine insert_column uses (applied cols-1
+#     times) so every OTHER row in the table stays grid-consistent. A
+#     row-split (rows>1) inserts brand-new <w:tr> rows immediately after the
+#     target row: the split cell's own column(s) get independent new
+#     content in each new row, while every OTHER cell in the target row
+#     grows a w:vMerge spanning the new rows so the table stays visually
+#     rectangular.
+#   * transpose_table -- supported ONLY for a fully rectangular table with
+#     NO gridSpan>1 and NO w:vMerge anywhere (every row has exactly the same
+#     number of plain, unmerged cells). Any merged cell makes the correct
+#     transposed merge geometry genuinely ambiguous (a horizontal merge does
+#     not have one canonical vertical-merge equivalent), so this refuses
+#     rather than risk silently producing a wrong table --
+#     reason="unsupported_merge". Row heights and column widths also have no
+#     canonical semantic mapping under a transpose; the new w:tblGrid falls
+#     back to the table's original total width divided evenly across the
+#     new column count -- an honest, documented default, not a fabricated
+#     precise one.
+#
+# Every write goes through the SAME disposable-copy, byte/zip/XML-integrity
+# pipeline the rest of this module uses (_load_docx_xml_stdlib /
+# _save_docx_xml_stdlib / _atomic_write_docx_bytes / _verify_docx_write /
+# _enforce_render_verification) via the shared _write_table_mutation tail
+# below -- never a whole-document native rewrite. Because every mutation
+# repositions or clones the SAME live ET.Element cell objects (never
+# re-serializes cell content from scratch), everything already inside a
+# cell -- paragraph styles, numbering references, bookmarks, run formatting,
+# relationship ids (images, hyperlinks) -- survives verbatim. Brand-new
+# cells get exactly one fresh, empty <w:p> with its own newly-minted,
+# document-unique w14:paraId (see _existing_para_ids / _new_para_id).
+#
+# Known, documented scope limitation: unlike move_section / copy_section /
+# relocate_table, these three primitives do not (yet) support the
+# draft_output_path / wave_run_id isolated-draft mode -- they always mutate
+# docx_path in place. Adding draft-mode support is a mechanical follow-up
+# (thread the same _resolve_draft_dest call these other primitives use),
+# not attempted here to keep this item's surface reviewable.
+# ---------------------------------------------------------------------------
+
+_W_TBL = _q(_W, "tbl")
+_W_TR = _q(_W, "tr")
+_W_TC = _q(_W, "tc")
+_W_TBLGRID = _q(_W, "tblGrid")
+_W_GRIDCOL = _q(_W, "gridCol")
+_W_TCPR = _q(_W, "tcPr")
+_W_TCW = _q(_W, "tcW")
+_W_GRIDSPAN = _q(_W, "gridSpan")
+_W_VMERGE = _q(_W, "vMerge")
+
+# CT_TcPr's fixed child-element sequence (ECMA-376 Part 1, SS17.4.70) -- used
+# to insert a NEW gridSpan/vMerge element at a schema-valid position rather
+# than blindly appending, which could produce an XML document Word rejects.
+_TCPR_CHILD_ORDER = (
+    "cnfStyle", "tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd",
+    "noWrap", "tcMar", "textDirection", "tcFitText", "vAlign", "hideMark",
+    "cellIns", "cellDel", "cellMerge",
+)
+
+
+def _resolve_table_element(
+    body: ET.Element, table_index: Any
+) -> tuple[ET.Element, None] | tuple[None, dict[str, Any]]:
+    """Validate ``table_index`` against ``body`` and return ``(tbl, None)``
+    on success or ``(None, error_dict)`` -- the same 0-based body-child
+    addressing scheme :func:`relocate_table` uses."""
+    body_list = list(body)
+    if not isinstance(table_index, int) or isinstance(table_index, bool) or table_index < 0:
+        return None, {"error": f"table_index must be a non-negative int, got {table_index!r}"}
+    if table_index >= len(body_list):
+        return None, {
+            "error": (
+                f"table_index {table_index} out of range -- document body has "
+                f"{len(body_list)} top-level children"
+            )
+        }
+    target_el = body_list[table_index]
+    if target_el.tag != _W_TBL:
+        found_tag = target_el.tag.rsplit("}", 1)[-1]
+        return None, {
+            "error": f"body child at index {table_index} is not a <w:tbl> (found <{found_tag}>)"
+        }
+    return target_el, None
+
+
+def _table_rows(tbl: ET.Element) -> list[ET.Element]:
+    return list(tbl.findall(_W_TR))
+
+
+def _cell_grid_span(tc: ET.Element) -> int:
+    tcPr = tc.find(_W_TCPR)
+    if tcPr is None:
+        return 1
+    gridSpan = tcPr.find(_W_GRIDSPAN)
+    if gridSpan is None:
+        return 1
+    try:
+        return max(1, int(gridSpan.get(_q(_W, "val"), "1")))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _cell_vmerge(tc: ET.Element) -> str | None:
+    """``"restart"`` / ``"continue"`` / ``None`` (no w:vMerge at all).
+
+    A ``<w:vMerge/>`` with no ``w:val`` attribute means ``"continue"`` per
+    ECMA-376 -- only ``w:val="restart"`` is ever spelled out explicitly.
+    """
+    tcPr = tc.find(_W_TCPR)
+    if tcPr is None:
+        return None
+    vMerge = tcPr.find(_W_VMERGE)
+    if vMerge is None:
+        return None
+    return vMerge.get(_q(_W, "val"), "continue")
+
+
+def _row_cell_spans(tr: ET.Element) -> list[tuple[ET.Element, int, int]]:
+    """``[(tc, start_col, span), ...]`` for one row, in document order."""
+    out: list[tuple[ET.Element, int, int]] = []
+    col = 0
+    for tc in tr.findall(_W_TC):
+        span = _cell_grid_span(tc)
+        out.append((tc, col, span))
+        col += span
+    return out
+
+
+def _table_grid_col_count(tbl: ET.Element) -> int | None:
+    grid = tbl.find(_W_TBLGRID)
+    if grid is None:
+        return None
+    cols = grid.findall(_W_GRIDCOL)
+    return len(cols) if cols else None
+
+
+def _validate_uniform_row_spans(tbl: ET.Element, grid_col_count: int) -> list[str]:
+    """Human-readable problems (empty == consistent): every row's cells must
+    account for EXACTLY ``grid_col_count`` grid columns. A row that over- or
+    under-shoots is a malformed-or-ambiguous table this module refuses to
+    guess about (see reason="ambiguous_grid" on the public functions)."""
+    problems: list[str] = []
+    for row_idx, tr in enumerate(_table_rows(tbl)):
+        total = sum(span for _tc, _start, span in _row_cell_spans(tr))
+        if total != grid_col_count:
+            problems.append(
+                f"row {row_idx} spans {total} grid column(s), expected {grid_col_count}"
+            )
+    return problems
+
+
+def _gridcol_width(tbl: ET.Element, index: int) -> int | None:
+    grid = tbl.find(_W_TBLGRID)
+    if grid is None:
+        return None
+    cols = grid.findall(_W_GRIDCOL)
+    if not (0 <= index < len(cols)):
+        return None
+    raw = cols[index].get(_q(_W, "w"))
+    try:
+        return int(raw) if raw is not None else None
+    except ValueError:
+        return None
+
+
+def _tc_width(tc: ET.Element) -> int | None:
+    tcPr = tc.find(_W_TCPR)
+    if tcPr is None:
+        return None
+    tcW = tcPr.find(_W_TCW)
+    if tcW is None:
+        return None
+    raw = tcW.get(_q(_W, "w"))
+    try:
+        return int(raw) if raw is not None else None
+    except ValueError:
+        return None
+
+
+def _ensure_tblgrid(tbl: ET.Element, col_count: int) -> ET.Element:
+    """Return ``tbl``'s ``<w:tblGrid>``, creating one with ``col_count``
+    width-less ``<w:gridCol>`` entries first if it doesn't exist yet (a real
+    Word-authored .docx always has one; this only matters for a hand-built
+    fixture)."""
+    grid = tbl.find(_W_TBLGRID)
+    if grid is not None:
+        return grid
+    grid = ET.Element(_W_TBLGRID)
+    tblPr = tbl.find(_q(_W, "tblPr"))
+    tbl.insert((list(tbl).index(tblPr) + 1) if tblPr is not None else 0, grid)
+    for _ in range(col_count):
+        ET.SubElement(grid, _W_GRIDCOL)
+    return grid
+
+
+def _tcpr_insert_index(tcPr: ET.Element, tag_name: str) -> int:
+    """Index at which to insert a new ``tag_name`` child into ``tcPr`` to
+    respect CT_TcPr's fixed element sequence (see ``_TCPR_CHILD_ORDER``)."""
+    try:
+        target_rank = _TCPR_CHILD_ORDER.index(tag_name)
+    except ValueError:  # pragma: no cover -- defensive; every caller here is a known tag
+        return len(list(tcPr))
+    for i, child in enumerate(tcPr):
+        local = child.tag.rsplit("}", 1)[-1]
+        try:
+            rank = _TCPR_CHILD_ORDER.index(local)
+        except ValueError:
+            continue
+        if rank > target_rank:
+            return i
+    return len(list(tcPr))
+
+
+def _set_grid_span(tc: ET.Element, span: int) -> None:
+    """Set (``span`` > 1) or remove (``span`` <= 1) ``tc``'s ``w:gridSpan``,
+    preserving CT_TcPr element ordering and creating ``w:tcPr`` on demand."""
+    tcPr = tc.find(_W_TCPR)
+    if tcPr is None:
+        if span <= 1:
+            return
+        tcPr = ET.Element(_W_TCPR)
+        tc.insert(0, tcPr)
+    gridSpan = tcPr.find(_W_GRIDSPAN)
+    if span <= 1:
+        if gridSpan is not None:
+            tcPr.remove(gridSpan)
+        return
+    if gridSpan is None:
+        gridSpan = ET.Element(_W_GRIDSPAN)
+        tcPr.insert(_tcpr_insert_index(tcPr, "gridSpan"), gridSpan)
+    gridSpan.set(_q(_W, "val"), str(span))
+
+
+def _set_vmerge(tc: ET.Element, mode: str | None) -> None:
+    """Set (``"restart"`` / ``"continue"``) or remove (``None``) ``tc``'s
+    ``w:vMerge``, preserving CT_TcPr element ordering."""
+    tcPr = tc.find(_W_TCPR)
+    if tcPr is None:
+        if mode is None:
+            return
+        tcPr = ET.Element(_W_TCPR)
+        tc.insert(0, tcPr)
+    vMerge = tcPr.find(_W_VMERGE)
+    if mode is None:
+        if vMerge is not None:
+            tcPr.remove(vMerge)
+        return
+    if vMerge is None:
+        vMerge = ET.Element(_W_VMERGE)
+        tcPr.insert(_tcpr_insert_index(tcPr, "vMerge"), vMerge)
+    if mode == "restart":
+        vMerge.set(_q(_W, "val"), "restart")
+    elif _q(_W, "val") in vMerge.attrib:
+        del vMerge.attrib[_q(_W, "val")]
+
+
+def _new_empty_tc(width: int | None, taken_ids: set[str]) -> ET.Element:
+    """Brand-new, empty ``<w:tc>``: one ``<w:tcPr>`` (with ``w:tcW`` when
+    ``width`` is known) plus one empty ``<w:p>`` carrying a freshly-minted,
+    never-before-seen ``w14:paraId`` (see ``_new_para_id``)."""
+    tc = ET.Element(_W_TC)
+    if width is not None:
+        tcPr = ET.SubElement(tc, _W_TCPR)
+        ET.SubElement(tcPr, _W_TCW, {_q(_W, "w"): str(width), _q(_W, "type"): "dxa"})
+    p = ET.SubElement(tc, _q(_W, "p"))
+    p.set(_q(_W14, "paraId"), _new_para_id(taken_ids))
+    return tc
+
+
+def _new_continuation_tc(width: int | None, taken_ids: set[str]) -> ET.Element:
+    """A brand-new ``<w:tc>`` marked ``w:vMerge`` (continue) -- a vertical-
+    merge placeholder cell for a row inserted by a row-split."""
+    tc = _new_empty_tc(width, taken_ids)
+    _set_vmerge(tc, "continue")
+    return tc
+
+
+def _insert_grid_columns(
+    tbl: ET.Element,
+    insertion_col: int,
+    count: int,
+    default_width: int | None,
+    *,
+    skip_row: ET.Element | None = None,
+    taken_ids: set[str] | None = None,
+) -> int:
+    """Insert ``count`` new grid columns at ``insertion_col`` into ``tbl``'s
+    ``w:tblGrid`` AND, for every row except ``skip_row``, either widen a
+    straddling cell's ``gridSpan`` or splice in a brand-new empty cell at
+    the boundary -- the shared engine behind both :func:`insert_column` and
+    :func:`split_cell`'s column-split mode. Caller must ensure ``tbl`` already
+    has a ``w:tblGrid`` (see :func:`_ensure_tblgrid`). Returns the number of
+    brand-new ``<w:p>`` paragraphs created (one per newly-spliced cell)."""
+    if count <= 0:
+        return 0
+    new_paragraphs = 0
+    ids = taken_ids if taken_ids is not None else _existing_para_ids(tbl)
+    grid = tbl.find(_W_TBLGRID)
+
+    for offset in range(count):
+        col = insertion_col + offset
+        for tr in _table_rows(tbl):
+            if tr is skip_row:
+                continue
+            spans = _row_cell_spans(tr)
+            straddling = next((tc for tc, s, sp in spans if s < col < s + sp), None)
+            if straddling is not None:
+                _set_grid_span(straddling, _cell_grid_span(straddling) + 1)
+                continue
+            tc_children = list(tr.findall(_W_TC))
+            insert_at = next(
+                (i for i, (_tc, s, _sp) in enumerate(spans) if s >= col), len(tc_children)
+            )
+            new_tc = _new_empty_tc(default_width, ids)
+            if insert_at >= len(tc_children):
+                tr.append(new_tc)
+            else:
+                anchor = tc_children[insert_at]
+                tr_children = list(tr)
+                tr.insert(tr_children.index(anchor), new_tc)
+            new_paragraphs += 1
+
+        if grid is not None:
+            new_gridcol = ET.Element(_W_GRIDCOL)
+            if default_width is not None:
+                new_gridcol.set(_q(_W, "w"), str(default_width))
+            grid_cols = grid.findall(_W_GRIDCOL)
+            if col >= len(grid_cols):
+                grid.append(new_gridcol)
+            else:
+                grid_children = list(grid)
+                grid.insert(grid_children.index(grid_cols[col]), new_gridcol)
+
+    return new_paragraphs
+
+
+def _split_rows(
+    target_el: ET.Element,
+    target_row: ET.Element,
+    target_cells: list[ET.Element],
+    start_col: int,
+    extra_rows: int,
+    taken_ids: set[str],
+) -> int:
+    """Insert ``extra_rows`` new ``<w:tr>`` immediately after ``target_row``.
+    The cell(s) in ``target_cells`` get brand-new, independent content in
+    each new row (the actual split-into-rows result). Every OTHER cell in
+    ``target_row`` grows a ``w:vMerge`` spanning the new rows (promoted to
+    ``"restart"`` if it wasn't already part of a merge; left untouched if it
+    already was one, correctly extending that existing merge) so the table
+    stays visually rectangular. Returns the number of brand-new ``<w:p>``
+    paragraphs created."""
+    new_paragraphs = 0
+
+    sibling_spans = [
+        (tc, s, sp) for tc, s, sp in _row_cell_spans(target_row) if tc not in target_cells
+    ]
+    for tc, _s, _sp in sibling_spans:
+        if _cell_vmerge(tc) is None:
+            _set_vmerge(tc, "restart")
+
+    insert_after = target_row
+    for _ in range(extra_rows):
+        new_tr = ET.Element(_W_TR)
+        ordered: list[tuple[int, ET.Element]] = []
+        for tc, s, sp in sibling_spans:
+            placeholder = _new_continuation_tc(_tc_width(tc), taken_ids)
+            _set_grid_span(placeholder, sp)
+            ordered.append((s, placeholder))
+            new_paragraphs += 1
+        for offset, tc in enumerate(target_cells):
+            fresh = _new_empty_tc(_tc_width(tc), taken_ids)
+            ordered.append((start_col + offset, fresh))
+            new_paragraphs += 1
+        ordered.sort(key=lambda item: item[0])
+        for _pos, tc in ordered:
+            new_tr.append(tc)
+
+        siblings_of_target_el = list(target_el)
+        insert_idx = siblings_of_target_el.index(insert_after) + 1
+        target_el.insert(insert_idx, new_tr)
+        insert_after = new_tr
+
+    return new_paragraphs
+
+
+def _write_table_mutation(
+    *,
+    docx_path: str,
+    raw: bytes,
+    root: ET.Element,
+    target_el: ET.Element,
+    table_index: int,
+    expected_counts: dict[str, int],
+    expected_hash: str,
+    index_db_path: str | None,
+    allow_degraded_render: bool,
+    degraded_render_reason: str | None,
+) -> dict[str, Any]:
+    """Shared stage -> verify -> render-gate -> promote tail for the table
+    structural-edit primitives (insert_column / split_cell / transpose_table)
+    -- identical discipline to relocate_table / insert_caption (see their
+    docstrings), factored out since all three share it verbatim. Returns
+    ``{"docx_path": ..., "render_info": {...}}`` on success, or an error
+    dict (already carrying ``"error"``, ``"file_restored"``,
+    ``"concurrent_write_detected"``, ``"table_index"``, ``"docx_path"``) on
+    failure -- the caller can layer its own identifying fields on top and
+    return it verbatim."""
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256") if transaction else None
+
+        verify_error = _verify_docx_write(
+            docx_path,
+            expected_counts=expected_counts,
+            expected_hash=expected_hash,
+            expected_range=(table_index, table_index + 1),
+        )
+        if verify_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["table_index"] = table_index
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["table_index"] = table_index
+            render_error["docx_path"] = docx_path
+            return render_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+    return {"docx_path": docx_path, "render_info": render_info}
+
+
+def insert_column(
+    docx_path: str,
+    table_index: int,
+    col_index: int,
+    position: str = "before",
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """a2cd9f54 -- Insert a new, empty grid column into an existing table.
+
+    ``col_index`` addresses an existing GRID column (0-based, from
+    ``_table_grid_col_count`` / the table's ``w:tblGrid``); ``position``
+    ("before", default, or "after") says which side of it the new column
+    lands on.
+
+    For each row: if the insertion point falls strictly INSIDE an existing
+    horizontally-merged cell's span, that cell's ``w:gridSpan`` is
+    incremented (the new column joins the merge) -- otherwise a brand-new,
+    empty cell (one empty paragraph, a fresh ``w14:paraId``) is spliced in
+    at the boundary. ``w:tblGrid`` always gets exactly one new
+    ``w:gridCol``, defaulted to the width of the column at ``col_index``.
+
+    Refuses (file untouched) with ``reason="ambiguous_grid"`` when the
+    table's rows do not consistently account for its declared grid-column
+    count -- this module never guesses at an inconsistent/malformed table's
+    real column addressing.
+
+    After a successful write, mandatory post-write verification (see
+    :func:`_write_table_mutation` / :func:`_verify_docx_write`) re-reads the
+    file from disk and confirms the exact expected byte content landed --
+    the file is best-effort restored from backup on any mismatch. A real
+    Word/COM (or LibreOffice) render-capability check also runs
+    (:func:`_enforce_render_verification`); see ``allow_degraded_render``.
+
+    Args:
+        docx_path:       Absolute path to the .docx file (mutated in place).
+        table_index:      0-based body-child position of the ``<w:tbl>``
+                          (same addressing as :func:`relocate_table`).
+        col_index:        0-based existing grid-column index to insert
+                          relative to.
+        position:         "before" (default) or "after" ``col_index``.
+        index_db_path:    If supplied, sidecar is invalidated after write.
+        allow_degraded_render: Explicit, audited opt-in to accept this write
+                          when no render backend is available in this
+                          environment. Requires ``degraded_render_reason``.
+        degraded_render_reason: Required, non-empty when
+                          ``allow_degraded_render`` is True.
+
+    Returns:
+        ``{status, table_index, col_index, position, grid_col_count,
+        row_count, col_count, docx_path, render_status, render_verified,
+        render_backend, render_detail}`` or ``{"error": ...}`` (with
+        ``"reason"`` one of ``"ambiguous_grid"`` when applicable) on
+        failure.
+    """
+    if position not in ("before", "after"):
+        return {"error": f"position must be 'before' or 'after', got {position!r}"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    target_el, err = _resolve_table_element(body, table_index)
+    if err is not None:
+        return err
+
+    rows = _table_rows(target_el)
+    grid_col_count = _table_grid_col_count(target_el)
+    if grid_col_count is None:
+        grid_col_count = max(
+            (sum(span for _tc, _s, span in _row_cell_spans(tr)) for tr in rows), default=0
+        )
+    if grid_col_count <= 0:
+        return {"error": "table has no columns to insert relative to"}
+
+    problems = _validate_uniform_row_spans(target_el, grid_col_count)
+    if problems:
+        return {
+            "error": (
+                "insert_column refused: this table's rows do not "
+                f"consistently account for its {grid_col_count} grid "
+                "column(s) -- ambiguous column addressing"
+            ),
+            "reason": "ambiguous_grid",
+            "details": problems,
+        }
+
+    if (
+        not isinstance(col_index, int)
+        or isinstance(col_index, bool)
+        or not (0 <= col_index < grid_col_count)
+    ):
+        return {
+            "error": (
+                f"col_index must be a non-negative int less than the "
+                f"table's {grid_col_count} grid column(s), got {col_index!r}"
+            )
+        }
+
+    insertion_col = col_index if position == "before" else col_index + 1
+
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
+
+    taken_ids = _existing_para_ids(root)
+    new_width = _gridcol_width(target_el, min(col_index, grid_col_count - 1))
+    _ensure_tblgrid(target_el, grid_col_count)
+
+    new_paragraphs_added = _insert_grid_columns(
+        target_el, insertion_col, 1, new_width, taken_ids=taken_ids
+    )
+
+    expected_counts = dict(baseline_counts)
+    expected_counts["paragraph_count"] = baseline_counts["paragraph_count"] + new_paragraphs_added
+    expected_hash = _hash_elements([target_el])
+
+    write_result = _write_table_mutation(
+        docx_path=docx_path,
+        raw=raw,
+        root=root,
+        target_el=target_el,
+        table_index=table_index,
+        expected_counts=expected_counts,
+        expected_hash=expected_hash,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+    if "error" in write_result:
+        return write_result
+
+    from ._vendored_content_tree import _table_node  # noqa: PLC0415
+
+    table_meta = _table_node(target_el, table_index)
+
+    return {
+        "status": "inserted",
+        "table_index": table_index,
+        "col_index": col_index,
+        "position": position,
+        "grid_col_count": grid_col_count + 1,
+        "row_count": table_meta["row_count"],
+        "col_count": table_meta["col_count"],
+        "docx_path": write_result["docx_path"],
+        **write_result["render_info"],
+    }
+
+
+def split_cell(
+    docx_path: str,
+    table_index: int,
+    row_index: int,
+    col_index: int,
+    cols: int = 1,
+    rows: int = 1,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """a2cd9f54 -- Split one table cell into ``cols`` columns and/or ``rows``
+    rows.
+
+    ``row_index`` is a 0-based ``<w:tr>`` index; ``col_index`` is the
+    target cell's STARTING grid column (from ``_row_cell_spans`` -- pass the
+    ``start_col`` a caller already knows from ``document_outline`` /
+    ``get_structure_elements`` table metadata, not an arbitrary grid
+    position inside a wider merged cell).
+
+    Refuses (file untouched) with ``reason="unsupported_merge"`` when the
+    target cell already has ``w:gridSpan`` > 1 or any ``w:vMerge`` --
+    splitting an already-merged cell is not attempted. Also refuses with
+    ``reason="ambiguous_grid"`` (``cols`` > 1 only) under the same
+    inconsistent-table condition :func:`insert_column` checks.
+
+    Column split (``cols`` > 1): the target cell is replaced by ``cols``
+    brand-new, independent cells (its width divided evenly, remainder on
+    the last one); every OTHER row is widened by ``cols - 1`` grid columns
+    via the SAME engine :func:`insert_column` uses (a straddling merged
+    cell's ``gridSpan`` grows; otherwise a blank cell is spliced in), so the
+    whole table stays grid-consistent.
+
+    Row split (``rows`` > 1): ``rows - 1`` brand-new ``<w:tr>`` are inserted
+    immediately after the target row. The split cell's own column(s) get
+    independent new content in each new row; every OTHER cell in the target
+    row grows a ``w:vMerge`` spanning the new rows (idempotent if it was
+    already part of one) so the table stays visually rectangular.
+
+    Args:
+        docx_path:       Absolute path to the .docx file (mutated in place).
+        table_index:     0-based body-child position of the ``<w:tbl>``.
+        row_index:       0-based ``<w:tr>`` index of the target cell.
+        col_index:       Target cell's starting grid column.
+        cols:            Number of columns to split into (default 1 = no
+                          column split).
+        rows:             Number of rows to split into (default 1 = no row
+                          split). At least one of ``cols``/``rows`` must be
+                          > 1.
+        index_db_path:    If supplied, sidecar is invalidated after write.
+        allow_degraded_render: Same audited opt-in as :func:`insert_column`.
+        degraded_render_reason: Required, non-empty when
+                          ``allow_degraded_render`` is True.
+
+    Returns:
+        ``{status, table_index, row_index, col_index, cols, rows, row_count,
+        col_count, docx_path, render_status, render_verified, render_backend,
+        render_detail}`` or ``{"error": ...}`` (with ``"reason"`` one of
+        ``"unsupported_merge"`` / ``"ambiguous_grid"`` when applicable) on
+        failure.
+    """
+    if not isinstance(cols, int) or isinstance(cols, bool) or cols < 1:
+        return {"error": f"cols must be a positive int, got {cols!r}"}
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows < 1:
+        return {"error": f"rows must be a positive int, got {rows!r}"}
+    if cols == 1 and rows == 1:
+        return {"error": "split_cell requires cols>1 and/or rows>1 -- nothing to split"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    target_el, err = _resolve_table_element(body, table_index)
+    if err is not None:
+        return err
+
+    table_rows_list = _table_rows(target_el)
+    if (
+        not isinstance(row_index, int)
+        or isinstance(row_index, bool)
+        or not (0 <= row_index < len(table_rows_list))
+    ):
+        return {
+            "error": (
+                f"row_index must be a non-negative int less than the "
+                f"table's {len(table_rows_list)} row(s), got {row_index!r}"
+            )
+        }
+
+    target_row = table_rows_list[row_index]
+    row_spans = _row_cell_spans(target_row)
+
+    hit = next(((tc, s, sp) for tc, s, sp in row_spans if s == col_index), None)
+    if hit is None:
+        inside = next(
+            ((tc, s, sp) for tc, s, sp in row_spans if s < col_index < s + sp), None
+        )
+        if inside is not None:
+            return {
+                "error": (
+                    f"col_index {col_index} is inside an existing merged "
+                    f"cell (grid columns {inside[1]}-{inside[1] + inside[2] - 1}) "
+                    "-- address a split by the cell's STARTING grid column"
+                ),
+                "reason": "unsupported_merge",
+            }
+        return {
+            "error": f"col_index {col_index} does not address any cell in row {row_index}"
+        }
+
+    target_tc, start_col, span = hit
+    if span > 1:
+        return {
+            "error": (
+                f"cannot split cell at row {row_index}, col {col_index}: it "
+                f"already spans {span} grid column(s) (w:gridSpan) -- "
+                "splitting an already-merged cell is not supported"
+            ),
+            "reason": "unsupported_merge",
+        }
+    if _cell_vmerge(target_tc) is not None:
+        return {
+            "error": (
+                f"cannot split cell at row {row_index}, col {col_index}: it "
+                "is already part of a vertical merge (w:vMerge) -- "
+                "splitting an already-merged cell is not supported"
+            ),
+            "reason": "unsupported_merge",
+        }
+
+    grid_col_count = _table_grid_col_count(target_el)
+    if grid_col_count is None:
+        grid_col_count = max(
+            (sum(sp for _tc, _s, sp in _row_cell_spans(tr)) for tr in table_rows_list),
+            default=0,
+        )
+    if cols > 1:
+        problems = _validate_uniform_row_spans(target_el, grid_col_count)
+        if problems:
+            return {
+                "error": (
+                    "split_cell refused: this table's rows do not "
+                    f"consistently account for its {grid_col_count} grid "
+                    "column(s) -- ambiguous column addressing"
+                ),
+                "reason": "ambiguous_grid",
+                "details": problems,
+            }
+
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
+    taken_ids = _existing_para_ids(root)
+    new_paragraphs_added = 0
+
+    original_width = _tc_width(target_tc)
+
+    if cols > 1:
+        # Net delta, not a gross addition: the ORIGINAL target cell (and
+        # whatever paragraph(s) it held) is removed as part of the splice,
+        # so only the DIFFERENCE between what's added and what's removed
+        # counts toward the structural-verification expectation below.
+        removed_paragraphs = _structural_counts([target_tc])["paragraph_count"]
+        per_col_width = (original_width // cols) if original_width else None
+        new_cells = [_new_empty_tc(per_col_width, taken_ids) for _ in range(cols)]
+        new_paragraphs_added += cols - removed_paragraphs
+
+        tr_children = list(target_row)
+        anchor_idx = tr_children.index(target_tc)
+        target_row.remove(target_tc)
+        for offset, tc in enumerate(new_cells):
+            target_row.insert(anchor_idx + offset, tc)
+
+        _ensure_tblgrid(target_el, grid_col_count)
+        new_paragraphs_added += _insert_grid_columns(
+            target_el, start_col + 1, cols - 1, per_col_width,
+            skip_row=target_row, taken_ids=taken_ids,
+        )
+        target_cells = new_cells
+    else:
+        target_cells = [target_tc]
+
+    if rows > 1:
+        new_paragraphs_added += _split_rows(
+            target_el=target_el,
+            target_row=target_row,
+            target_cells=target_cells,
+            start_col=start_col,
+            extra_rows=rows - 1,
+            taken_ids=taken_ids,
+        )
+
+    expected_counts = dict(baseline_counts)
+    expected_counts["paragraph_count"] = baseline_counts["paragraph_count"] + new_paragraphs_added
+    expected_hash = _hash_elements([target_el])
+
+    write_result = _write_table_mutation(
+        docx_path=docx_path,
+        raw=raw,
+        root=root,
+        target_el=target_el,
+        table_index=table_index,
+        expected_counts=expected_counts,
+        expected_hash=expected_hash,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+    if "error" in write_result:
+        return write_result
+
+    from ._vendored_content_tree import _table_node  # noqa: PLC0415
+
+    table_meta = _table_node(target_el, table_index)
+
+    return {
+        "status": "split",
+        "table_index": table_index,
+        "row_index": row_index,
+        "col_index": col_index,
+        "cols": cols,
+        "rows": rows,
+        "row_count": table_meta["row_count"],
+        "col_count": table_meta["col_count"],
+        "docx_path": write_result["docx_path"],
+        **write_result["render_info"],
+    }
+
+
+def transpose_table(
+    docx_path: str,
+    table_index: int,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """a2cd9f54 -- Transpose a table's rows and columns in place.
+
+    Supported ONLY for a fully rectangular table with NO ``w:gridSpan`` > 1
+    and NO ``w:vMerge`` anywhere -- refuses with ``reason="unsupported_merge"``
+    otherwise (a horizontally-merged cell has no single canonical
+    vertically-merged equivalent, so this never guesses). Also refuses with
+    ``reason="ambiguous_grid"`` if the table's rows do not all have the same
+    cell count.
+
+    Reuses the SAME ``<w:tc>`` element objects (never deep-copied), only
+    repositioning them -- every relationship id (image/hyperlink), bookmark,
+    numbering reference, and run of formatted text inside a cell survives
+    verbatim; only each cell's row/column position changes.
+
+    Row heights and column widths have no canonical semantic mapping under
+    a transpose (a row's height does not become a column's width in any
+    well-defined way): the new ``w:tblGrid`` falls back to the table's
+    original total width (summed from its old ``w:gridCol`` widths, when
+    present) divided evenly across the new column count -- a documented,
+    honest default rather than a fabricated precise one. ``w:trPr`` (e.g.
+    explicit row heights) is intentionally dropped from the new rows for
+    the same reason.
+
+    Args:
+        docx_path:       Absolute path to the .docx file (mutated in place).
+        table_index:      0-based body-child position of the ``<w:tbl>``.
+        index_db_path:    If supplied, sidecar is invalidated after write.
+        allow_degraded_render: Same audited opt-in as :func:`insert_column`.
+        degraded_render_reason: Required, non-empty when
+                          ``allow_degraded_render`` is True.
+
+    Returns:
+        ``{status, table_index, row_count, col_count, docx_path,
+        render_status, render_verified, render_backend, render_detail}`` or
+        ``{"error": ...}`` (with ``"reason"`` one of ``"unsupported_merge"``
+        / ``"ambiguous_grid"`` when applicable) on failure.
+    """
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    target_el, err = _resolve_table_element(body, table_index)
+    if err is not None:
+        return err
+
+    rows = _table_rows(target_el)
+    if not rows:
+        return {"error": "table has no rows to transpose"}
+
+    row_cell_lists: list[list[ET.Element]] = []
+    for tr in rows:
+        cells = tr.findall(_W_TC)
+        for tc in cells:
+            if _cell_grid_span(tc) != 1 or _cell_vmerge(tc) is not None:
+                return {
+                    "error": (
+                        "transpose_table refused: this table contains a "
+                        "merged cell (w:gridSpan or w:vMerge) -- the "
+                        "correct transposed merge geometry is ambiguous, so "
+                        "this primitive only supports a fully rectangular, "
+                        "unmerged table"
+                    ),
+                    "reason": "unsupported_merge",
+                }
+        row_cell_lists.append(cells)
+
+    col_count = len(row_cell_lists[0]) if row_cell_lists else 0
+    if col_count == 0 or any(len(cells) != col_count for cells in row_cell_lists):
+        return {
+            "error": (
+                "transpose_table refused: every row must have the SAME "
+                "number of cells -- this table's rows are not uniform"
+            ),
+            "reason": "ambiguous_grid",
+        }
+    row_count = len(row_cell_lists)
+
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
+
+    # Build the transposed row list: new row r = column r of every old row,
+    # in old-row order. Reuses the SAME <w:tc> element objects (never
+    # deep-copied) -- see docstring.
+    new_trs: list[ET.Element] = []
+    for new_row_idx in range(col_count):
+        new_tr = ET.Element(_W_TR)
+        for old_row_idx in range(row_count):
+            new_tr.append(row_cell_lists[old_row_idx][new_row_idx])
+        new_trs.append(new_tr)
+
+    for tr in rows:
+        target_el.remove(tr)
+    for tr in new_trs:
+        target_el.append(tr)
+
+    # Rebuild w:tblGrid for the new column count (== old row_count). See
+    # docstring for why widths fall back to an even split of the original
+    # total rather than a fabricated precise mapping.
+    old_grid = target_el.find(_W_TBLGRID)
+    total_width = None
+    if old_grid is not None:
+        widths = []
+        for gc in old_grid.findall(_W_GRIDCOL):
+            raw_w = gc.get(_q(_W, "w"))
+            if raw_w is not None:
+                try:
+                    widths.append(int(raw_w))
+                except ValueError:
+                    pass
+        if widths:
+            total_width = sum(widths)
+        target_el.remove(old_grid)
+
+    new_grid = ET.Element(_W_TBLGRID)
+    tblPr = target_el.find(_q(_W, "tblPr"))
+    target_el.insert((list(target_el).index(tblPr) + 1) if tblPr is not None else 0, new_grid)
+    per_col_width = (total_width // row_count) if total_width else None
+    for _ in range(row_count):
+        gc = ET.SubElement(new_grid, _W_GRIDCOL)
+        if per_col_width is not None:
+            gc.set(_q(_W, "w"), str(per_col_width))
+
+    # A pure cell-reshuffle: paragraph/heading/table/image counts are ALL
+    # invariant -- no content is created, destroyed, or leaves the table.
+    expected_counts = dict(baseline_counts)
+    expected_hash = _hash_elements([target_el])
+
+    write_result = _write_table_mutation(
+        docx_path=docx_path,
+        raw=raw,
+        root=root,
+        target_el=target_el,
+        table_index=table_index,
+        expected_counts=expected_counts,
+        expected_hash=expected_hash,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+    if "error" in write_result:
+        return write_result
+
+    from ._vendored_content_tree import _table_node  # noqa: PLC0415
+
+    table_meta = _table_node(target_el, table_index)
+
+    return {
+        "status": "transposed",
+        "table_index": table_index,
+        "row_count": table_meta["row_count"],
+        "col_count": table_meta["col_count"],
+        "docx_path": write_result["docx_path"],
+        **write_result["render_info"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # f1185012 -- page header / footer support.
 #
 # python-docx, the Google Docs API + UI, and Apryse (a commercial DOCX SDK)
@@ -13803,7 +15211,14 @@ def locate_anchors(document_path: str, queries: list[dict[str, Any]]) -> dict[st
     }
 
 
-def read_document_snapshot(docx_path: str) -> dict[str, Any]:
+def read_document_snapshot(
+    docx_path: str,
+    *,
+    page_size: int | None = None,
+    cursor: str | None = None,
+    section_anchor: str | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
     """Read the saved DOCX snapshot without writing or requiring a close.
 
     Word normally leaves a sibling ~$ lock file while a document is open.
@@ -13833,6 +15248,37 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
         these limitations alongside anything derived from it, rather than
         silently treating "read succeeded" as "reflects what's on screen in
         Word right now".
+
+    1dff1300 -- cursor-based pagination + section scoping, identical
+    contract to :func:`document_outline` (see its docstring for the full
+    cursor/staleness/rejection rules) applied to the ``paragraphs`` list
+    instead of ``headings``. A cursor minted by ``document_outline`` is
+    never accepted here, and vice versa (each is bound to its own
+    ``kind``). Omitting BOTH ``page_size`` and ``cursor`` (the default)
+    returns the FULL paragraph list exactly as before this item -- fully
+    backward compatible; ``source_sha256`` (already present) doubles as
+    this function's document-identity fingerprint, so no new top-level
+    field is needed for that.
+
+    Each paragraph in a PAGINATED response additionally carries
+    ``section_path`` (ancestor heading texts, root first) and
+    ``heading_para_id`` -- deterministic document order and stable
+    per-paragraph identity were already true of ``para_id`` (see
+    :func:`parse_docx`'s three-tier id scheme); this adds the section
+    identity alongside it.
+
+    ``index_db_path``, when given, attaches ``stale_index`` (this
+    document's structural-sidecar freshness -- see
+    :func:`get_structure_freshness`) and, best-effort, whole-document
+    ``tables`` / ``figures`` identity metadata already recorded in that
+    sidecar (see :func:`get_local_structure_elements`) plus ``equations``
+    (see :func:`get_local_equations`, filtered to the ones whose
+    ``para_id`` falls within the current page/section when paginating --
+    ``para_id`` is directly comparable across both functions, unlike the
+    sidecar's raw body-child ``index``, which counts tables/paragraphs
+    together and is therefore NOT filtered per-page here). Never raises
+    and never blocks on a missing/stale/incomplete sidecar -- absence or
+    staleness is reported via ``stale_index``, never a hard failure.
     """
     try:
         with open(docx_path, "rb") as handle:
@@ -13843,6 +15289,20 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
         paragraphs = parse_docx(raw)
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
         return {"error": str(exc)}
+
+    fingerprint = _source_fingerprint(raw)
+
+    scoped_paragraphs = paragraphs
+    if section_anchor is not None:
+        bounds = _resolve_section_anchor_bounds(paragraphs, section_anchor)
+        if bounds is None:
+            return {
+                "error": f"section_anchor {section_anchor!r} does not resolve to any heading",
+                "reason": "section_not_found",
+            }
+        start_idx, end_idx = bounds
+        scoped_paragraphs = paragraphs[start_idx:end_idx]
+
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         xml_parts = sorted(
             name
@@ -13856,17 +15316,15 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
         os.path.dirname(docx_path),
         "~$" + os.path.basename(docx_path),
     )
-    return {
+
+    result: dict[str, Any] = {
         "status": "read_only",
         "docx_path": docx_path,
         "byte_size": len(raw),
         "saved_mtime": _stat_mtime(docx_path),
-        "source_sha256": _source_fingerprint(raw),
+        "source_sha256": fingerprint,
         "word_lock_hint": os.path.exists(lock_hint),
         "xml_parts": xml_parts,
-        "paragraph_count": len(paragraphs),
-        "heading_count": sum(1 for paragraph in paragraphs if _is_heading(paragraph["style"])),
-        "paragraphs": paragraphs,
         "limitations": [
             "This reflects only the last SAVED state of docx_path. Any "
             "edits made in Word since the last save -- including changes "
@@ -13882,3 +15340,58 @@ def read_document_snapshot(docx_path: str) -> dict[str, Any]:
             "writer may not create one at all).",
         ],
     }
+
+    if index_db_path is not None:
+        result["stale_index"] = get_structure_freshness(index_db_path)
+        try:
+            elements = get_local_structure_elements(index_db_path, allow_stale=True)
+            result["tables"] = elements.get("tables", [])
+            result["figures"] = elements.get("figures", [])
+        except sqlite3.OperationalError:
+            result["tables"] = []
+            result["figures"] = []
+        try:
+            result["equations"] = get_local_equations(index_db_path)
+        except sqlite3.OperationalError:
+            result["equations"] = []
+
+    if page_size is None and cursor is None:
+        result["paragraph_count"] = len(scoped_paragraphs)
+        result["heading_count"] = sum(
+            1 for paragraph in scoped_paragraphs if _is_heading(paragraph["style"])
+        )
+        result["paragraphs"] = scoped_paragraphs
+        return result
+
+    offset, resolved_page_size, error = _resolve_pagination_window(
+        kind="snapshot",
+        fingerprint=fingerprint,
+        total_items=len(scoped_paragraphs),
+        page_size=page_size,
+        cursor=cursor,
+        section_anchor=section_anchor,
+    )
+    if error is not None:
+        return error
+
+    page_start, page_end, next_cursor, has_more = _paginated_page_result(
+        offset, resolved_page_size, len(scoped_paragraphs),
+        kind="snapshot", fingerprint=fingerprint, section_anchor=section_anchor,
+    )
+    annotated = _annotate_section_paths(scoped_paragraphs)
+    page_paragraphs = annotated[page_start:page_end]
+
+    if index_db_path is not None and "equations" in result:
+        page_para_ids = {p.get("para_id") for p in page_paragraphs}
+        result["equations"] = [
+            eq for eq in result["equations"] if eq.get("para_id") in page_para_ids
+        ]
+
+    result["paragraph_count"] = len(page_paragraphs)
+    result["heading_count"] = sum(1 for p in page_paragraphs if _is_heading(p.get("style")))
+    result["paragraphs"] = page_paragraphs
+    result["cursor"] = next_cursor
+    result["has_more"] = has_more
+    result["total"] = len(scoped_paragraphs)
+    result["section_anchor"] = section_anchor
+    return result

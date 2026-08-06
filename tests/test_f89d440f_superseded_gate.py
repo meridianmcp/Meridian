@@ -166,9 +166,20 @@ async def test_invalid_blocker_kind_still_rejected(db):
 @pytest.mark.asyncio
 async def test_mcp_add_and_claim_superseded(db, tmp_path):
     """(h) add_sprint_item via MCP stores blocker_kind='superseded'; claim_sprint_item
-    via MCP returns the blocked dict instead of claiming."""
+    via MCP returns the blocked dict instead of claiming.
+
+    2a176d6d/93e266e7 — the title's "MCP" keyword trips the title->hotspot-file
+    auto-inference (_infer_touches_resources), so this item ends up with a real
+    (if inferred) touches_resources entry. That's genuine production behavior,
+    not a test artifact, so the fix is a real session_id — exercising the
+    resource-lock path the same way a real executor would — rather than
+    stripping the inferred resource just to dodge the identity gate. The
+    SUPERSEDED block itself happens at the db layer, after the identity/lock
+    gates, so a valid session_id is required to even reach it.
+    """
     p = await db_module.create_project(db, "mcp-superseded")
     pid = p["id"]
+    sess = await db_module.register_session(db, pid, "superseded-claimant")
     added = await _dispatch_mcp_tool(
         "add_sprint_item",
         {
@@ -185,7 +196,7 @@ async def test_mcp_add_and_claim_superseded(db, tmp_path):
 
     claimed = await _dispatch_mcp_tool(
         "claim_sprint_item",
-        {"project_id": pid, "item_id": added["id"]},
+        {"project_id": pid, "item_id": added["id"], "session_id": sess["id"]},
         db,
         str(tmp_path),
     )

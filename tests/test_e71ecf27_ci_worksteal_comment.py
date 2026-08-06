@@ -3,8 +3,24 @@ e71ecf27 -- Verify that test.yml documents real CI timing data for --dist=workst
 
 This test ensures:
 1. The workflow file is valid YAML.
-2. Both test-core and test-postgres jobs retain --dist=worksteal (the change is kept).
+2. Both test-core and test-postgres jobs still get worksteal scheduling for the
+   full suite (the change is kept -- see note below on how this is checked now).
 3. The real CI timing data comment block is present in both jobs (not speculative language).
+
+06d7835 (adaptive local/CI test runner) replaced the literal
+``pytest ... --dist=worksteal ...`` invocation in both jobs' run steps with
+``pixi run python scripts/run_tests.py ...`` -- ``--dist=worksteal`` is no
+longer a static flag in this YAML file at all; it is a runtime decision
+``scripts/run_tests.py::build_run_args`` makes (worksteal for a collected
+count above the serial threshold, serial otherwise -- the full test-core/
+test-postgres suite is always well above that threshold, so the real-world
+scheduling behavior these tests originally guarded is unchanged). The two
+worksteal-presence tests below were updated to assert the NEW invariant --
+the job routes through the adaptive runner -- rather than grep for a flag
+that no longer appears in this file by design. The worksteal-for-large-
+selections guarantee itself is covered directly, at the unit level, by
+tests/test_run_tests_policy.py::test_large_selection_uses_worksteal_with_cap
+and tests/test_collect_count_verbosity_fix.py.
 """
 
 import pathlib
@@ -32,24 +48,30 @@ def test_workflow_yaml_is_valid():
 
 
 def test_test_core_job_uses_worksteal():
-    """test-core job must still use --dist=worksteal (change retained, not reverted)."""
+    """test-core job must route the full suite through the adaptive runner,
+    which is what now decides worksteal vs. serial at run time (06d7835) --
+    see this module's docstring for why a literal --dist=worksteal grep is
+    no longer the right check."""
     data = _load_yaml()
     steps = data["jobs"]["test-core"]["steps"]
     run_steps = [s["run"] for s in steps if "run" in s]
     combined = "\n".join(run_steps)
-    assert "--dist=worksteal" in combined, (
-        "test-core must still pass --dist=worksteal to pytest"
+    assert "scripts/run_tests.py" in combined, (
+        "test-core must route the full suite through scripts/run_tests.py "
+        "(the adaptive runner that applies --dist=worksteal for large selections)"
     )
 
 
 def test_test_postgres_job_uses_worksteal():
-    """test-postgres job must still use --dist=worksteal (change retained, not reverted)."""
+    """test-postgres job must route the full suite through the adaptive
+    runner, same reasoning as test_test_core_job_uses_worksteal above."""
     data = _load_yaml()
     steps = data["jobs"]["test-postgres"]["steps"]
     run_steps = [s["run"] for s in steps if "run" in s]
     combined = "\n".join(run_steps)
-    assert "--dist=worksteal" in combined, (
-        "test-postgres must still pass --dist=worksteal to pytest"
+    assert "scripts/run_tests.py" in combined, (
+        "test-postgres must route the full suite through scripts/run_tests.py "
+        "(the adaptive runner that applies --dist=worksteal for large selections)"
     )
 
 

@@ -140,3 +140,78 @@ def test_xdist_gate_note_across_modes(execution_mode: str, completion_mode: str)
         f"<test_gate_note> missing for execution_mode={execution_mode!r}, "
         f"completion_mode={completion_mode!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# abac2298 — the Wave 16 friction report's follow-up: xdist worker crashes
+# (MemoryError while formatting a collection-error traceback, then a node-
+# bookkeeping KeyError) do NOT carry a real "<path>::<test>" identity, so the
+# guidance must not demand isolating one. It must also distinguish a worker
+# crash from a plain collection failure, a timeout, and a command that never
+# ran at all (missing_command) -- the four categories the old guidance
+# collapsed into a single "INTERNALERROR -> isolate the test" instruction.
+# ---------------------------------------------------------------------------
+
+
+def test_xdist_gate_note_covers_missing_command_case():
+    """The note must call out a command that cannot even be resolved/executed
+    as its own diagnostic, distinct from a test failure."""
+    goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
+    assert "missing-command diagnostic" in goal
+    assert "no tests ran at all" in goal
+
+
+def test_xdist_gate_note_does_not_demand_isolation_when_no_identity_exists():
+    """Regression guard for the exact Wave 16 friction: a worker-level crash
+    with no reported test identity (MemoryError / xdist node KeyError) must
+    tell the executor to skip straight to the serial fallback, not demand a
+    single-test isolation target that does not exist."""
+    goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
+    assert "MemoryError" in goal
+    assert "node-bookkeeping KeyError" in goal
+    assert "there is nothing to isolate" in goal
+    assert "skip straight to step (3)'s serial rerun" in goal
+
+
+def test_xdist_gate_note_distinguishes_collection_failure_and_timeout():
+    goal = h._build_quick_start_goal([{**_ITEM, "title": "FEAT: implementation"}])
+    assert "collection failure, not a worker crash" in goal
+    assert "a timeout, not a code regression" in goal
+    # 5abf3e12 — no ALL-CAPS threat framing anywhere, including these new
+    # sentences (matches test_build_quick_start_goal_xml_structure_preserves_
+    # constraints's existing "FAILURE" guard in test_cov_handoff.py).
+    assert "FAILURE" not in goal
+
+
+def test_test_gate_recovery_clause_present_and_machine_readable():
+    """abac2298 — the machine-readable companion to the prose note: a tool
+    can read the recovery protocol without parsing free text."""
+    goal = h._build_quick_start_goal(
+        [{**_ITEM, "title": "FEAT: implementation"}], test_cmd="pixi run test -n auto",
+    )
+    assert "<test_gate_recovery " in goal
+    assert goal.count("<test_gate_recovery ") == 1
+    assert (
+        'categories="test_failure,collection_failure,worker_crash,timeout,missing_command"'
+        in goal
+    )
+    # Derived from the SAME _strip_parallelism_flag the prose note uses --
+    # never a second, independently-hardcoded fallback command.
+    assert 'serial_fallback_cmd="pixi run test"' in goal
+    assert "worker_crash_action=" in goal
+
+
+def test_test_gate_recovery_clause_absent_for_general_sprint_and_override():
+    """Mirrors <test_gate_note>'s own suppression: a GENERAL sprint type or
+    an explicit completion_criteria_override skips the whole xdist block,
+    including the new recovery tag -- neither is meaningful without a real
+    test-floor completion criterion."""
+    general_goal = h._build_quick_start_goal(
+        [{"id": "g1", "title": "General housekeeping", "version": None}],
+    )
+    override_goal = h._build_quick_start_goal(
+        [{**_ITEM, "title": "FEAT: implementation"}],
+        completion_criteria_override="Done when the doc is published.",
+    )
+    assert "<test_gate_recovery " not in general_goal
+    assert "<test_gate_recovery " not in override_goal

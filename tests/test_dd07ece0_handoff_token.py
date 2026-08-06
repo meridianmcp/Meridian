@@ -69,6 +69,23 @@ def _extract_token_from_goal(goal: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+# ffd7269c — full/delta modes render one wall-clock ``generated_at`` field
+# (an ISO-8601 "seconds"-precision timestamp: meridian/handoff.py's
+# ``now_utc.isoformat(timespec="seconds")``) that is GENUINELY expected to
+# differ between two back-to-back calls whenever they straddle a second
+# boundary — not a determinism bug, just a second real per-call field
+# alongside the token. Normalize it out the same way the token itself is
+# normalized, so a determinism assertion checks the thing it actually means
+# to check (everything derived from DB state is stable) without being
+# flaky on timing. A no-op on goal/starter output, which carries no such
+# field.
+_ISO8601_TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}")
+
+
+def _normalize_generated_at(text: str) -> str:
+    return _ISO8601_TS_RE.sub("STRIPPED-TIMESTAMP", text)
+
+
 # ---------------------------------------------------------------------------
 # (a) Token minted and embedded in /goal block
 # ---------------------------------------------------------------------------
@@ -945,11 +962,12 @@ async def test_repeated_generate_handoff_calls_differ_only_by_token(db, tmp_path
     assert token_a is not None and token_b is not None
     assert token_a != token_b, "each call must mint a fresh single-use token"
 
-    stripped_a = content_a.replace(token_a, "STRIPPED", 1)
-    stripped_b = content_b.replace(token_b, "STRIPPED", 1)
+    stripped_a = _normalize_generated_at(content_a.replace(token_a, "STRIPPED", 1))
+    stripped_b = _normalize_generated_at(content_b.replace(token_b, "STRIPPED", 1))
     assert stripped_a == stripped_b, (
         "generate_handoff output must be byte-identical for identical DB "
-        "state once the single-use token is normalized out"
+        "state once the single-use token (and the genuinely-per-call wall-"
+        "clock generated_at timestamp) are normalized out"
     )
 
 
@@ -1464,3 +1482,120 @@ async def test_load_handoff_content_byte_identical_between_mcp_and_stdio_transpo
         "load_handoff must return byte-identical content across the HTTP-MCP "
         "and stdio transports for the same stored revision"
     )
+
+
+# ---------------------------------------------------------------------------
+# ffd7269c — cross-mode determinism + token/body-integrity hardening.
+#
+# test_repeated_generate_handoff_calls_differ_only_by_token above only ever
+# exercised the default (full) mode. goal/starter/delta each independently
+# call _mint_and_embed_goal_token too (meridian/handoff.py lines ~7920,
+# ~8636, ~8918) — prove the SAME "identical DB state -> byte-identical
+# output modulo the single-use token" guarantee holds for all four, so a
+# future edit to any one mode's renderer can't silently reintroduce
+# nondeterminism (e.g. an unstable dict/set iteration order, an unseeded
+# random tiebreak) that only full mode's test would have caught.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["goal", "starter", "full", "delta"])
+async def test_repeated_generate_handoff_calls_differ_only_by_token_every_mode(
+    db, tmp_path, mode,
+):
+    p = await db_module.create_project(db, f"token-determinism-{mode}")
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "do the thing",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": "locate target",
+        }],
+    )
+
+    out_a = tmp_path / "a"
+    out_b = tmp_path / "b"
+    out_a.mkdir()
+    out_b.mkdir()
+
+    _path_a, content_a, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(out_a), skip_ai_summary=True, mode=mode,
+    )
+    _path_b, content_b, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(out_b), skip_ai_summary=True, mode=mode,
+    )
+
+    token_a = _extract_token_from_goal(content_a)
+    token_b = _extract_token_from_goal(content_b)
+    assert token_a is not None and token_b is not None, (
+        f"mode={mode} must embed a provenance token in every call"
+    )
+    assert token_a != token_b, (
+        f"mode={mode}: each call must mint a fresh single-use token"
+    )
+
+    stripped_a = _normalize_generated_at(content_a.replace(token_a, "STRIPPED", 1))
+    stripped_b = _normalize_generated_at(content_b.replace(token_b, "STRIPPED", 1))
+    assert stripped_a == stripped_b, (
+        f"mode={mode}: generate_handoff output must be byte-identical for "
+        "identical DB state once the single-use token (and the genuinely-"
+        "per-call wall-clock generated_at timestamp) are normalized out"
+    )
+
+    # Both tokens are independently genuine (never a fabricated/reused one)
+    # and each verifies exactly once.
+    first = await handoff_module.verify_handoff_token(db, token_a, p["id"])
+    assert first == {"valid": True, "reason": "ok"}
+    second = await handoff_module.verify_handoff_token(db, token_b, p["id"])
+    assert second == {"valid": True, "reason": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_force_include_foreign_project_id_never_reaches_token_bound_body(
+    db, tmp_path,
+):
+    """Integration-level body-integrity check: force_include_ids is a
+    VISIBILITY override (3cab355a), and a cross-project id passed to it must
+    be rejected (reason='wrong_project') BEFORE the goal-only body is built
+    and token-bound — never silently smuggled into an executable,
+    provenance-token-bound body just because a caller happened to name its
+    id. This composes two independently-tested primitives
+    (_resolve_force_included_items's wrong_project check, and
+    _mint_and_embed_goal_token's body-hash binding) and proves they hold
+    together, not just individually."""
+    home_pid = (await db_module.create_project(db, "force-include-home"))["id"]
+    foreign_pid = (await db_module.create_project(db, "force-include-foreign"))["id"]
+    foreign_item = await db_module.add_sprint_item(
+        db, foreign_pid, "v1", "SECRET foreign-project item — must never leak",
+    )
+    await db_module.add_sprint_item(db, home_pid, "v1", "genuine home item")
+
+    rejected: list[dict] = []
+    _path, content, _amended = await handoff_module.generate_handoff(
+        db, home_pid, str(tmp_path), skip_ai_summary=True, mode="goal",
+        force_include_ids=[foreign_item["id"]],
+        force_include_rejected=rejected,
+    )
+
+    assert foreign_item["id"] not in content, (
+        "a foreign-project id passed via force_include_ids must never appear "
+        "in the rendered, token-bound /goal body"
+    )
+    assert rejected == [{"id": foreign_item["id"], "reason": "wrong_project"}]
+
+    token = _extract_token_from_goal(content)
+    assert token is not None
+    # mode="goal" returns the token-bound body with the <goal_token>/SECURITY
+    # banner spliced in; strip_goal_token_banner reconstructs the exact text
+    # that was hashed at mint time (see its own docstring / round-trip test
+    # above) so a direct verify_handoff_token(body=...) call — not routed
+    # through a transport that strips it for us — matches.
+    presented_body = handoff_module.strip_goal_token_banner(content)
+    verify = await handoff_module.verify_handoff_token(
+        db, token, home_pid, body=presented_body,
+    )
+    # This must verify cleanly, proving the rejection happened before
+    # minting/hashing, not as a post-hoc redaction of an already-bound body
+    # (a body that ever contained the foreign id and had it stripped AFTER
+    # minting would fail this exact check with reason='body_mismatch').
+    assert verify == {"valid": True, "reason": "ok"}, verify

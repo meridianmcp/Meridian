@@ -866,9 +866,11 @@ async def test_get_parallelizable_groups_macro_waves_empty_when_no_groups(db):
 # --- 4. handoff._build_quick_start_goal macro-wave framing -------------------
 
 def test_build_quick_start_goal_macro_wave_framing_when_compressed():
-    """A hand-built parallel_groups dict whose "macro_waves" genuinely
-    compresses (fewer waves than raw groups) renders "Wave N [...]" framing
-    instead of a flat batch list, and never drops or duplicates an id."""
+    """Compressed macro-waves preserve the full ID set.
+
+    Each ID intentionally appears once in the authoritative executor manifest
+    and once in the human-readable batch prose.
+    """
     items = [{"id": f"i{n}", "version": None} for n in range(6)]
     groups = [
         [{"id": "i0"}, {"id": "i1"}], [{"id": "i2"}], [{"id": "i3"}],
@@ -890,7 +892,7 @@ def test_build_quick_start_goal_macro_wave_framing_when_compressed():
     assert "Wave 2 [batch 3: i3; batch 4: i4]" in goal
     assert "Wave 3 [batch 5: i5]" in goal
     for iid in ("i0", "i1", "i2", "i3", "i4", "i5"):
-        assert goal.count(iid) == 1  # each id rendered exactly once
+        assert goal.count(iid) == 2  # manifest + presentation prose
 
 
 def test_build_quick_start_goal_falls_back_to_flat_when_no_compression():
@@ -966,9 +968,7 @@ def test_build_quick_start_goal_macro_wave_framing_preserves_leftover_handling()
 
 @pytest.mark.asyncio
 async def test_build_quick_start_goal_end_to_end_from_real_db_macro_waves(db):
-    """Full pipeline: get_parallelizable_groups()'s real macro_waves output
-    feeds straight into _build_quick_start_goal() and renders Wave framing,
-    with no item lost or duplicated."""
+    """The real macro-wave pipeline preserves every ID in the manifest."""
     pid = await _project(db, "mw-e2e")
     # 6 items share one resource (6 singleton groups); one more item touches
     # a disjoint resource and first-fits into group 0, giving it 2 items so
@@ -999,7 +999,7 @@ async def test_build_quick_start_goal_end_to_end_from_real_db_macro_waves(db):
     assert "macro-wave" in goal
     assert "Wave 1" in goal
     for iid in ids:
-        assert goal.count(iid) == 1
+        assert goal.count(iid) == 2  # manifest + presentation prose
 
 
 # --- 5. _requested_macro_wave_count_from_settings ----------------------------
