@@ -77,10 +77,29 @@ def _has_option(args: list[str], name: str) -> bool:
     return any(arg == name or arg.startswith(name + "=") for arg in args)
 
 
+def _without_verbosity_args(args: list[str]) -> list[str]:
+    """Strip ``-q``/``--quiet``/``-v``/``--verbose`` before the collect-only
+    preflight appends its own single ``-q``.
+
+    Every caller in this repo already passes its own ``-q`` (matching this
+    repo's pytest-invocation convention), so appending another ``-q``
+    on top produced pytest verbosity -2, not -1. At -2, pytest's terminal
+    reporter switches ``--collect-only`` to a per-file "path: count" summary
+    with NO final "N tests collected" line at all -- confirmed live: this
+    silently broke every ``pixi run test``/``test-cov`` invocation (local
+    and CI) with ``Could not determine collected test count``, which blocked
+    the dev->main auto-promote deploy pipeline outright. Stripping any
+    caller-supplied verbosity flags here guarantees the preflight always
+    runs at exactly one ``-q`` (verbosity -1), independent of the caller's
+    own flags, so its output format is deterministic and parseable.
+    """
+    return [arg for arg in args if arg not in ("-q", "--quiet", "-v", "--verbose")]
+
+
 def collect_count(args: list[str]) -> tuple[int | None, int]:
     """Collect tests once, returning ``(count, pytest_exit_code)``."""
 
-    collect_args = _without_xdist_args(args)
+    collect_args = _without_verbosity_args(_without_xdist_args(args))
     collect_args.extend(["--collect-only", "-q", "-p", "no:xdist"])
     completed = subprocess.run(
         [sys.executable, "-m", "pytest", *collect_args],
