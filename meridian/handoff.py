@@ -40,6 +40,7 @@ from . import db as db_module
 from . import docx_integrity_gate as docx_integrity_gate_module
 from . import executor_contract as executor_contract_module
 from . import pointers as pointers_module
+from . import tool_discovery as tool_discovery_module
 from . import tool_requirements as tool_requirements_module
 from .db.sprint_items import (
     _is_deferred,
@@ -3430,6 +3431,23 @@ def build_item_briefing(
             "<tool_requirements>"
             + _xml_escape(tool_requirements_module.canonical_json(_tool_requirements))
             + "</tool_requirements>"
+        )
+    # 86b36617 — the COMPILED ToolSearch-style discovery request for this
+    # item's tool_requirements: which query to issue (select:<name> plus a
+    # keyword fallback), batched per server_or_namespace, and each entry's
+    # declared fallback chain rendered EXPLICITLY (not left for the executor
+    # to infer from <tool_requirements> prose). Pure/sync — no DB, so this
+    # never needs the item's live availability/receipt state (that lives on
+    # executor_contract.build_executor_contract's async `tool_discovery`
+    # field instead). Rendered only when there is something to compile —
+    # mirrors <tool_requirements>'s own "no tag when nothing declared"
+    # restraint.
+    _discovery_request = tool_discovery_module.compile_discovery_request(item)
+    if _discovery_request["requested"]:
+        parts.append(
+            "<tool_discovery_request>"
+            + _xml_escape(json.dumps(_discovery_request, sort_keys=True))
+            + "</tool_discovery_request>"
         )
     # 2f9cb288 (665 follow-up) — typed artifact declaration contract: only
     # rendered when the item actually declares SOMETHING (mirrors
