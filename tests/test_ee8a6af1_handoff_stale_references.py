@@ -20,8 +20,24 @@ Covers:
   - The three transports that catch HandoffEvidenceRequired (mcp/handler.py,
     mcp/stdio_handler.py, routes/handoff.py) get the same structured-refusal
     treatment for HandoffStaleReferenceError (error code "STALE_REFERENCE").
+
+ffd7269c adds a GENERATED-BOARD matrix (deterministically seeded, not
+hand-picked single cases) proving the security-critical invariant named in
+that sprint item's acceptance criteria: no mode (goal/starter/full/delta)
+can ever emit an executable, token-bound body from a board containing a
+stale (missing), foreign-project, or merged-away dependency reference —
+regardless of how many OTHER items on the same board are perfectly valid
+(same-version, cross-version, or dependency-free) — and a clean board
+(including legitimate cross-version edges) always mints a genuine,
+independently-verifiable provenance token for every mode. It also proves
+'planner' mode structurally never emits a <goal_token> at all (it is not a
+token-bound executor body to begin with), so the invariant holds for that
+mode by construction rather than by an exception path.
 """
 from __future__ import annotations
+
+import random
+import re
 
 import pytest
 
@@ -366,3 +382,209 @@ def test_routes_handoff_endpoint_returns_structured_422(client):
     assert detail["error"] == "STALE_REFERENCE"
     assert detail["project_id"] == pid
     assert detail["stale_references"][0]["reason"] == "missing"
+
+
+# ---------------------------------------------------------------------------
+# ffd7269c — generated-board matrix. Deterministically seeded (not hand-
+# picked) board topologies, exercising every dependency-role category named
+# in the sprint item's acceptance criteria (stale/missing, foreign-project,
+# merged-away, valid same-version, valid cross-version, none) in
+# combination on a SINGLE board, across every executable mode.
+# ---------------------------------------------------------------------------
+
+_TOKEN_RE = re.compile(r"<goal_token>([^<]+)</goal_token>")
+
+
+def _extract_token(text: str) -> str | None:
+    m = _TOKEN_RE.search(text or "")
+    return m.group(1).strip() if m else None
+
+
+async def _count_handoff_tokens(db, project_id: str) -> int:
+    async with db.execute(
+        "SELECT COUNT(*) AS c FROM handoff_tokens WHERE project_id = ?",
+        (project_id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return 0
+    return row["c"] if isinstance(row, dict) else row[0]
+
+
+# Every dependency role a generated item can be assigned. "stale" roles
+# (ghost/foreign/merged_away) must ALWAYS block every mode; the rest must
+# never block on their own.
+_DEP_ROLES = (
+    "none",
+    "valid_same_version",
+    "valid_cross_version",
+    "ghost",
+    "foreign",
+    "merged_away",
+)
+_STALE_ROLES = {"ghost", "foreign", "merged_away"}
+
+
+async def _build_generated_board(
+    db, rng: random.Random, home_pid: str, foreign_pid: str, size: int,
+) -> tuple[list[dict[str, str]], bool]:
+    """Populate ``home_pid`` with ``size`` randomly-roled dependent items on
+    top of four fixed anchors (v1-valid, v2-valid, a merged-away source, and
+    a real item that lives entirely in a different project). Returns
+    ``(items, expected_stale)``.
+    """
+    anchor_v1 = await db_module.add_sprint_item(db, home_pid, "v1", "anchor v1")
+    anchor_v2 = await db_module.add_sprint_item(db, home_pid, "v2", "anchor v2")
+    merged_source = await db_module.add_sprint_item(db, home_pid, "v1", "will be merged")
+    await db_module.merge_sprint_items(db, home_pid, [merged_source["id"]], "merge survivor")
+    foreign_item = await db_module.add_sprint_item(db, foreign_pid, "v1", "lives in another project")
+
+    items: list[dict[str, str]] = []
+    expected_stale = False
+    for i in range(size):
+        role = rng.choice(_DEP_ROLES)
+        version = rng.choice(["v1", "v2"])
+        depends_on: str | None
+        if role == "none":
+            depends_on = None
+        elif role == "valid_same_version":
+            depends_on = anchor_v1["id"] if version == "v1" else anchor_v2["id"]
+        elif role == "valid_cross_version":
+            # Deliberately mismatched bucket: a live, real, project-local
+            # dependency in a DIFFERENT version than the item itself — a
+            # legitimate external edge, not staleness (ee8a6af1's own
+            # distinction between project-wide identity and version-scoped
+            # executable view).
+            depends_on = anchor_v2["id"] if version == "v1" else anchor_v1["id"]
+        elif role == "ghost":
+            depends_on = f"ghost-{rng.randrange(10**9)}"
+            expected_stale = True
+        elif role == "foreign":
+            depends_on = foreign_item["id"]
+            expected_stale = True
+        else:  # merged_away
+            depends_on = merged_source["id"]
+            expected_stale = True
+        # force=True: the generated titles ("generated item N role=...")
+        # deliberately share most of their words across the board (only the
+        # index/role token differs), which trips add_sprint_item's near-
+        # duplicate-title guard (b0d42ef6, >=60% word-set overlap) — a real
+        # guard worth having for human-authored titles, but not the thing
+        # this generator is exercising, so bypass it explicitly rather than
+        # contort the titles into artificial uniqueness.
+        item = await db_module.add_sprint_item(
+            db, home_pid, version, f"generated item {i} role={role}",
+            depends_on=depends_on, force=True,
+        )
+        items.append({"id": item["id"], "role": role, "version": version})
+    return items, expected_stale
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("board_seed", range(8))
+async def test_generated_board_matrix_no_mode_leaks_token_bound_body_from_bad_state(
+    db, tmp_path, board_seed,
+):
+    """The core security invariant, proved over generated (not hand-picked)
+    board topologies: whatever mix of none/valid-same-version/valid-cross-
+    version/ghost/foreign/merged-away dependency roles a board happens to
+    have, EVERY executable mode (goal/starter/full/delta) must:
+
+    * refuse outright (HandoffStaleReferenceError), write NOTHING to disk,
+      and mint NO new handoff_tokens row, whenever ANY item on the board has
+      a stale/foreign/merged-away dependency — even when most other items
+      on the same board are perfectly valid (mixed state, not all-bad); and
+    * otherwise succeed with non-empty content and a genuine, independently
+      verifiable provenance token, including when the only "unusual" edges
+      are legitimate cross-version dependencies within the same project.
+    """
+    rng = random.Random(20260805_000 + board_seed)  # fixed seed -> deterministic
+    home_pid = await _project(db, f"generated-board-home-{board_seed}")
+    foreign_pid = await _project(db, f"generated-board-foreign-{board_seed}")
+    size = rng.randint(2, 6)
+    _items, expected_stale = await _build_generated_board(
+        db, rng, home_pid, foreign_pid, size,
+    )
+
+    for mode in ("goal", "starter", "full", "delta"):
+        out_dir = tmp_path / f"seed{board_seed}-{mode}"
+        out_dir.mkdir()
+        tokens_before = await _count_handoff_tokens(db, home_pid)
+
+        if expected_stale:
+            with pytest.raises(handoff_module.HandoffStaleReferenceError) as excinfo:
+                await handoff_module.generate_handoff(
+                    db, home_pid, str(out_dir), skip_ai_summary=True, mode=mode,
+                )
+            assert excinfo.value.project_id == home_pid
+            assert excinfo.value.stale_references, "must report WHICH edges are stale"
+            assert list(out_dir.iterdir()) == [], (
+                f"mode={mode} must write nothing to disk on refusal"
+            )
+            tokens_after = await _count_handoff_tokens(db, home_pid)
+            assert tokens_after == tokens_before, (
+                f"mode={mode} must mint NO provenance token for a refused handoff "
+                f"(board_seed={board_seed}, size={size})"
+            )
+        else:
+            _path, content, _amended = await handoff_module.generate_handoff(
+                db, home_pid, str(out_dir), skip_ai_summary=True, mode=mode,
+            )
+            assert content, f"mode={mode} must render on a clean board"
+            token = _extract_token(content)
+            assert token, (
+                f"mode={mode} must embed a genuine provenance token on a clean "
+                f"board (board_seed={board_seed}, size={size})"
+            )
+            verify = await handoff_module.verify_handoff_token(db, token, home_pid)
+            assert verify == {"valid": True, "reason": "ok"}, (
+                f"mode={mode}'s minted token must be genuine and scoped to "
+                f"this exact project: {verify}"
+            )
+
+
+@pytest.mark.asyncio
+async def test_planner_mode_never_emits_token_bound_body_even_with_stale_references(
+    db, tmp_path,
+):
+    """Planner mode is deliberately EXCLUDED from the stale-reference check
+    (it is a directive planning-session prompt, not an executor /goal — see
+    HandoffStaleReferenceError's own docstring and
+    test_generate_handoff_stale_reference_blocks_every_mode above). That
+    exclusion is only safe because planner mode structurally never produces
+    a token-bound executable body in the first place: prove it directly,
+    on a board that WOULD block every other mode, so the invariant "no mode
+    can emit an executable token-bound body from stale state" is verified
+    for planner by construction (no token ever minted) rather than merely
+    assumed from the fact that it is untested here.
+    """
+    pid = await _project(db, "stale-ref-planner-no-token")
+    await db_module.add_sprint_item(
+        db, pid, "v1", "child of a ghost", depends_on="ghost-item-id-does-not-exist",
+    )
+
+    tokens_before = await _count_handoff_tokens(db, pid)
+    _path, content, _amended = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="planner",
+    )
+    assert content
+    assert _extract_token(content) is None, (
+        "planner mode must never embed a <goal_token> — it is not an "
+        "executable, token-bound body"
+    )
+    tokens_after = await _count_handoff_tokens(db, pid)
+    assert tokens_after == tokens_before, (
+        "planner mode must never mint a provenance token, stale board or not"
+    )
+
+    # And every OTHER mode on this exact same (still-stale) board still
+    # refuses outright, confirming planner's silence is a structural
+    # property of that mode, not evidence the stale-reference check itself
+    # was accidentally weakened.
+    for mode in ("goal", "starter", "full", "delta"):
+        out_dir = tmp_path / f"planner-contrast-{mode}"
+        out_dir.mkdir()
+        with pytest.raises(handoff_module.HandoffStaleReferenceError):
+            await handoff_module.generate_handoff(
+                db, pid, str(out_dir), skip_ai_summary=True, mode=mode,
+            )
