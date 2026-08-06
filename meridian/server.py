@@ -4005,6 +4005,18 @@ async def mcp_tools_doc() -> str:
         "Bulk-insert sprint items in one call — lets an orchestrator LLM decompose a goal "
         "into parallel work items without N sequential `add_sprint_item` calls. Pass a list "
         "of `{title, description?, group?, version?}` dicts; returns the list of new item IDs.")
+    lines += _render_tool("execute_batch",
+        "Run a homogeneous batch of sprint-management writes (sprint item creates/updates, "
+        "pointer creates, note creates) with real atomic-or-independent semantics: "
+        "`mode='all_or_nothing'` validates every entry before mutating anything and rolls "
+        "back everything already written if a later entry fails; `mode='best_effort'` "
+        "processes each entry independently. Both `mode` and `idempotency_key` are REQUIRED "
+        "on every call — a retried call with the same `(project_id, operation, "
+        "idempotency_key)` replays the first call's result instead of re-executing. Every "
+        "entry's outcome (`ok` | `error` | `rolled_back` | `not_attempted`) comes back in "
+        "input order so a caller never has to guess whether a partial write happened. Also "
+        "available over HTTP as `POST /projects/{project_id}/sprint-batch` with the "
+        "identical request/response shape.")
     lines += _render_tool("get_planning_brief",
         "Read-only: Return a compact planning context (sprint, north star, pending items, "
         "in-progress items, recent tasks, active sessions, recent decisions, pending HITLs). "

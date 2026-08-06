@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **158 tools** over MCP.
+Meridian exposes **159 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -510,6 +510,28 @@ Bulk-insert sprint items in one call — lets an orchestrator LLM decompose a go
 **Example:**
 ```
 fan_out_sprint_items(project_id="abc-123", items=[{"title": "Design DB schema", "group": "backend"}, {"title": "Build API endpoints", "group": "backend"}, {"title": "Wire up frontend", "group": "frontend"}])
+```
+
+---
+
+
+### `execute_batch`
+Run a homogeneous batch of sprint-management writes (sprint item creates/updates, pointer creates, note creates) with real atomic-or-independent semantics: `mode='all_or_nothing'` validates every entry before mutating anything and rolls back everything already written if a later entry fails; `mode='best_effort'` processes each entry independently. Both `mode` and `idempotency_key` are REQUIRED on every call — a retried call with the same `(project_id, operation, idempotency_key)` replays the first call's result instead of re-executing. Every entry's outcome (`ok` | `error` | `rolled_back` | `not_attempted`) comes back in input order so a caller never has to guess whether a partial write happened. Also available over HTTP as `POST /projects/{project_id}/sprint-batch` with the identical request/response shape.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `project_id` | string | optional |  |
+| `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
+| `operation` | string | required | Stable operation name selecting the entry shape and forced per-entry action (sprint_items=create, item_updates=update). See the tool description for each shape. |
+| `entries` | array | required | Non-empty list of entry objects, ALL matching the chosen operation's shape. Each entry may carry an optional 'correlation_key' string echoed back on its result. |
+| `mode` | string | required | REQUIRED — no default. 'all_or_nothing': validate-then-mutate with compensating rollback on any mutation failure. 'best_effort': every entry processed independently. |
+| `idempotency_key` | string | required | REQUIRED key (value may be null or "" to explicitly opt out). A retried call with the same (project_id, operation, idempotency_key) replays the first call's stored result instead of re-executing. |
+| `session_id` | string | optional | Batch-level default session_id used by 'notes' entries that omit their own session_id. |
+| `max_entries` | integer | optional | Optional cap on len(entries) for this call (default 100). Exceeding it rejects the whole call before anything is attempted. |
+
+**Example:**
+```
+execute_batch(project_id="abc-123", operation="sprint_items", entries=[{"title": "Add rate limiting", "correlation_key": "a"}, {"title": "Add retry backoff", "correlation_key": "b"}], mode="all_or_nothing", idempotency_key="my-2026-08-05-batch-1")
 ```
 
 ---

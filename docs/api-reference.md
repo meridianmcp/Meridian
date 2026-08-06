@@ -1051,6 +1051,7 @@ No auth required.
 | `GET` | `/projects/{project_id}/settings` | Return persisted per-project dashboard settings |
 | `PATCH` | `/projects/{project_id}/settings` | Update persisted per-project dashboard settings |
 | `GET` | `/projects/{project_id}/slot-readiness` | Probe whether the code/Serena tunnel slot is ready for this project |
+| `POST` | `/projects/{project_id}/sprint-batch` | Run a homogeneous batch of sprint-management writes |
 | `GET` | `/projects/{project_id}/sprint-items` | List sprint items, optionally filtered by status |
 | `POST` | `/projects/{project_id}/sprint-items` | Append a todo sprint item. Body: ``{version, title, group?, human_id?}`` |
 | `DELETE` | `/projects/{project_id}/sprint-items/{item_id}` | Delete a sprint item permanently |

@@ -1881,6 +1881,58 @@ async def handle_delete_sprint_item_pointer(
     return {"pointer_id": args["pointer_id"], "deleted": removed}
 
 
+async def handle_execute_batch(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: execute_batch.
+
+    627187b8 — multi-transport exposure of meridian.db.batch_management's
+    shared batch engine (86e4ae44). All request-shape validation (operation/
+    mode/idempotency_key) and the operation-name -> entry_kind translation
+    live in meridian.batch_ops, shared verbatim with the HTTP route
+    (meridian/routes/sprint.py's execute_batch_endpoint) and the stdio
+    transport (which routes this exact tool name through the same
+    _dispatch_mcp_tool -> _handle_sprint_tools path handler.py uses) — so all
+    three transports can never advertise or execute divergent semantics.
+    """
+    from ... import batch_ops  # noqa: PLC0415
+
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    try:
+        batch_ops.validate_batch_request_shape(args)
+    except batch_ops.BatchRequestError as exc:
+        return {"error": str(exc)}
+    entries = args.get("entries") or []
+    validate_input_size(json.dumps(entries, default=str), "batch entries", 2_000_000)
+    max_entries_raw = args.get("max_entries")
+    try:
+        max_entries = (
+            int(max_entries_raw) if max_entries_raw else batch_ops.DEFAULT_MAX_BATCH_ENTRIES
+        )
+    except (TypeError, ValueError):
+        return {"error": "max_entries must be an integer"}
+    try:
+        return await batch_ops.execute_batch_operation(
+            db,
+            project_id=args["project_id"],
+            operation=args["operation"],
+            entries=entries,
+            mode=args["mode"],
+            idempotency_key=args.get("idempotency_key") or None,
+            tenant_id=_mcp_tenant_id,
+            actor=args.get("session_id"),
+            session_id=args.get("session_id"),
+            max_entries=max_entries,
+        )
+    except (batch_ops.BatchRequestError, batch_ops.batch_management.BatchEngineError) as exc:
+        return {"error": str(exc)}
+
+
 async def handle_complete_wave_gate(
     args: dict[str, Any],
     db: Any,

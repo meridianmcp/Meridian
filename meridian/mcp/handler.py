@@ -3969,7 +3969,7 @@ async def _handle_sprint_tools(
     analyze_sprint, claim_sprint_item, claim_parallel_batch, add_subtask, split_sprint_item,
     merge_sprint_items, complete_sprint_item, add_sprint_item_pointer,
     get_sprint_item_pointers, resolve_sprint_item_pointers,
-    delete_sprint_item_pointer, complete_wave_gate, configure_wave_gate,
+    delete_sprint_item_pointer, execute_batch, complete_wave_gate, configure_wave_gate,
     start_wave_run, finalize_wave_run, resume_wave.
 
     ba4f879b — the original if/elif chain has been replaced with a per-tool
@@ -4001,6 +4001,7 @@ async def _handle_sprint_tools(
         handle_get_sprint_item_pointers,
         handle_resolve_sprint_item_pointers,
         handle_delete_sprint_item_pointer,
+        handle_execute_batch,
         handle_complete_wave_gate,
         handle_configure_wave_gate,
         handle_start_wave_run,
@@ -4030,6 +4031,7 @@ async def _handle_sprint_tools(
         "get_sprint_item_pointers": handle_get_sprint_item_pointers,
         "resolve_sprint_item_pointers": handle_resolve_sprint_item_pointers,
         "delete_sprint_item_pointer": handle_delete_sprint_item_pointer,
+        "execute_batch": handle_execute_batch,
         "complete_wave_gate": handle_complete_wave_gate,
         "configure_wave_gate": handle_configure_wave_gate,
         "start_wave_run": handle_start_wave_run,

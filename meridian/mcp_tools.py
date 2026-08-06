@@ -60,6 +60,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_sprint_item_pointers": 'get_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "delete_sprint_item_pointer": 'delete_sprint_item_pointer(pointer_id="pointer-uuid")',
+    "execute_batch": 'execute_batch(project_id="abc-123", operation="sprint_items", entries=[{"title": "Add rate limiting", "correlation_key": "a"}, {"title": "Add retry backoff", "correlation_key": "b"}], mode="all_or_nothing", idempotency_key="my-2026-08-05-batch-1")',
     "get_notes": 'get_notes(project_id="abc-123")',
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
@@ -1364,6 +1365,61 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "pointer_id": {"type": "string", "description": "The id of the pointer to delete."}},
          "required": ["pointer_id"]}},
+    {"name": "execute_batch", "description":
+        "627187b8 — run a HOMOGENEOUS batch of management writes (all entries the "
+        "SAME operation) with real atomic-or-independent semantics. Every entry in "
+        "``entries`` is validated and reported individually — no guessing whether a "
+        "partial write happened. operation selects the entry shape:\n"
+        "• sprint_items — create new sprint items. Each entry needs a non-empty "
+        "'title' plus any add_sprint_item kwarg (version, group, human_id, "
+        "depends_on, priority, touches_resources, ...). Every entry's own 'action' "
+        "(if present) must be 'create'.\n"
+        "• item_updates — patch existing sprint items. Each entry needs a non-empty "
+        "'item_id' plus at least one patch_sprint_item field to change (title, "
+        "status, notes, priority, ...). Every entry's own 'action' (if present) "
+        "must be 'update'.\n"
+        "• pointers — attach generic pointers (see add_sprint_item_pointer). Each "
+        "entry needs 'sprint_item_id', 'source_type', 'targets' (+ optional "
+        "'label').\n"
+        "• notes — file sprint notes (see add_sprint_note). Each entry needs "
+        "'title' and 'body' (+ optional 'session_id' — falls back to this call's "
+        "own top-level session_id when omitted — and 'note_kind').\n"
+        "Any entry MAY carry a 'correlation_key' (any non-empty string) echoed "
+        "back on its result for reconciliation; every result also carries its "
+        "0-based input 'index' regardless.\n"
+        "mode is REQUIRED and controls failure semantics: 'all_or_nothing' "
+        "validates every entry BEFORE mutating anything — if any entry fails "
+        "validation, NOTHING is written (status 'rejected'); if a mutation fails "
+        "partway through, every entry this call already wrote is rolled back via "
+        "a compensating delete/revert (status 'failed'). 'best_effort' processes "
+        "each entry independently — one entry's failure never blocks the others "
+        "(status 'ok' | 'partial' | 'failed' depending on how many succeeded).\n"
+        "idempotency_key is REQUIRED (pass null or \"\" to explicitly opt out of "
+        "idempotency protection for this call) — a retried call with the identical "
+        "(project_id, operation, idempotency_key) tuple returns the FIRST call's "
+        "stored result verbatim (idempotent_replay:true) instead of re-executing, "
+        "making retries safe even for all_or_nothing batches that already wrote "
+        "and rolled back once.\n"
+        "Returns {status, mode, entry_kind, operation, project_id, idempotency_key, "
+        "idempotent_replay, created_count, error_count, results:[{index, "
+        "correlation_key, status, id, outcome, error_code, error_message, "
+        "retryable}]} — results is ALWAYS in input order regardless of processing "
+        "order. Each result status is 'ok' (mutated), 'error' (validation or "
+        "mutation failure — see error_code/error_message/retryable), "
+        "'rolled_back' (succeeded, then undone by a later all_or_nothing failure), "
+        "or 'not_attempted' (never reached because an earlier entry aborted the "
+        "batch). max_entries caps this call (default 100); exceeding it is "
+        "rejected before anything is attempted.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "operation": {"type": "string", "enum": ["sprint_items", "item_updates", "pointers", "notes"], "description": "Stable operation name selecting the entry shape and forced per-entry action (sprint_items=create, item_updates=update). See the tool description for each shape."},
+         "entries": {"type": "array", "description": "Non-empty list of entry objects, ALL matching the chosen operation's shape. Each entry may carry an optional 'correlation_key' string echoed back on its result.", "items": {"type": "object"}},
+         "mode": {"type": "string", "enum": ["all_or_nothing", "best_effort"], "description": "REQUIRED — no default. 'all_or_nothing': validate-then-mutate with compensating rollback on any mutation failure. 'best_effort': every entry processed independently."},
+         "idempotency_key": {"type": "string", "description": "REQUIRED key (value may be null or \"\" to explicitly opt out). A retried call with the same (project_id, operation, idempotency_key) replays the first call's stored result instead of re-executing."},
+         "session_id": {"type": "string", "description": "Batch-level default session_id used by 'notes' entries that omit their own session_id."},
+         "max_entries": {"type": "integer", "description": "Optional cap on len(entries) for this call (default 100). Exceeding it rejects the whole call before anything is attempted."}},
+         "required": ["operation", "entries", "mode", "idempotency_key"]}},
     {"name": "add_insight", "description":
         "Record a durable STRATEGIC INSIGHT — accumulated understanding that generates future "
         "decisions. A first-class knowledge type SEPARATE from decisions (choices with a "
@@ -2902,6 +2958,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_sprint_item_pointers":      "sprint-management",
     "resolve_sprint_item_pointers":  "sprint-management",
     "delete_sprint_item_pointer":    "sprint-management",
+    "execute_batch":                 "sprint-management",
     # project CRUD
     "create_project":      "project",
     "set_parent_project":  "project",
@@ -3045,6 +3102,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_sprint_item_pointers":      "both",
     "resolve_sprint_item_pointers":  "both",
     "delete_sprint_item_pointer":    "executor",
+    "execute_batch":                 "both",
     "claim_file":                "executor",
     "release_file":              "executor",
     "get_file_claims":           "executor",
@@ -3259,6 +3317,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "merge_sprint_items":         "common-support",
     "split_sprint_item":          "common-support",
     "add_sprint_item_pointer":    "common-support",
+    "execute_batch":              "common-support",
     "update_sprint_item":         "common-support",
     # notes / knowledge (regular lookups)
     "log_task":                   "common-support",
