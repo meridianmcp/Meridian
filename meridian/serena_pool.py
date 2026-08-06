@@ -99,6 +99,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from . import process_budget as _process_budget
+
 # Routing header: the executor's MCP client sets this to the repo it is working
 # in; the server forwards it and the tunnel relay uses it to pick the daemon.
 REPO_PATH_HEADER = "x-meridian-repo-path"
@@ -586,6 +588,11 @@ class SerenaDaemonPool:
         self._quarantine_cooldown_seconds = quarantine_cooldown_seconds
         self._adopt_failures: dict[str, int] = {}
         self._quarantine_until: dict[str, float] = {}
+        # 9c8336c4 — one ProcessBudgetMonitor per repo_path key, created
+        # lazily on first check_budgets() call. Only ever tracks OWNED
+        # daemons (see check_budgets) — an adopted/leased daemon belongs to
+        # a sibling pool's own registry, not this one's.
+        self._budget_monitors: "dict[str, _process_budget.ProcessBudgetMonitor]" = {}
 
     @staticmethod
     def _normalize(repo_path: str) -> str:
@@ -979,6 +986,69 @@ class SerenaDaemonPool:
                 "idle_seconds": daemon.idle_seconds(when),
             })
         return out
+
+    # ── host-local memory/CPU budgets (9c8336c4) ────────────────────────────
+
+    def check_budgets(
+        self,
+        budget: "_process_budget.ProcessBudget | None" = None,
+        *,
+        sampler: "Callable[[int], Any] | None" = None,
+        on_terminate: "Callable[[dict[str, Any]], None] | None" = None,
+    ) -> "list[_process_budget.BudgetReport]":
+        """Sample and enforce a host-local memory/CPU budget against every
+        daemon THIS pool OWNS (spawned itself).
+
+        An adopted/leased daemon (``daemon.owned is False``) is never
+        checked here — it belongs to a sibling pool's own registry and
+        this pool has no OS-level authority to throttle or kill it. This is
+        the "only processes proven owned ... may be throttled or
+        terminated" rule from the sprint notes, enforced structurally
+        rather than by a runtime check.
+
+        Opt-in: never invoked automatically by :meth:`get_or_spawn` /
+        :meth:`reap_idle` / :meth:`shutdown` — a caller (the tunnel's
+        periodic loop) calls this on its own cadence. Returns one
+        :class:`process_budget.BudgetReport` per checked daemon so a caller
+        can log/aggregate; a daemon whose report action is ``"kill"`` is
+        released through the existing broker-aware :meth:`_release_daemon`
+        path (so a still-leased-by-a-sibling daemon is correctly left
+        running even if THIS pool's budget considers it over-budget — the
+        sibling's lease wins, matching every other release path in this
+        module) and removed from local tracking.
+
+        ``on_terminate``, if given, mirrors :meth:`reap_idle`'s own
+        callback shape — called once per daemon this pool actually
+        terminates, with ``{repo_path, port, pid, reason: "budget_exceeded"}``.
+        """
+        cfg = budget or _process_budget.load_host_budget_config()
+        if not cfg.enabled:
+            return []
+        reports: "list[_process_budget.BudgetReport]" = []
+        for key, daemon in list(self._daemons.items()):
+            if not daemon.owned or daemon.pid is None:
+                continue
+            monitor = self._budget_monitors.get(key)
+            if monitor is None:
+                monitor = _process_budget.ProcessBudgetMonitor(f"serena:{key}", cfg)
+                self._budget_monitors[key] = monitor
+            sample = _process_budget.sample_process(daemon.pid, proc_factory=sampler)
+            report = monitor.evaluate(daemon.pid, sample)
+            if report.action == "kill":
+                pid = daemon.pid
+                port = daemon.port
+                del self._daemons[key]
+                terminated = self._release_daemon(key, daemon)
+                monitor.record_kill_outcome(survived=not terminated)
+                if terminated:
+                    self._budget_monitors.pop(key, None)
+                    if on_terminate is not None:
+                        on_terminate({
+                            "repo_path": key, "port": port, "pid": pid,
+                            "reason": "budget_exceeded",
+                        })
+            reports.append(report)
+        return reports
 
     def __len__(self) -> int:
         return len(self._daemons)

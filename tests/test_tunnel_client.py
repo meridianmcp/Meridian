@@ -3113,6 +3113,253 @@ def test_proc_watchdog_healthy_tick_resets_failure_streak(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 9c8336c4 — host-local memory/CPU budgets + quarantine for owned processes
+# ---------------------------------------------------------------------------
+
+
+class _FakeOwnedProc:
+    """Minimal Popen stand-in used by the owned-lifecycle spawn tests."""
+    def __init__(self, pid=54321):
+        self.pid = pid
+    def poll(self):
+        return None  # alive
+
+
+def test_slot_proxy_use_owned_lifecycle_defaults_false():
+    """A slot built the old way keeps the pre-9c8336c4 behaviour — the owned
+    lifecycle path is strictly opt-in, same contract as reuse_existing."""
+    proxy = tc.SlotProxy(["cmd"], 9400, "fs")
+    assert proxy.use_owned_lifecycle is False
+    assert proxy.owned_handle is None
+
+
+def test_ensure_running_owned_lifecycle_spawns_via_owned_backend(monkeypatch):
+    """use_owned_lifecycle=True routes ensure_running through
+    _spawn_owned_with_cache_retry and captures the returned handle onto
+    proxy.owned_handle, instead of the plain _spawn_with_cache_retry path."""
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    fake_handle = object()
+    calls = []
+
+    def fake_spawn_owned(cmd, env, label, diagnostics=None):
+        calls.append((cmd, label))
+        return _FakeOwnedProc(), fake_handle
+
+    monkeypatch.setattr(tc, "_spawn_owned_with_cache_retry", fake_spawn_owned)
+    monkeypatch.setattr(
+        tc, "_spawn_with_cache_retry",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("plain spawn path must not run")),
+    )
+
+    proxy = tc.SlotProxy(
+        ["mcp-proxy", "--port", "9401"], 9401, "owned-test",
+        use_owned_lifecycle=True,
+    )
+    _run_sync(_run_ensure(proxy))
+
+    assert len(calls) == 1
+    assert proxy.owned_handle is fake_handle
+    assert proxy.is_running
+
+
+def test_ensure_running_non_owned_lifecycle_never_sets_owned_handle(monkeypatch):
+    """Every existing (non-opted-in) slot must never end up with an
+    owned_handle — the owned path is additive, not a silent default change."""
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _FakeOwnedProc())
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9402"], 9402, "plain-test")
+    _run_sync(_run_ensure(proxy))
+
+    assert proxy.owned_handle is None
+    assert proxy.is_running
+
+
+def test_kill_with_owned_handle_uses_close_owned_process(monkeypatch):
+    """kill() on a slot holding an owned_handle tears down via
+    _close_owned_process (whole job/process-group tree) instead of
+    _terminate_proc_tree, clears owned_handle, and returns that call's
+    confirmed-gone bool."""
+    proxy = tc.SlotProxy(["cmd"], 9403, "owned-kill-test", use_owned_lifecycle=True)
+    proxy._proc = _FakeOwnedProc()
+    proxy.holder["proc"] = proxy._proc
+    fake_handle = object()
+    proxy.owned_handle = fake_handle
+
+    close_calls = []
+    monkeypatch.setattr(tc, "_close_owned_process", lambda h, **kw: close_calls.append(h) or True)
+    monkeypatch.setattr(
+        tc, "_terminate_proc_tree",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not use the non-owned teardown path")),
+    )
+    monkeypatch.setattr(tc, "_clear_slot_claim", lambda *a, **kw: None)
+
+    result = proxy.kill(reason="budget_quarantined")
+
+    assert close_calls == [fake_handle]
+    assert proxy.owned_handle is None
+    assert proxy._proc is None
+    assert result is True
+    assert proxy.diagnostics.state == tc.SlotState.QUARANTINED
+
+
+def test_kill_without_owned_handle_uses_terminate_proc_tree(monkeypatch):
+    """Backward compatibility: a slot that never opted into the owned
+    lifecycle keeps tearing down via _terminate_proc_tree and kill() returns
+    None (no confirmation available for that path)."""
+    proxy = tc.SlotProxy(["cmd"], 9404, "plain-kill-test")
+    proxy._proc = _FakeOwnedProc()
+    proxy.holder["proc"] = proxy._proc
+
+    terminate_calls = []
+    monkeypatch.setattr(tc, "_terminate_proc_tree", lambda proc: terminate_calls.append(proc))
+    monkeypatch.setattr(tc, "_clear_slot_claim", lambda *a, **kw: None)
+
+    result = proxy.kill()
+
+    assert len(terminate_calls) == 1
+    assert result is None
+    assert proxy._proc is None
+
+
+def _budget_breaching_sample(pid):
+    return tc._process_budget.BudgetSample(pid=pid, sample_time=1.0, current_bytes=10**10)
+
+
+def _budget_healthy_sample(pid):
+    return tc._process_budget.BudgetSample(pid=pid, sample_time=1.0, current_bytes=100)
+
+
+def test_budget_watchdog_noop_without_owned_handle(monkeypatch):
+    """No owned_handle (every slot that never opted in) — the watchdog never
+    samples or acts, every tick."""
+    proxy = tc.SlotProxy(["cmd"], 9405, "no-handle-test")
+
+    sample_calls = []
+    monkeypatch.setattr(
+        tc._process_budget, "sample_process",
+        lambda pid, **kw: sample_calls.append(pid) or _budget_healthy_sample(pid),
+    )
+
+    async def fake_sleep(_d):
+        raise _StopLoop()
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    cfg = tc._process_budget.ProcessBudget(enabled=True, sample_interval_seconds=0)
+    try:
+        asyncio.run(tc._budget_watchdog(proxy, budget=cfg))
+    except _StopLoop:
+        pass
+
+    assert sample_calls == []
+
+
+def test_budget_watchdog_quiesces_then_kills_over_budget_owned_process(monkeypatch):
+    proxy = tc.SlotProxy(["cmd"], 9406, "owned-budget-test", use_owned_lifecycle=True)
+    proxy._proc = _FakeOwnedProc(pid=77777)
+    proxy.holder["proc"] = proxy._proc
+    fake_handle = tc._process_lifecycle.OwnedProcessHandle(
+        run_id="r1", pid=77777, executable="x", cwd=None, cmdline=["x"],
+    )
+    proxy.owned_handle = fake_handle
+
+    monkeypatch.setattr(tc._process_budget, "sample_process", lambda pid, **kw: _budget_breaching_sample(pid))
+    monkeypatch.setattr(tc._process_lifecycle, "verify_handle_live", lambda h: True)
+
+    kill_calls = []
+    real_kill = proxy.kill
+    def spy_kill(reason="stopped"):
+        kill_calls.append(reason)
+        return real_kill(reason=reason)
+    proxy.kill = spy_kill
+    monkeypatch.setattr(tc, "_close_owned_process", lambda h, **kw: True)
+    monkeypatch.setattr(tc, "_clear_slot_claim", lambda *a, **kw: None)
+
+    calls = {"n": 0}
+    async def fake_sleep(_d):
+        calls["n"] += 1
+        if calls["n"] >= 3:  # let 2 loop bodies run (quiesce, then kill), then break
+            raise _StopLoop()
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    cfg = tc._process_budget.ProcessBudget(enabled=True, max_memory_bytes=1024, sample_interval_seconds=0)
+    try:
+        asyncio.run(tc._budget_watchdog(proxy, budget=cfg))
+    except _StopLoop:
+        pass
+
+    # First tick: quiesce warning only, nothing killed. Second tick: still
+    # breached -> forced kill.
+    assert kill_calls == ["budget_quarantined"]
+    assert proxy.owned_handle is None
+
+
+def test_budget_watchdog_healthy_process_never_killed(monkeypatch):
+    proxy = tc.SlotProxy(["cmd"], 9407, "healthy-budget-test", use_owned_lifecycle=True)
+    proxy._proc = _FakeOwnedProc(pid=88888)
+    proxy.holder["proc"] = proxy._proc
+    proxy.owned_handle = tc._process_lifecycle.OwnedProcessHandle(
+        run_id="r2", pid=88888, executable="x", cwd=None, cmdline=["x"],
+    )
+
+    monkeypatch.setattr(tc._process_budget, "sample_process", lambda pid, **kw: _budget_healthy_sample(pid))
+    monkeypatch.setattr(tc._process_lifecycle, "verify_handle_live", lambda h: True)
+
+    kill_calls = []
+    proxy.kill = lambda reason="stopped": kill_calls.append(reason)
+
+    calls = {"n": 0}
+    async def fake_sleep(_d):
+        calls["n"] += 1
+        if calls["n"] >= 4:
+            raise _StopLoop()
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    cfg = tc._process_budget.ProcessBudget(enabled=True, max_memory_bytes=1024 * 1024, sample_interval_seconds=0)
+    try:
+        asyncio.run(tc._budget_watchdog(proxy, budget=cfg))
+    except _StopLoop:
+        pass
+
+    assert kill_calls == []
+
+
+def test_budget_watchdog_disabled_budget_never_acts(monkeypatch):
+    proxy = tc.SlotProxy(["cmd"], 9408, "disabled-budget-test", use_owned_lifecycle=True)
+    proxy._proc = _FakeOwnedProc(pid=99999)
+    proxy.holder["proc"] = proxy._proc
+    proxy.owned_handle = tc._process_lifecycle.OwnedProcessHandle(
+        run_id="r3", pid=99999, executable="x", cwd=None, cmdline=["x"],
+    )
+
+    sample_calls = []
+    monkeypatch.setattr(
+        tc._process_budget, "sample_process",
+        lambda pid, **kw: sample_calls.append(pid) or _budget_breaching_sample(pid),
+    )
+
+    calls = {"n": 0}
+    async def fake_sleep(_d):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise _StopLoop()
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    cfg = tc._process_budget.ProcessBudget(enabled=False, sample_interval_seconds=0)
+    try:
+        asyncio.run(tc._budget_watchdog(proxy, budget=cfg))
+    except _StopLoop:
+        pass
+
+    assert sample_calls == []  # disabled — never even samples
+
+
+# ---------------------------------------------------------------------------
 # set_active_repo control message — pool.default_repo_path mutation
 # ---------------------------------------------------------------------------
 

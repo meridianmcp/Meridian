@@ -743,3 +743,125 @@ def test_has_live_lease_true_only_for_matching_pid_with_live_lease(tmp_path):
     assert sp.has_live_lease(broker, 4242, pid_alive=lambda pid: False) is False
     assert sp.has_live_lease(broker, 9999, pid_alive=lambda pid: True) is False
     assert sp.has_live_lease(broker / "missing", 1, pid_alive=lambda pid: True) is False
+
+
+# ── host-local memory/CPU budgets (9c8336c4) ────────────────────────────────
+
+
+def _breaching_sampler(pid):
+    """Fake psutil.Process double whose memory_info() always reports a
+    current_bytes value that exceeds any test budget below."""
+    class _Mem:
+        rss = 10 * 1024 * 1024 * 1024  # 10 GiB -- comfortably over budget
+
+    class _Proc:
+        def memory_info(self):
+            return _Mem()
+
+        def cpu_percent(self, interval=None):
+            return 0.0
+
+    return _Proc()
+
+
+def _healthy_sampler(pid):
+    class _Mem:
+        rss = 100 * 1024 * 1024  # 100 MiB -- comfortably under budget
+
+    class _Proc:
+        def memory_info(self):
+            return _Mem()
+
+        def cpu_percent(self, interval=None):
+            return 1.0
+
+    return _Proc()
+
+
+def test_check_budgets_disabled_is_a_no_op(tmp_path):
+    pool, procs, clock = _pool()
+    pool.get_or_spawn(str(tmp_path))
+    reports = pool.check_budgets(sp._process_budget.ProcessBudget(enabled=False), sampler=_breaching_sampler)
+    assert reports == []
+    assert procs[0].terminated is False
+
+
+def test_check_budgets_within_budget_takes_no_action(tmp_path):
+    pool, procs, clock = _pool()
+    pool.get_or_spawn(str(tmp_path))
+    cfg = sp._process_budget.ProcessBudget(enabled=True, max_memory_bytes=1024 * 1024 * 1024)
+    reports = pool.check_budgets(cfg, sampler=_healthy_sampler)
+    assert len(reports) == 1
+    assert reports[0].action == "none"
+    assert procs[0].terminated is False
+
+
+def test_check_budgets_quiesces_then_terminates_owned_daemon(tmp_path):
+    pool, procs, clock = _pool()
+    pool.get_or_spawn(str(tmp_path))
+    cfg = sp._process_budget.ProcessBudget(enabled=True, max_memory_bytes=1024 * 1024 * 1024)
+
+    r1 = pool.check_budgets(cfg, sampler=_breaching_sampler)
+    assert r1[0].action == "quiesce"
+    assert procs[0].terminated is False
+    assert len(pool) == 1  # not removed yet
+
+    r2 = pool.check_budgets(cfg, sampler=_breaching_sampler)
+    assert r2[0].action == "kill"
+    assert procs[0].terminated is True
+    assert len(pool) == 0  # removed from local tracking
+
+
+def test_check_budgets_never_touches_adopted_leased_daemon(tmp_path):
+    """An adopted (not-owned) daemon belongs to a sibling pool's own
+    registry -- this pool must never throttle/terminate it, matching the
+    sprint's "only processes proven owned ... may be throttled" rule."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    liveness = {}
+    pool_a, procs_a, _ = _broker_pool(tmp_path, "pool-a", 111, liveness)
+    da = pool_a.get_or_spawn(str(repo))
+
+    pool_b, procs_b, _ = _broker_pool(tmp_path, "pool-b", 222, liveness)
+    db = pool_b.get_or_spawn(str(repo))
+    assert db.owned is False
+
+    cfg = sp._process_budget.ProcessBudget(enabled=True, max_memory_bytes=1024 * 1024 * 1024)
+    # Two calls -- enough to escalate to "kill" for an OWNED daemon -- must
+    # produce zero reports against pool_b, since it owns nothing.
+    assert pool_b.check_budgets(cfg, sampler=_breaching_sampler) == []
+    assert pool_b.check_budgets(cfg, sampler=_breaching_sampler) == []
+    assert da.proc.terminated is False  # pool_a's real daemon left untouched
+
+
+def test_check_budgets_on_terminate_callback_fires_with_reason():
+    pool, procs, clock = _pool()
+    pool.get_or_spawn("/some/repo")
+    cfg = sp._process_budget.ProcessBudget(enabled=True, max_memory_bytes=1024 * 1024 * 1024)
+    pool.check_budgets(cfg, sampler=_breaching_sampler)  # quiesce
+
+    seen = []
+    pool.check_budgets(cfg, sampler=_breaching_sampler, on_terminate=lambda info: seen.append(info))
+    assert len(seen) == 1
+    assert seen[0]["reason"] == "budget_exceeded"
+    assert seen[0]["pid"] == procs[0].pid
+
+
+def test_check_budgets_spares_daemon_still_leased_by_sibling(tmp_path):
+    """A budget breach on a daemon a sibling pool still leases must not kill
+    it out from under that sibling -- same "leased daemons are never pulled
+    out" contract as reap_idle/_release_daemon."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    liveness = {}
+    pool_a, procs_a, _ = _broker_pool(tmp_path, "pool-a", 111, liveness)
+    da = pool_a.get_or_spawn(str(repo))
+    pool_b, procs_b, _ = _broker_pool(tmp_path, "pool-b", 222, liveness)
+    pool_b.get_or_spawn(str(repo))  # pool_b adopts -- now leasing it too
+
+    cfg = sp._process_budget.ProcessBudget(enabled=True, max_memory_bytes=1024 * 1024 * 1024)
+    pool_a.check_budgets(cfg, sampler=_breaching_sampler)  # quiesce
+    pool_a.check_budgets(cfg, sampler=_breaching_sampler)  # kill attempt
+
+    assert da.proc.terminated is False  # pool_b's live lease saved it
+    assert len(pool_a) == 0  # pool_a released its own local tracking regardless
