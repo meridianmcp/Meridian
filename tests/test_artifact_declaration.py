@@ -552,3 +552,271 @@ def test_mcp_update_sprint_item_rejects_secret_shaped_planned_output(client):
     }))
     assert "error" in result
     assert "secret-shaped" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# 24f5146d — planned_output.promotion: base-hash preconditions, declared
+# resource footprint, and the ONE canonical merger lock.
+# ---------------------------------------------------------------------------
+
+_SHA_A = "a" * 64
+_SHA_B = "b" * 64
+
+
+def test_normalize_promotion_none_passes_through():
+    assert ad.normalize_promotion(None) is None
+
+
+def test_normalize_promotion_accepts_valid_declaration():
+    normalized = ad.normalize_promotion({
+        "base_sha256": _SHA_A.upper(),
+        "resource_footprint": ["paraId:00AA1122", "table:2", "figure:Fig1", "media:image1.png", "part:word/document.xml"],
+        "merger_lock_key": "outputs/thesis.docx",
+    })
+    # Case-folded to canonical lowercase, mirrors normalize_artifact_kind.
+    assert normalized["base_sha256"] == _SHA_A
+    assert normalized["resource_footprint"] == [
+        "paraId:00AA1122", "table:2", "figure:Fig1", "media:image1.png", "part:word/document.xml",
+    ]
+    assert normalized["merger_lock_key"] == "outputs/thesis.docx"
+
+
+def test_normalize_promotion_defaults_are_none_and_empty_list():
+    normalized = ad.normalize_promotion({})
+    assert normalized == {
+        "base_sha256": None,
+        "resource_footprint": [],
+        "merger_lock_key": None,
+    }
+
+
+def test_normalize_promotion_rejects_non_object():
+    with pytest.raises(ad.ArtifactDeclarationError, match="must be an object"):
+        ad.normalize_promotion("nope")
+
+
+def test_normalize_promotion_rejects_unknown_field():
+    with pytest.raises(ad.ArtifactDeclarationError, match="unknown planned_output.promotion field"):
+        ad.normalize_promotion({"base_sha256": _SHA_A, "bogus": 1})
+
+
+@pytest.mark.parametrize("bad", ["not-hex-and-too-short", "g" * 64, "a" * 63, 12345])
+def test_normalize_promotion_rejects_malformed_base_sha256(bad):
+    with pytest.raises(ad.ArtifactDeclarationError, match="base_sha256"):
+        ad.normalize_promotion({"base_sha256": bad})
+
+
+def test_normalize_promotion_rejects_non_list_resource_footprint():
+    with pytest.raises(ad.ArtifactDeclarationError, match="resource_footprint"):
+        ad.normalize_promotion({"resource_footprint": "paraId:x"})
+
+
+def test_normalize_promotion_rejects_untagged_resource_footprint_entry():
+    with pytest.raises(ad.ArtifactDeclarationError, match="must start with one of"):
+        ad.normalize_promotion({"resource_footprint": ["not-tagged"]})
+
+
+def test_normalize_promotion_rejects_empty_resource_footprint_entry():
+    with pytest.raises(ad.ArtifactDeclarationError):
+        ad.normalize_promotion({"resource_footprint": [""]})
+
+
+def test_normalize_promotion_dedupes_resource_footprint_preserving_order():
+    normalized = ad.normalize_promotion({
+        "resource_footprint": ["table:1", "table:2", "table:1"],
+    })
+    assert normalized["resource_footprint"] == ["table:1", "table:2"]
+
+
+def test_normalize_promotion_rejects_resource_footprint_over_cap():
+    entries = [f"table:{i}" for i in range(ad._MAX_FOOTPRINT_ENTRIES + 1)]
+    with pytest.raises(ad.ArtifactDeclarationError, match="exceeding the cap"):
+        ad.normalize_promotion({"resource_footprint": entries})
+
+
+def test_normalize_promotion_rejects_non_string_merger_lock_key():
+    with pytest.raises(ad.ArtifactDeclarationError, match="merger_lock_key"):
+        ad.normalize_promotion({"merger_lock_key": 123})
+    with pytest.raises(ad.ArtifactDeclarationError, match="merger_lock_key"):
+        ad.normalize_promotion({"merger_lock_key": "  "})
+
+
+def test_normalize_planned_output_wires_promotion_block():
+    raw = _valid_planned_output(promotion={"base_sha256": _SHA_A})
+    normalized = ad.normalize_planned_output(raw)
+    assert normalized["promotion"]["base_sha256"] == _SHA_A
+    # merger_lock_key defaulted from the pointer's own first target uri.
+    assert normalized["promotion"]["merger_lock_key"] == "outputs/figures/ablation.png"
+
+
+def test_normalize_planned_output_promotion_explicit_merger_lock_key_wins():
+    raw = _valid_planned_output(
+        promotion={"base_sha256": _SHA_A, "merger_lock_key": "outputs/custom.docx"}
+    )
+    normalized = ad.normalize_planned_output(raw)
+    assert normalized["promotion"]["merger_lock_key"] == "outputs/custom.docx"
+
+
+def test_normalize_planned_output_promotion_absent_by_default():
+    normalized = ad.normalize_planned_output(_valid_planned_output())
+    assert normalized["promotion"] is None
+
+
+def test_normalize_planned_output_rejects_malformed_promotion():
+    raw = _valid_planned_output(promotion={"base_sha256": "not-a-hash"})
+    with pytest.raises(ad.ArtifactDeclarationError, match="base_sha256"):
+        ad.normalize_planned_output(raw)
+
+
+def test_effective_promotion_absent_is_none():
+    assert ad.effective_promotion({}) is None
+    assert ad.effective_promotion({"planned_output": None}) is None
+
+
+def test_effective_promotion_reads_stored_promotion():
+    stored = ad.serialize_planned_output(
+        _valid_planned_output(promotion={"base_sha256": _SHA_A})
+    )
+    item = {"planned_output": stored}
+    promotion = ad.effective_promotion(item)
+    assert promotion["base_sha256"] == _SHA_A
+
+
+def test_effective_promotion_planned_output_without_promotion_is_none():
+    stored = ad.serialize_planned_output(_valid_planned_output())
+    assert ad.effective_promotion({"planned_output": stored}) is None
+
+
+def test_merger_lock_key_for_target_prefixes_deterministically():
+    key1 = ad.merger_lock_key_for_target("outputs/thesis.docx")
+    key2 = ad.merger_lock_key_for_target("outputs/thesis.docx")
+    assert key1 == key2
+    assert key1.startswith("docx-merger-lock::")
+    assert key1 != ad.merger_lock_key_for_target("outputs/other.docx")
+
+
+def test_merger_lock_key_for_target_rejects_empty():
+    with pytest.raises(ad.ArtifactDeclarationError):
+        ad.merger_lock_key_for_target("")
+    with pytest.raises(ad.ArtifactDeclarationError):
+        ad.merger_lock_key_for_target(None)
+
+
+# --- base-hash preconditions (filesystem, no DB) ----------------------------
+
+def test_compute_base_sha256_missing_file_is_none(tmp_path):
+    missing = tmp_path / "does-not-exist.docx"
+    assert ad.compute_base_sha256(missing) is None
+
+
+def test_compute_base_sha256_matches_hashlib(tmp_path):
+    import hashlib
+
+    target = tmp_path / "x.docx"
+    target.write_bytes(b"some docx bytes")
+    assert ad.compute_base_sha256(target) == hashlib.sha256(b"some docx bytes").hexdigest()
+
+
+def test_check_promotion_preconditions_no_base_declared_is_ok(tmp_path):
+    target = tmp_path / "x.docx"
+    target.write_bytes(b"content")
+    item = {"planned_output": ad.serialize_planned_output(_valid_planned_output())}
+    result = ad.check_promotion_preconditions(item, target)
+    assert result["ok"] is True
+    assert result["declared_base_sha256"] is None
+    assert result["target_exists"] is True
+
+
+def test_check_promotion_preconditions_matching_hash_is_ok(tmp_path):
+    target = tmp_path / "x.docx"
+    target.write_bytes(b"content")
+    base = ad.compute_base_sha256(target)
+    item = {
+        "planned_output": ad.serialize_planned_output(
+            _valid_planned_output(promotion={"base_sha256": base})
+        )
+    }
+    result = ad.check_promotion_preconditions(item, target)
+    assert result["ok"] is True
+    assert result["current_base_sha256"] == base
+
+
+def test_check_promotion_preconditions_mismatched_hash_is_not_ok(tmp_path):
+    target = tmp_path / "x.docx"
+    target.write_bytes(b"content")
+    item = {
+        "planned_output": ad.serialize_planned_output(
+            _valid_planned_output(promotion={"base_sha256": _SHA_A})
+        )
+    }
+    result = ad.check_promotion_preconditions(item, target)
+    assert result["ok"] is False
+    assert "mismatch" in result["reason"]
+    assert result["declared_base_sha256"] == _SHA_A
+
+
+def test_check_promotion_preconditions_missing_target_reports_not_exists(tmp_path):
+    target = tmp_path / "gone.docx"
+    item = {
+        "planned_output": ad.serialize_planned_output(
+            _valid_planned_output(promotion={"base_sha256": _SHA_A})
+        )
+    }
+    result = ad.check_promotion_preconditions(item, target)
+    assert result["ok"] is False
+    assert result["target_exists"] is False
+    assert result["current_base_sha256"] is None
+
+
+# --- the ONE canonical merger lock (DB-backed) ------------------------------
+
+async def test_acquire_release_promotion_merger_lock_round_trip(db):
+    project = await db_module.create_project(db, "merger-lock-basic")
+    session = await db_module.register_session(db, project["id"], "worker-1")
+    target = "outputs/thesis.docx"
+
+    lock = await ad.acquire_promotion_merger_lock(db, target, session["id"])
+    assert lock["claimed"] is True
+    assert lock["file_path"] == ad.merger_lock_key_for_target(target)
+
+    status = await ad.get_promotion_merger_lock(db, target, project["id"])
+    assert status["file_lock"] is not None
+    assert status["file_lock"]["session_id"] == session["id"]
+
+    released = await ad.release_promotion_merger_lock(db, target, session["id"])
+    assert released is True
+
+    status_after = await ad.get_promotion_merger_lock(db, target, project["id"])
+    assert status_after["file_lock"] is None
+
+
+async def test_acquire_promotion_merger_lock_blocks_second_session(db):
+    project = await db_module.create_project(db, "merger-lock-contention")
+    s1 = await db_module.register_session(db, project["id"], "worker-1")
+    s2 = await db_module.register_session(db, project["id"], "worker-2")
+    target = "outputs/thesis.docx"
+
+    first = await ad.acquire_promotion_merger_lock(db, target, s1["id"])
+    assert first["claimed"] is True
+
+    second = await ad.acquire_promotion_merger_lock(db, target, s2["id"])
+    assert second["claimed"] is False
+    assert second["holder_session_id"] == s1["id"]
+
+    # A different target's lock is completely independent.
+    other = await ad.acquire_promotion_merger_lock(db, "outputs/other.docx", s2["id"])
+    assert other["claimed"] is True
+
+
+async def test_release_promotion_merger_lock_only_releases_own_session(db):
+    project = await db_module.create_project(db, "merger-lock-release-guard")
+    s1 = await db_module.register_session(db, project["id"], "worker-1")
+    s2 = await db_module.register_session(db, project["id"], "worker-2")
+    target = "outputs/thesis.docx"
+
+    await ad.acquire_promotion_merger_lock(db, target, s1["id"])
+    released_by_wrong_session = await ad.release_promotion_merger_lock(db, target, s2["id"])
+    assert released_by_wrong_session is False
+
+    status = await ad.get_promotion_merger_lock(db, target, project["id"])
+    assert status["file_lock"] is not None  # still held by s1

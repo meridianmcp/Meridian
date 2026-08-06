@@ -6816,6 +6816,82 @@ async def build_docx_integrity_gate_for_handoff(
 
 
 # ---------------------------------------------------------------------------
+# 24f5146d — docx promotion base-hash readiness for generate_handoff.
+#
+# KNOWN LIMITATIONS (documented honestly rather than silently claiming full
+# coverage, per this item's own explicit priority to leave a clear note over
+# false completeness):
+#   * Only checks the FIRST target of each item's planned_output — a
+#     multi-target planned_output is not fully covered.
+#   * A relative target uri is resolved against ``output_dir`` (the same
+#     directory generate_handoff itself writes into) as a best-effort guess
+#     at the real on-disk location; a project whose docx targets live
+#     elsewhere needs a different resolution strategy this function does not
+#     attempt.
+#   * Only reachable from ``mode in {"full", "delta"}`` (see
+#     ``generate_handoff``'s own ``promotion_readiness`` docstring) — the
+#     starter/compact/goal paths return before pending_sprint_items reaches
+#     its final form and are NOT wired to this function in this pass.
+# ---------------------------------------------------------------------------
+
+async def build_promotion_readiness_for_handoff(
+    db: Any,
+    project_id: str,
+    pending_items: "list[dict[str, Any]] | None",
+    *,
+    output_dir: str,
+    max_checked_items: int = 20,
+) -> dict[str, Any]:
+    """24f5146d — best-effort docx promotion base-hash readiness for a handoff.
+
+    For every pending item that declares
+    ``planned_output.promotion.base_sha256``
+    (:func:`meridian.artifact_declaration.effective_promotion`), resolves
+    that item's first ``planned_output`` target uri relative to
+    ``output_dir`` and runs
+    :func:`meridian.artifact_declaration.check_promotion_preconditions`
+    against it. Returns ``{"checked": [...], "unresolved_count": int}`` where
+    each ``checked`` entry is
+    ``{"item_id", "target_docx_path", **check_promotion_preconditions(...)}``.
+
+    Bounded to ``max_checked_items`` (mirrors ``docx_integrity_gate``'s own
+    ``_MAX_CHECKED_ARTIFACTS`` discipline) so a large board never turns this
+    best-effort enrichment into dozens of filesystem hashes. Never raises —
+    an individual item's check failure is skipped, not fatal to the whole
+    result; the caller (``generate_handoff``) wraps this in its own
+    try/except regardless, matching every other best-effort field here.
+    """
+    checked: list[dict[str, Any]] = []
+    unresolved = 0
+    for item in (pending_items or [])[:max_checked_items]:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        try:
+            promotion = artifact_declaration_module.effective_promotion(item)
+        except Exception:  # noqa: BLE001 — a malformed declaration is skipped, not fatal
+            continue
+        if not promotion or not promotion.get("base_sha256"):
+            continue
+        try:
+            planned = artifact_declaration_module.effective_planned_output(item)
+            targets = (planned or {}).get("targets") or []
+            if not targets or not isinstance(targets[0], dict):
+                continue
+            target_uri = targets[0].get("uri")
+            if not target_uri:
+                continue
+            target_path = os.path.join(output_dir, target_uri)
+            outcome = artifact_declaration_module.check_promotion_preconditions(item, target_path)
+        except Exception:  # noqa: BLE001 — one item's check failure skips just that item
+            continue
+        entry = {"item_id": item["id"], **outcome}
+        checked.append(entry)
+        if not outcome.get("ok"):
+            unresolved += 1
+    return {"checked": checked, "unresolved_count": unresolved}
+
+
+# ---------------------------------------------------------------------------
 # 8a883f60 — explicit, machine-readable outcome for every best-effort step
 # generate_handoff runs: code-pointer enrichment, resolved-pointer annotation,
 # freshness re-query, wave-gate exclusion, graph-search availability.
@@ -7496,6 +7572,7 @@ async def generate_handoff(
     strict_continuation: bool = False,
     continuation_status: dict[str, Any] | None = None,
     selected_item_ids: list[str] | None = None,
+    promotion_readiness: dict[str, Any] | None = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -7716,6 +7793,27 @@ async def generate_handoff(
     rendered, written to disk, or persisted. ``mode="planner"`` is exempt
     (it returns before this resolution runs, same as the pre-existing
     ``version``/``HandoffStaleReferenceError`` handling below).
+
+    ``promotion_readiness`` (24f5146d) — optional output dict, SAME purely-
+    additive out-param shape as ``evidence_status``/``continuation_status``
+    above: when given (any dict, typically ``{}``), it is populated in place
+    with ``{"checked": [...], "unresolved_count": int}`` — one entry per
+    pending item whose ``planned_output.promotion.base_sha256`` is declared
+    (:func:`meridian.artifact_declaration.effective_promotion`), each entry
+    the result of :func:`meridian.artifact_declaration.
+    check_promotion_preconditions` against that item's first ``planned_output``
+    target uri resolved relative to ``output_dir``. This surfaces docx
+    promotion base-hash staleness (has the target changed on disk since the
+    promotion was declared) directly in the handoff a receiving executor
+    reads, mirroring how ``evidence_status`` surfaces test-evidence outcomes.
+    A caller that passes ``None`` (the default — every pre-existing call
+    site) sees ZERO functional change to the returned ``(path, content,
+    amended)`` or to ``content`` itself. Best-effort and fully guarded: any
+    failure degrades to an empty ``checked`` list, never breaks the
+    mandatory handoff. Only populated for ``mode in {"full", "delta"}`` —
+    the modes where the full pending-item list is resolved; other modes
+    leave the passed dict untouched (documented gap, not silent — see the
+    module's own KNOWN LIMITATIONS note near ``build_promotion_readiness_for_handoff``).
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -7902,6 +8000,20 @@ async def generate_handoff(
         rejected=force_include_rejected,
     )
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
+    # 24f5146d — best-effort docx promotion base-hash readiness, purely
+    # additive (see promotion_readiness's own docstring above). Populated
+    # here (full/delta only) because this is the first point in the function
+    # where pending_sprint_items is the final, force-include-resolved list.
+    if promotion_readiness is not None:
+        try:
+            _promo = await build_promotion_readiness_for_handoff(
+                db, project_id, pending_sprint_items, output_dir=output_dir,
+            )
+            promotion_readiness.clear()
+            promotion_readiness.update(_promo)
+        except Exception:  # noqa: BLE001 — promotion readiness is best-effort
+            promotion_readiness.clear()
+            promotion_readiness.update({"checked": [], "unresolved_count": 0, "error": "promotion_readiness_failed"})
     # Flag items that may already be done based on recent task descriptions or commits
     pending_sprint_items = _annotate_possibly_done(pending_sprint_items, tasks, commit_messages)
     # Auto-set touches_files from recent git history for items without it.

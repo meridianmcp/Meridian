@@ -73,7 +73,11 @@ from typing import Any
 
 import aiosqlite
 
-from meridian.db.wave_runs import get_wave_run, WAVE_RUN_TERMINAL_STATUSES
+from meridian.db.wave_runs import (
+    get_wave_run,
+    get_pinned_promotion_targets,
+    WAVE_RUN_TERMINAL_STATUSES,
+)
 from meridian.db.board_snapshot import build_board_snapshot, diff_board_snapshots
 
 
@@ -226,6 +230,46 @@ async def check_wave_resume(
                 f"what superseded it)"
             )
 
+    # 24f5146d — docx promotion-target staleness. A wave run that pinned
+    # base-hash preconditions for one or more docx promotion targets (see
+    # meridian.db.wave_runs.create_wave_run(promotion_targets=...)) is ALSO
+    # stale — even though nothing about it moves board_snapshot's own
+    # tracked-field revision hash, which covers sprint-item state, not
+    # filesystem state — when the pinned target's on-disk content changed
+    # since the wave was planned. Same fail-closed posture, same "name every
+    # specific reason" discipline as every other check in this function.
+    # Best-effort per target: a hashing failure never crashes resume-check
+    # itself, it is folded into the mismatch (current_sha256=None) below.
+    pinned_promotion_targets = await get_pinned_promotion_targets(db, wave_run_id)
+    promotion_status: list[dict[str, Any]] = []
+    if pinned_promotion_targets:
+        from meridian import artifact_declaration as _artifact_declaration  # noqa: PLC0415
+
+        for pin in pinned_promotion_targets:
+            target = pin.get("target_docx_path")
+            pinned_hash = pin.get("base_sha256")
+            if not target:
+                continue
+            try:
+                current_hash = _artifact_declaration.compute_base_sha256(target)
+            except Exception:  # noqa: BLE001 — best-effort; never break resume-check
+                current_hash = None
+            unchanged = current_hash == pinned_hash
+            promotion_status.append({
+                "target_docx_path": target,
+                "pinned_base_sha256": pinned_hash,
+                "current_base_sha256": current_hash,
+                "unchanged": unchanged,
+            })
+            if not unchanged:
+                reasons.append(
+                    f"docx promotion target {target} changed on disk since "
+                    f"this wave was planned (base_sha256 was {pinned_hash!r}, "
+                    f"now {current_hash!r}) — re-plan the promotion (a fresh "
+                    "create_wave_run(promotion_targets=...) pin) or explicitly "
+                    "accept the new base before resuming"
+                )
+
     result = {
         "wave_run_id": wave_run_id,
         "resumable": not reasons,
@@ -233,6 +277,7 @@ async def check_wave_resume(
         "resume_delta": diff,
         "pinned_revision_hash": pinned.get("revision_hash"),
         "live_revision_hash": live.get("revision_hash"),
+        "promotion_target_status": promotion_status,
     }
     if reasons:
         joined = "; ".join(reasons)
