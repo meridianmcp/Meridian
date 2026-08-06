@@ -27,7 +27,15 @@ _BEFORE_TRIM_CHAR_COUNT = 16309
 # paragraph (~800 chars) -- genuine new-feature content documenting the live
 # 138-nested-worktree 502 reproduction, not prose re-inflation. Bumped
 # headroom to 17136 (current) + 100.
-_MAX_ALLOWED_CHARS = 17236
+# 92ac025c fixed a stale Context7 tool name (`get-library-docs`, retired by
+# Context7 in favor of `query-docs`) in the RESEARCH ROUTING PROTOCOL section
+# and added the version-pinning + untrusted-content-handling rule this item's
+# documentation_retrieval capability required -- genuine correctness + safety
+# content, kept as tight as the character budget allows. Landed on top of
+# c95d0c12 above (both merged onto dev the same day); ceiling recomputed
+# directly from the merged file (17262 chars) + 100, rather than stacked
+# from two stale estimates.
+_MAX_ALLOWED_CHARS = 17362
 
 
 def test_length_decreased_after_trim():

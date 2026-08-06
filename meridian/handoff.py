@@ -6850,6 +6850,7 @@ async def build_continuation_manifest(
     version: str | None = None,
     source: str | None = None,
     record_revision: bool = True,
+    restrict_to_ids: "set[str] | None" = None,
 ) -> dict[str, Any]:
     """836ca1d5 — the shared, deterministic continuation-manifest serializer.
 
@@ -6914,6 +6915,17 @@ async def build_continuation_manifest(
         are already rendered in the delta body's own "Pending:" section:
         duplicating them here would defeat the point of a compact delta.
 
+    ``restrict_to_ids`` (94f48e4d) — optional set of ids to further filter
+    ``pending_item_ids`` down to (an intersection, not a re-query). Used by
+    ``generate_handoff(mode='delta', selected_item_ids=...)`` so this
+    manifest's own pending-id list stays consistent with a scoped delta's
+    "Pending:" section instead of silently listing ids the caller explicitly
+    asked NOT to see. Deliberately does NOT affect ``item_count``,
+    ``revision_hash``, or ``revision_counter`` — those describe the REAL,
+    canonical board state for staleness detection (this manifest's actual
+    purpose) and must stay accurate regardless of any one handoff call's
+    scoping choices; only the informational id list is filtered.
+
     Best-effort by convention (matches every other enrichment step in
     ``generate_handoff``): callers should wrap this in try/except and treat a
     failure as "no manifest for this call" rather than letting it break
@@ -6964,6 +6976,8 @@ async def build_continuation_manifest(
         it.get("id") for it in snapshot["items"]
         if (it.get("status") or "") in ("pending", "todo")
     ]
+    if restrict_to_ids is not None:
+        pending_ids = [pid for pid in pending_ids if pid in restrict_to_ids]
 
     return {
         "schema_version": _CONTINUATION_MANIFEST_SCHEMA_VERSION,
@@ -7536,6 +7550,122 @@ async def _resolve_force_included_items(
     return pending_sprint_items
 
 
+class HandoffSelectionError(ValueError):
+    """Raised by ``generate_handoff`` (and its goal-mode helper) when
+    ``selected_item_ids`` is given and at least one requested id fails
+    validation.
+
+    Unlike ``force_include_ids`` (which silently drops an invalid id into
+    ``force_include_rejected`` and still renders a handoff), a scoped
+    ``selected_item_ids`` request defines the ENTIRE returned scope — a
+    caller explicitly asking for only these items' dependency closure — so
+    any invalid id fails the whole call closed rather than silently
+    returning a narrower or broader scope than what was actually requested.
+    Nothing is rendered, written to disk, or persisted for this call
+    (same "refuse outright" contract as :class:`HandoffEvidenceRequired`).
+
+    ``rejected`` carries one entry per invalid id, reusing the exact same
+    reason vocabulary as :func:`_resolve_force_included_items` — ``not_found``,
+    ``wrong_project``, ``wrong_version``, ``not_pending`` (with a ``status``
+    field distinguishing done/skipped/in_progress/etc.) — so a caller can
+    render the same class of error message for either mechanism.
+    """
+
+    def __init__(self, rejected: list[dict[str, Any]]):
+        self.rejected = rejected
+        ids = ", ".join(str(r.get("id")) for r in rejected)
+        super().__init__(
+            f"generate_handoff refused (selected_item_ids): invalid id(s) {ids}"
+        )
+
+
+async def _resolve_selected_item_ids(
+    db: Any,
+    project_id: str,
+    selected_item_ids: "list[str] | None",
+    pending_sprint_items: list[dict[str, Any]],
+    *,
+    effective_version: "str | None",
+) -> list[dict[str, Any]]:
+    """(94f48e4d) Restrict ``pending_sprint_items`` to exactly the items named
+    by ``selected_item_ids`` plus their still-open ``depends_on`` closure.
+
+    Returns ``pending_sprint_items`` UNCHANGED when ``selected_item_ids`` is
+    falsy — this is an opt-in scoping mechanism with zero behavior change
+    for every existing caller that never passes it.
+
+    Fail-closed (raises :class:`HandoffSelectionError`) when ANY requested id
+    is unknown, belongs to a different project, belongs to a different
+    version than ``effective_version`` (when one is in effect), or is not
+    genuinely ``todo``/``pending`` — covers done, skipped, in_progress, and
+    any other terminal or claimed status. See the exception's own docstring
+    for why this fails the WHOLE call rather than degrading per-id the way
+    ``force_include_ids`` does.
+
+    Dependency closure: each valid selected item's ``depends_on`` chain is
+    walked to the root (cycle-safe — mirrors the chain walk in
+    :func:`meridian.db.sprint_items.get_planning_brief`); any STILL-OPEN
+    (todo/pending) ancestor not already selected is added to the closure
+    too, so an executor handed this scoped handoff sees every prerequisite
+    it still needs to do, not just the item(s) it explicitly asked for. An
+    ancestor that is already done/in_progress/etc. is left out of the
+    returned list (nothing further to do there) and does NOT itself cause a
+    rejection — only the explicitly requested ids are validated that
+    strictly.
+    """
+    if not selected_item_ids:
+        return pending_sprint_items
+    _by_id = {it["id"]: it for it in pending_sprint_items if it.get("id")}
+    rejected: list[dict[str, Any]] = []
+    validated: dict[str, dict[str, Any]] = {}
+    for _sid in selected_item_ids:
+        if not _sid:
+            continue
+        _item = await db_module.get_sprint_item(db, _sid)
+        if _item is None:
+            rejected.append({"id": _sid, "reason": "not_found"})
+            continue
+        if _item.get("project_id") != project_id:
+            rejected.append({"id": _sid, "reason": "wrong_project"})
+            continue
+        if effective_version is not None and _item.get("version") != effective_version:
+            rejected.append({
+                "id": _sid,
+                "reason": "wrong_version",
+                "item_version": _item.get("version"),
+                "requested_version": effective_version,
+            })
+            continue
+        if _item.get("status") not in ("todo", "pending"):
+            rejected.append({
+                "id": _sid,
+                "reason": "not_pending",
+                "status": _item.get("status"),
+            })
+            continue
+        validated[_sid] = _item
+    if rejected:
+        raise HandoffSelectionError(rejected)
+
+    # Dependency closure: walk depends_on to the root for each selected item,
+    # cycle-safe, pulling in any ancestor that's still genuinely open.
+    closure: dict[str, dict[str, Any]] = dict(validated)
+    for _item in list(validated.values()):
+        seen: set[str] = {_item["id"]}
+        cur_dep = _item.get("depends_on")
+        while cur_dep and cur_dep not in seen:
+            seen.add(cur_dep)
+            if cur_dep in closure:
+                break
+            ancestor = _by_id.get(cur_dep) or await db_module.get_sprint_item(db, cur_dep)
+            if ancestor is None:
+                break
+            if ancestor.get("status") in ("todo", "pending"):
+                closure[cur_dep] = ancestor
+            cur_dep = ancestor.get("depends_on")
+    return list(closure.values())
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -7551,6 +7681,7 @@ async def generate_handoff(
     extra_narrative: str | None = None,
     identity: str | None = None,
     force_include_ids: list[str] | None = None,
+    selected_item_ids: "list[str] | None" = None,
     version: str | None = None,
     strict_evidence: bool = False,
     evidence_status: dict[str, Any] | None = None,
@@ -7623,6 +7754,19 @@ async def generate_handoff(
     each). A caller that passes ``None`` (the default) sees zero functional
     change to the returned ``(path, content, amended)`` or to ``content``
     itself.
+
+    ``selected_item_ids`` (94f48e4d) — optional list of sprint-item ids that,
+    when given, RESTRICTS the returned pending list to exactly those items
+    plus their still-open ``depends_on`` closure, instead of the project/
+    version's full backlog. Applies to ``full``/``delta``/``goal`` modes
+    (the modes that enumerate pending items at all — ``starter``/``compact``
+    never did, same as ``force_include_ids``). Unlike ``force_include_ids``,
+    this is FAIL-CLOSED: raises :class:`HandoffSelectionError` (nothing
+    rendered/written/persisted) if ANY requested id is unknown, cross-
+    project, cross-version, or not genuinely todo/pending — see
+    :func:`_resolve_selected_item_ids` and the exception's own docstring for
+    the full contract. ``None``/empty (the default) is a pure no-op — every
+    existing caller sees zero behavior change.
 
     ``version`` (efaa918a, extended by b8f89491) — optional explicit sprint-
     version bucket. Resolved ONCE, up front, and threaded through EVERY
@@ -7823,6 +7967,7 @@ async def generate_handoff(
             output_dir,
             graph_searcher=graph_searcher,
             force_include_ids=force_include_ids,
+            selected_item_ids=selected_item_ids,
             completion_criteria_override=_project_completion_criteria_override,
             version=_effective_version,
             strict_evidence=strict_evidence,
@@ -7924,6 +8069,13 @@ async def generate_handoff(
         db, project_id, force_include_ids, pending_sprint_items,
         effective_version=_effective_version,
         rejected=force_include_rejected,
+    )
+    # 94f48e4d — selected_item_ids restricts the pending list to exactly the
+    # requested items' dependency closure; fail-closed on any invalid id (see
+    # _resolve_selected_item_ids's own docstring). No-op when not given.
+    pending_sprint_items = await _resolve_selected_item_ids(
+        db, project_id, selected_item_ids, pending_sprint_items,
+        effective_version=_effective_version,
     )
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
     # Flag items that may already be done based on recent task descriptions or commits
@@ -8425,11 +8577,21 @@ async def generate_handoff(
         # in this function; a failure degrades to the pre-836ca1d5 output
         # (no tag) rather than breaking delta generation.
         try:
+            # 94f48e4d — when this delta call is itself scoped via
+            # selected_item_ids, restrict the manifest's own pending-id list
+            # to match (see build_continuation_manifest's restrict_to_ids
+            # docstring) — never revision_hash/item_count, which stay
+            # canonical/unfiltered for genuine staleness detection.
+            _restrict_ids = (
+                {it["id"] for it in pending_sprint_items if it.get("id")}
+                if selected_item_ids else None
+            )
             _continuation_manifest = await build_continuation_manifest(
                 db, project_id,
                 session_id=session_id,
                 version=_effective_version,
                 source="generate_handoff:delta",
+                restrict_to_ids=_restrict_ids,
             )
         except Exception:  # noqa: BLE001 — manifest is best-effort, never fatal
             _continuation_manifest = None
@@ -9084,6 +9246,7 @@ async def _generate_goal_only_handoff(
     *,
     graph_searcher: Callable[[str], Any] | None = None,
     force_include_ids: list[str] | None = None,
+    selected_item_ids: "list[str] | None" = None,
     completion_criteria_override: str | None = None,
     version: str | None = None,
     strict_evidence: bool = False,
@@ -9152,6 +9315,12 @@ async def _generate_goal_only_handoff(
         db, project_id, force_include_ids, pending_sprint_items,
         effective_version=version,
         rejected=force_include_rejected,
+    )
+    # 94f48e4d — same fail-closed selection restriction generate_handoff's
+    # full/delta branch applies; see _resolve_selected_item_ids's docstring.
+    pending_sprint_items = await _resolve_selected_item_ids(
+        db, project_id, selected_item_ids, pending_sprint_items,
+        effective_version=version,
     )
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
 

@@ -2877,6 +2877,14 @@ async def _handle_task_tools(
         _raw_fii = args.get("force_include_ids")
         if isinstance(_raw_fii, list):
             _force_include_ids = [str(x) for x in _raw_fii if x]
+        # 94f48e4d — pass selected_item_ids through so a caller can request a
+        # handoff scoped to exactly these items' dependency closure. See
+        # handoff_module_local.generate_handoff's own docstring for the
+        # fail-closed contract (differs from force_include_ids above).
+        _selected_item_ids: list[str] | None = None
+        _raw_sel = args.get("selected_item_ids")
+        if isinstance(_raw_sel, list):
+            _selected_item_ids = [str(x) for x in _raw_sel if x]
         _handoff_degraded = False
         # 8a883f60 — opt-in, fail-closed strict evidence for this handoff's
         # best-effort steps (mirrors complete_sprint_item's strict_evidence
@@ -2920,6 +2928,7 @@ async def _handle_task_tools(
                     pointer_symbol_resolver=_pointer_symbol_resolver,
                     identity=_resolve_caller_identity(tenant),
                     force_include_ids=_force_include_ids,
+                    selected_item_ids=_selected_item_ids,
                     skip_ai_summary=_skip_ai,
                     version=_requested_version,
                     strict_evidence=_strict_evidence,
@@ -2956,6 +2965,18 @@ async def _handle_task_tools(
                     "generate_handoff without strict_evidence=true to get "
                     "today's graceful-degrade behavior."
                 ),
+            }
+        except handoff_module_local.HandoffSelectionError as exc:
+            # 94f48e4d — selected_item_ids given and at least one requested id
+            # failed validation: fail CLOSED. Nothing was rendered/written/
+            # persisted for this call — surface exactly which id(s) were
+            # rejected and why, instead of silently returning a broader or
+            # narrower scope than what was actually requested.
+            return {
+                "error": "HANDOFF_SELECTION_BLOCKED",
+                "project_id": args["project_id"],
+                "selection_rejected": exc.rejected,
+                "message": str(exc),
             }
         except handoff_module_local.HandoffContinuationRequired as exc:
             # ecc8b280 — strict_continuation=True, this call is NOT
