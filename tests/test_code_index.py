@@ -180,3 +180,145 @@ def test_search_code_semantic_registered_in_stdio_surface():
     from meridian import mcp_tools as mt
 
     assert "search_code_semantic" in mt._TOOL_EXAMPLES
+
+
+def test_prospect_symbol_registered_in_stdio_surface():
+    """d5e60791 — prospect_symbol was entirely absent from the stdio
+    transport's tool list AND its call_tool dispatch (unlike
+    search_code_semantic, which was already wired): a stdio-connected client
+    (e.g. the documented self-hosted `pixi run python -m meridian --mcp`
+    connection) got "unknown tool: prospect_symbol" no matter what. Assert
+    the Tool() is registered and the dispatch elif chain routes it through
+    the same shared _dispatch_mcp_tool as search_code_semantic."""
+    import inspect
+
+    from meridian.mcp import stdio_handler as sh
+
+    source = inspect.getsource(sh)
+    assert 'name="prospect_symbol"' in source
+    # Dispatched via the same shared tuple search_code_semantic already uses.
+    assert '"prospect_symbol",' in source
+
+
+# ===========================================================================
+# d5e60791 — packaging/boot-preflight resilience for the meridian_codeindex
+# import. Live reproduction: an already-running MCP connector serving this
+# exact checkout raised "No module named 'meridian_codeindex'" even though
+# `pixi run python -c "import meridian_codeindex"` succeeded moments later
+# from a shell in the SAME checkout -- a stale/never-resynced runtime
+# environment, not a genuinely-missing package. meridian.code_index now
+# self-heals by falling back to the vendored source tree that ships in every
+# checkout (extensions/meridian-codeindex/meridian_codeindex/) before giving
+# up, and raises an ACTIONABLE ImportError (not a bare ModuleNotFoundError)
+# when even that fails.
+# ===========================================================================
+
+def test_ensure_meridian_codeindex_importable_succeeds_when_already_importable():
+    """The common case (properly synced env, e.g. CI / this pixi env): no
+    path surgery needed, returns None immediately."""
+    err = ci._ensure_meridian_codeindex_importable()
+    assert err is None
+
+
+def test_ensure_meridian_codeindex_importable_falls_back_to_vendored_source(
+    monkeypatch, tmp_path,
+):
+    """Simulates the exact live bug: the FIRST `import meridian_codeindex`
+    fails (as if this runtime's site-packages never saw the pixi.toml
+    editable-install entry). The boot preflight must locate the vendored
+    source tree next to meridian/code_index.py, insert it onto sys.path, and
+    retry -- succeeding on the second attempt."""
+    import builtins
+    import sys
+    import types
+
+    vendored_root = tmp_path / "extensions" / "meridian-codeindex"
+    pkg_dir = vendored_root / "meridian_codeindex"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "meridian").mkdir()
+
+    monkeypatch.setattr(ci, "__file__", str(tmp_path / "meridian" / "code_index.py"))
+
+    call_count = {"n": 0}
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "meridian_codeindex":
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise ModuleNotFoundError(
+                    "No module named 'meridian_codeindex'", name="meridian_codeindex",
+                )
+            # Second attempt must only succeed because the vendored dir is
+            # now on sys.path -- proves causation, not coincidence.
+            assert str(vendored_root) in sys.path
+            return types.ModuleType("meridian_codeindex")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    try:
+        err = ci._ensure_meridian_codeindex_importable()
+    finally:
+        if str(vendored_root) in sys.path:
+            sys.path.remove(str(vendored_root))
+
+    assert err is None
+    assert call_count["n"] == 2
+
+
+def test_ensure_meridian_codeindex_importable_returns_original_error_without_vendored_source(
+    monkeypatch, tmp_path,
+):
+    """When even the vendored source tree isn't present on disk (e.g. a
+    frozen/packaged distribution that never ships extensions/), the ORIGINAL
+    ModuleNotFoundError is returned -- never masked, never crashes."""
+    import builtins
+
+    (tmp_path / "meridian").mkdir()
+    monkeypatch.setattr(ci, "__file__", str(tmp_path / "meridian" / "code_index.py"))
+    # Deliberately no extensions/meridian-codeindex/ under tmp_path.
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "meridian_codeindex":
+            raise ModuleNotFoundError(
+                "No module named 'meridian_codeindex'", name="meridian_codeindex",
+            )
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    err = ci._ensure_meridian_codeindex_importable()
+    assert isinstance(err, ModuleNotFoundError)
+    assert err.name == "meridian_codeindex"
+
+
+def test_ensure_meridian_codeindex_importable_does_not_mask_transitive_dependency_error(
+    monkeypatch, tmp_path,
+):
+    """meridian_codeindex ITSELF being found but failing to import because
+    one of ITS OWN dependencies (e.g. duckdb) is missing is a different
+    problem sys.path surgery cannot fix -- must return that real error
+    immediately, not silently swallow it into a misleading packaging-gap
+    story."""
+    import builtins
+
+    vendored_root = tmp_path / "extensions" / "meridian-codeindex"
+    pkg_dir = vendored_root / "meridian_codeindex"
+    pkg_dir.mkdir(parents=True)
+    (pkg_dir / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "meridian").mkdir()
+    monkeypatch.setattr(ci, "__file__", str(tmp_path / "meridian" / "code_index.py"))
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "meridian_codeindex":
+            raise ModuleNotFoundError("No module named 'duckdb'", name="duckdb")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    err = ci._ensure_meridian_codeindex_importable()
+    assert isinstance(err, ModuleNotFoundError)
+    assert err.name == "duckdb"
