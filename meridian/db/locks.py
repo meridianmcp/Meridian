@@ -23,6 +23,7 @@ import aiosqlite
 from meridian.db import (  # noqa: PLC0415
     _new_id,
     _row_to_dict,
+    _publish_project_event,  # 0d0cada7 — live release notifications (release_symbol)
     get_code_notes_for_file,
     get_decisions_for_file,
 )
@@ -995,6 +996,14 @@ async def claim_symbol(
             "reason": "file_locked",
             "file_path": normalized,
             "holder_session_id": _fl.get("session_id"),
+            # 0d0cada7 — describes the BLOCKING lock's own granularity (a
+            # whole-file lock, not this request's symbol-level ask), matching
+            # the "coarse"/"file"/"symbol"/"unresolved" vocabulary
+            # claim_parallel_batch's _claim_batch_resource already uses, so a
+            # caller sees one consistent scheduler-diagnostics shape
+            # regardless of which claim path answered.
+            "claim_granularity": "file",
+            "lease_expiry": _fl.get("expires_at"),
             "message": (
                 f"Cannot claim symbol in {normalized}: another live session holds a "
                 "whole-file lock on it. Wait for it to release, or coordinate."
@@ -1007,6 +1016,10 @@ async def claim_symbol(
             "claimed": False,
             "reason": "unparseable",
             "file_path": normalized,
+            # 0d0cada7 — nothing was (or could be) resolved to a concrete
+            # symbol range; "unresolved" mirrors _claim_batch_resource's own
+            # classification for a resource that never landed any lock.
+            "claim_granularity": "unresolved",
             "message": (
                 f"Could not extract symbols from {normalized} "
                 "(unsupported language, syntax error, or missing grammar). "
@@ -1020,6 +1033,7 @@ async def claim_symbol(
             "claimed": False,
             "reason": "symbol_not_found",
             "file_path": normalized,
+            "claim_granularity": "unresolved",
             "available_symbols": [s["name"] for s in symbols],
             "message": (
                 f"Symbol '{symbol}' not found in {normalized}. "
@@ -1048,6 +1062,7 @@ async def claim_symbol(
             "reason": "ambiguous_symbol",
             "file_path": normalized,
             "symbol": symbol,
+            "claim_granularity": "unresolved",
             "matches": [
                 {
                     "type": m["type"],
@@ -1086,6 +1101,14 @@ async def claim_symbol(
             "reason": "symbol_conflict",
             "file_path": normalized,
             "symbol": symbol,
+            "claim_granularity": "symbol",
+            # 0d0cada7 — top-level convenience alongside "conflicts" (which
+            # already carries this per-conflict): the FIRST/primary blocker,
+            # matching the flat holder_session_id shape the "file_locked"
+            # branch above and _claim_batch_resource already return, so a
+            # caller never has to special-case "sometimes it's nested in a
+            # list" across the different claim_symbol outcomes.
+            "holder_session_id": holder.get("session_id"),
             "conflicts": [
                 {
                     "symbol_name": c["symbol_name"],
@@ -1133,6 +1156,17 @@ async def claim_symbol(
         "symbol_type": target["type"],
         "line_start": target["line_start"],
         "line_end": target["line_end"],
+        # 0d0cada7 — a real AST-resolved symbol-range claim, matching the
+        # vocabulary _claim_batch_resource/_sprint_item_resource_claim_gate
+        # already use for their OWN "symbol" outcome.
+        "claim_granularity": "symbol",
+        # file_symbol_claims carries no TTL column of its own — a symbol
+        # claim is heartbeat-bound (see _live_symbol_claims_for_file /
+        # _CLAIM_LIVE_HOURS) rather than an explicit expires_at row. This is
+        # an INFORMATIONAL projection of that same window ("live at least
+        # until the holder's heartbeat goes stale"), not a stored deadline —
+        # never treat it as a hard TTL the way file_locks.expires_at is one.
+        "lease_expiry": _cutoff_dt(-_CLAIM_LIVE_HOURS),
     }
     if _sym_resource_hint and _sym_resource_hint.get("wave_assignment_hint"):
         sym_result["wave_assignment_hint"] = _sym_resource_hint["wave_assignment_hint"]
@@ -1200,6 +1234,26 @@ async def release_symbol(
     history, matching every other release_* helper in this module. Returns
     True if a live claim was actually released, False if none matched
     (already released / never claimed).
+
+    Fail-closed by construction (0d0cada7): the UPDATE is scoped to
+    ``session_id = ?`` in the WHERE clause, so this can never release a claim
+    a DIFFERENT live session holds — there is no "force" path here at all,
+    matching the scheduler contract's "never force-release a live claim"
+    rule. This is the primitive an item-boundary release (completion,
+    failure, cancellation) or a heartbeat-expiry sweep is expected to call
+    per released ``symbol:`` resource; releasing is the caller's explicit
+    responsibility (see AGENTS.md's claim sequence) rather than an implicit
+    side effect of completion, so a caller that forgets to release simply
+    leaves the claim to expire via the existing heartbeat/TTL path instead of
+    silently losing track of it.
+
+    0d0cada7 — a real release also publishes a lightweight
+    ``resource_released`` project event (best-effort; a lookup failure never
+    turns a successful release into an error) so another live session/
+    dashboard polling ``get_parallelizable_groups`` learns the resource is
+    free without waiting out its own backoff window — the event-driven
+    counterpart to the ``retry_after`` polling hint returned elsewhere in
+    this contract.
     """
     normalized = _normalize_file_path(file_path)
     sym = (symbol_name or "").strip()
@@ -1212,7 +1266,26 @@ async def release_symbol(
         (session_id, normalized, sym),
     )
     await db.commit()
-    return cur.rowcount > 0
+    released = cur.rowcount > 0
+    if released:
+        try:
+            async with db.execute(
+                "SELECT project_id FROM sessions WHERE id = ?", (session_id,)
+            ) as _cur:
+                _row = await _cur.fetchone()
+            _proj = _row_to_dict(_row) or {}
+            if _proj.get("project_id"):
+                _publish_project_event(
+                    _proj["project_id"], "resource_released",
+                    {
+                        "resource": f"symbol:{normalized}::{sym}",
+                        "session_id": session_id,
+                        "claim_granularity": "symbol",
+                    },
+                )
+        except Exception:  # noqa: BLE001 — best-effort notification only
+            pass
+    return released
 
 
 async def get_symbol_hotspots(

@@ -8,9 +8,11 @@ call sites using ``db_module.function_name()`` continue to work unchanged.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
+from datetime import datetime, timezone  # 0d0cada7 — lease-local scheduler diagnostics
 from typing import Any
 from xml.sax.saxutils import escape as _xml_escape  # fdaa5b55/cd038235 — same
 # escaping helper/discipline as 5abf3e12 (meridian/handoff.py's
@@ -3972,6 +3974,178 @@ def _predict_resource_granularity(resource: str) -> str:
     return "other"
 
 
+# ---------------------------------------------------------------------------
+# 0d0cada7 — lease-local scheduler diagnostics.
+#
+# get_parallelizable_groups already recomputes ``groups``/``blocked``/``running``
+# fresh from the live board on EVERY call (nothing about it is a persisted,
+# staleness-prone wave plan) — that part of the lease-local contract already
+# held before this item. What was missing: (1) a deterministic digest a caller
+# can compare across two calls to detect "the board moved under me" (used by
+# claim_parallel_batch's new ``plan_generation`` staleness check below), and
+# (2) visibility into WHY an otherwise-eligible item can't actually be claimed
+# right now — a declared resource may be genuinely held by another live
+# session even though nothing in get_parallelizable_groups' own conflict-graph
+# coloring says so (that coloring only proves the RETURNED batch is internally
+# disjoint; it never cross-checks against locks already held by unrelated
+# in-flight work). Surfacing that here is what lets an executor poll with
+# bounded backoff and emit a structured blocker instead of escalating to a
+# native clarification (see request_hitl's new ``blocker_context`` and
+# meridian/handoff.py's ``_build_scheduler_lease_clause``).
+# ---------------------------------------------------------------------------
+
+
+def _compute_plan_generation(entries: list[tuple[str, ...]]) -> str:
+    """Deterministic digest over a board-state snapshot for staleness detection.
+
+    ``entries`` is any list of plain-string tuples describing the relevant
+    slice of board state (item id, status, claimed_at, resource set, ...).
+    Sorted before hashing so caller-side ordering never perturbs the digest —
+    two calls that observe the identical state always produce the identical
+    digest, and any real change (a claim, a completion, a new item) changes
+    it. Truncated sha256 hex: cheap to compare/log, stable across process
+    restarts (no random salt, no wall-clock component).
+    """
+    normalized = sorted(entries)
+    blob = "\n".join("|".join(t) for t in normalized)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _seconds_until(
+    expiry: Any, *, default: int = 60, minimum: int = 15, maximum: int = 300
+) -> int:
+    """Best-effort bounded-backoff hint (seconds) from an ``expires_at`` value
+    of unknown shape (TEXT on SQLite, TIMESTAMPTZ on Postgres — locks.py's own
+    cross-adapter notes apply here too). Never raises: an unparsable/missing
+    value falls back to ``default``. Always clamped to ``[minimum, maximum]``
+    so a caller never gets an unbounded, zero, or negative retry hint — this
+    is what keeps a poll loop a BOUNDED backoff rather than a busy spin or an
+    indefinite wait.
+    """
+    if expiry is None:
+        return default
+    try:
+        if isinstance(expiry, str):
+            dt = datetime.strptime(expiry[:19], "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
+        elif isinstance(expiry, datetime):
+            dt = expiry if expiry.tzinfo else expiry.replace(tzinfo=timezone.utc)
+        else:
+            return default
+        remaining = int((dt - datetime.now(timezone.utc)).total_seconds())
+        return max(minimum, min(maximum, remaining)) if remaining > 0 else minimum
+    except (ValueError, TypeError):
+        return default
+
+
+async def _live_resource_holder(
+    db: aiosqlite.Connection, resource: str
+) -> dict[str, Any] | None:
+    """Read-only: who (if anyone) currently holds ``resource`` right now.
+
+    Cross-checks a declared ``touches_resources`` entry against the REAL lock
+    tables (file_locks / file_symbol_claims / resource_locks), independent of
+    get_parallelizable_groups' own conflict-graph coloring (which only proves
+    the items IT returns together are pairwise disjoint from each other — it
+    has no visibility into locks held by work outside that batch, e.g. an
+    already in_progress item). Returns ``None`` when the resource is free, or
+    ``{"holder_session_id", "lease_expiry", "claim_granularity"}`` when held.
+    Mirrors the file⊃symbol hierarchy claim_symbol/claim_file already enforce:
+    a whole-file lock blocks every symbol in that file too.
+    """
+    from meridian.db import get_file_claims, get_symbol_claims, get_resource_claims  # noqa: PLC0415
+
+    if resource.startswith("file:"):
+        file_path = resource[len("file:"):]
+        claims = await get_file_claims(db, file_path)
+        lock = claims.get("file_lock")
+        if lock and lock.get("session_id"):
+            return {
+                "holder_session_id": lock.get("session_id"),
+                "lease_expiry": lock.get("expires_at"),
+                "claim_granularity": "file",
+            }
+        return None
+
+    if resource.startswith("symbol:"):
+        value = resource[len("symbol:"):]
+        file_path, sep, symbol_name = value.partition("::")
+        if not sep or not symbol_name or not file_path:
+            return None  # malformed — nothing resolvable to check
+        claims = await get_file_claims(db, file_path)
+        lock = claims.get("file_lock")
+        if lock and lock.get("session_id"):
+            # file ⊃ symbol: a whole-file lock blocks every symbol in it too.
+            return {
+                "holder_session_id": lock.get("session_id"),
+                "lease_expiry": lock.get("expires_at"),
+                "claim_granularity": "file",
+            }
+        for c in await get_symbol_claims(db, file_path):
+            if c.get("symbol_name") == symbol_name and c.get("session_id"):
+                return {
+                    "holder_session_id": c.get("session_id"),
+                    # file_symbol_claims carries no TTL column (heartbeat-bound
+                    # only — see locks.py's _CLAIM_LIVE_HOURS) so there is no
+                    # real expires_at to surface; explicit None rather than a
+                    # fabricated timestamp.
+                    "lease_expiry": None,
+                    "claim_granularity": "symbol",
+                }
+        return None
+
+    claims = await get_resource_claims(db, resource)
+    lock = claims.get("resource_lock")
+    if lock and lock.get("session_id"):
+        return {
+            "holder_session_id": lock.get("session_id"),
+            "lease_expiry": lock.get("expires_at"),
+            "claim_granularity": "n/a",
+        }
+    return None
+
+
+async def _plan_generation_entries(
+    db: aiosqlite.Connection,
+    items: list[tuple[str, str, str, list[str]]],
+    *,
+    holder_cache: dict[str, "dict[str, Any] | None"] | None = None,
+) -> list[tuple[str, ...]]:
+    """Build the ``(item_id, status, claimed_at, holder_tagged_resources)``
+    tuples :func:`_compute_plan_generation` hashes for BOTH
+    get_parallelizable_groups (the digest a caller reads) and
+    claim_parallel_batch (the digest it independently recomputes to check
+    staleness) — factored out so the two can never drift into incompatible
+    formats.
+
+    Deliberately cross-checks each declared resource's REAL live holder (not
+    just the item's own ``status``/``claimed_at``/``resources`` columns) so
+    the digest changes when a totally different in_progress item's claim
+    changes the picture too — a bare item-row digest would miss exactly the
+    2026-08-05 incident shape: item A's own row never changes while an
+    unrelated item B quietly holds a resource A also declares.
+
+    ``items`` is ``[(item_id, status, claimed_at, resources), ...]``.
+    ``holder_cache`` lets a caller that already looked up some resources
+    (e.g. get_parallelizable_groups' own resource_blocked pass) reuse those
+    lookups instead of re-querying; new lookups this call makes are written
+    back into the SAME dict when one is supplied, so a caller can pass an
+    empty dict in and inspect it afterward too.
+    """
+    cache = holder_cache if holder_cache is not None else {}
+    entries: list[tuple[str, ...]] = []
+    for iid, status, claimed_at, resources in items:
+        tags: list[str] = []
+        for res in resources:
+            if res not in cache:
+                cache[res] = await _live_resource_holder(db, res)
+            holder = cache[res]
+            tags.append(f"{res}={(holder or {}).get('holder_session_id') or ''}")
+        entries.append((iid, status, claimed_at, ",".join(sorted(tags))))
+    return entries
+
+
 async def get_parallelizable_groups(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4164,9 +4338,85 @@ async def get_parallelizable_groups(
     # which remains the authoritative conflict-free partition.
     _macro_wave_cap = _clamp_macro_wave_count(requested_macro_wave_count)
     macro_waves = pack_groups_into_macro_waves(groups, _macro_wave_cap)
+
+    # 0d0cada7 — cross-check every eligible item's declared resources against
+    # REAL live locks, not just this call's own conflict-graph coloring (see
+    # _live_resource_holder's docstring: the coloring only proves the batch
+    # THIS call returns is internally disjoint — it has no visibility into a
+    # lock already held by work outside that batch, e.g. an in_progress item
+    # from an earlier wave). This is what lets a caller tell "genuinely
+    # nothing to do yet" apart from "safe on paper, but a live session holds
+    # the resource right now" — the latter is exactly the case where an
+    # executor should poll with bounded backoff instead of escalating.
+    # Shared cache: at most one live-lock lookup per DISTINCT resource
+    # declared across the whole eligible set, reused below by BOTH the
+    # resource_blocked diagnostic (which short-circuits at the first
+    # blocking resource per item, for a readable one-line-per-item summary)
+    # and the plan_generation digest (which needs EVERY resource's holder,
+    # not just the first, so the digest can't miss a change to a
+    # non-first resource).
+    _holder_cache: dict[str, "dict[str, Any] | None"] = {}
+    resource_blocked: list[dict[str, Any]] = []
+    for it in eligible:
+        for res in it["resources"]:
+            if res not in _holder_cache:
+                _holder_cache[res] = await _live_resource_holder(db, res)
+            holder = _holder_cache[res]
+            if holder is None:
+                continue
+            resource_blocked.append({
+                "id": it["id"],
+                "title": it.get("title", ""),
+                "resource": res,
+                "wait_reason": "resource_locked",
+                "holder_session_id": holder.get("holder_session_id"),
+                "lease_expiry": holder.get("lease_expiry"),
+                "claim_granularity": holder.get("claim_granularity"),
+                "retry_after": _seconds_until(holder.get("lease_expiry")),
+            })
+            break  # one blocking resource is enough to explain the wait
+
+    # Deterministic digest of the state THIS call actually observed — lets a
+    # caller (claim_parallel_batch's plan_generation staleness check below, or
+    # an executor deciding whether to recompute) detect "the board moved since
+    # I last looked" without re-diffing the whole payload by hand. Folds in
+    # each resource's live HOLDER (via the same cache above), not just the
+    # item's own status/claimed_at/resources columns — see
+    # _plan_generation_entries' docstring for why that matters.
+    _gen_entries = await _plan_generation_entries(
+        db,
+        [
+            (it["id"], it.get("status") or "pending", str(it.get("claimed_at") or ""),
+             it.get("resources") or [])
+            for it in eligible
+        ],
+        holder_cache=_holder_cache,
+    ) + [
+        (r["id"], str(r.get("status") or ""), str(r.get("claimed_at") or ""), "")
+        for r in running
+    ]
+    plan_generation = _compute_plan_generation(_gen_entries)
+    # Index-aligned with "groups" — the digest of exactly one group's items,
+    # in the same tuple shape claim_parallel_batch's own plan_generation
+    # check recomputes, so a caller can pass group_generations[i] straight
+    # through as claim_parallel_batch(..., plan_generation=...) for groups[i].
+    group_generations = [
+        _compute_plan_generation(await _plan_generation_entries(
+            db,
+            [
+                (it["id"], it.get("status") or "pending", str(it.get("claimed_at") or ""),
+                 it.get("resources") or [])
+                for it in group
+            ],
+            holder_cache=_holder_cache,
+        ))
+        for group in groups
+    ]
+
     return {
         "version": version,
         "groups": groups,
+        "group_generations": group_generations,
         "group_count": len(groups),
         "eligible_count": len(eligible),
         "undeclared_count": undeclared,
@@ -4181,6 +4431,12 @@ async def get_parallelizable_groups(
         "macro_waves": macro_waves,
         "macro_wave_count": len(macro_waves),
         "requested_macro_wave_count": _macro_wave_cap,
+        # 0d0cada7 — lease-local scheduler diagnostics (additive; existing
+        # keys/values above are all byte-for-byte unchanged).
+        "resource_blocked": resource_blocked,
+        "resource_blocked_count": len({b["id"] for b in resource_blocked}),
+        "plan_generation": plan_generation,
+        "recomputed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
 
@@ -4492,6 +4748,7 @@ async def claim_parallel_batch(
     resource_contents: dict[str, Any] | None = None,
     force_manifest: bool = False,
     manifest_reason: str | None = None,
+    plan_generation: str | None = None,
 ) -> dict[str, Any]:
     """22cad9b8 — atomically claim a whole parallel-safe batch of sprint items.
 
@@ -4501,15 +4758,29 @@ async def claim_parallel_batch(
     maps ``{item_id: claiming_session_id}`` so a caller can pre-assign each
     item to the DISTINCT worker session that will actually execute it —
     resources then end up held under the session that does the work, so
-    nothing needs handing off once workers launch.
+    nothing needs handing off once workers launch. This is the lease-local
+    path the scheduler contract (0d0cada7) expects for real parallel
+    fan-out: prefer it over reusing one ``session_id`` for every item in a
+    multi-item batch (see ``lease_local_warning`` on the success result).
+
+    ``plan_generation`` (0d0cada7, optional) — when supplied, must match the
+    digest a caller previously computed for exactly this item set (see
+    :func:`get_parallelizable_groups`'s ``group_generations``, index-aligned
+    with its ``groups``). If the live board has moved since that digest was
+    taken (any of these items' status/claimed_at/resources changed), the
+    call is rejected with ``STALE_PLAN_GENERATION`` before anything is
+    persisted or claimed — a stale wave plan is refreshed, never treated as
+    still valid. Omitted (``None``, the default) skips the check entirely —
+    every existing caller is unaffected.
 
     Returns ``{"ok": True, "manifest_id", "batch_key", "claimed_item_ids",
-    "items", "resources", "manifest"}`` on success, or ``{"ok": False,
-    "error": <code>, "message": ...}`` (plus error-specific fields) on any
-    rejection — never raises for an expected validation/conflict outcome, only
-    for a genuine caller bug (empty item_ids / missing session_id). See the
-    module-level comment above for the full step-by-step contract; error
-    codes are: ITEM_NOT_FOUND, UNDECLARED_RESOURCE_IN_BATCH,
+    "items", "resources", "manifest", "plan_generation",
+    "lease_local_warning"}`` on success, or ``{"ok": False, "error": <code>,
+    "message": ...}`` (plus error-specific fields) on any rejection — never
+    raises for an expected validation/conflict outcome, only for a genuine
+    caller bug (empty item_ids / missing session_id). See the module-level
+    comment above for the full step-by-step contract; error codes are:
+    ITEM_NOT_FOUND, STALE_PLAN_GENERATION, UNDECLARED_RESOURCE_IN_BATCH,
     BATCH_COMPOSITION_CONFLICT, BATCH_MANIFEST_EXISTS, ITEM_CLAIM_CONFLICT,
     <claim_sprint_item's own blocked "error" values e.g. DEFERRED/SUPERSEDED/
     WAVE_GATE_PENDING/UNPROSPECTED>, BATCH_RESOURCE_CONFLICT.
@@ -4546,6 +4817,46 @@ async def claim_parallel_batch(
         iid: parse_touches_resources(items_by_id[iid].get("touches_resources"))
         for iid in ordered_ids
     }
+
+    # ── Plan-generation staleness guard (0d0cada7) — fail BEFORE persisting a
+    # manifest or claiming anything so a stale plan never leaves partial state.
+    # Uses the exact same _plan_generation_entries shape/order as
+    # get_parallelizable_groups' per-group digest — including the live
+    # resource-HOLDER cross-check, not just each item's own status/
+    # claimed_at/resources columns — so a caller's previously-fetched
+    # ``group_generations`` entry compares equal when (and only when)
+    # nothing about these specific items OR the resources they declare has
+    # changed. A digest that only watched the items' own rows would miss the
+    # 2026-08-05 incident shape exactly: an item's row never changes while a
+    # totally unrelated in_progress item quietly holds its declared resource.
+    # ──
+    _holder_cache: dict[str, "dict[str, Any] | None"] = {}
+    _current_generation = _compute_plan_generation(await _plan_generation_entries(
+        db,
+        [
+            (
+                iid, items_by_id[iid].get("status") or "pending",
+                str(items_by_id[iid].get("claimed_at") or ""),
+                item_resources[iid],
+            )
+            for iid in ordered_ids
+        ],
+        holder_cache=_holder_cache,
+    ))
+    if plan_generation is not None and plan_generation != _current_generation:
+        return {
+            "ok": False,
+            "error": "STALE_PLAN_GENERATION",
+            "message": (
+                "this batch's plan_generation no longer matches the live board "
+                "(an item's status, claim, or declared resources changed since "
+                "the digest was computed) — recompute via "
+                "get_parallelizable_groups and retry with the fresh generation "
+                "instead of treating this plan as still valid."
+            ),
+            "expected_plan_generation": plan_generation,
+            "current_plan_generation": _current_generation,
+        }
 
     # ── Undeclared-resource guard: never silently treat "nothing declared"
     # as "safe to parallelize" (mirrors get_parallelizable_groups' de730a25
@@ -4675,12 +4986,31 @@ async def claim_parallel_batch(
                         "'symbol:<path>::<symbol>'.",
                         item_id=iid, resource=resource,
                     )
+                # 0d0cada7 — enrich the conflict with the same wait_reason/
+                # lease_expiry/retry_after/claim_granularity shape
+                # get_parallelizable_groups' resource_blocked entries use, so
+                # a caller sees ONE consistent scheduler-diagnostics contract
+                # regardless of which code path surfaced the contention.
+                # Best-effort: a fresh lookup race (holder released between
+                # the failed acquire above and this read) degrades to the
+                # outcome's own fields rather than raising.
+                try:
+                    _holder = await _live_resource_holder(db, resource)
+                except Exception:  # noqa: BLE001 — diagnostics must never mask the real conflict
+                    _holder = None
                 return await _rollback_and_fail(
                     "BATCH_RESOURCE_CONFLICT",
                     f"resource {resource!r} (item {iid!r}) is locked by another "
                     f"live session ({outcome.get('holder_session_id')}).",
                     item_id=iid, resource=resource,
-                    holder_session_id=outcome.get("holder_session_id"),
+                    holder_session_id=(_holder or {}).get("holder_session_id")
+                    or outcome.get("holder_session_id"),
+                    wait_reason="resource_locked",
+                    lease_expiry=(_holder or {}).get("lease_expiry"),
+                    claim_granularity=(_holder or {}).get("claim_granularity")
+                    or outcome.get("claim_granularity"),
+                    retry_after=_seconds_until((_holder or {}).get("lease_expiry")),
+                    plan_generation=_current_generation,
                 )
             # 2a176d6d (finding 4) — record what granularity was ACTUALLY
             # acquired for every resource in the batch (not just newly-
@@ -4702,6 +5032,26 @@ async def claim_parallel_batch(
 
     final_manifest = await mark_batch_claim_outcome(db, manifest["id"], "claimed")
     result_items = [await get_sprint_item(db, iid) for iid in ordered_ids]
+
+    # 0d0cada7 — lease-local nudge: a multi-item batch where the SAME session
+    # ends up as the claiming identity for more than one item is exactly the
+    # pattern behind the live incident this item fixes (one session "planning
+    # its backlog" by holding several items' claims while only genuinely
+    # executing one at a time, starving every other live session). This never
+    # blocks the call — ``item_sessions`` assigning each item to its own
+    # DISTINCT worker session is the documented correct usage and is left
+    # completely alone — it only surfaces the risk so a caller (or the
+    # executor reading this response) can self-correct.
+    _session_to_items: dict[str, list[str]] = {}
+    for iid in ordered_ids:
+        _claim_session = (item_sessions or {}).get(iid, session_id)
+        _session_to_items.setdefault(_claim_session, []).append(iid)
+    lease_local_warning = [
+        {"session_id": sid, "item_ids": iids}
+        for sid, iids in _session_to_items.items()
+        if len(iids) > 1
+    ] if len(ordered_ids) > 1 else []
+
     return {
         "ok": True,
         "manifest_id": manifest["id"],
@@ -4715,6 +5065,9 @@ async def claim_parallel_batch(
         # (still the plain sorted-string union other callers already parse).
         "resource_claims": resource_claims,
         "manifest": final_manifest,
+        # 0d0cada7 — lease-local scheduler diagnostics (additive).
+        "plan_generation": _current_generation,
+        "lease_local_warning": lease_local_warning,
     }
 
 

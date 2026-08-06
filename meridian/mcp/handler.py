@@ -1764,6 +1764,12 @@ async def _sprint_item_resource_claim_gate(
                 lock_scope.append({
                     "resource": resource, "scope": "file", "file_path": file_path,
                     "acquired": True, "newly_acquired": not pre_held,
+                    # 0d0cada7 — claim_granularity/lease_expiry alongside
+                    # "scope" so every lock_scope entry (acquired or blocked)
+                    # carries the same scheduler-diagnostics shape regardless
+                    # of which branch produced it.
+                    "claim_granularity": "file",
+                    "lease_expiry": result.get("expires_at"),
                 })
                 if not pre_held:
                     acquired_this_call.append({"kind": "file", "file_path": file_path})
@@ -1772,6 +1778,10 @@ async def _sprint_item_resource_claim_gate(
                 {
                     "resource": resource, "scope": "file", "file_path": file_path,
                     "acquired": False,
+                    "wait_reason": result.get("reason") or "locked",
+                    "claim_granularity": "file",
+                    "lease_expiry": result.get("expires_at"),
+                    "retry_after": db_module._seconds_until(result.get("expires_at")),
                     "conflict": {
                         "reason": result.get("reason") or "locked",
                         "holder_session_id": result.get("holder_session_id"),
@@ -1790,6 +1800,7 @@ async def _sprint_item_resource_claim_gate(
                 lock_scope.append({
                     "resource": resource, "scope": "none", "acquired": False,
                     "fallback_reason": "no_file_scope",
+                    "claim_granularity": "unresolved",
                 })
                 continue
 
@@ -1809,6 +1820,8 @@ async def _sprint_item_resource_claim_gate(
                         "newly_acquired": not pre_held,
                         "line_start": symbol_result.get("line_start"),
                         "line_end": symbol_result.get("line_end"),
+                        "claim_granularity": symbol_result.get("claim_granularity") or "symbol",
+                        "lease_expiry": symbol_result.get("lease_expiry"),
                     })
                     if not pre_held:
                         acquired_this_call.append({
@@ -1820,10 +1833,16 @@ async def _sprint_item_resource_claim_gate(
                     if not _holder:
                         _conf = symbol_result.get("conflicts") or [{}]
                         _holder = _conf[0].get("holder_session_id")
+                    _lease_expiry = symbol_result.get("lease_expiry")
                     return await _blocked(
                         {
                             "resource": resource, "scope": "symbol", "file_path": file_path,
                             "symbol": symbol_name, "acquired": False,
+                            "wait_reason": symbol_result.get("reason"),
+                            "claim_granularity": symbol_result.get("claim_granularity")
+                            or "symbol",
+                            "lease_expiry": _lease_expiry,
+                            "retry_after": db_module._seconds_until(_lease_expiry),
                             "conflict": {
                                 "reason": symbol_result.get("reason"),
                                 "holder_session_id": _holder,
@@ -1846,6 +1865,13 @@ async def _sprint_item_resource_claim_gate(
                     "symbol": symbol_name, "acquired": True,
                     "newly_acquired": not pre_held_file,
                     "fallback_reason": fallback_reason,
+                    # 0d0cada7 — a symbol: resource that widened to a whole-
+                    # file lock is ALWAYS explicitly "coarse" here, never bare
+                    # "file" — the caller must never mistake this for a
+                    # genuinely-declared file: resource's real intent (see
+                    # _claim_batch_resource's identical distinction).
+                    "claim_granularity": "coarse",
+                    "lease_expiry": file_result.get("expires_at"),
                 })
                 if not pre_held_file:
                     acquired_this_call.append({"kind": "file", "file_path": file_path})
@@ -1855,6 +1881,10 @@ async def _sprint_item_resource_claim_gate(
                     "resource": resource, "scope": "file", "file_path": file_path,
                     "symbol": symbol_name, "acquired": False,
                     "fallback_reason": fallback_reason,
+                    "wait_reason": file_result.get("reason") or "locked",
+                    "claim_granularity": "coarse",
+                    "lease_expiry": file_result.get("expires_at"),
+                    "retry_after": db_module._seconds_until(file_result.get("expires_at")),
                     "conflict": {
                         "reason": file_result.get("reason") or "locked",
                         "holder_session_id": file_result.get("holder_session_id"),

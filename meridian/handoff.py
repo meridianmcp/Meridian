@@ -2574,6 +2574,72 @@ def _build_execution_policy_clause(policy: dict[str, Any] | None) -> str:
     )
 
 
+def _build_scheduler_lease_clause(parallel_groups: "dict[str, Any] | None") -> str:
+    """0d0cada7 — lease-local scheduler diagnostics surfaced directly in the
+    /goal, closing the gap the 2026-08-05 v0.2.6 incident exposed: an
+    executor holding only ONE genuinely in_progress item saw its remaining
+    disjoint, dependency-satisfied backlog as inexplicably stuck and emitted
+    a native clarification instead of recording a Meridian blocker or
+    recomputing the residual work.
+
+    Two independent pieces, both additive fields on the SAME
+    ``get_parallelizable_groups()`` dict already threaded into
+    :func:`_build_quick_start_goal` as ``parallel_groups`` (no new call, no
+    new parameter):
+
+    ``<plan_generation>`` — the live-board digest an executor can hand back
+    to ``claim_parallel_batch(..., plan_generation=...)`` so a stale wave
+    plan is rejected/refreshed rather than treated as immutable forever.
+
+    ``<resource_contention>`` — any item that IS dependency-satisfied but
+    can't be claimed right now because another live session holds one of its
+    declared resources (``parallel_groups["resource_blocked"]``). This is
+    ordinary lock contention, not a real blocker: the guidance explicitly
+    tells the executor to poll with the returned ``retry_after`` bound and
+    recompute, and to reserve ``request_hitl`` for a genuine human decision,
+    a stale-lease ownership ambiguity, or a destructive action — never for
+    routine contention.
+
+    Returns ``""`` when ``parallel_groups`` is falsy or carries neither
+    field (every call site/test that predates this item, or a hand-built
+    dict from an older code path) — existing output is byte-for-byte
+    unchanged in that case.
+    """
+    if not parallel_groups:
+        return ""
+    _gen = parallel_groups.get("plan_generation")
+    _blocked = parallel_groups.get("resource_blocked") or []
+    if not _gen and not _blocked:
+        return ""
+    out = ""
+    if _gen:
+        out += f'\n<plan_generation value="{_xml_escape(str(_gen), {chr(34): "&quot;"})}" />'
+    if _blocked:
+        _lines = "; ".join(
+            f"{b.get('id')} waiting on {b.get('resource')} held by session "
+            f"{str(b.get('holder_session_id') or 'unknown')[:8]} "
+            f"(retry in ~{b.get('retry_after')}s)"
+            for b in _blocked
+        )
+        out += (
+            "\n<resource_contention>"
+            + _xml_escape(
+                "These items are dependency-satisfied but a resource they declare "
+                "is currently held by another LIVE session -- this is ordinary "
+                "lock contention, not a genuine blocker. Poll with bounded "
+                "backoff (use the retry_after seconds below) and recompute via "
+                "get_parallelizable_groups; do not open a native clarification "
+                "for this. Only call request_hitl for a genuine human decision, "
+                "a stale-lease ownership ambiguity, or a destructive action -- "
+                'and even then pass kind="scheduler_blocker" with '
+                "blocker_context so it is a tracked, structured record rather "
+                f"than an untracked native stop. Waiting: {_lines}"
+            )
+            + "</resource_contention>"
+        )
+    return out
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -3243,6 +3309,11 @@ def _build_quick_start_goal(
         # item_artifact_pointer_findings section exactly for the same
         # request.
         + _build_artifact_pointer_findings_clause(_all_pending_for_tool_requirements)
+        # 0d0cada7 — lease-local scheduler diagnostics: plan_generation (for
+        # claim_parallel_batch's stale-plan check) + any resource_blocked
+        # items with poll/backoff guidance, straight from the SAME
+        # parallel_groups dict already threaded through this function.
+        + _build_scheduler_lease_clause(parallel_groups)
         + f"{_manual_note}"
         f"{_backburner_note}"
         f"{_excluded_unprospected_note}"
