@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from typing import Any
 
 import meridian.server as _server
@@ -1224,6 +1225,21 @@ async def handle_complete_sprint_item(
         _board_change_for_session,
         _close_or_propose_github_issue,
     )
+    # a2a027cf — correlation id: caller-supplied (threaded down from the
+    # dispatch layer / an HTTP request id when available) or freshly minted
+    # here so it exists even when this handler is invoked directly (tests,
+    # stdio). Attached to every response this handler returns — success or
+    # error — so a client that never saw a response (transport timeout) can
+    # still correlate a retry with the original attempt's server-side logs.
+    _correlation_id = str(args.get("correlation_id") or uuid.uuid4().hex)
+    _retry_guidance = (
+        "Do not blindly retry: call get_sprint_items (or get_sprint_item) to "
+        "re-check this item's live status first. If it is already 'done', "
+        "the earlier call already succeeded and no further action is "
+        "needed; complete_sprint_item itself is idempotent for that case "
+        "(a retry on an already-done item returns completion_outcome="
+        "'already_committed', not an error)."
+    )
     # 0716c9e0 — check active worktree before marking done.
     # e7548587 — require_merge_approval is a TRI-STATE (mirrors
     # hitl_auto_answer's own 0/1/2 pattern): 0=off (no check at all),
@@ -1532,17 +1548,22 @@ async def handle_complete_sprint_item(
             # acknowledgement that the caller is completing a DIFFERENT,
             # NON-stale session's live claim. Never inferred/defaulted true.
             force_foreign_claim=bool(args.get("force_foreign_claim")),
+            # a2a027cf — threaded through so DB-level phase timings/logs and
+            # this handler's response agree on one id for the whole call.
+            correlation_id=_correlation_id,
         )
     except db_module.SprintItemEvidenceRequired as exc:
         return {
             "error": "EVIDENCE_REQUIRED",
             "item_id": args["item_id"],
+            "correlation_id": _correlation_id,
             "message": str(exc),
         }
     except db_module.SprintItemVerificationRequired as exc:
         return {
             "error": "VERIFICATION_REQUIRED",
             "item_id": args["item_id"],
+            "correlation_id": _correlation_id,
             "message": str(exc),
         }
     except db_module.SprintItemClaimMismatch as exc:
@@ -1553,17 +1574,26 @@ async def handle_complete_sprint_item(
         return {
             "error": "CLAIM_MISMATCH",
             "item_id": args["item_id"],
+            "correlation_id": _correlation_id,
             "message": str(exc),
         }
     except db_module.SprintItemStatusRace as exc:
         # fa3e3331 — another caller already moved this item out of an
         # active state (e.g. a concurrent skip/fail/complete won the
         # race). Surface it distinctly rather than a misleading
-        # "not found".
+        # "not found". a2a027cf — this now only fires for a GENUINE
+        # conflicting outcome (current_status differs from the 'done'
+        # target complete_sprint_item was attempting): db_module.
+        # complete_sprint_item itself already turns the "already done, this
+        # IS what we were retrying for" case into a plain idempotent
+        # success (completion_outcome="already_committed") before this
+        # exception can even be raised — see its docstring (a2a027cf).
         return {
             "error": "STATUS_RACE",
             "item_id": exc.item_id,
             "current_status": exc.current_status,
+            "correlation_id": _correlation_id,
+            "retry_guidance": _retry_guidance,
             "message": str(exc),
         }
     if item is None:

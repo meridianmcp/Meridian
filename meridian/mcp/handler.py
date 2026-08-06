@@ -15,6 +15,8 @@ import asyncio
 import json
 import os
 import re
+import time
+import uuid
 from typing import Any
 
 import meridian.server as _server
@@ -5775,6 +5777,74 @@ async def _handle_code_index_tools(
     return _MISS
 
 
+# a2a027cf — bounded dispatch-level budget for complete_sprint_item,
+# comfortably under the ~60s client-side timeouts observed in the field
+# (HTTP, stdio, and connector/mcp-remote transports all funnel through this
+# one dispatcher, so one budget here covers all three). Generous relative
+# to a normal completion call (the DB layer's own advisory-work budget,
+# _ADVISORY_PHASE_TIMEOUT_S, is 5s) but leaves headroom for real transport
+# latency before this layer's own timeout kicks in.
+_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S = 45.0
+
+
+async def _complete_sprint_item_timeout_response(
+    db: Any, args: dict[str, Any], correlation_id: str, elapsed_s: float,
+) -> dict[str, Any]:
+    """a2a027cf — best-effort outcome classification after a dispatch-level
+    timeout on complete_sprint_item.
+
+    ``asyncio.wait_for`` cancels the wrapped coroutine at the timeout
+    boundary, but the underlying DB write (if it had already reached
+    ``_transition_status``'s own ``db.commit()``) is NOT undone by that
+    cancellation — a commit that already landed stays landed. Re-query the
+    item's live status to tell a genuinely-uncommitted timeout apart from
+    "it actually worked, just slowly", rather than leaving the caller to
+    guess:
+
+    * ``current_status == "done"`` -> ``completion_outcome="committed"``:
+      the write landed; nothing further to do.
+    * item found, some other active/terminal status -> ``"timed_out_before_
+      commit"``: safe to retry (complete_sprint_item's own idempotency
+      means a retry is never harmful even if THIS attempt turns out to have
+      landed a moment later after all).
+    * the re-query itself fails (or the item/project can't be resolved) ->
+      ``"unknown_outcome"``: genuinely can't tell; the caller must re-query
+      via get_sprint_items/get_sprint_item before deciding anything.
+    """
+    item_id = args.get("item_id")
+    project_id = args.get("project_id")
+    outcome = "unknown_outcome"
+    current_status = None
+    try:
+        if item_id and project_id:
+            _item = await db_module.get_sprint_item(db, item_id)
+            if _item is not None and _item.get("project_id") == project_id:
+                current_status = _item.get("status")
+                outcome = "committed" if current_status == "done" else "timed_out_before_commit"
+    except Exception:  # noqa: BLE001 — the re-query itself failing IS the unknown case
+        outcome = "unknown_outcome"
+    return {
+        "error": "COMPLETE_SPRINT_ITEM_TIMEOUT",
+        "item_id": item_id,
+        "correlation_id": correlation_id,
+        "completion_outcome": outcome,
+        "current_status": current_status,
+        "elapsed_s": round(elapsed_s, 3),
+        "message": (
+            f"complete_sprint_item did not respond within the dispatch "
+            f"timeout ({elapsed_s:.1f}s elapsed, correlation_id="
+            f"{correlation_id}). completion_outcome={outcome!r}. Do NOT "
+            "blindly retry -- call get_sprint_items (or get_sprint_item) to "
+            "re-check this item's live status first: if it is already "
+            "'done' the write landed and no further action is needed; "
+            "complete_sprint_item is idempotent for that case regardless "
+            "(a retry against an already-done item returns "
+            "completion_outcome='already_committed', never a duplicate "
+            "completion or a misleading failure)."
+        ),
+    }
+
+
 async def _dispatch_mcp_tool(
     name: str,
     args: dict[str, Any],
@@ -5815,8 +5885,39 @@ async def _dispatch_mcp_tool(
         _handle_outputs_tools,
         _handle_code_index_tools,
     )
+    # a2a027cf — complete_sprint_item timeout-safety at the dispatch layer.
+    # Repeated live reports: an MCP client (HTTP/stdio/connector — this
+    # dispatcher is the one chokepoint all three funnel through) times out
+    # around 60s waiting on complete_sprint_item even though the underlying
+    # DB write had already committed. Give this ONE tool a bounded budget
+    # comfortably under that: on timeout, re-query the item's live status
+    # (the write is either already durable or it isn't — cancelling the
+    # wrapped call here cannot undo a commit that already happened) and
+    # return a STRUCTURED response distinguishing "committed" (it actually
+    # landed, just slowly) from "timed_out_before_commit" from
+    # "unknown_outcome" (the re-query itself failed), rather than letting
+    # the caller hang past its own client-side deadline with no signal at
+    # all. Every other tool's dispatch is completely unaffected — the
+    # timeout only ever applies when ``name == "complete_sprint_item"``.
+    _is_complete_sprint_item = name == "complete_sprint_item"
+    if _is_complete_sprint_item:
+        _dispatch_correlation_id = str(args.get("correlation_id") or uuid.uuid4().hex)
+        args = {**args, "correlation_id": _dispatch_correlation_id}
+        _dispatch_t0 = time.monotonic()
     for _grp in _groups:
-        _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)
+        if _is_complete_sprint_item:
+            try:
+                _result = await asyncio.wait_for(
+                    _grp(name, args, db, data_dir, tenant, _mcp_tenant_id),
+                    timeout=_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                _result = await _complete_sprint_item_timeout_response(
+                    db, args, _dispatch_correlation_id,
+                    time.monotonic() - _dispatch_t0,
+                )
+        else:
+            _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)
         if _result is not _MISS:
             # 8c147109 — activity heartbeat: record a compact one-liner into the
             # session_activity ring-buffer so a remote planner session can observe

@@ -8,6 +8,7 @@ call sites using ``db_module.function_name()`` continue to work unchanged.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -293,6 +294,18 @@ _VALID_SPRINT_STATUSES = {
 _ACTIVE_SPRINT_STATUSES = {
     "pending", "in_progress", "todo", "indeterminate", "provisional_complete",
 }
+
+# a2a027cf — bounded budget (seconds) for complete_sprint_item's purely
+# ADVISORY post-commit work (parent rollup, mixed-ownership task-chain
+# advance, continuation-state gather). The authoritative status write
+# (sprint_items.status -> 'done') has already committed by the time any of
+# this runs; none of it may hold the HTTP/MCP response hostage past a
+# client's own request timeout (repeated live reports: clients timing out
+# around 60s while the write had actually already landed). Generous
+# relative to the real work (a handful of indexed lookups) but far under
+# typical client timeouts, so it only ever engages under genuine pathology
+# (e.g. a huge sprint board) rather than everyday completion calls.
+_ADVISORY_PHASE_TIMEOUT_S = 5.0
 
 # Statuses that make an existing item a *blocking* duplicate when a new item
 # with a near-identical title is added. Only open/active work counts: a title
@@ -1793,6 +1806,7 @@ async def complete_sprint_item(
     verification_verdict: str | None = None,
     verification_notes: str | None = None,
     force_foreign_claim: bool = False,
+    correlation_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
 
@@ -1878,8 +1892,86 @@ async def complete_sprint_item(
     downstream step only ever touches the ONE issue linked to THIS item
     (8fc92474) and classifies purely from the DB column above, never from
     issue title/body/labels/custom fields (eda40627/8c170bcc).
+
+    a2a027cf — timeout-safe / observable / idempotent completion. Repeated
+    live reports: an MCP/HTTP client times out around 60s waiting on this
+    call even though the server-side write had already landed; a defensive
+    retry then either re-observed "done" (confusing) or hit a bare
+    SprintItemStatusRace (actively misleading — nothing raced, the ORIGINAL
+    call's own write simply finished after the client stopped waiting for
+    it). This adds:
+
+    * ``correlation_id`` — caller-supplied (thread this down from an MCP/
+      HTTP request id when you have one) or freshly minted here when
+      omitted. Always present on the returned dict as ``correlation_id`` so
+      a client that times out before seeing the response can still
+      correlate a server-side log line with the retry it's about to make.
+    * ``phase_timings_ms`` — wall-clock duration of each internal phase
+      (``lookup``, ``ownership_check``, ``verification_check``,
+      ``evidence_check``, ``stored_evidence_check``, ``status_transition``,
+      ``post_commit_advisory``), rounded to milliseconds. Purely
+      observational — never affects control flow. Lets a slow phase be
+      identified from the response itself instead of guessed from a raw
+      client-side timeout.
+    * ``completion_outcome`` — ``"committed"`` when THIS call performed the
+      active->done transition, or ``"already_committed"`` when the item was
+      ALREADY ``done`` on entry (an idempotent no-op — see below). Absent
+      when the call raises.
+    * Idempotent retry: if the item is ALREADY ``done`` when this function
+      is entered, every gate below (ownership / verification / evidence)
+      and every side effect (rollup, task-chain advance, GitHub-issue
+      close, notifications) is SKIPPED — the current row is returned
+      immediately with ``completion_outcome="already_committed"``. A
+      completion call whose target state is already reached is a no-op
+      success, not grounds to re-run gates whose only purpose was deciding
+      whether the active->done transition may proceed, or to re-fire
+      side effects that already fired once (duplicate HITL filings,
+      duplicate GitHub comments, etc. — "a timeout must never cause
+      duplicate completion, duplicate side effects, or misleading
+      failure"). A concurrent race against a DIFFERENT terminal status
+      (e.g. someone skipped/failed it first) is UNCHANGED: that still
+      raises :class:`SprintItemStatusRace` exactly as before, because that
+      IS a genuine conflicting outcome, not a replay of this same
+      completion.
+    * Bounded advisory work: the two purely-derived-state post-commit steps
+      (:func:`_maybe_rollup_parent`, :func:`_advance_task_chain`) run under
+      a single bounded ``asyncio.wait_for`` budget
+      (:data:`_ADVISORY_PHASE_TIMEOUT_S`) so a slow rollup/chain-advance can
+      never hold the ALREADY-committed response hostage. On timeout the
+      commit itself is untouched (it already landed before this phase
+      starts) — the response carries ``advisory_work_deferred: true``
+      instead of hanging. The continuation-state gather (also advisory) is
+      bounded the same way.
     """
+    _t_start = time.monotonic()
+    _phase_ms: dict[str, float] = {}
+    _last_t = _t_start
+
+    def _mark_phase(name: str) -> None:
+        nonlocal _last_t
+        _now = time.monotonic()
+        _phase_ms[name] = round((_now - _last_t) * 1000, 3)
+        _last_t = _now
+
+    _correlation_id = correlation_id or _new_id()
+
     item = await get_sprint_item(db, item_id)
+    _mark_phase("lookup")
+
+    if (
+        item is not None
+        and item.get("project_id") == project_id
+        and item.get("status") == "done"
+    ):
+        # a2a027cf — idempotent retry / already-committed short-circuit. See
+        # the docstring above: no gates, no side effects, just the current
+        # row plus the observability fields. This is a no-op success.
+        result = dict(item)
+        result["completion_outcome"] = "already_committed"
+        result["correlation_id"] = _correlation_id
+        result["phase_timings_ms"] = dict(_phase_ms)
+        return result
+
     _evidence_quality_warning: str | None = None
     _stored_evidence_warning: str | None = None
     if item is not None and item.get("project_id") == project_id:
@@ -1939,6 +2031,7 @@ async def complete_sprint_item(
                     "pass force_foreign_claim=true to acknowledge and complete "
                     "anyway."
                 )
+        _mark_phase("ownership_check")
         if item.get("require_verification"):
             if verifier_session_id and verification_verdict:
                 await record_sprint_item_verification(
@@ -1981,6 +2074,7 @@ async def complete_sprint_item(
                     "(different session_id, no memory of the implementation) "
                     "must file the PASS verdict."
                 )
+        _mark_phase("verification_check")
         if item.get("required_notes"):
             has_evidence = bool(
                 (notes or "").strip()
@@ -2018,13 +2112,34 @@ async def complete_sprint_item(
             )
         except Exception:  # noqa: BLE001 — never block completion
             _stored_evidence_warning = None
-    result = await _update_sprint_item_status(
-        db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor,
-        expected_statuses=_ACTIVE_SPRINT_STATUSES,
-    )
+    _mark_phase("evidence_check")
+    _completion_outcome: str | None = None
+    try:
+        result = await _update_sprint_item_status(
+            db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor,
+            expected_statuses=_ACTIVE_SPRINT_STATUSES,
+        )
+    finally:
+        _mark_phase("status_transition")
     if result is not None:
-        await _maybe_rollup_parent(db, project_id, item_id)
-        await _advance_task_chain(db, project_id, item_id)
+        # a2a027cf — the core status write above has ALREADY committed (see
+        # _transition_status: it calls db.commit() itself, synchronously,
+        # before returning). Everything from here down is advisory
+        # derived-state maintenance, not part of "did the item complete" —
+        # so it runs under a bounded budget and can never turn an
+        # already-successful commit into a hung or misleading response.
+        _completion_outcome = "committed"
+        _advisory_deferred = False
+        try:
+            await asyncio.wait_for(
+                _run_post_commit_side_effects(db, project_id, item_id),
+                timeout=_ADVISORY_PHASE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            _advisory_deferred = True
+        except Exception:  # noqa: BLE001 — advisory only, never block completion
+            pass
+        _mark_phase("post_commit_advisory")
         if _evidence_quality_warning or _stored_evidence_warning:
             result = dict(result)
             if _evidence_quality_warning:
@@ -2036,24 +2151,60 @@ async def complete_sprint_item(
         # only calls complete_sprint_item (never get_sprint_progress) still
         # gets a structured signal about whether autonomous work remains
         # instead of having to infer it from prose. Advisory only — never
-        # blocks completion, fails open on any error, same shape as the two
-        # warning fields above.
+        # blocks completion, fails open on any error (INCLUDING a timeout),
+        # same shape as the two warning fields above.
         try:
-            _cg_sibling_items = await get_sprint_items_cached(db, project_id)
+            _cg_sibling_items, _cg_project = await asyncio.wait_for(
+                _gather_continuation_inputs(db, project_id),
+                timeout=_ADVISORY_PHASE_TIMEOUT_S,
+            )
             _cg_version = result.get("version")
             if _cg_version:
                 _cg_sibling_items = [
                     it for it in _cg_sibling_items if it.get("version") == _cg_version
                 ]
-            _cg_project = await get_project(db, project_id)
             result = dict(result)
             result["continuation"] = _continuation_gate.compute_continuation_state(
                 _cg_sibling_items,
                 execution_mode=(_cg_project or {}).get("execution_mode"),
             )
+        except asyncio.TimeoutError:
+            _advisory_deferred = True
         except Exception:  # noqa: BLE001 — advisory only, never block completion
             pass
+        _mark_phase("continuation_state")
+        result = dict(result)
+        if _advisory_deferred:
+            result["advisory_work_deferred"] = True
+        result["completion_outcome"] = _completion_outcome
+        result["correlation_id"] = _correlation_id
+        result["phase_timings_ms"] = dict(_phase_ms)
     return result
+
+
+async def _run_post_commit_side_effects(
+    db: aiosqlite.Connection, project_id: str, item_id: str,
+) -> None:
+    """a2a027cf — the two purely-advisory post-commit maintenance steps
+    (parent rollup + mixed-ownership task-chain advance) that
+    :func:`complete_sprint_item` used to run unbounded. Split out so both can
+    be awaited under a single ``asyncio.wait_for`` budget without duplicating
+    call sites. Neither step is part of the authoritative status write — the
+    caller's own ``_update_sprint_item_status`` call has already committed
+    ``status='done'`` before this function is ever invoked."""
+    await _maybe_rollup_parent(db, project_id, item_id)
+    await _advance_task_chain(db, project_id, item_id)
+
+
+async def _gather_continuation_inputs(
+    db: aiosqlite.Connection, project_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """a2a027cf — the two async fetches continuation-state computation needs,
+    split out so they can be awaited under a single bounded
+    ``asyncio.wait_for`` call in :func:`complete_sprint_item`."""
+    _sibling_items = await get_sprint_items_cached(db, project_id)
+    _project = await get_project(db, project_id)
+    return _sibling_items, _project
 
 
 async def provisional_complete_sprint_item(
