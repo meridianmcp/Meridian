@@ -186,7 +186,11 @@ def test_version_constant_and_embedded_marker_agree():
     marker, so the freshly-generated default would immediately register as
     stale against its own governing constant."""
     embedded = agent_defaults.parse_standard_version(agent_defaults.DEFAULT_AGENT_INSTRUCTIONS)
-    assert embedded == agent_defaults.AGENT_INSTRUCTIONS_STANDARD_VERSION == 17
+    assert embedded == agent_defaults.AGENT_INSTRUCTIONS_STANDARD_VERSION
+    # 18, not 17 -- c95d0c12 landed its own v17 entry on dev while this
+    # worktree was stale; this item's entry was renumbered to v18 during the
+    # cherry-pick merge (see the changelog comment in agent_defaults.py).
+    assert agent_defaults.AGENT_INSTRUCTIONS_STANDARD_VERSION == 18
 
 
 def test_fresh_default_instructions_are_not_stale():
