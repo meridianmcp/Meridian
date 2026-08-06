@@ -117,11 +117,18 @@ def search_outputs(
     Returns:
       {outputs_dir, query, hits, total_indexed} plus optional {subtree,
       partial, pending_stale_count, fts_pending, tantivy_lock_warning,
-      db_write_error, zero_hits_warning, error, convergence}.
+      index_lock_warning, db_write_error, zero_hits_warning, error,
+      convergence}.
       ``pending_stale_count`` (only present when ``partial`` is True) is the
       number of confirmed-stale files still queued for analysis+write --
       distinguishes a zero-hit result on a mid-pass index (more indexing
       queued) from a genuine miss on a fully-converged index (81a0b23d).
+      ``index_lock_warning`` (a52216e2) is present whenever the index's
+      single-writer lock itself could not be acquired this call (real
+      cross-process contention against an ACTIVE owner, or an unexpected
+      acquisition failure) -- mirrors the ``tantivy_lock_warning`` precedent:
+      the call still degraded gracefully (never raised), but got fewer/no
+      hits because a write it needed didn't happen. Safe to re-invoke.
       ``zero_hits_warning`` is present whenever ``hits`` is empty AND the
       index isn't fully converged (partial/fts_pending/db_write_error set,
       OR ``convergence.converged`` is False) -- treat its presence as "do
@@ -149,6 +156,15 @@ def search_outputs(
       whole backlog fit). A non-zero ``analysis_backlog_deferred`` also
       implies ``partial``/``pending_stale_count`` above, for the same
       "re-invoke rather than conclude not-found" reason.
+
+      ``index_lock`` (a52216e2) is a read-only snapshot of who currently
+      holds this index's write lock -- {held, pid, hostname, session_id,
+      started_at, heartbeat_at, age_seconds, lock_mode, pid_alive, is_stale,
+      stale_reason} -- or ``None`` for an in-memory index. Never acquired
+      just by calling this tool, and never used to terminate anything: a
+      ``is_stale=True`` reading only means a leftover lock FILE from a
+      crashed owner is safe to reclaim, not that any process should be
+      killed.
       Each hit has: path, score, bm25, is_archival, canonical_path, kind,
       generating_script, csv_columns, json_keys, size, mtime, annotations,
       literal_match.
@@ -227,7 +243,15 @@ def get_convergence_state(
     Returns:
       {outputs_dir, subtree, converged, walk_complete, scan_boundary,
       pending_count, indexed_count, expected_count, last_error, fts_pending,
-      partial}, or {error: ...} if ``outputs_dir`` doesn't exist.
+      partial, index_lock}, or {error: ...} if ``outputs_dir`` doesn't exist.
+      ``index_lock`` (a52216e2): a read-only snapshot of this index's
+      single-writer lock/lease -- {held, pid, hostname, session_id,
+      started_at, heartbeat_at, age_seconds, lock_mode, pid_alive, is_stale,
+      stale_reason} -- or ``None`` for an in-memory index. Distinguishes an
+      ACTIVE owner (a live, recently-heartbeating writer -- never stolen,
+      never touched) from a STALE one (a leftover lock file from a crashed
+      owner, safe to reclaim on the next acquire). This call never acquires
+      the lock itself and never disturbs whatever process currently holds it.
     """
     return outputs_local.get_convergence_state(outputs_dir, subtree=subtree)
 
