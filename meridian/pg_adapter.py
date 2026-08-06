@@ -4180,6 +4180,56 @@ async def _migrate_pg_vector_index_state(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_executor_reports(conn: PostgresConnection) -> None:
+    """9154aa9a — executor_reports: durable executor-report / corrective-
+    handoff-lifecycle records (mirrors db.executor_reports._migrate_executor_reports_table
+    — see that function's docstring for the full field-by-field rationale).
+
+    CREATE TABLE / INDEX IF NOT EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS executor_reports ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    version TEXT,"
+        "    session_id TEXT,"
+        "    source_handoff_id TEXT,"
+        "    board_revision_hash TEXT,"
+        "    item_outcomes TEXT NOT NULL DEFAULT '[]',"
+        "    changed_resources TEXT NOT NULL DEFAULT '[]',"
+        "    commits TEXT NOT NULL DEFAULT '[]',"
+        "    tests TEXT,"
+        "    tool_availability TEXT NOT NULL DEFAULT '[]',"
+        "    artifact_evidence TEXT,"
+        "    blockers TEXT NOT NULL DEFAULT '[]',"
+        "    unresolved_questions TEXT NOT NULL DEFAULT '[]',"
+        "    recommended_next_actions TEXT NOT NULL DEFAULT '[]',"
+        "    status TEXT NOT NULL DEFAULT 'submitted'"
+        "        CHECK (status IN ('submitted','accepted','superseded')),"
+        "    parent_report_id TEXT,"
+        "    correction_reason TEXT,"
+        "    report_hash TEXT,"
+        "    accepted_handoff_id TEXT,"
+        "    accepted_at TEXT,"
+        "    accepted_by TEXT,"
+        "    idempotency_key TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_executor_reports_project "
+        "ON executor_reports(project_id, created_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_executor_reports_project_version "
+        "ON executor_reports(project_id, version);"
+        "CREATE INDEX IF NOT EXISTS idx_executor_reports_parent "
+        "ON executor_reports(parent_report_id);"
+        "CREATE INDEX IF NOT EXISTS idx_executor_reports_source_handoff "
+        "ON executor_reports(source_handoff_id);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_executor_reports_idempotency "
+        "ON executor_reports(project_id, idempotency_key) "
+        "WHERE idempotency_key IS NOT NULL;"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -4289,4 +4339,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_handoff_corrections_table,
     _migrate_pg_vector_index_state,
     _migrate_pg_pixi_env_roots,
+    _migrate_pg_executor_reports,
 )

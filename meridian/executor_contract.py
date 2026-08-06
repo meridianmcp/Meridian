@@ -921,6 +921,32 @@ async def build_executor_contract_for_item_id(
     return await build_executor_contract(db, project_id, item, **kwargs)
 
 
+async def summarize_contract_for_report(
+    db: Any, project_id: str, item_id: str, **kwargs: Any,
+) -> "dict[str, Any] | None":
+    """9154aa9a -- compact per-item contract summary for embedding into an
+    executor_report item_outcome entry (see
+    ``meridian.handoff.record_executor_report``'s ``enrich_contract_hashes``
+    kwarg) -- durable provenance tying a reported outcome to the EXACT
+    executor_contract (by hash) the executor was working against, without
+    needing to persist the full contract object into every report row.
+
+    Returns ``None`` when the item does not exist or belongs to a different
+    project (mirrors :func:`build_executor_contract_for_item_id`) -- never
+    raises."""
+    contract = await build_executor_contract_for_item_id(
+        db, project_id, item_id, **kwargs,
+    )
+    if contract is None:
+        return None
+    return {
+        "item_id": contract.get("item_id"),
+        "contract_hash": contract.get("contract_hash"),
+        "executable": contract.get("executable"),
+        "generated_at": contract.get("generated_at"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Projections -- JSON / XML clause / human text. Every renderer below is a
 # PURE function of an already-built ``contract`` dict: none of them fetch,
