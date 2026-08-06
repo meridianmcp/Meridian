@@ -1206,3 +1206,72 @@ async def test_dispatch_complete_sprint_item_other_tools_unaffected_by_timeout_w
     )
     assert isinstance(result, list)
     assert any(it["id"] == item["id"] for it in result)
+
+
+# ---------------------------------------------------------------------------
+# 56e9b3c7 — _reset_stale_claim (autonomous stale-claim reconciliation) is
+# ANOTHER caller of the _transition_status chokepoint proven race-safe above.
+# Verify it passes the correct to_status/from_statuses (same passthrough
+# proof pattern as every other caller in this file) and, independently,
+# that it is itself race-safe as a REAL concurrent chokepoint caller.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reset_stale_claim_passes_pending_from_in_progress_to_chokepoint(db, monkeypatch):
+    """_reset_stale_claim must call _transition_status with to_status='pending'
+    and from_statuses=['in_progress'] — the same atomic TOCTOU guard every
+    other transition in this module routes through."""
+    p = await db_module.create_project(db, "reset-stale-chokepoint")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "stale target")
+    owner = await db_module.register_session(db, p["id"], "chokepoint-owner")
+    await db_module.claim_sprint_item(db, p["id"], item["id"], actor=owner["id"])
+    await db.execute("UPDATE sessions SET status = 'closed' WHERE id = ?", (owner["id"],))
+    await db.commit()
+
+    captured: dict = {}
+    real_transition = _sprint_items_mod._transition_status
+
+    async def _capture_transition(db_conn, project_id, item_id, to_status,
+                                   from_statuses=None, **kwargs):
+        captured["to_status"] = to_status
+        captured["from_statuses"] = set(from_statuses) if from_statuses is not None else None
+        return await real_transition(db_conn, project_id, item_id, to_status,
+                                     from_statuses=from_statuses, **kwargs)
+
+    monkeypatch.setattr(db_module, "_transition_status", _capture_transition)
+    monkeypatch.setattr(_sprint_items_mod, "_transition_status", _capture_transition)
+
+    fresh = await db_module.get_sprint_item(db, item["id"])
+    verdict = await db_module.classify_stale_claim(db, fresh)
+    assert verdict["classification"] == "stale"
+    result = await _sprint_items_mod._reset_stale_claim(db, p["id"], item["id"], verdict)
+    assert result is not None
+    assert captured["to_status"] == "pending"
+    assert captured["from_statuses"] == {"in_progress"}
+
+
+@pytest.mark.asyncio
+async def test_reset_stale_claim_noop_when_item_already_raced_away(db):
+    """If the item is no longer in_progress by the time _reset_stale_claim
+    actually writes (a concurrent completion/claim beat it), it must no-op
+    (return None) rather than clobber the real winner's status — same
+    race-lost contract as requeue_or_fail_stalled_item."""
+    p = await db_module.create_project(db, "reset-stale-raced-away")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "raced away")
+    owner = await db_module.register_session(db, p["id"], "raced-owner")
+    await db_module.claim_sprint_item(db, p["id"], item["id"], actor=owner["id"])
+    await db.execute("UPDATE sessions SET status = 'closed' WHERE id = ?", (owner["id"],))
+    await db.commit()
+
+    fresh = await db_module.get_sprint_item(db, item["id"])
+    verdict = await db_module.classify_stale_claim(db, fresh)
+    assert verdict["classification"] == "stale"
+
+    # A concurrent winner completes the item first.
+    await db_module.complete_sprint_item(db, p["id"], item["id"], force_foreign_claim=True)
+
+    result = await _sprint_items_mod._reset_stale_claim(db, p["id"], item["id"], verdict)
+    assert result is None
+    final = await db_module.get_sprint_item(db, item["id"])
+    assert final["status"] == "done"  # the real winner's terminal state stuck

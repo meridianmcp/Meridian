@@ -2368,6 +2368,19 @@ async def claim_sprint_item(
     function's result is a full ``get_sprint_item`` row) so a caller that
     claims directly (bypassing /goal's rendered ``<required_tool>``
     directive) still sees the pin and can honour it.
+
+    56e9b3c7 — AUTONOMOUS STALE-CLAIM RECONCILIATION: when the item is
+    already ``in_progress``, this function no longer just raises. It first
+    classifies the existing claim via :func:`classify_stale_claim` — a
+    multi-signal check (claiming session's heartbeat/closed-state, worktree
+    activity, task-log evidence since ``claimed_at`` — NOT ``claimed_at`` age
+    alone) — and, ONLY when the verdict is ``"stale"``, atomically releases
+    the abandoned claim's item/resource locks, resets it to ``pending``, and
+    writes an audit record (:func:`_reset_stale_claim`) before retrying the
+    claim fresh. An ``"active"`` or ``"ambiguous"`` verdict changes nothing —
+    the ``ValueError`` below still fires exactly as before. See
+    :func:`reconcile_stale_claims` for the project/version-scoped bulk sweep
+    (dry-run + bounded-batch) built on the same classifier.
     """
     item = await get_sprint_item(db, item_id)
     if item is None:
@@ -2509,9 +2522,38 @@ async def claim_sprint_item(
         }
     blocked = {"in_progress", "done", "failed", "skipped"}
     if (item.get("status") or "pending") in blocked:
-        raise ValueError(
-            f"cannot claim item with status '{item.get('status')}'"
-        )
+        # 56e9b3c7 — AUTONOMOUS STALE-CLAIM RECONCILIATION: previously this
+        # branch just raised ValueError for an in_progress item, and the ONLY
+        # feedback a caller got was the MCP handler's own reactive, age-only
+        # (claimed_at > 2h) STALE_CLAIM report AFTER the raise — nothing ever
+        # actually reconciled the claim; the response merely suggested
+        # update_sprint_item(status='pending', force=true), a schema that
+        # doesn't exist. Before giving up, run the full multi-signal
+        # classification (heartbeat/session-liveness, worktree activity,
+        # task-log evidence, explicit close — NOT claimed_at age alone) via
+        # classify_stale_claim(). Only a "stale" verdict is auto-reconciled;
+        # "active" and "ambiguous" verdicts fall through to the unchanged
+        # raise below — a claim is NEVER reset on a hunch or on age alone.
+        if (item.get("status") or "") == "in_progress":
+            try:
+                _reconcile_verdict = await classify_stale_claim(db, item)
+            except Exception:  # noqa: BLE001 — classification must never wedge a claim attempt
+                _reconcile_verdict = {"classification": "ambiguous"}
+            if _reconcile_verdict.get("classification") == "stale":
+                _reconciled = await _reset_stale_claim(
+                    db, project_id, item_id, _reconcile_verdict, actor=actor,
+                )
+                if _reconciled is not None:
+                    # The stale claim was atomically released back to pending
+                    # (locks released, stall_count bumped, audit record
+                    # written by _reset_stale_claim) — re-fetch and fall
+                    # through to the normal claim path below as if this
+                    # caller had found the item pending in the first place.
+                    item = await get_sprint_item(db, item_id)
+        if (item.get("status") or "pending") in blocked:
+            raise ValueError(
+                f"cannot claim item with status '{item.get('status')}'"
+            )
     # fa3e3331 — the pre-check above (read, then this UPDATE) is a classic
     # TOCTOU race: two concurrent claims can both pass the pre-check before
     # either commits. Routing through _transition_status with from_statuses
@@ -2548,6 +2590,556 @@ async def claim_sprint_item(
             f"cannot claim item with status '{_raced.get('status')}'"
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# 56e9b3c7 — autonomous stale-claim reconciliation.
+#
+# THE DEFECT: claim_sprint_item only ever REPORTED a stale claim reactively —
+# after a second claim attempt raised ValueError, the MCP handler
+# (meridian/mcp/handlers/sprint_tools.py, 10c0f6a0) checked claimed_at age
+# alone (>2h) and, if stale, told the caller to self-service via
+# ``update_sprint_item(status='pending', force=true)`` — a recovery contract
+# the public update tool schema never actually exposed. There was no
+# autonomous sweep, no session-heartbeat/liveness check, no worktree/process
+# check, no evidence check, and no audit trail of who reset what or why.
+#
+# THE FIX: two entry points sharing ONE classifier (:func:`classify_stale_claim`)
+# and ONE atomic reset (:func:`_reset_stale_claim`):
+#   1. claim_sprint_item itself (see above) — autonomously reconciles the ONE
+#      item a caller is actively trying to claim, inline, before raising.
+#   2. :func:`reconcile_stale_claims` — a project/version-scoped BULK sweep
+#      with dry-run and bounded-batch modes, for a scheduler path or an
+#      explicit human/planner-triggered audit across an entire board.
+#
+# CLASSIFICATION IS DELIBERATELY CONSERVATIVE. Per the acceptance criteria:
+# "never reset an active or ambiguous claim" and "require multiple signals
+# ... when evidence is ambiguous". Concretely:
+#   * A claiming session with a LIVE heartbeat (found, not closed/archived,
+#     last_seen within the staleness window) is ALWAYS "active", no matter
+#     how old claimed_at is — a 70-hour-old claim under a session that is
+#     still heartbeating is genuine long-running work, not abandonment.
+#   * No actor recorded at all -> "ambiguous" (nothing to verify liveness
+#     against — resetting blind is the one thing this module must never do).
+#   * The claiming session explicitly closed/archived -> "stale" outright,
+#     unconditionally — this mirrors the ALREADY-SHIPPED, accepted precedent
+#     in complete_sprint_item's own claim-ownership gate (8693b6a8): an
+#     explicit close is a strong, non-time-based signal, not a guess.
+#   * Anything short of that (session simply not found — e.g. a human-named
+#     actor string, per the SAME "can't tell != proof of death" precedent
+#     8693b6a8 already established — or a session whose heartbeat has merely
+#     gone cold without an explicit close) requires claimed_at age STALE
+#     *plus* at least one corroborating signal (no live worktree activity, no
+#     task-log evidence since the claim, or — for the fully-unrecognised-actor
+#     case — two independent corroborators) before landing on "stale". A
+#     single signal alone (age, or a cold-but-not-explicitly-closed session)
+#     is "ambiguous", never "stale" — the multi-signal requirement the
+#     acceptance criteria calls for.
+#   * When ``repo_root`` is supplied (self-hosted only — mirrors
+#     sprint_evidence_guard's own self-hosted-only gate), a claim that already
+#     has real, fresh, matching completion evidence on file
+#     (:func:`meridian.sprint_evidence_guard.verify_strict_completion_evidence`
+#     returns ``ok=True``) is downgraded from "stale" to "ambiguous" — this
+#     looks like completed work that was never marked done, not an abandoned
+#     claim, and resetting it to pending would silently discard real work.
+# ---------------------------------------------------------------------------
+
+# Reuse the SAME 2h number claim_sprint_item's reactive report and
+# complete_sprint_item's claim-ownership gate already use, so "is this claim
+# stale" answers identically everywhere in the codebase that asks.
+_RECONCILE_STALE_HOURS = _CLAIM_OWNERSHIP_STALE_HOURS
+
+# Bulk-sweep batch bounds (reconcile_stale_claims). Bounded so a huge board
+# can never turn one sweep call into an unbounded scan/lock storm.
+_RECONCILE_DEFAULT_BATCH = 25
+_RECONCILE_MAX_BATCH = 200
+
+# event_type recorded in action_audit_log for every autonomous/bulk reset —
+# same append-only audit table sprint_evidence_guard's override path uses.
+RECONCILE_STALE_CLAIM_AUDIT_EVENT = "sprint_item_stale_claim_reconciled"
+
+# Classification verdicts returned by classify_stale_claim().
+RECONCILE_ACTIVE = "active"
+RECONCILE_STALE = "stale"
+RECONCILE_AMBIGUOUS = "ambiguous"
+RECONCILE_NOT_APPLICABLE = "not_applicable"
+
+
+async def _claim_session_liveness(
+    db: aiosqlite.Connection, actor: str
+) -> dict[str, Any]:
+    """Resolve a claim's ``actor`` against the sessions table.
+
+    Mirrors (and is intentionally consistent with) complete_sprint_item's
+    own claim-ownership staleness check (8693b6a8): a session row that
+    doesn't exist at all is "can't tell", NOT proof of death — many actor
+    strings are human names or foreign identifiers with no session row.
+    """
+    async with db.execute(
+        "SELECT status, last_seen FROM sessions WHERE id = ?", (actor,)
+    ) as cur:
+        row = await cur.fetchone()
+    sess = _row_to_dict(row)
+    if sess is None:
+        return {
+            "found": False, "status": None, "last_seen": None,
+            "closed_or_archived": False, "heartbeat_cold": None,
+            "verified_alive": False,
+        }
+    status = sess.get("status") or ""
+    closed_or_archived = status in ("closed", "archived")
+    last_seen_dt = _parse_deferral_ts(sess.get("last_seen"))
+    heartbeat_cold: bool | None = None
+    if last_seen_dt is not None:
+        from datetime import datetime as _dt_cls  # noqa: PLC0415
+        age_h = (_dt_cls.utcnow() - last_seen_dt).total_seconds() / 3600
+        heartbeat_cold = age_h > _RECONCILE_STALE_HOURS
+    verified_alive = (not closed_or_archived) and (heartbeat_cold is False)
+    return {
+        "found": True, "status": status, "last_seen": sess.get("last_seen"),
+        "closed_or_archived": closed_or_archived,
+        "heartbeat_cold": heartbeat_cold,
+        "verified_alive": verified_alive,
+    }
+
+
+async def _claim_worktree_activity(
+    db: aiosqlite.Connection,
+    actor: str,
+    item_id: str,
+    *,
+    repo_root: "Any | None" = None,
+) -> bool | None:
+    """Worktree-activity signal for one (actor, item) claim.
+
+    Returns ``True`` when a live, registered worktree for this exact
+    (session, item) pair exists — real evidence of ongoing work. Returns
+    ``False`` when a worktree WAS registered for this pair but is no longer
+    live (removed, or — self-hosted only, when ``repo_root`` is supplied —
+    its recorded owner ``pid`` is confirmed dead via the same liveness check
+    ``worktree_cleanup`` itself uses before a real disk removal). Returns
+    ``None`` (unknown, votes neither way) when no worktree was ever
+    registered for this pair at all — many legitimate executors work in a
+    single tree and never call register_worktree.
+    """
+    async with db.execute(
+        "SELECT * FROM active_worktrees WHERE session_id = ? AND item_id = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (actor, item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    wt = _row_to_dict(row)
+    if wt is None:
+        return None
+    if wt.get("removed_at"):
+        return False
+    if repo_root is not None and wt.get("pid") is not None:
+        try:
+            from ..worktree_cleanup import _pid_is_alive  # noqa: PLC0415
+            if not _pid_is_alive(int(wt["pid"])):
+                return False
+        except Exception:  # noqa: BLE001 — an unverifiable pid is not proof of death
+            pass
+    return True
+
+
+async def _claim_recent_task_evidence(
+    db: aiosqlite.Connection,
+    actor: str | None,
+    item_id: str,
+    claimed_at_dt: "Any | None",
+) -> bool | None:
+    """True when a task_log row for this actor/item was logged at/since the claim.
+
+    Returns ``None`` (unknown) when ``claimed_at_dt`` couldn't be parsed —
+    there is nothing to compare "since" against. Uses ``>=`` rather than a
+    strict ``>``: both timestamps are second-granularity TEXT columns, so a
+    task logged in the SAME second as the claim (a common real sequence —
+    claim, then immediately log progress) must still count as evidence, not
+    be excluded by a same-second tie.
+    """
+    if claimed_at_dt is None:
+        return None
+    claimed_at_str = claimed_at_dt.strftime("%Y-%m-%d %H:%M:%S")
+    params: list[Any] = [item_id, claimed_at_str]
+    actor_clause = ""
+    if actor:
+        actor_clause = "OR session_id = ? "
+        params.insert(1, actor)
+    async with db.execute(
+        "SELECT COUNT(*) AS cnt FROM task_log "
+        f"WHERE (sprint_item_id = ? {actor_clause}) AND created_at >= ?",
+        tuple(params),
+    ) as cur:
+        row = await cur.fetchone()
+    cnt = (row["cnt"] if isinstance(row, dict) else row[0]) if row else 0
+    return bool(cnt)
+
+
+async def classify_stale_claim(
+    db: aiosqlite.Connection,
+    item: dict[str, Any],
+    *,
+    repo_root: "Any | None" = None,
+    now: "Any | None" = None,
+) -> dict[str, Any]:
+    """Classify ONE sprint item's current claim as active/stale/ambiguous.
+
+    See the module-level "56e9b3c7" comment block above claim_sprint_item's
+    reconciliation hook for the full decision-tree rationale. Never raises
+    for a normal classification outcome — an internal error degrades a
+    specific signal to "unknown" rather than aborting, matching this
+    module's established fail-open-on-uncertainty convention (never fail
+    open toward RESETTING a claim, only toward classifying it "ambiguous").
+
+    Returns ``{"item_id", "classification", "reasons": [str, ...],
+    "signals": {...}}``. ``classification`` is one of "active", "stale",
+    "ambiguous", or "not_applicable" (item isn't in_progress at all).
+    """
+    from datetime import datetime as _dt_cls  # noqa: PLC0415
+
+    item_id = item.get("id")
+    reasons: list[str] = []
+    if (item.get("status") or "") != "in_progress":
+        return {
+            "item_id": item_id, "classification": RECONCILE_NOT_APPLICABLE,
+            "reasons": ["item is not in_progress"], "signals": {},
+        }
+
+    now_dt = now or _dt_cls.utcnow()
+    claimed_at_dt = _parse_deferral_ts(item.get("claimed_at"))
+    age_hours: float | None = None
+    age_stale = False
+    if claimed_at_dt is not None:
+        age_hours = (now_dt - claimed_at_dt).total_seconds() / 3600
+        age_stale = age_hours > _RECONCILE_STALE_HOURS
+
+    actor = (item.get("actor") or "").strip()
+    signals: dict[str, Any] = {
+        "actor": actor or None,
+        "claimed_at": item.get("claimed_at"),
+        "age_hours": round(age_hours, 2) if age_hours is not None else None,
+        "age_stale": age_stale,
+    }
+
+    if not actor:
+        signals.update({"session_found": None, "worktree_live": None, "recent_evidence": None})
+        return {
+            "item_id": item_id, "classification": RECONCILE_AMBIGUOUS,
+            "reasons": ["no actor recorded on the claim — cannot verify session "
+                        "liveness, so the claim is never auto-reset blind"],
+            "signals": signals,
+        }
+
+    session = await _claim_session_liveness(db, actor)
+    signals.update({
+        "session_found": session["found"],
+        "session_status": session["status"],
+        "session_last_seen": session["last_seen"],
+        "session_explicitly_closed": session["closed_or_archived"],
+        "session_heartbeat_cold": session["heartbeat_cold"],
+        "session_verified_alive": session["verified_alive"],
+    })
+
+    if session["verified_alive"]:
+        reasons.append(
+            f"claiming session {actor!r} has a live heartbeat "
+            f"(status={session['status']!r}, last_seen={session['last_seen']!r})"
+        )
+        return {
+            "item_id": item_id, "classification": RECONCILE_ACTIVE,
+            "reasons": reasons, "signals": signals,
+        }
+
+    if session["closed_or_archived"]:
+        reasons.append(
+            f"claiming session {actor!r} is explicitly {session['status']!r} "
+            "— mirrors complete_sprint_item's own claim-ownership precedent "
+            "(8693b6a8) that an explicit close is unconditional proof of death"
+        )
+        return {
+            "item_id": item_id, "classification": RECONCILE_STALE,
+            "reasons": reasons, "signals": signals,
+        }
+
+    worktree_live = await _claim_worktree_activity(db, actor, item_id, repo_root=repo_root)
+    recent_evidence = await _claim_recent_task_evidence(db, actor, item_id, claimed_at_dt)
+    signals["worktree_live"] = worktree_live
+    signals["recent_evidence"] = recent_evidence
+
+    corroborators = 0
+    if age_stale:
+        corroborators += 1
+        reasons.append(f"claimed_at is {signals['age_hours']}h old (> {_RECONCILE_STALE_HOURS}h)")
+    if worktree_live is False:
+        corroborators += 1
+        reasons.append("no live registered worktree for this claim (removed or owning process dead)")
+    if recent_evidence is False:
+        corroborators += 1
+        reasons.append("no task_log activity for this item/session since it was claimed")
+
+    session_heartbeat_dead = bool(session["found"] and session["heartbeat_cold"])
+    session_unknown = not session["found"]
+    # A LIVE, registered worktree is a veto against auto-reset, not merely
+    # "not a corroborator" — a quiet executor that never calls log_task but
+    # still has an active worktree registered (optionally pid-confirmed
+    # alive) is exactly the "legitimate long-running work" the acceptance
+    # criteria says must be preserved, even with a cold heartbeat and zero
+    # task_log rows. A live worktree can only ever push toward "ambiguous"
+    # (never "active" outright — that still requires a verified heartbeat).
+    worktree_veto = worktree_live is True
+
+    classification = RECONCILE_AMBIGUOUS
+    if session_heartbeat_dead and corroborators >= 1 and not worktree_veto:
+        reasons.insert(0, f"claiming session {actor!r}'s heartbeat has gone cold")
+        classification = RECONCILE_STALE
+    elif session_unknown and age_stale and corroborators >= 2 and not worktree_veto:
+        reasons.insert(0, f"no session row found for actor {actor!r} (unverifiable identity)")
+        classification = RECONCILE_STALE
+    elif corroborators == 0 and not worktree_veto and session["heartbeat_cold"] is not True:
+        # Nothing suspicious at all — fresh-ish claim, no negative signals.
+        classification = RECONCILE_ACTIVE
+        reasons = ["no staleness signals fired"]
+    elif worktree_veto and classification != RECONCILE_STALE:
+        reasons.append("a live registered worktree vetoes auto-reset — needs human review")
+
+    if classification == RECONCILE_STALE and repo_root is not None:
+        try:
+            from meridian.sprint_evidence_guard import verify_strict_completion_evidence  # noqa: PLC0415
+            _evidence = await verify_strict_completion_evidence(
+                db, repo_root, item.get("project_id"), item_id, item,
+            )
+            signals["strict_evidence_ok"] = bool(_evidence.get("ok"))
+        except Exception:  # noqa: BLE001 — evidence check is advisory to classification
+            signals["strict_evidence_ok"] = None
+        if signals.get("strict_evidence_ok"):
+            classification = RECONCILE_AMBIGUOUS
+            reasons.append(
+                "verify_strict_completion_evidence found real, fresh completion "
+                "evidence on file — this looks like finished work that was never "
+                "marked done, not an abandoned claim; resetting to pending would "
+                "risk silently discarding it. A human should review and likely "
+                "call complete_sprint_item instead."
+            )
+
+    return {"item_id": item_id, "classification": classification, "reasons": reasons, "signals": signals}
+
+
+async def _reset_stale_claim(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    verdict: dict[str, Any],
+    *,
+    actor: str | None = None,
+) -> dict[str, Any] | None:
+    """Atomically reset ONE proven-stale claim: release its locks, return the
+    item to pending, and write an audit record. NEVER call this directly on
+    a verdict that isn't ``"stale"`` — this function does not itself re-check
+    the classification, only the live status (TOCTOU guard).
+
+    Returns ``None`` (silent no-op) if the item raced away from
+    ``in_progress`` between classification and this write (a concurrent
+    legitimate completion/claim/reconciliation beat this one to it) — never
+    clobbers a concurrent winner, matching every other transition in this
+    module's race-safety contract.
+    """
+    item = await get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return None
+    prior_actor = item.get("actor")
+    prior_claimed_at = item.get("claimed_at")
+
+    # TOCTOU-safe: only transitions FROM in_progress. A race-lost attempt is
+    # a silent no-op (mirrors requeue_or_fail_stalled_item / _transition_status).
+    transitioned = await _transition_status(
+        db, project_id, item_id, "pending",
+        from_statuses=["in_progress"],
+    )
+    if transitioned is None:
+        return None
+
+    new_stall_count = int(item.get("stall_count") or 0) + 1
+    await db.execute(
+        "UPDATE sprint_items SET claimed_at = NULL, stall_count = ? "
+        "WHERE id = ? AND project_id = ?",
+        (new_stall_count, item_id, project_id),
+    )
+    await db.commit()
+
+    # Release item/resource locks the abandoned claim held. Best-effort:
+    # release_file/release_resource/release_symbol live in db/locks.py, which
+    # is imported back onto the meridian.db package AFTER sprint_items.py —
+    # lazy import here (called well after full package init) avoids the
+    # circular-import ordering issue, same pattern _check_wrong_worktree in
+    # sprint_evidence_guard.py already uses for a cross-submodule call.
+    released: list[str] = []
+    if prior_actor:
+        try:
+            from meridian.db import release_file, release_resource, release_symbol  # noqa: PLC0415
+            for rid in parse_touches_resources(item.get("touches_resources")):
+                body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
+                try:
+                    if body.startswith("file:"):
+                        path = body[len("file:"):]
+                        if await release_file(db, path, prior_actor):
+                            released.append(rid)
+                    elif body.startswith("symbol:"):
+                        path, _, sym = body[len("symbol:"):].partition("::")
+                        if sym and await release_symbol(db, prior_actor, path, sym):
+                            released.append(rid)
+                        elif not sym and await release_file(db, path, prior_actor):
+                            released.append(rid)
+                    else:
+                        if await release_resource(db, body, prior_actor):
+                            released.append(rid)
+                except Exception:  # noqa: BLE001 — one bad resource id must not block the rest
+                    continue
+        except Exception:  # noqa: BLE001 — lock release is best-effort, never blocks the reset
+            pass
+
+    from meridian.db import record_action_audit_event  # noqa: PLC0415
+    detail = json.dumps({
+        "item_id": item_id,
+        "prior_actor": prior_actor,
+        "prior_claimed_at": prior_claimed_at,
+        "released_resources": released,
+        "classification": verdict.get("classification"),
+        "reasons": verdict.get("reasons"),
+        "signals": verdict.get("signals"),
+    })
+    try:
+        await record_action_audit_event(
+            db, RECONCILE_STALE_CLAIM_AUDIT_EVENT,
+            project_id=project_id, actor=actor, detail=detail,
+        )
+    except Exception:  # noqa: BLE001 — an audit-log hiccup must not undo an already-committed reset
+        pass
+
+    updated = await get_sprint_item(db, item_id)
+    return {
+        "item_id": item_id,
+        "prior_actor": prior_actor,
+        "prior_claimed_at": prior_claimed_at,
+        "released_resources": released,
+        "stall_count": new_stall_count,
+        "reasons": verdict.get("reasons"),
+        "item": updated,
+    }
+
+
+async def reconcile_stale_claims(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    version: str | None = None,
+    item_ids: list[str] | None = None,
+    dry_run: bool = True,
+    max_batch: int = _RECONCILE_DEFAULT_BATCH,
+    actor: str | None = None,
+    repo_root: "Any | None" = None,
+) -> dict[str, Any]:
+    """56e9b3c7 — project/version-scoped, auditable stale-claim reconciliation
+    sweep. The bulk counterpart to claim_sprint_item's inline autonomous
+    reconciliation — for a scheduler path, or an explicit human/planner-
+    triggered audit across a whole board.
+
+    Scans ``in_progress`` items in ``project_id`` (optionally narrowed to one
+    ``version`` and/or an explicit ``item_ids`` allow-list — never cross-project:
+    every candidate query is hard-scoped to ``project_id``), classifies each
+    via :func:`classify_stale_claim`, and — ONLY when ``dry_run=False`` — resets
+    every "stale" verdict via :func:`_reset_stale_claim`. "active" and
+    "ambiguous" verdicts are NEVER touched, dry-run or not.
+
+    ``dry_run=True`` (the default) performs the full scan/classification and
+    reports exactly what WOULD happen without writing anything — safe to run
+    against any project, including live production boards, at any time.
+
+    ``max_batch`` bounds how many in_progress candidates are classified (and,
+    if not dry-run, potentially reset) in a single call — capped at
+    :data:`_RECONCILE_MAX_BATCH` regardless of what's requested, so one call
+    can never turn into an unbounded scan/lock-release storm on a huge board.
+    ``truncated=True`` on the result means more candidates exist than were
+    scanned this call — page through with subsequent calls.
+
+    Returns ``{"project_id", "version", "dry_run", "max_batch",
+    "candidates_total", "scanned", "truncated", "active": [...],
+    "stale": [...], "ambiguous": [...], "reset": [...], "errors": [...]}``.
+    Each of active/stale/ambiguous holds classify_stale_claim's verdict dicts;
+    "reset" holds _reset_stale_claim's result dicts (only populated when
+    dry_run=False); "errors" holds ``{"item_id", "error"}`` for any single
+    candidate whose classification or reset blew up — one bad item never
+    aborts the whole sweep.
+    """
+    if max_batch <= 0:
+        raise ValueError("max_batch must be positive")
+    max_batch = min(int(max_batch), _RECONCILE_MAX_BATCH)
+
+    where = ["project_id = ?", "status = 'in_progress'"]
+    params: list[Any] = [project_id]
+    if version:
+        where.append("version = ?")
+        params.append(version)
+    if item_ids:
+        placeholders = ", ".join("?" for _ in item_ids)
+        where.append(f"id IN ({placeholders})")
+        params.extend(item_ids)
+    query = (
+        f"SELECT * FROM sprint_items WHERE {' AND '.join(where)} "
+        "ORDER BY claimed_at ASC"
+    )
+    async with db.execute(query, tuple(params)) as cur:
+        rows = await cur.fetchall()
+    candidates = [r for r in (_row_to_dict(row) for row in rows) if r]
+
+    active: list[dict[str, Any]] = []
+    stale: list[dict[str, Any]] = []
+    ambiguous: list[dict[str, Any]] = []
+    reset: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    scanned = 0
+    for cand in candidates:
+        if scanned >= max_batch:
+            break
+        scanned += 1
+        try:
+            verdict = await classify_stale_claim(db, cand, repo_root=repo_root)
+        except Exception as exc:  # noqa: BLE001 — one bad item must never wedge the sweep
+            errors.append({"item_id": cand.get("id"), "error": str(exc)})
+            continue
+        cls = verdict.get("classification")
+        if cls == RECONCILE_ACTIVE:
+            active.append(verdict)
+        elif cls in (RECONCILE_AMBIGUOUS, RECONCILE_NOT_APPLICABLE):
+            ambiguous.append(verdict)
+        else:  # RECONCILE_STALE
+            stale.append(verdict)
+            if not dry_run:
+                try:
+                    reset_result = await _reset_stale_claim(
+                        db, project_id, cand["id"], verdict, actor=actor,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"item_id": cand.get("id"), "error": str(exc)})
+                    continue
+                if reset_result is not None:
+                    reset.append(reset_result)
+
+    return {
+        "project_id": project_id,
+        "version": version,
+        "dry_run": dry_run,
+        "max_batch": max_batch,
+        "candidates_total": len(candidates),
+        "scanned": scanned,
+        "truncated": len(candidates) > scanned,
+        "active": active,
+        "stale": stale,
+        "ambiguous": ambiguous,
+        "reset": reset,
+        "errors": errors,
+    }
 
 
 async def fail_sprint_item(
