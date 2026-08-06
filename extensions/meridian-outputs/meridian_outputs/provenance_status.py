@@ -56,6 +56,49 @@ read-only helpers item bd5b8d79 added: ``get_indexed_output`` and
 
 NO hosted call is made anywhere in this module -- fully local, matching the
 rest of the ``meridian_outputs`` package.
+
+Hash- and convergence-awareness (sprint item d3374b0e)
+--------------------------------------------------------
+This module was extended, without changing any of the above contract, to add
+the pieces item d3374b0e's acceptance criteria call for -- kept at genuine
+parity with this same item's other deliverable, the dependency-light local
+fallback ``tools/meridian_fallbacks/output_provenance_gate.py`` (same status
+strings, same ledger formats, same SHA-256 algorithm):
+
+  - A fifth explicit status, :data:`STALE_BY_SCRIPT` -- ranked ABOVE
+    :data:`EXACT`. An exact provenance record can still be promoted to this
+    status when the output was ALSO independently fingerprint-tagged
+    (``fingerprint.tag_output``, a separate ledger from ``annotate``'s own --
+    see that module's docstring) and the tagged generating-script's content
+    hash no longer matches the script's CURRENT on-disk hash
+    (:func:`_stale_by_script_result`, composing :func:`fingerprint.
+    check_staleness`). This is a strictly stronger, more specific signal than
+    the existing ``staleness`` block: the script that produced this output
+    has itself changed, independent of whether the output FILE's own content
+    ever changed.
+  - New ``archival`` field (every branch) -- canonical/archival identity
+    (``is_archival``/``canonical_path``/``sha256``), sourced from
+    ``outputs_local.get_indexed_output_status``'s row (the SAME DuckDB row
+    ``classify_canonical_archival`` already classified during indexing -- no
+    new hashing here, no re-implementation of that heuristic).
+  - New ``convergence`` field (every branch) and ``inconclusive`` flag
+    (:data:`UNREGISTERED`/:data:`UNKNOWN` branch) -- an unconverged index is
+    inconclusive, never proof of missing provenance. Reuses
+    ``outputs_local.get_indexed_output_status``'s own ``degraded`` signal
+    (True when its ``get_convergence_state()`` snapshot is not yet
+    ``converged``) rather than re-deriving convergence logic here.
+    ``inconclusive`` is additive-only: it never changes what
+    ``provenance_type`` a caller sees (a previously-``UNKNOWN`` answer stays
+    ``UNKNOWN``), it only tells a caller whether that answer is a confirmed
+    absence or "not found yet, walk still in progress." :data:`EXACT`/
+    :data:`STALE_BY_SCRIPT`/:data:`DIRECTORY_FALLBACK` are always
+    ``inconclusive=False`` -- finding SOMETHING is never inconclusive,
+    regardless of whether the rest of the tree has finished converging.
+
+All of the above are purely ADDITIVE new dict keys -- every field this
+module returned before item d3374b0e (``path``, ``provenance_type``,
+``record``, ``directory_note``, ``staleness``) keeps the exact same shape and
+values for every scenario the original implementation covered.
 """
 from __future__ import annotations
 
@@ -69,6 +112,7 @@ __all__ = [
     "DIRECTORY_FALLBACK",
     "UNREGISTERED",
     "UNKNOWN",
+    "STALE_BY_SCRIPT",
     "get_provenance_status",
 ]
 
@@ -76,6 +120,7 @@ EXACT = "exact"
 DIRECTORY_FALLBACK = "directory_fallback"
 UNREGISTERED = "unregistered"
 UNKNOWN = "unknown"
+STALE_BY_SCRIPT = "stale_by_script"
 
 
 def _staleness(query_path: str, record: dict[str, Any]) -> dict[str, Any]:
@@ -135,6 +180,66 @@ def _staleness(query_path: str, record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _indexed_lookup(outputs_dir: str, path: str) -> dict[str, Any]:
+    """Single-call composition of ``outputs_local.get_indexed_output_status``
+    for this module's convergence- and archival-awareness (item d3374b0e).
+
+    Reused across every branch of :func:`get_provenance_status` so ONE
+    lookup answers three questions at once: is ``path`` a known indexed row
+    (``row``), is that answer backed by a converged index (``degraded`` --
+    see that function's own docstring for why a non-converged index must
+    never be read as confirmed absence), and -- new here -- the row's own
+    ``is_archival``/``canonical_path``/``sha256`` fields, surfaced as
+    ``archival`` regardless of which ``provenance_type`` this call ultimately
+    resolves to (a file can be BOTH e.g. exactly recorded AND a classified
+    archival copy of some canonical twin).
+    """
+    status = outputs_local.get_indexed_output_status(outputs_dir, path)
+    row = status.get("row")
+    archival: dict[str, Any] | None = None
+    if row is not None:
+        archival = {
+            "is_archival": bool(row.get("is_archival")),
+            "canonical_path": row.get("canonical_path"),
+            "sha256": row.get("sha256"),
+        }
+    return {
+        "row": row,
+        "degraded": bool(status.get("degraded")),
+        "convergence": status.get("convergence"),
+        "archival": archival,
+    }
+
+
+def _stale_by_script_result(outputs_dir: str, path: str) -> dict[str, Any] | None:
+    """Cross-references :mod:`fingerprint`'s INDEPENDENT script-tagging
+    ledger for ``path`` (item d3374b0e).
+
+    ``annotate.record_provenance``'s ledger records WHAT produced an output
+    (a ``generating_script`` name hint) and a snapshot of the OUTPUT's own
+    content hash -- it does not itself track the generating SCRIPT's content
+    hash; that is ``fingerprint.tag_output``'s job (a deliberately separate
+    ledger, per that module's own docstring). This composes the two: if
+    ``path`` was ALSO tagged via ``fingerprint.tag_output`` at some point,
+    :func:`fingerprint.check_staleness` tells us whether the script that
+    tagging pointed at has since changed -- the "was this regenerated under
+    a now-fixed/now-different script version" signal this module could not
+    previously surface at all.
+
+    Returns ``None`` when ``path`` was never fingerprint-tagged (nothing to
+    compare) -- this is NOT the same as "not stale"; callers must check for
+    ``None`` before reading ``is_stale``. Otherwise the matching
+    :class:`fingerprint.StalenessResult`, as a dict.
+    """
+    target = annotate._normalize_path(path)
+    if not target:
+        return None
+    for result in fingerprint.check_staleness(outputs_dir):
+        if annotate._normalize_path(result.path) == target:
+            return result.to_dict()
+    return None
+
+
 def _directory_fallback(outputs_dir: str, path: str) -> dict[str, Any] | None:
     """The best (most path-specific, most recent) MERIDIAN_NOTES.md-sourced
     annotation covering ``path``, or ``None`` if none exists.
@@ -164,12 +269,22 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     Returns:
       ``{"error": ...}`` if ``outputs_dir``/``path`` are missing. Otherwise
       always ``{"path": path, "provenance_type": ..., "record": ...,
-      "directory_note": ..., "staleness": ...}`` where exactly one of
-      ``record``/``directory_note`` is non-``None`` (or neither, for
-      ``"unregistered"``/``"unknown"``) and ``provenance_type`` is one of:
+      "directory_note": ..., "staleness": ..., "script_staleness": ...,
+      "archival": ..., "convergence": ..., "inconclusive": ...}`` where
+      exactly one of ``record``/``directory_note`` is non-``None`` (or
+      neither, for ``"unregistered"``/``"unknown"``) and ``provenance_type``
+      is one of:
 
+        - :data:`STALE_BY_SCRIPT` -- ``record`` is the exact
+          ``annotate.get_provenance`` record (same as :data:`EXACT`), but
+          ``script_staleness`` (see :func:`_stale_by_script_result`) shows
+          the fingerprint-tagged generating script has changed content since
+          tagging -- promoted above :data:`EXACT` because this is a
+          stronger, more specific staleness signal (item d3374b0e).
         - :data:`EXACT` -- ``record`` is the exact ``annotate.get_provenance``
           record; ``staleness`` is populated (see :func:`_staleness`).
+          ``script_staleness`` is ``None`` (never fingerprint-tagged) or
+          not stale.
         - :data:`DIRECTORY_FALLBACK` -- ``directory_note`` is the covering
           ``MERIDIAN_NOTES.md`` annotation; ``staleness`` is ``None`` (a
           directory-level note has no single file to check staleness
@@ -180,21 +295,44 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
         - :data:`UNKNOWN` -- none of the above: this path has never been
           discovered by the outputs walker at all. Same ``None`` shape as
           ``UNREGISTERED`` -- distinguish the two by ``provenance_type``
-          alone, never by inferring from field presence.
+          alone, never by inferring from field presence. Check
+          ``inconclusive`` before treating this as confirmed absence -- an
+          unconverged index makes this "not found yet," not "confirmed
+          absent" (item d3374b0e).
+
+      ``archival`` (``{"is_archival", "canonical_path", "sha256"}`` or
+      ``None`` if ``path`` was never indexed) and ``convergence`` (the
+      index's :class:`outputs_local.ConvergenceState`-shaped dict, or
+      ``None``) are populated on every branch. ``inconclusive`` is ``True``
+      only when ``provenance_type`` is :data:`UNREGISTERED`/:data:`UNKNOWN`
+      AND the index has not yet converged -- always ``False`` for the other
+      three statuses (finding something is never inconclusive).
     """
     if not outputs_dir or not str(outputs_dir).strip():
         return {"error": "outputs_dir is required"}
     if not path or not str(path).strip():
         return {"error": "path is required"}
 
+    indexed = _indexed_lookup(outputs_dir, path)
+
     record = annotate.get_provenance(outputs_dir, path)
     if record is not None:
+        script_staleness = _stale_by_script_result(outputs_dir, path)
+        provenance_type = (
+            STALE_BY_SCRIPT
+            if script_staleness is not None and script_staleness.get("is_stale")
+            else EXACT
+        )
         return {
             "path": path,
-            "provenance_type": EXACT,
+            "provenance_type": provenance_type,
             "record": record,
             "directory_note": None,
             "staleness": _staleness(path, record),
+            "script_staleness": script_staleness,
+            "archival": indexed["archival"],
+            "convergence": indexed["convergence"],
+            "inconclusive": False,
         }
 
     directory_note = _directory_fallback(outputs_dir, path)
@@ -205,14 +343,22 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
             "record": None,
             "directory_note": directory_note,
             "staleness": None,
+            "script_staleness": None,
+            "archival": indexed["archival"],
+            "convergence": indexed["convergence"],
+            "inconclusive": False,
         }
 
-    indexed = outputs_local.get_indexed_output(outputs_dir, path)
-    provenance_type = UNREGISTERED if indexed is not None else UNKNOWN
+    provenance_type = UNREGISTERED if indexed["row"] is not None else UNKNOWN
+    inconclusive = indexed["row"] is None and indexed["degraded"]
     return {
         "path": path,
         "provenance_type": provenance_type,
         "record": None,
         "directory_note": None,
         "staleness": None,
+        "script_staleness": None,
+        "archival": indexed["archival"],
+        "convergence": indexed["convergence"],
+        "inconclusive": inconclusive,
     }
