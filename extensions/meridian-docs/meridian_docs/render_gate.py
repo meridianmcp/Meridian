@@ -80,6 +80,7 @@ __all__ = [
     "KNOWN_BACKENDS",
     "detect_backend",
     "check_render_capability",
+    "check_word_com_render_receipt",
     "verify_promotion_readiness",
 ]
 
@@ -472,6 +473,34 @@ _WORD_COM_BACKEND = RenderBackend(
 )
 
 KNOWN_BACKENDS: tuple[RenderBackend, ...] = (_SOFFICE_BACKEND, _WORD_COM_BACKEND)
+
+
+# ---------------------------------------------------------------------------
+# Word/COM-only render receipt (8419f55f).
+#
+# tools/meridian_fallbacks/docx_completion_gate.py's local DOCX completion
+# gate accepts ONLY a real Word COM render as an external verification
+# receipt: a LibreOffice/soffice conversion is a legitimate render-
+# CAPABILITY signal for check_render_capability's general three-state
+# contract above, but it is not what that gate's stricter contract means by
+# "Word rendered this document" -- Word COM automation is the only backend
+# that actually opens the file in the real authoring application the
+# document is meant for. This helper scopes check_render_capability to just
+# that one backend so callers needing this narrower guarantee don't have to
+# reach into KNOWN_BACKENDS / the private _WORD_COM_BACKEND name themselves.
+# ---------------------------------------------------------------------------
+
+def check_word_com_render_receipt(docx_path: str) -> dict[str, Any]:
+    """Like :func:`check_render_capability`, but restricted to the Word COM
+    backend only (never LibreOffice/soffice).
+
+    Returns the SAME three-state contract (``"rendered"`` /
+    ``"unavailable-with-reason"`` / ``"failed"``), scoped to just the
+    ``"word-com"`` backend: on any non-Windows platform, or a Windows
+    machine without ``pywin32`` / Word installed, this returns
+    ``"unavailable-with-reason"`` -- never ``"rendered"``.
+    """
+    return check_render_capability(docx_path, backends=(_WORD_COM_BACKEND,))
 
 
 # ---------------------------------------------------------------------------

@@ -1044,3 +1044,104 @@ def test_server_check_render_capability_still_works_with_new_retry_param(tmp_pat
     result = server.check_render_capability(docx_path)
 
     assert result["status"] == render_gate.FAILED
+
+
+# ---------------------------------------------------------------------------
+# check_word_com_render_receipt (8419f55f) -- scopes check_render_capability
+# to ONLY the word-com backend, for tools/meridian_fallbacks/
+# docx_completion_gate.py's stricter "Word/COM rendering only counts as an
+# external verification receipt" contract.
+#
+# Every test here monkeypatches render_gate._WORD_COM_BACKEND (or sys.platform,
+# which the REAL backend's unavailable_reason() consults at call time) rather
+# than actually exercising pywin32 / a real Word install -- exactly the same
+# discipline the rest of this file already follows, and load-bearing on any
+# machine that (like this one) genuinely has Word installed: a test that
+# didn't inject a fake backend here would launch real Word COM automation.
+# ---------------------------------------------------------------------------
+
+def test_word_com_render_receipt_never_consults_soffice_even_when_available(tmp_path, monkeypatch):
+    """Restricted to word-com only -- soffice being available/winning the
+    general chain must have zero effect on this function."""
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate, "_soffice_unavailable_reason", lambda: None)
+    monkeypatch.setattr(
+        render_gate,
+        "_soffice_render",
+        lambda path: (_ for _ in ()).throw(AssertionError("soffice must never be consulted")),
+    )
+    fake_word_backend = _fake_backend(
+        "word-com", available=True, render=lambda path: {"converted_via": "word-com"}
+    )
+    monkeypatch.setattr(render_gate, "_WORD_COM_BACKEND", fake_word_backend)
+
+    result = render_gate.check_word_com_render_receipt(docx_path)
+
+    assert result["status"] == render_gate.RENDERED
+    assert result["backend"] == "word-com"
+
+
+def test_word_com_render_receipt_success(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+    fake_word_backend = _fake_backend(
+        "word-com", available=True, render=lambda path: {"converted_via": "word-com"}
+    )
+    monkeypatch.setattr(render_gate, "_WORD_COM_BACKEND", fake_word_backend)
+
+    result = render_gate.check_word_com_render_receipt(docx_path)
+
+    assert result["status"] == render_gate.RENDERED
+    assert result["status"] == "rendered"
+
+
+def test_word_com_render_receipt_off_windows_is_unavailable_not_success(monkeypatch, tmp_path):
+    docx_path = _write_dummy_docx(tmp_path)
+    monkeypatch.setattr(render_gate.sys, "platform", "linux")
+
+    result = render_gate.check_word_com_render_receipt(docx_path)
+
+    assert result["status"] == render_gate.UNAVAILABLE_WITH_REASON
+    assert "win32" in result["reason"].lower()
+    assert result["status"] != render_gate.RENDERED
+
+
+def test_word_com_render_receipt_pywin32_missing_is_unavailable(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+    fake_word_backend = _fake_backend(
+        "word-com", available=False, reason="pywin32 (win32com) is not installed"
+    )
+    monkeypatch.setattr(render_gate, "_WORD_COM_BACKEND", fake_word_backend)
+
+    result = render_gate.check_word_com_render_receipt(docx_path)
+
+    assert result["status"] == render_gate.UNAVAILABLE_WITH_REASON
+    assert "pywin32" in result["reason"]
+    assert result["status"] != render_gate.RENDERED
+
+
+def test_word_com_render_receipt_failure_is_failed_not_rendered(tmp_path, monkeypatch):
+    docx_path = _write_dummy_docx(tmp_path)
+
+    def _boom(path: str) -> dict[str, Any]:
+        raise render_gate.RenderCapabilityError("Word COM render failed: mock com_error")
+
+    fake_word_backend = _fake_backend("word-com", available=True, render=_boom)
+    monkeypatch.setattr(render_gate, "_WORD_COM_BACKEND", fake_word_backend)
+
+    result = render_gate.check_word_com_render_receipt(docx_path)
+
+    assert result["status"] == render_gate.FAILED
+    assert "mock com_error" in result["reason"]
+    assert result["status"] != render_gate.RENDERED
+    assert result["status"] != render_gate.UNAVAILABLE_WITH_REASON
+
+
+def test_word_com_render_receipt_missing_file_is_failed():
+    result = render_gate.check_word_com_render_receipt("does_not_exist_anywhere.docx")
+
+    assert result["status"] == render_gate.FAILED
+    assert "no such file" in result["reason"]
+
+
+def test_check_word_com_render_receipt_exported_in_all():
+    assert "check_word_com_render_receipt" in render_gate.__all__
