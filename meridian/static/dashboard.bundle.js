@@ -2410,6 +2410,58 @@
   }
 
   // meridian/static/dashboard-settings.ts
+  function formatTunnelConfigGenerationStatus(info) {
+    if (!info || typeof info !== "object" || info.generation == null) {
+      return {
+        label: "Unknown",
+        tone: "unknown",
+        detail: "No runtime configuration generation has been reported for this tunnel yet."
+      };
+    }
+    const gen = info.generation;
+    const hash = info.config_hash ? String(info.config_hash).slice(0, 8) : "unknown";
+    if (info.restart_required) {
+      return {
+        label: `Restart required (generation ${gen})`,
+        tone: "warn",
+        detail: `Settings changed to generation ${gen} (config ${hash}) while a tunnel was actively connected. Restart "meridian --tunnel" to apply it \u2014 the running process is still serving the previous configuration.`
+      };
+    }
+    return {
+      label: `Applied (generation ${gen})`,
+      tone: "ok",
+      detail: `Runtime configuration generation ${gen} (config ${hash}) is the latest saved configuration and is what the next tunnel connection will load.`
+    };
+  }
+  window.formatTunnelConfigGenerationStatus = formatTunnelConfigGenerationStatus;
+  async function _renderTunnelConfigGenerationBanner(projectId) {
+    const host = document.getElementById(`settings-body-${projectId}`);
+    if (!host) return;
+    const bannerId = `tunnel-config-gen-banner-${projectId}`;
+    const existing = document.getElementById(bannerId);
+    if (existing) existing.remove();
+    let status;
+    try {
+      status = await api(`/tunnel/status/${projectId}`);
+    } catch (e3) {
+      return;
+    }
+    const info = status && status.config_generation && status.config_generation.default;
+    const formatted = formatTunnelConfigGenerationStatus(info);
+    if (formatted.tone !== "warn") return;
+    const esc = window.escapeHtml || String;
+    const banner = document.createElement("div");
+    banner.id = bannerId;
+    banner.style.cssText = "margin-top:18px;padding:8px 10px;border-radius:4px;font-size:10px;line-height:1.5;background:#f59e0b1a;border:1px solid #f59e0b55";
+    banner.innerHTML = `<strong style="color:#f59e0b">${esc(formatted.label)}</strong><div style="margin-top:3px;color:var(--muted)">${esc(formatted.detail)}</div>`;
+    const section = document.getElementById(`tunnel-plugins-section-${projectId}`);
+    if (section && section.parentElement === host) {
+      host.insertBefore(banner, section);
+    } else {
+      host.appendChild(banner);
+    }
+  }
+  window._renderTunnelConfigGenerationBanner = _renderTunnelConfigGenerationBanner;
   function suggestNtfyTopic2(projectId) {
     const proj = (window.state?.projects || []).find((p3) => p3.id === projectId);
     const slug = (proj?.name || "meridian").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24) || "meridian";
@@ -4103,7 +4155,12 @@ project_id = "${displayPid}"`;
     </div>
 
     <!-- b970fe07 \u2014 Serena default repo path (code-extractor slot). Single value;
-         used at tunnel start only when --repo is not passed on the CLI. -->
+         used at tunnel start only when --repo is not passed on the CLI.
+         9d9a92cc \u2014 this same slot feeds Claude Desktop/Code/Cursor uniformly
+         (they all reach it through the tunnel's local proxy port, see
+         docs/mcp-tool-surface.md); a missing/cleared command override now
+         correctly falls back to the current default (Serena), never the
+         retired mcp-server-code-extractor package. -->
     <div style="margin-bottom:10px">
 
       <div style="font-size:10px;color:var(--muted);margin-bottom:4px">Serena Repo Path<br><span style="font-size:9px;color:var(--muted)">Default <code>--project</code> for the tunnel's code-extractor (Serena). Used only when <code>--repo</code> is not passed at tunnel start.</span></div>
@@ -4117,6 +4174,22 @@ project_id = "${displayPid}"`;
     <div style="margin-bottom:10px">
 
       <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:10px;color:var(--muted)"><input type="checkbox" id="exec-enrich_prospect-${projectId}" ${execCfg.enrich_handoffs_with_code_pointers !== false ? "checked" : ""} style="cursor:pointer"> Auto-prospect code pointers on handoff <span style="font-size:9px">(attaches file/symbol pointers to sprint items; ON by default)</span></label>
+
+    </div>
+
+    <!-- f7084ed0 \u2014 orphan-process-reaper Stop hook toggle. OFF by default;
+         enabling registers a project-scoped Stop hook (meridian/orphan_reaper.py)
+         that reaps dangling pixi/python/node/cmd/uv/conhost processes still
+         rooted in a worktree whose sprint item/session is done, after
+         validating PID + start-time ownership and killing the whole process
+         tree. Saves immediately on change (not batched into "Save defaults")
+         because disabling has an immediate side effect: it deletes any
+         already-written .claude/hooks/orphan_reaper.* files right away
+         instead of waiting for the next generate_handoff. -->
+    <div style="margin-bottom:10px">
+
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:10px;color:var(--muted)"><input type="checkbox" id="exec-orphan-reaper-${projectId}" style="cursor:pointer"> Auto-reap dangling processes from dead worktree sessions <span id="exec-orphan-reaper-status-${projectId}" style="font-size:9px"></span></label>
+      <span style="display:block;font-size:9px;color:var(--muted);margin-top:2px">Off by default. Registers <code>.claude/hooks/orphan_reaper.sh</code>/<code>.ps1</code>, ownership-validated (PID + start time) before anything is signalled \u2014 never touches a process it can't confirm identity for. (Applies on the machine running the tunnel/server.)</span>
 
     </div>
 
@@ -4383,6 +4456,38 @@ project_id = "${displayPid}"`;
             _addCodeDir();
           }
         });
+        const _orphanReaperCb = document.getElementById(`exec-orphan-reaper-${projectId}`);
+        const _orphanReaperStatus = document.getElementById(`exec-orphan-reaper-status-${projectId}`);
+        if (_orphanReaperCb) {
+          api(`/projects/${projectId}/orphan_reaper`).then((s3) => {
+            _orphanReaperCb.checked = !!(s3 && s3.enabled);
+          }).catch(() => {
+          });
+          _orphanReaperCb.addEventListener("change", async () => {
+            const desired = _orphanReaperCb.checked;
+            _orphanReaperCb.disabled = true;
+            if (_orphanReaperStatus) _orphanReaperStatus.textContent = "saving\u2026";
+            try {
+              const res = await api(`/projects/${projectId}/orphan_reaper/toggle`, {
+                method: "POST",
+                body: JSON.stringify({ enabled: desired })
+              });
+              const removedCount = Array.isArray(res?.removed_files) ? res.removed_files.length : 0;
+              _orphanReaperCb.checked = !!res?.enabled;
+              if (_orphanReaperStatus) {
+                _orphanReaperStatus.textContent = res?.enabled ? "(enabled)" : removedCount ? `(disabled \u2014 removed ${removedCount} hook file${removedCount === 1 ? "" : "s"})` : "(disabled)";
+                setTimeout(() => {
+                  if (_orphanReaperStatus) _orphanReaperStatus.textContent = "";
+                }, 4e3);
+              }
+            } catch (e3) {
+              _orphanReaperCb.checked = !desired;
+              if (_orphanReaperStatus) _orphanReaperStatus.textContent = e3?.message || "(failed to save)";
+            } finally {
+              _orphanReaperCb.disabled = false;
+            }
+          });
+        }
         saveBtn.onclick = async () => {
           saveBtn.disabled = true;
           const fields = ["env_file", "test_cmd", "deploy_cmd", "branch"];
@@ -5315,6 +5420,11 @@ project_id = "${displayPid}"`;
       }
       try {
         window.loadTunnelPluginsSection?.(projectId);
+      } catch (e3) {
+      }
+      try {
+        _renderTunnelConfigGenerationBanner(projectId).catch(() => {
+        });
       } catch (e3) {
       }
       if (isDemoMode()) hideDemoAdminControls();
@@ -7837,7 +7947,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // ../../../node_modules/preact/dist/preact.module.js
+  // node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -8096,7 +8206,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // ../../../node_modules/preact/hooks/dist/hooks.module.js
+  // node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -8237,7 +8347,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // ../../../node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -9090,7 +9200,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // ../../../node_modules/zustand/esm/vanilla.mjs
+  // node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();
