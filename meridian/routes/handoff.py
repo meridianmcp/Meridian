@@ -303,3 +303,51 @@ async def load_handoff_correction_endpoint(
     except handoff_module.HandoffCorrectionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"correction": correction}
+
+
+@router.get("/projects/{project_id}/wave-summary/{wave_id}")
+async def get_wave_summary_endpoint(
+    project_id: str, wave_id: str, request: Request
+) -> dict[str, Any]:
+    """bbb447ec — the authoritative, immutable completion record for one wave.
+
+    REST mirror of ``meridian.db.get_wave_summary`` — a read-only projection
+    of a wave's persisted completion summary (item outcomes, commits/changed
+    resources, test receipts, blockers, exclusions, tool availability,
+    handoff status), keyed by ``wave_id`` (the same value as
+    ``sprint_items.wave`` / ``wave_gate_results.wave_label``, e.g.
+    ``"wave-5"``). Optional ``?version=`` query param scopes to one
+    sprint-version bucket (unscoped/'' bucket by default — same convention as
+    ``board_snapshot_revisions``); optional ``?wave_run_id=`` narrows to one
+    specific run/attempt. Pass ``?include_history=1`` to also return every
+    prior (superseded) row in the correction chain, oldest first — the full
+    audit trail, mirroring ``get_wave_run_events(include_superseded=True)``.
+
+    ``{"summary": null}`` (never a 404) when no summary has ever been
+    recorded for the bucket — a wave with no summary yet is a normal state,
+    not an error, matching ``load_handoff_correction``'s own "null body, not
+    404" convention just above.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    version = request.query_params.get("version") or None
+    wave_run_id = request.query_params.get("wave_run_id") or None
+    include_history = (request.query_params.get("include_history") or "").lower() in (
+        "1", "true", "yes",
+    )
+    summary = await db_module.get_wave_summary(
+        db, project_id, wave_id, version=version, wave_run_id=wave_run_id,
+    )
+    result: dict[str, Any] = {
+        "project_id": project_id,
+        "wave_id": wave_id,
+        "version": version,
+        "summary": summary,
+    }
+    if include_history:
+        result["history"] = await db_module.get_wave_summary_history(
+            db, project_id, wave_id, version=version, wave_run_id=wave_run_id,
+        )
+    return result

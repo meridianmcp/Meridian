@@ -4180,6 +4180,50 @@ async def _migrate_pg_vector_index_state(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_wave_run_summaries(conn: PostgresConnection) -> None:
+    """bbb447ec — wave_run_summaries: immutable wave-completion summaries
+    keyed by wave_id (mirrors db.wave_run_summary._migrate_wave_run_summaries
+    — see that function's module docstring for the full field-by-field
+    rationale: explicit outcome enum, structured test-receipt evidence,
+    append-only correction via superseded_by, project/version-isolated
+    retrieval).
+
+    CREATE TABLE / INDEX IF NOT EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS wave_run_summaries ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    version_filter TEXT NOT NULL DEFAULT '',"
+        "    wave_id TEXT NOT NULL,"
+        "    wave_run_id TEXT,"
+        "    session_id TEXT,"
+        "    board_revision_hash TEXT,"
+        "    items TEXT NOT NULL DEFAULT '[]',"
+        "    commits TEXT NOT NULL DEFAULT '[]',"
+        "    changed_resources TEXT NOT NULL DEFAULT '[]',"
+        "    test_receipts TEXT NOT NULL DEFAULT '[]',"
+        "    blockers TEXT NOT NULL DEFAULT '[]',"
+        "    exclusions TEXT NOT NULL DEFAULT '[]',"
+        "    tool_availability TEXT NOT NULL DEFAULT '[]',"
+        "    handoff_status TEXT,"
+        "    summary_hash TEXT,"
+        "    actor TEXT,"
+        "    supersedes TEXT,"
+        "    superseded_by TEXT,"
+        "    correction_reason TEXT,"
+        "    seq INTEGER NOT NULL DEFAULT 1,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_summaries_lookup "
+        "ON wave_run_summaries(project_id, version_filter, wave_id, seq DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_summaries_run "
+        "ON wave_run_summaries(wave_run_id);"
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_summaries_supersedes "
+        "ON wave_run_summaries(supersedes);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -4289,4 +4333,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_handoff_corrections_table,
     _migrate_pg_vector_index_state,
     _migrate_pg_pixi_env_roots,
+    _migrate_pg_wave_run_summaries,
 )

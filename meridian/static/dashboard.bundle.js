@@ -2347,13 +2347,64 @@
     } catch {
     }
   }
+  var _OUTCOME_COLOR = {
+    completed: "var(--accent-green)",
+    blocked: "#fbbf24",
+    failed: "#ef4444",
+    skipped: "var(--muted)",
+    unverified: "var(--accent)"
+  };
+  function buildWaveSummaryHtml(summary) {
+    if (!summary) {
+      return `<div class="live-empty">No wave summary recorded yet.</div>`;
+    }
+    const items = Array.isArray(summary.items) ? summary.items : [];
+    const counts = {};
+    for (const it of items) {
+      const outcome = String(it && it.outcome || "unverified");
+      counts[outcome] = (counts[outcome] || 0) + 1;
+    }
+    const chips = Object.keys(counts).sort().map((k3) => {
+      const color = _OUTCOME_COLOR[k3] || "var(--muted)";
+      return `<span style="font-size:9px;color:${color};border:1px solid ${color}55;border-radius:3px;padding:0 4px;margin-right:4px">${_esc(k3)} ${counts[k3]}</span>`;
+    }).join("");
+    const receipts = Array.isArray(summary.test_receipts) ? summary.test_receipts : [];
+    const receiptsHtml = receipts.map((r3) => {
+      const ok = r3.exit_code === 0;
+      return `<div style="font-size:10px;color:var(--muted);margin-top:2px">
+        <span style="color:${ok ? "var(--accent-green)" : "#ef4444"}">${ok ? "\u2713" : "\u2717"}</span>
+        ${_esc(r3.scope || "targeted")} \xB7 ${_esc(r3.command || "")} \xB7 exit ${_esc(r3.exit_code)} \xB7 ${_esc(r3.passed ?? 0)} passed / ${_esc(r3.failed ?? 0)} failed
+      </div>`;
+    }).join("");
+    const supersededTag = summary.superseded_by ? `<span style="font-size:9px;color:#fbbf24;margin-left:6px" title="A newer correction replaced this record">superseded</span>` : "";
+    const handoffTag = summary.handoff_status ? `<span style="font-size:9px;color:var(--muted);margin-left:6px">handoff: ${_esc(summary.handoff_status)}</span>` : "";
+    return `<div class="wave-summary-panel" style="font-size:11px">
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-bottom:4px">
+      <span style="font-weight:600;color:var(--text)">${_esc(summary.wave_id || "")}</span>
+      ${handoffTag}${supersededTag}
+    </div>
+    <div style="margin-bottom:4px">${chips || '<span style="color:var(--muted)">no items recorded</span>'}</div>
+    ${receiptsHtml}
+  </div>`;
+  }
+  function renderWaveSummary(projectId, waveId, summary) {
+    try {
+      if (typeof document === "undefined") return;
+      const root = document.getElementById(`wave-summary-${projectId}-${waveId}`);
+      if (!root) return;
+      root.innerHTML = buildWaveSummaryHtml(summary);
+    } catch {
+    }
+  }
   try {
     Object.assign(window, {
       computeWaveProgress,
       buildWaveProgressHtml,
       renderWaveProgress: renderWaveProgress2,
       formatElapsedSince,
-      parseTouchesResources
+      parseTouchesResources,
+      buildWaveSummaryHtml,
+      renderWaveSummary
     });
   } catch {
   }
@@ -7786,7 +7837,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // node_modules/preact/dist/preact.module.js
+  // ../../../node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -8045,7 +8096,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // node_modules/preact/hooks/dist/hooks.module.js
+  // ../../../node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -8186,7 +8237,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // ../../../node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -9039,7 +9090,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // node_modules/zustand/esm/vanilla.mjs
+  // ../../../node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();
