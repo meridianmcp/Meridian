@@ -2999,6 +2999,103 @@ async def generate_default_session_name(
     return f"{_adj[_h % len(_adj)]}-{_noun[(_h // len(_adj)) % len(_noun)]}-{ts}"
 
 
+# --- worker_context XML prompt-budget contract (bfb18ea2) -----------------
+#
+# WORKER_CONTEXT_XML_BUDGET_CHARS (contract version
+# WORKER_CONTEXT_XML_BUDGET_VERSION): build_worker_context_xml()'s return
+# value is GUARANTEED to never exceed this many CHARACTERS. This block is
+# spliced into every worker's first prompt, so the limit is a deliberate
+# context/latency budget decision — not an artifact of an XML parser or an
+# MCP protocol limit.
+#
+# Unit chosen: characters, not tokens. This codebase has no tokenizer
+# dependency anywhere (no tiktoken / token-count utility exists here), so a
+# token budget would mean adding a new dependency for one call site. A
+# character count is deterministic, dependency-free, and cheap to enforce
+# on every call. As a rough sanity cross-check only (not an exact
+# conversion): ~4 chars/token is typical for English prose, so 700 chars is
+# roughly ~175 tokens — comfortably inside the "~500 tokens" this function
+# has described in prose since v1.2.0. That "~500 tokens" language was
+# never actually checked against a tokenizer; the only enforced number was
+# always this char count, via the test. This constant makes that the
+# explicit, single source of truth instead of a bare literal (`700`) in
+# the test with no named contract behind it.
+#
+# Bump WORKER_CONTEXT_XML_BUDGET_VERSION whenever the number or the unit
+# changes, so callers/tests can tell "the contract changed on purpose"
+# apart from "someone edited a bare literal".
+WORKER_CONTEXT_XML_BUDGET_VERSION = 1
+WORKER_CONTEXT_XML_BUDGET_CHARS = 700
+
+# Visible marker appended when a field had to be compacted to fit the
+# budget above. Never cut silently — a worker (or a test) can always tell
+# truncation happened by looking for this marker.
+_WORKER_CONTEXT_TRUNCATION_MARKER = " …[truncated]"
+
+
+def _worker_context_bounded_field(raw: str, budget_chars: int) -> str:
+    """XML-escape ``raw``, bounded to at most ``budget_chars`` characters.
+
+    If the escaped text already fits, it is returned unchanged — this is
+    the common case and behaves exactly like a plain ``escape(raw)`` call.
+
+    If it doesn't fit, the RAW text (never the escaped text) is cut via
+    binary search to the largest prefix whose ESCAPED form still fits —
+    this is what guarantees an XML entity like ``&amp;`` is never split
+    in half, since we always escape-then-measure instead of slicing
+    already-escaped text. The cut is then backed off to the nearest
+    preceding whitespace boundary so a word is never chopped in the
+    middle either, and an explicit ``"...[truncated]"`` marker is
+    appended so truncation is always visible. The result is always
+    <= ``budget_chars`` (best-effort on the marker only: if
+    ``budget_chars`` is too small to fit the marker at all — not
+    expected for this contract's normal fields, since sub-budgets are
+    hundreds of characters — the marker is dropped, but the entity- and
+    word-boundary safety above still holds).
+    """
+    from xml.sax.saxutils import escape
+
+    escaped = escape(raw)
+    if len(escaped) <= budget_chars:
+        return escaped
+
+    if budget_chars <= 0:
+        return ""
+
+    marker = _WORKER_CONTEXT_TRUNCATION_MARKER
+    use_marker = budget_chars > len(marker)
+    room = (budget_chars - len(marker)) if use_marker else budget_chars
+
+    # Binary-search the largest raw-text prefix whose ESCAPED form fits
+    # in `room`. Escaping can expand length ("&" -> "&amp;"), so we can't
+    # just slice the escaped string directly without risking a split
+    # entity — this holds regardless of whether a marker is being added,
+    # which is what the earlier, buggy degenerate-budget fallback got
+    # wrong (it sliced an already-escaped string directly).
+    lo, hi = 0, len(raw)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(escape(raw[:mid])) <= room:
+            lo = mid
+        else:
+            hi = mid - 1
+    cut = lo
+
+    # Back off to the nearest preceding whitespace so a word is never
+    # split in half. If there's no whitespace to back off to (one huge
+    # "word"), keep the exact character-accurate cut instead. Only
+    # meaningful when we're about to append a marker — without one,
+    # keep the exact binary-search cut to use the full budget.
+    if use_marker and 0 < cut < len(raw) and not raw[cut].isspace():
+        ws = raw.rfind(" ", 0, cut)
+        if ws > 0:
+            cut = ws
+
+    prefix = raw[:cut].rstrip() if use_marker else raw[:cut]
+    result = escape(prefix)
+    return (result + marker) if use_marker else result
+
+
 def build_worker_context_xml(
     *,
     version_goal: str,
@@ -3007,36 +3104,68 @@ def build_worker_context_xml(
     repo: str,
     test_cmd: str = "pixi run test",
     commit_pattern: str = (
-        "Use commit.py pattern: write commit message to tmp/commit.py, "
-        "run via pixi run python tmp/commit.py, then delete tmp/commit.py "
-        "in the same command. GOAL.md is git-tracked — include it in the "
-        "staged files (git add GOAL.md) when it has been modified."
+        "Write commit message to tmp/commit.py, run via pixi run "
+        "python tmp/commit.py, then delete it in the same command. "
+        "Include GOAL.md in the staged files if it was modified "
+        "(git-tracked)."
     ),
     done_when: str = (
         "log_task done, tests green, committed (no stray .py at repo root)."
     ),
 ) -> str:
-    """v1.2.0 — slim XML for worker sessions.
+    """v1.3.0 — slim XML for worker sessions, under an explicit char budget.
 
     Workers don't need north_star, decisions, or sprint history —
     they need the version goal + the one task they're claiming, plus
     the operational machinery (repo path, test cmd, commit pattern,
-    completion criteria). The resulting block is intentionally short
-    (under ~500 tokens) so it costs nothing to splat into a
-    Claude Code worker's first turn.
+    completion criteria).
+
+    Prompt-budget contract: the returned string never exceeds
+    ``WORKER_CONTEXT_XML_BUDGET_CHARS`` characters — see that constant's
+    comment above for the unit/number rationale and version. When the
+    full, escaped ``version_goal``/``task_description`` wouldn't fit,
+    they (and only they — the operational fields repo/test_cmd/
+    commit_pattern/done_when are never truncated) are compacted at a
+    whole-word boundary with a visible ``"...[truncated]"`` marker rather
+    than being cut silently or mid-word.
     """
     from xml.sax.saxutils import escape, quoteattr
 
-    return "\n".join([
-        "<worker_context>",
-        f"  <version_goal>{escape(version_goal)}</version_goal>",
-        f"  <task id={quoteattr(task_id)}>{escape(task_description)}</task>",
-        f"  <repo>{escape(repo)}</repo>",
-        f"  <test_cmd>{escape(test_cmd)}</test_cmd>",
-        f"  <commit_pattern>{escape(commit_pattern)}</commit_pattern>",
-        f"  <done_when>{escape(done_when)}</done_when>",
-        "</worker_context>",
-    ])
+    def _assemble(goal_xml: str, task_xml: str) -> str:
+        return "\n".join([
+            "<worker_context>",
+            f"  <version_goal>{goal_xml}</version_goal>",
+            f"  <task id={quoteattr(task_id)}>{task_xml}</task>",
+            f"  <repo>{escape(repo)}</repo>",
+            f"  <test_cmd>{escape(test_cmd)}</test_cmd>",
+            f"  <commit_pattern>{escape(commit_pattern)}</commit_pattern>",
+            f"  <done_when>{escape(done_when)}</done_when>",
+            "</worker_context>",
+        ])
+
+    goal_full = escape(version_goal)
+    task_full = escape(task_description)
+    candidate = _assemble(goal_full, task_full)
+    if len(candidate) <= WORKER_CONTEXT_XML_BUDGET_CHARS:
+        return candidate
+
+    # Over budget: the fixed overhead (wrapper tags + repo/test_cmd/
+    # commit_pattern/done_when) is exactly whatever's left once the two
+    # dynamic fields are subtracted back out of the full candidate —
+    # exact regardless of the "\n".join formatting above.
+    fixed_len = len(candidate) - len(goal_full) - len(task_full)
+    dynamic_budget = max(0, WORKER_CONTEXT_XML_BUDGET_CHARS - fixed_len)
+
+    total_raw = len(version_goal) + len(task_description)
+    if total_raw == 0:
+        goal_budget = task_budget = dynamic_budget // 2
+    else:
+        goal_budget = int(dynamic_budget * (len(version_goal) / total_raw))
+        task_budget = dynamic_budget - goal_budget
+
+    goal_bounded = _worker_context_bounded_field(version_goal, goal_budget)
+    task_bounded = _worker_context_bounded_field(task_description, task_budget)
+    return _assemble(goal_bounded, task_bounded)
 
 
 async def start_worker_session(

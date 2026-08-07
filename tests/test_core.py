@@ -6278,9 +6278,14 @@ async def test_start_worker_session_xml_is_slim(db):
     await db_module.set_decision(db, p["id"], "internal call")
     result = await db_module.start_worker_session(db, p["id"])
     xml = result["worker_context"]
-    # Under 700 chars per spec (matters because it lands in every
-    # worker's first prompt).
-    assert len(xml) < 700, f"worker_context too big: {len(xml)} chars"
+    # Bounded by the named prompt-budget contract (bfb18ea2), not a bare
+    # unexplained literal — matters because it lands in every worker's
+    # first prompt. See WORKER_CONTEXT_XML_BUDGET_CHARS's comment in
+    # meridian/db/__init__.py for the unit (chars, not tokens) rationale.
+    assert len(xml) <= db_module.WORKER_CONTEXT_XML_BUDGET_CHARS, (
+        f"worker_context too big: {len(xml)} chars "
+        f"(budget={db_module.WORKER_CONTEXT_XML_BUDGET_CHARS})"
+    )
     # Worker-relevant fields present.
     assert "<version_goal>" in xml
     assert "<task " in xml
@@ -6293,6 +6298,140 @@ async def test_start_worker_session_xml_is_slim(db):
     assert "decisions" not in xml
     assert "<sprint>" not in xml
     assert "<recent_tasks>" not in xml
+    # Small, typical content should never trigger the truncation path.
+    assert "[truncated]" not in xml
+
+
+@pytest.mark.asyncio
+async def test_worker_context_xml_budget_contract_is_named(db):
+    """The 700-char cap is a versioned, named constant — not a bare
+    literal duplicated between the implementation and the test."""
+    assert db_module.WORKER_CONTEXT_XML_BUDGET_CHARS == 700
+    assert db_module.WORKER_CONTEXT_XML_BUDGET_VERSION == 1
+
+
+def test_build_worker_context_xml_long_goal_and_task_are_bounded():
+    """A pathologically long version_goal/task_description must never
+    push the XML over budget — they get compacted at a word boundary
+    with a visible marker instead."""
+    long_goal = "This is a very long version goal statement. " * 40
+    long_task = "This is a very long task description that goes on. " * 40
+    xml = db_module.build_worker_context_xml(
+        version_goal=long_goal,
+        task_id="task-123",
+        task_description=long_task,
+        repo="/some/repo/path",
+    )
+    assert len(xml) <= db_module.WORKER_CONTEXT_XML_BUDGET_CHARS, (
+        f"worker_context exceeded budget: {len(xml)} chars"
+    )
+    # Truncation must be visible, not silent.
+    assert "[truncated]" in xml
+    # Operational fields are never truncated — only the two dynamic
+    # content fields (version_goal/task_description) are compacted.
+    assert "<repo>/some/repo/path</repo>" in xml
+    assert "<test_cmd>pixi run test</test_cmd>" in xml
+    assert "<commit_pattern>" in xml
+    assert "commit_pattern>[truncated]" not in xml
+    assert "<done_when>" in xml
+    assert "done_when>[truncated]" not in xml
+    # Truncation happens at a whole-word boundary, not mid-word. The
+    # last token retained right before the marker must be preceded by
+    # whitespace in the ORIGINAL source text — i.e. it's the start of a
+    # genuine word there, never a fragment sliced out of the middle of
+    # one (padding with a leading space lets this also match a source
+    # string's very first word).
+    before_marker = xml.split("…[truncated]")[0]
+    last_word = before_marker.rstrip().rsplit(None, 1)[-1]
+    padded_goal = " " + long_goal
+    padded_task = " " + long_task
+    assert (f" {last_word}" in padded_goal) or (f" {last_word}" in padded_task), (
+        f"{last_word!r} is not a whole-word boundary in the source text "
+        "(truncation likely split a word mid-way)"
+    )
+
+
+def test_build_worker_context_xml_special_characters_escaped():
+    """XML-special characters and unicode must be escaped correctly and
+    never split an entity in half, even under truncation.
+
+    The strongest check available is that the output actually parses as
+    well-formed XML — that alone rules out unescaped '<'/'&', a split
+    entity from mid-escape truncation, and a malformed id="..." attribute.
+    """
+    import xml.etree.ElementTree as ET
+
+    special_goal = (
+        "Goal with <tag> & \"quotes\" 'apostrophes' and ünïcödé 日本語 "
+        "emoji \U0001F600 more & more <nested> content " * 5
+    )
+    xml_short = db_module.build_worker_context_xml(
+        version_goal="Goal with <tag> & \"quotes\" 'apos' and ünïcödé 日本語",
+        task_id="task-<id>",
+        task_description="task & <desc> with \"quotes\"",
+        repo="/r",
+    )
+    xml_long = db_module.build_worker_context_xml(
+        version_goal=special_goal,
+        task_id="task-<id>",
+        task_description="task & <desc> with \"quotes\"",
+        repo="/r",
+    )
+    for xml in (xml_short, xml_long):
+        assert len(xml) <= db_module.WORKER_CONTEXT_XML_BUDGET_CHARS
+        root = ET.fromstring(xml)  # raises ParseError on malformed XML
+        assert root.tag == "worker_context"
+
+    # Short (untruncated) case: raw content round-trips exactly through
+    # escape/unescape, including unicode.
+    goal_el = ET.fromstring(xml_short).find("version_goal")
+    assert goal_el.text == (
+        "Goal with <tag> & \"quotes\" 'apos' and ünïcödé 日本語"
+    )
+    task_el = ET.fromstring(xml_short).find("task")
+    assert task_el.text == "task & <desc> with \"quotes\""
+    assert task_el.get("id") == "task-<id>"
+
+    # Long (truncated) case: still well-formed, and the visible marker
+    # made it into the parsed text rather than being cut off.
+    assert "…[truncated]" in ET.fromstring(xml_long).find("version_goal").text
+
+
+def test_build_worker_context_xml_exact_boundary():
+    """Content whose full, escaped XML lands exactly at the budget must
+    pass through untruncated; one character more must trigger visible
+    truncation while staying within budget."""
+    budget = db_module.WORKER_CONTEXT_XML_BUDGET_CHARS
+
+    def _xml_for_goal_len(n: int) -> str:
+        return db_module.build_worker_context_xml(
+            version_goal="g" * n,
+            task_id="t",
+            task_description="d",
+            repo="/r",
+            test_cmd="pixi run test",
+        )
+
+    # Find the exact raw length at which the untruncated candidate first
+    # exceeds the budget (i.e. the boundary edge).
+    boundary_n = None
+    for n in range(0, budget):
+        xml = _xml_for_goal_len(n)
+        if "[truncated]" in xml:
+            boundary_n = n
+            break
+    assert boundary_n is not None, "did not find a truncation boundary"
+
+    # Right at the edge (one char below the boundary): no truncation,
+    # content passes through verbatim.
+    at_edge = _xml_for_goal_len(boundary_n - 1)
+    assert "[truncated]" not in at_edge
+    assert len(at_edge) <= budget
+
+    # One character over: truncation kicks in, output still bounded.
+    over_edge = _xml_for_goal_len(boundary_n)
+    assert "[truncated]" in over_edge
+    assert len(over_edge) <= budget
 
 
 @pytest.mark.asyncio
