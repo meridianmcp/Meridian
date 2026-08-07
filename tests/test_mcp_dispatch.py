@@ -628,3 +628,97 @@ async def test_real_subprocess_execute_batch_exit_code(tmp_path):
     # and malformed-request error in the second session did not change the
     # real subprocess's exit status one bit.
     assert failure_rc == baseline_rc
+
+
+# ---------------------------------------------------------------------------
+# a2a027cf — complete_sprint_item timeout-safety / idempotency / observability
+# across transports (dispatch table, stdio, HTTP). The DB-level core
+# (idempotent retry, phase timings, bounded advisory work) is covered in
+# depth by tests/test_sprint_item_status_race.py; this section proves the
+# SAME logical contract holds across the transports this file already
+# exercises for execute_batch.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_dispatch_table_matches_handler_direct(db, project):
+    item = await db_module.add_sprint_item(db, project["id"], "v1", "Dispatch-table complete")
+
+    direct = await st_mod.handle_complete_sprint_item(
+        {"project_id": project["id"], "item_id": item["id"]},
+        db, _DATA_DIR, None, None,
+    )
+    assert direct["status"] == "done"
+    assert direct["completion_outcome"] == "committed"
+    assert "correlation_id" in direct
+
+    via_dispatch = await mh._handle_sprint_tools(
+        "complete_sprint_item",
+        {"project_id": project["id"], "item_id": item["id"]},
+        db, _DATA_DIR, None, None,
+    )
+    # Idempotent retry through the OTHER call path -- same logical contract.
+    assert via_dispatch["status"] == "done"
+    assert via_dispatch["completion_outcome"] == "already_committed"
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_stdio_transport_idempotent_retry(db, project, monkeypatch):
+    server = _build_stdio_server(monkeypatch, db)
+    item = await db_module.add_sprint_item(db, project["id"], "v1", "Stdio complete parity")
+
+    first = await _call_stdio_tool(server, "complete_sprint_item", {
+        "project_id": project["id"], "item_id": item["id"],
+    })
+    assert first["status"] == "done"
+    assert first["completion_outcome"] == "committed"
+    assert "correlation_id" in first
+
+    # A retry over the SAME transport must be idempotent, not an error.
+    second = await _call_stdio_tool(server, "complete_sprint_item", {
+        "project_id": project["id"], "item_id": item["id"],
+    })
+    assert "error" not in second
+    assert second["status"] == "done"
+    assert second["completion_outcome"] == "already_committed"
+
+
+def test_complete_sprint_item_http_route_idempotent_retry(client):
+    project = client.post("/projects", json={"name": "complete-http-parity"}).json()
+    item = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1", "title": "HTTP complete parity"},
+    ).json()
+
+    first = client.post(f"/projects/{project['id']}/sprint-items/{item['id']}/complete", json={})
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["status"] == "done"
+    assert first_body["completion_outcome"] == "committed"
+    assert "correlation_id" in first_body
+
+    # a2a027cf -- retrying the SAME HTTP call after the item is already done
+    # is now a 200 idempotent no-op, not a 409. A GENUINELY conflicting race
+    # (different terminal status) still 409s -- see
+    # test_complete_sprint_item_http_route_genuine_conflict_still_409 below.
+    second = client.post(f"/projects/{project['id']}/sprint-items/{item['id']}/complete", json={})
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["status"] == "done"
+    assert second_body["completion_outcome"] == "already_committed"
+
+
+def test_complete_sprint_item_http_route_genuine_conflict_still_409(client):
+    project = client.post("/projects", json={"name": "complete-http-conflict"}).json()
+    item = client.post(
+        f"/projects/{project['id']}/sprint-items",
+        json={"version": "v1", "title": "HTTP conflict item"},
+    ).json()
+    client.post(f"/projects/{project['id']}/sprint-items/{item['id']}/skip", json={"reason": "nope"})
+
+    r = client.post(f"/projects/{project['id']}/sprint-items/{item['id']}/complete", json={})
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["current_status"] == "skipped"
+    assert "correlation_id" in detail
+    assert "retry_guidance" in detail

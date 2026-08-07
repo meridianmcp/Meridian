@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import threading
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -336,15 +337,46 @@ async def complete_sprint_item_endpoint(
     project_id: str, item_id: str, request: Request,
     body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Mark a sprint item ``done``. Optional body: ``{task_id}``."""
+    """Mark a sprint item ``done``. Optional body: ``{task_id}``.
+
+    a2a027cf — timeout-safe / idempotent / observable completion over HTTP.
+    ``correlation_id`` may be supplied in the body (or is minted here) and
+    is always echoed back on both success and the 409 conflict body below,
+    so a client that timed out waiting on this response can correlate a
+    retry with the original attempt's server-side logs. The underlying
+    db_module.complete_sprint_item call is itself idempotent for the
+    "already done" case (see its docstring) -- retrying this endpoint after
+    a client-side timeout returns 200 with completion_outcome=
+    "already_committed" rather than a misleading 409, UNLESS a genuinely
+    different, conflicting terminal status won a real race, which still
+    reports 409 exactly as before.
+    """
     db = await _db(request)
+    _correlation_id = str((body or {}).get("correlation_id") or uuid.uuid4().hex)
     try:
         item = await db_module.complete_sprint_item(
             db, project_id, item_id,
             task_id=(body or {}).get("task_id"),
+            correlation_id=_correlation_id,
         )
     except db_module.SprintItemStatusRace as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "item_id": exc.item_id,
+                "current_status": exc.current_status,
+                "correlation_id": _correlation_id,
+                "retry_guidance": (
+                    "Re-check this item's live status (GET "
+                    f"/projects/{project_id}/sprint-items/{item_id}) before "
+                    "retrying -- this is a genuine conflicting status, not a "
+                    "timeout replay (a retry against an already-'done' item "
+                    "succeeds with completion_outcome='already_committed' "
+                    "instead of reaching this error)."
+                ),
+            },
+        )
     if item is None:
         raise HTTPException(status_code=404, detail="sprint item not found")
     # Lazy import to avoid circular dependency on server.py at module level.

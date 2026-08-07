@@ -1974,3 +1974,469 @@ async def test_parallelizable_groups_predicted_granularity_flags_malformed_symbo
     res = await db_module.get_parallelizable_groups(db, pid, version="v1")
     item = res["groups"][0][0]
     assert item["predicted_granularity"]["symbol:_helper_fn"] == "malformed_symbol"
+
+
+# ---------------------------------------------------------------------------
+# 0d0cada7 — lease-local scheduler contract: plan_generation staleness
+# detection, live resource-lock cross-checking (resource_blocked), and the
+# claim_symbol/release_symbol/gate/request_hitl diagnostics enrichment that
+# feeds it. See tests/test_sprint_item_waves.py and
+# tests/test_handoff_executor_planner_lifecycle.py for the dynamic-replan
+# and handoff-rendering coverage of the same contract.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_plan_generation_stable_when_board_unchanged(db):
+    """Two back-to-back calls against an unchanged board must produce the
+    IDENTICAL plan_generation digest — it's a pure function of observed
+    state, not a random/time-based value."""
+    p = await db_module.create_project(db, "0d0cada7-gen-stable")
+    pid = p["id"]
+    await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"],
+    )
+    first = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    second = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert first["plan_generation"] == second["plan_generation"]
+    assert first["plan_generation"]
+    assert len(first["group_generations"]) == len(first["groups"])
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_plan_generation_changes_when_item_claimed(db):
+    """Claiming an item changes the live board, so the digest must change —
+    otherwise a caller could never detect a stale plan."""
+    p = await db_module.create_project(db, "0d0cada7-gen-changes")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "b", touches_resources=["file:b.py"], prospect_bypass=True,
+        force=True,
+    )
+    before = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    await db_module.claim_sprint_item(db, pid, a["id"], actor=sess["id"])
+    after = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert before["plan_generation"] != after["plan_generation"]
+    # b is untouched and still eligible — dynamic recomputation must still
+    # surface it without restarting anything.
+    after_ids = {it["id"] for grp in after["groups"] for it in grp}
+    assert b["id"] in after_ids
+    assert a["id"] not in after_ids
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_resource_blocked_flags_external_file_lock(db):
+    """An item can be dependency-satisfied and land in a 'safe' group while
+    STILL being unclaimable right now because an unrelated live session
+    already holds its declared file — this is exactly what the 2026-08-05
+    incident's executor had no visibility into. resource_blocked must
+    surface it with the full wait_reason/holder/lease/retry contract."""
+    p = await db_module.create_project(db, "0d0cada7-resource-blocked-file")
+    pid = p["id"]
+    holder = await db_module.register_session(db, pid, "holder")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "touches locked file", touches_resources=["file:shared.py"],
+    )
+    pre = await db_module.claim_file(db, "shared.py", holder["id"])
+    assert pre["claimed"] is True
+
+    res = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    # Still reported as a normal, disjoint, "safe" group (the coloring never
+    # cross-checks external locks) ...
+    all_ids = {it["id"] for grp in res["groups"] for it in grp}
+    assert item["id"] in all_ids
+    # ... but resource_blocked makes the REAL contention explicit.
+    assert res["resource_blocked_count"] == 1
+    entry = res["resource_blocked"][0]
+    assert entry["id"] == item["id"]
+    assert entry["resource"] == "file:shared.py"
+    assert entry["wait_reason"] == "resource_locked"
+    assert entry["holder_session_id"] == holder["id"]
+    assert entry["claim_granularity"] == "file"
+    assert isinstance(entry["retry_after"], int) and entry["retry_after"] > 0
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_resource_blocked_flags_external_symbol_lock(db):
+    """Same as the file-lock case, but for a real symbol-level claim held by
+    another live session — the file⊃symbol hierarchy must be respected the
+    same way claim_symbol/claim_file already enforce it."""
+    p = await db_module.create_project(db, "0d0cada7-resource-blocked-symbol")
+    pid = p["id"]
+    holder = await db_module.register_session(db, pid, "holder")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "touches locked symbol",
+        touches_resources=["symbol:pkg/mod.py::foo"],
+    )
+    pre = await db_module.claim_symbol(db, holder["id"], "pkg/mod.py", "foo", _FOO_BAR_SRC)
+    assert pre["claimed"] is True
+
+    res = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert res["resource_blocked_count"] == 1
+    entry = res["resource_blocked"][0]
+    assert entry["id"] == item["id"]
+    assert entry["holder_session_id"] == holder["id"]
+    assert entry["claim_granularity"] == "symbol"
+
+
+@pytest.mark.asyncio
+async def test_parallelizable_groups_resource_blocked_empty_when_free(db):
+    """The common/happy case: nothing external is held, so resource_blocked
+    is empty and every item's own group placement is genuinely actionable
+    right now."""
+    p = await db_module.create_project(db, "0d0cada7-resource-blocked-none")
+    pid = p["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "free", touches_resources=["file:free.py"])
+    res = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert res["resource_blocked"] == []
+    assert res["resource_blocked_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_stale_plan_generation_rejected(db):
+    """0d0cada7 — a plan_generation computed BEFORE the board changed must be
+    rejected when submitted AFTER the change, forcing a recompute instead of
+    treating the stale plan as still valid."""
+    p = await db_module.create_project(db, "0d0cada7-stale-plan")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    other = await db_module.register_session(db, pid, "other")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    groups = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    stale_generation = groups["group_generations"][0]
+
+    # Board moves: a DIFFERENT session claims a's file out from under the plan.
+    claimed = await db_module.claim_file(db, "a.py", other["id"])
+    assert claimed["claimed"] is True
+
+    result = await db_module.claim_parallel_batch(
+        db, pid, sess["id"], [a["id"]], plan_generation=stale_generation,
+    )
+    assert result["ok"] is False
+    assert result["error"] == "STALE_PLAN_GENERATION"
+    assert result["expected_plan_generation"] == stale_generation
+    assert result["current_plan_generation"] != stale_generation
+    # Nothing was claimed or persisted — a's status is untouched.
+    reread = await db_module.get_sprint_item(db, a["id"])
+    assert reread["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_fresh_plan_generation_from_groups_accepted(db):
+    """The happy path for the staleness check: a generation taken from
+    get_parallelizable_groups' group_generations, submitted unchanged, must
+    be accepted end-to-end (no false-positive staleness)."""
+    p = await db_module.create_project(db, "0d0cada7-fresh-plan")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    groups = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    generation = groups["group_generations"][0]
+    result = await db_module.claim_parallel_batch(
+        db, pid, sess["id"], [a["id"]], plan_generation=generation,
+    )
+    assert result["ok"] is True
+    assert result["plan_generation"] == generation
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_lease_local_warning_on_shared_session(db):
+    """0d0cada7 — a multi-item batch where the SAME session claims more than
+    one item (no item_sessions override) is exactly the pattern behind the
+    live incident: one session 'planning its backlog' while only genuinely
+    executing one item at a time. This must never block the call (the
+    existing happy-path test pins that), but it must be surfaced."""
+    p = await db_module.create_project(db, "0d0cada7-lease-warning")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "solo-executor")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "b", touches_resources=["file:b.py"], prospect_bypass=True,
+        force=True,
+    )
+    result = await db_module.claim_parallel_batch(db, pid, sess["id"], [a["id"], b["id"]])
+    assert result["ok"] is True
+    assert len(result["lease_local_warning"]) == 1
+    assert result["lease_local_warning"][0]["session_id"] == sess["id"]
+    assert set(result["lease_local_warning"][0]["item_ids"]) == {a["id"], b["id"]}
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_no_lease_local_warning_with_distinct_sessions(db):
+    """The documented correct usage — item_sessions assigning each item to
+    its own worker — must never trigger the warning."""
+    p = await db_module.create_project(db, "0d0cada7-lease-warning-clean")
+    pid = p["id"]
+    orchestrator = await db_module.register_session(db, pid, "orchestrator")
+    w1 = await db_module.register_session(db, pid, "worker-1")
+    w2 = await db_module.register_session(db, pid, "worker-2")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "b", touches_resources=["file:b.py"], prospect_bypass=True,
+        force=True,
+    )
+    result = await db_module.claim_parallel_batch(
+        db, pid, orchestrator["id"], [a["id"], b["id"]],
+        item_sessions={a["id"]: w1["id"], b["id"]: w2["id"]},
+    )
+    assert result["ok"] is True
+    assert result["lease_local_warning"] == []
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_resource_conflict_carries_scheduler_diagnostics(db):
+    """0d0cada7 — a BATCH_RESOURCE_CONFLICT rejection must carry the same
+    wait_reason/lease_expiry/retry_after/claim_granularity/plan_generation
+    shape as get_parallelizable_groups' resource_blocked entries, not just
+    the bare holder_session_id it already had."""
+    p = await db_module.create_project(db, "0d0cada7-conflict-diagnostics")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    stranger = await db_module.register_session(db, pid, "stranger")
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "a", touches_resources=["file:a.py"], prospect_bypass=True,
+    )
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "b", touches_resources=["file:b.py"], prospect_bypass=True,
+        force=True,
+    )
+    pre = await db_module.claim_file(db, "b.py", stranger["id"])
+    assert pre["claimed"] is True
+
+    result = await db_module.claim_parallel_batch(db, pid, sess["id"], [a["id"], b["id"]])
+    assert result["ok"] is False
+    assert result["error"] == "BATCH_RESOURCE_CONFLICT"
+    assert result["wait_reason"] == "resource_locked"
+    assert result["holder_session_id"] == stranger["id"]
+    assert result["claim_granularity"] == "file"
+    assert isinstance(result["retry_after"], int) and result["retry_after"] > 0
+    assert result["plan_generation"]
+
+
+# ---------------------------------------------------------------------------
+# 0d0cada7 — claim_symbol/release_symbol scheduler-diagnostics enrichment.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_symbol_success_carries_claim_granularity_and_lease_expiry(db):
+    p = await db_module.create_project(db, "0d0cada7-symbol-success-fields")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    result = await db_module.claim_symbol(db, sess["id"], "pkg/mod.py", "foo", _FOO_BAR_SRC)
+    assert result["claimed"] is True
+    assert result["claim_granularity"] == "symbol"
+    assert result["lease_expiry"]
+
+
+@pytest.mark.asyncio
+async def test_claim_symbol_conflict_carries_claim_granularity_and_holder(db):
+    p = await db_module.create_project(db, "0d0cada7-symbol-conflict-fields")
+    pid = p["id"]
+    holder = await db_module.register_session(db, pid, "holder")
+    claimant = await db_module.register_session(db, pid, "claimant")
+    pre = await db_module.claim_symbol(db, holder["id"], "pkg/mod.py", "foo", _FOO_BAR_SRC)
+    assert pre["claimed"] is True
+    result = await db_module.claim_symbol(db, claimant["id"], "pkg/mod.py", "foo", _FOO_BAR_SRC)
+    assert result["claimed"] is False
+    assert result["reason"] == "symbol_conflict"
+    assert result["claim_granularity"] == "symbol"
+    assert result["holder_session_id"] == holder["id"]
+
+
+@pytest.mark.asyncio
+async def test_claim_symbol_file_locked_carries_claim_granularity_file(db):
+    p = await db_module.create_project(db, "0d0cada7-symbol-filelocked-fields")
+    pid = p["id"]
+    holder = await db_module.register_session(db, pid, "holder")
+    claimant = await db_module.register_session(db, pid, "claimant")
+    pre = await db_module.claim_file(db, "pkg/mod.py", holder["id"])
+    assert pre["claimed"] is True
+    result = await db_module.claim_symbol(db, claimant["id"], "pkg/mod.py", "foo", _FOO_BAR_SRC)
+    assert result["claimed"] is False
+    assert result["reason"] == "file_locked"
+    assert result["claim_granularity"] == "file"
+    assert result["lease_expiry"] == pre["expires_at"]
+
+
+@pytest.mark.asyncio
+async def test_claim_symbol_unparseable_carries_unresolved_granularity(db):
+    p = await db_module.create_project(db, "0d0cada7-symbol-unparseable-fields")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    result = await db_module.claim_symbol(db, sess["id"], "notes.txt", "foo", "not real code {{{")
+    assert result["claimed"] is False
+    assert result["reason"] == "unparseable"
+    assert result["claim_granularity"] == "unresolved"
+
+
+@pytest.mark.asyncio
+async def test_release_symbol_still_fail_closed_and_returns_bool(db):
+    """release_symbol's public bool contract must be unchanged: True on a
+    real release, False on a no-op, and it can NEVER release another live
+    session's claim (no force path exists)."""
+    p = await db_module.create_project(db, "0d0cada7-release-symbol-boundary")
+    pid = p["id"]
+    holder = await db_module.register_session(db, pid, "holder")
+    stranger = await db_module.register_session(db, pid, "stranger")
+    pre = await db_module.claim_symbol(db, holder["id"], "pkg/mod.py", "foo", _FOO_BAR_SRC)
+    assert pre["claimed"] is True
+
+    # A different session cannot release someone else's claim.
+    stolen = await db_module.release_symbol(db, stranger["id"], "pkg/mod.py", "foo")
+    assert stolen is False
+    still_live = await db_module.get_symbol_claims(db, "pkg/mod.py")
+    assert any(c["symbol_name"] == "foo" and c["released_at"] is None for c in still_live)
+
+    # The actual owner releasing it succeeds exactly once.
+    released = await db_module.release_symbol(db, holder["id"], "pkg/mod.py", "foo")
+    assert released is True
+    again = await db_module.release_symbol(db, holder["id"], "pkg/mod.py", "foo")
+    assert again is False
+
+
+# ---------------------------------------------------------------------------
+# 0d0cada7 — _sprint_item_resource_claim_gate scheduler-diagnostics
+# enrichment (claim_granularity/lease_expiry/wait_reason/retry_after).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gate_acquired_file_entry_carries_granularity_and_lease(db):
+    import meridian.server  # noqa: F401 — import first to avoid handler/server import cycle
+    from meridian.mcp.handler import _sprint_item_resource_claim_gate
+
+    p = await db_module.create_project(db, "0d0cada7-gate-file-fields")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "touches a file", touches_resources=["file:a.py"],
+        prospect_bypass=True,
+    )
+    gate = await _sprint_item_resource_claim_gate(db, pid, item["id"], sess["id"])
+    assert gate["ok"] is True
+    entry = gate["lock_scope"][0]
+    assert entry["claim_granularity"] == "file"
+    assert entry["lease_expiry"]
+
+
+@pytest.mark.asyncio
+async def test_gate_blocked_file_entry_carries_wait_reason_and_retry_after(db):
+    import meridian.server  # noqa: F401
+    from meridian.mcp.handler import _sprint_item_resource_claim_gate
+
+    p = await db_module.create_project(db, "0d0cada7-gate-file-blocked-fields")
+    pid = p["id"]
+    holder = await db_module.register_session(db, pid, "holder")
+    claimant = await db_module.register_session(db, pid, "claimant")
+    pre = await db_module.claim_file(db, "a.py", holder["id"])
+    assert pre["claimed"] is True
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "touches a locked file", touches_resources=["file:a.py"],
+        prospect_bypass=True,
+    )
+    gate = await _sprint_item_resource_claim_gate(db, pid, item["id"], claimant["id"])
+    assert gate["ok"] is False
+    assert gate["error"] == "RESOURCE_LOCKED"
+    entry = gate["conflicts"][0]
+    assert entry["wait_reason"] == "locked"
+    assert entry["claim_granularity"] == "file"
+    assert isinstance(entry["retry_after"], int) and entry["retry_after"] > 0
+
+
+@pytest.mark.asyncio
+async def test_gate_coarse_symbol_fallback_carries_coarse_granularity(db):
+    import meridian.server  # noqa: F401
+    from meridian.mcp.handler import _sprint_item_resource_claim_gate
+
+    p = await db_module.create_project(db, "0d0cada7-gate-coarse-fields")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "symbol with no source supplied",
+        touches_resources=["symbol:pkg/mod.py::foo"], prospect_bypass=True,
+    )
+    # No resource_contents supplied -> falls back to a whole-file lock.
+    gate = await _sprint_item_resource_claim_gate(db, pid, item["id"], sess["id"])
+    assert gate["ok"] is True
+    entry = gate["lock_scope"][0]
+    assert entry["fallback_reason"] == "no_source_supplied"
+    assert entry["claim_granularity"] == "coarse"
+    assert entry["lease_expiry"]
+
+
+# ---------------------------------------------------------------------------
+# 0d0cada7 — request_hitl blocker_context: the TRACKED, structured record for
+# a genuine scheduler blocker, distinct from an untracked native HITL.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_blocker_context_persists_structured_fields(db):
+    p = await db_module.create_project(db, "0d0cada7-hitl-blocker-context")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    row = await db_module.request_hitl(
+        db, pid, "item x is waiting on a live resource lock",
+        session_id=sess["id"], kind="scheduler_blocker",
+        blocker_context={
+            "resource": "file:a.py",
+            "item_id": "abc123",
+            "holder_session_id": "other-session",
+            "lease_expiry": "2026-01-01 00:00:00",
+            "claim_granularity": "file",
+            "retry_after": 30,
+            "wait_reason": "resource_locked",
+            "plan_generation": "deadbeef",
+            "ignored_unknown_field": "should be dropped",
+        },
+    )
+    assert row["kind"] == "scheduler_blocker"
+    payload = json.loads(row["payload"])
+    blocker = payload["blocker"]
+    assert blocker["resource"] == "file:a.py"
+    assert blocker["holder_session_id"] == "other-session"
+    assert blocker["retry_after"] == 30
+    assert "ignored_unknown_field" not in blocker
+
+    # Visible through the durable HITL/blocker API, not just the return value.
+    reread = await db_module.get_hitl_request(db, row["id"])
+    assert reread is not None
+    assert json.loads(reread["payload"])["blocker"]["wait_reason"] == "resource_locked"
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_blocker_context_does_not_force_require_human(db):
+    """Ordinary lock contention must stay pollable, not escalate to a
+    human-only request just because blocker_context was supplied."""
+    p = await db_module.create_project(db, "0d0cada7-hitl-blocker-no-forced-human")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    row = await db_module.request_hitl(
+        db, pid, "ordinary contention", session_id=sess["id"],
+        kind="scheduler_blocker", blocker_context={"resource": "file:a.py"},
+    )
+    payload = json.loads(row["payload"])
+    assert payload.get("require_human") is not True
+
+
+@pytest.mark.asyncio
+async def test_request_hitl_without_blocker_context_unaffected(db):
+    """Every existing caller that never passes blocker_context sees
+    byte-for-byte the same payload shape as before this parameter existed."""
+    p = await db_module.create_project(db, "0d0cada7-hitl-no-blocker-context")
+    pid = p["id"]
+    row = await db_module.request_hitl(db, pid, "plain question")
+    assert row["payload"] is None

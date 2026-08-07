@@ -328,3 +328,122 @@ async def test_assign_sprint_waves_splits_colon_symbol_suffixed_same_file(db):
     # Both real declarations touch the SAME file, so they must NOT land in
     # the same wave despite the different trailing ":<symbol>" suffix.
     assert ra["wave"] != rb["wave"]
+
+
+# ---------------------------------------------------------------------------
+# 0d0cada7 — lease-local scheduler contract: dynamic recomputation (no wave
+# is a persisted, immutable plan — get_parallelizable_groups is authoritative
+# and live on every call), lease/TTL expiry unblocking a resource-contended
+# item, and cross-project isolation. Complements the plan_generation/
+# resource_blocked/claim_granularity coverage in tests/test_resource_locks.py.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dynamic_refresh_adds_newly_unblocked_item_without_restart(db):
+    """One worker completing item A must make dependency-blocked item B
+    immediately visible on the VERY NEXT get_parallelizable_groups call —
+    no assign_sprint_waves rerun, no executor restart, just a live recompute
+    from the authoritative board."""
+    pid = await _project(db)
+    sess = await db_module.register_session(db, pid, "w1")
+    a = await db_module.add_sprint_item(db, pid, "v1", "root item")
+    b = await db_module.add_sprint_item(
+        db, pid, "v1", "depends on root", depends_on=a["id"], force=True,
+    )
+
+    before = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    before_eligible_ids = {it["id"] for grp in before["groups"] for it in grp}
+    assert a["id"] in before_eligible_ids
+    assert b["id"] not in before_eligible_ids
+    assert any(x["id"] == b["id"] for x in before["blocked"])
+
+    await db_module.claim_sprint_item(db, pid, a["id"], actor=sess["id"])
+    await db_module.complete_sprint_item(db, pid, a["id"], actor=sess["id"])
+
+    after = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    after_eligible_ids = {it["id"] for grp in after["groups"] for it in grp}
+    assert b["id"] in after_eligible_ids
+    assert not any(x["id"] == b["id"] for x in after["blocked"])
+    assert before["plan_generation"] != after["plan_generation"]
+
+
+@pytest.mark.asyncio
+async def test_resource_lease_expiry_unblocks_resource_contended_item(db):
+    """A resource_blocked item becomes genuinely claimable again once the
+    blocking lock's TTL lapses — the scheduler contract's 'release ... at
+    ... heartbeat expiry' path, observed end-to-end through
+    get_parallelizable_groups rather than the raw lock table."""
+    pid = await _project(db)
+    holder = await db_module.register_session(db, pid, "holder")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "touches a file", touches_resources=["file:leased.py"],
+    )
+    pre = await db_module.claim_file(db, "leased.py", holder["id"])
+    assert pre["claimed"] is True
+
+    mid = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert mid["resource_blocked_count"] == 1
+    assert mid["resource_blocked"][0]["id"] == item["id"]
+
+    # Force the lock's TTL to have already lapsed (mirrors
+    # test_expire_resource_locks_by_ttl's pattern in test_resource_locks.py).
+    await db.execute(
+        "UPDATE file_locks SET expires_at = datetime('now', '-1 hour') "
+        "WHERE file_path = 'leased.py'"
+    )
+    await db.commit()
+
+    after = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert after["resource_blocked"] == []
+    assert after["resource_blocked_count"] == 0
+    assert mid["plan_generation"] != after["plan_generation"]
+
+
+@pytest.mark.asyncio
+async def test_cross_project_isolation_item_not_found_before_plan_generation_check(db):
+    """A cross-project item id must be refused as ITEM_NOT_FOUND — never
+    reaching (and never satisfied or contradicted by) the plan_generation
+    staleness check, and never touching the OTHER project's item at all.
+    Dynamic replanning must never cross a project boundary."""
+    pid_a = (await db_module.create_project(db, "0d0cada7-cross-a"))["id"]
+    pid_b = (await db_module.create_project(db, "0d0cada7-cross-b"))["id"]
+    sess_b = await db_module.register_session(db, pid_b, "w1")
+    item_a = await db_module.add_sprint_item(
+        db, pid_a, "v1", "lives in project A", touches_resources=["file:a.py"],
+    )
+
+    result = await db_module.claim_parallel_batch(
+        db, pid_b, sess_b["id"], [item_a["id"]], plan_generation="whatever-stale-value",
+    )
+    assert result["ok"] is False
+    assert result["error"] == "ITEM_NOT_FOUND"
+    assert "expected_plan_generation" not in result
+
+    # Project A's item is completely untouched.
+    reread = await db_module.get_sprint_item(db, item_a["id"])
+    assert reread["status"] == "pending"
+    assert reread["project_id"] == pid_a
+
+
+@pytest.mark.asyncio
+async def test_cross_project_groups_never_mix_items(db):
+    """Two projects each declaring the identical resource path never appear
+    in each other's get_parallelizable_groups output — grouping/plan
+    computation is strictly project-scoped."""
+    pid_a = (await db_module.create_project(db, "0d0cada7-nomix-a"))["id"]
+    pid_b = (await db_module.create_project(db, "0d0cada7-nomix-b"))["id"]
+    item_a = await db_module.add_sprint_item(
+        db, pid_a, "v1", "same path a", touches_resources=["file:shared_name.py"],
+    )
+    item_b = await db_module.add_sprint_item(
+        db, pid_b, "v1", "same path b", touches_resources=["file:shared_name.py"],
+    )
+    res_a = await db_module.get_parallelizable_groups(db, pid_a, version="v1")
+    res_b = await db_module.get_parallelizable_groups(db, pid_b, version="v1")
+    ids_a = {it["id"] for grp in res_a["groups"] for it in grp}
+    ids_b = {it["id"] for grp in res_b["groups"] for it in grp}
+    assert ids_a == {item_a["id"]}
+    assert ids_b == {item_b["id"]}
+    assert item_b["id"] not in ids_a
+    assert item_a["id"] not in ids_b

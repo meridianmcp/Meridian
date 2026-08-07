@@ -29,8 +29,92 @@ involvement at all and also exposes a ``meridian-codeindex`` CLI.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# d5e60791 -- boot-time packaging preflight for the meridian_codeindex import.
+#
+# meridian_codeindex is a real, standalone pip package (its own
+# extensions/meridian-codeindex/pyproject.toml) normally made importable via
+# pixi.toml's `meridian-codeindex = { path = "extensions/meridian-codeindex",
+# editable = true }` pypi-dependency. That wiring is CORRECT and confirmed
+# working for a freshly `pixi install`-synced environment (`pixi run python
+# -c "import meridian_codeindex"` succeeds) -- but it is a property of the
+# SOLVED/INSTALLED environment on disk, not of the source checkout itself.
+#
+# Live reproduction (d5e60791, 2026-08-06): the ALREADY-RUNNING MCP connector
+# serving this exact repo checkout still raised "No module named
+# 'meridian_codeindex'" from search_code_semantic / prospect_symbol's rung 3,
+# even though `pixi run python -c "import meridian_codeindex"` succeeded from
+# a shell in the SAME checkout moments later. That server process was
+# started against (or never re-synced into) a pixi/pip environment predating
+# this editable-install entry, so its own site-packages never picked it up
+# -- a class of gap that hits ANY runtime that hasn't (re)synced: a
+# long-lived server process, a stale venv, a packaged distribution built
+# before this wiring landed. The search algorithm itself was never the bug.
+#
+# Rather than let every code-index tool call fail until a human notices and
+# manually restarts with a resynced env, fall back to the vendored source
+# tree that ships in EVERY checkout of this repo
+# (extensions/meridian-codeindex/meridian_codeindex/), right next to
+# meridian/ itself, and retry the import once. This makes the package
+# resolve in every MCP runtime that has the repo checked out on disk -- the
+# MCP handler dispatch, the stdio transport, and a direct local
+# `python -c "import meridian_codeindex"` -- independent of whether pip/pixi
+# happens to have (re)installed the editable entry in that particular
+# process's environment.
+# ---------------------------------------------------------------------------
+
+def _ensure_meridian_codeindex_importable() -> "ModuleNotFoundError | None":
+    """Best-effort boot preflight: make ``import meridian_codeindex`` work.
+
+    Returns ``None`` on success -- either it was already importable (the
+    common case in a properly synced env) or the vendored-source fallback
+    below fixed it. Returns the ORIGINAL :class:`ModuleNotFoundError` when
+    neither path works (e.g. a frozen/packaged distribution that never ships
+    ``extensions/`` at all, or a genuinely missing transitive dependency like
+    ``duckdb``) so the caller can raise a truthful, actionable error instead
+    of masking the real cause.
+    """
+    try:
+        import meridian_codeindex  # noqa: F401
+        return None
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name != "meridian_codeindex" and not exc.name.startswith(
+            "meridian_codeindex."
+        ):
+            # A TRANSITIVE dependency of meridian_codeindex is missing (e.g.
+            # duckdb) -- sys.path surgery cannot fix that; surface the real
+            # error as-is instead of pretending this is a packaging gap.
+            return exc
+        vendored = Path(__file__).resolve().parent.parent / "extensions" / "meridian-codeindex"
+        if not (vendored / "meridian_codeindex" / "__init__.py").is_file():
+            return exc
+        vendored_str = str(vendored)
+        if vendored_str not in sys.path:
+            sys.path.insert(0, vendored_str)
+        try:
+            import meridian_codeindex  # noqa: F401
+            return None
+        except ModuleNotFoundError as retry_exc:
+            return retry_exc
+
+
+_IMPORT_ERROR = _ensure_meridian_codeindex_importable()
+if _IMPORT_ERROR is not None:
+    raise ImportError(
+        "meridian_codeindex is not importable in this runtime "
+        f"({_IMPORT_ERROR}). search_code_semantic and prospect_symbol's "
+        "local BM25 fallback rung cannot run until the package is "
+        "available -- run `pixi install` (self-hosted) or "
+        "`pip install -e extensions/meridian-codeindex`, or verify the "
+        "vendored source tree at "
+        "extensions/meridian-codeindex/meridian_codeindex/ is present on "
+        "disk next to the meridian/ package."
+    ) from _IMPORT_ERROR
 
 from meridian_codeindex import code_index as _impl
 

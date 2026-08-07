@@ -8695,6 +8695,7 @@ async def request_hitl(
     options: list[str] | None = None,
     recommended: str | int | None = None,
     require_human: bool = False,
+    blocker_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a HITL request. Returns the inserted row.
 
@@ -8708,6 +8709,24 @@ async def request_hitl(
     the dashboard highlights it with a "(recommended)" badge + border and Enter
     submits it, and an auto-answer picks it instead of the first option. Explicit
     ``payload`` JSON, when given, is merged with the options/recommended fields.
+
+    ``blocker_context`` (0d0cada7, optional) — structured scheduler-lock
+    diagnostics (``resource``, ``item_id``, ``holder_session_id``,
+    ``lease_expiry``, ``claim_granularity``, ``retry_after``, ``wait_reason``,
+    ``plan_generation`` — any subset; unknown/extra keys are dropped) merged
+    into ``payload["blocker"]`` so it is durably queryable via
+    ``get_hitl_request``/``list_hitl_requests`` ("the Meridian HITL/blocker
+    APIs"). This is the TRACKED counterpart to "do not open an untracked
+    native HITL for ordinary lock contention": pass ``kind="scheduler_blocker"``
+    and leave ``require_human`` False for routine contention an executor
+    should poll through with bounded backoff (see the returned
+    ``retry_after``); reserve ``require_human=True`` — independent of this
+    parameter, unchanged from its existing meaning — for what the scheduler
+    contract actually calls a genuine escalation: a real human decision, a
+    stale-lease ownership ambiguity, or a destructive action. Passing
+    ``blocker_context`` never changes ``require_human``'s default (False) or
+    the auto-answer eligibility rules on its own — those still key off
+    ``kind``/``question`` exactly as before.
     """
     if urgency not in _VALID_HITL_URGENCY:
         raise ValueError(
@@ -8716,7 +8735,10 @@ async def request_hitl(
     # cd134cf1 — fold options + recommended into the payload JSON. e43e6941 —
     # also persist require_human there (no migration) so the dashboard can flag a
     # human-only request and the no-auto-answer rule survives a reload.
-    if options is not None or recommended is not None or require_human:
+    # 0d0cada7 — blocker_context folds in alongside them (additive; a caller
+    # supplying none of these three sees byte-for-byte the same payload as
+    # before this parameter existed).
+    if options is not None or recommended is not None or require_human or blocker_context:
         try:
             _pl = json.loads(payload) if payload else {}
             if not isinstance(_pl, dict):
@@ -8731,6 +8753,14 @@ async def request_hitl(
             _pl["recommended"] = _rec
         if require_human:
             _pl["require_human"] = True
+        if blocker_context:
+            _blocker_fields = (
+                "resource", "item_id", "holder_session_id", "lease_expiry",
+                "claim_granularity", "retry_after", "wait_reason", "plan_generation",
+            )
+            _pl["blocker"] = {
+                k: blocker_context[k] for k in _blocker_fields if k in blocker_context
+            }
         payload = json.dumps(_pl)
     hid = _new_id()
     await db.execute(
@@ -11864,6 +11894,14 @@ from .sprint_items import (  # noqa: F401
     split_sprint_item,
     sprint_test_coverage_expected,
     start_sprint_item,
+    # 56e9b3c7 — autonomous stale-claim reconciliation
+    classify_stale_claim,
+    reconcile_stale_claims,
+    RECONCILE_STALE_CLAIM_AUDIT_EVENT,
+    RECONCILE_ACTIVE,
+    RECONCILE_STALE,
+    RECONCILE_AMBIGUOUS,
+    RECONCILE_NOT_APPLICABLE,
     # Public classes
     SprintItemClaimMismatch,
     SprintItemEvidenceRequired,
@@ -11878,6 +11916,9 @@ from .sprint_items import (  # noqa: F401
     _NICKNAME_NOUN,
     _NICKNAME_STOPWORDS,
     _PATCH_SPRINT_ITEM_ALLOWED_STATUSES,
+    _RECONCILE_STALE_HOURS,
+    _RECONCILE_DEFAULT_BATCH,
+    _RECONCILE_MAX_BATCH,
     _SPRINT_DUP_OVERLAP_THRESHOLD,
     _SPRINT_ITEMS_CACHE,
     _SPRINT_ITEMS_CACHE_TTL,
@@ -11889,12 +11930,16 @@ from .sprint_items import (  # noqa: F401
     _VALID_SPRINT_PRIORITIES,
     _VALID_SPRINT_STATUSES,
     _advance_task_chain,
+    _claim_session_liveness,
+    _claim_worktree_activity,
+    _claim_recent_task_evidence,
     _invalidate_sprint_items_cache,
     _is_manual_sprint_item,
     _item_declares_resources,
     is_item_claim_prospected,
     _maybe_rollup_parent,
     _parse_deferral_ts,
+    _reset_stale_claim,
     _split_wave_label,
     _get_blocking_wave_gate,
     _session_stall_summary,
@@ -11911,6 +11956,11 @@ from .sprint_items import (  # noqa: F401
     _topo_depth_map,
     _transition_status,
     _update_sprint_item_status,
+    # 0d0cada7 — lease-local scheduler diagnostics, also called directly by
+    # meridian.mcp.handler._sprint_item_resource_claim_gate and by tests.
+    _compute_plan_generation,
+    _seconds_until,
+    _live_resource_holder,
 )
 
 

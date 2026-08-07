@@ -29,6 +29,8 @@ ONCE against that chokepoint. Per-caller tests in this file verify:
       for complete/fail/push/skip/start/provisional_complete).
 """
 import asyncio
+import time
+
 import pytest
 
 from meridian import db as db_module
@@ -173,7 +175,13 @@ async def test_start_sprint_item_guards_pending_todo_only(db):
 
 
 @pytest.mark.asyncio
-async def test_mcp_handler_complete_sprint_item_surfaces_status_race(db):
+async def test_mcp_handler_complete_sprint_item_idempotent_retry_not_status_race(db):
+    """a2a027cf — FIXED behavior. This test used to assert the OPPOSITE: that
+    re-completing an already-'done' item via the MCP dispatch surfaced
+    STATUS_RACE. That was exactly the reported production bug -- a client
+    that timed out around the original call and retried saw a misleading
+    failure even though the original write had already succeeded. A retry
+    against an already-done item is now a plain idempotent success."""
     import meridian.server as srv
 
     p, item = await _project_with_item(db)
@@ -184,9 +192,34 @@ async def test_mcp_handler_complete_sprint_item_surfaces_status_race(db):
         {"project_id": p["id"], "item_id": item["id"]},
         db, "/tmp",
     )
+    assert "error" not in result
+    assert result["status"] == "done"
+    assert result["completion_outcome"] == "already_committed"
+    assert "correlation_id" in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_handler_complete_sprint_item_genuine_race_still_status_race(db):
+    """A genuine conflicting race (item ends up in a DIFFERENT terminal
+    status than the one this call was attempting) must still surface
+    STATUS_RACE -- only the "already reached the SAME target status" replay
+    case became idempotent, not races in general."""
+    import meridian.server as srv
+
+    p, item = await _project_with_item(db)
+    await db_module.claim_sprint_item(db, p["id"], item["id"])
+    await db_module.skip_sprint_item(db, p["id"], item["id"], reason="raced out")
+
+    result = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
     assert result["error"] == "STATUS_RACE"
     assert result["item_id"] == item["id"]
-    assert result["current_status"] == "done"
+    assert result["current_status"] == "skipped"
+    assert "correlation_id" in result
+    assert "retry_guidance" in result
 
 
 # ---------------------------------------------------------------------------
@@ -925,3 +958,320 @@ async def test_claim_parallel_batch_atomic_race_second_caller_rejected(db):
     assert reread_y["status"] == "pending"
     assert reread_y["claimed_at"] is None
     assert (await db_module.get_file_claims(db, "y.py"))["file_lock"] is None
+
+
+# ---------------------------------------------------------------------------
+# a2a027cf — timeout-safe / observable / idempotent complete_sprint_item.
+#
+# Repeated live reports: complete_sprint_item calls timing out at the client
+# around 60s even though the server-side write may have already succeeded; a
+# defensive re-query then reveals the item is already done, or a retry
+# returns a misleading STATUS_RACE. This section covers:
+#   1. DB-level idempotent retry (completion_outcome, no duplicate side
+#      effects, gates skipped on replay).
+#   2. Observability (correlation_id, phase_timings_ms).
+#   3. Bounded advisory work (rollup/task-chain-advance/continuation-state
+#      cannot hold an already-committed response hostage).
+#   4. Dispatch-level timeout classification (committed / timed_out_before_
+#      commit / unknown_outcome).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_idempotent_retry_returns_already_committed(db):
+    """Retrying complete_sprint_item on an item that is ALREADY 'done' is a
+    no-op success, not an error -- the direct fix for the reported bug."""
+    p, item = await _project_with_item(db)
+
+    first = await db_module.complete_sprint_item(db, p["id"], item["id"], notes="shipped")
+    assert first["status"] == "done"
+    assert first["completion_outcome"] == "committed"
+
+    second = await db_module.complete_sprint_item(db, p["id"], item["id"])
+    assert second["status"] == "done"
+    assert second["completion_outcome"] == "already_committed"
+    assert second["correlation_id"]
+    # The original evidence/notes are untouched by the no-op retry.
+    assert second["notes"] == "shipped"
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_idempotent_retry_skips_ownership_gate(db):
+    """An idempotent retry from a DIFFERENT actor than the one who actually
+    completed the item must NOT raise SprintItemClaimMismatch -- once the
+    item is done, ownership gates (which only make sense for deciding
+    whether an active->done transition may proceed) no longer apply. This is
+    exactly the cross-session retry scenario the acceptance criteria calls
+    out (an orchestrator re-verifying after a timeout, not the same session
+    that made the original call)."""
+    p = await db_module.create_project(db, "idempotent-cross-actor")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "do the thing")
+    owner = await db_module.register_session(db, p["id"], "owner-session")
+    await db_module.claim_sprint_item(db, p["id"], item["id"], actor=owner["id"])
+    await db_module.complete_sprint_item(db, p["id"], item["id"], actor=owner["id"])
+
+    # A different actor retries -- must succeed idempotently, not raise.
+    retried = await db_module.complete_sprint_item(
+        db, p["id"], item["id"], actor="a-totally-different-session",
+    )
+    assert retried["status"] == "done"
+    assert retried["completion_outcome"] == "already_committed"
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_idempotent_retry_no_duplicate_side_effects(db, monkeypatch):
+    """A retry against an already-done item must NOT re-run rollup / the
+    task-chain advance -- those fire real side effects (e.g. filing a HITL
+    handoff on a mixed-ownership chain transition) that must never be
+    duplicated by a timeout-and-retry."""
+    p, item = await _project_with_item(db)
+    await db_module.complete_sprint_item(db, p["id"], item["id"])
+
+    calls = {"rollup": 0, "chain": 0}
+    real_rollup = _sprint_items_mod._maybe_rollup_parent
+    real_chain = _sprint_items_mod._advance_task_chain
+
+    async def _counting_rollup(*a, **k):
+        calls["rollup"] += 1
+        return await real_rollup(*a, **k)
+
+    async def _counting_chain(*a, **k):
+        calls["chain"] += 1
+        return await real_chain(*a, **k)
+
+    monkeypatch.setattr(_sprint_items_mod, "_maybe_rollup_parent", _counting_rollup)
+    monkeypatch.setattr(_sprint_items_mod, "_advance_task_chain", _counting_chain)
+
+    result = await db_module.complete_sprint_item(db, p["id"], item["id"])
+    assert result["completion_outcome"] == "already_committed"
+    assert calls["rollup"] == 0
+    assert calls["chain"] == 0
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_correlation_id_generated_and_echoed(db):
+    """A caller-supplied correlation_id is echoed back verbatim; when omitted
+    one is minted so the response always carries one."""
+    p, item = await _project_with_item(db)
+
+    result = await db_module.complete_sprint_item(
+        db, p["id"], item["id"], correlation_id="my-custom-correlation-id",
+    )
+    assert result["correlation_id"] == "my-custom-correlation-id"
+
+    item2 = await db_module.add_sprint_item(db, p["id"], "v1", "second racy item")
+    auto = await db_module.complete_sprint_item(db, p["id"], item2["id"])
+    assert auto["correlation_id"]  # non-empty, freshly minted
+    assert auto["correlation_id"] != "my-custom-correlation-id"
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_phase_timings_present(db):
+    """The response carries phase_timings_ms with the expected phase keys so
+    a slow phase can be identified from the response itself."""
+    p, item = await _project_with_item(db)
+
+    result = await db_module.complete_sprint_item(db, p["id"], item["id"])
+    timings = result["phase_timings_ms"]
+    assert isinstance(timings, dict)
+    for phase in ("lookup", "evidence_check", "status_transition", "post_commit_advisory"):
+        assert phase in timings, f"missing phase {phase!r} in {timings!r}"
+        assert isinstance(timings[phase], (int, float))
+
+
+@pytest.mark.asyncio
+async def test_complete_sprint_item_bounded_advisory_work_does_not_hang(db, monkeypatch):
+    """A pathologically slow post-commit advisory step (rollup/chain-advance)
+    must not hold the response hostage -- it is bounded by
+    _ADVISORY_PHASE_TIMEOUT_S and the response comes back with
+    advisory_work_deferred=True instead of hanging until the slow step
+    finishes. The core status commit (already done by this point) is
+    unaffected either way."""
+    p, item = await _project_with_item(db)
+
+    monkeypatch.setattr(_sprint_items_mod, "_ADVISORY_PHASE_TIMEOUT_S", 0.05)
+
+    async def _slow_side_effects(*a, **k):
+        await asyncio.sleep(5.0)
+
+    monkeypatch.setattr(_sprint_items_mod, "_run_post_commit_side_effects", _slow_side_effects)
+
+    start = time.monotonic()
+    result = await db_module.complete_sprint_item(db, p["id"], item["id"])
+    elapsed = time.monotonic() - start
+
+    assert result["status"] == "done"
+    assert result["completion_outcome"] == "committed"
+    assert result.get("advisory_work_deferred") is True
+    assert elapsed < 2.0, f"complete_sprint_item took {elapsed}s -- advisory work held the response hostage"
+
+    # The core write is durable even though the advisory tail was deferred.
+    final = await db_module.get_sprint_item(db, item["id"])
+    assert final["status"] == "done"
+
+
+# ---------------------------------------------------------------------------
+# Dispatch-level (meridian.mcp.handler._dispatch_mcp_tool) timeout handling.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_complete_sprint_item_timeout_classifies_committed(db, monkeypatch):
+    """If the dispatch-level budget is exceeded but the underlying write had
+    ALREADY committed by the time of the timeout, the timeout response must
+    classify the outcome as 'committed' (re-derived from a live re-query),
+    not report a bare failure."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+
+    p, item = await _project_with_item(db)
+    monkeypatch.setattr(mh, "_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S", 0.05)
+
+    from meridian.mcp.handlers import sprint_tools as st_mod
+    real_handle = st_mod.handle_complete_sprint_item
+
+    async def _slow_handle(args, db_arg, data_dir, tenant, mcp_tenant_id):
+        # Let the real completion commit first, THEN stall past the
+        # dispatch-level timeout -- simulates the exact reported scenario:
+        # the write landed, but the response was slow to come back.
+        result = await real_handle(args, db_arg, data_dir, tenant, mcp_tenant_id)
+        await asyncio.sleep(5.0)
+        return result
+
+    monkeypatch.setattr(st_mod, "handle_complete_sprint_item", _slow_handle)
+
+    result = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
+    assert result["error"] == "COMPLETE_SPRINT_ITEM_TIMEOUT"
+    assert result["completion_outcome"] == "committed"
+    assert result["current_status"] == "done"
+    assert result["correlation_id"]
+
+    # The write is real and durable.
+    final = await db_module.get_sprint_item(db, item["id"])
+    assert final["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_complete_sprint_item_timeout_classifies_timed_out_before_commit(db, monkeypatch):
+    """If the dispatch-level budget is exceeded BEFORE the underlying write
+    ever happens, the timeout response must classify the outcome as
+    'timed_out_before_commit' -- the item is still safely retryable."""
+    import meridian.server as srv
+    from meridian.mcp import handler as mh
+
+    p, item = await _project_with_item(db)
+    monkeypatch.setattr(mh, "_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S", 0.05)
+
+    from meridian.mcp.handlers import sprint_tools as st_mod
+
+    async def _never_completes(args, db_arg, data_dir, tenant, mcp_tenant_id):
+        await asyncio.sleep(5.0)
+        raise AssertionError("should have been cancelled by the dispatch timeout")
+
+    monkeypatch.setattr(st_mod, "handle_complete_sprint_item", _never_completes)
+
+    result = await srv._dispatch_mcp_tool(
+        "complete_sprint_item",
+        {"project_id": p["id"], "item_id": item["id"]},
+        db, "/tmp",
+    )
+    assert result["error"] == "COMPLETE_SPRINT_ITEM_TIMEOUT"
+    assert result["completion_outcome"] == "timed_out_before_commit"
+    # _project_with_item creates the item without claiming it, so it's
+    # still 'pending' -- the exact pre-completion status doesn't matter
+    # here, only that it is NOT 'done' (nothing committed).
+    assert result["current_status"] == "pending"
+
+    # Nothing committed -- a normal (non-timed-out) retry now succeeds cleanly.
+    retried = await db_module.complete_sprint_item(db, p["id"], item["id"])
+    assert retried["status"] == "done"
+    assert retried["completion_outcome"] == "committed"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_complete_sprint_item_other_tools_unaffected_by_timeout_wrapping(db):
+    """The dispatch-level timeout wrapping is scoped ONLY to
+    complete_sprint_item -- an unrelated tool call must behave exactly as
+    before (sanity check that the conditional wrapping in _dispatch_mcp_tool
+    didn't change control flow for every other tool)."""
+    import meridian.server as srv
+
+    p, item = await _project_with_item(db)
+    result = await srv._dispatch_mcp_tool(
+        "get_sprint_items", {"project_id": p["id"]}, db, "/tmp",
+    )
+    assert isinstance(result, list)
+    assert any(it["id"] == item["id"] for it in result)
+
+
+# ---------------------------------------------------------------------------
+# 56e9b3c7 — _reset_stale_claim (autonomous stale-claim reconciliation) is
+# ANOTHER caller of the _transition_status chokepoint proven race-safe above.
+# Verify it passes the correct to_status/from_statuses (same passthrough
+# proof pattern as every other caller in this file) and, independently,
+# that it is itself race-safe as a REAL concurrent chokepoint caller.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reset_stale_claim_passes_pending_from_in_progress_to_chokepoint(db, monkeypatch):
+    """_reset_stale_claim must call _transition_status with to_status='pending'
+    and from_statuses=['in_progress'] — the same atomic TOCTOU guard every
+    other transition in this module routes through."""
+    p = await db_module.create_project(db, "reset-stale-chokepoint")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "stale target")
+    owner = await db_module.register_session(db, p["id"], "chokepoint-owner")
+    await db_module.claim_sprint_item(db, p["id"], item["id"], actor=owner["id"])
+    await db.execute("UPDATE sessions SET status = 'closed' WHERE id = ?", (owner["id"],))
+    await db.commit()
+
+    captured: dict = {}
+    real_transition = _sprint_items_mod._transition_status
+
+    async def _capture_transition(db_conn, project_id, item_id, to_status,
+                                   from_statuses=None, **kwargs):
+        captured["to_status"] = to_status
+        captured["from_statuses"] = set(from_statuses) if from_statuses is not None else None
+        return await real_transition(db_conn, project_id, item_id, to_status,
+                                     from_statuses=from_statuses, **kwargs)
+
+    monkeypatch.setattr(db_module, "_transition_status", _capture_transition)
+    monkeypatch.setattr(_sprint_items_mod, "_transition_status", _capture_transition)
+
+    fresh = await db_module.get_sprint_item(db, item["id"])
+    verdict = await db_module.classify_stale_claim(db, fresh)
+    assert verdict["classification"] == "stale"
+    result = await _sprint_items_mod._reset_stale_claim(db, p["id"], item["id"], verdict)
+    assert result is not None
+    assert captured["to_status"] == "pending"
+    assert captured["from_statuses"] == {"in_progress"}
+
+
+@pytest.mark.asyncio
+async def test_reset_stale_claim_noop_when_item_already_raced_away(db):
+    """If the item is no longer in_progress by the time _reset_stale_claim
+    actually writes (a concurrent completion/claim beat it), it must no-op
+    (return None) rather than clobber the real winner's status — same
+    race-lost contract as requeue_or_fail_stalled_item."""
+    p = await db_module.create_project(db, "reset-stale-raced-away")
+    item = await db_module.add_sprint_item(db, p["id"], "v1", "raced away")
+    owner = await db_module.register_session(db, p["id"], "raced-owner")
+    await db_module.claim_sprint_item(db, p["id"], item["id"], actor=owner["id"])
+    await db.execute("UPDATE sessions SET status = 'closed' WHERE id = ?", (owner["id"],))
+    await db.commit()
+
+    fresh = await db_module.get_sprint_item(db, item["id"])
+    verdict = await db_module.classify_stale_claim(db, fresh)
+    assert verdict["classification"] == "stale"
+
+    # A concurrent winner completes the item first.
+    await db_module.complete_sprint_item(db, p["id"], item["id"], force_foreign_claim=True)
+
+    result = await _sprint_items_mod._reset_stale_claim(db, p["id"], item["id"], verdict)
+    assert result is None
+    final = await db_module.get_sprint_item(db, item["id"])
+    assert final["status"] == "done"  # the real winner's terminal state stuck

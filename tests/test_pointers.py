@@ -2811,3 +2811,111 @@ def test_build_quick_start_goal_strict_pointer_evidence_excludes_when_unresolved
     )
     assert "<excluded_unprospected" in out
     assert "item-1" in out
+
+
+# ===========================================================================
+# 3b3020ac — execution-manifest-backed readiness
+# (verify_execution_manifest_target_readiness), a thin adapter layered on
+# top of verify_target_readiness that consumes
+# meridian.executor_contract.aggregate_worker_completions()'s fail-closed
+# aggregation (duck-typed here; this module never imports executor_contract
+# — see the adapter's own module-section docstring for why).
+# ===========================================================================
+
+import hashlib as _hashlib  # noqa: E402
+
+from meridian.pointers import verify_execution_manifest_target_readiness  # noqa: E402
+
+
+def _ok_aggregation(worker_records):
+    return {"ok": True, "status": "complete", "is_full_production": True, "worker_records": worker_records}
+
+
+class TestVerifyExecutionManifestTargetReadiness:
+    @pytest.mark.asyncio
+    async def test_disk_level_failure_short_circuits_before_manifest_check(self, tmp_path):
+        """A target that fails verify_target_readiness's own disk check is
+        never rescued by a manifest, no matter what the aggregation says."""
+        missing = tmp_path / "nope.png"
+        out = await verify_execution_manifest_target_readiness(
+            {"uri": str(missing), "target_kind": "existing"},
+            _ok_aggregation({}),
+        )
+        assert out["ready"] is False
+        assert out["status"] == "missing"
+        assert out["manifest_verified"] is False
+
+    @pytest.mark.asyncio
+    async def test_missing_or_not_ok_aggregation_refuses_directory_presence_alone(self, tmp_path):
+        """Directory presence alone (a real file on disk) must never be
+        treated as sufficient — an absent or failed aggregation downgrades
+        an otherwise-ready target to not ready."""
+        real = tmp_path / "out.png"
+        real.write_bytes(b"hello world")
+        target = {"uri": str(real), "target_kind": "existing"}
+
+        out_none = await verify_execution_manifest_target_readiness(target, None)
+        assert out_none["ready"] is False
+        assert out_none["manifest_verified"] is False
+
+        out_failed = await verify_execution_manifest_target_readiness(
+            target, {"ok": False, "status": "failed", "worker_records": {}},
+        )
+        assert out_failed["ready"] is False
+        assert out_failed["manifest_verified"] is False
+
+    @pytest.mark.asyncio
+    async def test_matching_manifest_hash_verifies_ready(self, tmp_path):
+        real = tmp_path / "out.png"
+        real.write_bytes(b"hello world")
+        content_hash = _hashlib.sha256(b"hello world").hexdigest()
+        aggregation = _ok_aggregation({"w1": {"output_hashes": {str(real): content_hash}}})
+
+        out = await verify_execution_manifest_target_readiness(
+            {"uri": str(real), "target_kind": "existing"}, aggregation,
+        )
+        assert out["ready"] is True
+        assert out["manifest_verified"] is True
+        assert out["manifest_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_path_not_recorded_in_aggregation_refuses(self, tmp_path):
+        real = tmp_path / "out.png"
+        real.write_bytes(b"hello world")
+        aggregation = _ok_aggregation({"w1": {"output_hashes": {}}})
+
+        out = await verify_execution_manifest_target_readiness(
+            {"uri": str(real), "target_kind": "existing"}, aggregation,
+        )
+        assert out["ready"] is False
+        assert out["manifest_verified"] is False
+        assert "not among" in out["manifest_reason"]
+
+    @pytest.mark.asyncio
+    async def test_hash_mismatch_between_disk_and_manifest_refuses(self, tmp_path):
+        """The file on disk has since changed — its current content hash no
+        longer matches what the manifest-backed aggregation recorded."""
+        real = tmp_path / "out.png"
+        real.write_bytes(b"hello world")
+        stale_hash = _hashlib.sha256(b"a completely different original content").hexdigest()
+        aggregation = _ok_aggregation({"w1": {"output_hashes": {str(real): stale_hash}}})
+
+        out = await verify_execution_manifest_target_readiness(
+            {"uri": str(real), "target_kind": "existing"}, aggregation,
+        )
+        assert out["ready"] is False
+        assert out["manifest_verified"] is False
+        assert "does not match" in out["manifest_reason"]
+
+    @pytest.mark.asyncio
+    async def test_injected_hash_file_seam_is_used(self, tmp_path):
+        real = tmp_path / "out.png"
+        real.write_bytes(b"hello world")
+        aggregation = _ok_aggregation({"w1": {"output_hashes": {str(real): "stub-hash"}}})
+
+        out = await verify_execution_manifest_target_readiness(
+            {"uri": str(real), "target_kind": "existing"}, aggregation,
+            hash_file=lambda _p: "stub-hash",
+        )
+        assert out["ready"] is True
+        assert out["manifest_verified"] is True

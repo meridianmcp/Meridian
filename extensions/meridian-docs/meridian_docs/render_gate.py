@@ -82,6 +82,7 @@ __all__ = [
     "check_render_capability",
     "check_word_com_render_receipt",
     "verify_promotion_readiness",
+    "verify_execution_manifest_promotion_readiness",
 ]
 
 # ---------------------------------------------------------------------------
@@ -877,4 +878,115 @@ def verify_promotion_readiness(
         "fingerprint_check": fingerprint_check,
         "structural_check": structural_check,
         "render_check": render_check,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3b3020ac -- execution-manifest-gated promotion readiness.
+#
+# meridian.executor_contract.aggregate_worker_completions() (a hash-pinned,
+# fail-closed aggregation over a scientific fan-out run's per-worker
+# completion records) is consumed here as a PLAIN DICT, duck-typed -- this
+# package is a separate, optionally-installed extension and does not import
+# meridian.executor_contract; a caller (Meridian core, or the thesis project
+# directly) builds the aggregation and passes it straight in.
+#
+# A DOCX draft whose CONTENT is derived from a scientific run (a results
+# table, a generated figure caption, a summary paragraph) must never be
+# promoted to canonical on the strength of narrative notes or directory
+# presence alone -- the run's own fail-closed aggregation must itself be
+# "ok". This function is a THIN layer on top of :func:`verify_promotion_readiness`
+# (called UNCHANGED, never duplicated): it adds exactly one more precondition
+# -- the manifest gate -- to the existing fingerprint/structural/render
+# checks, using the SAME ``{"ready": bool, "reason": str|None, ...}``
+# fail-closed verdict shape this module already uses everywhere.
+# ---------------------------------------------------------------------------
+
+def verify_execution_manifest_promotion_readiness(
+    canonical_path: str,
+    draft_path: str,
+    expected_source_sha256: str,
+    aggregation: "dict[str, Any] | None",
+    *,
+    allow_partial_manifest: bool = False,
+    require_render: bool = False,
+    backends: Sequence[RenderBackend] = KNOWN_BACKENDS,
+) -> dict[str, Any]:
+    """:func:`verify_promotion_readiness`, PLUS a scientific execution-
+    manifest completeness gate.
+
+    ``aggregation`` is the dict returned by
+    ``meridian.executor_contract.aggregate_worker_completions`` (or an
+    equivalent caller-built dict carrying at least ``{"ok": bool, "status":
+    str, "is_full_production": bool}``).
+
+    The manifest gate refuses promotion (``ready=False``) when EITHER:
+
+    * ``aggregation`` is missing, not a dict, or its own ``ok`` is falsy --
+      narrative notes or directory presence are never sufficient evidence
+      to promote a document derived from a scientific run.
+    * ``aggregation`` is ``ok`` but NOT ``is_full_production`` (a valid
+      failure-stage subset, per
+      ``executor_contract.aggregate_worker_completions``'s own
+      full-production-vs-subset distinction) and the caller did not pass
+      ``allow_partial_manifest=True`` -- promoting a document from a
+      PARTIAL run must be an explicit, opt-in choice, never the default.
+
+    All of :func:`verify_promotion_readiness`'s existing checks (source-
+    fingerprint equality, structural comparison, render verification) still
+    run UNCHANGED and independently gate readiness too -- this function
+    never weakens or bypasses any of them; it only ADDS the manifest check
+    on top, mirroring how ``check_promotion_preconditions`` (24f5146d) added
+    a base-hash gate without touching ``transactional_merge``'s own apply-
+    time checks.
+
+    Returns :func:`verify_promotion_readiness`'s own dict shape, plus one
+    additive ``manifest_check`` key
+    (``{"ok": bool, "status": str|None, "is_full_production": bool|None,
+    "accepted": bool}``). ``ready``/``reason`` reflect BOTH the base checks
+    AND the manifest gate (a semicolon-joined summary of every failing
+    check, matching this module's existing convention). Never raises.
+    """
+    manifest_reasons: list[str] = []
+    aggregation_ok = isinstance(aggregation, dict) and bool(aggregation.get("ok"))
+    if not aggregation_ok:
+        status = aggregation.get("status") if isinstance(aggregation, dict) else None
+        manifest_reasons.append(
+            f"execution-manifest aggregation is not ok (status={status!r}) -- "
+            "narrative notes or directory presence are never sufficient "
+            "evidence to promote a document derived from a scientific run"
+        )
+    elif not aggregation.get("is_full_production") and not allow_partial_manifest:
+        manifest_reasons.append(
+            f"execution-manifest aggregation status="
+            f"{aggregation.get('status')!r} is not full production data (a "
+            "valid failure-stage subset) -- pass allow_partial_manifest=True "
+            "to explicitly accept promoting from a partial run"
+        )
+
+    manifest_check: dict[str, Any] = {
+        "ok": aggregation_ok,
+        "status": aggregation.get("status") if isinstance(aggregation, dict) else None,
+        "is_full_production": (
+            aggregation.get("is_full_production") if isinstance(aggregation, dict) else None
+        ),
+        "accepted": not manifest_reasons,
+    }
+
+    base = verify_promotion_readiness(
+        canonical_path, draft_path, expected_source_sha256,
+        require_render=require_render, backends=backends,
+    )
+
+    ready = bool(base["ready"]) and not manifest_reasons
+    reasons: list[str] = []
+    if not base["ready"] and base.get("reason"):
+        reasons.append(base["reason"])
+    reasons.extend(manifest_reasons)
+
+    return {
+        **base,
+        "ready": ready,
+        "reason": None if ready else "; ".join(reasons),
+        "manifest_check": manifest_check,
     }

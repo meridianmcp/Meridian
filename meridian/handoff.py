@@ -1090,396 +1090,6 @@ async def load_handoff_correction(
 
 
 # ---------------------------------------------------------------------------
-# 9154aa9a — durable executor_report / planner_checkpoint lifecycle.
-#
-# handoff_corrections (above) is a correction to a HANDOFF BODY — it exists
-# for a blocked executor to hand a planner a targeted patch (pointer/scope
-# fix) to a specific rendered /goal. It is not a general-purpose "here is
-# what actually happened this session" report: it has no notion of test
-# results, tool availability, or a list of item outcomes, and it always
-# requires a source_handoff_id to anchor to.
-#
-# executor_reports (meridian.db.executor_reports) is the missing first-class
-# piece: a durable, NON-EXECUTABLE record an executor submits when it
-# finishes (or blocks on) a batch of work, and a planner reads
-# conversationally — what changed, what passed/failed, what's still open,
-# and what the executor recommends next. Corrections to a REPORT (a planner
-# asked a follow-up, or a later session discovered the report was wrong)
-# chain via parent_report_id — the parent is marked superseded, never
-# rewritten, exactly like handoff_corrections' own auto-supersede discipline.
-#
-# The two features compose rather than merge: accept_executor_report's
-# planner-promotion step calls the SAME generate_handoff renderer every
-# other handoff path uses (never a parallel rendering path), so an accepted
-# report's resulting handoff is indistinguishable, to a receiving executor,
-# from any other handoff — it is simply evidence that a planner reviewed
-# real reported outcomes before authorizing the next batch of executable
-# scope. Recording or correcting a report NEVER touches sprint_items itself
-# — only the explicit accept step renders a handoff, and even that never
-# creates/edits sprint items directly (per the sprint-item spec: "only the
-# planner promotion step may create or update executable sprint scope").
-# ---------------------------------------------------------------------------
-
-
-class ExecutorReportError(ValueError):
-    """Raised for an invalid executor-report / corrective-report request:
-    unknown project, an unresolved ``parent_report_id`` or cross-project/
-    cross-version correction lineage, sprint-item pointers in
-    ``item_outcomes`` that don't resolve on the live board, or an acceptance
-    attempt against a report carrying no reportable evidence. Subclasses
-    ``ValueError`` — same ``except ValueError`` convention as
-    :class:`HandoffCorrectionError`.
-    """
-
-
-def _unresolved_item_outcome_ids(
-    item_outcomes: "list[dict[str, Any]] | None",
-    item_index: dict[str, Any],
-) -> list[str]:
-    """Sorted, deduped ``item_id`` values in ``item_outcomes`` that are NOT
-    present in ``item_index`` (a :func:`board_snapshot.get_project_item_index`
-    result) — i.e. pointers a report claims to speak about but that don't
-    resolve to a real sprint item on this project/version's live board."""
-    return sorted({
-        str(o.get("item_id")) for o in (item_outcomes or [])
-        if o.get("item_id") and str(o.get("item_id")) not in item_index
-    })
-
-
-async def record_executor_report(
-    db: Any,
-    project_id: str,
-    *,
-    version: str | None = None,
-    session_id: str | None = None,
-    source_handoff_id: str | None = None,
-    item_outcomes: "list[dict[str, Any]] | None" = None,
-    changed_resources: "list[Any] | None" = None,
-    commits: "list[Any] | None" = None,
-    tests: "dict[str, Any] | None" = None,
-    tool_availability: "list[dict[str, Any]] | None" = None,
-    artifact_evidence: Any = None,
-    blockers: "list[dict[str, Any]] | None" = None,
-    unresolved_questions: "list[Any] | None" = None,
-    recommended_next_actions: "list[Any] | None" = None,
-    board_revision_hash: str | None = None,
-    parent_report_id: str | None = None,
-    correction_reason: str | None = None,
-    idempotency_key: str | None = None,
-    enrich_contract_hashes: bool = False,
-) -> dict[str, Any]:
-    """Record a durable, non-executable executor-to-planner completion report.
-
-    This is the data-capture half of the feature — it never renders or
-    invalidates a handoff and never touches ``sprint_items`` (see the module
-    docstring above); call :func:`accept_executor_report` separately for the
-    planner-promotion step that produces a fresh executable handoff FROM an
-    accepted report.
-
-    ``parent_report_id`` (correction lineage) — when given, this report
-    supersedes an earlier one without rewriting it. Fails closed
-    (:class:`ExecutorReportError`) when the parent:
-
-    * does not exist,
-    * belongs to a different project (cross-project correction), or
-    * is scoped to a different, non-null ``version`` than this report's own
-      non-null ``version`` (cross-version correction).
-
-    When ``version`` is omitted and a parent is given, the parent's own
-    version is inherited.
-
-    ``board_revision_hash`` — when omitted, captured automatically via
-    :func:`meridian.db.build_board_snapshot` for ``(project_id, version)`` at
-    record time, so a report always carries real, live evidence of what the
-    board looked like — never a caller-fabricated value the caller forgot to
-    (or couldn't) compute. Best-effort: a snapshot failure degrades to
-    ``None`` rather than blocking report capture.
-
-    Fails closed (:class:`ExecutorReportError`) when any ``item_outcomes``
-    entry's ``item_id`` does not resolve against
-    :func:`meridian.db.get_project_item_index` for this project/version —
-    a report's claimed outcomes must point at REAL sprint items, never an
-    unresolved/typo'd id that a planner would otherwise have no way to
-    detect from prose alone.
-
-    ``enrich_contract_hashes`` (opt-in, default False) — when True, every
-    ``item_outcomes`` entry missing its own ``contract_hash`` is enriched,
-    best-effort, with the live ``executor_contract`` hash for that item (see
-    :func:`meridian.executor_contract.summarize_contract_for_report`) — a
-    durable tie between a reported outcome and the EXACT executor_contract
-    the executor was working against. Never raises: a lookup failure simply
-    leaves that entry's ``contract_hash`` unset.
-    """
-    project = await db_module.get_project(db, project_id)
-    if project is None:
-        raise ExecutorReportError(f"project {project_id!r} not found")
-
-    if source_handoff_id:
-        source = await db_module.get_handoff(db, source_handoff_id)
-        if source is None or source.get("project_id") != project_id:
-            raise ExecutorReportError(
-                f"source_handoff_id {source_handoff_id!r} does not name an "
-                f"existing handoff belonging to project {project_id!r}"
-            )
-
-    if parent_report_id:
-        parent = await db_module.get_executor_report(db, parent_report_id)
-        if parent is None:
-            raise ExecutorReportError(
-                f"parent_report_id {parent_report_id!r} not found — a "
-                "correction must reference a real, previously recorded report"
-            )
-        if parent.get("project_id") != project_id:
-            raise ExecutorReportError(
-                f"parent report {parent_report_id!r} belongs to project "
-                f"{parent.get('project_id')!r}, not {project_id!r} — "
-                "refusing a cross-project correction"
-            )
-        parent_version = parent.get("version")
-        if version and parent_version and version != parent_version:
-            raise ExecutorReportError(
-                f"parent report {parent_report_id!r} is scoped to version "
-                f"{parent_version!r}, not {version!r} — refusing a "
-                "cross-version correction"
-            )
-        if version is None:
-            version = parent_version
-
-    if board_revision_hash is None:
-        try:
-            snapshot = await db_module.build_board_snapshot(db, project_id, version=version)
-            board_revision_hash = snapshot.get("revision_hash")
-        except Exception:  # noqa: BLE001 — best-effort; never block report capture
-            board_revision_hash = None
-
-    try:
-        item_index = await db_module.get_project_item_index(db, project_id, version=version)
-    except Exception:  # noqa: BLE001 — degrade to "nothing resolves" rather than crash
-        item_index = {}
-    unresolved = _unresolved_item_outcome_ids(item_outcomes, item_index)
-    if unresolved:
-        raise ExecutorReportError(
-            f"item_outcomes reference sprint-item id(s) not present on this "
-            f"project/version's live board: {unresolved} — a report's item "
-            "outcomes must point at real, resolvable sprint items"
-        )
-
-    outcomes = item_outcomes or []
-    if enrich_contract_hashes and outcomes:
-        from . import executor_contract as executor_contract_module  # noqa: PLC0415
-        enriched: list[dict[str, Any]] = []
-        for outcome in outcomes:
-            o = dict(outcome)
-            if not o.get("contract_hash") and o.get("item_id"):
-                try:
-                    summary = await executor_contract_module.summarize_contract_for_report(
-                        db, project_id, o["item_id"],
-                    )
-                except Exception:  # noqa: BLE001 — best-effort enrichment only
-                    summary = None
-                if summary:
-                    o["contract_hash"] = summary.get("contract_hash")
-            enriched.append(o)
-        outcomes = enriched
-
-    return await db_module.create_executor_report(
-        db, project_id,
-        version=version, session_id=session_id, source_handoff_id=source_handoff_id,
-        board_revision_hash=board_revision_hash,
-        item_outcomes=outcomes, changed_resources=changed_resources, commits=commits,
-        tests=tests, tool_availability=tool_availability,
-        artifact_evidence=artifact_evidence, blockers=blockers,
-        unresolved_questions=unresolved_questions,
-        recommended_next_actions=recommended_next_actions,
-        parent_report_id=parent_report_id, correction_reason=correction_reason,
-        idempotency_key=idempotency_key,
-    )
-
-
-async def accept_executor_report(
-    db: Any,
-    project_id: str,
-    report_id: str,
-    output_dir: str,
-    *,
-    session_id: str | None = None,
-    mode: str = "full",
-    accepted_by: str | None = None,
-    **generate_handoff_kwargs: Any,
-) -> dict[str, Any]:
-    """The ONE planner-promotion step: turn an accepted executor report into
-    a fresh, executable handoff.
-
-    Per the sprint-item spec, this is the ONLY path that may produce a new
-    executable handoff from a report — :func:`record_executor_report` itself
-    never does. Steps, in order:
-
-    1. Load the report; fail closed (:class:`ExecutorReportError`) if it
-       doesn't exist, belongs to a different project, or has status
-       ``superseded`` (a correction replaced it — accept the latest report
-       in its lineage instead, via ``list_executor_reports(parent_report_id=...)``).
-    2. **Idempotent retry**: if this report was already accepted
-       (``accepted_handoff_id`` set), return that same linkage again without
-       generating a second handoff for the same acceptance.
-    3. **Missing-evidence gate**: refuse a report with BOTH empty
-       ``item_outcomes`` and empty ``blockers`` — nothing was reported, so
-       there is nothing to promote.
-    4. **Unresolved-pointer gate**: re-validate every ``item_outcomes`` entry
-       against a FRESH :func:`meridian.db.get_project_item_index` (the board
-       may have moved since the report was recorded) — fails closed on any
-       id that no longer resolves.
-    5. **Rebuild from live state, never from the report's own stored text**:
-       calls :func:`generate_handoff` (the SAME renderer every other handoff
-       path uses) scoped to the report's own ``version`` — which applies its
-       own existing stale-``depends_on`` fail-closed gate
-       (:class:`HandoffStaleReferenceError`) against the live board.
-    6. Stamps the report ``accepted`` with the new handoff's id
-       (:func:`meridian.db.mark_executor_report_accepted`).
-
-    The new handoff's id is recovered via a before/after id-diff against
-    ``get_handoffs`` (never by re-querying "the latest handoff", which is
-    only second-granularity-ordered on SQLite and can return the wrong row —
-    the same b7f41c73-family gotcha :func:`regenerate_handoff_correction`
-    documents).
-    """
-    report = await db_module.get_executor_report(db, report_id)
-    if report is None:
-        raise ExecutorReportError(f"executor report {report_id!r} not found")
-    if report.get("project_id") != project_id:
-        raise ExecutorReportError(
-            f"executor report {report_id!r} belongs to a different project"
-        )
-    if report.get("status") == "superseded":
-        raise ExecutorReportError(
-            f"executor report {report_id!r} was superseded by a correction "
-            "— accept the latest report in its lineage instead (see "
-            "list_executor_reports(parent_report_id=...))"
-        )
-    if report.get("accepted_handoff_id"):
-        return {
-            "report": report,
-            "already_accepted": True,
-            "new_handoff_id": report.get("accepted_handoff_id"),
-            "new_handoff_path": None,
-            "new_handoff_content": None,
-            "amended": None,
-        }
-
-    outcomes = report.get("item_outcomes") or []
-    blockers = report.get("blockers") or []
-    if not outcomes and not blockers:
-        raise ExecutorReportError(
-            f"executor report {report_id!r} carries no item_outcomes and no "
-            "blockers — refusing to promote a report with no reportable "
-            "evidence into an executable handoff"
-        )
-
-    version = report.get("version")
-    try:
-        item_index = await db_module.get_project_item_index(db, project_id, version=version)
-    except Exception:  # noqa: BLE001
-        item_index = {}
-    unresolved = _unresolved_item_outcome_ids(outcomes, item_index)
-    if unresolved:
-        raise ExecutorReportError(
-            f"executor report {report_id!r} references sprint-item id(s) no "
-            f"longer resolvable on this project/version's live board: "
-            f"{unresolved}"
-        )
-
-    # edd9c54b interaction (see regenerate_handoff_correction's own comment
-    # above): pop pending_goal first so generate_handoff lands on its
-    # fresh-insert path rather than amending an unrelated prior row in place.
-    try:
-        await db_module.pop_pending_goal(db, project_id)
-    except Exception:  # noqa: BLE001
-        pass
-
-    _before_ids = {
-        r["id"] for r in await db_module.get_handoffs(db, project_id, limit=10)
-    }
-    path, content, amended = await generate_handoff(
-        db, project_id, output_dir,
-        session_id=session_id, version=version, mode=mode,
-        **generate_handoff_kwargs,
-    )
-    _after_rows = await db_module.get_handoffs(db, project_id, limit=10)
-    new_handoff = next(
-        (r for r in _after_rows if r["id"] not in _before_ids),
-        _after_rows[0] if _after_rows else None,
-    )
-    new_handoff_id = new_handoff.get("id") if new_handoff else None
-
-    updated_report = await db_module.mark_executor_report_accepted(
-        db, report_id,
-        accepted_handoff_id=new_handoff_id,
-        accepted_by=accepted_by or session_id,
-    )
-
-    return {
-        "report": updated_report,
-        "already_accepted": False,
-        "new_handoff_id": new_handoff_id,
-        "new_handoff_path": path,
-        "new_handoff_content": content,
-        "amended": amended,
-    }
-
-
-def _render_executor_report_planner_section(
-    latest_report: "dict[str, Any] | None",
-    corrections: "list[dict[str, Any]]",
-) -> list[str]:
-    """Pure renderer: the '## Latest executor report' planner-handoff section.
-
-    Deliberately informational-only — every line here is read-only evidence
-    for the planner to review, never an instruction the planner (or a
-    downstream automated reader) could mistake for executable /goal content.
-    Returns an empty list when there is nothing to report (a project with no
-    executor reports yet), so callers can splice this in unconditionally.
-    """
-    if latest_report is None:
-        return []
-    lines = ["## Latest executor report (informational — not executable)", ""]
-    rid = (latest_report.get("id") or "")[:8]
-    status = latest_report.get("status", "?")
-    ver = latest_report.get("version") or "(unscoped)"
-    lines.append(f"- Report `{rid}` — status **{status}**, version `{ver}`")
-    outcomes = latest_report.get("item_outcomes") or []
-    blockers = latest_report.get("blockers") or []
-    lines.append(f"- {len(outcomes)} item outcome(s), {len(blockers)} blocker(s)")
-    tests = latest_report.get("tests")
-    if isinstance(tests, dict) and tests:
-        lines.append(
-            f"- Tests: exit_code={tests.get('exit_code')} "
-            f"passed={tests.get('passed')} failed={tests.get('failed')}"
-        )
-    unresolved_qs = latest_report.get("unresolved_questions") or []
-    for q in unresolved_qs[:5]:
-        lines.append(f"- Open question: {_clip_body(q, 150)}")
-    next_actions = latest_report.get("recommended_next_actions") or []
-    for a in next_actions[:5]:
-        lines.append(f"- Recommended next action: {_clip_body(a, 150)}")
-    if not latest_report.get("accepted_handoff_id"):
-        lines.append(
-            "- **Awaiting planner review** — call "
-            "`accept_executor_report(...)` to promote this report to a "
-            "fresh executable handoff, or record a correction via "
-            "`record_executor_report(parent_report_id=...)` first."
-        )
-    if corrections:
-        lines.append("")
-        lines.append("### Correction lineage (superseded by the report above)")
-        for c in corrections[:5]:
-            cid = (c.get("id") or "")[:8]
-            cstatus = c.get("status", "?")
-            reason = _clip_body(c.get("correction_reason"), 120)
-            lines.append(f"- `{cid}` [{cstatus}] {reason}")
-    lines.append("")
-    return lines
-
-
-# ---------------------------------------------------------------------------
 # amend_handoff (63b602ff) — explicit, scoped handoff amendment.
 #
 # generate_handoff's own amend-vs-fresh detection (edd9c54b, further below in
@@ -2964,6 +2574,72 @@ def _build_execution_policy_clause(policy: dict[str, Any] | None) -> str:
     )
 
 
+def _build_scheduler_lease_clause(parallel_groups: "dict[str, Any] | None") -> str:
+    """0d0cada7 — lease-local scheduler diagnostics surfaced directly in the
+    /goal, closing the gap the 2026-08-05 v0.2.6 incident exposed: an
+    executor holding only ONE genuinely in_progress item saw its remaining
+    disjoint, dependency-satisfied backlog as inexplicably stuck and emitted
+    a native clarification instead of recording a Meridian blocker or
+    recomputing the residual work.
+
+    Two independent pieces, both additive fields on the SAME
+    ``get_parallelizable_groups()`` dict already threaded into
+    :func:`_build_quick_start_goal` as ``parallel_groups`` (no new call, no
+    new parameter):
+
+    ``<plan_generation>`` — the live-board digest an executor can hand back
+    to ``claim_parallel_batch(..., plan_generation=...)`` so a stale wave
+    plan is rejected/refreshed rather than treated as immutable forever.
+
+    ``<resource_contention>`` — any item that IS dependency-satisfied but
+    can't be claimed right now because another live session holds one of its
+    declared resources (``parallel_groups["resource_blocked"]``). This is
+    ordinary lock contention, not a real blocker: the guidance explicitly
+    tells the executor to poll with the returned ``retry_after`` bound and
+    recompute, and to reserve ``request_hitl`` for a genuine human decision,
+    a stale-lease ownership ambiguity, or a destructive action — never for
+    routine contention.
+
+    Returns ``""`` when ``parallel_groups`` is falsy or carries neither
+    field (every call site/test that predates this item, or a hand-built
+    dict from an older code path) — existing output is byte-for-byte
+    unchanged in that case.
+    """
+    if not parallel_groups:
+        return ""
+    _gen = parallel_groups.get("plan_generation")
+    _blocked = parallel_groups.get("resource_blocked") or []
+    if not _gen and not _blocked:
+        return ""
+    out = ""
+    if _gen:
+        out += f'\n<plan_generation value="{_xml_escape(str(_gen), {chr(34): "&quot;"})}" />'
+    if _blocked:
+        _lines = "; ".join(
+            f"{b.get('id')} waiting on {b.get('resource')} held by session "
+            f"{str(b.get('holder_session_id') or 'unknown')[:8]} "
+            f"(retry in ~{b.get('retry_after')}s)"
+            for b in _blocked
+        )
+        out += (
+            "\n<resource_contention>"
+            + _xml_escape(
+                "These items are dependency-satisfied but a resource they declare "
+                "is currently held by another LIVE session -- this is ordinary "
+                "lock contention, not a genuine blocker. Poll with bounded "
+                "backoff (use the retry_after seconds below) and recompute via "
+                "get_parallelizable_groups; do not open a native clarification "
+                "for this. Only call request_hitl for a genuine human decision, "
+                "a stale-lease ownership ambiguity, or a destructive action -- "
+                'and even then pass kind="scheduler_blocker" with '
+                "blocker_context so it is a tracked, structured record rather "
+                f"than an untracked native stop. Waiting: {_lines}"
+            )
+            + "</resource_contention>"
+        )
+    return out
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -2987,8 +2663,21 @@ def _build_quick_start_goal(
     completion_criteria_override: str | None = None,
     execution_policy: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
+    selected_scope: "dict[str, Any] | None" = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
+
+    ``selected_scope`` (cffb9323) — the dict :func:`_resolve_selected_item_scope`
+    returns, or ``None`` (the default — every pre-existing call site) when the
+    caller never opted into an explicit ``selected_item_ids`` scope. When
+    given, a ``<selected_item_scope>`` tag (see
+    :func:`_build_selected_scope_clause`) states the exact selected ids and
+    dependency-closure so the receiving executor session knows precisely what
+    is (and is not) in scope for this handoff — the actual restriction of
+    ``pending_sprint_items`` to that closure happens in the caller (every
+    mode narrows its own item list BEFORE calling this function), so this
+    parameter only controls the DECLARATION rendered alongside whatever items
+    were already passed in.
 
     ``force_included_ids`` (0a65f5cc) — ids exempted from the
     backburner/deferred exclusion below (see ``_is_backburner_sprint_item``)
@@ -3313,7 +3002,8 @@ def _build_quick_start_goal(
         return (
             f"{_loop_prefix}/goal\n"
             "<executor_directive>Verify remaining work is complete.</executor_directive>"
-            f"{_policy_clause}\n"
+            f"{_policy_clause}"
+            f"{_build_selected_scope_clause(selected_scope)}\n"
             # 0d5453bc — explicit single-run wording: full suite runs once,
             # at the end of the megasprint, not per item.
             f"<completion_criteria>{_xml_escape(_empty_completion)}"
@@ -3526,7 +3216,8 @@ def _build_quick_start_goal(
     return (
         f"{_loop_prefix}/goal\n"
         f"<executor_directive>{_xml_escape(directive)}</executor_directive>"
-        f"{_policy_clause}\n"
+        f"{_policy_clause}"
+        f"{_build_selected_scope_clause(selected_scope)}\n"
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
         # board query keeps a resumed session honest about mid-run injections
         # and already-claimed items instead of trusting a stale list.
@@ -3633,6 +3324,11 @@ def _build_quick_start_goal(
         # item_artifact_pointer_findings section exactly for the same
         # request.
         + _build_artifact_pointer_findings_clause(_all_pending_for_tool_requirements)
+        # 0d0cada7 — lease-local scheduler diagnostics: plan_generation (for
+        # claim_parallel_batch's stale-plan check) + any resource_blocked
+        # items with poll/backoff guidance, straight from the SAME
+        # parallel_groups dict already threaded through this function.
+        + _build_scheduler_lease_clause(parallel_groups)
         + f"{_manual_note}"
         f"{_backburner_note}"
         f"{_excluded_unprospected_note}"
@@ -6337,6 +6033,7 @@ def _render_custom_hook_files(hook: dict[str, Any]) -> dict[str, str]:
     event = hook["event"]
     matcher = hook.get("matcher") or ""
     blocking = bool(hook.get("blocking", 1))
+    is_stop = event == "Stop"
     header_bits = [f"event={event}"]
     if matcher:
         header_bits.append(f"matcher={matcher}")
@@ -6348,13 +6045,41 @@ def _render_custom_hook_files(hook: dict[str, Any]) -> dict[str, str]:
     )
     out: dict[str, str] = {}
 
+    # b4f4627f — every Stop-event custom hook (not just sprint_guard, and not
+    # just the hardcoded orphan_reaper one) gets the same infinite-retrigger
+    # guard sprint_guard.{sh,ps1} already use: Claude Code sets
+    # stop_hook_active=true on a Stop event that was itself caused by a
+    # PREVIOUS Stop hook's own exit-2 block, so any Stop hook that doesn't
+    # check it can retrigger forever. PreToolUse/PostToolUse hooks are
+    # unaffected (that field is Stop-specific) and keep the exact prior
+    # rendering. The original stdin payload is consumed to check the flag, so
+    # it's re-exposed to the user's script via $MERIDIAN_HOOK_STDIN /
+    # $env:MERIDIAN_HOOK_STDIN — a documented, explicit substitute for the raw
+    # re-read the script would otherwise lose.
+    stop_guard_sh = (
+        'payload="$(cat 2>/dev/null || true)"\n'
+        'if printf \'%s\' "$payload" | grep -Eq '
+        '\'"stop_hook_active"[[:space:]]*:[[:space:]]*true\'; then\n'
+        '  exit 0\n'
+        'fi\n'
+        'export MERIDIAN_HOOK_STDIN="$payload"\n'
+    ) if is_stop else ""
+    stop_guard_ps1 = (
+        "$_meridianRawStdin = [Console]::In.ReadToEnd()\n"
+        "try { $_meridianPayload = $_meridianRawStdin | ConvertFrom-Json } "
+        "catch { $_meridianPayload = $null }\n"
+        "if ($_meridianPayload -and $_meridianPayload.stop_hook_active -eq $true) { exit 0 }\n"
+        "$env:MERIDIAN_HOOK_STDIN = $_meridianRawStdin\n"
+    ) if is_stop else ""
+
     script_sh = (hook.get("script_sh") or "").strip("\n")
     if script_sh:
         if blocking:
-            out[f"{slug}.sh"] = header + script_sh + "\n"
+            out[f"{slug}.sh"] = header + stop_guard_sh + script_sh + "\n"
         else:
             out[f"{slug}.sh"] = (
                 header
+                + stop_guard_sh
                 + "set -uo pipefail\n"
                 + "(\n"
                 + script_sh + "\n"
@@ -6371,12 +6096,13 @@ def _render_custom_hook_files(hook: dict[str, Any]) -> dict[str, str]:
     script_ps1 = (hook.get("script_ps1") or "").strip("\n")
     if script_ps1:
         if blocking:
-            out[f"{slug}.ps1"] = header + script_ps1 + "\n"
+            out[f"{slug}.ps1"] = header + stop_guard_ps1 + script_ps1 + "\n"
         else:
             body_name = f"{slug}_body.ps1"
             out[body_name] = header + script_ps1 + "\n"
             out[f"{slug}.ps1"] = (
                 header
+                + stop_guard_ps1
                 + "$ErrorActionPreference = 'SilentlyContinue'\n"
                 + f'& powershell -NoProfile -NonInteractive -File "$PSScriptRoot\\{body_name}"\n'
                 + "$_meridianHookRc = $LASTEXITCODE\n"
@@ -6390,6 +6116,47 @@ def _render_custom_hook_files(hook: dict[str, Any]) -> dict[str, str]:
     return out
 
 
+def custom_hook_artifact_filenames(slug: str) -> tuple[str, str, str]:
+    """b4f4627f — the (up to) 3 filenames ``_render_custom_hook_files`` can
+    produce for one hook's ``slug``, regardless of its CURRENT blocking /
+    script_ps1 configuration: ``{slug}.sh``, ``{slug}.ps1``, and the
+    advisory-mode ``.ps1`` wrapper's companion ``{slug}_body.ps1``. Returned
+    as a fixed superset (rather than re-derived from the hook's current row)
+    so a config change (e.g. blocking True -> False, or removing script_ps1)
+    can never leave an orphaned file behind from the PREVIOUS configuration —
+    mirrors ``orphan_reaper.ORPHAN_REAPER_HOOK_FILENAMES``'s same
+    fixed-superset approach for its one hardcoded slug.
+    """
+    return (f"{slug}.sh", f"{slug}.ps1", f"{slug}_body.ps1")
+
+
+def remove_custom_hook_artifacts(hooks_dir: "Path | str", slug: str) -> list[str]:
+    """b4f4627f — delete any already-written files for one custom hook's
+    ``slug`` from *hooks_dir* (a repo's ``.claude/hooks`` dir) immediately,
+    generalizing ``orphan_reaper.remove_orphan_reaper_artifacts`` to any
+    user-defined hook rather than just the one hardcoded orphan_reaper slug.
+    Best-effort, pure filesystem cleanup: never raises, never touches the DB,
+    never touches anything outside *hooks_dir* itself. Returns the filenames
+    actually removed (empty list if none were present or *slug* is falsy).
+    """
+    removed: list[str] = []
+    if not slug:
+        return removed
+    try:
+        base = Path(hooks_dir)
+    except Exception:  # noqa: BLE001 — malformed path input
+        return removed
+    for filename in custom_hook_artifact_filenames(slug):
+        try:
+            path = base / filename
+            if path.exists():
+                path.unlink()
+                removed.append(filename)
+        except Exception:  # noqa: BLE001 — one bad file must not abort the rest
+            continue
+    return removed
+
+
 async def _write_custom_hooks(db: aiosqlite.Connection, project_id: str, hooks_dir: Path) -> None:
     """273287cb — (re)write every enabled ``custom_hooks`` row for ``project_id``
     into ``hooks_dir``. Called from ``_write_sprint_guard_hooks`` under the same
@@ -6397,13 +6164,28 @@ async def _write_custom_hooks(db: aiosqlite.Connection, project_id: str, hooks_d
     Never touches ``sprint_guard.{sh,ps1}`` — ``add_custom_hook`` already
     rejects the reserved ``sprint_guard`` slug, and this is a second,
     defense-in-depth skip in case a row somehow bypassed that check.
+
+    b4f4627f — ALSO reconciles disabled hooks: a hook that currently exists
+    with ``enabled=0`` has any stale files from a PRIOR enabled write removed
+    (``remove_custom_hook_artifacts``) instead of being silently skipped
+    forever, which was the only prior behavior (see
+    ``db.hooks.delete_custom_hook``'s docstring for the still-unchanged
+    delete-path gap this does not touch — a deleted row isn't visited here at
+    all). This is a backstop convergence pass on every ``generate_handoff``;
+    ``update_custom_hook`` (mcp/handlers/project_tools.py) additionally does
+    the same removal immediately when it flips a hook's ``enabled`` flag off,
+    rather than waiting for the next handoff.
     """
-    hooks = await db_module.get_custom_hooks(db, project_id, enabled_only=True)
-    for hook in hooks:
-        if hook.get("slug") in db_module._RESERVED_HOOK_SLUGS:  # noqa: SLF001
+    all_hooks = await db_module.get_custom_hooks(db, project_id)
+    for hook in all_hooks:
+        slug = hook.get("slug")
+        if slug in db_module._RESERVED_HOOK_SLUGS:  # noqa: SLF001
             continue
-        for filename, content in _render_custom_hook_files(hook).items():
-            (hooks_dir / filename).write_text(content, encoding="utf-8")
+        if hook.get("enabled"):
+            for filename, content in _render_custom_hook_files(hook).items():
+                (hooks_dir / filename).write_text(content, encoding="utf-8")
+        else:
+            remove_custom_hook_artifacts(hooks_dir, slug)
 
 
 async def _write_sprint_guard_hooks(
@@ -6850,7 +6632,6 @@ async def build_continuation_manifest(
     version: str | None = None,
     source: str | None = None,
     record_revision: bool = True,
-    restrict_to_ids: "set[str] | None" = None,
 ) -> dict[str, Any]:
     """836ca1d5 — the shared, deterministic continuation-manifest serializer.
 
@@ -6915,17 +6696,6 @@ async def build_continuation_manifest(
         are already rendered in the delta body's own "Pending:" section:
         duplicating them here would defeat the point of a compact delta.
 
-    ``restrict_to_ids`` (94f48e4d) — optional set of ids to further filter
-    ``pending_item_ids`` down to (an intersection, not a re-query). Used by
-    ``generate_handoff(mode='delta', selected_item_ids=...)`` so this
-    manifest's own pending-id list stays consistent with a scoped delta's
-    "Pending:" section instead of silently listing ids the caller explicitly
-    asked NOT to see. Deliberately does NOT affect ``item_count``,
-    ``revision_hash``, or ``revision_counter`` — those describe the REAL,
-    canonical board state for staleness detection (this manifest's actual
-    purpose) and must stay accurate regardless of any one handoff call's
-    scoping choices; only the informational id list is filtered.
-
     Best-effort by convention (matches every other enrichment step in
     ``generate_handoff``): callers should wrap this in try/except and treat a
     failure as "no manifest for this call" rather than letting it break
@@ -6976,8 +6746,6 @@ async def build_continuation_manifest(
         it.get("id") for it in snapshot["items"]
         if (it.get("status") or "") in ("pending", "todo")
     ]
-    if restrict_to_ids is not None:
-        pending_ids = [pid for pid in pending_ids if pid in restrict_to_ids]
 
     return {
         "schema_version": _CONTINUATION_MANIFEST_SCHEMA_VERSION,
@@ -7131,6 +6899,82 @@ async def build_docx_integrity_gate_for_handoff(
         )
     except Exception:  # noqa: BLE001 — docx integrity gate is best-effort
         return None
+
+
+# ---------------------------------------------------------------------------
+# 24f5146d — docx promotion base-hash readiness for generate_handoff.
+#
+# KNOWN LIMITATIONS (documented honestly rather than silently claiming full
+# coverage, per this item's own explicit priority to leave a clear note over
+# false completeness):
+#   * Only checks the FIRST target of each item's planned_output — a
+#     multi-target planned_output is not fully covered.
+#   * A relative target uri is resolved against ``output_dir`` (the same
+#     directory generate_handoff itself writes into) as a best-effort guess
+#     at the real on-disk location; a project whose docx targets live
+#     elsewhere needs a different resolution strategy this function does not
+#     attempt.
+#   * Only reachable from ``mode in {"full", "delta"}`` (see
+#     ``generate_handoff``'s own ``promotion_readiness`` docstring) — the
+#     starter/compact/goal paths return before pending_sprint_items reaches
+#     its final form and are NOT wired to this function in this pass.
+# ---------------------------------------------------------------------------
+
+async def build_promotion_readiness_for_handoff(
+    db: Any,
+    project_id: str,
+    pending_items: "list[dict[str, Any]] | None",
+    *,
+    output_dir: str,
+    max_checked_items: int = 20,
+) -> dict[str, Any]:
+    """24f5146d — best-effort docx promotion base-hash readiness for a handoff.
+
+    For every pending item that declares
+    ``planned_output.promotion.base_sha256``
+    (:func:`meridian.artifact_declaration.effective_promotion`), resolves
+    that item's first ``planned_output`` target uri relative to
+    ``output_dir`` and runs
+    :func:`meridian.artifact_declaration.check_promotion_preconditions`
+    against it. Returns ``{"checked": [...], "unresolved_count": int}`` where
+    each ``checked`` entry is
+    ``{"item_id", "target_docx_path", **check_promotion_preconditions(...)}``.
+
+    Bounded to ``max_checked_items`` (mirrors ``docx_integrity_gate``'s own
+    ``_MAX_CHECKED_ARTIFACTS`` discipline) so a large board never turns this
+    best-effort enrichment into dozens of filesystem hashes. Never raises —
+    an individual item's check failure is skipped, not fatal to the whole
+    result; the caller (``generate_handoff``) wraps this in its own
+    try/except regardless, matching every other best-effort field here.
+    """
+    checked: list[dict[str, Any]] = []
+    unresolved = 0
+    for item in (pending_items or [])[:max_checked_items]:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        try:
+            promotion = artifact_declaration_module.effective_promotion(item)
+        except Exception:  # noqa: BLE001 — a malformed declaration is skipped, not fatal
+            continue
+        if not promotion or not promotion.get("base_sha256"):
+            continue
+        try:
+            planned = artifact_declaration_module.effective_planned_output(item)
+            targets = (planned or {}).get("targets") or []
+            if not targets or not isinstance(targets[0], dict):
+                continue
+            target_uri = targets[0].get("uri")
+            if not target_uri:
+                continue
+            target_path = os.path.join(output_dir, target_uri)
+            outcome = artifact_declaration_module.check_promotion_preconditions(item, target_path)
+        except Exception:  # noqa: BLE001 — one item's check failure skips just that item
+            continue
+        entry = {"item_id": item["id"], **outcome}
+        checked.append(entry)
+        if not outcome.get("ok"):
+            unresolved += 1
+    return {"checked": checked, "unresolved_count": unresolved}
 
 
 # ---------------------------------------------------------------------------
@@ -7389,6 +7233,52 @@ class HandoffStaleReferenceError(ValueError):
         )
 
 
+class HandoffSelectionError(ValueError):
+    """cffb9323 — raised by generate_handoff BEFORE any mode (starter/compact,
+    goal, full, delta) renders, persists, or mints a goal_token, when a caller
+    passed an explicit ``selected_item_ids`` scope and at least one requested
+    id is missing, belongs to a different project, belongs to a different
+    sprint-version bucket (when this call is version-scoped), or is not
+    genuinely claimable (already ``in_progress`` under another session, or a
+    terminal status like ``done``/``failed``/``skipped``).
+
+    This is the 2026-08-05 gap this item closes: ``generate_handoff(...,
+    force_include_ids=[...])`` never had an INCLUDE-ONLY filter at all — every
+    mode still emitted the entire eligible version backlog, so a supposedly
+    isolated parallel-follow-up handoff could overlap an active wave/batch a
+    sibling session already owns. ``selected_item_ids`` closes that gap, and
+    — like :class:`HandoffStaleReferenceError` — fails CLOSED rather than
+    silently widening back to the unfiltered backlog: nothing is rendered,
+    written to disk, or persisted for a call that raises this. A caller that
+    never passes ``selected_item_ids`` (every pre-existing call site) is
+    completely unaffected.
+
+    ``rejected`` mirrors ``force_include_rejected``'s shape — each entry is
+    ``{"id": ..., "reason": ...}`` with ``reason`` one of ``not_found``,
+    ``wrong_project``, ``wrong_version``, ``in_progress``, ``not_pending``.
+    """
+
+    def __init__(
+        self,
+        project_id: str,
+        requested_ids: list[str],
+        rejected: list[dict[str, Any]],
+    ):
+        self.project_id = project_id
+        self.requested_ids = list(requested_ids)
+        self.rejected = list(rejected)
+        self.code = "SELECTION_REJECTED"
+        detail = "; ".join(
+            f"{r.get('id')} ({r.get('reason')})" for r in rejected
+        )
+        super().__init__(
+            f"generate_handoff refused for project {project_id!r}: "
+            f"selected_item_ids contains {len(rejected)} invalid id(s) — "
+            f"{detail}. Fix or drop the invalid id(s); this call will NOT "
+            "silently widen to the unfiltered backlog."
+        )
+
+
 def _finalize_capability_status(
     capability_status: dict[str, Any],
     evidence_status: "dict[str, Any] | None",
@@ -7550,77 +7440,81 @@ async def _resolve_force_included_items(
     return pending_sprint_items
 
 
-class HandoffSelectionError(ValueError):
-    """Raised by ``generate_handoff`` (and its goal-mode helper) when
-    ``selected_item_ids`` is given and at least one requested id fails
-    validation.
-
-    Unlike ``force_include_ids`` (which silently drops an invalid id into
-    ``force_include_rejected`` and still renders a handoff), a scoped
-    ``selected_item_ids`` request defines the ENTIRE returned scope — a
-    caller explicitly asking for only these items' dependency closure — so
-    any invalid id fails the whole call closed rather than silently
-    returning a narrower or broader scope than what was actually requested.
-    Nothing is rendered, written to disk, or persisted for this call
-    (same "refuse outright" contract as :class:`HandoffEvidenceRequired`).
-
-    ``rejected`` carries one entry per invalid id, reusing the exact same
-    reason vocabulary as :func:`_resolve_force_included_items` — ``not_found``,
-    ``wrong_project``, ``wrong_version``, ``not_pending`` (with a ``status``
-    field distinguishing done/skipped/in_progress/etc.) — so a caller can
-    render the same class of error message for either mechanism.
-    """
-
-    def __init__(self, rejected: list[dict[str, Any]]):
-        self.rejected = rejected
-        ids = ", ".join(str(r.get("id")) for r in rejected)
-        super().__init__(
-            f"generate_handoff refused (selected_item_ids): invalid id(s) {ids}"
-        )
+# ---------------------------------------------------------------------------
+# cffb9323 — explicit item-scoped executor handoffs. See HandoffSelectionError
+# for the incident this closes: generate_handoff had no INCLUDE-ONLY item/
+# group filter, so a supposedly isolated parallel-follow-up handoff could
+# overlap an active wave/batch a sibling session already owns.
+# ---------------------------------------------------------------------------
 
 
-async def _resolve_selected_item_ids(
+async def _resolve_selected_item_scope(
     db: Any,
     project_id: str,
     selected_item_ids: "list[str] | None",
-    pending_sprint_items: list[dict[str, Any]],
     *,
     effective_version: "str | None",
-) -> list[dict[str, Any]]:
-    """(94f48e4d) Restrict ``pending_sprint_items`` to exactly the items named
-    by ``selected_item_ids`` plus their still-open ``depends_on`` closure.
+) -> "dict[str, Any] | None":
+    """cffb9323 — validate + dependency-close an explicit ``selected_item_ids``
+    scope for ONE ``generate_handoff`` call, shared by every executable mode
+    (full/delta, starter/compact, goal) so they cannot drift out of agreement.
 
-    Returns ``pending_sprint_items`` UNCHANGED when ``selected_item_ids`` is
-    falsy — this is an opt-in scoping mechanism with zero behavior change
-    for every existing caller that never passes it.
+    Returns ``None`` when ``selected_item_ids`` is falsy — scope selection is
+    OFF, and every pre-existing caller sees zero behaviour change (the exact
+    same purely-additive contract ``force_include_ids``/``version`` use).
 
-    Fail-closed (raises :class:`HandoffSelectionError`) when ANY requested id
-    is unknown, belongs to a different project, belongs to a different
-    version than ``effective_version`` (when one is in effect), or is not
-    genuinely ``todo``/``pending`` — covers done, skipped, in_progress, and
-    any other terminal or claimed status. See the exception's own docstring
-    for why this fails the WHOLE call rather than degrading per-id the way
-    ``force_include_ids`` does.
+    When given, EVERY requested id is validated exactly like
+    :func:`_resolve_force_included_items` validates ``force_include_ids`` —
+    same reason vocabulary (``not_found``, ``wrong_project``,
+    ``wrong_version``) — PLUS two claimability reasons specific to a NARROW-
+    the-scope selector (as opposed to force_include_ids' WIDEN-the-scope
+    override, where a non-pending id is merely skipped): ``in_progress`` (the
+    item is already claimed by another session — pulling it into an
+    "isolated" scope would defeat the entire point of this feature) and
+    ``not_pending`` (any other terminal status: done/failed/skipped/pushed).
 
-    Dependency closure: each valid selected item's ``depends_on`` chain is
-    walked to the root (cycle-safe — mirrors the chain walk in
-    :func:`meridian.db.sprint_items.get_planning_brief`); any STILL-OPEN
-    (todo/pending) ancestor not already selected is added to the closure
-    too, so an executor handed this scoped handoff sees every prerequisite
-    it still needs to do, not just the item(s) it explicitly asked for. An
-    ancestor that is already done/in_progress/etc. is left out of the
-    returned list (nothing further to do there) and does NOT itself cause a
-    rejection — only the explicitly requested ids are validated that
-    strictly.
+    UNLIKE ``force_include_ids`` (which records rejections and proceeds with
+    whatever validated),  ANY invalid id here raises
+    :class:`HandoffSelectionError` immediately — see its docstring for why:
+    an item-scoped handoff exists specifically to guarantee isolation, so a
+    silently-dropped invalid id (which could make the effective scope wider,
+    or just different, than what the caller believed they asked for) is
+    exactly the failure mode this feature must not reproduce.
+
+    On success, returns a dict:
+      - ``selected_item_ids`` — the caller's own explicit ids, de-duplicated,
+        order preserved.
+      - ``closure_item_ids`` — ``selected_item_ids`` plus every transitively
+        required ``depends_on`` ancestor that is ITSELF still ``todo``/
+        ``pending`` in this same project/version scope (a satisfied/done
+        dependency needs no seat in the scope; a foreign/cross-version/
+        already-claimed dependency is left OUT of the closure rather than
+        silently pulled in — ``_build_quick_start_goal``'s existing
+        "blocked on an item outside this goal" rendering already explains
+        that case honestly). Sorted for a deterministic, order-independent
+        hash/render.
+      - ``closure_hash`` — a stable SHA-256 hex digest
+        (:func:`_hash_goal_body`) of the canonical-JSON-encoded sorted
+        closure id list, embedded in the rendered ``<selected_item_scope>``
+        tag (see ``_build_selected_scope_clause``) so a receiving session (or
+        a later audit) can confirm the exact set a handoff was scoped to.
+        Because this tag lives INSIDE ``quick_start_goal`` before
+        ``_mint_and_embed_goal_token`` hashes that text into the minted
+        token's ``body_hash`` (efaa918a), the selected scope is bound into
+        the SAME token/body-integrity mechanism as every other part of the
+        /goal block — no separate token-schema change needed.
     """
     if not selected_item_ids:
-        return pending_sprint_items
-    _by_id = {it["id"]: it for it in pending_sprint_items if it.get("id")}
-    rejected: list[dict[str, Any]] = []
-    validated: dict[str, dict[str, Any]] = {}
+        return None
+    _seen: set[str] = set()
+    requested: list[str] = []
     for _sid in selected_item_ids:
-        if not _sid:
-            continue
+        if _sid and _sid not in _seen:
+            _seen.add(_sid)
+            requested.append(_sid)
+    rejected: list[dict[str, Any]] = []
+    by_id: dict[str, dict[str, Any]] = {}
+    for _sid in requested:
         _item = await db_module.get_sprint_item(db, _sid)
         if _item is None:
             rejected.append({"id": _sid, "reason": "not_found"})
@@ -7636,34 +7530,105 @@ async def _resolve_selected_item_ids(
                 "requested_version": effective_version,
             })
             continue
-        if _item.get("status") not in ("todo", "pending"):
+        _status = _item.get("status")
+        if _status == "in_progress":
             rejected.append({
                 "id": _sid,
-                "reason": "not_pending",
-                "status": _item.get("status"),
+                "reason": "in_progress",
+                "claimed_by": _item.get("actor"),
             })
             continue
-        validated[_sid] = _item
+        if _status not in ("todo", "pending"):
+            rejected.append({"id": _sid, "reason": "not_pending", "status": _status})
+            continue
+        by_id[_sid] = _item
     if rejected:
-        raise HandoffSelectionError(rejected)
+        raise HandoffSelectionError(project_id, requested, rejected)
 
-    # Dependency closure: walk depends_on to the root for each selected item,
-    # cycle-safe, pulling in any ancestor that's still genuinely open.
-    closure: dict[str, dict[str, Any]] = dict(validated)
-    for _item in list(validated.values()):
-        seen: set[str] = {_item["id"]}
-        cur_dep = _item.get("depends_on")
-        while cur_dep and cur_dep not in seen:
-            seen.add(cur_dep)
-            if cur_dep in closure:
-                break
-            ancestor = _by_id.get(cur_dep) or await db_module.get_sprint_item(db, cur_dep)
-            if ancestor is None:
-                break
-            if ancestor.get("status") in ("todo", "pending"):
-                closure[cur_dep] = ancestor
-            cur_dep = ancestor.get("depends_on")
-    return list(closure.values())
+    # Dependency closure — walk each selected item's depends_on chain,
+    # pulling in any transitively-required ancestor that is ITSELF still
+    # todo/pending in this same project/version scope. Guards against cycles
+    # via closure_seen even though depends_on is a single-parent edge today.
+    closure_seen: set[str] = set()
+    stack = list(requested)
+    while stack:
+        cur = stack.pop()
+        if cur in closure_seen:
+            continue
+        closure_seen.add(cur)
+        item = by_id.get(cur)
+        if item is None:
+            item = await db_module.get_sprint_item(db, cur)
+            if item is None:
+                continue
+            by_id[cur] = item
+        dep_id = item.get("depends_on")
+        if not dep_id or dep_id in closure_seen:
+            continue
+        dep_item = by_id.get(dep_id)
+        if dep_item is None:
+            dep_item = await db_module.get_sprint_item(db, dep_id)
+            if dep_item is None:
+                continue
+            by_id[dep_id] = dep_item
+        if dep_item.get("project_id") != project_id:
+            continue
+        if effective_version is not None and dep_item.get("version") != effective_version:
+            continue
+        if dep_item.get("status") not in ("todo", "pending"):
+            continue
+        stack.append(dep_id)
+
+    closure_sorted = sorted(closure_seen)
+    _digest = _hash_goal_body(
+        json.dumps(closure_sorted, sort_keys=True, separators=(",", ":"))
+    )
+    return {
+        "selected_item_ids": requested,
+        "closure_item_ids": closure_sorted,
+        "closure_hash": _digest,
+    }
+
+
+def _build_selected_scope_clause(selected_scope: "dict[str, Any] | None") -> str:
+    """cffb9323 — render the ``<selected_item_scope>`` /goal tag stating the
+    EXACT selected ids (and any dependency-closure additions) a handoff was
+    scoped to. Returns ``""`` when ``selected_scope`` is falsy (the caller
+    never passed ``selected_item_ids`` — every pre-existing call site is
+    byte-for-byte unchanged), matching every other optional-clause builder in
+    this module (``_build_model_hints_clause``, etc.).
+
+    Called from BOTH ``_build_quick_start_goal`` return branches (empty-board
+    and normal) so the declaration is present even when the closure-filtered
+    batch happens to be empty. Embedded before ``_mint_and_embed_goal_token``
+    hashes ``quick_start_goal`` into the token's ``body_hash`` — see
+    ``_resolve_selected_item_scope``'s docstring for why that alone satisfies
+    "persist the selected scope and hash into the token" with no separate
+    token-schema change.
+    """
+    if not selected_scope:
+        return ""
+    requested = selected_scope.get("selected_item_ids") or []
+    closure = selected_scope.get("closure_item_ids") or []
+    digest = selected_scope.get("closure_hash") or ""
+    extra = [i for i in closure if i not in requested]
+    extra_note = (
+        f" (+{len(extra)} pulled in via dependency closure: {', '.join(extra)})"
+        if extra else ""
+    )
+    body = (
+        f"Item-scoped handoff: this session is scoped to EXACTLY "
+        f"{', '.join(closure) if closure else '(none)'}{extra_note}. Any other "
+        "pending sprint item -- including anything in a concurrently active "
+        "wave/batch -- is OUT OF SCOPE for this handoff and must not be "
+        "claimed from it."
+    )
+    return (
+        f'\n<selected_item_scope requested="{_xml_escape(", ".join(requested))}" '
+        f'closure="{_xml_escape(", ".join(closure))}" '
+        f'closure_hash="{_xml_escape(digest)}">'
+        f"{_xml_escape(body)}</selected_item_scope>"
+    )
 
 
 async def generate_handoff(
@@ -7681,7 +7646,6 @@ async def generate_handoff(
     extra_narrative: str | None = None,
     identity: str | None = None,
     force_include_ids: list[str] | None = None,
-    selected_item_ids: "list[str] | None" = None,
     version: str | None = None,
     strict_evidence: bool = False,
     evidence_status: dict[str, Any] | None = None,
@@ -7693,6 +7657,8 @@ async def generate_handoff(
     checkpoint: bool = False,
     strict_continuation: bool = False,
     continuation_status: dict[str, Any] | None = None,
+    selected_item_ids: list[str] | None = None,
+    promotion_readiness: dict[str, Any] | None = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -7754,19 +7720,6 @@ async def generate_handoff(
     each). A caller that passes ``None`` (the default) sees zero functional
     change to the returned ``(path, content, amended)`` or to ``content``
     itself.
-
-    ``selected_item_ids`` (94f48e4d) — optional list of sprint-item ids that,
-    when given, RESTRICTS the returned pending list to exactly those items
-    plus their still-open ``depends_on`` closure, instead of the project/
-    version's full backlog. Applies to ``full``/``delta``/``goal`` modes
-    (the modes that enumerate pending items at all — ``starter``/``compact``
-    never did, same as ``force_include_ids``). Unlike ``force_include_ids``,
-    this is FAIL-CLOSED: raises :class:`HandoffSelectionError` (nothing
-    rendered/written/persisted) if ANY requested id is unknown, cross-
-    project, cross-version, or not genuinely todo/pending — see
-    :func:`_resolve_selected_item_ids` and the exception's own docstring for
-    the full contract. ``None``/empty (the default) is a pure no-op — every
-    existing caller sees zero behavior change.
 
     ``version`` (efaa918a, extended by b8f89491) — optional explicit sprint-
     version bucket. Resolved ONCE, up front, and threaded through EVERY
@@ -7894,6 +7847,59 @@ async def generate_handoff(
     regardless of ``strict_continuation``/``checkpoint``, so a caller can
     always read the machine-readable continuation/terminal-ready state
     without opting into the hard refusal.
+
+    ``selected_item_ids`` (cffb9323) — optional explicit INCLUDE-ONLY item
+    scope, ``None`` by default (every pre-existing call site is completely
+    unaffected). This is the fix for the 2026-08-05 parallel-follow-up gap:
+    ``force_include_ids`` only ever WIDENS the pending list (re-adds specific
+    deferred ids); there was no way to NARROW a handoff to just the ids a
+    caller names, so a supposedly isolated executor handoff for a two-item
+    follow-up still emitted the entire eligible version backlog — able to
+    overlap an active wave/batch a sibling session already owns.
+
+    When given, resolved ONCE via :func:`_resolve_selected_item_scope` —
+    BEFORE any mode branch below — into a dependency-closed scope (the
+    requested ids plus any transitively-required ``depends_on`` ancestor
+    that is itself still todo/pending) and threaded through EVERY executable
+    mode (``full``/``delta``, ``starter``/``compact``, ``goal``) so they
+    cannot disagree about what is in scope. Each mode narrows its own
+    pending-item list to this closure before rendering, and the rendered
+    ``<selected_item_scope>`` tag (embedded in ``quick_start_goal`` BEFORE
+    the token mint hashes that text into ``body_hash`` — see
+    ``_mint_and_embed_goal_token``) states the exact selected ids, any
+    dependency-closure additions, and a stable hash of the closure — so the
+    selected scope is bound into the SAME body-hash/token-integrity
+    mechanism (efaa918a) as every other part of the /goal block, with no
+    separate token-schema change.
+
+    Fails CLOSED, not silently widened: if ANY requested id is missing,
+    belongs to a different project/version, is already ``in_progress`` under
+    another session, or is otherwise not genuinely claimable, this raises
+    :class:`HandoffSelectionError` — see its docstring — BEFORE anything is
+    rendered, written to disk, or persisted. ``mode="planner"`` is exempt
+    (it returns before this resolution runs, same as the pre-existing
+    ``version``/``HandoffStaleReferenceError`` handling below).
+
+    ``promotion_readiness`` (24f5146d) — optional output dict, SAME purely-
+    additive out-param shape as ``evidence_status``/``continuation_status``
+    above: when given (any dict, typically ``{}``), it is populated in place
+    with ``{"checked": [...], "unresolved_count": int}`` — one entry per
+    pending item whose ``planned_output.promotion.base_sha256`` is declared
+    (:func:`meridian.artifact_declaration.effective_promotion`), each entry
+    the result of :func:`meridian.artifact_declaration.
+    check_promotion_preconditions` against that item's first ``planned_output``
+    target uri resolved relative to ``output_dir``. This surfaces docx
+    promotion base-hash staleness (has the target changed on disk since the
+    promotion was declared) directly in the handoff a receiving executor
+    reads, mirroring how ``evidence_status`` surfaces test-evidence outcomes.
+    A caller that passes ``None`` (the default — every pre-existing call
+    site) sees ZERO functional change to the returned ``(path, content,
+    amended)`` or to ``content`` itself. Best-effort and fully guarded: any
+    failure degrades to an empty ``checked`` list, never breaks the
+    mandatory handoff. Only populated for ``mode in {"full", "delta"}`` —
+    the modes where the full pending-item list is resolved; other modes
+    leave the passed dict untouched (documented gap, not silent — see the
+    module's own KNOWN LIMITATIONS note near ``build_promotion_readiness_for_handoff``).
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -7922,6 +7928,14 @@ async def generate_handoff(
     _stale_references = db_module.find_stale_reference_ids(_stale_item_index)
     if _stale_references:
         raise HandoffStaleReferenceError(project_id, _effective_version, _stale_references)
+    # cffb9323 — resolve the explicit item-scoped selection ONCE, for every
+    # remaining executable mode (mirrors the version resolution just above).
+    # Raises HandoffSelectionError (fail closed) BEFORE anything below this
+    # point is rendered/persisted when the caller passed selected_item_ids
+    # and any requested id is invalid — see _resolve_selected_item_scope.
+    _selected_scope = await _resolve_selected_item_scope(
+        db, project_id, selected_item_ids, effective_version=_effective_version,
+    )
     # 2204ce80 — optional, additive "related planning records" lookup. Runs
     # only when the caller opted in on BOTH arguments; see the docstring above.
     if related_records_query is not None and related_records is not None:
@@ -7950,6 +7964,7 @@ async def generate_handoff(
             strict_evidence=strict_evidence,
             evidence_status=evidence_status,
             strict_pointer_evidence=strict_pointer_evidence,
+            selected_scope=_selected_scope,
         )
         return (
             _st_path,
@@ -7967,13 +7982,13 @@ async def generate_handoff(
             output_dir,
             graph_searcher=graph_searcher,
             force_include_ids=force_include_ids,
-            selected_item_ids=selected_item_ids,
             completion_criteria_override=_project_completion_criteria_override,
             version=_effective_version,
             strict_evidence=strict_evidence,
             evidence_status=evidence_status,
             strict_pointer_evidence=strict_pointer_evidence,
             force_include_rejected=force_include_rejected,
+            selected_scope=_selected_scope,
         )
         return (
             _g_path,
@@ -8070,14 +8085,21 @@ async def generate_handoff(
         effective_version=_effective_version,
         rejected=force_include_rejected,
     )
-    # 94f48e4d — selected_item_ids restricts the pending list to exactly the
-    # requested items' dependency closure; fail-closed on any invalid id (see
-    # _resolve_selected_item_ids's own docstring). No-op when not given.
-    pending_sprint_items = await _resolve_selected_item_ids(
-        db, project_id, selected_item_ids, pending_sprint_items,
-        effective_version=_effective_version,
-    )
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
+    # 24f5146d — best-effort docx promotion base-hash readiness, purely
+    # additive (see promotion_readiness's own docstring above). Populated
+    # here (full/delta only) because this is the first point in the function
+    # where pending_sprint_items is the final, force-include-resolved list.
+    if promotion_readiness is not None:
+        try:
+            _promo = await build_promotion_readiness_for_handoff(
+                db, project_id, pending_sprint_items, output_dir=output_dir,
+            )
+            promotion_readiness.clear()
+            promotion_readiness.update(_promo)
+        except Exception:  # noqa: BLE001 — promotion readiness is best-effort
+            promotion_readiness.clear()
+            promotion_readiness.update({"checked": [], "unresolved_count": 0, "error": "promotion_readiness_failed"})
     # Flag items that may already be done based on recent task descriptions or commits
     pending_sprint_items = _annotate_possibly_done(pending_sprint_items, tasks, commit_messages)
     # Auto-set touches_files from recent git history for items without it.
@@ -8355,6 +8377,16 @@ async def generate_handoff(
             "used the pre-enrichment snapshot; an item claimed/completed "
             "elsewhere mid-generation may still appear pending"
         )
+    if _selected_scope:
+        # cffb9323 — narrow to the validated dependency-closure as the FINAL
+        # step before quick_start_goal is built, so it wins regardless of
+        # whether the freshness re-query above succeeded or fell back to the
+        # pre-enrichment snapshot — an item-scoped full/delta handoff must
+        # never name an out-of-scope id.
+        _closure_ids = set(_selected_scope.get("closure_item_ids") or [])
+        pending_sprint_items = [
+            it for it in pending_sprint_items if it.get("id") in _closure_ids
+        ]
     try:
         sessions = await db_module.get_sessions(db, project_id, active_only=False)
         session_names = {s["id"]: s["name"] for s in sessions}
@@ -8453,6 +8485,7 @@ async def generate_handoff(
         # eb8b6894 — opt-in STRICT pointer gate: excludes an item whose
         # durable pointer row exists but never actually resolved.
         strict_pointer_evidence=strict_pointer_evidence,
+        selected_scope=_selected_scope,
     )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
@@ -8577,21 +8610,11 @@ async def generate_handoff(
         # in this function; a failure degrades to the pre-836ca1d5 output
         # (no tag) rather than breaking delta generation.
         try:
-            # 94f48e4d — when this delta call is itself scoped via
-            # selected_item_ids, restrict the manifest's own pending-id list
-            # to match (see build_continuation_manifest's restrict_to_ids
-            # docstring) — never revision_hash/item_count, which stay
-            # canonical/unfiltered for genuine staleness detection.
-            _restrict_ids = (
-                {it["id"] for it in pending_sprint_items if it.get("id")}
-                if selected_item_ids else None
-            )
             _continuation_manifest = await build_continuation_manifest(
                 db, project_id,
                 session_id=session_id,
                 version=_effective_version,
                 source="generate_handoff:delta",
-                restrict_to_ids=_restrict_ids,
             )
         except Exception:  # noqa: BLE001 — manifest is best-effort, never fatal
             _continuation_manifest = None
@@ -8991,34 +9014,6 @@ async def _generate_planner_handoff(
     if span_block:
         lines += [span_block, ""]
 
-    # 9154aa9a — latest durable executor report + its correction lineage
-    # (informational only, see _render_executor_report_planner_section's own
-    # docstring). Guarded/best-effort so a project with no reports, or a
-    # pre-migration DB, still renders a clean prompt.
-    reports = await _safe(db_module.list_executor_reports(db, project_id, limit=1), [])
-    latest_report = reports[0] if reports else None
-    # Walk the correction lineage BACKWARD (parent_report_id) from the
-    # latest report — this is "what this report superseded to get here",
-    # not "what superseded it" (nothing supersedes the latest report by
-    # definition). Bounded hop count so a malformed/cyclical chain can never
-    # hang the planner-handoff render.
-    correction_lineage: list[dict[str, Any]] = []
-    if latest_report is not None:
-        _parent_id = latest_report.get("parent_report_id")
-        _hops = 0
-        while _parent_id and _hops < 5:
-            _ancestor = await _safe(db_module.get_executor_report(db, _parent_id), None)
-            if _ancestor is None:
-                break
-            correction_lineage.append(_ancestor)
-            _parent_id = _ancestor.get("parent_report_id")
-            _hops += 1
-    report_section = _render_executor_report_planner_section(
-        latest_report, correction_lineage,
-    )
-    if report_section:
-        lines += report_section
-
     # Thinking scaffold — empty labelled sections for the planner to fill in.
     lines += [
         "## Thinking scaffold",
@@ -9062,6 +9057,7 @@ async def _generate_starter_handoff(
     strict_evidence: bool = False,
     evidence_status: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
+    selected_scope: "dict[str, Any] | None" = None,
 ) -> tuple[str, str]:
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
@@ -9091,6 +9087,13 @@ async def _generate_starter_handoff(
     runs ``_annotate_resolved_pointers``, so no pending item carries
     ``pointer_resolution_status`` and ``_build_quick_start_goal`` falls back
     to its ordinary presence-only check regardless of this flag.
+
+    ``selected_scope`` (cffb9323) — the dict ``generate_handoff`` resolved via
+    ``_resolve_selected_item_scope``, or ``None`` (default — unaffected).
+    When given, ``pending`` is narrowed to the dependency-closure id set
+    BEFORE ``_build_quick_start_goal`` renders it, and the resulting /goal
+    carries the same ``<selected_item_scope>`` declaration full/delta/goal
+    render — see that function's docstring.
     """
     project_id = project["id"]
     sprint_items_all = await db_module.get_sprint_items(
@@ -9107,6 +9110,12 @@ async def _generate_starter_handoff(
         if it.get("status") in {"pending", "todo"}
     ]
     pending = _prepare_pending_sprint_items(pending)
+    if selected_scope:
+        # cffb9323 — narrow to the validated dependency-closure BEFORE any
+        # further enrichment/rendering, so an item-scoped starter handoff
+        # never names an out-of-scope id anywhere below this point.
+        _closure_ids = set(selected_scope.get("closure_item_ids") or [])
+        pending = [it for it in pending if it.get("id") in _closure_ids]
     settings = await db_module.get_project_settings(db, project_id)
     executor_config = (settings or {}).get("executor_config") if settings else None
     # ecf69de8 — the project's executor posture selects the /goal framing.
@@ -9208,6 +9217,7 @@ async def _generate_starter_handoff(
         # first required action).
         execution_policy=_execution_policy_from_settings(settings, _s_execution_mode),
         strict_pointer_evidence=strict_pointer_evidence,
+        selected_scope=selected_scope,
     )
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the
@@ -9246,13 +9256,13 @@ async def _generate_goal_only_handoff(
     *,
     graph_searcher: Callable[[str], Any] | None = None,
     force_include_ids: list[str] | None = None,
-    selected_item_ids: "list[str] | None" = None,
     completion_criteria_override: str | None = None,
     version: str | None = None,
     strict_evidence: bool = False,
     evidence_status: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
     force_include_rejected: "list[dict[str, Any]] | None" = None,
+    selected_scope: "dict[str, Any] | None" = None,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
 
@@ -9316,13 +9326,15 @@ async def _generate_goal_only_handoff(
         effective_version=version,
         rejected=force_include_rejected,
     )
-    # 94f48e4d — same fail-closed selection restriction generate_handoff's
-    # full/delta branch applies; see _resolve_selected_item_ids's docstring.
-    pending_sprint_items = await _resolve_selected_item_ids(
-        db, project_id, selected_item_ids, pending_sprint_items,
-        effective_version=version,
-    )
     pending_sprint_items = _prepare_pending_sprint_items(pending_sprint_items)
+    if selected_scope:
+        # cffb9323 — narrow to the validated dependency-closure BEFORE any
+        # further enrichment/rendering, so an item-scoped goal-only handoff
+        # never names an out-of-scope id anywhere below this point.
+        _closure_ids = set(selected_scope.get("closure_item_ids") or [])
+        pending_sprint_items = [
+            it for it in pending_sprint_items if it.get("id") in _closure_ids
+        ]
 
     # 91ac0199 — same code-pointer enrichment gate generate_handoff's full/
     # delta branch uses. Fully guarded: never break the mandatory handoff.
@@ -9499,6 +9511,7 @@ async def _generate_goal_only_handoff(
         # first required action).
         execution_policy=_execution_policy_from_settings(proj_settings, _g_execution_mode),
         strict_pointer_evidence=strict_pointer_evidence,
+        selected_scope=selected_scope,
     )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.

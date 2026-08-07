@@ -940,6 +940,13 @@ No auth required.
 | `POST` | `/outputs/mcp/{tenant_id}/{rest:path}` | Same as outputs_mcp_proxy but for sub-paths |
 
 
+### `/pkg-guard`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/pkg-guard/check` | 23f21820 -- package-install verification gate |
+
+
 ### `/ppt`
 
 | Method | Path | Description |
@@ -1162,6 +1169,7 @@ No auth required.
 | `GET` | `/tunnel/filesystem-roots` | Return the directories the tunnel's filesystem connector may read |
 | `POST` | `/tunnel/filesystem-roots` | live-fs-roots — add a served filesystem root and push it live |
 | `GET` | `/tunnel/manifest` | Read-only tools/list manifest snapshot for this tenant (49d8244d) |
+| `POST` | `/tunnel/openai/diagnostics/{tenant_id}` | Compose OpenAI Secure MCP Tunnel adapter diagnostics for *tenant_id*, |
 | `GET` | `/tunnel/plugins` | Return the current tenant's resolved tunnel plugins + raw override config |
 | `PUT` | `/tunnel/plugins` | Persist the tenant's tunnel plugin overrides (Settings → Tunnel Plugins) |
 | `GET` | `/tunnel/plugins/check` | Check whether a plugin binary is available on the server's PATH |

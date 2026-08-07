@@ -55,11 +55,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import subprocess
+from pathlib import Path
 from typing import Any, Callable
 
 from . import artifact_declaration as _artifact_declaration
 from . import capability_availability as _capability_availability
 from . import capability_contract as _capability_contract
+from . import capability_manifest as _capability_manifest
 from . import db as db_module
 from . import tool_discovery as _tool_discovery
 from . import tool_requirements as _tool_requirements
@@ -1110,3 +1114,822 @@ def render_text(contract: dict[str, Any]) -> str:
             f"(already passed: {gate_after.get('gate_passed')})."
         )
     return "\n".join(lines)
+
+
+# ===========================================================================
+# 3b3020ac -- hash-pinned scientific execution manifests, per-worker
+# completion records, and fail-closed aggregation.
+#
+# A GENERIC, reusable contract for long parallel scientific reruns and other
+# fan-out jobs -- narrower than, and deliberately non-duplicative of, the
+# 24f5146d docx-promotion work in :mod:`meridian.artifact_declaration`
+# (``compute_base_sha256`` / ``check_promotion_preconditions`` / the merger
+# lock) and :mod:`meridian.db.wave_runs` (``promotion_precondition_pinned`` /
+# ``_validate_promotion_evidence``). This section REUSES that work's exact
+# philosophy -- deterministic sha256 hashing, a ``{ok/ready, reason, ...}``
+# fail-closed verdict shape, "unknown/matching base is trivially unchanged"
+# semantics -- for a DIFFERENT, more general problem: a scientific rerun
+# fans out across MANY workers (not one docx target), each of which must
+# report a structurally-valid, hash-pinned completion record before an
+# aggregator can trust the run as done.
+#
+# Deliberately THESIS-ALGORITHM-FREE: this module knows nothing about
+# images/branches/ground-truth as scientific concepts. ``expected_counts``
+# is an opaque caller-supplied ``{label: int}`` dict and ``output_schema``
+# domains are caller-named -- the only thing enforced here is the STRUCTURE
+# of the contract (hash pinning, fail-closed aggregation), never a specific
+# pipeline's semantics. A thesis-project caller imports this module and
+# supplies its own paths/counts/schema; see the module-level docstring's own
+# discipline (pure validation, no DB, no network) -- this whole section is
+# equally DB-free and synchronous, so it is trivially importable from a
+# caller that has never touched Meridian's own database.
+#
+# Persistence is intentionally NOT owned here (mirrors ``pointers.py``'s own
+# "injectable seam, no core-local store" stance for provenance): "one
+# immutable manifest per run" is enforced via :func:`check_manifest_immutable`,
+# a pure yes/no gate a caller's OWN storage layer calls before writing --
+# never a table this module creates itself.
+# ===========================================================================
+
+EXECUTION_MANIFEST_SCHEMA_VERSION = 1
+
+_MANIFEST_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+WORKER_STATUS_COMPLETE = "complete"
+WORKER_STATUS_FAILED = "failed"
+WORKER_STATUS_PARTIAL = "partial"
+WORKER_STATUS_SKIPPED = "skipped"
+WORKER_STATUSES = frozenset({
+    WORKER_STATUS_COMPLETE, WORKER_STATUS_FAILED,
+    WORKER_STATUS_PARTIAL, WORKER_STATUS_SKIPPED,
+})
+
+# Raw-domain vs DSE-domain (Design Space Exploration) schema tagging --
+# every domain an ``output_schema`` declares must be tagged with one of
+# these two kinds (see :func:`_validate_output_schema`); the tag is NOT
+# optional once a caller declares ANY domains at all, so a per-worker
+# record's outputs can never be silently ambiguous about which family of
+# array it belongs to.
+OUTPUT_DOMAIN_RAW = "raw"
+OUTPUT_DOMAIN_DSE = "dse"
+_KNOWN_OUTPUT_DOMAIN_KINDS = frozenset({OUTPUT_DOMAIN_RAW, OUTPUT_DOMAIN_DSE})
+
+AGGREGATION_STATUS_COMPLETE = "complete"
+AGGREGATION_STATUS_PARTIAL = "partial"
+AGGREGATION_STATUS_FAILED = "failed"
+
+
+class ExecutionManifestError(ValueError):
+    """Raised when an execution manifest or worker completion record fails
+    schema/safety validation."""
+
+
+# ---------------------------------------------------------------------------
+# Hashing / identity utilities -- mirror artifact_declaration.compute_base_sha256's
+# "sha256 over current on-disk bytes, None for a missing file is a valid
+# state, never an error" discipline, extended from ONE file to a whole set.
+# ---------------------------------------------------------------------------
+
+def hash_file_set(paths: list[str]) -> "dict[str, str | None]":
+    """sha256 of each path's CURRENT on-disk bytes, keyed by the path as
+    given. ``None`` for a missing/unreadable file is a valid state (e.g. an
+    input the run has not fetched yet), never an error -- the exact same
+    "unknown base" semantics :func:`meridian.artifact_declaration.compute_base_sha256`
+    already documents, applied per-file across a whole set. Never raises."""
+    out: "dict[str, str | None]" = {}
+    for raw in paths or []:
+        p = str(raw)
+        try:
+            path_obj = Path(p)
+            if not path_obj.is_file():
+                out[p] = None
+                continue
+            out[p] = hashlib.sha256(path_obj.read_bytes()).hexdigest()
+        except OSError:
+            out[p] = None
+    return out
+
+
+def aggregate_file_set_hash(file_hashes: "dict[str, str | None]") -> str:
+    """ONE deterministic sha256 over a whole ``{path: hash}`` set (dict keys
+    are sorted before hashing, so caller insertion order never matters) --
+    the file-SET identity hash, distinct from any single file's own hash.
+    Used for both the runner/source identity hash and the input file-set
+    hash (:func:`build_execution_manifest`)."""
+    return hashlib.sha256(
+        _canonical_json(dict(sorted(file_hashes.items()))).encode("utf-8")
+    ).hexdigest()
+
+
+def capture_git_state(
+    repo_dir: str, *, run: "Callable[[list[str]], str | None] | None" = None,
+) -> dict[str, Any]:
+    """Best-effort ``{"head": <sha>|None, "dirty_files": [...]}`` for
+    ``repo_dir``.
+
+    ``run`` is an injectable ``argv -> stdout|None`` seam (tests stub it; no
+    real git binary/repo required to exercise this function) -- the default
+    shells out to git via :mod:`subprocess`, guarded and timeout-bounded.
+    ANY failure (not a repo, git missing, timeout, non-zero exit) degrades
+    to ``{"head": None, "dirty_files": []}`` -- a best-effort identity
+    fingerprint, never a hard error blocking manifest construction. Never
+    raises.
+    """
+    def _default_run(argv: list[str]) -> "str | None":
+        try:
+            result = subprocess.run(
+                argv, cwd=repo_dir, capture_output=True, text=True,
+                timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout
+
+    runner = run or _default_run
+    head_out = runner(["git", "rev-parse", "HEAD"])
+    head = head_out.strip() if head_out else None
+    status_out = runner(["git", "status", "--porcelain"])
+    dirty_files: list[str] = []
+    if status_out:
+        for line in status_out.splitlines():
+            line = line.rstrip("\n")
+            if len(line) > 3:
+                dirty_files.append(line[3:].strip())
+    return {"head": head, "dirty_files": sorted(set(f for f in dirty_files if f))}
+
+
+# ---------------------------------------------------------------------------
+# output_schema -- raw-domain vs DSE-domain explicit tagging.
+# ---------------------------------------------------------------------------
+
+def _validate_output_schema(raw: "dict[str, Any] | None") -> dict[str, Any]:
+    """Normalize+validate a manifest's ``output_schema``. ``None``/absent
+    normalizes to ``{"version": None, "domains": {}}`` -- no domains
+    declared is a valid, backward-compatible state (domain enforcement in
+    :func:`aggregate_worker_completions` is then simply skipped, mirroring
+    this codebase's pervasive "absent means unknown, never retroactively
+    enforced" convention). Once ANY domain is declared, each one MUST carry
+    an explicit ``kind`` in {"raw", "dse"} -- raises
+    :class:`ExecutionManifestError` otherwise; tagging is not optional once
+    opted into."""
+    if raw is None:
+        return {"version": None, "domains": {}}
+    if not isinstance(raw, dict):
+        raise ExecutionManifestError("output_schema must be an object")
+    domains_raw = raw.get("domains") or {}
+    if not isinstance(domains_raw, dict):
+        raise ExecutionManifestError("output_schema.domains must be an object")
+    domains: dict[str, Any] = {}
+    for name, spec in domains_raw.items():
+        if not isinstance(spec, dict) or spec.get("kind") not in _KNOWN_OUTPUT_DOMAIN_KINDS:
+            raise ExecutionManifestError(
+                f"output_schema.domains[{name!r}] must declare kind in "
+                f"{sorted(_KNOWN_OUTPUT_DOMAIN_KINDS)} -- raw vs DSE schema "
+                "tagging is mandatory once any domain is declared"
+            )
+        fields = spec.get("fields")
+        if fields is not None and not (
+            isinstance(fields, list) and all(isinstance(f, str) for f in fields)
+        ):
+            raise ExecutionManifestError(
+                f"output_schema.domains[{name!r}].fields must be a list of strings"
+            )
+        domains[str(name)] = {"kind": spec["kind"], "fields": list(fields) if fields else []}
+    return {"version": raw.get("version"), "domains": domains}
+
+
+# ---------------------------------------------------------------------------
+# The manifest -- ONE immutable, hash-pinned object per (project_id,
+# version, run_id).
+# ---------------------------------------------------------------------------
+
+def build_execution_manifest(
+    *,
+    project_id: str,
+    version: str,
+    run_id: str,
+    runner_name: str,
+    sprint_item_id: "str | None" = None,
+    decision_ids: "list[str] | None" = None,
+    runner_source_paths: "list[str] | None" = None,
+    input_paths: "list[str] | None" = None,
+    git_head: "str | None" = None,
+    git_dirty_files: "list[str] | None" = None,
+    python_version: "str | None" = None,
+    pixi_env_fingerprint: "str | None" = None,
+    runtime_fingerprint_extra: "dict[str, Any] | None" = None,
+    config_fingerprint: "dict[str, Any] | None" = None,
+    expected_counts: "dict[str, int] | None" = None,
+    output_schema: "dict[str, Any] | None" = None,
+    allow_partial: bool = False,
+    hash_files: "Callable[[list[str]], dict[str, Any]] | None" = None,
+) -> dict[str, Any]:
+    """Build ONE project/version-scoped, hash-pinned execution manifest for
+    a fan-out scientific rerun (or any other batch job).
+
+    Captures every field the sprint spec calls for:
+
+    * ``runner_identity`` -- ``runner_name`` plus per-file sha256 of
+      ``runner_source_paths`` (:func:`hash_file_set`) and their combined
+      ``source_set_hash`` (:func:`aggregate_file_set_hash`).
+    * ``input_identity`` -- the SAME hashing applied to ``input_paths``
+      (the input file-set/content hashes).
+    * ``git_state`` -- caller-supplied ``git_head``/``git_dirty_files``
+      (see :func:`capture_git_state` for a ready-made best-effort capture
+      the caller can run in ITS OWN repo before calling this function --
+      Meridian's own repo is not necessarily where the scientific run
+      lives, so this function never shells out to git itself).
+    * ``runtime_fingerprint`` / ``config_fingerprint`` -- Python/pixi/
+      runtime and effective config/environment fingerprints. Screened via
+      :func:`meridian.capability_manifest._check_no_secrets_or_local_paths`
+      (REUSED, never reimplemented) so no secret-shaped string can land in
+      shared manifest state -- "without secrets" per the sprint spec.
+      Deliberately scoped to just these two sub-objects: ``runner_source_paths``
+      / ``input_paths`` / ``git_dirty_files`` are LEGITIMATELY real
+      filesystem paths (that is their entire purpose, and they are hashed,
+      never stored raw as secrets would be) -- screening those would break
+      the manifest's actual job, so only the fingerprint sub-objects (which
+      have no business containing a path or a credential) are screened.
+    * ``expected_counts`` -- an opaque ``{label: non-negative int}`` dict
+      (e.g. ``{"images": 100, "branches": 12, "ground_truth": 50}``) --
+      deliberately caller-named, never a fixed scientific vocabulary this
+      module would have to understand.
+    * ``output_schema`` -- see :func:`_validate_output_schema` (raw vs DSE
+      domain tagging).
+    * ``lineage`` -- ``sprint_item_id`` / ``decision_ids`` (sorted).
+    * ``allow_partial`` -- whether :func:`aggregate_worker_completions` may
+      ever report a valid failure-stage-subset ``"partial"`` verdict for
+      this run, distinct from full production data.
+
+    ``hash_files`` is an injectable ``paths -> {path: hash|None}`` seam
+    (defaults to :func:`hash_file_set`) so tests never touch the real
+    filesystem.
+
+    Raises :class:`ExecutionManifestError` on any schema/safety violation.
+    The returned dict carries ``manifest_hash`` -- a stable sha256 over
+    every field EXCEPT ``created_at``/``manifest_hash`` themselves (mirrors
+    :func:`executor_contract_hash`'s own wall-clock exclusion exactly, via
+    the SAME :func:`_canonical_json`) -- and ``created_at``, a wall-clock
+    timestamp carried for humans/audit but never hashed.
+    """
+    if not project_id or not str(project_id).strip():
+        raise ExecutionManifestError("project_id is required")
+    if not version or not str(version).strip():
+        raise ExecutionManifestError("version is required")
+    if not run_id or not str(run_id).strip():
+        raise ExecutionManifestError("run_id is required")
+    if not runner_name or not str(runner_name).strip():
+        raise ExecutionManifestError("runner_name is required")
+
+    hasher = hash_files or hash_file_set
+    runner_hashes = hasher(list(runner_source_paths or []))
+    input_hashes = hasher(list(input_paths or []))
+
+    expected_counts_normalized: dict[str, int] = {}
+    for k, v in (expected_counts or {}).items():
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise ExecutionManifestError(
+                f"expected_counts[{k!r}] must be a non-negative int, got {v!r}"
+            )
+        expected_counts_normalized[str(k)] = v
+
+    runtime_fingerprint: dict[str, Any] = {
+        "python_version": python_version,
+        "pixi_env_fingerprint": pixi_env_fingerprint,
+        **(runtime_fingerprint_extra or {}),
+    }
+    config_fp: dict[str, Any] = dict(config_fingerprint or {})
+
+    try:
+        _capability_manifest._check_no_secrets_or_local_paths(
+            runtime_fingerprint, path="runtime_fingerprint",
+        )
+        _capability_manifest._check_no_secrets_or_local_paths(
+            config_fp, path="config_fingerprint",
+        )
+    except _capability_manifest.CapabilityManifestError as exc:
+        raise ExecutionManifestError(str(exc)) from exc
+
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    manifest: dict[str, Any] = {
+        "schema_version": EXECUTION_MANIFEST_SCHEMA_VERSION,
+        "run_id": str(run_id).strip(),
+        "scope": {"project_id": project_id, "version": version},
+        "lineage": {
+            "sprint_item_id": sprint_item_id,
+            "decision_ids": sorted(str(d) for d in (decision_ids or [])),
+        },
+        "runner_identity": {
+            "name": runner_name.strip(),
+            "source_hashes": dict(sorted(runner_hashes.items())),
+            "source_set_hash": aggregate_file_set_hash(runner_hashes),
+        },
+        "input_identity": {
+            "file_hashes": dict(sorted(input_hashes.items())),
+            "file_set_hash": aggregate_file_set_hash(input_hashes),
+        },
+        "git_state": {
+            "head": git_head,
+            "dirty_files": sorted(set(git_dirty_files or [])),
+        },
+        "runtime_fingerprint": runtime_fingerprint,
+        "config_fingerprint": config_fp,
+        "expected_counts": expected_counts_normalized,
+        "output_schema": _validate_output_schema(output_schema),
+        "allow_partial": bool(allow_partial),
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    manifest["manifest_hash"] = execution_manifest_hash(manifest)
+    return manifest
+
+
+def execution_manifest_hash(manifest: dict[str, Any]) -> str:
+    """Stable sha256 over ``manifest``, EXCLUDING ``created_at``/
+    ``manifest_hash`` themselves -- see :func:`build_execution_manifest`."""
+    payload = {
+        k: v for k, v in manifest.items() if k not in ("created_at", "manifest_hash")
+    }
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def check_manifest_immutable(
+    existing_manifest: "dict[str, Any] | None", new_manifest: dict[str, Any],
+) -> "tuple[bool, str | None]":
+    """Fail-closed precondition for a caller's OWN persistence layer: is it
+    safe to write ``new_manifest``, given whatever manifest (if any) is
+    already on file for this ``run_id``/``project_id``/``version`` scope?
+
+    This module does not own storage (see the module section docstring) --
+    a caller's persistence layer supplies ``existing_manifest`` (its own
+    prior read for the SAME scope) and this is the ONE shared gate so "one
+    immutable manifest per run" is enforced identically everywhere it is
+    checked, never re-derived ad hoc per call site.
+
+    Returns ``(True, None)`` when there is no existing manifest yet (first
+    write) OR the existing manifest's ``manifest_hash`` matches
+    ``new_manifest``'s (an idempotent re-write of the SAME content is safe
+    -- mirrors ``check_promotion_preconditions``'s own "matching hash is
+    trivially fine" rule). Returns ``(False, reason)`` when a DIFFERENT
+    manifest already exists for this run -- a caller must never silently
+    overwrite it; a genuinely different run needs a NEW ``run_id``.
+    """
+    if existing_manifest is None:
+        return True, None
+    existing_scope = existing_manifest.get("scope") or {}
+    new_scope = new_manifest.get("scope") or {}
+    if (
+        existing_manifest.get("run_id") != new_manifest.get("run_id")
+        or existing_scope.get("project_id") != new_scope.get("project_id")
+        or existing_scope.get("version") != new_scope.get("version")
+    ):
+        return False, (
+            "existing_manifest is for a different run_id/project_id/version "
+            "scope -- check_manifest_immutable must be called with the prior "
+            "manifest for the SAME run, not an unrelated one"
+        )
+    if existing_manifest.get("manifest_hash") == new_manifest.get("manifest_hash"):
+        return True, None
+    return False, (
+        f"a manifest already exists for run_id={new_manifest.get('run_id')!r} "
+        f"with a DIFFERENT hash ({existing_manifest.get('manifest_hash')!r} != "
+        f"{new_manifest.get('manifest_hash')!r}) -- manifests are immutable "
+        "per run; plan a NEW run_id instead of mutating this one"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-worker completion records.
+# ---------------------------------------------------------------------------
+
+_WORKER_RECORD_REQUIRED_FIELDS = (
+    "worker_id", "manifest_hash", "run_id", "status", "expected_keys",
+    "row_counts", "output_hashes",
+)
+
+
+def build_worker_completion_record(
+    manifest: dict[str, Any],
+    *,
+    worker_id: str,
+    status: str,
+    input_hash: "str | None" = None,
+    config_hash: "str | None" = None,
+    expected_keys: "list[str] | None" = None,
+    row_counts: "dict[str, int] | None" = None,
+    output_hashes: "dict[str, str] | None" = None,
+    domain: "str | None" = None,
+    error: "str | None" = None,
+) -> dict[str, Any]:
+    """Build ONE structurally-valid worker completion record, bound to
+    ``manifest`` via its ``manifest_hash`` -- the hash a downstream
+    aggregator/skip-existing check cross-references (:func:`check_skip_existing_worker`,
+    :func:`aggregate_worker_completions`) so a record can never silently be
+    reused against a DIFFERENT manifest than the one it was built for.
+
+    ``status`` must be one of :data:`WORKER_STATUSES`. ``output_hashes`` is
+    a ``{path: sha256_hex}`` map -- every value must be a valid 64-char hex
+    digest. ``domain`` (optional) names which of the manifest's declared
+    ``output_schema`` domains (raw/dse) this record's outputs belong to --
+    schema-mismatch detection happens at aggregation time
+    (:func:`aggregate_worker_completions`), not here (a single record has
+    no way to know the full domain set without the manifest's context,
+    which it already carries via ``manifest_hash`` alone -- re-validating
+    domain membership here would require threading the full manifest object
+    through every call site; the aggregator is the ONE place that already
+    has both sides in scope).
+
+    Raises :class:`ExecutionManifestError` on any schema violation. The
+    returned dict carries ``record_hash`` -- a stable sha256 over the whole
+    record (via :func:`_canonical_json`), useful as a durable dedup/audit
+    key independent of ``manifest_hash`` alone.
+    """
+    if not worker_id or not str(worker_id).strip():
+        raise ExecutionManifestError("worker_id is required")
+    if status not in WORKER_STATUSES:
+        raise ExecutionManifestError(
+            f"status must be one of {sorted(WORKER_STATUSES)}, got {status!r}"
+        )
+    row_counts_normalized: dict[str, int] = {}
+    for k, v in (row_counts or {}).items():
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            raise ExecutionManifestError(
+                f"row_counts[{k!r}] must be a non-negative int, got {v!r}"
+            )
+        row_counts_normalized[str(k)] = v
+    output_hashes_normalized: dict[str, str] = {}
+    for path, h in (output_hashes or {}).items():
+        if not isinstance(h, str) or not _MANIFEST_SHA256_HEX_RE.match(h.strip().lower()):
+            raise ExecutionManifestError(
+                f"output_hashes[{path!r}] must be a 64-char hex sha256, got {h!r}"
+            )
+        output_hashes_normalized[str(path)] = h.strip().lower()
+
+    record: dict[str, Any] = {
+        "worker_id": str(worker_id).strip(),
+        "manifest_hash": manifest.get("manifest_hash"),
+        "run_id": manifest.get("run_id"),
+        "status": status,
+        "input_hash": input_hash,
+        "config_hash": config_hash,
+        "expected_keys": sorted(str(k) for k in (expected_keys or [])),
+        "row_counts": row_counts_normalized,
+        "output_hashes": dict(sorted(output_hashes_normalized.items())),
+        "domain": domain,
+        "error": error,
+    }
+    record["record_hash"] = hashlib.sha256(
+        _canonical_json(record).encode("utf-8")
+    ).hexdigest()
+    return record
+
+
+def validate_worker_completion_record(record: Any) -> "tuple[bool, str | None]":
+    """Pure structural/shape validation for an ALREADY-BUILT worker
+    completion record (e.g. one read back from a caller's own storage) --
+    mirrors :func:`meridian.pointers.check_structural_validity`'s role for
+    pointers exactly: shape/schema only, no manifest/hash MATCHING here
+    (that is :func:`check_skip_existing_worker`'s job, which calls this
+    function FIRST as one of its own gates). Never raises.
+
+    Returns ``(True, None)`` when well-formed, ``(False, <reason>)``
+    otherwise.
+    """
+    if not isinstance(record, dict):
+        return False, "worker completion record must be an object"
+    for field in _WORKER_RECORD_REQUIRED_FIELDS:
+        if field not in record:
+            return False, f"worker completion record missing required field: {field}"
+    if record.get("status") not in WORKER_STATUSES:
+        return False, (
+            f"status must be one of {sorted(WORKER_STATUSES)}, got "
+            f"{record.get('status')!r}"
+        )
+    if not isinstance(record.get("worker_id"), str) or not record["worker_id"].strip():
+        return False, "worker_id must be a non-empty string"
+    if not isinstance(record.get("manifest_hash"), str) or not record["manifest_hash"].strip():
+        return False, "manifest_hash must be a non-empty string"
+    if not isinstance(record.get("expected_keys"), list):
+        return False, "expected_keys must be a list"
+    if not isinstance(record.get("row_counts"), dict):
+        return False, "row_counts must be an object"
+    for k, v in record["row_counts"].items():
+        if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+            return False, f"row_counts[{k!r}] must be a non-negative int"
+    output_hashes = record.get("output_hashes")
+    if not isinstance(output_hashes, dict):
+        return False, "output_hashes must be an object"
+    for path, h in output_hashes.items():
+        if not isinstance(h, str) or not _MANIFEST_SHA256_HEX_RE.match(h.strip().lower()):
+            return False, f"output_hashes[{path!r}] is not a valid sha256 hex digest"
+    return True, None
+
+
+def check_skip_existing_worker(
+    manifest: dict[str, Any],
+    existing_record: "dict[str, Any] | None",
+    *,
+    current_input_hash: "str | None" = None,
+    current_config_hash: "str | None" = None,
+) -> "tuple[bool, str]":
+    """Fail-closed skip-existing gate: "Only allow skip-existing when an
+    existing worker record matches the current manifest/config/input hashes
+    and passes structural validation" (sprint spec, verbatim).
+
+    Returns ``(True, reason)`` ONLY when ALL of the following hold:
+
+    * ``existing_record`` is present and passes :func:`validate_worker_completion_record`.
+    * ``existing_record["status"] == "complete"`` -- skip-existing only ever
+      makes sense over a worker that already genuinely SUCCEEDED; skipping
+      a prior failed/partial/skipped attempt would silently accept
+      incomplete work as done.
+    * ``existing_record["manifest_hash"] == manifest["manifest_hash"]`` --
+      the manifest (runner identity, inputs, config fingerprint, ...) has
+      not changed since this worker last completed.
+    * ``existing_record["input_hash"] == current_input_hash`` and
+      ``existing_record["config_hash"] == current_config_hash`` -- this
+      SPECIFIC worker's own input/config also has not changed (a worker's
+      input can change even when the run-level manifest hash does not, if
+      the manifest's inputs are run-wide but each worker consumes a slice
+      of them).
+
+    Any single mismatch returns ``(False, <specific reason>)`` -- fail
+    closed, and always WITH a reason (never a bare "no"), since a re-run
+    needs to know exactly why a stale record could not be trusted. Never
+    raises.
+    """
+    if existing_record is None:
+        return False, "no existing worker record on file -- nothing to skip"
+    valid, err = validate_worker_completion_record(existing_record)
+    if not valid:
+        return False, f"existing worker record failed structural validation: {err}"
+    if existing_record.get("status") != WORKER_STATUS_COMPLETE:
+        return False, (
+            f"existing worker record has status={existing_record.get('status')!r}, "
+            "not 'complete' -- only a genuinely completed prior attempt can be skipped"
+        )
+    if existing_record.get("manifest_hash") != manifest.get("manifest_hash"):
+        return False, (
+            "existing worker record's manifest_hash does not match the "
+            "CURRENT manifest -- the manifest changed since this worker last "
+            "ran (different inputs/config/runner identity); re-run required"
+        )
+    if existing_record.get("input_hash") != current_input_hash:
+        return False, (
+            f"existing worker record's input_hash "
+            f"({existing_record.get('input_hash')!r}) does not match the "
+            f"current input_hash ({current_input_hash!r}) -- this worker's "
+            "input changed since it last completed; re-run required"
+        )
+    if existing_record.get("config_hash") != current_config_hash:
+        return False, (
+            f"existing worker record's config_hash "
+            f"({existing_record.get('config_hash')!r}) does not match the "
+            f"current config_hash ({current_config_hash!r}) -- this worker's "
+            "config changed since it last completed; re-run required"
+        )
+    return True, (
+        "existing worker record matches the current manifest/config/input "
+        "hashes and is structurally valid -- safe to skip"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed aggregation.
+# ---------------------------------------------------------------------------
+
+def aggregate_worker_completions(
+    manifest: dict[str, Any],
+    records: "list[dict[str, Any]]",
+    *,
+    expected_worker_ids: "list[str]",
+) -> dict[str, Any]:
+    """Fail-closed aggregation over one run's per-worker completion records.
+
+    Fails closed (``ok=False``, ``status="failed"``) on ANY of:
+
+    * **missing** -- an id in ``expected_worker_ids`` with no record at all.
+    * **duplicate** -- the SAME ``worker_id`` submitting more than one
+      record (a race in a parallel rerun) -- regardless of whether the
+      duplicates agree; two submissions for one worker is itself the
+      violation.
+    * **structurally invalid** -- a record failing
+      :func:`validate_worker_completion_record`.
+    * **hash-mismatched** -- a record's ``manifest_hash`` does not match
+      ``manifest["manifest_hash"]`` (it was built against a stale/different
+      manifest).
+    * **schema-mismatched** -- ``manifest`` declares ``output_schema``
+      domains but a record's ``domain`` is not one of them (only enforced
+      when the manifest actually declared domains -- see
+      :func:`_validate_output_schema`).
+    * **empty** -- a record reporting ``status="complete"`` with NO output
+      hashes and all-zero row counts (claims success but produced nothing).
+    * **partial without opt-in** -- any ``status="partial"`` record when
+      ``manifest["allow_partial"]`` is ``False``.
+    * **no expectation declared** -- ``expected_worker_ids`` is empty. This
+      is never vacuously "complete" (mirrors
+      :func:`meridian.pointers._summarize_target_resolution`'s own "empty is
+      never vacuously ready" rule) -- a caller must always declare how many
+      workers this run should have produced.
+
+    Distinguishes FULL PRODUCTION DATA from a VALID FAILURE-STAGE SUBSET:
+    when ``manifest["allow_partial"]`` is ``True`` and the ONLY issues are
+    missing/partial workers (no duplicate/hash-mismatch/schema-mismatch/
+    empty/invalid records), the aggregation succeeds (``ok=True``) with
+    ``status="partial"`` and ``is_full_production=False`` -- a legitimate,
+    explicitly-accepted subset, never silently indistinguishable from a
+    genuinely complete run (``status="complete"``, ``is_full_production=True``).
+
+    Keeps raw-domain versus DSE-domain arrays explicitly schema-tagged in
+    the returned ``domains`` rollup (each entry carries the manifest's own
+    declared ``kind``).
+
+    Exposes deterministic diagnostics: ``expected_count``/``observed_count``
+    and a single, deterministically-chosen ``first_failing_worker`` (the
+    lexicographically-first worker id across every problem category --
+    stable across repeated calls with the SAME input, never order-of-
+    iteration dependent).
+
+    Never raises -- every violation is reported in the returned dict, never
+    an exception (this is meant to run as a completion/provenance GATE, not
+    something a caller wraps in try/except).
+    """
+    expected = sorted({str(w) for w in (expected_worker_ids or [])})
+    manifest_hash = manifest.get("manifest_hash")
+    allow_partial = bool(manifest.get("allow_partial"))
+    domains_declared: dict[str, Any] = (manifest.get("output_schema") or {}).get("domains") or {}
+
+    seen_worker_ids: dict[str, int] = {}
+    structurally_invalid: list[str] = []
+    structurally_invalid_worker_ids: set[str] = set()
+    duplicate_workers: set[str] = set()
+    valid_records: dict[str, dict[str, Any]] = {}
+
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            structurally_invalid.append("<malformed non-dict record>")
+            continue
+        raw_wid = rec.get("worker_id")
+        wid_key = str(raw_wid) if isinstance(raw_wid, str) and raw_wid.strip() else "<missing worker_id>"
+        seen_worker_ids[wid_key] = seen_worker_ids.get(wid_key, 0) + 1
+        if seen_worker_ids[wid_key] > 1:
+            duplicate_workers.add(wid_key)
+        valid, err = validate_worker_completion_record(rec)
+        if not valid:
+            structurally_invalid.append(f"{wid_key}: {err}")
+            structurally_invalid_worker_ids.add(wid_key)
+            continue
+        valid_records[wid_key] = rec
+
+    observed_ids = sorted(seen_worker_ids)
+    missing_workers = sorted(set(expected) - set(observed_ids))
+
+    hash_mismatched: list[str] = []
+    schema_mismatched: list[str] = []
+    empty_output: list[str] = []
+    partial_workers: list[str] = []
+    counts_by_status: dict[str, int] = {s: 0 for s in sorted(WORKER_STATUSES)}
+    domain_rollup: dict[str, dict[str, Any]] = {
+        name: {"kind": spec.get("kind"), "complete_workers": 0, "rows": 0}
+        for name, spec in domains_declared.items()
+    }
+
+    for wid_key, rec in valid_records.items():
+        status = rec.get("status")
+        counts_by_status[status] = counts_by_status.get(status, 0) + 1
+        if rec.get("manifest_hash") != manifest_hash:
+            hash_mismatched.append(wid_key)
+        domain = rec.get("domain")
+        if domains_declared:
+            if domain not in domains_declared:
+                schema_mismatched.append(wid_key)
+            elif status == WORKER_STATUS_COMPLETE:
+                domain_rollup[domain]["complete_workers"] += 1
+                domain_rollup[domain]["rows"] += sum(rec.get("row_counts", {}).values())
+        if status == WORKER_STATUS_COMPLETE:
+            total_rows = sum(rec.get("row_counts", {}).values())
+            if not rec.get("output_hashes") and total_rows == 0:
+                empty_output.append(wid_key)
+        if status == WORKER_STATUS_PARTIAL:
+            partial_workers.append(wid_key)
+
+    hash_mismatched.sort()
+    schema_mismatched.sort()
+    empty_output.sort()
+    partial_workers.sort()
+
+    has_hard_violation = bool(
+        duplicate_workers or hash_mismatched or schema_mismatched
+        or empty_output or structurally_invalid
+    )
+
+    problem_workers = sorted(
+        set(missing_workers) | duplicate_workers | set(hash_mismatched)
+        | set(schema_mismatched) | set(empty_output) | structurally_invalid_worker_ids
+        | (set(partial_workers) if not allow_partial else set())
+    )
+    first_failing_worker = problem_workers[0] if problem_workers else None
+
+    if not expected:
+        status_verdict = AGGREGATION_STATUS_FAILED
+        ok = False
+        is_full_production = False
+        reason = (
+            "expected_worker_ids is empty -- aggregation refuses to guess how "
+            "many workers this run should have produced (fail closed, never "
+            "vacuously complete); declare the full expected worker id set"
+        )
+    elif not has_hard_violation and not missing_workers and not partial_workers:
+        status_verdict = AGGREGATION_STATUS_COMPLETE
+        ok = True
+        is_full_production = True
+        reason = (
+            "every expected worker completed with matching hashes and no "
+            "integrity violations -- full production data"
+        )
+    elif not has_hard_violation and allow_partial and valid_records and (missing_workers or partial_workers):
+        status_verdict = AGGREGATION_STATUS_PARTIAL
+        ok = True
+        is_full_production = False
+        reason = (
+            f"allow_partial=True and this run has {len(missing_workers)} "
+            f"missing / {len(partial_workers)} partial worker(s) with no "
+            "integrity violations -- accepted as a VALID failure-stage "
+            "subset, distinct from full production data"
+        )
+    else:
+        status_verdict = AGGREGATION_STATUS_FAILED
+        ok = False
+        is_full_production = False
+        reasons: list[str] = []
+        if missing_workers:
+            reasons.append(f"{len(missing_workers)} missing worker(s): {missing_workers}")
+        if duplicate_workers:
+            reasons.append(
+                f"{len(duplicate_workers)} duplicate worker submission(s): "
+                f"{sorted(duplicate_workers)}"
+            )
+        if hash_mismatched:
+            reasons.append(f"{len(hash_mismatched)} hash-mismatched worker(s): {hash_mismatched}")
+        if schema_mismatched:
+            reasons.append(
+                f"{len(schema_mismatched)} schema-mismatched worker(s): {schema_mismatched}"
+            )
+        if empty_output:
+            reasons.append(
+                f"{len(empty_output)} worker(s) reported complete with empty output: {empty_output}"
+            )
+        if structurally_invalid:
+            reasons.append(
+                f"{len(structurally_invalid)} structurally invalid record(s): {structurally_invalid}"
+            )
+        if partial_workers and not allow_partial:
+            reasons.append(
+                f"{len(partial_workers)} partial worker(s) but manifest.allow_partial "
+                f"is False: {partial_workers}"
+            )
+        if not reasons:
+            reasons.append("aggregation could not reach a complete/partial verdict")
+        reason = "; ".join(reasons)
+
+    return {
+        "ok": ok,
+        "status": status_verdict,
+        "is_full_production": is_full_production,
+        "reason": reason,
+        "run_id": manifest.get("run_id"),
+        "manifest_hash": manifest_hash,
+        "expected_count": len(expected),
+        "observed_count": len(observed_ids),
+        "counts_by_status": counts_by_status,
+        "missing_workers": missing_workers,
+        "duplicate_workers": sorted(duplicate_workers),
+        "hash_mismatched_workers": hash_mismatched,
+        "schema_mismatched_workers": schema_mismatched,
+        "empty_output_workers": empty_output,
+        "partial_workers": partial_workers,
+        "structurally_invalid_records": structurally_invalid,
+        "first_failing_worker": first_failing_worker,
+        "domains": domain_rollup,
+        "worker_records": valid_records,
+    }
+
+
+def summarize_execution_manifest_aggregation(aggregation: dict[str, Any]) -> dict[str, Any]:
+    """Compact projection of an :func:`aggregate_worker_completions` result
+    -- mirrors :func:`summarize_contract_for_report`'s role for executor
+    contracts: small enough to embed in a report/handoff row, still carries
+    the hash + fail-closed verdict a downstream completion/provenance gate
+    needs without re-deriving anything."""
+    return {
+        "run_id": aggregation.get("run_id"),
+        "manifest_hash": aggregation.get("manifest_hash"),
+        "status": aggregation.get("status"),
+        "ok": aggregation.get("ok"),
+        "is_full_production": aggregation.get("is_full_production"),
+        "expected_count": aggregation.get("expected_count"),
+        "observed_count": aggregation.get("observed_count"),
+        "first_failing_worker": aggregation.get("first_failing_worker"),
+    }

@@ -111,6 +111,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "add_custom_hook": 'add_custom_hook(project_id="abc-123", name="no-secrets", event="PreToolUse", matcher="Read|Bash", script_sh="grep -q SECRET_KEY <<<\\"$(cat)\\" && exit 2 || exit 0", blocking=True)',
     "get_custom_hooks": 'get_custom_hooks(project_id="abc-123", event="PreToolUse")',
     "delete_custom_hook": 'delete_custom_hook(project_id="abc-123", hook_id="hook-uuid")',
+    "update_custom_hook": 'update_custom_hook(project_id="abc-123", hook_id="hook-uuid", enabled=False)  # or edit name/event/matcher/script_sh/script_ps1/blocking',
 }
 
 
@@ -387,7 +388,22 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "continuation_status, message} — resolve/claim the remaining item(s), record a "
         "genuine blocker_kind on them, or call again with checkpoint=true. Default "
         "(strict_continuation omitted/false) behavior never blocks — continuation_status "
-        "is still always returned so a caller can act on it voluntarily.",
+        "is still always returned so a caller can act on it voluntarily. "
+        "Also supports selected_item_ids (cffb9323) — an explicit INCLUDE-ONLY item scope "
+        "for safe parallel-follow-up handoffs. force_include_ids only ever WIDENS the "
+        "pending list (re-adds specific deferred ids); selected_item_ids NARROWS it: when "
+        "given, generate_handoff resolves a dependency-closed scope (the requested ids "
+        "plus any transitively-required depends_on ancestor still todo/pending) and "
+        "applies it identically across every executable mode (full/delta/starter/goal), so "
+        "an isolated two-item follow-up handoff never emits the rest of the eligible "
+        "version backlog or overlaps an active wave/batch a sibling session already owns. "
+        "The rendered /goal carries a <selected_item_scope requested=... closure=... "
+        "closure_hash=...> tag stating the exact selected ids and the wave plan — embedded "
+        "in the body BEFORE the provenance token is minted, so the selection is bound into "
+        "the SAME body-hash/token-integrity mechanism (efaa918a) as the rest of the /goal "
+        "block. Fails CLOSED, not silently widened: a missing/foreign/wrong-version/"
+        "already-in_progress/otherwise-non-pending requested id raises a structured "
+        "refusal (HandoffSelectionError) — nothing is rendered or persisted for that call.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"]},
@@ -395,7 +411,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "root_dir": {"type": "string", "description": "Optional request-local absolute source-tree root used by live pointer resolution's local semantic fallback when no code tunnel is available. Never persisted."},
          "version": {"type": "string", "description": "(b8f89491) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this handoff to — applies to every mode (full/delta/starter/compact/goal), not just starter. Wins over the calling session's own stored sprint_version. Omit to fall back to session_id's scope, or to the whole project's cross-version backlog when neither is set."},
          "force_include_ids": {"type": "array", "items": {"type": "string"}, "description": "(45f519a0, validated by 3cab355a) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming. Every id is validated: it must belong to this project, match the effective version scope (when one applies), and be genuinely todo/pending — an unknown/cross-project/cross-version/not-pending id is rejected (reported in the response's force_include_rejected list, never silently dropped) rather than honoured. Accepted ids are also exempt from the code-pointer enrichment cap, so a requested item always gets prospected regardless of how large the pending board is."},
-         "selected_item_ids": {"type": "array", "items": {"type": "string"}, "description": "(94f48e4d) Optional list of sprint-item ids to RESTRICT this handoff to — exactly these items plus their still-open depends_on closure, instead of the full project/version backlog. Applies to full/delta/goal modes. FAIL-CLOSED, unlike force_include_ids above: any unknown, cross-project, cross-version, or non-pending (done/skipped/in_progress) id refuses the WHOLE call — nothing rendered, written, or persisted — returning {error: HANDOFF_SELECTION_BLOCKED, selection_rejected, message} instead of silently returning a narrower or broader scope than requested. Omit/empty for today's unrestricted behavior (zero change for every existing caller)."},
+         "selected_item_ids": {"type": "array", "items": {"type": "string"}, "description": "(cffb9323) Optional explicit INCLUDE-ONLY item scope for a safe, isolated parallel-follow-up handoff — the opposite direction from force_include_ids (which WIDENS the pending list). When given, the pending batch on EVERY mode (full/delta/starter/compact/goal) is narrowed to exactly these ids plus their dependency closure (any depends_on ancestor still todo/pending in this project/version) — nothing else from the eligible backlog is included. Every requested id is validated (must exist, belong to this project, match the effective version scope when one applies, and be genuinely todo/pending — not already in_progress under another session, not done/failed/skipped): if ANY id fails validation, generate_handoff raises rather than silently falling back to the unfiltered backlog. The dependency-closure ids and a stable hash of that closure are rendered in a <selected_item_scope> tag inside the /goal block, bound into the same token body-hash as the rest of the content."},
          "skip_ai_summary": {"type": "boolean", "description": "65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time."},
          "strict_evidence": {"type": "boolean", "description": "(8a883f60) Opt-in, off by default — mirrors complete_sprint_item's strict_evidence shape exactly. When true, a failed/degraded pointer-enrichment/freshness/wave-gate/graph-search capability makes this call refuse to render or persist a handoff at all, returning {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, evidence_errors, message} instead. Leave false/omitted for today's graceful-degrade behavior (handoff_evidence_status is still returned either way)."},
          "strict_pointer_evidence": {"type": "boolean", "description": "(eb8b6894) Opt-in, off by default, separate from strict_evidence above. When true, the claimable/goal batch's UNPROSPECTED exclusion requires a pending item's durable pointer(s) to have actually RESOLVED (resolve_pointer succeeded), not merely be PRESENT as a row — a structurally-valid-but-unresolved pointer no longer silently satisfies the gate. Never raises/blocks the whole handoff (unlike strict_evidence): an affected item is simply excluded from the claimable batch, the same way today's presence-only UNPROSPECTED gate already excludes items. Every pending item's pointer_resolution_status (structural_valid/target_resolved/provenance_verified/resolution_source/strict_satisfied) is always returned regardless of this flag — it only changes which items make the claimable cut."},
@@ -1252,7 +1268,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "labelled in the result ({rung: 'graph'|'serena'|'semantic', hits:[...], "
         "fallback_reason: str?}) so the caller knows which level succeeded. "
         "All three legs are best-effort: a missing tunnel, inactive slot, or "
-        "missing root_dir degrades to the next rung, never an error. "
+        "missing root_dir degrades to the next rung, never a bare error with "
+        "no diagnostic. d5e60791 — every rung's outcome is recorded under "
+        "result.rungs.{graph,serena,semantic}: status "
+        "('not_attempted'|'skipped'|'attempted'|'succeeded'|'empty'|'error'), "
+        "attempted_tool/selected_tool, and (on skip/error) a reason/error + "
+        "error_kind ('dependency_error' vs 'runtime_error') — a missing "
+        "dependency (e.g. an uninstalled local package) or any other runtime "
+        "failure in a rung is NEVER silently collapsed into rung='none' with "
+        "no trace; fallback_reason is always populated when every rung misses. "
         "4b8f083f — when root_dir is a git checkout, the graph rung is ALSO "
         "auto-skipped (same as an explicit stale_graph=true, with fallback_reason "
         "'graph_skipped_commit_drift_detected') whenever a cheap local "
@@ -2027,15 +2051,10 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "left untouched (re-run once they clear). Idempotent — recomputes from the live "
         "board each call. Hand-override any item afterwards with update_sprint_item(wave=...). "
         "Returns {version, wave_count, assigned, waves: {'wave-1': [ids...], ...}, "
-        "blocked_count, undeclared_count, cycles, graph_digest}. 605ca2c4 — if active "
-        "executor sessions are detected, the response also includes "
-        "active_session_warning: re-labeling wave numbers while a session is mid-flight "
-        "can desync it from a /goal string that already references specific wave labels. "
-        "05553946 — cycles lists any depends_on cycle found among the eligible items "
-        "(full closed path per cycle); a non-empty list means the affected items' wave "
-        "labels are a lenient best-effort fallback, not a real topological position — fix "
-        "via update_sprint_item(depends_on=...), which rejects new cycles outright. "
-        "graph_digest is a deterministic digest of the eligible set's dependency edges.",
+        "blocked_count, undeclared_count}. 605ca2c4 — if active executor sessions are "
+        "detected, the response also includes active_session_warning: re-labeling wave "
+        "numbers while a session is mid-flight can desync it from a /goal string that "
+        "already references specific wave labels.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string", "description": "Optional: only assign waves to items in this sprint-version bucket."}},
@@ -2661,13 +2680,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "a tools/list re-discovery is pending. Includes a run_id + timestamp for "
         "correlating with support requests. Tokens/credentials are redacted. "
         "Requires an authenticated hosted tenant (tunnel mode) — self-hosted "
-        "callers with no tenant get an empty, unauthenticated-shaped snapshot. "
-        "315b0a63 — also includes process_leases: {available, active, "
-        "unowned_survivors} from this SERVER PROCESS's own local cross-client "
-        "worker-lease registry (meridian/process_registry.py). Meaningful when "
-        "this process shares a machine with the registering client(s) — e.g. a "
-        "self-hosted single-machine install; a remote hosted instance has no "
-        "visibility into your laptop and correctly reports zero here.",
+        "callers with no tenant get an empty, unauthenticated-shaped snapshot.",
      "inputSchema": {"type": "object", "properties": {
          "hostname": {"type": "string", "description": "Optional: report only this machine's per-host config override instead of the per-tenant default (mirrors get_tunnel_plugins's ?hostname=)."}},
          "required": []}},
@@ -2850,6 +2863,32 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "hook_id": {"type": "string", "description": "The hook id to delete."}},
+         "required": ["hook_id"]}},
+    {"name": "update_custom_hook", "description":
+        "b4f4627f — the previously-missing generic enable/disable/edit path for a "
+        "user-defined hook (id returned by add_custom_hook / get_custom_hooks): patches "
+        "name, event, matcher, script_sh, script_ps1, blocking, and/or enabled without "
+        "the delete+recreate round-trip add_custom_hook/delete_custom_hook would "
+        "otherwise require. At least one editable field is required. Renaming re-derives "
+        "the slug (same reserved-name / uniqueness checks as add_custom_hook); the db "
+        "layer raises ValueError for a bad event, the reserved 'sprint_guard' name, or a "
+        "slug collision — surfaced as {error}. Returns {error} (never raises) when "
+        "hook_id doesn't resolve for this project. Flipping enabled true -> false also "
+        "removes any already-written .claude/hooks/<slug>.* files immediately (best-"
+        "effort, when the project has a resolvable repo_path) instead of waiting for the "
+        "next generate_handoff to simply stop re-writing them — reported back as "
+        "removed_files when any were deleted.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "hook_id": {"type": "string", "description": "The hook id to update."},
+         "name": {"type": "string", "description": "New human-readable name; re-derives the slug (must not be 'sprint_guard' or collide with another hook's slug on this project)."},
+         "event": {"type": "string", "enum": ["PreToolUse", "PostToolUse", "Stop"], "description": "New hook event."},
+         "script_sh": {"type": "string", "description": "New POSIX shell script body."},
+         "script_ps1": {"type": "string", "description": "New PowerShell script body."},
+         "matcher": {"type": "string", "description": "New Claude Code tool-name matcher regex; ignored for Stop hooks."},
+         "blocking": {"type": "boolean", "description": "true = real exit-code-blocking semantics. false = advisory/non-blocking."},
+         "enabled": {"type": "boolean", "description": "Enable/disable this hook. Disabling immediately removes any already-written artifact files for it (best-effort)."}},
          "required": ["hook_id"]}},
 ]
 
@@ -3091,6 +3130,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "add_custom_hook":     "config",
     "get_custom_hooks":    "config",
     "delete_custom_hook":  "config",
+    "update_custom_hook":  "config",
     # research
     "paper_search": "research",
     "social_search": "research",
@@ -3213,6 +3253,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "add_custom_hook":           "both",
     "get_custom_hooks":          "both",
     "delete_custom_hook":        "both",
+    "update_custom_hook":        "both",
     "add_note":                  "both",
     "get_notes":                 "both",
     "read_note":                 "both",
@@ -3421,6 +3462,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "add_custom_hook":            "maintenance-only",
     "get_custom_hooks":           "maintenance-only",
     "delete_custom_hook":         "maintenance-only",
+    "update_custom_hook":         "maintenance-only",
     # goal / sprint editing (planning boundaries only)
     "set_goal":                   "maintenance-only",
     "set_north_star":             "maintenance-only",

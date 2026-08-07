@@ -1620,6 +1620,98 @@ def find_outputs_by_source(
     }
 
 
+def check_promotion_source_freshness(
+    outputs_dir: str, source_output_path: str, *, expected_sha256: "str | None" = None,
+) -> dict[str, Any]:
+    """24f5146d — provenance-closure check for the SOURCE half of a
+    script->artifact->document promotion: does the script-run output about
+    to be promoted into a docx still match an EXPECTED content hash a caller
+    captured earlier (e.g. when the promotion's declaration/resource
+    footprint was first authored, or from a prior
+    ``meridian-outputs`` provenance record)?
+
+    Reuses :func:`resolve_output_with_fallback` (never reimplemented) to
+    find ``source_output_path`` in the outputs index — exact path first,
+    then a relocation-tolerant basename fallback — purely to resolve the
+    real on-disk path and confirm the output is genuinely indexed at all.
+    The actual freshness comparison is against ``expected_sha256`` — NOT
+    against the index's own recorded ``sha256`` — because
+    :func:`resolve_output_with_fallback` triggers an INCREMENTAL rebuild on
+    every call (5116078b), which re-hashes any changed file before this
+    function ever reads it; comparing the index's own hash against a
+    freshly-computed one taken microseconds later can never observe a
+    change; it would always read "fresh," which is not a genuine check.
+    ``expected_sha256`` breaks that self-healing loop by supplying a
+    baseline from OUTSIDE this call.
+
+    This closes the "script-run -> artifact" half of provenance; the
+    "artifact -> document" half (has the DOCX target itself changed since
+    the promotion was declared) is
+    :func:`meridian.artifact_declaration.check_promotion_preconditions` —
+    the two are deliberately separate, composable checks rather than one
+    function conflating two different staleness questions.
+
+    Returns ``{"resolved": bool, "match_type": str | None, "fresh": bool | None,
+    "expected_sha256": str | None, "current_sha256": str | None, "reason": str}``.
+    ``fresh`` is ``None`` — "cannot confirm," never silently treated as
+    fresh or stale — when the source could not be resolved in the index at
+    all, when ``expected_sha256`` was not supplied (nothing to compare
+    against), or when the current content could not be hashed. Never
+    raises.
+    """
+    resolved = resolve_output_with_fallback(outputs_dir, source_output_path)
+    if resolved is None:
+        return {
+            "resolved": False,
+            "match_type": None,
+            "fresh": None,
+            "expected_sha256": expected_sha256,
+            "current_sha256": None,
+            "reason": (
+                "source output not found in the outputs index — provenance "
+                "freshness cannot be verified"
+            ),
+        }
+    current_sha256 = _sha256_file(resolved.get("path") or source_output_path)
+    if expected_sha256 is None:
+        return {
+            "resolved": True,
+            "match_type": resolved.get("match_type"),
+            "fresh": None,
+            "expected_sha256": None,
+            "current_sha256": current_sha256,
+            "reason": (
+                "no expected_sha256 supplied — resolved the source but have "
+                "nothing to compare its current content against"
+            ),
+        }
+    if current_sha256 is None:
+        return {
+            "resolved": True,
+            "match_type": resolved.get("match_type"),
+            "fresh": None,
+            "expected_sha256": expected_sha256,
+            "current_sha256": None,
+            "reason": "current content could not be hashed — freshness cannot be confirmed",
+        }
+    fresh = current_sha256 == expected_sha256
+    return {
+        "resolved": True,
+        "match_type": resolved.get("match_type"),
+        "fresh": fresh,
+        "expected_sha256": expected_sha256,
+        "current_sha256": current_sha256,
+        "reason": (
+            "output content matches the expected hash"
+            if fresh
+            else (
+                "output content no longer matches the expected hash — the "
+                "artifact this promotion would embed may be stale"
+            )
+        ),
+    }
+
+
 class OutputsIndexer:
     """Recursive watcher + queryable index over an outputs directory tree.
 

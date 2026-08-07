@@ -101,6 +101,7 @@ a live Zotero.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -2405,3 +2406,152 @@ def assemble_artifact_pointer_findings_from_annotated_items(
         if isinstance(finding, dict):
             entries.append(finding)
     return sorted(entries, key=lambda e: e.get("item_id") or "")
+
+
+# ---------------------------------------------------------------------------
+# 3b3020ac -- execution-manifest-backed readiness.
+#
+# meridian.executor_contract.aggregate_worker_completions() (a hash-pinned,
+# fail-closed aggregation over a scientific fan-out run's per-worker
+# completion records) is consumed here as a PLAIN DICT -- this module
+# deliberately never imports meridian.executor_contract at module scope:
+# executor_contract already imports meridian.capability_contract, which in
+# turn imports THIS module for pointer extraction, so an eager import here
+# would be a real cycle. Duck-typing the aggregation shape (``ok``,
+# ``status``, ``worker_records: {worker_id: {output_hashes: {path: sha256}, ...}}``)
+# keeps this a genuinely thin adapter: no re-derivation of aggregation
+# logic, just one more fail-closed cross-check layered on top of
+# :func:`verify_target_readiness`'s existing disk-presence gate.
+#
+# Completion/provenance gates must consume the manifest rather than trust
+# narrative notes or directory presence (sprint spec) -- this is that
+# consumption point for the pointers.py readiness primitive specifically.
+# ---------------------------------------------------------------------------
+
+def _local_sha256_file(path: str) -> "str | None":
+    """Minimal, dependency-free sha256-of-a-file helper (mirrors
+    ``meridian.executor_contract.hash_file_set``'s per-file semantics; not
+    imported from there to avoid the cycle described above). ``None`` on any
+    read failure -- never raises."""
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
+async def verify_execution_manifest_target_readiness(
+    target: dict[str, Any],
+    aggregation: "dict[str, Any] | None",
+    *,
+    outputs_dir: str | None = None,
+    path_exists: Callable[[str], bool] | None = None,
+    is_dir: Callable[[str], bool] | None = None,
+    hash_file: Callable[[str], "str | None"] | None = None,
+    figure_resolver: FigureResolver | None = None,
+    provenance_getter: ProvenanceGetter | None = None,
+) -> dict[str, Any]:
+    """Fail-closed completion-time readiness for a pointer target that is
+    supposed to be backed by a hash-pinned execution-manifest aggregation
+    (see the module section docstring above), rather than by directory
+    presence alone.
+
+    Reuses :func:`verify_target_readiness` VERBATIM for the disk-level half
+    of the check (existence, is_directory, meridian-outputs
+    canonical/archival classification, planned_new provenance) -- this
+    function only ADDS a manifest cross-check on top, never duplicating any
+    of that logic:
+
+    1. If the base disk-level check is not ``ready``, that verdict is
+       returned unchanged (with ``manifest_verified=False`` and an
+       explanatory ``manifest_reason``) -- a manifest can never rescue a
+       target that genuinely does not exist on disk.
+    2. If ``aggregation`` is missing or not ``ok`` (per
+       ``executor_contract.aggregate_worker_completions``'s own fail-closed
+       verdict), the target is downgraded to ``ready=False`` even if the
+       disk-level check passed -- directory presence alone is never
+       sufficient evidence for a target that claims manifest backing.
+    3. Otherwise, the target's ``uri`` (tried under every normalized local
+       path spelling — :func:`normalize_local_uri_candidates`, the SAME
+       normalization :func:`verify_target_readiness` itself already uses)
+       must appear in ``aggregation["worker_records"]``'s recorded
+       ``output_hashes``, and the file's CURRENT on-disk hash
+       (:func:`_local_sha256_file`, or an injected ``hash_file``) must match
+       the recorded one — a target whose bytes changed since the run
+       completed, or that was never part of the run's own recorded outputs
+       at all, is refused.
+
+    Returns the SAME dict :func:`verify_target_readiness` returns, plus two
+    additive keys: ``manifest_verified`` (bool) and ``manifest_reason``
+    (``None`` iff ``manifest_verified`` is ``True``). Never raises.
+    """
+    base = await verify_target_readiness(
+        target, outputs_dir=outputs_dir, path_exists=path_exists, is_dir=is_dir,
+        figure_resolver=figure_resolver, provenance_getter=provenance_getter,
+    )
+    if not base.get("ready"):
+        return {
+            **base, "manifest_verified": False,
+            "manifest_reason": "disk-level readiness already failed — see 'reason'",
+        }
+
+    if not isinstance(aggregation, dict) or not aggregation.get("ok"):
+        status = aggregation.get("status") if isinstance(aggregation, dict) else None
+        return {
+            **base, "ready": False, "manifest_verified": False,
+            "manifest_reason": (
+                "no ok execution-manifest aggregation was supplied "
+                f"(status={status!r}) — directory presence alone is not "
+                "sufficient evidence; consume "
+                "executor_contract.aggregate_worker_completions()'s result"
+            ),
+        }
+
+    uri = ""
+    if isinstance(target, dict):
+        raw_uri = target.get("uri")
+        uri = raw_uri.strip() if isinstance(raw_uri, str) else ""
+    candidates = set(normalize_local_uri_candidates(uri))
+
+    recorded_hash: "str | None" = None
+    matched_path: "str | None" = None
+    for rec in (aggregation.get("worker_records") or {}).values():
+        if not isinstance(rec, dict):
+            continue
+        for out_path, out_hash in (rec.get("output_hashes") or {}).items():
+            if out_path in candidates:
+                recorded_hash, matched_path = out_hash, out_path
+                break
+        if recorded_hash is not None:
+            break
+
+    if recorded_hash is None:
+        return {
+            **base, "ready": False, "manifest_verified": False,
+            "manifest_reason": (
+                f"{uri!r} is not among the execution-manifest aggregation's "
+                "recorded worker output hashes — no manifest-backed evidence "
+                "this file is genuine run output"
+            ),
+        }
+
+    hasher = hash_file or _local_sha256_file
+    try:
+        current_hash = hasher(matched_path or uri)
+    except Exception as exc:  # noqa: BLE001 — degrade, never fake success
+        return {
+            **base, "ready": False, "manifest_verified": False,
+            "manifest_reason": f"could not hash {uri!r} to verify against the manifest: {exc}",
+        }
+
+    if current_hash != recorded_hash:
+        return {
+            **base, "ready": False, "manifest_verified": False,
+            "manifest_reason": (
+                f"current on-disk hash of {uri!r} ({current_hash!r}) does not "
+                f"match the manifest-recorded output hash ({recorded_hash!r}) "
+                "— the file changed since the run completed"
+            ),
+        }
+
+    return {**base, "manifest_verified": True, "manifest_reason": None}
