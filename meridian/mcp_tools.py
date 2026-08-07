@@ -61,6 +61,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "delete_sprint_item_pointer": 'delete_sprint_item_pointer(pointer_id="pointer-uuid")',
     "execute_batch": 'execute_batch(project_id="abc-123", operation="sprint_items", entries=[{"title": "Add rate limiting", "correlation_key": "a"}, {"title": "Add retry backoff", "correlation_key": "b"}], mode="all_or_nothing", idempotency_key="my-2026-08-05-batch-1")',
+    "batch_read": 'batch_read(project_id="abc-123", requests=[{"request_id": "items", "adapter": "sprint_board", "operation": "get_sprint_items", "args": {"status": "pending"}}, {"request_id": "ptrs", "adapter": "sprint_board", "operation": "get_sprint_item_pointers", "args": {"sprint_item_id": "item-uuid"}, "depends_on": ["items"]}])',
+    "batch_mutate": 'batch_mutate(project_id="abc-123", entries=[{"kind": "sprint_item_update", "item_id": "item-uuid", "priority": "high", "correlation_key": "a"}, {"kind": "sprint_item_pointer", "sprint_item_id": "item-uuid", "source_type": "file", "targets": [{"uri": "meridian/db/batch_management.py"}], "correlation_key": "b"}], mode="all_or_nothing", idempotency_key="my-2026-08-07-mutate-1")',
     "get_notes": 'get_notes(project_id="abc-123")',
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
@@ -1444,6 +1446,72 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "session_id": {"type": "string", "description": "Batch-level default session_id used by 'notes' entries that omit their own session_id."},
          "max_entries": {"type": "integer", "description": "Optional cap on len(entries) for this call (default 100). Exceeding it rejects the whole call before anything is attempted."}},
          "required": ["operation", "entries", "mode", "idempotency_key"]}},
+    {"name": "batch_read", "description":
+        "133bfff6 — run a batch of DOMAIN-AWARE, CONCURRENT read requests in ONE call. "
+        "Each request names an 'adapter' + 'operation' + 'args'; independent requests "
+        "(no depends_on) execute concurrently via asyncio.gather — this is pure in-process "
+        "dispatch, no subagents/worktrees involved. A request with 'depends_on' (a list of "
+        "other requests' 'request_id's in this SAME batch) waits only for its own declared "
+        "prerequisites, not the whole batch; if a prerequisite fails, the dependent resolves "
+        "immediately with error_code='DEPENDENCY_FAILED' and is never executed. Two requests "
+        "with the identical adapter+operation+normalized-args+depends_on-set COALESCE to one "
+        "execution — duplicates come back with cache_hit=true and coalesced_with=<the request_id "
+        "that actually ran>; pass a non-default cache_policy to opt a specific request out of "
+        "coalescing. Adapters currently registered: 'sprint_board' with operations "
+        "'get_sprint_items' (args: status, show_blocked, include_human, version, "
+        "include_manual_blocker, include_deferred — same meaning as the get_sprint_items tool) "
+        "and 'get_sprint_item_pointers' (args: sprint_item_id — 404s if that item belongs to a "
+        "different project). Returns {results: [{request_id, status, adapter, operation, result, "
+        "error_code, error_message, elapsed_ms, cache_hit, coalesced_with}], elapsed_ms} — "
+        "results is ALWAYS in input order. error_code is one of VALIDATION_ERROR, "
+        "ADAPTER_NOT_FOUND, OPERATION_NOT_FOUND, DEPENDENCY_NOT_FOUND, DEPENDENCY_CYCLE, "
+        "DEPENDENCY_FAILED, NOT_FOUND, TIMEOUT, INTERNAL_ERROR. This tool is READ-ONLY — for "
+        "mutations use batch_mutate or execute_batch.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "requests": {"type": "array", "description": "Non-empty list of typed read requests.", "items": {"type": "object", "properties": {
+             "request_id": {"type": "string", "description": "Required, unique within this batch."},
+             "adapter": {"type": "string", "description": "Registered adapter name, e.g. 'sprint_board'."},
+             "operation": {"type": "string", "description": "Operation the adapter exposes, e.g. 'get_sprint_items'."},
+             "args": {"type": "object", "description": "Operation-specific arguments. Defaults to {}."},
+             "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Optional list of this batch's own request_ids that must resolve first."},
+             "timeout_ms": {"type": "integer", "description": "Optional per-request timeout in milliseconds (default 10000)."},
+             "cache_policy": {"type": "string", "description": "Optional. Any value other than omitted/\"\"/\"default\" opts this request OUT of duplicate-coalescing."}},
+             "required": ["request_id", "adapter", "operation"]}},
+         "max_requests": {"type": "integer", "description": "Optional cap on len(requests) for this call (default 100)."}},
+         "required": ["requests"]}},
+    {"name": "batch_mutate", "description":
+        "133bfff6 — run a batch of TRANSACTIONAL mutation entries in ONE call, mixing TWO entry "
+        "kinds selected per-entry via 'kind': 'sprint_item_pointer' (attach a pointer — same "
+        "shape as add_sprint_item_pointer: sprint_item_id, source_type, targets, optional label) "
+        "and 'sprint_item_update' (patch an EXISTING sprint item — same shape as update_sprint_item: "
+        "item_id + at least one patchable field; sprint-item CREATION is not supported here, use "
+        "execute_batch(operation='sprint_items', ...) or add_sprint_item for that). Reuses the exact "
+        "same validated apply/compensate logic execute_batch and the single-item tools already use — "
+        "no separate/duplicated mutation path. mode is REQUIRED: 'all_or_nothing' validates every "
+        "entry BEFORE mutating anything — any validation failure writes NOTHING (status 'rejected'); "
+        "a mutation failure partway through rolls back every entry this call already wrote via a "
+        "compensating delete/revert (status 'failed', per-entry status 'rolled_back'). 'best_effort' "
+        "processes each entry independently (status 'ok' | 'partial' | 'failed'). idempotency_key is "
+        "REQUIRED (pass null or \"\" to explicitly opt out) — a retried call with the identical "
+        "(project_id, idempotency_key) tuple returns the FIRST call's stored result verbatim "
+        "(idempotent_replay:true) instead of re-executing. PROJECT ISOLATION: an entry MAY carry its "
+        "own 'project_id' field, but it MUST match this call's own project_id or the entry is rejected "
+        "outright — a mutation entry can never target a different project. Returns {status, mode, "
+        "project_id, idempotency_key, idempotent_replay, created_count, error_count, results:[{index, "
+        "correlation_key, status, id, outcome, error_code, error_message, retryable}], request_id, "
+        "committed_count, failures:[...failed results...], rollback_status: 'none'|'rolled_back'|"
+        "'rejected'} — results is ALWAYS in input order.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "entries": {"type": "array", "description": "Non-empty list of entries, each carrying its own 'kind' ('sprint_item_pointer' or 'sprint_item_update'). Each entry may carry an optional 'correlation_key' string echoed back on its result.", "items": {"type": "object"}},
+         "mode": {"type": "string", "enum": ["all_or_nothing", "best_effort"], "description": "REQUIRED — no default."},
+         "idempotency_key": {"type": "string", "description": "REQUIRED key (value may be null or \"\" to explicitly opt out)."},
+         "session_id": {"type": "string", "description": "Optional attribution for the idempotency receipt."},
+         "max_entries": {"type": "integer", "description": "Optional cap on len(entries) for this call (default 100)."}},
+         "required": ["entries", "mode", "idempotency_key"]}},
     {"name": "add_insight", "description":
         "Record a durable STRATEGIC INSIGHT — accumulated understanding that generates future "
         "decisions. A first-class knowledge type SEPARATE from decisions (choices with a "
@@ -1877,7 +1945,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "group, deferred_until (enforced deferral), track, or depends_on (dependency ordering). "
         "Only the fields you pass are changed; omitted fields are left untouched. Pass an empty "
         "string for human_id, group, deferred_until, track, or depends_on to clear it. Returns "
-        "the updated item, or an error if the id is unknown.",
+        "the updated item, or an error if the id is unknown. For TWO OR MORE independent item "
+        "patches, prefer the single execute_batch(operation='item_updates', entries=[...], "
+        "mode='best_effort' or 'all_or_nothing', idempotency_key='...') call instead of "
+        "repeating this tool: it validates and reports each item in input order, supports "
+        "per-item correlation_key values, and makes retries idempotent. Use best_effort when "
+        "one invalid item must not block the rest; use all_or_nothing when the whole patch set "
+        "must succeed together.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
@@ -2896,6 +2970,7 @@ _READ_ONLY_TOOLS = {
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
     "get_custom_hooks",
+    "batch_read",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook"}
 
@@ -2983,6 +3058,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "resolve_sprint_item_pointers":  "sprint-management",
     "delete_sprint_item_pointer":    "sprint-management",
     "execute_batch":                 "sprint-management",
+    "batch_read":                    "sprint-management",
+    "batch_mutate":                  "sprint-management",
     # project CRUD
     "create_project":      "project",
     "set_parent_project":  "project",
@@ -3127,6 +3204,8 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "resolve_sprint_item_pointers":  "both",
     "delete_sprint_item_pointer":    "executor",
     "execute_batch":                 "both",
+    "batch_read":                    "both",
+    "batch_mutate":                  "both",
     "claim_file":                "executor",
     "release_file":              "executor",
     "get_file_claims":           "executor",
@@ -3342,6 +3421,8 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "split_sprint_item":          "common-support",
     "add_sprint_item_pointer":    "common-support",
     "execute_batch":              "common-support",
+    "batch_read":                 "common-support",
+    "batch_mutate":               "common-support",
     "update_sprint_item":         "common-support",
     # notes / knowledge (regular lookups)
     "log_task":                   "common-support",
