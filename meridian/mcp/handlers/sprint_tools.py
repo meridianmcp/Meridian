@@ -2063,6 +2063,99 @@ async def handle_execute_batch(
         return {"error": str(exc)}
 
 
+async def handle_batch_read(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: batch_read.
+
+    133bfff6 — generalized, domain-aware CONCURRENT batch-read dispatch.
+    Request-shape/execution logic lives entirely in ``meridian.batch_read``
+    (pure in-process ``asyncio`` dispatch — never subagents/worktrees);
+    this handler only resolves project_id and forwards the call.
+    """
+    from ... import batch_read as batch_read_module  # noqa: PLC0415
+
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    requests = args.get("requests") or []
+    validate_input_size(json.dumps(requests, default=str), "batch_read requests", 2_000_000)
+    max_requests_raw = args.get("max_requests")
+    try:
+        max_requests = (
+            int(max_requests_raw) if max_requests_raw
+            else batch_read_module.DEFAULT_MAX_BATCH_REQUESTS
+        )
+    except (TypeError, ValueError):
+        return {"error": "max_requests must be an integer"}
+    try:
+        return await batch_read_module.batch_read(
+            db,
+            project_id=args["project_id"],
+            requests=requests,
+            tenant_id=_mcp_tenant_id,
+            max_requests=max_requests,
+        )
+    except batch_read_module.BatchReadRequestError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_batch_mutate(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: batch_mutate.
+
+    133bfff6 — transactional, MIXED-kind (sprint_item_pointer +
+    sprint_item_update only) batch mutation. All request-shape validation
+    (mode/idempotency_key) and the actual engine live in
+    ``meridian.batch_mutate`` / ``meridian.db.batch_management.
+    execute_mixed_mutation_batch``, reusing the exact same per-entry
+    adapters ``execute_batch`` already uses — no duplicated mutation logic.
+    """
+    from ... import batch_mutate as batch_mutate_module  # noqa: PLC0415
+
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    try:
+        batch_mutate_module.validate_batch_mutate_request_shape(args)
+    except batch_mutate_module.BatchMutateRequestError as exc:
+        return {"error": str(exc)}
+    entries = args.get("entries") or []
+    validate_input_size(json.dumps(entries, default=str), "batch_mutate entries", 2_000_000)
+    max_entries_raw = args.get("max_entries")
+    try:
+        max_entries = (
+            int(max_entries_raw) if max_entries_raw
+            else batch_mutate_module.DEFAULT_MAX_BATCH_ENTRIES
+        )
+    except (TypeError, ValueError):
+        return {"error": "max_entries must be an integer"}
+    try:
+        return await batch_mutate_module.batch_mutate(
+            db,
+            project_id=args["project_id"],
+            entries=entries,
+            mode=args["mode"],
+            idempotency_key=args.get("idempotency_key") or None,
+            tenant_id=_mcp_tenant_id,
+            actor=args.get("session_id"),
+            session_id=args.get("session_id"),
+            max_entries=max_entries,
+        )
+    except (
+        batch_mutate_module.BatchMutateRequestError,
+        batch_mutate_module.batch_management.BatchEngineError,
+    ) as exc:
+        return {"error": str(exc)}
+
+
 async def handle_complete_wave_gate(
     args: dict[str, Any],
     db: Any,
