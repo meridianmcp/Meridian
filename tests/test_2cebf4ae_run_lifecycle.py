@@ -34,6 +34,15 @@ import pytest
 import scripts.run_tests as rt
 from meridian import orphan_reaper
 
+# Captured before the module-wide _stub_cleanup_and_integrations autouse
+# fixture (below) monkeypatches rt._kill_process_tree/_report_survivors to
+# no-op stubs for every _run_pytest_observed test -- section 6's tests
+# below need the REAL implementations to exercise the psutil-availability
+# fallback, so they call these captured references instead of the
+# (per-test, possibly stubbed) rt.* module attributes.
+_REAL_KILL_PROCESS_TREE = rt._kill_process_tree
+_REAL_REPORT_SURVIVORS = rt._report_survivors
+
 
 # ---------------------------------------------------------------------------
 # 1. Windows PID-liveness fix
@@ -41,9 +50,10 @@ from meridian import orphan_reaper
 
 
 class _FakeWin32Probe:
-    def __init__(self, *, handle=None, last_error=0):
+    def __init__(self, *, handle=None, last_error=0, exit_code=None):
         self._handle = handle
         self._last_error = last_error
+        self._exit_code = exit_code
         self.opened_pid = None
         self.closed_handle = None
 
@@ -57,6 +67,9 @@ class _FakeWin32Probe:
 
     def get_last_error(self):
         return self._last_error
+
+    def get_exit_code(self, handle):
+        return self._exit_code
 
 
 def test_win32_pid_is_running_dead_pid_via_error_invalid_parameter():
@@ -72,6 +85,32 @@ def test_win32_pid_is_running_alive_pid_via_handle():
     probe = _FakeWin32Probe(handle=1234, last_error=0)
     assert rt._win32_pid_is_running(42, probe_loader=lambda: probe) is True
     assert probe.closed_handle == 1234
+
+
+def test_win32_pid_is_running_handle_open_but_exit_code_not_still_active_is_dead():
+    """Real-world gap found via a live spawned-process test: OpenProcess
+    succeeding only proves the process OBJECT still exists, which remains
+    true as long as ANY handle references it -- e.g. a parent's own
+    still-open subprocess.Popen handle -- even after the process has
+    genuinely terminated. GetExitCodeProcess is the actual liveness
+    signal; anything other than STILL_ACTIVE (259) means dead, regardless
+    of the handle having opened successfully."""
+    probe = _FakeWin32Probe(handle=1234, last_error=0, exit_code=0)
+    assert rt._win32_pid_is_running(42, probe_loader=lambda: probe) is False
+    assert probe.closed_handle == 1234
+
+
+def test_win32_pid_is_running_handle_open_and_still_active_is_alive():
+    probe = _FakeWin32Probe(handle=1234, last_error=0, exit_code=rt._STILL_ACTIVE)
+    assert rt._win32_pid_is_running(42, probe_loader=lambda: probe) is True
+
+
+def test_win32_pid_is_running_exit_code_query_unavailable_fails_safe_alive():
+    """If GetExitCodeProcess itself can't be queried (exit_code stays
+    None), fall through to the pre-existing fail-safe ALIVE default rather
+    than guessing dead."""
+    probe = _FakeWin32Probe(handle=1234, last_error=0, exit_code=None)
+    assert rt._win32_pid_is_running(42, probe_loader=lambda: probe) is True
 
 
 def test_win32_pid_is_running_access_denied_treated_as_alive():
@@ -635,3 +674,93 @@ def test_report_tree_survivors_only_checks_given_pids(monkeypatch):
 def test_report_tree_survivors_no_psutil_returns_empty(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", None)
     assert orphan_reaper.report_tree_survivors([1, 2, 3]) == []
+
+
+# ---------------------------------------------------------------------------
+# 6. run_tests.py wrapper truthfulness when psutil is absent (verifier
+#    finding on the initial 2cebf4ae implementation): orphan_reaper's
+#    psutil-backed primitives intentionally silent-degrade to False/[] for
+#    their OWN callers when psutil isn't installed -- but this repo's base
+#    pixi env genuinely has no psutil (gated behind the optional [semantic]
+#    extra), so scripts/run_tests.py must not trust that degraded value as
+#    if it meant "confirmed no survivors" / "kill failed" -- it must detect
+#    psutil's absence itself and route to the real, non-psutil fallback
+#    (taskkill/os.kill + _pid_is_running's OpenProcess-based Windows probe)
+#    instead of silently reporting a clean result for a process that is, in
+#    fact, still alive.
+# ---------------------------------------------------------------------------
+
+
+def test_psutil_importable_reflects_real_availability(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    assert rt._psutil_importable() is False
+
+    class _FakePsutil:
+        pass
+
+    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
+    assert rt._psutil_importable() is True
+
+
+def test_kill_process_tree_falls_back_when_psutil_absent(monkeypatch):
+    """Without the fix, orphan_reaper.kill_process_tree(pid) would silently
+    return False (psutil ImportError swallowed inside orphan_reaper), and
+    _kill_process_tree's try/except would treat that False as a normal
+    return value -- never reaching the dependency-free taskkill/os.kill
+    fallback below. Assert the fallback actually runs when psutil is gone,
+    by spawning a real child process and confirming it is truly killed."""
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    import subprocess as _subprocess
+
+    proc = _subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+    try:
+        assert rt._pid_is_running(proc.pid) is True
+        result = _REAL_KILL_PROCESS_TREE(proc.pid)
+        proc.wait(timeout=10)
+        assert result is True
+        assert rt._pid_is_running(proc.pid) is False
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+def test_report_survivors_falls_back_when_psutil_absent(monkeypatch):
+    """Without the fix, orphan_reaper.report_tree_survivors(pids) would
+    silently return [] when psutil is missing, which _report_survivors
+    would pass straight through -- falsely reporting "no survivors" for a
+    pid that is demonstrably still alive. Assert the real _pid_is_running
+    fallback engages instead."""
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    import subprocess as _subprocess
+
+    proc = _subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+    try:
+        survivors = _REAL_REPORT_SURVIVORS([proc.pid])
+        assert survivors == [proc.pid]
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_kill_process_tree_prefers_reaper_when_psutil_present(monkeypatch):
+    """Sanity check for the other branch: when psutil IS importable, the
+    orphan_reaper-backed path is still used (this fix must not bypass it
+    unconditionally, only when psutil is genuinely absent)."""
+    class _FakePsutil:
+        pass
+
+    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
+    called = {}
+
+    def _fake_kill(pid):
+        called["pid"] = pid
+        return True
+
+    monkeypatch.setattr(orphan_reaper, "kill_process_tree", _fake_kill)
+    assert _REAL_KILL_PROCESS_TREE(999) is True
+    assert called["pid"] == 999
