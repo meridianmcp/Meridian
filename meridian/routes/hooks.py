@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 
 from .._deps import _hosted_mode
 
@@ -235,3 +236,43 @@ async def delete_connection(name: str, request: Request) -> dict[str, Any]:
         connections=connections,
     )
     return {"ok": True, "deleted": name}
+
+
+# ---------------------------------------------------------------------------
+# Package-install verification gate (23f21820)
+# ---------------------------------------------------------------------------
+
+class _PkgGuardRequest(BaseModel):
+    command: str
+
+
+@router.post("/pkg-guard/check")
+async def pkg_guard_check(body: _PkgGuardRequest) -> dict[str, Any]:
+    """23f21820 -- package-install verification gate.
+
+    Accepts a Bash command string (from the PreToolUse hook), extracts any
+    pip/npm/uvx install operations, and checks each package against its
+    registry (PyPI JSON API or npm registry). Returns a gate decision:
+      - action: "allow" | "warn"
+      - message: advisory text (empty when allow)
+      - packages: list of extracted package names
+      - results: per-package registry check details
+      - allowlisted_all: true when every package was in the known-good allowlist
+
+    Fails open: any server-side error returns action="allow" so a Meridian
+    availability issue never permanently wedges an executor session.
+    """
+    from ..pkg_install_guard import gate_command  # noqa: PLC0415
+
+    try:
+        result = gate_command(body.command)
+    except Exception as exc:
+        # Fail open -- never let a bug in the guard block legitimate work.
+        return {
+            "action": "allow",
+            "message": f"pkg-guard internal error (failing open): {exc}",
+            "packages": [],
+            "results": [],
+            "allowlisted_all": True,
+        }
+    return result
