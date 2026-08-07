@@ -369,6 +369,26 @@ def test_build_extractor_proxy_command_shell_for_cmd_inner_on_windows(monkeypatc
     assert cmd[sep + 1:] == inner
 
 
+def test_build_extractor_proxy_command_shell_fallback_is_counted(monkeypatch):
+    # 36e46957 — every --shell branch fire is explicit/counted/diagnosable.
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    inner = [r"C:\some\tool.cmd", "mcp-server-code-extractor"]
+    assert tc._shell_fallback_diagnostics() == {}
+    tc._build_extractor_proxy_command(r"C:\npm\npx.cmd", inner, port=9010)
+    diag = tc._shell_fallback_diagnostics()
+    assert sum(diag.values()) == 1
+    assert any(k.startswith("extractor:") for k in diag)
+
+
+def test_build_extractor_proxy_command_no_shell_means_no_fallback_recorded(monkeypatch):
+    # 36e46957 — the direct-executable path (no .cmd/.bat inner) must NOT
+    # record a shell-fallback occurrence: only the actual fallback is counted.
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    inner = ["uvx", "mcp-server-code-extractor"]
+    tc._build_extractor_proxy_command("npx", inner, port=9010)
+    assert tc._shell_fallback_diagnostics() == {}
+
+
 def test_build_extractor_proxy_command_python_module_inner(monkeypatch):
     # pip fallback: inner is `python -m code_extractor`.
     monkeypatch.setattr(tc.sys, "platform", "linux")
@@ -401,6 +421,67 @@ def test_find_uvx_returns_none_when_absent(monkeypatch, tmp_path):
     monkeypatch.setattr(tc.shutil, "which", lambda name: None)
     monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
     assert tc._find_uvx() is None
+
+
+# ---------------------------------------------------------------------------
+# 36e46957 — _cached_npx / _cached_uvx: reuse resolved launchers instead of
+# re-probing PATH/the filesystem on every call. conftest.py's autouse
+# _reset_tunnel_launcher_diagnostics fixture clears the cache before AND
+# after every test, so these tests (and every other test in the suite that
+# monkeypatches _find_npx/_find_uvx directly) stay independent regardless of
+# execution order.
+# ---------------------------------------------------------------------------
+
+def test_cached_npx_resolves_once_and_reuses_value(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_find_npx():
+        calls["n"] += 1
+        return "/resolved/npx"
+
+    monkeypatch.setattr(tc, "_find_npx", fake_find_npx)
+    first = tc._cached_npx()
+    second = tc._cached_npx()
+    third = tc._cached_npx()
+    assert first == second == third == "/resolved/npx"
+    assert calls["n"] == 1  # only the FIRST call actually probed
+
+
+def test_cached_uvx_resolves_once_and_reuses_value(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_find_uvx():
+        calls["n"] += 1
+        return "/resolved/uvx"
+
+    monkeypatch.setattr(tc, "_find_uvx", fake_find_uvx)
+    assert tc._cached_uvx() == "/resolved/uvx"
+    assert tc._cached_uvx() == "/resolved/uvx"
+    assert calls["n"] == 1
+
+
+def test_cached_uvx_caches_a_none_result_too(monkeypatch):
+    # uvx genuinely absent (None) must also be memoized — not re-probed
+    # forever because "not in cache" would otherwise mis-treat a falsy
+    # cached value as a miss.
+    calls = {"n": 0}
+
+    def fake_find_uvx():
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(tc, "_find_uvx", fake_find_uvx)
+    assert tc._cached_uvx() is None
+    assert tc._cached_uvx() is None
+    assert calls["n"] == 1
+
+
+def test_reset_launcher_resolution_cache_clears_between_calls(monkeypatch):
+    monkeypatch.setattr(tc, "_find_npx", lambda: "/first/npx")
+    assert tc._cached_npx() == "/first/npx"
+    tc._reset_launcher_resolution_cache()
+    monkeypatch.setattr(tc, "_find_npx", lambda: "/second/npx")
+    assert tc._cached_npx() == "/second/npx"
 
 
 def test_resolve_extractor_inner_prefers_uvx(monkeypatch):
@@ -1992,6 +2073,61 @@ def test_build_proxy_for_inner_shell_for_cmd_shim_on_windows(monkeypatch):
     monkeypatch.setattr(tc.sys, "platform", "win32")
     cmd = tc._build_proxy_for_inner("npx.cmd", ["codegraph.cmd"], 8809)
     assert "--shell" in cmd
+
+
+# ---------------------------------------------------------------------------
+# 36e46957 — shell-fallback diagnostics: explicit, counted, rate-limited,
+# diagnosable accounting for every --shell branch fired by the proxy
+# builders, plus _proc_watchdog relaunches of an already shell-wrapped cmd.
+# ---------------------------------------------------------------------------
+
+def test_build_proxy_for_inner_shell_fallback_is_counted(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    assert tc._shell_fallback_diagnostics() == {}
+    tc._build_proxy_for_inner("npx.cmd", ["codegraph.cmd"], 8809)
+    diag = tc._shell_fallback_diagnostics()
+    assert sum(diag.values()) == 1
+    assert any(k.startswith("proxy_for_inner:") for k in diag)
+
+
+def test_build_proxy_for_inner_direct_exe_records_no_shell_fallback(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    tc._build_proxy_for_inner("npx.cmd", ["codegraph.exe"], 8809)
+    assert tc._shell_fallback_diagnostics() == {}
+
+
+def test_build_proxy_for_inner_non_windows_records_no_shell_fallback(monkeypatch):
+    # POSIX never needs --shell regardless of inner extension.
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    tc._build_proxy_for_inner("npx", ["codegraph.cmd"], 8809)
+    assert tc._shell_fallback_diagnostics() == {}
+
+
+def test_shell_fallback_diagnostics_accumulates_per_reason(monkeypatch):
+    assert tc._note_shell_fallback("reason-a") == 1
+    assert tc._note_shell_fallback("reason-a") == 2
+    assert tc._note_shell_fallback("reason-b") == 1
+    diag = tc._shell_fallback_diagnostics()
+    assert diag == {"reason-a": 2, "reason-b": 1}
+
+
+def test_shell_fallback_print_is_rate_limited_but_count_is_not(monkeypatch, capsys):
+    # Rate-limited: only the first _SHELL_FALLBACK_PRINT_LIMIT occurrences of
+    # a given reason print to stderr; the counter itself keeps climbing past
+    # that so a flapping slot's terminal isn't spammed but nothing is lost.
+    for _ in range(tc._SHELL_FALLBACK_PRINT_LIMIT + 5):
+        tc._note_shell_fallback("flapping-slot")
+    assert tc._shell_fallback_diagnostics()["flapping-slot"] == tc._SHELL_FALLBACK_PRINT_LIMIT + 5
+    captured = capsys.readouterr()
+    printed_lines = [ln for ln in captured.err.splitlines() if "flapping-slot" in ln]
+    assert len(printed_lines) == tc._SHELL_FALLBACK_PRINT_LIMIT
+
+
+def test_reset_shell_fallback_diagnostics_clears_counts():
+    tc._note_shell_fallback("some-reason")
+    assert tc._shell_fallback_diagnostics() != {}
+    tc._reset_shell_fallback_diagnostics()
+    assert tc._shell_fallback_diagnostics() == {}
 
 
 # ---------------------------------------------------------------------------

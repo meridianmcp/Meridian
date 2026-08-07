@@ -2193,6 +2193,108 @@ def _spawn_kwargs() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Launcher resolution cache (36e46957) — reuse resolved npx/uvx launchers
+# instead of re-probing PATH/the filesystem on every slot build, retry, or
+# pooled spawn within one tunnel process's lifetime. PATH does not change
+# mid-process, so a second (or hundredth) ``shutil.which``/existence probe
+# for the same launcher is pure waste — and on a machine with a slow/AV-
+# hooked filesystem, waste that adds up across every Serena daemon spawn
+# (:func:`_serena_pool_spawn` re-resolves uvx once per repo_path) and every
+# proxy build that carries a literal ``"npx"`` inner token
+# (:func:`_build_proxy_for_inner`).
+#
+# _find_npx / _find_uvx themselves are DELIBERATELY left untouched: they stay
+# the raw, directly-monkeypatchable resolution primitives their existing unit
+# tests exercise against varying PATH/filesystem state. _cached_npx /
+# _cached_uvx are thin memoizing wrappers that every repeated-call site now
+# goes through instead — this module-level dict is what "reuse resolved
+# launchers" means operationally. Production code never resets it (PATH is
+# stable for the tunnel's whole life); _reset_launcher_resolution_cache is a
+# test-only hook so tests exercising different mocked PATH states don't leak
+# a stale resolution across test functions in the same process.
+# ---------------------------------------------------------------------------
+
+_LAUNCHER_RESOLUTION_CACHE: "dict[str, str | None]" = {}
+
+
+def _reset_launcher_resolution_cache() -> None:
+    """Test-only: clear the memoized npx/uvx launcher-path cache (36e46957)."""
+    _LAUNCHER_RESOLUTION_CACHE.clear()
+
+
+def _cached_npx() -> str:
+    """Memoized wrapper around :func:`_find_npx` — see module note above."""
+    if "npx" not in _LAUNCHER_RESOLUTION_CACHE:
+        _LAUNCHER_RESOLUTION_CACHE["npx"] = _find_npx()
+    return _LAUNCHER_RESOLUTION_CACHE["npx"]
+
+
+def _cached_uvx() -> "str | None":
+    """Memoized wrapper around :func:`_find_uvx` — see module note above."""
+    if "uvx" not in _LAUNCHER_RESOLUTION_CACHE:
+        _LAUNCHER_RESOLUTION_CACHE["uvx"] = _find_uvx()
+    return _LAUNCHER_RESOLUTION_CACHE["uvx"]
+
+
+# ---------------------------------------------------------------------------
+# Shell-fallback diagnostics (36e46957) — explicit, counted, rate-limited,
+# diagnosable accounting for every place a Meridian-owned proxy spawn is
+# forced through mcp-proxy's ``--shell`` (itself Windows' unavoidable
+# cmd.exe-for-.cmd/.bat behaviour — see :func:`_build_proxy_for_inner` and
+# :func:`_build_extractor_proxy_command`). This does NOT reduce or suppress a
+# single required shell fallback — every one of those is structurally
+# necessary and stays exactly as before — it only makes each occurrence
+# visible and countable instead of a silently-appended flag, so a human or a
+# future dashboard panel can correlate "N shell-wrapped spawns" against the
+# kernel-pool paged-pool-growth investigation. This item does NOT claim, by
+# itself, to fix that kernel-level issue.
+# ---------------------------------------------------------------------------
+
+_SHELL_FALLBACK_COUNTS: "dict[str, int]" = {}
+_SHELL_FALLBACK_PRINT_LIMIT = 3  # rate limit: full print only for the first N per reason
+
+
+def _reset_shell_fallback_diagnostics() -> None:
+    """Test-only: clear shell-fallback counters (36e46957)."""
+    _SHELL_FALLBACK_COUNTS.clear()
+
+
+def _note_shell_fallback(reason: str) -> int:
+    """Record one shell-fallback occurrence for *reason*; return the new count.
+
+    * **Explicit** — always recorded (never a silent ``cmd.append("--shell")``).
+    * **Counted** — every call increments ``_SHELL_FALLBACK_COUNTS[reason]``,
+      queryable via :func:`_shell_fallback_diagnostics`.
+    * **Rate-limited** — only the first ``_SHELL_FALLBACK_PRINT_LIMIT``
+      occurrences of a given *reason* print to stderr; a flapping slot (e.g.
+      a watchdog relaunching a shell-wrapped command every few seconds)
+      can't spam the terminal. The counter itself is never rate-limited —
+      it stays authoritative even once printing stops.
+    * **Diagnosable** — :func:`_shell_fallback_diagnostics` exposes a
+      read-only snapshot of the live counts.
+    """
+    count = _SHELL_FALLBACK_COUNTS.get(reason, 0) + 1
+    _SHELL_FALLBACK_COUNTS[reason] = count
+    if count <= _SHELL_FALLBACK_PRINT_LIMIT:
+        suffix = (
+            " (further occurrences of this reason are counted but not printed)"
+            if count == _SHELL_FALLBACK_PRINT_LIMIT else ""
+        )
+        print(
+            f"tunnel: shell fallback engaged ({reason}) — occurrence #{count}; "
+            "this is the platform-required cmd.exe wrapper for a .cmd/.bat "
+            f"launcher, not a bug.{suffix}",
+            file=sys.stderr, flush=True,
+        )
+    return count
+
+
+def _shell_fallback_diagnostics() -> "dict[str, int]":
+    """Read-only snapshot of shell-fallback counts by reason (36e46957)."""
+    return dict(_SHELL_FALLBACK_COUNTS)
+
+
+# ---------------------------------------------------------------------------
 # Scoped cache-clear + spawn retry (a9d1ef7f)
 # ---------------------------------------------------------------------------
 
@@ -3265,9 +3367,15 @@ def _serena_pool_spawn(cmd: "list[str]") -> "subprocess.Popen":
     full path when :func:`_find_uvx` can find it; a machine where it truly
     can't be found keeps the original bare token, so the OS's own error
     surfaces exactly as before rather than this function inventing one.
+
+    36e46957 — resolves via :func:`_cached_uvx` rather than calling
+    :func:`_find_uvx` directly: the pool calls this once per repo_path, so
+    a busy tunnel with several projects open re-hits this path repeatedly —
+    memoizing avoids re-probing PATH/the filesystem for the same answer
+    every time.
     """
     if cmd and cmd[0] == "uvx":
-        _resolved_uvx = _find_uvx()
+        _resolved_uvx = _cached_uvx()
         if _resolved_uvx:
             cmd = [_resolved_uvx, *cmd[1:]]
     proc = subprocess.Popen(cmd, **_spawn_kwargs())
@@ -4085,10 +4193,11 @@ def _extract_slot_diagnostics(
     PACKAGE (see :func:`_extract_slot_package_name`), the Python runtime
     running this tunnel process, the effective cwd (``--project``), and a
     dependency preflight signal (whether ``uvx`` is resolvable on this
-    machine at all — see :func:`_find_uvx`). Intended for the startup
-    banner and a future dashboard "repair" panel. Pure aside from the
-    ``uvx`` PATH/well-known-location probe, so it never spawns anything and
-    never prints anything sensitive.
+    machine at all — see :func:`_find_uvx`, resolved here via the memoized
+    :func:`_cached_uvx`, 36e46957). Intended for the startup banner and a
+    future dashboard "repair" panel. Pure aside from the ``uvx`` PATH/well-
+    known-location probe (skipped entirely once cached), so it never spawns
+    anything and never prints anything sensitive.
     """
     from .tunnel_plugins import SERENA_EXTRACT_COMMAND  # deferred — see _resolve_extract_slot_command
 
@@ -4098,7 +4207,7 @@ def _extract_slot_diagnostics(
         "package": _extract_slot_package_name(resolved),
         "python_runtime": sys.executable,
         "cwd": repo_path,
-        "uvx_available": _find_uvx() is not None,
+        "uvx_available": _cached_uvx() is not None,
     }
 
 
@@ -4121,8 +4230,11 @@ def _resolve_extractor_inner_cmd() -> "list[str] | None":
     interpreter's environment and run it as ``python -m code_extractor`` (the
     module is ``code_extractor``). Returns the inner-command token list, or None
     if neither path is available.
+
+    36e46957 — resolves ``uvx`` via the memoized :func:`_cached_uvx` rather
+    than calling :func:`_find_uvx` directly (reuse resolved launchers).
     """
-    uvx = _find_uvx()
+    uvx = _cached_uvx()
     if uvx:
         return [uvx, "mcp-server-code-extractor"]
     # Fallback: ensure the package is importable in this env, then run as a module.
@@ -4160,11 +4272,18 @@ def _build_extractor_proxy_command(
     ``.bat`` shim (Node 24's CVE-2024-27980 mitigation blocks direct ``.cmd``
     spawns). ``uvx.exe`` / ``python.exe`` are real executables that spawn directly
     and preserve support for paths with spaces, so no shell is needed for them.
+
+    36e46957 — every time the ``.cmd``/``.bat`` branch fires, the occurrence is
+    recorded via :func:`_note_shell_fallback` (explicit/counted/rate-limited/
+    diagnosable) so operators can see how often the extractor slot needed the
+    shell wrapper without this function's own preference-for-direct-executables
+    behaviour changing at all.
     """
     cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
            "--server", "stream", "--stateless"]
     if sys.platform == "win32" and inner_cmd and inner_cmd[0].lower().endswith((".cmd", ".bat")):
         cmd.append("--shell")
+        _note_shell_fallback(f"extractor:{Path(inner_cmd[0]).name}")
     cmd += ["--", *inner_cmd]
     return cmd
 
@@ -4569,23 +4688,30 @@ def _build_proxy_for_inner(
     mitigation above never triggers, so mcp-proxy's direct (no-shell) spawn of
     it raises ``ENOENT`` (the same failure class :func:`_find_npx` exists to
     avoid for the *outer* npx — that resolution was never applied to *inner*
-    commands). Resolve a literal ``"npx"`` inner token through :func:`_find_npx`
-    here, once, at the single choke point every inner command passes through —
-    this then also makes the ``--shell`` check above trigger correctly, since
-    the resolved path ends in ``.cmd`` on Windows.
+    commands). Resolve a literal ``"npx"`` inner token through :func:`_cached_npx`
+    (a memoized wrapper around :func:`_find_npx`, 36e46957) here, once per call,
+    at the single choke point every inner command passes through — this then
+    also makes the ``--shell`` check above trigger correctly, since the
+    resolved path ends in ``.cmd`` on Windows.
 
     *stateless* (4ea1b9d5) — when False, ``--stateless`` is omitted so the inner
     server keeps state across requests. Used for ``session_mode: "persistent"``
     slots like Desktop Commander, whose terminal sessions must survive between
     calls; ``--stateless`` would reset them on every POST.
+
+    36e46957 — every time the ``--shell`` branch fires below, the occurrence is
+    recorded via :func:`_note_shell_fallback` (explicit/counted/rate-limited/
+    diagnosable); the direct-executable preference and required-shim fallback
+    behaviour themselves are unchanged.
     """
     if inner_cmd and inner_cmd[0] == "npx":
-        inner_cmd = [_win_shell_safe_path(_find_npx()), *inner_cmd[1:]]
+        inner_cmd = [_win_shell_safe_path(_cached_npx()), *inner_cmd[1:]]
     cmd = [npx, "-y", "mcp-proxy", "--port", str(port), "--server", "stream"]
     if stateless:
         cmd.append("--stateless")
     if sys.platform == "win32" and inner_cmd and inner_cmd[0].lower().endswith((".cmd", ".bat")):
         cmd.append("--shell")
+        _note_shell_fallback(f"proxy_for_inner:{Path(inner_cmd[0]).name}")
     cmd += ["--", *inner_cmd]
     return cmd
 
@@ -5810,6 +5936,17 @@ async def _proc_watchdog(
     spam the terminal, but the slot keeps a standing chance to self-heal without
     a manual tunnel restart. A relaunch that comes back healthy resets the
     counter and the normal fast-retry cadence. Runs until cancelled.
+
+    36e46957 — a relaunch of a shell-wrapped command (``holder["cmd"]``
+    contains ``--shell``, i.e. mcp-proxy hands the inner launcher to
+    cmd.exe) is exactly the "repeated short-lived cmd.exe process creation"
+    pattern the kernel-pool investigation flagged: a slot that flaps through
+    this path spawns a fresh cmd.exe every retry. Each such relaunch is
+    recorded via :func:`_note_shell_fallback` (explicit/counted/rate-limited/
+    diagnosable) so the count is visible without this function itself trying
+    to avoid or suppress the retry — the existing backoff/cooldown logic
+    above already bounds the retry *rate*; this only makes the shell-wrapped
+    ones countable.
     """
     label = holder.get("label", "?")
     failures = 0
@@ -5844,6 +5981,9 @@ async def _proc_watchdog(
             )
             backoff = min(max(backoff, poll_interval) * 2, _MAX_BACKOFF)
         try:
+            _relaunch_cmd = holder.get("cmd") or []
+            if "--shell" in _relaunch_cmd:
+                _note_shell_fallback(f"proc_watchdog_relaunch:{label}")
             relaunched = subprocess.Popen(
                 holder["cmd"], env=holder.get("env"), **_spawn_kwargs()
             )
@@ -6439,7 +6579,10 @@ async def run_tunnel(
     # 2. Build commands for all enabled slots. Processes are NOT spawned here —
     #    lazy spawning (3649a61a) defers each proxy until its first incoming
     #    request, then auto-kills after _IDLE_KILL_SECONDS of idle time.
-    npx = _find_npx()
+    # 36e46957 — resolved via _cached_npx so every slot builder below (and any
+    # literal "npx" inner token _build_proxy_for_inner resolves later) reuses
+    # this single PATH probe instead of each re-resolving it independently.
+    npx = _cached_npx()
     # aaddb273 — per-run identity: a UUID that identifies THIS tunnel invocation.
     # Threaded through every SlotProxy so claim files can be attributed to this
     # run vs. a prior-generation tunnel that left orphans.
