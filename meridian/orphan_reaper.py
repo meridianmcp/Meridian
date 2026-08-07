@@ -370,6 +370,49 @@ def _psutil_kill_tree(pid: int) -> bool:
         return False
 
 
+def kill_process_tree(pid: int) -> bool:
+    """Public wrapper around the tree-safe kill primitive (:func:`_psutil_kill_tree`)
+    for callers OUTSIDE this module's own orphan-sweep flow -- e.g.
+    ``scripts/run_tests.py``'s durable test-run-lifecycle hardening
+    (2cebf4ae), which needs the exact same cross-platform tree-kill this
+    module already proved (taskkill /F /T on Windows, psutil recursive
+    terminate-then-kill on POSIX) rather than a second, independently
+    maintained implementation. Ownership validation is the CALLER's
+    responsibility here -- unlike :func:`reap_orphans`, this has no
+    name/dead-worktree matching step, so only call it with a pid you
+    already know you own (e.g. one YOU spawned)."""
+    return _psutil_kill_tree(pid)
+
+
+def collect_process_tree(pid: int) -> list[int]:
+    """Public wrapper around :func:`_psutil_collect_tree` -- see
+    :func:`kill_process_tree`'s docstring for why external callers reuse
+    this instead of reimplementing descendant enumeration."""
+    return _psutil_collect_tree(pid)
+
+
+def report_tree_survivors(pids: list[int]) -> list[int]:
+    """Given pids the caller already knows it owns (its own spawned tree --
+    NEVER a name-matched guess), return the subset still alive. Pure
+    reporting: never kills anything itself, mirroring
+    ``process_registry.report_unowned_survivors``'s "report, don't
+    guess-and-kill" discipline. Returns ``[]`` (not an error) when psutil
+    is unavailable -- best-effort, matching every other optional-psutil
+    path in this module."""
+    survivors: list[int] = []
+    try:
+        import psutil  # type: ignore
+    except Exception:  # noqa: BLE001 -- psutil not installed
+        return survivors
+    for p in pids or []:
+        try:
+            if psutil.pid_exists(int(p)):
+                survivors.append(int(p))
+        except Exception:  # noqa: BLE001
+            continue
+    return survivors
+
+
 def reap_orphans(
     dead_paths: list[str],
     process_iter: Callable[[], Iterable[dict[str, Any]]] | None = None,
