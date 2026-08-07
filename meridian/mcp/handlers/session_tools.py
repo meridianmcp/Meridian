@@ -270,6 +270,9 @@ async def handle_list_sessions(
 ) -> Any:
     """MCP tool: list_sessions."""
     active_only = args.get("status", "active") != "all"
+    # Mirror the HTTP GET /projects/{project_id}/sessions route (routes/projects.py),
+    # which expires stale sessions before querying so the MCP and HTTP paths agree.
+    await _server._expire_and_generate_handoffs(db, data_dir)
     return await db_module.get_sessions(db, args["project_id"], active_only=active_only)
 
 
