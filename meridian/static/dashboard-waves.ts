@@ -396,6 +396,123 @@ export function renderWaveProgress(projectId: string, sprintItems: WaveItem[]): 
   }
 }
 
+// ---------------------------------------------------------------------------
+// Wave-completion summary (bbb447ec) — minimal read-only display of the
+// durable wave_run_summaries record (meridian.db.get_wave_summary /
+// GET /projects/{id}/wave-summary/{wave_id}). Deliberately NOT the live
+// batch-progress panel above: this renders the AUTHORITATIVE, immutable,
+// post-hoc record — item outcomes (explicit enum, never inferred), test
+// receipts, and correction lineage — once a wave has actually finished.
+// Pure string builder + a thin best-effort DOM layer, same shape as the
+// wave-progress panel; no fetch logic here (the caller supplies the already-
+// fetched summary object, mirroring renderWaveProgress's own contract).
+// ---------------------------------------------------------------------------
+
+export interface WaveSummaryTestReceipt {
+  command?: string;
+  exit_code?: number;
+  passed?: number;
+  failed?: number;
+  scope?: string;
+}
+
+export interface WaveSummaryItemOutcome {
+  item_id: string;
+  outcome: string;
+  [key: string]: unknown;
+}
+
+export interface WaveSummary {
+  id?: string;
+  wave_id?: string;
+  wave_run_id?: string | null;
+  session_id?: string | null;
+  board_revision_hash?: string | null;
+  items?: WaveSummaryItemOutcome[];
+  test_receipts?: WaveSummaryTestReceipt[];
+  blockers?: unknown[];
+  exclusions?: unknown[];
+  handoff_status?: string | null;
+  created_at?: string | null;
+  supersedes?: string | null;
+  superseded_by?: string | null;
+}
+
+const _OUTCOME_COLOR: Record<string, string> = {
+  completed: "var(--accent-green)",
+  blocked: "#fbbf24",
+  failed: "#ef4444",
+  skipped: "var(--muted)",
+  unverified: "var(--accent)",
+};
+
+/** Build the read-only wave-summary panel HTML from a fetched WaveSummary (or
+ * null when none has been recorded yet). Pure string builder — no DOM/fetch
+ * side effects, so it unit tests without a DOM (mirrors buildWaveProgressHtml). */
+export function buildWaveSummaryHtml(summary: WaveSummary | null | undefined): string {
+  if (!summary) {
+    return `<div class="live-empty">No wave summary recorded yet.</div>`;
+  }
+  const items = Array.isArray(summary.items) ? summary.items : [];
+  const counts: Record<string, number> = {};
+  for (const it of items) {
+    const outcome = String((it && it.outcome) || "unverified");
+    counts[outcome] = (counts[outcome] || 0) + 1;
+  }
+  const chips = Object.keys(counts)
+    .sort()
+    .map((k) => {
+      const color = _OUTCOME_COLOR[k] || "var(--muted)";
+      return `<span style="font-size:9px;color:${color};border:1px solid ${color}55;border-radius:3px;padding:0 4px;margin-right:4px">${_esc(k)} ${counts[k]}</span>`;
+    })
+    .join("");
+
+  const receipts = Array.isArray(summary.test_receipts) ? summary.test_receipts : [];
+  const receiptsHtml = receipts
+    .map((r) => {
+      const ok = r.exit_code === 0;
+      return `<div style="font-size:10px;color:var(--muted);margin-top:2px">
+        <span style="color:${ok ? "var(--accent-green)" : "#ef4444"}">${ok ? "✓" : "✗"}</span>
+        ${_esc(r.scope || "targeted")} · ${_esc(r.command || "")} · exit ${_esc(r.exit_code)} · ${_esc(r.passed ?? 0)} passed / ${_esc(r.failed ?? 0)} failed
+      </div>`;
+    })
+    .join("");
+
+  const supersededTag = summary.superseded_by
+    ? `<span style="font-size:9px;color:#fbbf24;margin-left:6px" title="A newer correction replaced this record">superseded</span>`
+    : "";
+  const handoffTag = summary.handoff_status
+    ? `<span style="font-size:9px;color:var(--muted);margin-left:6px">handoff: ${_esc(summary.handoff_status)}</span>`
+    : "";
+
+  return `<div class="wave-summary-panel" style="font-size:11px">
+    <div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-bottom:4px">
+      <span style="font-weight:600;color:var(--text)">${_esc(summary.wave_id || "")}</span>
+      ${handoffTag}${supersededTag}
+    </div>
+    <div style="margin-bottom:4px">${chips || '<span style="color:var(--muted)">no items recorded</span>'}</div>
+    ${receiptsHtml}
+  </div>`;
+}
+
+/** Repaint the wave-summary panel for a project/wave from an already-fetched
+ * summary (or null). Best-effort: a missing mount point leaves the DOM
+ * untouched — same contract as renderWaveProgress above. */
+export function renderWaveSummary(
+  projectId: string,
+  waveId: string,
+  summary: WaveSummary | null,
+): void {
+  try {
+    if (typeof document === "undefined") return;
+    const root = document.getElementById(`wave-summary-${projectId}-${waveId}`);
+    if (!root) return;
+    root.innerHTML = buildWaveSummaryHtml(summary);
+  } catch {
+    /* best-effort — never break the panel */
+  }
+}
+
 // Re-expose on window so the bundled Live-tab refresh loop (dashboard.ts) can
 // call renderWaveProgress bare, matching the codebase's global-function style.
 try {
@@ -405,5 +522,7 @@ try {
     renderWaveProgress,
     formatElapsedSince,
     parseTouchesResources,
+    buildWaveSummaryHtml,
+    renderWaveSummary,
   });
 } catch { /* non-browser (test) context */ }

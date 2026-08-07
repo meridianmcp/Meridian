@@ -1133,6 +1133,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_vector_index_state(db)
     await _migrate_pixi_env_roots(db)
     await _migrate_executor_reports_table(db)
+    await _migrate_wave_run_summaries(db)
     return db
 
 
@@ -12143,6 +12144,23 @@ from .wave_runs import (  # noqa: F401
 from .wave_resume import (  # noqa: F401
     WaveResumeStale,
     check_wave_resume,
+)
+
+
+# bbb447ec — immutable, queryable wave-completion summaries keyed by wave_id.
+# Imported after board_snapshot (needs canonical_json already bound) and after
+# wave_runs (a summary's wave_run_id typically references a wave_runs.id,
+# though this module never enforces that FK — see wave_run_summary.py).
+from .wave_run_summary import (  # noqa: F401
+    WAVE_SUMMARY_ITEM_OUTCOMES,
+    WAVE_SUMMARY_TEST_SCOPES,
+    _migrate_wave_run_summaries,
+    canonical_wave_summary_hash,
+    persist_wave_summary,
+    get_wave_summary,
+    get_wave_summary_by_id,
+    get_wave_summary_history,
+    record_wave_summary_correction,
 )
 
 

@@ -7,7 +7,10 @@ import {
   parseTouchesResources,
   formatElapsedSince,
   buildWaveProgressHtml,
+  buildWaveSummaryHtml,
+  renderWaveSummary,
   type WaveItem,
+  type WaveSummary,
 } from "./dashboard-waves";
 
 // Minimal item factory — mirrors the /sprint-items row shape.
@@ -244,5 +247,72 @@ describe("buildWaveProgressHtml", () => {
     ]);
     expect(wp.maxFanOut).toBe(3);
     expect(buildWaveProgressHtml(wp)).toContain("up to 3× parallel");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildWaveSummaryHtml / renderWaveSummary (bbb447ec) — read-only display of
+// the durable, authoritative wave_run_summaries record. Distinct from the
+// live batch-progress panel above: this renders a POST-HOC, immutable record
+// (explicit outcome enum, structured test receipts, correction lineage), not
+// a live recomputation from in-flight sprint items.
+// ---------------------------------------------------------------------------
+
+const summary = (over: Partial<WaveSummary> = {}): WaveSummary => ({
+  wave_id: "wave-5",
+  items: [
+    { item_id: "a", outcome: "completed" },
+    { item_id: "b", outcome: "completed" },
+    { item_id: "c", outcome: "blocked" },
+  ],
+  test_receipts: [
+    { command: "pytest -q", exit_code: 0, passed: 42, failed: 0, scope: "targeted" },
+  ],
+  ...over,
+});
+
+describe("buildWaveSummaryHtml", () => {
+  it("renders 'no summary' state for null/undefined", () => {
+    expect(buildWaveSummaryHtml(null)).toContain("No wave summary recorded");
+    expect(buildWaveSummaryHtml(undefined)).toContain("No wave summary recorded");
+  });
+
+  it("renders one outcome chip per distinct outcome with correct counts", () => {
+    const html = buildWaveSummaryHtml(summary());
+    expect(html).toContain("wave-5");
+    expect(html).toContain("completed 2");
+    expect(html).toContain("blocked 1");
+  });
+
+  it("renders a test receipt with pass/fail counts and a pass/fail glyph", () => {
+    const html = buildWaveSummaryHtml(summary());
+    expect(html).toContain("pytest -q");
+    expect(html).toContain("42 passed");
+    expect(html).toContain("0 failed");
+    expect(html).toContain("✓"); // exit_code 0 → pass glyph
+
+    const failing = buildWaveSummaryHtml(
+      summary({ test_receipts: [{ command: "pytest -q", exit_code: 1, passed: 40, failed: 2 }] }),
+    );
+    expect(failing).toContain("✗");
+  });
+
+  it("flags a superseded record and shows the handoff_status when present", () => {
+    const html = buildWaveSummaryHtml(
+      summary({ superseded_by: "newer-id", handoff_status: "generated" }),
+    );
+    expect(html).toContain("superseded");
+    expect(html).toContain("handoff: generated");
+  });
+
+  it("an empty items list renders the 'no items recorded' fallback, not a crash", () => {
+    const html = buildWaveSummaryHtml(summary({ items: [] }));
+    expect(html).toContain("no items recorded");
+  });
+});
+
+describe("renderWaveSummary", () => {
+  it("is a no-op outside a DOM context (never throws)", () => {
+    expect(() => renderWaveSummary("proj-1", "wave-5", summary())).not.toThrow();
   });
 });
