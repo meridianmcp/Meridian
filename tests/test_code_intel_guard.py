@@ -888,6 +888,39 @@ def test_ps1_hook_blocks_when_validated_ready_and_tunnel(tool):
 
 
 @_needs_powershell
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+@pytest.mark.parametrize(
+    "slot_body",
+    [
+        json.dumps({"ready": 1, "has_tunnel": True}),
+        json.dumps({"ready": True, "has_tunnel": 1}),
+        json.dumps({"ready": "true", "has_tunnel": True}),
+        json.dumps({"ready": 1, "has_tunnel": 1}),
+    ],
+)
+def test_ps1_hook_fails_open_on_non_boolean_ready_or_tunnel(tool, slot_body):
+    """Verifier-found gap (post-883ce543 fix): PowerShell's -eq coerces its
+    RHS to the LHS's type, so a non-boolean truthy JSON value like ready=1
+    (int) or ready="true" (string) made "$slotReady -eq $true" coerce
+    $true -> 1 (or "True") and wrongly compare equal, BLOCKING when it
+    should fail open -- diverging from code_intel_guard.sh, whose jq/regex
+    path only ever matches the literal strings "true"/"false". Must fail
+    open (exit 0) for every one of these malformed-but-truthy shapes,
+    identically to the .sh hook."""
+    url, srv, _t = _start_plain_stub(code_intel_enabled=1, slot_body=slot_body)
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_ps1_hook(payload, meridian_url=url)
+        assert r.returncode == 0, (
+            f"{tool}: ps1 hook must fail open on non-boolean ready/has_tunnel "
+            f"({slot_body!r}), not block via -eq type coercion. "
+            f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        )
+    finally:
+        srv.shutdown()
+
+
+@_needs_powershell
 @pytest.mark.parametrize("payload", ["", "not json at all", "{}", '{"foo":"bar"}'])
 def test_ps1_hook_fails_open_on_unparseable_payload(payload):
     r = _run_ps1_hook(payload, meridian_url=_free_url())
