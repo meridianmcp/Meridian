@@ -62,6 +62,10 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
+import shutil
+import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -229,6 +233,87 @@ def _resolve_token() -> str:
     return token
 
 
+def _is_tls_verification_error(exc: BaseException) -> bool:
+    """Return whether urllib failed during certificate verification.
+
+    Some Windows Python/uvx environments resolve a different Cloudflare edge
+    certificate than the system curl/browser stack.  This is intentionally
+    narrow: connection failures and HTTP errors must not silently switch
+    transports, and no fallback disables certificate verification.
+    """
+    reason = getattr(exc, "reason", exc)
+    message = str(reason).lower()
+    return (
+        "certificate_verify_failed" in message
+        or "certificate verify failed" in message
+        or "certificate has expired" in message
+        or "certificate is not yet valid" in message
+    )
+
+
+def _call_mcp_tool_via_curl(
+    url: str,
+    payload: bytes,
+    headers: dict[str, str],
+    timeout: int,
+) -> str:
+    """Retry one HTTPS JSON-RPC request through the system curl client.
+
+    The payload and headers are placed in short-lived temp files so bearer
+    tokens never appear in the child-process command line.  curl performs its
+    normal certificate validation; this is a transport-path fallback, not an
+    insecure TLS workaround.
+    """
+    curl = shutil.which("curl") or shutil.which("curl.exe")
+    if not curl:
+        raise RuntimeError("curl is unavailable for the TLS transport fallback")
+
+    with tempfile.TemporaryDirectory(prefix="meridian-ingest-") as temp_dir:
+        payload_path = os.path.join(temp_dir, "payload.json")
+        headers_path = os.path.join(temp_dir, "headers.txt")
+        with open(payload_path, "wb") as payload_file:
+            payload_file.write(payload)
+        with open(headers_path, "w", encoding="utf-8", newline="\n") as headers_file:
+            for name, value in headers.items():
+                headers_file.write(f"{name}: {value}\n")
+
+        command = [
+            curl,
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--max-time",
+            str(timeout),
+            "--request",
+            "POST",
+            "--header",
+            f"@{headers_path}",
+            "--data-binary",
+            f"@{payload_path}",
+            url,
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                timeout=timeout + 5,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"curl fallback timed out after {timeout}s") from exc
+
+        raw = completed.stdout.decode("utf-8", errors="replace")
+        if completed.returncode:
+            detail = completed.stderr.decode("utf-8", errors="replace").strip()
+            if raw.strip():
+                detail = f"{detail}: {raw[:500]}" if detail else raw[:500]
+            raise RuntimeError(
+                f"curl fallback exited {completed.returncode}"
+                + (f": {detail}" if detail else "")
+            )
+        return raw
+
+
 def _call_mcp_tool(
     tool_name: str,
     params: dict[str, Any],
@@ -238,7 +323,9 @@ def _call_mcp_tool(
 ) -> dict[str, Any]:
     """POST a ``tools/call`` JSON-RPC call to the hosted Meridian /mcp endpoint.
 
-    Uses stdlib ``urllib.request`` only (no httpx/requests dependency).
+    Uses stdlib ``urllib.request`` primarily.  If that process reports a
+    certificate-verification failure, retries once through the system curl
+    client with normal certificate validation (no TLS bypass).
 
     Returns the unwrapped result dict, or raises :class:`DocExtractionError`
     describing the server-side failure.
@@ -295,10 +382,18 @@ def _call_mcp_tool(
         raise DocExtractionError(
             f"hosted {tool_name} returned HTTP {exc.code}: {body}"
         ) from exc
-    except urllib.error.URLError as exc:
-        raise DocExtractionError(
-            f"could not reach Meridian at {url}: {exc.reason}"
-        ) from exc
+    except (urllib.error.URLError, ssl.SSLError) as exc:
+        if not _is_tls_verification_error(exc):
+            raise DocExtractionError(
+                f"could not reach Meridian at {url}: {exc.reason}"
+            ) from exc
+        try:
+            raw = _call_mcp_tool_via_curl(url, payload, headers, timeout)
+        except Exception as fallback_exc:  # noqa: BLE001
+            raise DocExtractionError(
+                f"urllib TLS verification failed for {url}; curl fallback also failed: "
+                f"{fallback_exc}"
+            ) from fallback_exc
 
     # The /mcp endpoint may return Streamable HTTP (SSE) or plain JSON.
     result_data: Any = None
