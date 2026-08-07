@@ -159,13 +159,14 @@ def collect_count(args: list[str]) -> tuple[int | None, int]:
 _ERROR_INVALID_PARAMETER = 87  # "the pid does not exist" -- dead.
 _ERROR_ACCESS_DENIED = 5  # process exists, we lack rights to query it -- alive.
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_STILL_ACTIVE = 259  # GetExitCodeProcess sentinel meaning "hasn't exited yet".
 
 
 class _Win32ProcessProbe:
-    """Thin, injectable wrapper over the two kernel32 calls PID liveness
-    needs. Mirrors ``meridian.process_lifecycle.Win32JobAPI``'s pattern
-    exactly -- a real instance wraps a properly-prototyped ``ctypes.WinDLL``;
-    tests construct a fake object exposing the same method names so this
+    """Thin, injectable wrapper over the kernel32 calls PID liveness needs.
+    Mirrors ``meridian.process_lifecycle.Win32JobAPI``'s pattern exactly --
+    a real instance wraps a properly-prototyped ``ctypes.WinDLL``; tests
+    construct a fake object exposing the same method names so this
     Windows-only code path is fully exercisable on non-Windows CI without
     ever touching a real ``ctypes.WinDLL`` (which does not exist off
     Windows -- see this repo's documented "must not touch Windows-only
@@ -183,6 +184,21 @@ class _Win32ProcessProbe:
 
     def get_last_error(self) -> int:
         return int(self._k.GetLastError())
+
+    def get_exit_code(self, handle: int) -> "int | None":
+        """``GetExitCodeProcess`` -- ``OpenProcess`` succeeding only means the
+        PID's process OBJECT still exists, which remains true as long as ANY
+        handle references it (e.g. a parent's own ``subprocess.Popen``
+        handle, held open until it calls ``wait()``/``poll()``) even after
+        the process has actually terminated. The exit code is the real
+        liveness signal: ``STILL_ACTIVE`` (259) means genuinely running,
+        anything else means it has exited. Returns ``None`` on any failure
+        (caller treats that as "can't tell, assume alive" -- fail safe)."""
+        import ctypes  # noqa: PLC0415 -- Windows-only
+
+        code = ctypes.c_uint32(0)
+        ok = self._k.GetExitCodeProcess(handle, ctypes.byref(code))
+        return int(code.value) if ok else None
 
 
 def _load_win32_process_probe() -> "_Win32ProcessProbe | None":
@@ -203,6 +219,8 @@ def _load_win32_process_probe() -> "_Win32ProcessProbe | None":
         kernel32.CloseHandle.restype = ctypes.c_int
         kernel32.GetLastError.argtypes = []
         kernel32.GetLastError.restype = ctypes.c_uint32
+        kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        kernel32.GetExitCodeProcess.restype = ctypes.c_int
         return _Win32ProcessProbe(kernel32)
     except Exception:  # noqa: BLE001
         return None
@@ -219,6 +237,15 @@ def _win32_pid_is_running(
     unavailable at all) as ALIVE -- fail safe, so this can never cause a
     live run's lock to be deleted out from under it. Never lets
     ``WinError 87`` propagate as an exception; that was the historical bug.
+
+    When ``OpenProcess`` DOES succeed, this also checks the real exit code
+    via ``GetExitCodeProcess`` rather than treating "handle opened" alone
+    as proof of life: the process OBJECT persists (making ``OpenProcess``
+    succeed) as long as ANY handle references it -- including a parent's
+    own still-open ``subprocess.Popen`` handle -- even well after the
+    process has actually terminated. Only ``STILL_ACTIVE`` (259) counts as
+    genuinely running; any other exit code (or a failed exit-code query)
+    falls through to the same fail-safe ALIVE default as before.
     """
     loader = probe_loader or _load_win32_process_probe
     try:
@@ -233,9 +260,15 @@ def _win32_pid_is_running(
         return True
     if handle:
         try:
+            exit_code = probe.get_exit_code(handle)
+        except Exception:  # noqa: BLE001
+            exit_code = None
+        try:
             probe.close_handle(handle)
         except Exception:  # noqa: BLE001
             pass
+        if exit_code is not None and exit_code != _STILL_ACTIVE:
+            return False
         return True
     try:
         err = probe.get_last_error()
@@ -653,72 +686,115 @@ class TestRunTracker:
 # terminate-then-kill on POSIX) when the meridian package is importable,
 # with a small dependency-free fallback so a broken/uninstalled meridian
 # package can never prevent a hung test run from being terminated.
+#
+# 2cebf4ae verifier finding: orphan_reaper's psutil-backed primitives are
+# intentionally silent-degrade for THEIR OWN callers (reap_orphans etc) --
+# kill_process_tree() returns False and report_tree_survivors() returns []
+# when psutil is simply not installed, rather than raising. This repo's
+# pixi env genuinely has no psutil in the base/CI install (it's gated
+# behind the optional [semantic] pyproject extra), so calling straight
+# into the reaper here would silently swallow that as "no survivors" /
+# "kill failed" instead of engaging the dependency-free fallback below --
+# a falsely clean cleanup receipt for a process that is, in fact, still
+# running. Checking psutil importability BEFORE delegating to the reaper
+# routes that exact case to the real (non-psutil) fallback instead.
 # ---------------------------------------------------------------------------
+
+
+def _psutil_importable() -> bool:
+    try:
+        import psutil  # type: ignore  # noqa: PLC0415,F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 def _process_tree_pids(pid: "int | None") -> list[int]:
     if pid is None:
         return []
-    try:
-        from meridian import orphan_reaper as _reaper  # noqa: PLC0415
-
-        return list(_reaper.collect_process_tree(pid))
-    except Exception:  # noqa: BLE001
+    if _psutil_importable():
         try:
-            import psutil  # type: ignore  # noqa: PLC0415
+            from meridian import orphan_reaper as _reaper  # noqa: PLC0415
 
-            proc = psutil.Process(pid)
-            return [pid, *[c.pid for c in proc.children(recursive=True)]]
+            return list(_reaper.collect_process_tree(pid))
         except Exception:  # noqa: BLE001
-            return [pid]
+            pass
+    try:
+        import psutil  # type: ignore  # noqa: PLC0415
+
+        proc = psutil.Process(pid)
+        return [pid, *[c.pid for c in proc.children(recursive=True)]]
+    except Exception:  # noqa: BLE001
+        return [pid]
 
 
 def _kill_process_tree(pid: "int | None") -> bool:
     if pid is None:
         return True
-    try:
-        from meridian import orphan_reaper as _reaper  # noqa: PLC0415
-
-        return bool(_reaper.kill_process_tree(pid))
-    except Exception:  # noqa: BLE001
+    if _psutil_importable():
         try:
-            if sys.platform == "win32":
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    capture_output=True, check=False, timeout=10,
-                )
-            else:
-                try:
-                    os.killpg(pid, 15)
-                except Exception:  # noqa: BLE001
-                    try:
-                        os.kill(pid, 15)
-                    except Exception:  # noqa: BLE001
-                        pass
-                time.sleep(1)
-                try:
-                    os.killpg(pid, 9)
-                except Exception:  # noqa: BLE001
-                    try:
-                        os.kill(pid, 9)
-                    except Exception:  # noqa: BLE001
-                        pass
-            return not _pid_is_running(pid)
+            from meridian import orphan_reaper as _reaper  # noqa: PLC0415
+
+            return bool(_reaper.kill_process_tree(pid))
         except Exception:  # noqa: BLE001
-            return False
+            pass
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, check=False, timeout=10,
+            )
+        else:
+            try:
+                os.killpg(pid, 15)
+            except Exception:  # noqa: BLE001
+                try:
+                    os.kill(pid, 15)
+                except Exception:  # noqa: BLE001
+                    pass
+            time.sleep(1)
+            try:
+                os.killpg(pid, 9)
+            except Exception:  # noqa: BLE001
+                try:
+                    os.kill(pid, 9)
+                except Exception:  # noqa: BLE001
+                    pass
+        # taskkill /F (and POSIX SIGKILL) signal termination but don't
+        # guarantee the OS has fully reaped the process by the time the
+        # call returns -- an immediate single _pid_is_running check can be
+        # a false negative. Under concurrent load (e.g. many xdist workers
+        # each spawning+killing a process at once) process teardown itself
+        # can take several real seconds, not milliseconds -- confirmed via
+        # a real spawned-process test under -n auto where a naive 5s poll
+        # window still occasionally missed the eventual exit. Poll for up
+        # to 10s rather than trusting one instantaneous (or briefly
+        # retried) sample.
+        for _ in range(40):
+            if not _pid_is_running(pid):
+                return True
+            time.sleep(0.25)
+        return not _pid_is_running(pid)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _report_survivors(pids: "list[int]") -> list[int]:
     """Pure reporting of which of *pids* -- a tree the caller already knows
     it owns -- are still alive. Never kills anything itself and never
     touches a process outside this explicit list, so an unrelated process
-    is never at risk."""
-    try:
-        from meridian import orphan_reaper as _reaper  # noqa: PLC0415
+    is never at risk. See the module-level comment above
+    :func:`_psutil_importable` for why this checks psutil availability
+    before delegating to ``orphan_reaper`` rather than trusting a silently
+    psutil-degraded ``[]`` as if it meant "confirmed no survivors"."""
+    if _psutil_importable():
+        try:
+            from meridian import orphan_reaper as _reaper  # noqa: PLC0415
 
-        return list(_reaper.report_tree_survivors(pids))
-    except Exception:  # noqa: BLE001
-        return [p for p in pids if _pid_is_running(p)]
+            return list(_reaper.report_tree_survivors(pids))
+        except Exception:  # noqa: BLE001
+            pass
+    return [p for p in pids if _pid_is_running(p)]
 
 
 # ---------------------------------------------------------------------------
