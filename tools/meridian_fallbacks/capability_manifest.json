@@ -2,7 +2,7 @@
   "schema_version": 1,
   "package": "meridian_fallbacks",
   "package_version": "0.1.0",
-  "generated_at": "2026-08-05",
+  "generated_at": "2026-08-06",
   "source_proposal": "1abedabe-2f82-40e5-a320-3b32d550cc40",
   "related_sprint_items": {
     "4ff6ff22-c6b0-4f0d-915a-5c534c4d8135": {
@@ -21,14 +21,23 @@
     "d3374b0e": {
       "title": "output_provenance_gate.py",
       "delivers": ["output_provenance_gate.py"],
-      "status": "planned",
-      "note": "Implemented by a sibling sprint item in a parallel isolated worktree. Deliberately NOT imported by this package's __init__.py to avoid a merge conflict with that commit -- import it directly once it lands: `from tools.meridian_fallbacks import output_provenance_gate`."
+      "status": "landed",
+      "note": "Landed and cross-checked for parity by sprint item 50f224ec against extensions/meridian-outputs/meridian_outputs/{annotate,fingerprint,provenance_status,outputs_local}.py: identical status-string constants, ledger filenames, and .meridian-outputs-cache layout, reimplemented stdlib-only (no import of meridian_outputs/duckdb/xxhash). Deliberately NOT imported by this package's __init__.py to avoid a merge conflict with the sibling commit that landed it -- import it directly: `from tools.meridian_fallbacks import output_provenance_gate`."
     },
     "8419f55f": {
       "title": "docx_completion_gate.py",
       "delivers": ["docx_completion_gate.py"],
-      "status": "planned",
-      "note": "Implemented by a sibling sprint item in a parallel isolated worktree. Deliberately NOT imported by this package's __init__.py to avoid a merge conflict with that commit -- import it directly once it lands: `from tools.meridian_fallbacks import docx_completion_gate`."
+      "status": "landed",
+      "note": "Landed and cross-checked for parity by sprint item 50f224ec against extensions/meridian-docs/meridian_docs/render_gate.py: identical RENDERED/UNAVAILABLE_WITH_REASON/FAILED status-string constants underlying the four render_report states. Deliberately NOT imported by this package's __init__.py to avoid a merge conflict with the sibling commit that landed it -- import it directly: `from tools.meridian_fallbacks import docx_completion_gate`."
+    },
+    "50f224ec-06a0-4e59-aec4-0902cc6cf32c": {
+      "title": "TEST: prove local fallback capability parity and handoff-ready contract serialization",
+      "delivers": [
+        "tools/meridian_fallbacks/tests/test_capability_parity.py",
+        "capability_manifest.json corrections (this file)"
+      ],
+      "status": "landed",
+      "note": "Proposal 1abedabe-2f82-40e5-a320-3b32d550cc40. Contract-tests this manifest against the real module bytes (sha256/byte_size), against meridian/capability_manifest.py's actual normalize_capability/normalize_manifest schema (fallback_chain_example.capability is now a genuinely schema-valid capability entry, not merely illustrative JSON), against every fallback_chain entry's real importability/callability, and against extensions/meridian-outputs and extensions/meridian-docs status-string/ledger-format parity. Also covers stale-worktree docx refusal, missing-tool degradation, missing Word/COM, unconverged-scan inconclusiveness, stale-script promotion, rollback, table-cell paraIds, and receipt (PatchManifest/MergeResult) JSON round-tripping. Does not modify the canonical thesis DOCX; does not treat Serena memories as authoritative."
     }
   },
   "purpose": "Local, dependency-light fallback tools for safe OOXML (.docx) editing when the meridian-docs MCP extension or a Word MCP tunnel slot is unavailable. Exists to satisfy Meridian's capability-manifest fallback_chain contract (AGENTS.md, 649e095f) as a documented, already-wired alternative -- never ad-hoc improvisation. Zero dependency on the Meridian server, its DB, any MCP tool, or Serena memories; source-of-truth is this tracked package plus durable PatchManifest pointers, per the originating proposal.",
@@ -122,21 +131,63 @@
         "A stale base_sha256 raises MergeConflictError rather than auto-merging -- there is no 3-way merge; the caller must explicitly opt in via allow_stale_base=True or re-create the manifest against the current file.",
         "Operations are applied strictly in the order they appear in manifest.operations -- no dependency graph or reordering."
       ]
+    },
+    "output_provenance_gate": {
+      "file": "output_provenance_gate.py",
+      "sha256": "864af948c874e93e18a47292bab56d90eae38c26c53b96b86d782ea20a717604",
+      "byte_size": 31305,
+      "supported_operations": [
+        "check_output_provenance(outputs_dir, path, max_scan_files=200_000) -> dict -- the local fallback answer to 'what do we know about this output's provenance', ranked EXACT > STALE_BY_SCRIPT > DIRECTORY_FALLBACK > UNREGISTERED > UNKNOWN",
+        "Explicit provenance_type statuses (string-identical to extensions/meridian-outputs/meridian_outputs/provenance_status.py's own constants): EXACT='exact', DIRECTORY_FALLBACK='directory_fallback', UNREGISTERED='unregistered', UNKNOWN='unknown', STALE_BY_SCRIPT='stale_by_script'",
+        "ScanState -- one snapshot of this call's bounded outputs_dir scan (generation/converged/scanned_count/truncated/errors/scanned_at); gates the 'inconclusive' field",
+        "main(argv) -- CLI entry point: `python output_provenance_gate.py <outputs_dir> <path>`, exit 0/2"
+      ],
+      "limitations": [
+        "Reads the SAME on-disk ledgers the real meridian-outputs extension writes (<outputs_dir>/.meridian-outputs-cache/{provenance_ledger.json,fingerprint_ledger.json}, plus MERIDIAN_NOTES.md) via plain json.load/file reads -- never imports meridian_outputs, duckdb, or xxhash.",
+        "Its own file-existence index is a bounded, per-call filesystem walk (default cap 200,000 files, override via max_scan_files) -- a truncated or errored walk sets inconclusive=True on an UNKNOWN/UNREGISTERED result rather than reporting confident absence.",
+        "The generation counter in fallback_index_ledger.json is explicitly disposable -- losing it just resets the counter to 1, never a correctness issue.",
+        "No hosted/MCP call is made anywhere in this module -- fully local, matching the rest of this package."
+      ]
+    },
+    "docx_completion_gate": {
+      "file": "docx_completion_gate.py",
+      "sha256": "caac931f8a7d4032649de9094f76e21c63d5312c2c2fb11d5b2dedda39abd6c9",
+      "byte_size": 39959,
+      "supported_operations": [
+        "run_completion_gate(docx_path, requirements=None, render_checker=None, skip_render_check=False) -> dict -- one fail-closed completion verdict: ready=True only when every hard structural check passes AND every set CompletionRequirements is satisfied",
+        "check_zip_integrity(raw) -- ZIP CRC-32, XML well-formedness, and required-part presence, all computed even after the first failure",
+        "enumerate_para_ids(document_xml) -- w14:paraId census split into body vs table-cell paragraphs, duplicate detection (the table-cell paraId gap class)",
+        "check_relationship_reachability(raw) -- every relationship target/rid/media file resolves; External TargetMode hyperlinks are never flagged",
+        "count_equations_and_captions(document_xml) -- m:oMath count, Caption-style paragraph count, SEQ field count",
+        "check_required_text(document_xml, required_texts, required_locators) -- plain substring assertions plus paraId-anchored (position-pinned) assertions",
+        "check_stale_source(docx_path, source_path=None, expected_source_sha256=None, expected_min_mtime=None) -- mtime ordering, source content-hash, and floor-timestamp staleness refusal (the 'stale worktree' guard)",
+        "CompletionRequirements -- declarative pass/fail knobs; structural corruption (bad CRC, malformed XML, duplicate paraIds, unresolved relationships) is always a hard failure, never a policy choice",
+        "Explicit render_report statuses (string-identical to extensions/meridian-docs/meridian_docs/render_gate.py's RENDERED/UNAVAILABLE_WITH_REASON/FAILED): RENDER_VERIFIED='render_verified', RENDER_UNVERIFIED='render_unverified', RENDER_UNAVAILABLE='render_unavailable', RENDER_FAILED='render_failed'",
+        "main(argv) -- CLI entry point: `python docx_completion_gate.py <docx_path> [--required-text ...] [--required-locator PARA_ID::TEXT] [--skip-render-check]`, exit 0/1"
+      ],
+      "limitations": [
+        "Structural checks are stdlib-only (zipfile + xml.etree.ElementTree) -- never full OOXML schema validation.",
+        "The ONE external render signal accepted is a real Word COM automation receipt, optionally delegated to meridian_docs.render_gate.check_word_com_render_receipt when that extension happens to be installed; its absence (non-Windows, no Word, extension not installed) is always RENDER_UNAVAILABLE, never silently folded into success.",
+        "Never raises for a bad/missing docx_path or malformed XML -- becomes a reported failure (ready=False with itemized reasons) instead.",
+        "Missing paraIds are counted, not treated as a hard failure -- some legitimately valid .docx files (never touched by Word 2010+) have none; duplicate paraIds are always a hard failure."
+      ]
     }
   },
   "fallback_chain_example": {
-    "comment": "Illustrative set_capability_manifest() entry showing how a project would register this package as the fallback for a docx-editing capability whose primary tool is the meridian-docs MCP extension or a Word MCP tunnel slot.",
-    "capability_id": "docx_editing",
-    "purpose": "Edit .docx files (insert content, insert images, apply reviewed patches) when authoring a document deliverable.",
-    "required_tools": ["meridian-docs:write_section", "meridian-docs:insert_image"],
-    "fallback_chain": [
-      "tools/meridian_fallbacks:transactional_merge.apply_patch_manifest",
-      "tools/meridian_fallbacks:safe_image_insert.insert_image",
-      "tools/meridian_fallbacks:safe_ooxml_writer.SafeOoxmlWriter"
-    ],
-    "availability_policy": "degraded_ok",
-    "verification_command": "pixi run python -m pytest tools/meridian_fallbacks/tests/ -q --timeout=60 -p no:xdist"
+    "comment": "Illustrative set_capability_manifest() entry showing how a project would register this package as the fallback for a docx-editing capability whose primary tool is the meridian-docs MCP extension or a Word MCP tunnel slot. `capability` below is schema-checked by tools/meridian_fallbacks/tests/test_capability_parity.py against the REAL meridian.capability_manifest.normalize_capability() -- it must stay a genuinely valid capability entry (fields id/purpose/required_tools/fallback_chain/availability_policy/verification_command only; no 'capability_id', no stray 'comment' inside it), not merely illustrative JSON.",
+    "capability": {
+      "id": "docx_editing",
+      "purpose": "Edit .docx files (insert content, insert images, apply reviewed patches) when authoring a document deliverable.",
+      "required_tools": ["meridian-docs:write_section", "meridian-docs:insert_image"],
+      "fallback_chain": [
+        "tools/meridian_fallbacks:transactional_merge.apply_patch_manifest",
+        "tools/meridian_fallbacks:safe_image_insert.insert_image",
+        "tools/meridian_fallbacks:safe_ooxml_writer.SafeOoxmlWriter"
+      ],
+      "availability_policy": "degraded_ok",
+      "verification_command": "pixi run python -m pytest tools/meridian_fallbacks/tests/ -q --timeout=60 -p no:xdist"
+    }
   },
-  "implementation_notes": "Copy/paste-ready usage:\n\nfrom tools.meridian_fallbacks import (\n    PatchManifest, apply_patch_manifest, insert_image, SafeOoxmlWriter,\n)\n\n# 1) Simple, single-shot edit (no manifest needed):\ninsert_image(\n    \"report.docx\", image_path=\"chart.png\",\n    anchor_text=\"Figure 1\", width_emu=4_572_000, height_emu=2_286_000,\n)\n\n# 2) Reviewable, transactional multi-op edit:\nmanifest = PatchManifest.create_from_file(\"report.docx\")\nimage_bytes = open(\"chart.png\", \"rb\").read()\nop = manifest.add_operation(\n    \"insert_image\", \"word/document.xml\", \"insert Figure 1 chart\",\n    payload=image_bytes, metadata={\"anchor_text\": \"Figure 1\", \"image_ext\": \"png\"},\n)\nmanifest.save(\"report.patch_manifest.json\")  # durable, reviewable pointer\n\n# ... later, possibly in a different process/session ...\nmanifest = PatchManifest.load(\"report.patch_manifest.json\")\nresult = apply_patch_manifest(manifest, payloads={op.op_id: image_bytes})\nassert result.success, result.error\n# result.backup_path points at the pre-apply snapshot if a rollback is needed.\n",
+  "implementation_notes": "Copy/paste-ready usage:\n\nfrom tools.meridian_fallbacks import (\n    PatchManifest, apply_patch_manifest, insert_image, SafeOoxmlWriter,\n)\n\n# 1) Simple, single-shot edit (no manifest needed):\ninsert_image(\n    \"report.docx\", image_path=\"chart.png\",\n    anchor_text=\"Figure 1\", width_emu=4_572_000, height_emu=2_286_000,\n)\n\n# 2) Reviewable, transactional multi-op edit:\nmanifest = PatchManifest.create_from_file(\"report.docx\")\nimage_bytes = open(\"chart.png\", \"rb\").read()\nop = manifest.add_operation(\n    \"insert_image\", \"word/document.xml\", \"insert Figure 1 chart\",\n    payload=image_bytes, metadata={\"anchor_text\": \"Figure 1\", \"image_ext\": \"png\"},\n)\nmanifest.save(\"report.patch_manifest.json\")  # durable, reviewable pointer\n\n# ... later, possibly in a different process/session ...\nmanifest = PatchManifest.load(\"report.patch_manifest.json\")\nresult = apply_patch_manifest(manifest, payloads={op.op_id: image_bytes})\nassert result.success, result.error\n# result.backup_path points at the pre-apply snapshot if a rollback is needed.\n\n# 3) Local provenance fallback (no meridian-outputs MCP connection needed):\nimport sys; sys.path.insert(0, \"tools/meridian_fallbacks\")\nfrom output_provenance_gate import check_output_provenance\nstatus = check_output_provenance(\"/abs/path/to/outputs\", \"/abs/path/to/outputs/results.csv\")\n# status[\"provenance_type\"] in {EXACT, STALE_BY_SCRIPT, DIRECTORY_FALLBACK, UNREGISTERED, UNKNOWN}\n# status[\"inconclusive\"] is True only when the local scan did not converge -- never treat\n# an inconclusive UNKNOWN as confirmed absence.\n# Acceptance tests: tools/meridian_fallbacks/tests/test_output_provenance_gate.py\n\n# 4) Local DOCX completion gate (before claiming a docx-producing sprint item complete):\nfrom docx_completion_gate import run_completion_gate, CompletionRequirements\nreport = run_completion_gate(\n    \"report.docx\",\n    CompletionRequirements(required_texts=[\"Executive Summary\"], min_equation_count=1),\n    skip_render_check=True,  # or omit to attempt a real Word/COM render receipt\n)\nassert report[\"ready\"], report[\"reasons\"]\n# Acceptance tests: tools/meridian_fallbacks/tests/test_docx_completion_gate.py\n# Cross-package parity + this manifest's own contract: tools/meridian_fallbacks/tests/test_capability_parity.py\n",
   "notes": "Record maintained by hand alongside the tracked source under tools/meridian_fallbacks/. Regenerate the sha256/byte_size fields (see the module docstrings) after any edit to the corresponding .py file so this manifest never drifts from what is actually committed."
 }

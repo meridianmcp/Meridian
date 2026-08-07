@@ -220,12 +220,58 @@ async def prospect_symbol_impl(
     which level succeeded.
     """
     tenant_id = (tenant or {}).get("id") or ""
+    # d5e60791 -- structured per-rung diagnostics. Each rung entry tracks:
+    #   status: "not_attempted" | "skipped" | "attempted" | "succeeded" |
+    #           "empty" | "error"
+    #   attempted_tool / selected_tool: which underlying tool(s) this rung
+    #           tried, and which one (if any) actually produced the result.
+    #   reason: why a rung was skipped (e.g. "no_active_tunnel").
+    #   error / error_kind: the real exception text when a rung raised, and
+    #           whether it looks like a missing-dependency problem
+    #           ("dependency_error", e.g. ModuleNotFoundError/ImportError) or
+    #           some other runtime failure ("runtime_error") -- so a caller
+    #           never has to guess WHY a rung silently produced nothing. This
+    #           closes the exact gap that let a swallowed
+    #           `ModuleNotFoundError: No module named 'meridian_codeindex'`
+    #           in the semantic rung collapse into a bare rung="none",
+    #           fallback_reason=None with zero diagnostic (d5e60791).
     result: dict[str, Any] = {
         "symbol": symbol,
         "rung": "none",
         "hits": [],
         "fallback_reason": None,
+        "rungs": {
+            "graph": {
+                "status": "not_attempted",
+                "attempted_tool": None,
+                "selected_tool": None,
+            },
+            "serena": {
+                "status": "not_attempted",
+                "attempted_tool": None,
+                "selected_tool": None,
+            },
+            "semantic": {
+                "status": "not_attempted",
+                "attempted_tool": None,
+                "selected_tool": None,
+            },
+        },
     }
+
+    def _mark_rung(rung_name: str, status: str, **fields: Any) -> None:
+        """Update one rung's diagnostic entry in-place (d5e60791)."""
+        entry = result["rungs"][rung_name]
+        entry["status"] = status
+        for key, value in fields.items():
+            if value is not None:
+                entry[key] = value
+
+    def _classify_error(exc: BaseException) -> str:
+        """dependency_error (missing/broken import) vs runtime_error (all else)."""
+        if isinstance(exc, (ImportError, ModuleNotFoundError)):
+            return "dependency_error"
+        return "runtime_error"
 
     # ------------- 4b8f083f: local commit-drift staleness probe -----------
     # Only runs when the caller hasn't already told us the graph is stale,
@@ -245,6 +291,7 @@ async def prospect_symbol_impl(
         try:
             from .routes import tunnel as _tunnel_mod  # noqa: PLC0415
             if _tunnel_mod.has_active_tunnel(tenant_id):
+                _mark_rung("graph", "attempted", attempted_tool="codebase__search_graph")
                 graph_args: dict[str, Any] = {"query": symbol, "limit": limit}
                 if project_id:
                     graph_args["project_id"] = project_id
@@ -300,6 +347,11 @@ async def prospect_symbol_impl(
                     result["rung"] = "graph"
                     result["hits"] = broad_hits
                     result["graph_raw"] = broad_payload
+                    _mark_rung(
+                        "graph", "succeeded",
+                        attempted_tool="codebase__search_graph",
+                        selected_tool="codebase__search_graph (broad retry)",
+                    )
                     result["fallback_reason"] = (
                         f"graph_project_id_mismatch_error: search_graph with "
                         f"project_id={project_id!r} failed ({original_msg!r}); "
@@ -322,6 +374,12 @@ async def prospect_symbol_impl(
                     if await _broad_retry_without_project_id(str(_rung1_exc)):
                         return result
                     result["fallback_reason"] = f"graph_error: {_rung1_exc}"
+                    _mark_rung(
+                        "graph", "error",
+                        attempted_tool="codebase__search_graph",
+                        error=f"{type(_rung1_exc).__name__}: {_rung1_exc}",
+                        error_kind=_classify_error(_rung1_exc),
+                    )
                     graph_result = None
 
                 if graph_result is not None:
@@ -346,6 +404,11 @@ async def prospect_symbol_impl(
                         result["rung"] = "graph"
                         result["hits"] = hits
                         result["graph_raw"] = payload
+                        _mark_rung(
+                            "graph", "succeeded",
+                            attempted_tool="codebase__search_graph",
+                            selected_tool="codebase__search_graph",
+                        )
                         if staleness_info:
                             result["_graph_staleness"] = staleness_info
                             result["fallback_reason"] = (
@@ -373,6 +436,12 @@ async def prospect_symbol_impl(
                                 result["_graph_staleness"] = staleness_info
                             return result
                         result["fallback_reason"] = f"graph_error: {app_err}"
+                        _mark_rung(
+                            "graph", "error",
+                            attempted_tool="codebase__search_graph",
+                            error=f"app_error: {app_err}",
+                            error_kind="runtime_error",
+                        )
                     elif project_id and graph_args.get("project_id"):
                         # Retry without project_id — broader search.
                         broad_args: dict[str, Any] = {"query": symbol, "limit": limit}
@@ -386,6 +455,11 @@ async def prospect_symbol_impl(
                                 result["rung"] = "graph"
                                 result["hits"] = broad_hits
                                 result["graph_raw"] = broad_payload
+                                _mark_rung(
+                                    "graph", "succeeded",
+                                    attempted_tool="codebase__search_graph",
+                                    selected_tool="codebase__search_graph (broad retry)",
+                                )
                                 # Surface the project_id mismatch as a note.
                                 result["fallback_reason"] = (
                                     f"graph_project_id_mismatch: search_graph "
@@ -402,15 +476,33 @@ async def prospect_symbol_impl(
                         result["fallback_reason"] = (
                             "graph_stale" if staleness_info else "graph_empty"
                         )
+                        _mark_rung(
+                            "graph", "empty",
+                            attempted_tool="codebase__search_graph",
+                            reason=result["fallback_reason"],
+                        )
                     else:
                         # Fall through to Serena.
                         result["fallback_reason"] = (
                             "graph_stale" if staleness_info else "graph_empty"
                         )
+                        _mark_rung(
+                            "graph", "empty",
+                            attempted_tool="codebase__search_graph",
+                            reason=result["fallback_reason"],
+                        )
                     if staleness_info:
                         result["_graph_staleness"] = staleness_info
+            else:
+                _mark_rung("graph", "skipped", reason="no_active_tunnel")
         except Exception as _e:  # noqa: BLE001 — fallback must never raise
             result["fallback_reason"] = f"graph_error: {_e}"
+            _mark_rung(
+                "graph", "error",
+                attempted_tool="codebase__search_graph",
+                error=f"{type(_e).__name__}: {_e}",
+                error_kind=_classify_error(_e),
+            )
 
     elif stale_graph:
         if commit_drift:
@@ -419,16 +511,29 @@ async def prospect_symbol_impl(
                 f"{commit_drift['commits_since_index']} commit(s) since last index "
                 f"({commit_drift['stored_commit'][:12]} -> {commit_drift['head_commit'][:12]})"
             )
+            _mark_rung("graph", "skipped", reason=result["fallback_reason"])
         else:
             result["fallback_reason"] = "graph_skipped_stale_graph=true"
+            _mark_rung("graph", "skipped", reason=result["fallback_reason"])
+
+    else:
+        # d5e60791 — the ONE remaining silent gap: not stale_graph and no
+        # tenant_id at all (e.g. a self-hosted call with no active tunnel
+        # context). Neither branch above fires; make that explicit instead
+        # of leaving rungs["graph"] at "not_attempted" with no explanation.
+        _mark_rung("graph", "skipped", reason="no_tenant_id")
 
     # ------------- Rung 2: extractor__find_symbol / find_declaration ------
+    _SERENA_TOOLS = "extractor__find_symbol, extractor__find_declaration"
     if tenant_id:
         try:
             from .routes import tunnel as _tunnel_mod  # noqa: PLC0415
             if _tunnel_mod.has_active_tunnel(tenant_id):
+                _mark_rung("serena", "attempted", attempted_tool=_SERENA_TOOLS)
                 # Try find_symbol first, then find_declaration.
                 serena_hits: list[Any] = []
+                serena_errors: list[str] = []
+                serena_tool_used: "str | None" = None
                 for serena_tool in ("extractor__find_symbol", "extractor__find_declaration"):
                     try:
                         s_result = await _tunnel_mod.call_tunnel_tool(
@@ -449,19 +554,54 @@ async def prospect_symbol_impl(
                             # Normalise to list.
                             if not isinstance(serena_hits, list):
                                 serena_hits = []
-                    except Exception:  # noqa: BLE001
+                    except Exception as _serena_exc:  # noqa: BLE001
+                        # d5e60791 — record the real error instead of
+                        # silently discarding it (was a bare `serena_hits =
+                        # []` with no trace); still try the next tool.
+                        serena_errors.append(
+                            f"{serena_tool}: {type(_serena_exc).__name__}: {_serena_exc}"
+                        )
                         serena_hits = []
                     if serena_hits:
+                        serena_tool_used = serena_tool
                         break
                 if serena_hits:
                     result["rung"] = "serena"
                     result["hits"] = serena_hits[:limit]
+                    _mark_rung(
+                        "serena", "succeeded",
+                        attempted_tool=_SERENA_TOOLS,
+                        selected_tool=serena_tool_used,
+                    )
                     return result
-        except Exception:  # noqa: BLE001 — fallback chain never raises
-            pass
+                if serena_errors:
+                    _mark_rung(
+                        "serena", "error",
+                        attempted_tool=_SERENA_TOOLS,
+                        error="; ".join(serena_errors),
+                        error_kind="runtime_error",
+                    )
+                else:
+                    _mark_rung("serena", "empty", attempted_tool=_SERENA_TOOLS)
+            else:
+                _mark_rung("serena", "skipped", reason="no_active_tunnel")
+        except Exception as _serena_outer_exc:  # noqa: BLE001 — fallback chain never raises
+            # d5e60791 — this used to be a bare `pass`, silently discarding
+            # whatever failed here (e.g. the tunnel import itself, or
+            # has_active_tunnel raising) with zero diagnostic. Record it
+            # truthfully instead.
+            _mark_rung(
+                "serena", "error",
+                attempted_tool=_SERENA_TOOLS,
+                error=f"{type(_serena_outer_exc).__name__}: {_serena_outer_exc}",
+                error_kind=_classify_error(_serena_outer_exc),
+            )
+    else:
+        _mark_rung("serena", "skipped", reason="no_tenant_id")
 
     # ------------- Rung 3: search_code_semantic BM25 ----------------------
     if root_dir:
+        _mark_rung("semantic", "attempted", attempted_tool="search_code_semantic")
         try:
             from . import code_index as _code_index  # noqa: PLC0415
             from . import hardening as _hardening  # noqa: PLC0415
@@ -478,16 +618,73 @@ async def prospect_symbol_impl(
                 reindex=True,
                 label="prospect_symbol_semantic",
             )
-            sem_hits = (sem_result or {}).get("hits") or []
-            if sem_hits:
-                result["rung"] = "semantic"
-                result["hits"] = sem_hits
-                result["semantic_raw"] = sem_result
-                return result
-        except Exception:  # noqa: BLE001
-            pass
+            if isinstance(sem_result, dict) and sem_result.get("error"):
+                # search_code_semantic degrades to {"error": "..."} instead
+                # of raising (e.g. root_dir missing, hosted-mode guard,
+                # timeout) — treat that the same as a raised exception so it
+                # is never silently mistaken for "zero hits, nothing wrong".
+                result["fallback_reason"] = f"semantic_error: {sem_result['error']}"
+                _mark_rung(
+                    "semantic", "error",
+                    attempted_tool="search_code_semantic",
+                    error=str(sem_result["error"]),
+                    error_kind="runtime_error",
+                )
+            else:
+                sem_hits = (sem_result or {}).get("hits") or []
+                if sem_hits:
+                    result["rung"] = "semantic"
+                    result["hits"] = sem_hits
+                    result["semantic_raw"] = sem_result
+                    _mark_rung(
+                        "semantic", "succeeded",
+                        attempted_tool="search_code_semantic",
+                        selected_tool="search_code_semantic",
+                    )
+                    return result
+                _mark_rung("semantic", "empty", attempted_tool="search_code_semantic")
+        except Exception as _sem_exc:  # noqa: BLE001
+            # d5e60791 — THE bug this item fixes: this used to be a bare
+            # `pass`, which meant a ModuleNotFoundError for
+            # 'meridian_codeindex' (the confirmed live failure — the
+            # extracted extensions/meridian-codeindex package not being
+            # importable in this runtime) silently collapsed into
+            # rung="none", fallback_reason=None with NO trace of what went
+            # wrong. Record the real exception — type, message, and whether
+            # it looks like a missing/broken dependency vs. some other
+            # runtime failure — both on this rung's own diagnostic entry and
+            # (since this is the last rung) as the top-level fallback_reason
+            # so a caller that only looks at fallback_reason still sees it.
+            _error_kind = _classify_error(_sem_exc)
+            _error_text = f"{type(_sem_exc).__name__}: {_sem_exc}"
+            result["fallback_reason"] = f"semantic_error: {_error_text}"
+            _mark_rung(
+                "semantic", "error",
+                attempted_tool="search_code_semantic",
+                error=_error_text,
+                error_kind=_error_kind,
+            )
+    else:
+        _mark_rung("semantic", "skipped", reason="no_root_dir")
 
-    # All rungs exhausted — return the (empty) result with diagnostic info.
+    # All rungs exhausted (rung stays "none"). d5e60791 — never return here
+    # with fallback_reason still None: synthesize one from the per-rung
+    # diagnostics so a caller ALWAYS has something actionable to look at,
+    # even when every rung failed for a different reason. Only fires when
+    # nothing upstream already set a specific fallback_reason (e.g.
+    # "graph_empty"), so existing exact-string callers are unaffected.
+    if result["rung"] == "none" and not result["fallback_reason"]:
+        _summary = []
+        for _rung_name in ("graph", "serena", "semantic"):
+            _entry = result["rungs"][_rung_name]
+            _piece = f"{_rung_name}={_entry['status']}"
+            if _entry.get("error"):
+                _piece += f" ({_entry['error']})"
+            elif _entry.get("reason"):
+                _piece += f" ({_entry['reason']})"
+            _summary.append(_piece)
+        result["fallback_reason"] = "all_rungs_missed: " + "; ".join(_summary)
+
     return result
 
 

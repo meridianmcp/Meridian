@@ -577,6 +577,78 @@ async def handle_delete_custom_hook(
     return {"hook_id": _hook_id, "deleted": deleted}
 
 
+async def handle_update_custom_hook(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: update_custom_hook (b4f4627f).
+
+    The previously-missing generic enable/disable/edit path: patches a subset
+    of an existing hook's editable fields (name, event, matcher, script_sh,
+    script_ps1, blocking, enabled) without the delete+recreate round-trip
+    add_custom_hook/delete_custom_hook would otherwise require. Renaming
+    re-derives the slug (same reserved-name / uniqueness checks as
+    add_custom_hook). The db layer raises ValueError for a bad event, the
+    reserved 'sprint_guard' name, or a slug collision — surfaced as {error},
+    same convention as add_custom_hook. Returns {"error": ...} (never raises)
+    when hook_id doesn't resolve to a row for this project.
+
+    b4f4627f — when this call flips ``enabled`` True -> False, any already-
+    written ``.claude/hooks/<slug>.*`` artifacts for THIS hook are removed
+    immediately — best-effort, only when the project has a resolvable
+    ``executor_config.repo_path`` with a ``.claude`` dir — instead of waiting
+    for the next ``generate_handoff`` to simply stop re-writing them. This
+    generalizes the per-hook convergence f7084ed0 built specifically for the
+    orphan_reaper Stop hook (``orphan_reaper.remove_orphan_reaper_artifacts``)
+    to every user-defined hook, via ``handoff.remove_custom_hook_artifacts``.
+    Nonblocking/fail-open: a removal failure never fails the update itself,
+    matching the orphan_reaper toggle route's own best-effort convention.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    _hook_id = (args.get("hook_id") or "").strip()
+    if not _pid or not _hook_id:
+        return {"error": "project_id and hook_id are both required"}
+    _editable_keys = (
+        "name", "event", "matcher", "script_sh", "script_ps1", "blocking", "enabled",
+    )
+    fields = {k: args[k] for k in _editable_keys if k in args}
+    if not fields:
+        return {"error": "at least one editable field must be supplied"}
+    before = await db_module.get_custom_hook(db, _pid, _hook_id)
+    try:
+        updated = await db_module.update_custom_hook(db, _pid, _hook_id, **fields)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if updated is None:
+        return {"error": f"no such hook: {_hook_id}"}
+    removed_files: list[str] = []
+    _was_enabled = bool(before.get("enabled")) if before else False
+    _now_enabled = bool(updated.get("enabled"))
+    # Hosted Meridian cannot safely resolve or mutate a caller's local
+    # repository.  Persist the hook state, but leave local artifact cleanup to
+    # the caller-side handoff/launcher instead of crossing the hosted/local
+    # filesystem boundary (no_local_fs_access guard).
+    if before is not None and _was_enabled and not _now_enabled and not _hosted_mode():
+        try:
+            from pathlib import Path as _Path  # noqa: PLC0415
+            from meridian import handoff as _handoff_module  # noqa: PLC0415
+            exec_cfg = await db_module.get_executor_config(db, _pid)
+            repo_path = (exec_cfg.get("repo_path") or "").strip()
+            if repo_path and (_Path(repo_path) / ".claude").exists():
+                hooks_dir = _Path(repo_path) / ".claude" / "hooks"
+                removed_files = _handoff_module.remove_custom_hook_artifacts(
+                    hooks_dir, updated.get("slug") or before.get("slug"),
+                )
+        except Exception:  # noqa: BLE001 — artifact cleanup is best-effort, never fails the update
+            pass
+    if removed_files:
+        return {**updated, "removed_files": removed_files}
+    return updated
+
+
 async def handle_get_capability_manifest(
     args: dict[str, Any],
     db: Any,

@@ -44,6 +44,7 @@ from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
     migrate_retired_overrides, config_fingerprint,
 )
+from ..openai_tunnel_adapter import combined_diagnostics, OpenAITunnelAdapterError
 
 router = APIRouter()
 _log = logging.getLogger(__name__)
@@ -1834,6 +1835,55 @@ async def tunnel_status(tenant_id: str) -> dict:
         "inflight": tenant_inflight_counts(tenant_id),
         "safe_to_restart": not any(tenant_inflight_counts(tenant_id).values()),
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /tunnel/openai/diagnostics/{tenant_id} — OPTIONAL OpenAI Secure MCP
+# Tunnel transport adapter diagnostics (45049071), explicitly namespaced
+# apart from tunnel_status()'s Meridian-tunnel socket state above so the two
+# transports can never be conflated by a caller. This endpoint does NOT
+# persist anything server-side (no new DB column, no change to production
+# credentials/connections) — the caller (dashboard, or the local
+# `meridian --tunnel` client's own tunnel_client.openai_tunnel_adapter_snapshot())
+# supplies the locally-known stdio/HTTP config each call. Persistence is an
+# explicit documented follow-up — see docs/secure-openai-mcp-tunnel-adapter.md.
+# ---------------------------------------------------------------------------
+
+@router.post("/tunnel/openai/diagnostics/{tenant_id}")
+async def openai_tunnel_diagnostics(tenant_id: str, request: Request) -> Response:
+    """Compose OpenAI Secure MCP Tunnel adapter diagnostics for *tenant_id*,
+    alongside Meridian's own tunnel socket state (see :func:`tunnel_status`).
+
+    Body (all optional): ``{"openai_tunnel_config": {...}, "reported_status":
+    {...}}``. ``openai_tunnel_config`` is validated via
+    ``openai_tunnel_adapter.normalize_config`` — a malformed config yields a
+    400 with the validation error, never a partial/best-guess diagnostics
+    response. ``reported_status`` optionally carries a live ``{"state": ...,
+    "detail": ...}`` health report from wherever actually probes the OpenAI
+    tunnel (out of scope for this item; see the adapter module's docstring).
+    Omitting both reports ``not_configured`` — no auth required, mirroring
+    :func:`tunnel_status`'s own lightweight, read-only status check.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — empty/invalid body -> treat as "no config supplied"
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    openai_config = body.get("openai_tunnel_config")
+    reported_status = body.get("reported_status")
+    if reported_status is not None and not isinstance(reported_status, dict):
+        reported_status = None
+    try:
+        diagnostics = combined_diagnostics(
+            tenant_id,
+            openai_config=openai_config,
+            reported_status=reported_status,
+            meridian_tunnel_active=tenant_id in _tunnel_sockets,
+        )
+    except OpenAITunnelAdapterError as exc:
+        return _json_response({"error": str(exc)}, status_code=400)
+    return _json_response(diagnostics)
 
 
 # ---------------------------------------------------------------------------

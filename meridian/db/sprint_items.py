@@ -8,9 +8,12 @@ call sites using ``db_module.function_name()`` continue to work unchanged.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import re
 import time
+from datetime import datetime, timezone  # 0d0cada7 — lease-local scheduler diagnostics
 from typing import Any
 from xml.sax.saxutils import escape as _xml_escape  # fdaa5b55/cd038235 — same
 # escaping helper/discipline as 5abf3e12 (meridian/handoff.py's
@@ -292,6 +295,18 @@ _VALID_SPRINT_STATUSES = {
 _ACTIVE_SPRINT_STATUSES = {
     "pending", "in_progress", "todo", "indeterminate", "provisional_complete",
 }
+
+# a2a027cf — bounded budget (seconds) for complete_sprint_item's purely
+# ADVISORY post-commit work (parent rollup, mixed-ownership task-chain
+# advance, continuation-state gather). The authoritative status write
+# (sprint_items.status -> 'done') has already committed by the time any of
+# this runs; none of it may hold the HTTP/MCP response hostage past a
+# client's own request timeout (repeated live reports: clients timing out
+# around 60s while the write had actually already landed). Generous
+# relative to the real work (a handful of indexed lookups) but far under
+# typical client timeouts, so it only ever engages under genuine pathology
+# (e.g. a huge sprint board) rather than everyday completion calls.
+_ADVISORY_PHASE_TIMEOUT_S = 5.0
 
 # Statuses that make an existing item a *blocking* duplicate when a new item
 # with a near-identical title is added. Only open/active work counts: a title
@@ -1792,6 +1807,7 @@ async def complete_sprint_item(
     verification_verdict: str | None = None,
     verification_notes: str | None = None,
     force_foreign_claim: bool = False,
+    correlation_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
 
@@ -1877,8 +1893,86 @@ async def complete_sprint_item(
     downstream step only ever touches the ONE issue linked to THIS item
     (8fc92474) and classifies purely from the DB column above, never from
     issue title/body/labels/custom fields (eda40627/8c170bcc).
+
+    a2a027cf — timeout-safe / observable / idempotent completion. Repeated
+    live reports: an MCP/HTTP client times out around 60s waiting on this
+    call even though the server-side write had already landed; a defensive
+    retry then either re-observed "done" (confusing) or hit a bare
+    SprintItemStatusRace (actively misleading — nothing raced, the ORIGINAL
+    call's own write simply finished after the client stopped waiting for
+    it). This adds:
+
+    * ``correlation_id`` — caller-supplied (thread this down from an MCP/
+      HTTP request id when you have one) or freshly minted here when
+      omitted. Always present on the returned dict as ``correlation_id`` so
+      a client that times out before seeing the response can still
+      correlate a server-side log line with the retry it's about to make.
+    * ``phase_timings_ms`` — wall-clock duration of each internal phase
+      (``lookup``, ``ownership_check``, ``verification_check``,
+      ``evidence_check``, ``stored_evidence_check``, ``status_transition``,
+      ``post_commit_advisory``), rounded to milliseconds. Purely
+      observational — never affects control flow. Lets a slow phase be
+      identified from the response itself instead of guessed from a raw
+      client-side timeout.
+    * ``completion_outcome`` — ``"committed"`` when THIS call performed the
+      active->done transition, or ``"already_committed"`` when the item was
+      ALREADY ``done`` on entry (an idempotent no-op — see below). Absent
+      when the call raises.
+    * Idempotent retry: if the item is ALREADY ``done`` when this function
+      is entered, every gate below (ownership / verification / evidence)
+      and every side effect (rollup, task-chain advance, GitHub-issue
+      close, notifications) is SKIPPED — the current row is returned
+      immediately with ``completion_outcome="already_committed"``. A
+      completion call whose target state is already reached is a no-op
+      success, not grounds to re-run gates whose only purpose was deciding
+      whether the active->done transition may proceed, or to re-fire
+      side effects that already fired once (duplicate HITL filings,
+      duplicate GitHub comments, etc. — "a timeout must never cause
+      duplicate completion, duplicate side effects, or misleading
+      failure"). A concurrent race against a DIFFERENT terminal status
+      (e.g. someone skipped/failed it first) is UNCHANGED: that still
+      raises :class:`SprintItemStatusRace` exactly as before, because that
+      IS a genuine conflicting outcome, not a replay of this same
+      completion.
+    * Bounded advisory work: the two purely-derived-state post-commit steps
+      (:func:`_maybe_rollup_parent`, :func:`_advance_task_chain`) run under
+      a single bounded ``asyncio.wait_for`` budget
+      (:data:`_ADVISORY_PHASE_TIMEOUT_S`) so a slow rollup/chain-advance can
+      never hold the ALREADY-committed response hostage. On timeout the
+      commit itself is untouched (it already landed before this phase
+      starts) — the response carries ``advisory_work_deferred: true``
+      instead of hanging. The continuation-state gather (also advisory) is
+      bounded the same way.
     """
+    _t_start = time.monotonic()
+    _phase_ms: dict[str, float] = {}
+    _last_t = _t_start
+
+    def _mark_phase(name: str) -> None:
+        nonlocal _last_t
+        _now = time.monotonic()
+        _phase_ms[name] = round((_now - _last_t) * 1000, 3)
+        _last_t = _now
+
+    _correlation_id = correlation_id or _new_id()
+
     item = await get_sprint_item(db, item_id)
+    _mark_phase("lookup")
+
+    if (
+        item is not None
+        and item.get("project_id") == project_id
+        and item.get("status") == "done"
+    ):
+        # a2a027cf — idempotent retry / already-committed short-circuit. See
+        # the docstring above: no gates, no side effects, just the current
+        # row plus the observability fields. This is a no-op success.
+        result = dict(item)
+        result["completion_outcome"] = "already_committed"
+        result["correlation_id"] = _correlation_id
+        result["phase_timings_ms"] = dict(_phase_ms)
+        return result
+
     _evidence_quality_warning: str | None = None
     _stored_evidence_warning: str | None = None
     if item is not None and item.get("project_id") == project_id:
@@ -1938,6 +2032,7 @@ async def complete_sprint_item(
                     "pass force_foreign_claim=true to acknowledge and complete "
                     "anyway."
                 )
+        _mark_phase("ownership_check")
         if item.get("require_verification"):
             if verifier_session_id and verification_verdict:
                 await record_sprint_item_verification(
@@ -1980,6 +2075,7 @@ async def complete_sprint_item(
                     "(different session_id, no memory of the implementation) "
                     "must file the PASS verdict."
                 )
+        _mark_phase("verification_check")
         if item.get("required_notes"):
             has_evidence = bool(
                 (notes or "").strip()
@@ -2017,13 +2113,34 @@ async def complete_sprint_item(
             )
         except Exception:  # noqa: BLE001 — never block completion
             _stored_evidence_warning = None
-    result = await _update_sprint_item_status(
-        db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor,
-        expected_statuses=_ACTIVE_SPRINT_STATUSES,
-    )
+    _mark_phase("evidence_check")
+    _completion_outcome: str | None = None
+    try:
+        result = await _update_sprint_item_status(
+            db, project_id, item_id, "done", task_id=task_id, notes=notes, actor=actor,
+            expected_statuses=_ACTIVE_SPRINT_STATUSES,
+        )
+    finally:
+        _mark_phase("status_transition")
     if result is not None:
-        await _maybe_rollup_parent(db, project_id, item_id)
-        await _advance_task_chain(db, project_id, item_id)
+        # a2a027cf — the core status write above has ALREADY committed (see
+        # _transition_status: it calls db.commit() itself, synchronously,
+        # before returning). Everything from here down is advisory
+        # derived-state maintenance, not part of "did the item complete" —
+        # so it runs under a bounded budget and can never turn an
+        # already-successful commit into a hung or misleading response.
+        _completion_outcome = "committed"
+        _advisory_deferred = False
+        try:
+            await asyncio.wait_for(
+                _run_post_commit_side_effects(db, project_id, item_id),
+                timeout=_ADVISORY_PHASE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            _advisory_deferred = True
+        except Exception:  # noqa: BLE001 — advisory only, never block completion
+            pass
+        _mark_phase("post_commit_advisory")
         if _evidence_quality_warning or _stored_evidence_warning:
             result = dict(result)
             if _evidence_quality_warning:
@@ -2035,24 +2152,60 @@ async def complete_sprint_item(
         # only calls complete_sprint_item (never get_sprint_progress) still
         # gets a structured signal about whether autonomous work remains
         # instead of having to infer it from prose. Advisory only — never
-        # blocks completion, fails open on any error, same shape as the two
-        # warning fields above.
+        # blocks completion, fails open on any error (INCLUDING a timeout),
+        # same shape as the two warning fields above.
         try:
-            _cg_sibling_items = await get_sprint_items_cached(db, project_id)
+            _cg_sibling_items, _cg_project = await asyncio.wait_for(
+                _gather_continuation_inputs(db, project_id),
+                timeout=_ADVISORY_PHASE_TIMEOUT_S,
+            )
             _cg_version = result.get("version")
             if _cg_version:
                 _cg_sibling_items = [
                     it for it in _cg_sibling_items if it.get("version") == _cg_version
                 ]
-            _cg_project = await get_project(db, project_id)
             result = dict(result)
             result["continuation"] = _continuation_gate.compute_continuation_state(
                 _cg_sibling_items,
                 execution_mode=(_cg_project or {}).get("execution_mode"),
             )
+        except asyncio.TimeoutError:
+            _advisory_deferred = True
         except Exception:  # noqa: BLE001 — advisory only, never block completion
             pass
+        _mark_phase("continuation_state")
+        result = dict(result)
+        if _advisory_deferred:
+            result["advisory_work_deferred"] = True
+        result["completion_outcome"] = _completion_outcome
+        result["correlation_id"] = _correlation_id
+        result["phase_timings_ms"] = dict(_phase_ms)
     return result
+
+
+async def _run_post_commit_side_effects(
+    db: aiosqlite.Connection, project_id: str, item_id: str,
+) -> None:
+    """a2a027cf — the two purely-advisory post-commit maintenance steps
+    (parent rollup + mixed-ownership task-chain advance) that
+    :func:`complete_sprint_item` used to run unbounded. Split out so both can
+    be awaited under a single ``asyncio.wait_for`` budget without duplicating
+    call sites. Neither step is part of the authoritative status write — the
+    caller's own ``_update_sprint_item_status`` call has already committed
+    ``status='done'`` before this function is ever invoked."""
+    await _maybe_rollup_parent(db, project_id, item_id)
+    await _advance_task_chain(db, project_id, item_id)
+
+
+async def _gather_continuation_inputs(
+    db: aiosqlite.Connection, project_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """a2a027cf — the two async fetches continuation-state computation needs,
+    split out so they can be awaited under a single bounded
+    ``asyncio.wait_for`` call in :func:`complete_sprint_item`."""
+    _sibling_items = await get_sprint_items_cached(db, project_id)
+    _project = await get_project(db, project_id)
+    return _sibling_items, _project
 
 
 async def provisional_complete_sprint_item(
@@ -2216,6 +2369,19 @@ async def claim_sprint_item(
     function's result is a full ``get_sprint_item`` row) so a caller that
     claims directly (bypassing /goal's rendered ``<required_tool>``
     directive) still sees the pin and can honour it.
+
+    56e9b3c7 — AUTONOMOUS STALE-CLAIM RECONCILIATION: when the item is
+    already ``in_progress``, this function no longer just raises. It first
+    classifies the existing claim via :func:`classify_stale_claim` — a
+    multi-signal check (claiming session's heartbeat/closed-state, worktree
+    activity, task-log evidence since ``claimed_at`` — NOT ``claimed_at`` age
+    alone) — and, ONLY when the verdict is ``"stale"``, atomically releases
+    the abandoned claim's item/resource locks, resets it to ``pending``, and
+    writes an audit record (:func:`_reset_stale_claim`) before retrying the
+    claim fresh. An ``"active"`` or ``"ambiguous"`` verdict changes nothing —
+    the ``ValueError`` below still fires exactly as before. See
+    :func:`reconcile_stale_claims` for the project/version-scoped bulk sweep
+    (dry-run + bounded-batch) built on the same classifier.
     """
     item = await get_sprint_item(db, item_id)
     if item is None:
@@ -2357,9 +2523,38 @@ async def claim_sprint_item(
         }
     blocked = {"in_progress", "done", "failed", "skipped"}
     if (item.get("status") or "pending") in blocked:
-        raise ValueError(
-            f"cannot claim item with status '{item.get('status')}'"
-        )
+        # 56e9b3c7 — AUTONOMOUS STALE-CLAIM RECONCILIATION: previously this
+        # branch just raised ValueError for an in_progress item, and the ONLY
+        # feedback a caller got was the MCP handler's own reactive, age-only
+        # (claimed_at > 2h) STALE_CLAIM report AFTER the raise — nothing ever
+        # actually reconciled the claim; the response merely suggested
+        # update_sprint_item(status='pending', force=true), a schema that
+        # doesn't exist. Before giving up, run the full multi-signal
+        # classification (heartbeat/session-liveness, worktree activity,
+        # task-log evidence, explicit close — NOT claimed_at age alone) via
+        # classify_stale_claim(). Only a "stale" verdict is auto-reconciled;
+        # "active" and "ambiguous" verdicts fall through to the unchanged
+        # raise below — a claim is NEVER reset on a hunch or on age alone.
+        if (item.get("status") or "") == "in_progress":
+            try:
+                _reconcile_verdict = await classify_stale_claim(db, item)
+            except Exception:  # noqa: BLE001 — classification must never wedge a claim attempt
+                _reconcile_verdict = {"classification": "ambiguous"}
+            if _reconcile_verdict.get("classification") == "stale":
+                _reconciled = await _reset_stale_claim(
+                    db, project_id, item_id, _reconcile_verdict, actor=actor,
+                )
+                if _reconciled is not None:
+                    # The stale claim was atomically released back to pending
+                    # (locks released, stall_count bumped, audit record
+                    # written by _reset_stale_claim) — re-fetch and fall
+                    # through to the normal claim path below as if this
+                    # caller had found the item pending in the first place.
+                    item = await get_sprint_item(db, item_id)
+        if (item.get("status") or "pending") in blocked:
+            raise ValueError(
+                f"cannot claim item with status '{item.get('status')}'"
+            )
     # fa3e3331 — the pre-check above (read, then this UPDATE) is a classic
     # TOCTOU race: two concurrent claims can both pass the pre-check before
     # either commits. Routing through _transition_status with from_statuses
@@ -2396,6 +2591,556 @@ async def claim_sprint_item(
             f"cannot claim item with status '{_raced.get('status')}'"
         )
     return result
+
+
+# ---------------------------------------------------------------------------
+# 56e9b3c7 — autonomous stale-claim reconciliation.
+#
+# THE DEFECT: claim_sprint_item only ever REPORTED a stale claim reactively —
+# after a second claim attempt raised ValueError, the MCP handler
+# (meridian/mcp/handlers/sprint_tools.py, 10c0f6a0) checked claimed_at age
+# alone (>2h) and, if stale, told the caller to self-service via
+# ``update_sprint_item(status='pending', force=true)`` — a recovery contract
+# the public update tool schema never actually exposed. There was no
+# autonomous sweep, no session-heartbeat/liveness check, no worktree/process
+# check, no evidence check, and no audit trail of who reset what or why.
+#
+# THE FIX: two entry points sharing ONE classifier (:func:`classify_stale_claim`)
+# and ONE atomic reset (:func:`_reset_stale_claim`):
+#   1. claim_sprint_item itself (see above) — autonomously reconciles the ONE
+#      item a caller is actively trying to claim, inline, before raising.
+#   2. :func:`reconcile_stale_claims` — a project/version-scoped BULK sweep
+#      with dry-run and bounded-batch modes, for a scheduler path or an
+#      explicit human/planner-triggered audit across an entire board.
+#
+# CLASSIFICATION IS DELIBERATELY CONSERVATIVE. Per the acceptance criteria:
+# "never reset an active or ambiguous claim" and "require multiple signals
+# ... when evidence is ambiguous". Concretely:
+#   * A claiming session with a LIVE heartbeat (found, not closed/archived,
+#     last_seen within the staleness window) is ALWAYS "active", no matter
+#     how old claimed_at is — a 70-hour-old claim under a session that is
+#     still heartbeating is genuine long-running work, not abandonment.
+#   * No actor recorded at all -> "ambiguous" (nothing to verify liveness
+#     against — resetting blind is the one thing this module must never do).
+#   * The claiming session explicitly closed/archived -> "stale" outright,
+#     unconditionally — this mirrors the ALREADY-SHIPPED, accepted precedent
+#     in complete_sprint_item's own claim-ownership gate (8693b6a8): an
+#     explicit close is a strong, non-time-based signal, not a guess.
+#   * Anything short of that (session simply not found — e.g. a human-named
+#     actor string, per the SAME "can't tell != proof of death" precedent
+#     8693b6a8 already established — or a session whose heartbeat has merely
+#     gone cold without an explicit close) requires claimed_at age STALE
+#     *plus* at least one corroborating signal (no live worktree activity, no
+#     task-log evidence since the claim, or — for the fully-unrecognised-actor
+#     case — two independent corroborators) before landing on "stale". A
+#     single signal alone (age, or a cold-but-not-explicitly-closed session)
+#     is "ambiguous", never "stale" — the multi-signal requirement the
+#     acceptance criteria calls for.
+#   * When ``repo_root`` is supplied (self-hosted only — mirrors
+#     sprint_evidence_guard's own self-hosted-only gate), a claim that already
+#     has real, fresh, matching completion evidence on file
+#     (:func:`meridian.sprint_evidence_guard.verify_strict_completion_evidence`
+#     returns ``ok=True``) is downgraded from "stale" to "ambiguous" — this
+#     looks like completed work that was never marked done, not an abandoned
+#     claim, and resetting it to pending would silently discard real work.
+# ---------------------------------------------------------------------------
+
+# Reuse the SAME 2h number claim_sprint_item's reactive report and
+# complete_sprint_item's claim-ownership gate already use, so "is this claim
+# stale" answers identically everywhere in the codebase that asks.
+_RECONCILE_STALE_HOURS = _CLAIM_OWNERSHIP_STALE_HOURS
+
+# Bulk-sweep batch bounds (reconcile_stale_claims). Bounded so a huge board
+# can never turn one sweep call into an unbounded scan/lock storm.
+_RECONCILE_DEFAULT_BATCH = 25
+_RECONCILE_MAX_BATCH = 200
+
+# event_type recorded in action_audit_log for every autonomous/bulk reset —
+# same append-only audit table sprint_evidence_guard's override path uses.
+RECONCILE_STALE_CLAIM_AUDIT_EVENT = "sprint_item_stale_claim_reconciled"
+
+# Classification verdicts returned by classify_stale_claim().
+RECONCILE_ACTIVE = "active"
+RECONCILE_STALE = "stale"
+RECONCILE_AMBIGUOUS = "ambiguous"
+RECONCILE_NOT_APPLICABLE = "not_applicable"
+
+
+async def _claim_session_liveness(
+    db: aiosqlite.Connection, actor: str
+) -> dict[str, Any]:
+    """Resolve a claim's ``actor`` against the sessions table.
+
+    Mirrors (and is intentionally consistent with) complete_sprint_item's
+    own claim-ownership staleness check (8693b6a8): a session row that
+    doesn't exist at all is "can't tell", NOT proof of death — many actor
+    strings are human names or foreign identifiers with no session row.
+    """
+    async with db.execute(
+        "SELECT status, last_seen FROM sessions WHERE id = ?", (actor,)
+    ) as cur:
+        row = await cur.fetchone()
+    sess = _row_to_dict(row)
+    if sess is None:
+        return {
+            "found": False, "status": None, "last_seen": None,
+            "closed_or_archived": False, "heartbeat_cold": None,
+            "verified_alive": False,
+        }
+    status = sess.get("status") or ""
+    closed_or_archived = status in ("closed", "archived")
+    last_seen_dt = _parse_deferral_ts(sess.get("last_seen"))
+    heartbeat_cold: bool | None = None
+    if last_seen_dt is not None:
+        from datetime import datetime as _dt_cls  # noqa: PLC0415
+        age_h = (_dt_cls.utcnow() - last_seen_dt).total_seconds() / 3600
+        heartbeat_cold = age_h > _RECONCILE_STALE_HOURS
+    verified_alive = (not closed_or_archived) and (heartbeat_cold is False)
+    return {
+        "found": True, "status": status, "last_seen": sess.get("last_seen"),
+        "closed_or_archived": closed_or_archived,
+        "heartbeat_cold": heartbeat_cold,
+        "verified_alive": verified_alive,
+    }
+
+
+async def _claim_worktree_activity(
+    db: aiosqlite.Connection,
+    actor: str,
+    item_id: str,
+    *,
+    repo_root: "Any | None" = None,
+) -> bool | None:
+    """Worktree-activity signal for one (actor, item) claim.
+
+    Returns ``True`` when a live, registered worktree for this exact
+    (session, item) pair exists — real evidence of ongoing work. Returns
+    ``False`` when a worktree WAS registered for this pair but is no longer
+    live (removed, or — self-hosted only, when ``repo_root`` is supplied —
+    its recorded owner ``pid`` is confirmed dead via the same liveness check
+    ``worktree_cleanup`` itself uses before a real disk removal). Returns
+    ``None`` (unknown, votes neither way) when no worktree was ever
+    registered for this pair at all — many legitimate executors work in a
+    single tree and never call register_worktree.
+    """
+    async with db.execute(
+        "SELECT * FROM active_worktrees WHERE session_id = ? AND item_id = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (actor, item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    wt = _row_to_dict(row)
+    if wt is None:
+        return None
+    if wt.get("removed_at"):
+        return False
+    if repo_root is not None and wt.get("pid") is not None:
+        try:
+            from ..worktree_cleanup import _pid_is_alive  # noqa: PLC0415
+            if not _pid_is_alive(int(wt["pid"])):
+                return False
+        except Exception:  # noqa: BLE001 — an unverifiable pid is not proof of death
+            pass
+    return True
+
+
+async def _claim_recent_task_evidence(
+    db: aiosqlite.Connection,
+    actor: str | None,
+    item_id: str,
+    claimed_at_dt: "Any | None",
+) -> bool | None:
+    """True when a task_log row for this actor/item was logged at/since the claim.
+
+    Returns ``None`` (unknown) when ``claimed_at_dt`` couldn't be parsed —
+    there is nothing to compare "since" against. Uses ``>=`` rather than a
+    strict ``>``: both timestamps are second-granularity TEXT columns, so a
+    task logged in the SAME second as the claim (a common real sequence —
+    claim, then immediately log progress) must still count as evidence, not
+    be excluded by a same-second tie.
+    """
+    if claimed_at_dt is None:
+        return None
+    claimed_at_str = claimed_at_dt.strftime("%Y-%m-%d %H:%M:%S")
+    params: list[Any] = [item_id, claimed_at_str]
+    actor_clause = ""
+    if actor:
+        actor_clause = "OR session_id = ? "
+        params.insert(1, actor)
+    async with db.execute(
+        "SELECT COUNT(*) AS cnt FROM task_log "
+        f"WHERE (sprint_item_id = ? {actor_clause}) AND created_at >= ?",
+        tuple(params),
+    ) as cur:
+        row = await cur.fetchone()
+    cnt = (row["cnt"] if isinstance(row, dict) else row[0]) if row else 0
+    return bool(cnt)
+
+
+async def classify_stale_claim(
+    db: aiosqlite.Connection,
+    item: dict[str, Any],
+    *,
+    repo_root: "Any | None" = None,
+    now: "Any | None" = None,
+) -> dict[str, Any]:
+    """Classify ONE sprint item's current claim as active/stale/ambiguous.
+
+    See the module-level "56e9b3c7" comment block above claim_sprint_item's
+    reconciliation hook for the full decision-tree rationale. Never raises
+    for a normal classification outcome — an internal error degrades a
+    specific signal to "unknown" rather than aborting, matching this
+    module's established fail-open-on-uncertainty convention (never fail
+    open toward RESETTING a claim, only toward classifying it "ambiguous").
+
+    Returns ``{"item_id", "classification", "reasons": [str, ...],
+    "signals": {...}}``. ``classification`` is one of "active", "stale",
+    "ambiguous", or "not_applicable" (item isn't in_progress at all).
+    """
+    from datetime import datetime as _dt_cls  # noqa: PLC0415
+
+    item_id = item.get("id")
+    reasons: list[str] = []
+    if (item.get("status") or "") != "in_progress":
+        return {
+            "item_id": item_id, "classification": RECONCILE_NOT_APPLICABLE,
+            "reasons": ["item is not in_progress"], "signals": {},
+        }
+
+    now_dt = now or _dt_cls.utcnow()
+    claimed_at_dt = _parse_deferral_ts(item.get("claimed_at"))
+    age_hours: float | None = None
+    age_stale = False
+    if claimed_at_dt is not None:
+        age_hours = (now_dt - claimed_at_dt).total_seconds() / 3600
+        age_stale = age_hours > _RECONCILE_STALE_HOURS
+
+    actor = (item.get("actor") or "").strip()
+    signals: dict[str, Any] = {
+        "actor": actor or None,
+        "claimed_at": item.get("claimed_at"),
+        "age_hours": round(age_hours, 2) if age_hours is not None else None,
+        "age_stale": age_stale,
+    }
+
+    if not actor:
+        signals.update({"session_found": None, "worktree_live": None, "recent_evidence": None})
+        return {
+            "item_id": item_id, "classification": RECONCILE_AMBIGUOUS,
+            "reasons": ["no actor recorded on the claim — cannot verify session "
+                        "liveness, so the claim is never auto-reset blind"],
+            "signals": signals,
+        }
+
+    session = await _claim_session_liveness(db, actor)
+    signals.update({
+        "session_found": session["found"],
+        "session_status": session["status"],
+        "session_last_seen": session["last_seen"],
+        "session_explicitly_closed": session["closed_or_archived"],
+        "session_heartbeat_cold": session["heartbeat_cold"],
+        "session_verified_alive": session["verified_alive"],
+    })
+
+    if session["verified_alive"]:
+        reasons.append(
+            f"claiming session {actor!r} has a live heartbeat "
+            f"(status={session['status']!r}, last_seen={session['last_seen']!r})"
+        )
+        return {
+            "item_id": item_id, "classification": RECONCILE_ACTIVE,
+            "reasons": reasons, "signals": signals,
+        }
+
+    if session["closed_or_archived"]:
+        reasons.append(
+            f"claiming session {actor!r} is explicitly {session['status']!r} "
+            "— mirrors complete_sprint_item's own claim-ownership precedent "
+            "(8693b6a8) that an explicit close is unconditional proof of death"
+        )
+        return {
+            "item_id": item_id, "classification": RECONCILE_STALE,
+            "reasons": reasons, "signals": signals,
+        }
+
+    worktree_live = await _claim_worktree_activity(db, actor, item_id, repo_root=repo_root)
+    recent_evidence = await _claim_recent_task_evidence(db, actor, item_id, claimed_at_dt)
+    signals["worktree_live"] = worktree_live
+    signals["recent_evidence"] = recent_evidence
+
+    corroborators = 0
+    if age_stale:
+        corroborators += 1
+        reasons.append(f"claimed_at is {signals['age_hours']}h old (> {_RECONCILE_STALE_HOURS}h)")
+    if worktree_live is False:
+        corroborators += 1
+        reasons.append("no live registered worktree for this claim (removed or owning process dead)")
+    if recent_evidence is False:
+        corroborators += 1
+        reasons.append("no task_log activity for this item/session since it was claimed")
+
+    session_heartbeat_dead = bool(session["found"] and session["heartbeat_cold"])
+    session_unknown = not session["found"]
+    # A LIVE, registered worktree is a veto against auto-reset, not merely
+    # "not a corroborator" — a quiet executor that never calls log_task but
+    # still has an active worktree registered (optionally pid-confirmed
+    # alive) is exactly the "legitimate long-running work" the acceptance
+    # criteria says must be preserved, even with a cold heartbeat and zero
+    # task_log rows. A live worktree can only ever push toward "ambiguous"
+    # (never "active" outright — that still requires a verified heartbeat).
+    worktree_veto = worktree_live is True
+
+    classification = RECONCILE_AMBIGUOUS
+    if session_heartbeat_dead and corroborators >= 1 and not worktree_veto:
+        reasons.insert(0, f"claiming session {actor!r}'s heartbeat has gone cold")
+        classification = RECONCILE_STALE
+    elif session_unknown and age_stale and corroborators >= 2 and not worktree_veto:
+        reasons.insert(0, f"no session row found for actor {actor!r} (unverifiable identity)")
+        classification = RECONCILE_STALE
+    elif corroborators == 0 and not worktree_veto and session["heartbeat_cold"] is not True:
+        # Nothing suspicious at all — fresh-ish claim, no negative signals.
+        classification = RECONCILE_ACTIVE
+        reasons = ["no staleness signals fired"]
+    elif worktree_veto and classification != RECONCILE_STALE:
+        reasons.append("a live registered worktree vetoes auto-reset — needs human review")
+
+    if classification == RECONCILE_STALE and repo_root is not None:
+        try:
+            from meridian.sprint_evidence_guard import verify_strict_completion_evidence  # noqa: PLC0415
+            _evidence = await verify_strict_completion_evidence(
+                db, repo_root, item.get("project_id"), item_id, item,
+            )
+            signals["strict_evidence_ok"] = bool(_evidence.get("ok"))
+        except Exception:  # noqa: BLE001 — evidence check is advisory to classification
+            signals["strict_evidence_ok"] = None
+        if signals.get("strict_evidence_ok"):
+            classification = RECONCILE_AMBIGUOUS
+            reasons.append(
+                "verify_strict_completion_evidence found real, fresh completion "
+                "evidence on file — this looks like finished work that was never "
+                "marked done, not an abandoned claim; resetting to pending would "
+                "risk silently discarding it. A human should review and likely "
+                "call complete_sprint_item instead."
+            )
+
+    return {"item_id": item_id, "classification": classification, "reasons": reasons, "signals": signals}
+
+
+async def _reset_stale_claim(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    verdict: dict[str, Any],
+    *,
+    actor: str | None = None,
+) -> dict[str, Any] | None:
+    """Atomically reset ONE proven-stale claim: release its locks, return the
+    item to pending, and write an audit record. NEVER call this directly on
+    a verdict that isn't ``"stale"`` — this function does not itself re-check
+    the classification, only the live status (TOCTOU guard).
+
+    Returns ``None`` (silent no-op) if the item raced away from
+    ``in_progress`` between classification and this write (a concurrent
+    legitimate completion/claim/reconciliation beat this one to it) — never
+    clobbers a concurrent winner, matching every other transition in this
+    module's race-safety contract.
+    """
+    item = await get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return None
+    prior_actor = item.get("actor")
+    prior_claimed_at = item.get("claimed_at")
+
+    # TOCTOU-safe: only transitions FROM in_progress. A race-lost attempt is
+    # a silent no-op (mirrors requeue_or_fail_stalled_item / _transition_status).
+    transitioned = await _transition_status(
+        db, project_id, item_id, "pending",
+        from_statuses=["in_progress"],
+    )
+    if transitioned is None:
+        return None
+
+    new_stall_count = int(item.get("stall_count") or 0) + 1
+    await db.execute(
+        "UPDATE sprint_items SET claimed_at = NULL, stall_count = ? "
+        "WHERE id = ? AND project_id = ?",
+        (new_stall_count, item_id, project_id),
+    )
+    await db.commit()
+
+    # Release item/resource locks the abandoned claim held. Best-effort:
+    # release_file/release_resource/release_symbol live in db/locks.py, which
+    # is imported back onto the meridian.db package AFTER sprint_items.py —
+    # lazy import here (called well after full package init) avoids the
+    # circular-import ordering issue, same pattern _check_wrong_worktree in
+    # sprint_evidence_guard.py already uses for a cross-submodule call.
+    released: list[str] = []
+    if prior_actor:
+        try:
+            from meridian.db import release_file, release_resource, release_symbol  # noqa: PLC0415
+            for rid in parse_touches_resources(item.get("touches_resources")):
+                body = rid[len("inferred:"):] if rid.lower().startswith("inferred:") else rid
+                try:
+                    if body.startswith("file:"):
+                        path = body[len("file:"):]
+                        if await release_file(db, path, prior_actor):
+                            released.append(rid)
+                    elif body.startswith("symbol:"):
+                        path, _, sym = body[len("symbol:"):].partition("::")
+                        if sym and await release_symbol(db, prior_actor, path, sym):
+                            released.append(rid)
+                        elif not sym and await release_file(db, path, prior_actor):
+                            released.append(rid)
+                    else:
+                        if await release_resource(db, body, prior_actor):
+                            released.append(rid)
+                except Exception:  # noqa: BLE001 — one bad resource id must not block the rest
+                    continue
+        except Exception:  # noqa: BLE001 — lock release is best-effort, never blocks the reset
+            pass
+
+    from meridian.db import record_action_audit_event  # noqa: PLC0415
+    detail = json.dumps({
+        "item_id": item_id,
+        "prior_actor": prior_actor,
+        "prior_claimed_at": prior_claimed_at,
+        "released_resources": released,
+        "classification": verdict.get("classification"),
+        "reasons": verdict.get("reasons"),
+        "signals": verdict.get("signals"),
+    })
+    try:
+        await record_action_audit_event(
+            db, RECONCILE_STALE_CLAIM_AUDIT_EVENT,
+            project_id=project_id, actor=actor, detail=detail,
+        )
+    except Exception:  # noqa: BLE001 — an audit-log hiccup must not undo an already-committed reset
+        pass
+
+    updated = await get_sprint_item(db, item_id)
+    return {
+        "item_id": item_id,
+        "prior_actor": prior_actor,
+        "prior_claimed_at": prior_claimed_at,
+        "released_resources": released,
+        "stall_count": new_stall_count,
+        "reasons": verdict.get("reasons"),
+        "item": updated,
+    }
+
+
+async def reconcile_stale_claims(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    version: str | None = None,
+    item_ids: list[str] | None = None,
+    dry_run: bool = True,
+    max_batch: int = _RECONCILE_DEFAULT_BATCH,
+    actor: str | None = None,
+    repo_root: "Any | None" = None,
+) -> dict[str, Any]:
+    """56e9b3c7 — project/version-scoped, auditable stale-claim reconciliation
+    sweep. The bulk counterpart to claim_sprint_item's inline autonomous
+    reconciliation — for a scheduler path, or an explicit human/planner-
+    triggered audit across a whole board.
+
+    Scans ``in_progress`` items in ``project_id`` (optionally narrowed to one
+    ``version`` and/or an explicit ``item_ids`` allow-list — never cross-project:
+    every candidate query is hard-scoped to ``project_id``), classifies each
+    via :func:`classify_stale_claim`, and — ONLY when ``dry_run=False`` — resets
+    every "stale" verdict via :func:`_reset_stale_claim`. "active" and
+    "ambiguous" verdicts are NEVER touched, dry-run or not.
+
+    ``dry_run=True`` (the default) performs the full scan/classification and
+    reports exactly what WOULD happen without writing anything — safe to run
+    against any project, including live production boards, at any time.
+
+    ``max_batch`` bounds how many in_progress candidates are classified (and,
+    if not dry-run, potentially reset) in a single call — capped at
+    :data:`_RECONCILE_MAX_BATCH` regardless of what's requested, so one call
+    can never turn into an unbounded scan/lock-release storm on a huge board.
+    ``truncated=True`` on the result means more candidates exist than were
+    scanned this call — page through with subsequent calls.
+
+    Returns ``{"project_id", "version", "dry_run", "max_batch",
+    "candidates_total", "scanned", "truncated", "active": [...],
+    "stale": [...], "ambiguous": [...], "reset": [...], "errors": [...]}``.
+    Each of active/stale/ambiguous holds classify_stale_claim's verdict dicts;
+    "reset" holds _reset_stale_claim's result dicts (only populated when
+    dry_run=False); "errors" holds ``{"item_id", "error"}`` for any single
+    candidate whose classification or reset blew up — one bad item never
+    aborts the whole sweep.
+    """
+    if max_batch <= 0:
+        raise ValueError("max_batch must be positive")
+    max_batch = min(int(max_batch), _RECONCILE_MAX_BATCH)
+
+    where = ["project_id = ?", "status = 'in_progress'"]
+    params: list[Any] = [project_id]
+    if version:
+        where.append("version = ?")
+        params.append(version)
+    if item_ids:
+        placeholders = ", ".join("?" for _ in item_ids)
+        where.append(f"id IN ({placeholders})")
+        params.extend(item_ids)
+    query = (
+        f"SELECT * FROM sprint_items WHERE {' AND '.join(where)} "
+        "ORDER BY claimed_at ASC"
+    )
+    async with db.execute(query, tuple(params)) as cur:
+        rows = await cur.fetchall()
+    candidates = [r for r in (_row_to_dict(row) for row in rows) if r]
+
+    active: list[dict[str, Any]] = []
+    stale: list[dict[str, Any]] = []
+    ambiguous: list[dict[str, Any]] = []
+    reset: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    scanned = 0
+    for cand in candidates:
+        if scanned >= max_batch:
+            break
+        scanned += 1
+        try:
+            verdict = await classify_stale_claim(db, cand, repo_root=repo_root)
+        except Exception as exc:  # noqa: BLE001 — one bad item must never wedge the sweep
+            errors.append({"item_id": cand.get("id"), "error": str(exc)})
+            continue
+        cls = verdict.get("classification")
+        if cls == RECONCILE_ACTIVE:
+            active.append(verdict)
+        elif cls in (RECONCILE_AMBIGUOUS, RECONCILE_NOT_APPLICABLE):
+            ambiguous.append(verdict)
+        else:  # RECONCILE_STALE
+            stale.append(verdict)
+            if not dry_run:
+                try:
+                    reset_result = await _reset_stale_claim(
+                        db, project_id, cand["id"], verdict, actor=actor,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"item_id": cand.get("id"), "error": str(exc)})
+                    continue
+                if reset_result is not None:
+                    reset.append(reset_result)
+
+    return {
+        "project_id": project_id,
+        "version": version,
+        "dry_run": dry_run,
+        "max_batch": max_batch,
+        "candidates_total": len(candidates),
+        "scanned": scanned,
+        "truncated": len(candidates) > scanned,
+        "active": active,
+        "stale": stale,
+        "ambiguous": ambiguous,
+        "reset": reset,
+        "errors": errors,
+    }
 
 
 async def fail_sprint_item(
@@ -3994,6 +4739,178 @@ def _predict_resource_granularity(resource: str) -> str:
     return "other"
 
 
+# ---------------------------------------------------------------------------
+# 0d0cada7 — lease-local scheduler diagnostics.
+#
+# get_parallelizable_groups already recomputes ``groups``/``blocked``/``running``
+# fresh from the live board on EVERY call (nothing about it is a persisted,
+# staleness-prone wave plan) — that part of the lease-local contract already
+# held before this item. What was missing: (1) a deterministic digest a caller
+# can compare across two calls to detect "the board moved under me" (used by
+# claim_parallel_batch's new ``plan_generation`` staleness check below), and
+# (2) visibility into WHY an otherwise-eligible item can't actually be claimed
+# right now — a declared resource may be genuinely held by another live
+# session even though nothing in get_parallelizable_groups' own conflict-graph
+# coloring says so (that coloring only proves the RETURNED batch is internally
+# disjoint; it never cross-checks against locks already held by unrelated
+# in-flight work). Surfacing that here is what lets an executor poll with
+# bounded backoff and emit a structured blocker instead of escalating to a
+# native clarification (see request_hitl's new ``blocker_context`` and
+# meridian/handoff.py's ``_build_scheduler_lease_clause``).
+# ---------------------------------------------------------------------------
+
+
+def _compute_plan_generation(entries: list[tuple[str, ...]]) -> str:
+    """Deterministic digest over a board-state snapshot for staleness detection.
+
+    ``entries`` is any list of plain-string tuples describing the relevant
+    slice of board state (item id, status, claimed_at, resource set, ...).
+    Sorted before hashing so caller-side ordering never perturbs the digest —
+    two calls that observe the identical state always produce the identical
+    digest, and any real change (a claim, a completion, a new item) changes
+    it. Truncated sha256 hex: cheap to compare/log, stable across process
+    restarts (no random salt, no wall-clock component).
+    """
+    normalized = sorted(entries)
+    blob = "\n".join("|".join(t) for t in normalized)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _seconds_until(
+    expiry: Any, *, default: int = 60, minimum: int = 15, maximum: int = 300
+) -> int:
+    """Best-effort bounded-backoff hint (seconds) from an ``expires_at`` value
+    of unknown shape (TEXT on SQLite, TIMESTAMPTZ on Postgres — locks.py's own
+    cross-adapter notes apply here too). Never raises: an unparsable/missing
+    value falls back to ``default``. Always clamped to ``[minimum, maximum]``
+    so a caller never gets an unbounded, zero, or negative retry hint — this
+    is what keeps a poll loop a BOUNDED backoff rather than a busy spin or an
+    indefinite wait.
+    """
+    if expiry is None:
+        return default
+    try:
+        if isinstance(expiry, str):
+            dt = datetime.strptime(expiry[:19], "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=timezone.utc
+            )
+        elif isinstance(expiry, datetime):
+            dt = expiry if expiry.tzinfo else expiry.replace(tzinfo=timezone.utc)
+        else:
+            return default
+        remaining = int((dt - datetime.now(timezone.utc)).total_seconds())
+        return max(minimum, min(maximum, remaining)) if remaining > 0 else minimum
+    except (ValueError, TypeError):
+        return default
+
+
+async def _live_resource_holder(
+    db: aiosqlite.Connection, resource: str
+) -> dict[str, Any] | None:
+    """Read-only: who (if anyone) currently holds ``resource`` right now.
+
+    Cross-checks a declared ``touches_resources`` entry against the REAL lock
+    tables (file_locks / file_symbol_claims / resource_locks), independent of
+    get_parallelizable_groups' own conflict-graph coloring (which only proves
+    the items IT returns together are pairwise disjoint from each other — it
+    has no visibility into locks held by work outside that batch, e.g. an
+    already in_progress item). Returns ``None`` when the resource is free, or
+    ``{"holder_session_id", "lease_expiry", "claim_granularity"}`` when held.
+    Mirrors the file⊃symbol hierarchy claim_symbol/claim_file already enforce:
+    a whole-file lock blocks every symbol in that file too.
+    """
+    from meridian.db import get_file_claims, get_symbol_claims, get_resource_claims  # noqa: PLC0415
+
+    if resource.startswith("file:"):
+        file_path = resource[len("file:"):]
+        claims = await get_file_claims(db, file_path)
+        lock = claims.get("file_lock")
+        if lock and lock.get("session_id"):
+            return {
+                "holder_session_id": lock.get("session_id"),
+                "lease_expiry": lock.get("expires_at"),
+                "claim_granularity": "file",
+            }
+        return None
+
+    if resource.startswith("symbol:"):
+        value = resource[len("symbol:"):]
+        file_path, sep, symbol_name = value.partition("::")
+        if not sep or not symbol_name or not file_path:
+            return None  # malformed — nothing resolvable to check
+        claims = await get_file_claims(db, file_path)
+        lock = claims.get("file_lock")
+        if lock and lock.get("session_id"):
+            # file ⊃ symbol: a whole-file lock blocks every symbol in it too.
+            return {
+                "holder_session_id": lock.get("session_id"),
+                "lease_expiry": lock.get("expires_at"),
+                "claim_granularity": "file",
+            }
+        for c in await get_symbol_claims(db, file_path):
+            if c.get("symbol_name") == symbol_name and c.get("session_id"):
+                return {
+                    "holder_session_id": c.get("session_id"),
+                    # file_symbol_claims carries no TTL column (heartbeat-bound
+                    # only — see locks.py's _CLAIM_LIVE_HOURS) so there is no
+                    # real expires_at to surface; explicit None rather than a
+                    # fabricated timestamp.
+                    "lease_expiry": None,
+                    "claim_granularity": "symbol",
+                }
+        return None
+
+    claims = await get_resource_claims(db, resource)
+    lock = claims.get("resource_lock")
+    if lock and lock.get("session_id"):
+        return {
+            "holder_session_id": lock.get("session_id"),
+            "lease_expiry": lock.get("expires_at"),
+            "claim_granularity": "n/a",
+        }
+    return None
+
+
+async def _plan_generation_entries(
+    db: aiosqlite.Connection,
+    items: list[tuple[str, str, str, list[str]]],
+    *,
+    holder_cache: dict[str, "dict[str, Any] | None"] | None = None,
+) -> list[tuple[str, ...]]:
+    """Build the ``(item_id, status, claimed_at, holder_tagged_resources)``
+    tuples :func:`_compute_plan_generation` hashes for BOTH
+    get_parallelizable_groups (the digest a caller reads) and
+    claim_parallel_batch (the digest it independently recomputes to check
+    staleness) — factored out so the two can never drift into incompatible
+    formats.
+
+    Deliberately cross-checks each declared resource's REAL live holder (not
+    just the item's own ``status``/``claimed_at``/``resources`` columns) so
+    the digest changes when a totally different in_progress item's claim
+    changes the picture too — a bare item-row digest would miss exactly the
+    2026-08-05 incident shape: item A's own row never changes while an
+    unrelated item B quietly holds a resource A also declares.
+
+    ``items`` is ``[(item_id, status, claimed_at, resources), ...]``.
+    ``holder_cache`` lets a caller that already looked up some resources
+    (e.g. get_parallelizable_groups' own resource_blocked pass) reuse those
+    lookups instead of re-querying; new lookups this call makes are written
+    back into the SAME dict when one is supplied, so a caller can pass an
+    empty dict in and inspect it afterward too.
+    """
+    cache = holder_cache if holder_cache is not None else {}
+    entries: list[tuple[str, ...]] = []
+    for iid, status, claimed_at, resources in items:
+        tags: list[str] = []
+        for res in resources:
+            if res not in cache:
+                cache[res] = await _live_resource_holder(db, res)
+            holder = cache[res]
+            tags.append(f"{res}={(holder or {}).get('holder_session_id') or ''}")
+        entries.append((iid, status, claimed_at, ",".join(sorted(tags))))
+    return entries
+
+
 async def get_parallelizable_groups(
     db: aiosqlite.Connection,
     project_id: str,
@@ -4186,9 +5103,85 @@ async def get_parallelizable_groups(
     # which remains the authoritative conflict-free partition.
     _macro_wave_cap = _clamp_macro_wave_count(requested_macro_wave_count)
     macro_waves = pack_groups_into_macro_waves(groups, _macro_wave_cap)
+
+    # 0d0cada7 — cross-check every eligible item's declared resources against
+    # REAL live locks, not just this call's own conflict-graph coloring (see
+    # _live_resource_holder's docstring: the coloring only proves the batch
+    # THIS call returns is internally disjoint — it has no visibility into a
+    # lock already held by work outside that batch, e.g. an in_progress item
+    # from an earlier wave). This is what lets a caller tell "genuinely
+    # nothing to do yet" apart from "safe on paper, but a live session holds
+    # the resource right now" — the latter is exactly the case where an
+    # executor should poll with bounded backoff instead of escalating.
+    # Shared cache: at most one live-lock lookup per DISTINCT resource
+    # declared across the whole eligible set, reused below by BOTH the
+    # resource_blocked diagnostic (which short-circuits at the first
+    # blocking resource per item, for a readable one-line-per-item summary)
+    # and the plan_generation digest (which needs EVERY resource's holder,
+    # not just the first, so the digest can't miss a change to a
+    # non-first resource).
+    _holder_cache: dict[str, "dict[str, Any] | None"] = {}
+    resource_blocked: list[dict[str, Any]] = []
+    for it in eligible:
+        for res in it["resources"]:
+            if res not in _holder_cache:
+                _holder_cache[res] = await _live_resource_holder(db, res)
+            holder = _holder_cache[res]
+            if holder is None:
+                continue
+            resource_blocked.append({
+                "id": it["id"],
+                "title": it.get("title", ""),
+                "resource": res,
+                "wait_reason": "resource_locked",
+                "holder_session_id": holder.get("holder_session_id"),
+                "lease_expiry": holder.get("lease_expiry"),
+                "claim_granularity": holder.get("claim_granularity"),
+                "retry_after": _seconds_until(holder.get("lease_expiry")),
+            })
+            break  # one blocking resource is enough to explain the wait
+
+    # Deterministic digest of the state THIS call actually observed — lets a
+    # caller (claim_parallel_batch's plan_generation staleness check below, or
+    # an executor deciding whether to recompute) detect "the board moved since
+    # I last looked" without re-diffing the whole payload by hand. Folds in
+    # each resource's live HOLDER (via the same cache above), not just the
+    # item's own status/claimed_at/resources columns — see
+    # _plan_generation_entries' docstring for why that matters.
+    _gen_entries = await _plan_generation_entries(
+        db,
+        [
+            (it["id"], it.get("status") or "pending", str(it.get("claimed_at") or ""),
+             it.get("resources") or [])
+            for it in eligible
+        ],
+        holder_cache=_holder_cache,
+    ) + [
+        (r["id"], str(r.get("status") or ""), str(r.get("claimed_at") or ""), "")
+        for r in running
+    ]
+    plan_generation = _compute_plan_generation(_gen_entries)
+    # Index-aligned with "groups" — the digest of exactly one group's items,
+    # in the same tuple shape claim_parallel_batch's own plan_generation
+    # check recomputes, so a caller can pass group_generations[i] straight
+    # through as claim_parallel_batch(..., plan_generation=...) for groups[i].
+    group_generations = [
+        _compute_plan_generation(await _plan_generation_entries(
+            db,
+            [
+                (it["id"], it.get("status") or "pending", str(it.get("claimed_at") or ""),
+                 it.get("resources") or [])
+                for it in group
+            ],
+            holder_cache=_holder_cache,
+        ))
+        for group in groups
+    ]
+
     return {
         "version": version,
         "groups": groups,
+        "group_generations": group_generations,
         "group_count": len(groups),
         "eligible_count": len(eligible),
         "undeclared_count": undeclared,
@@ -4203,6 +5196,12 @@ async def get_parallelizable_groups(
         "macro_waves": macro_waves,
         "macro_wave_count": len(macro_waves),
         "requested_macro_wave_count": _macro_wave_cap,
+        # 0d0cada7 — lease-local scheduler diagnostics (additive; existing
+        # keys/values above are all byte-for-byte unchanged).
+        "resource_blocked": resource_blocked,
+        "resource_blocked_count": len({b["id"] for b in resource_blocked}),
+        "plan_generation": plan_generation,
+        "recomputed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
 
@@ -4514,6 +5513,7 @@ async def claim_parallel_batch(
     resource_contents: dict[str, Any] | None = None,
     force_manifest: bool = False,
     manifest_reason: str | None = None,
+    plan_generation: str | None = None,
 ) -> dict[str, Any]:
     """22cad9b8 — atomically claim a whole parallel-safe batch of sprint items.
 
@@ -4523,15 +5523,29 @@ async def claim_parallel_batch(
     maps ``{item_id: claiming_session_id}`` so a caller can pre-assign each
     item to the DISTINCT worker session that will actually execute it —
     resources then end up held under the session that does the work, so
-    nothing needs handing off once workers launch.
+    nothing needs handing off once workers launch. This is the lease-local
+    path the scheduler contract (0d0cada7) expects for real parallel
+    fan-out: prefer it over reusing one ``session_id`` for every item in a
+    multi-item batch (see ``lease_local_warning`` on the success result).
+
+    ``plan_generation`` (0d0cada7, optional) — when supplied, must match the
+    digest a caller previously computed for exactly this item set (see
+    :func:`get_parallelizable_groups`'s ``group_generations``, index-aligned
+    with its ``groups``). If the live board has moved since that digest was
+    taken (any of these items' status/claimed_at/resources changed), the
+    call is rejected with ``STALE_PLAN_GENERATION`` before anything is
+    persisted or claimed — a stale wave plan is refreshed, never treated as
+    still valid. Omitted (``None``, the default) skips the check entirely —
+    every existing caller is unaffected.
 
     Returns ``{"ok": True, "manifest_id", "batch_key", "claimed_item_ids",
-    "items", "resources", "manifest"}`` on success, or ``{"ok": False,
-    "error": <code>, "message": ...}`` (plus error-specific fields) on any
-    rejection — never raises for an expected validation/conflict outcome, only
-    for a genuine caller bug (empty item_ids / missing session_id). See the
-    module-level comment above for the full step-by-step contract; error
-    codes are: ITEM_NOT_FOUND, UNDECLARED_RESOURCE_IN_BATCH,
+    "items", "resources", "manifest", "plan_generation",
+    "lease_local_warning"}`` on success, or ``{"ok": False, "error": <code>,
+    "message": ...}`` (plus error-specific fields) on any rejection — never
+    raises for an expected validation/conflict outcome, only for a genuine
+    caller bug (empty item_ids / missing session_id). See the module-level
+    comment above for the full step-by-step contract; error codes are:
+    ITEM_NOT_FOUND, STALE_PLAN_GENERATION, UNDECLARED_RESOURCE_IN_BATCH,
     BATCH_COMPOSITION_CONFLICT, BATCH_MANIFEST_EXISTS, ITEM_CLAIM_CONFLICT,
     <claim_sprint_item's own blocked "error" values e.g. DEFERRED/SUPERSEDED/
     WAVE_GATE_PENDING/UNPROSPECTED>, BATCH_RESOURCE_CONFLICT.
@@ -4568,6 +5582,46 @@ async def claim_parallel_batch(
         iid: parse_touches_resources(items_by_id[iid].get("touches_resources"))
         for iid in ordered_ids
     }
+
+    # ── Plan-generation staleness guard (0d0cada7) — fail BEFORE persisting a
+    # manifest or claiming anything so a stale plan never leaves partial state.
+    # Uses the exact same _plan_generation_entries shape/order as
+    # get_parallelizable_groups' per-group digest — including the live
+    # resource-HOLDER cross-check, not just each item's own status/
+    # claimed_at/resources columns — so a caller's previously-fetched
+    # ``group_generations`` entry compares equal when (and only when)
+    # nothing about these specific items OR the resources they declare has
+    # changed. A digest that only watched the items' own rows would miss the
+    # 2026-08-05 incident shape exactly: an item's row never changes while a
+    # totally unrelated in_progress item quietly holds its declared resource.
+    # ──
+    _holder_cache: dict[str, "dict[str, Any] | None"] = {}
+    _current_generation = _compute_plan_generation(await _plan_generation_entries(
+        db,
+        [
+            (
+                iid, items_by_id[iid].get("status") or "pending",
+                str(items_by_id[iid].get("claimed_at") or ""),
+                item_resources[iid],
+            )
+            for iid in ordered_ids
+        ],
+        holder_cache=_holder_cache,
+    ))
+    if plan_generation is not None and plan_generation != _current_generation:
+        return {
+            "ok": False,
+            "error": "STALE_PLAN_GENERATION",
+            "message": (
+                "this batch's plan_generation no longer matches the live board "
+                "(an item's status, claim, or declared resources changed since "
+                "the digest was computed) — recompute via "
+                "get_parallelizable_groups and retry with the fresh generation "
+                "instead of treating this plan as still valid."
+            ),
+            "expected_plan_generation": plan_generation,
+            "current_plan_generation": _current_generation,
+        }
 
     # ── Undeclared-resource guard: never silently treat "nothing declared"
     # as "safe to parallelize" (mirrors get_parallelizable_groups' de730a25
@@ -4697,12 +5751,31 @@ async def claim_parallel_batch(
                         "'symbol:<path>::<symbol>'.",
                         item_id=iid, resource=resource,
                     )
+                # 0d0cada7 — enrich the conflict with the same wait_reason/
+                # lease_expiry/retry_after/claim_granularity shape
+                # get_parallelizable_groups' resource_blocked entries use, so
+                # a caller sees ONE consistent scheduler-diagnostics contract
+                # regardless of which code path surfaced the contention.
+                # Best-effort: a fresh lookup race (holder released between
+                # the failed acquire above and this read) degrades to the
+                # outcome's own fields rather than raising.
+                try:
+                    _holder = await _live_resource_holder(db, resource)
+                except Exception:  # noqa: BLE001 — diagnostics must never mask the real conflict
+                    _holder = None
                 return await _rollback_and_fail(
                     "BATCH_RESOURCE_CONFLICT",
                     f"resource {resource!r} (item {iid!r}) is locked by another "
                     f"live session ({outcome.get('holder_session_id')}).",
                     item_id=iid, resource=resource,
-                    holder_session_id=outcome.get("holder_session_id"),
+                    holder_session_id=(_holder or {}).get("holder_session_id")
+                    or outcome.get("holder_session_id"),
+                    wait_reason="resource_locked",
+                    lease_expiry=(_holder or {}).get("lease_expiry"),
+                    claim_granularity=(_holder or {}).get("claim_granularity")
+                    or outcome.get("claim_granularity"),
+                    retry_after=_seconds_until((_holder or {}).get("lease_expiry")),
+                    plan_generation=_current_generation,
                 )
             # 2a176d6d (finding 4) — record what granularity was ACTUALLY
             # acquired for every resource in the batch (not just newly-
@@ -4724,6 +5797,26 @@ async def claim_parallel_batch(
 
     final_manifest = await mark_batch_claim_outcome(db, manifest["id"], "claimed")
     result_items = [await get_sprint_item(db, iid) for iid in ordered_ids]
+
+    # 0d0cada7 — lease-local nudge: a multi-item batch where the SAME session
+    # ends up as the claiming identity for more than one item is exactly the
+    # pattern behind the live incident this item fixes (one session "planning
+    # its backlog" by holding several items' claims while only genuinely
+    # executing one at a time, starving every other live session). This never
+    # blocks the call — ``item_sessions`` assigning each item to its own
+    # DISTINCT worker session is the documented correct usage and is left
+    # completely alone — it only surfaces the risk so a caller (or the
+    # executor reading this response) can self-correct.
+    _session_to_items: dict[str, list[str]] = {}
+    for iid in ordered_ids:
+        _claim_session = (item_sessions or {}).get(iid, session_id)
+        _session_to_items.setdefault(_claim_session, []).append(iid)
+    lease_local_warning = [
+        {"session_id": sid, "item_ids": iids}
+        for sid, iids in _session_to_items.items()
+        if len(iids) > 1
+    ] if len(ordered_ids) > 1 else []
+
     return {
         "ok": True,
         "manifest_id": manifest["id"],
@@ -4737,6 +5830,9 @@ async def claim_parallel_batch(
         # (still the plain sorted-string union other callers already parse).
         "resource_claims": resource_claims,
         "manifest": final_manifest,
+        # 0d0cada7 — lease-local scheduler diagnostics (additive).
+        "plan_generation": _current_generation,
+        "lease_local_warning": lease_local_warning,
     }
 
 

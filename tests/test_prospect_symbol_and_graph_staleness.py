@@ -1045,6 +1045,181 @@ class TestGraphEmptyAfterFreshIndex:
         assert result["hits"][0]["name"] == "dominant_segments_from_group"
 
 
+class TestProspectSymbolTruthfulDiagnostics:
+    """d5e60791 — prospect_symbol_impl must never silently collapse an
+    exception into rung="none" with no diagnostic. Every rung now carries a
+    structured entry in result["rungs"] (status/attempted_tool/selected_tool/
+    reason/error/error_kind), and the top-level fallback_reason is always
+    populated when every rung misses.
+
+    The first test below is a direct unit-test encoding of the live bug
+    reproduction: an already-running MCP connector reported
+    ``search_code_semantic`` failing with "No module named
+    'meridian_codeindex'" while prospect_symbol silently returned
+    ``{"rung": "none", "fallback_reason": None}`` with zero trace of why.
+    """
+
+    @pytest.mark.asyncio
+    async def test_semantic_dependency_error_is_not_silently_swallowed(self, monkeypatch):
+        """The exact live reproduction: meridian_codeindex not importable in
+        this runtime must surface as a real, structured diagnostic -- never
+        as a bare rung="none" with fallback_reason=None."""
+        from meridian import hardening as _hardening
+
+        async def _fake_bulkhead_raises(fn, *a, **kw):
+            raise ModuleNotFoundError(
+                "No module named 'meridian_codeindex'", name="meridian_codeindex",
+            )
+
+        monkeypatch.setattr(_hardening, "run_in_bulkhead", _fake_bulkhead_raises)
+
+        result = await _prospect_symbol_impl(
+            symbol="prospect_symbol_impl",
+            project_id="",
+            root_dir="/repo",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=None,  # no tunnel context at all -> graph/serena both skip cleanly
+            data_dir="",
+        )
+        assert result["rung"] == "none"
+        # The bug this closes: fallback_reason must NEVER be None here.
+        assert result.get("fallback_reason") is not None
+        fr = str(result["fallback_reason"])
+        assert "semantic_error" in fr
+        assert "meridian_codeindex" in fr
+
+        rungs = result["rungs"]
+        assert rungs["graph"]["status"] == "skipped"
+        assert rungs["graph"]["reason"] == "no_tenant_id"
+        assert rungs["serena"]["status"] == "skipped"
+        assert rungs["serena"]["reason"] == "no_tenant_id"
+        assert rungs["semantic"]["status"] == "error"
+        assert rungs["semantic"]["attempted_tool"] == "search_code_semantic"
+        assert "meridian_codeindex" in rungs["semantic"]["error"]
+        # A missing/broken import must be classified as a dependency error,
+        # not lumped in with generic runtime failures.
+        assert rungs["semantic"]["error_kind"] == "dependency_error"
+
+    @pytest.mark.asyncio
+    async def test_semantic_rung_error_dict_result_is_not_treated_as_empty(self, monkeypatch):
+        """search_code_semantic can degrade to {"error": "..."} instead of
+        raising (e.g. hosted-mode guard, bad root_dir). That must be treated
+        as a real error too, not silently read as "zero hits, nothing wrong"."""
+        from meridian import hardening as _hardening
+
+        async def _fake_bulkhead_error_dict(fn, *a, **kw):
+            return {
+                "root_dir": "/repo", "query": "x", "hits": [],
+                "total_indexed": 0,
+                "error": "root_dir does not exist: /repo",
+            }
+
+        monkeypatch.setattr(_hardening, "run_in_bulkhead", _fake_bulkhead_error_dict)
+
+        result = await _prospect_symbol_impl(
+            symbol="x",
+            project_id="",
+            root_dir="/repo",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=None,
+            data_dir="",
+        )
+        assert result["rung"] == "none"
+        fr = str(result.get("fallback_reason") or "")
+        assert "semantic_error" in fr
+        assert "does not exist" in fr
+        assert result["rungs"]["semantic"]["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_serena_rung_exceptions_recorded_not_silently_swallowed(self, monkeypatch):
+        """Both extractor__find_symbol and extractor__find_declaration
+        raising must be visible in rungs["serena"], not a bare `pass`."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        async def _fake_call_tunnel(tid, name, args, **kw):
+            raise RuntimeError(f"{name} exploded")
+
+        monkeypatch.setattr(_tunnel_mod, "call_tunnel_tool", _fake_call_tunnel)
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: True)
+
+        result = await _prospect_symbol_impl(
+            symbol="whatever",
+            project_id="",
+            root_dir="",  # semantic rung skipped -> serena's error is decisive
+            limit=5,
+            kind=None,
+            stale_graph=True,  # graph rung skipped cleanly, isolates serena
+            tenant={"id": "tenant-serena-error"},
+            data_dir="",
+        )
+        assert result["rung"] == "none"
+        serena_entry = result["rungs"]["serena"]
+        assert serena_entry["status"] == "error"
+        assert "extractor__find_symbol exploded" in serena_entry["error"]
+        assert "extractor__find_declaration exploded" in serena_entry["error"]
+        assert serena_entry["error_kind"] == "runtime_error"
+
+    @pytest.mark.asyncio
+    async def test_graph_rung_no_active_tunnel_is_recorded_not_silent(self, monkeypatch):
+        """Previously: has_active_tunnel()=False left rungs untouched with no
+        explanation at all. Must now record an explicit skip reason."""
+        import meridian.routes.tunnel as _tunnel_mod
+
+        monkeypatch.setattr(_tunnel_mod, "has_active_tunnel", lambda tid: False)
+
+        result = await _prospect_symbol_impl(
+            symbol="whatever",
+            project_id="",
+            root_dir="",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant={"id": "tenant-no-tunnel"},
+            data_dir="",
+        )
+        assert result["rung"] == "none"
+        assert result["rungs"]["graph"]["status"] == "skipped"
+        assert result["rungs"]["graph"]["reason"] == "no_active_tunnel"
+        assert result["rungs"]["serena"]["status"] == "skipped"
+        assert result["rungs"]["serena"]["reason"] == "no_active_tunnel"
+        # Every rung accounted for -> synthesized fallback_reason, never None.
+        assert result.get("fallback_reason") is not None
+
+    @pytest.mark.asyncio
+    async def test_successful_semantic_rung_marks_rungs_succeeded(self, monkeypatch):
+        """Sanity check: the new diagnostics don't break the success path."""
+        from meridian import hardening as _hardening
+
+        fake_semantic_result = {
+            "root_dir": "/repo", "query": "put_figures",
+            "hits": [{"path": "meridian/doc_store.py", "name": "put_figures"}],
+            "total_indexed": 5,
+        }
+
+        async def _fake_bulkhead(fn, *a, **kw):
+            return fake_semantic_result
+
+        monkeypatch.setattr(_hardening, "run_in_bulkhead", _fake_bulkhead)
+
+        result = await _prospect_symbol_impl(
+            symbol="put_figures",
+            project_id="",
+            root_dir="/repo",
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=None,
+            data_dir="",
+        )
+        assert result["rung"] == "semantic"
+        assert result["rungs"]["semantic"]["status"] == "succeeded"
+        assert result["rungs"]["semantic"]["selected_tool"] == "search_code_semantic"
+
+
 class TestFingerprintWildcardFallback:
     """9033914e — staleness fingerprint wildcard fallback for project-specific
     search_graph calls after a project_id-less index_repository run."""

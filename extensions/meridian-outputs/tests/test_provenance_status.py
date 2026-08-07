@@ -493,3 +493,98 @@ class TestConvergenceAwareness:
         fallback_status = PS.get_provenance_status(str(tmp_path), str(fallback_target))
         assert exact_status["inconclusive"] is False
         assert fallback_status["inconclusive"] is False
+
+
+# ---------------------------------------------------------------------------
+# 3b3020ac — execution-manifest-backed provenance status
+# (get_manifest_backed_provenance_status), a thin adapter layered on top of
+# get_provenance_status that consumes
+# meridian.executor_contract.aggregate_worker_completions()'s fail-closed
+# aggregation (duck-typed here — this package never imports
+# meridian.executor_contract; see the adapter's own module-section
+# docstring for why).
+# ---------------------------------------------------------------------------
+
+def _ok_manifest_aggregation(worker_records):
+    return {
+        "ok": True, "status": "complete", "is_full_production": True,
+        "worker_records": worker_records,
+    }
+
+
+class TestManifestBackedProvenanceStatus:
+    def test_missing_outputs_dir_returns_error_unchanged(self) -> None:
+        result = PS.get_manifest_backed_provenance_status("", "/some/file.csv", None)
+        assert "error" in result
+        assert "manifest_status" not in result
+
+    @duckdb_required
+    def test_no_aggregation_supplied_is_not_verified(self, tmp_path: Path) -> None:
+        target = tmp_path / "out.csv"
+        target.write_text("a,b\n1,2\n", encoding="utf-8")
+        result = PS.get_manifest_backed_provenance_status(str(tmp_path), str(target), None)
+        assert result["manifest_status"]["manifest_verified"] is False
+        assert result["manifest_status"]["reason"]
+
+    @duckdb_required
+    def test_not_ok_aggregation_is_not_verified(self, tmp_path: Path) -> None:
+        target = tmp_path / "out.csv"
+        target.write_text("a,b\n1,2\n", encoding="utf-8")
+        aggregation = {"ok": False, "status": "failed", "worker_records": {}}
+        result = PS.get_manifest_backed_provenance_status(str(tmp_path), str(target), aggregation)
+        assert result["manifest_status"]["manifest_verified"] is False
+        assert "not ok" in result["manifest_status"]["reason"] or "status=" in result["manifest_status"]["reason"]
+
+    @duckdb_required
+    def test_matching_recorded_hash_verifies_true(self, tmp_path: Path) -> None:
+        target = tmp_path / "out.csv"
+        content = b"a,b\n1,2\n"
+        target.write_bytes(content)
+        import hashlib
+        content_hash = hashlib.sha256(content).hexdigest()
+        aggregation = _ok_manifest_aggregation({"w1": {"output_hashes": {str(target): content_hash}}})
+
+        result = PS.get_manifest_backed_provenance_status(str(tmp_path), str(target), aggregation)
+        assert result["manifest_status"]["manifest_verified"] is True
+        assert result["manifest_status"]["reason"] is None
+        assert result["manifest_status"]["recorded_output_hash"] == content_hash
+        assert result["manifest_status"]["current_content_hash"] == content_hash
+
+    @duckdb_required
+    def test_path_not_among_recorded_outputs_is_not_verified(self, tmp_path: Path) -> None:
+        target = tmp_path / "out.csv"
+        target.write_text("a,b\n1,2\n", encoding="utf-8")
+        aggregation = _ok_manifest_aggregation({"w1": {"output_hashes": {}}})
+
+        result = PS.get_manifest_backed_provenance_status(str(tmp_path), str(target), aggregation)
+        assert result["manifest_status"]["manifest_verified"] is False
+        assert "not among" in result["manifest_status"]["reason"]
+
+    @duckdb_required
+    def test_stale_content_hash_is_not_verified(self, tmp_path: Path) -> None:
+        """The file on disk has changed since the manifest-backed run
+        recorded its output hash — a stale content match must never be
+        reported as verified."""
+        target = tmp_path / "out.csv"
+        target.write_text("current content\n", encoding="utf-8")
+        stale_hash = "0" * 64
+        aggregation = _ok_manifest_aggregation({"w1": {"output_hashes": {str(target): stale_hash}}})
+
+        result = PS.get_manifest_backed_provenance_status(str(tmp_path), str(target), aggregation)
+        assert result["manifest_status"]["manifest_verified"] is False
+        assert result["manifest_status"]["recorded_output_hash"] == stale_hash
+        assert result["manifest_status"]["current_content_hash"] != stale_hash
+
+    @duckdb_required
+    def test_base_provenance_fields_are_preserved(self, tmp_path: Path) -> None:
+        """The adapter's manifest_status key is purely ADDITIVE — every
+        field get_provenance_status already returns stays intact."""
+        target = tmp_path / "out.csv"
+        target.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(target))
+
+        base = PS.get_provenance_status(str(tmp_path), str(target))
+        result = PS.get_manifest_backed_provenance_status(str(tmp_path), str(target), None)
+        for key in base:
+            assert result[key] == base[key]
+        assert "manifest_status" in result

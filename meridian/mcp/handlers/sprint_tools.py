@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from typing import Any
 
 import meridian.server as _server
@@ -934,27 +935,61 @@ async def handle_claim_sprint_item(
         await _rollback_sprint_item_resource_locks(
             db, args.get("session_id"), _resource_lock_gate
         )
-        # 10c0f6a0 — if already in_progress, check for stale claim and surface info
+        # 10c0f6a0 / 56e9b3c7 — if already in_progress, explain WHY this claim
+        # attempt was refused. db_module.claim_sprint_item() itself already ran
+        # autonomous reconciliation (classify_stale_claim + auto-reset via
+        # _reset_stale_claim) BEFORE raising the ValueError we just caught — so
+        # reaching this point means the existing claim was independently judged
+        # "active" (a live heartbeat) or "ambiguous" (not enough corroborating
+        # signals to touch it), or a genuinely concurrent claim just won a real
+        # race. It is NOT safe to blindly force-reclaim from here — that old
+        # advice pointed at a recovery contract (update_sprint_item(status=
+        # 'pending', force=true)) the public schema never actually exposed, and
+        # would have defeated the whole point of the multi-signal check above.
+        # Re-run the (cheap, read-only) classifier here purely to surface WHY.
         _stale_item = await db_module.get_sprint_item(db, args["item_id"])
-        if _stale_item and _stale_item.get("status") == "in_progress" and _stale_item.get("claimed_at"):
-            from datetime import datetime as _dt_cls  # noqa: PLC0415
+        if _stale_item and _stale_item.get("status") == "in_progress":
             try:
-                _ca = _dt_cls.fromisoformat(_stale_item["claimed_at"].split(".")[0].replace("Z", ""))
-                _age_h = (_dt_cls.utcnow() - _ca).total_seconds() / 3600
-                if _age_h > 2:
-                    return {
-                        "error": "STALE_CLAIM",
-                        "message": (
-                            f"Item is in_progress but claimed {round(_age_h, 1)}h ago with no recent "
-                            "activity — the claiming session may have ended. Safe to force-reclaim "
-                            "by calling update_sprint_item(status='pending', force=true)."
-                        ),
-                        "stale_age_hours": round(_age_h, 1),
-                        "claimed_at": _stale_item["claimed_at"],
-                        "item": _stale_item,
-                    }
+                _verdict = await db_module.classify_stale_claim(db, _stale_item)
             except Exception:  # noqa: BLE001
-                pass
+                _verdict = None
+            if _verdict is not None and _verdict.get("classification") in ("active", "ambiguous"):
+                _signals = _verdict.get("signals") or {}
+                _next_item = None
+                try:
+                    _grp = await db_module.get_parallelizable_groups(
+                        db, args["project_id"], version=_stale_item.get("version")
+                    )
+                    for _group in _grp.get("groups", []):
+                        for _cand in _group:
+                            if _cand.get("id") != args["item_id"]:
+                                _next_item = _cand
+                                break
+                        if _next_item is not None:
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
+                return {
+                    # Keep the stable claim-result contract for callers that
+                    # only branch on status, while exposing the richer
+                    # classifier diagnostics added by stale-claim recovery.
+                    "status": "already_claimed",
+                    "error": "ACTIVE_CLAIM" if _verdict["classification"] == "active" else "AMBIGUOUS_CLAIM",
+                    "message": (
+                        f"Item is in_progress; autonomous stale-claim reconciliation classified "
+                        f"the existing claim as {_verdict['classification']!r} (not stale enough to "
+                        "auto-reset): " + " ".join(_verdict.get("reasons") or ["no reasons recorded"])
+                    ),
+                    "classification": _verdict["classification"],
+                    "reasons": _verdict.get("reasons"),
+                    "signals": _signals,
+                    "stale_age_hours": _signals.get("age_hours"),
+                    "claimed_at": _stale_item.get("claimed_at"),
+                    "current_status": _stale_item.get("status"),
+                    "next_available_id": (_next_item or {}).get("id"),
+                    "next_available_title": (_next_item or {}).get("title"),
+                    "item": _stale_item,
+                }
         # df573218 — claim race: another session grabbed this item between
         # planning and claiming. Instead of crashing the worker with a hard
         # error, point it at the next claimable item so it can keep going.
@@ -1124,6 +1159,52 @@ async def handle_claim_sprint_item(
     return item
 
 
+async def handle_reconcile_stale_claims(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """56e9b3c7 — project/version-scoped, auditable stale-claim reconciliation
+    sweep. Thin MCP-shaped wrapper over
+    :func:`meridian.db.sprint_items.reconcile_stale_claims` — the bulk
+    counterpart to the autonomous, per-item reconciliation now built directly
+    into ``claim_sprint_item`` (see that function's own docstring/comment
+    block for the full multi-signal classification rationale).
+
+    NOTE ON WIRING: this handler follows the same signature every other
+    per-tool handler in this module uses (so it is ready to be registered in
+    ``meridian/mcp/handler.py``'s sprint-tools dispatch table and exposed via
+    ``meridian/mcp_tools.py``'s schema list the same way every sibling tool
+    is), but that dispatch-table/schema registration is intentionally left
+    to a follow-up — this fix's own touches_resources scope covers this file
+    and the db/evidence-guard layer, not ``mcp/handler.py`` or
+    ``mcp_tools.py``. Call it directly (as the tests in
+    ``tests/test_claim_concurrency.py`` do) until that wiring lands.
+
+    Args (all optional except ``project_id``): ``version`` (scope to one
+    sprint version), ``item_ids`` (explicit allow-list), ``dry_run``
+    (default True — report only, write nothing), ``max_batch`` (bounded
+    batch size), ``actor`` (recorded as who ran the sweep, for the audit
+    trail), ``repo_root`` (self-hosted only — enables the worktree-pid and
+    strict-completion-evidence signals; defaults to the server's own
+    ``_REPO_ROOT`` when not explicitly overridden).
+    """
+    repo_root = args.get("repo_root")
+    if repo_root is None:
+        repo_root = _server._REPO_ROOT
+    return await db_module.reconcile_stale_claims(
+        db, args["project_id"],
+        version=args.get("version"),
+        item_ids=args.get("item_ids"),
+        dry_run=args.get("dry_run", True),
+        max_batch=args.get("max_batch", db_module._RECONCILE_DEFAULT_BATCH),
+        actor=args.get("actor"),
+        repo_root=repo_root,
+    )
+
+
 async def handle_claim_parallel_batch(
     args: dict[str, Any],
     db: Any,
@@ -1223,6 +1304,21 @@ async def handle_complete_sprint_item(
         _unclaimed_file_warnings,
         _board_change_for_session,
         _close_or_propose_github_issue,
+    )
+    # a2a027cf — correlation id: caller-supplied (threaded down from the
+    # dispatch layer / an HTTP request id when available) or freshly minted
+    # here so it exists even when this handler is invoked directly (tests,
+    # stdio). Attached to every response this handler returns — success or
+    # error — so a client that never saw a response (transport timeout) can
+    # still correlate a retry with the original attempt's server-side logs.
+    _correlation_id = str(args.get("correlation_id") or uuid.uuid4().hex)
+    _retry_guidance = (
+        "Do not blindly retry: call get_sprint_items (or get_sprint_item) to "
+        "re-check this item's live status first. If it is already 'done', "
+        "the earlier call already succeeded and no further action is "
+        "needed; complete_sprint_item itself is idempotent for that case "
+        "(a retry on an already-done item returns completion_outcome="
+        "'already_committed', not an error)."
     )
     # 0716c9e0 — check active worktree before marking done.
     # e7548587 — require_merge_approval is a TRI-STATE (mirrors
@@ -1532,17 +1628,22 @@ async def handle_complete_sprint_item(
             # acknowledgement that the caller is completing a DIFFERENT,
             # NON-stale session's live claim. Never inferred/defaulted true.
             force_foreign_claim=bool(args.get("force_foreign_claim")),
+            # a2a027cf — threaded through so DB-level phase timings/logs and
+            # this handler's response agree on one id for the whole call.
+            correlation_id=_correlation_id,
         )
     except db_module.SprintItemEvidenceRequired as exc:
         return {
             "error": "EVIDENCE_REQUIRED",
             "item_id": args["item_id"],
+            "correlation_id": _correlation_id,
             "message": str(exc),
         }
     except db_module.SprintItemVerificationRequired as exc:
         return {
             "error": "VERIFICATION_REQUIRED",
             "item_id": args["item_id"],
+            "correlation_id": _correlation_id,
             "message": str(exc),
         }
     except db_module.SprintItemClaimMismatch as exc:
@@ -1553,17 +1654,26 @@ async def handle_complete_sprint_item(
         return {
             "error": "CLAIM_MISMATCH",
             "item_id": args["item_id"],
+            "correlation_id": _correlation_id,
             "message": str(exc),
         }
     except db_module.SprintItemStatusRace as exc:
         # fa3e3331 — another caller already moved this item out of an
         # active state (e.g. a concurrent skip/fail/complete won the
         # race). Surface it distinctly rather than a misleading
-        # "not found".
+        # "not found". a2a027cf — this now only fires for a GENUINE
+        # conflicting outcome (current_status differs from the 'done'
+        # target complete_sprint_item was attempting): db_module.
+        # complete_sprint_item itself already turns the "already done, this
+        # IS what we were retrying for" case into a plain idempotent
+        # success (completion_outcome="already_committed") before this
+        # exception can even be raised — see its docstring (a2a027cf).
         return {
             "error": "STATUS_RACE",
             "item_id": exc.item_id,
             "current_status": exc.current_status,
+            "correlation_id": _correlation_id,
+            "retry_guidance": _retry_guidance,
             "message": str(exc),
         }
     if item is None:

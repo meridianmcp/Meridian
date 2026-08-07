@@ -625,3 +625,483 @@ def test_render_text_pure_over_static_contract():
     text = ec.render_text(contract)
     assert "abc123" in text
     assert "1. Call complete_sprint_item." in text
+
+
+# ===========================================================================
+# 3b3020ac — hash-pinned scientific execution manifests, per-worker
+# completion records, and fail-closed aggregation.
+#
+# All of this is DB-free and synchronous (see the module section docstring
+# in meridian/executor_contract.py) — no `db` fixture needed.
+# ===========================================================================
+
+def _base_manifest_kwargs(**overrides):
+    kwargs = dict(
+        project_id="proj-a",
+        version="v1",
+        run_id="run-1",
+        runner_name="thesis-runner",
+        expected_counts={"images": 3, "branches": 2},
+        output_schema={
+            "version": "1.0",
+            "domains": {
+                "images": {"kind": "raw", "fields": ["path"]},
+                "branch_metrics": {"kind": "dse", "fields": ["branch_id"]},
+            },
+        },
+        config_fingerprint={"solver": "adam", "lr": 0.01},
+        python_version="3.12.4",
+        pixi_env_fingerprint="pixi-hash-abc",
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _stub_hasher(mapping):
+    """Injectable hash_files seam: returns a fixed {path: hash} dict for
+    every path requested, defaulting missing entries to a stable sha256-like
+    stand-in so tests never touch the real filesystem."""
+    def _hash(paths):
+        return {p: mapping.get(p, "0" * 64) for p in paths}
+    return _hash
+
+
+# ---------------------------------------------------------------------------
+# Manifest construction, hashing, immutability, secret/path screening.
+# ---------------------------------------------------------------------------
+
+class TestBuildExecutionManifest:
+    def test_manifest_has_required_shape(self):
+        manifest = ec.build_execution_manifest(**_base_manifest_kwargs())
+        for key in (
+            "schema_version", "run_id", "scope", "lineage", "runner_identity",
+            "input_identity", "git_state", "runtime_fingerprint",
+            "config_fingerprint", "expected_counts", "output_schema",
+            "allow_partial", "created_at", "manifest_hash",
+        ):
+            assert key in manifest, key
+        assert manifest["scope"] == {"project_id": "proj-a", "version": "v1"}
+        assert manifest["run_id"] == "run-1"
+        assert manifest["output_schema"]["domains"]["images"]["kind"] == "raw"
+        assert manifest["output_schema"]["domains"]["branch_metrics"]["kind"] == "dse"
+
+    def test_manifest_requires_core_identity_fields(self):
+        for missing in ("project_id", "version", "run_id", "runner_name"):
+            kwargs = _base_manifest_kwargs()
+            kwargs[missing] = ""
+            with pytest.raises(ec.ExecutionManifestError):
+                ec.build_execution_manifest(**kwargs)
+
+    def test_manifest_hash_deterministic_for_identical_inputs(self):
+        """Idempotent rerun: building the SAME manifest twice (identical
+        inputs) yields byte-identical hashes — the caller can safely re-plan
+        the same run without minting spurious 'different' manifests."""
+        m1 = ec.build_execution_manifest(**_base_manifest_kwargs())
+        m2 = ec.build_execution_manifest(**_base_manifest_kwargs())
+        assert m1["manifest_hash"] == m2["manifest_hash"]
+        # created_at is wall-clock and MUST NOT be part of the hash.
+        assert ec.execution_manifest_hash(m1) == ec.execution_manifest_hash(m2)
+
+    def test_manifest_hash_changes_when_inputs_change(self):
+        m1 = ec.build_execution_manifest(**_base_manifest_kwargs())
+        m2 = ec.build_execution_manifest(**_base_manifest_kwargs(config_fingerprint={"solver": "sgd"}))
+        assert m1["manifest_hash"] != m2["manifest_hash"]
+
+    def test_two_project_version_isolation(self):
+        """Two manifests differing ONLY in project_id/version get different
+        hashes and different scopes — a run in one project/version can never
+        be mistaken for a run in another, even with identical run_id and
+        otherwise-identical content."""
+        m_proj_a = ec.build_execution_manifest(**_base_manifest_kwargs(project_id="proj-a", version="v1"))
+        m_proj_b = ec.build_execution_manifest(**_base_manifest_kwargs(project_id="proj-b", version="v1"))
+        m_v2 = ec.build_execution_manifest(**_base_manifest_kwargs(project_id="proj-a", version="v2"))
+        assert m_proj_a["manifest_hash"] != m_proj_b["manifest_hash"]
+        assert m_proj_a["manifest_hash"] != m_v2["manifest_hash"]
+        assert m_proj_a["scope"] != m_proj_b["scope"]
+        assert m_proj_a["scope"] != m_v2["scope"]
+
+    def test_runner_and_input_hashes_use_injected_hasher(self):
+        hasher = _stub_hasher({"runner.py": "a" * 64, "input.csv": "b" * 64})
+        manifest = ec.build_execution_manifest(
+            **_base_manifest_kwargs(
+                runner_source_paths=["runner.py"],
+                input_paths=["input.csv"],
+                hash_files=hasher,
+            )
+        )
+        assert manifest["runner_identity"]["source_hashes"] == {"runner.py": "a" * 64}
+        assert manifest["input_identity"]["file_hashes"] == {"input.csv": "b" * 64}
+        assert manifest["runner_identity"]["source_set_hash"]
+        assert manifest["input_identity"]["file_set_hash"]
+
+    def test_git_state_and_lineage_carried_through(self):
+        manifest = ec.build_execution_manifest(
+            **_base_manifest_kwargs(
+                sprint_item_id="item-123",
+                decision_ids=["dec-2", "dec-1"],
+                git_head="deadbeef" * 5,
+                git_dirty_files=["b.py", "a.py"],
+            )
+        )
+        assert manifest["lineage"]["sprint_item_id"] == "item-123"
+        assert manifest["lineage"]["decision_ids"] == ["dec-1", "dec-2"]
+        assert manifest["git_state"]["head"] == "deadbeef" * 5
+        assert manifest["git_state"]["dirty_files"] == ["a.py", "b.py"]
+
+    def test_secret_shaped_config_fingerprint_rejected(self):
+        with pytest.raises(ec.ExecutionManifestError):
+            ec.build_execution_manifest(
+                **_base_manifest_kwargs(
+                    config_fingerprint={"token": "sk-abcdefghij1234567890"}
+                )
+            )
+
+    def test_absolute_local_path_in_runtime_fingerprint_rejected(self):
+        with pytest.raises(ec.ExecutionManifestError):
+            ec.build_execution_manifest(
+                **_base_manifest_kwargs(
+                    runtime_fingerprint_extra={"venv_path": r"C:\Users\alice\venv"}
+                )
+            )
+
+    def test_input_and_runner_paths_are_not_secret_screened(self):
+        """File-path fields (runner_source_paths / input_paths) are
+        LEGITIMATELY real paths — they must never be rejected by the
+        secret/local-path screen that only applies to the fingerprint
+        sub-objects."""
+        manifest = ec.build_execution_manifest(
+            **_base_manifest_kwargs(
+                runner_source_paths=[r"C:\Users\alice\thesis\runner.py"],
+                input_paths=[r"C:\Users\alice\thesis\data.csv"],
+                hash_files=lambda paths: {p: None for p in paths},
+            )
+        )
+        assert r"C:\Users\alice\thesis\runner.py" in manifest["runner_identity"]["source_hashes"]
+
+    def test_expected_counts_must_be_non_negative_ints(self):
+        with pytest.raises(ec.ExecutionManifestError):
+            ec.build_execution_manifest(**_base_manifest_kwargs(expected_counts={"images": -1}))
+        with pytest.raises(ec.ExecutionManifestError):
+            ec.build_execution_manifest(**_base_manifest_kwargs(expected_counts={"images": "3"}))
+
+
+class TestOutputSchemaDomainTagging:
+    def test_domain_missing_kind_rejected(self):
+        with pytest.raises(ec.ExecutionManifestError):
+            ec.build_execution_manifest(
+                **_base_manifest_kwargs(
+                    output_schema={"version": "1.0", "domains": {"images": {}}}
+                )
+            )
+
+    def test_domain_unknown_kind_rejected(self):
+        with pytest.raises(ec.ExecutionManifestError):
+            ec.build_execution_manifest(
+                **_base_manifest_kwargs(
+                    output_schema={
+                        "version": "1.0",
+                        "domains": {"images": {"kind": "processed"}},
+                    }
+                )
+            )
+
+    def test_no_domains_declared_is_valid_backward_compat_state(self):
+        manifest = ec.build_execution_manifest(**_base_manifest_kwargs(output_schema=None))
+        assert manifest["output_schema"] == {"version": None, "domains": {}}
+
+
+class TestManifestImmutability:
+    def test_first_write_always_safe(self):
+        m = ec.build_execution_manifest(**_base_manifest_kwargs())
+        ok, reason = ec.check_manifest_immutable(None, m)
+        assert ok is True
+        assert reason is None
+
+    def test_idempotent_rewrite_of_identical_manifest_is_safe(self):
+        m1 = ec.build_execution_manifest(**_base_manifest_kwargs())
+        m2 = ec.build_execution_manifest(**_base_manifest_kwargs())
+        ok, reason = ec.check_manifest_immutable(m1, m2)
+        assert ok is True
+        assert reason is None
+
+    def test_mutating_an_existing_run_is_refused(self):
+        m1 = ec.build_execution_manifest(**_base_manifest_kwargs())
+        m2 = ec.build_execution_manifest(**_base_manifest_kwargs(config_fingerprint={"solver": "sgd"}))
+        ok, reason = ec.check_manifest_immutable(m1, m2)
+        assert ok is False
+        assert "different hash" in reason.lower() or "different" in reason.lower()
+
+    def test_unrelated_scope_is_rejected(self):
+        m1 = ec.build_execution_manifest(**_base_manifest_kwargs(project_id="proj-a"))
+        m2 = ec.build_execution_manifest(**_base_manifest_kwargs(project_id="proj-b"))
+        ok, reason = ec.check_manifest_immutable(m1, m2)
+        assert ok is False
+        assert "scope" in reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# Per-worker completion records + skip-existing.
+# ---------------------------------------------------------------------------
+
+def _manifest():
+    return ec.build_execution_manifest(**_base_manifest_kwargs())
+
+
+def _complete_record(manifest, worker_id="w1", **overrides):
+    kwargs = dict(
+        manifest=manifest, worker_id=worker_id, status=ec.WORKER_STATUS_COMPLETE,
+        input_hash="in-1", config_hash="cfg-1", expected_keys=["k1", "k2"],
+        row_counts={"rows": 10}, output_hashes={f"{worker_id}.png": "a" * 64},
+        domain="images",
+    )
+    kwargs.update(overrides)
+    return ec.build_worker_completion_record(**kwargs)
+
+
+class TestWorkerCompletionRecords:
+    def test_build_and_validate_round_trip(self):
+        manifest = _manifest()
+        record = _complete_record(manifest)
+        assert record["manifest_hash"] == manifest["manifest_hash"]
+        assert record["record_hash"]
+        valid, err = ec.validate_worker_completion_record(record)
+        assert valid is True
+        assert err is None
+
+    def test_invalid_status_rejected(self):
+        manifest = _manifest()
+        with pytest.raises(ec.ExecutionManifestError):
+            ec.build_worker_completion_record(manifest=manifest, worker_id="w1", status="done")
+
+    def test_invalid_output_hash_rejected(self):
+        manifest = _manifest()
+        with pytest.raises(ec.ExecutionManifestError):
+            ec.build_worker_completion_record(
+                manifest=manifest, worker_id="w1", status=ec.WORKER_STATUS_COMPLETE,
+                output_hashes={"a.png": "not-a-hash"},
+            )
+
+    def test_structural_validation_rejects_malformed_record(self):
+        valid, err = ec.validate_worker_completion_record({"worker_id": "w1"})
+        assert valid is False
+        assert "missing required field" in err
+
+        valid2, err2 = ec.validate_worker_completion_record("not-a-dict")
+        assert valid2 is False
+        assert err2
+
+
+class TestSkipExisting:
+    def test_matching_hashes_allows_skip(self):
+        manifest = _manifest()
+        record = _complete_record(manifest)
+        ok, reason = ec.check_skip_existing_worker(
+            manifest, record, current_input_hash="in-1", current_config_hash="cfg-1",
+        )
+        assert ok is True
+        assert "safe to skip" in reason
+
+    def test_stale_manifest_hash_refuses_skip(self):
+        """Hash mismatch: an existing record was built against a DIFFERENT
+        manifest (e.g. config changed since the worker last ran) — skip is
+        refused even though the worker_id/status otherwise look fine."""
+        manifest_old = ec.build_execution_manifest(**_base_manifest_kwargs(config_fingerprint={"solver": "sgd"}))
+        manifest_new = ec.build_execution_manifest(**_base_manifest_kwargs(config_fingerprint={"solver": "adam"}))
+        stale_record = _complete_record(manifest_old)
+        ok, reason = ec.check_skip_existing_worker(
+            manifest_new, stale_record, current_input_hash="in-1", current_config_hash="cfg-1",
+        )
+        assert ok is False
+        assert "manifest_hash" in reason
+
+    def test_stale_input_hash_refuses_skip(self):
+        manifest = _manifest()
+        record = _complete_record(manifest, input_hash="in-1")
+        ok, reason = ec.check_skip_existing_worker(
+            manifest, record, current_input_hash="in-DIFFERENT", current_config_hash="cfg-1",
+        )
+        assert ok is False
+        assert "input_hash" in reason
+
+    def test_stale_config_hash_refuses_skip(self):
+        manifest = _manifest()
+        record = _complete_record(manifest, config_hash="cfg-1")
+        ok, reason = ec.check_skip_existing_worker(
+            manifest, record, current_input_hash="in-1", current_config_hash="cfg-DIFFERENT",
+        )
+        assert ok is False
+        assert "config_hash" in reason
+
+    def test_non_complete_status_refuses_skip(self):
+        manifest = _manifest()
+        record = _complete_record(manifest, status=ec.WORKER_STATUS_FAILED, output_hashes={}, row_counts={})
+        ok, reason = ec.check_skip_existing_worker(
+            manifest, record, current_input_hash="in-1", current_config_hash="cfg-1",
+        )
+        assert ok is False
+        assert "complete" in reason
+
+    def test_no_existing_record_refuses_skip(self):
+        manifest = _manifest()
+        ok, reason = ec.check_skip_existing_worker(manifest, None)
+        assert ok is False
+        assert "nothing to skip" in reason
+
+    def test_structurally_invalid_existing_record_refuses_skip(self):
+        manifest = _manifest()
+        ok, reason = ec.check_skip_existing_worker(manifest, {"worker_id": "w1"})
+        assert ok is False
+        assert "structural validation" in reason
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed aggregation.
+# ---------------------------------------------------------------------------
+
+class TestAggregateWorkerCompletions:
+    def test_full_production_when_every_worker_completes_cleanly(self):
+        manifest = _manifest()
+        records = [_complete_record(manifest, worker_id=f"w{i}") for i in range(1, 4)]
+        agg = ec.aggregate_worker_completions(
+            manifest, records, expected_worker_ids=["w1", "w2", "w3"],
+        )
+        assert agg["ok"] is True
+        assert agg["status"] == ec.AGGREGATION_STATUS_COMPLETE
+        assert agg["is_full_production"] is True
+        assert agg["expected_count"] == 3
+        assert agg["observed_count"] == 3
+        assert agg["first_failing_worker"] is None
+        assert agg["missing_workers"] == []
+
+    def test_idempotent_rerun_same_records_same_verdict(self):
+        """Aggregating the identical record set twice yields a byte-for-byte
+        identical verdict (minus nothing wall-clock — this aggregation
+        carries no timestamp at all) — a re-run over unchanged state must
+        never flip status."""
+        manifest = _manifest()
+        records = [_complete_record(manifest, worker_id=f"w{i}") for i in range(1, 4)]
+        agg1 = ec.aggregate_worker_completions(manifest, records, expected_worker_ids=["w1", "w2", "w3"])
+        agg2 = ec.aggregate_worker_completions(manifest, records, expected_worker_ids=["w1", "w2", "w3"])
+        assert agg1 == agg2
+
+    def test_missing_worker_fails_closed(self):
+        manifest = _manifest()
+        records = [_complete_record(manifest, worker_id="w1")]
+        agg = ec.aggregate_worker_completions(manifest, records, expected_worker_ids=["w1", "w2"])
+        assert agg["ok"] is False
+        assert agg["status"] == ec.AGGREGATION_STATUS_FAILED
+        assert agg["missing_workers"] == ["w2"]
+        assert agg["first_failing_worker"] == "w2"
+
+    def test_empty_expected_worker_ids_never_vacuously_complete(self):
+        manifest = _manifest()
+        records = [_complete_record(manifest, worker_id="w1")]
+        agg = ec.aggregate_worker_completions(manifest, records, expected_worker_ids=[])
+        assert agg["ok"] is False
+        assert agg["status"] == ec.AGGREGATION_STATUS_FAILED
+
+    def test_duplicate_worker_submission_fails_closed(self):
+        manifest = _manifest()
+        records = [_complete_record(manifest, worker_id="w1"), _complete_record(manifest, worker_id="w1")]
+        agg = ec.aggregate_worker_completions(manifest, records, expected_worker_ids=["w1"])
+        assert agg["ok"] is False
+        assert agg["duplicate_workers"] == ["w1"]
+        assert agg["first_failing_worker"] == "w1"
+
+    def test_empty_output_on_complete_status_fails_closed(self):
+        manifest = _manifest()
+        empty_record = ec.build_worker_completion_record(
+            manifest=manifest, worker_id="w1", status=ec.WORKER_STATUS_COMPLETE,
+            output_hashes={}, row_counts={}, domain="images",
+        )
+        agg = ec.aggregate_worker_completions(manifest, [empty_record], expected_worker_ids=["w1"])
+        assert agg["ok"] is False
+        assert agg["empty_output_workers"] == ["w1"]
+
+    def test_hash_mismatched_worker_fails_closed(self):
+        manifest_old = ec.build_execution_manifest(**_base_manifest_kwargs(config_fingerprint={"solver": "sgd"}))
+        manifest_new = ec.build_execution_manifest(**_base_manifest_kwargs(config_fingerprint={"solver": "adam"}))
+        stale_record = _complete_record(manifest_old, worker_id="w1")
+        agg = ec.aggregate_worker_completions(manifest_new, [stale_record], expected_worker_ids=["w1"])
+        assert agg["ok"] is False
+        assert agg["hash_mismatched_workers"] == ["w1"]
+        assert agg["first_failing_worker"] == "w1"
+
+    def test_schema_confusion_domain_not_declared_fails_closed(self):
+        manifest = _manifest()
+        confused_record = _complete_record(manifest, worker_id="w1", domain="not_a_real_domain")
+        agg = ec.aggregate_worker_completions(manifest, [confused_record], expected_worker_ids=["w1"])
+        assert agg["ok"] is False
+        assert agg["schema_mismatched_workers"] == ["w1"]
+
+    def test_raw_and_dse_domains_rolled_up_separately(self):
+        manifest = _manifest()
+        raw_rec = _complete_record(manifest, worker_id="w1", domain="images", row_counts={"rows": 4})
+        dse_rec = ec.build_worker_completion_record(
+            manifest=manifest, worker_id="w2", status=ec.WORKER_STATUS_COMPLETE,
+            output_hashes={"w2.json": "b" * 64}, row_counts={"branches": 7},
+            domain="branch_metrics",
+        )
+        agg = ec.aggregate_worker_completions(manifest, [raw_rec, dse_rec], expected_worker_ids=["w1", "w2"])
+        assert agg["ok"] is True
+        assert agg["domains"]["images"]["kind"] == "raw"
+        assert agg["domains"]["images"]["complete_workers"] == 1
+        assert agg["domains"]["images"]["rows"] == 4
+        assert agg["domains"]["branch_metrics"]["kind"] == "dse"
+        assert agg["domains"]["branch_metrics"]["complete_workers"] == 1
+        assert agg["domains"]["branch_metrics"]["rows"] == 7
+
+    def test_partial_without_allow_partial_fails_closed(self):
+        manifest = _manifest()  # allow_partial defaults to False
+        partial_record = _complete_record(manifest, worker_id="w1", status=ec.WORKER_STATUS_PARTIAL)
+        agg = ec.aggregate_worker_completions(manifest, [partial_record], expected_worker_ids=["w1"])
+        assert agg["ok"] is False
+        assert agg["status"] == ec.AGGREGATION_STATUS_FAILED
+        assert agg["partial_workers"] == ["w1"]
+
+    def test_partial_run_with_allow_partial_is_a_valid_failure_stage_subset(self):
+        """Distinguishes full production data from a valid failure-stage
+        subset: allow_partial=True + a genuinely-partial run with NO
+        integrity violations succeeds, but explicitly NOT as full
+        production."""
+        manifest = ec.build_execution_manifest(**_base_manifest_kwargs(allow_partial=True))
+        complete_record = _complete_record(manifest, worker_id="w1")
+        agg = ec.aggregate_worker_completions(
+            manifest, [complete_record], expected_worker_ids=["w1", "w2"],
+        )
+        assert agg["ok"] is True
+        assert agg["status"] == ec.AGGREGATION_STATUS_PARTIAL
+        assert agg["is_full_production"] is False
+        assert agg["missing_workers"] == ["w2"]
+
+    def test_structurally_invalid_record_fails_closed(self):
+        manifest = _manifest()
+        agg = ec.aggregate_worker_completions(
+            manifest, [{"worker_id": "w1"}], expected_worker_ids=["w1"],
+        )
+        assert agg["ok"] is False
+        assert agg["structurally_invalid_records"]
+        assert agg["first_failing_worker"] == "w1"
+
+    def test_deterministic_diagnostics_first_failing_worker_is_lexicographic(self):
+        manifest = _manifest()
+        records = [_complete_record(manifest, worker_id="w3")]
+        agg = ec.aggregate_worker_completions(
+            manifest, records, expected_worker_ids=["w1", "w2", "w3"],
+        )
+        # w1 and w2 are both missing — the deterministic pick is the
+        # lexicographically-first one, stable across repeated calls.
+        assert agg["first_failing_worker"] == "w1"
+        agg_again = ec.aggregate_worker_completions(
+            manifest, records, expected_worker_ids=["w1", "w2", "w3"],
+        )
+        assert agg_again["first_failing_worker"] == "w1"
+
+    def test_summarize_execution_manifest_aggregation_is_compact(self):
+        manifest = _manifest()
+        records = [_complete_record(manifest, worker_id="w1")]
+        agg = ec.aggregate_worker_completions(manifest, records, expected_worker_ids=["w1"])
+        summary = ec.summarize_execution_manifest_aggregation(agg)
+        assert summary["ok"] is True
+        assert summary["manifest_hash"] == manifest["manifest_hash"]
+        assert "worker_records" not in summary

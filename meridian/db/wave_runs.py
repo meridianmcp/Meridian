@@ -310,6 +310,36 @@ async def get_wave_run_events(
     return [e for e in (_hydrate_event(r) for r in rows) if e is not None]
 
 
+async def get_pinned_promotion_targets(
+    db: aiosqlite.Connection, wave_run_id: str,
+) -> list[dict[str, Any]]:
+    """24f5146d — the docx promotion targets + base-hash preconditions this
+    wave run pinned at creation (see ``create_wave_run(promotion_targets=...)``),
+    or ``[]`` when none were ever pinned.
+
+    Reads the append-only ``promotion_precondition_pinned`` event this module
+    writes — no separate table. If ``create_wave_run`` were ever called more
+    than once with ``promotion_targets`` for the same run (not a supported
+    flow today, but defensive), the LATEST such event wins, matching this
+    module's "append a new event to correct" philosophy elsewhere.
+
+    Each entry is ``{"target_docx_path": str, "base_sha256": str | None}``.
+    Used by :func:`finalize_wave_run` (promotion-evidence gate) and by
+    :func:`meridian.db.wave_resume.check_wave_resume` (docx-target staleness
+    detection).
+    """
+    events = await get_wave_run_events(db, wave_run_id, include_superseded=False)
+    pinned: list[dict[str, Any]] = []
+    for event in events:
+        if event.get("event_type") != "promotion_precondition_pinned":
+            continue
+        payload = event.get("payload") or {}
+        targets = payload.get("targets")
+        if isinstance(targets, list):
+            pinned = [t for t in targets if isinstance(t, dict)]
+    return pinned
+
+
 async def supersede_wave_run_event(
     db: aiosqlite.Connection,
     wave_run_id: str,
@@ -382,6 +412,7 @@ async def create_wave_run(
     item_ids: list[str] | None = None,
     degraded_tools: list[dict[str, Any]] | None = None,
     actor: str | None = None,
+    promotion_targets: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create a wave run in status ``planned`` and pin its board snapshot.
 
@@ -392,6 +423,21 @@ async def create_wave_run(
     resumed session can tell "newer board" from merely "different board".
     Passing no snapshot is allowed (a run can be created before the board is
     read) — ``revision_hash`` is then NULL and staleness cannot be checked.
+
+    ``promotion_targets`` (24f5146d, OPTIONAL) — a list of docx target paths
+    this wave's items may promote script-run output into. When given, each
+    target's CURRENT on-disk base sha256
+    (:func:`meridian.artifact_declaration.compute_base_sha256`) is computed
+    ONCE, right now, and pinned as an append-only
+    ``promotion_precondition_pinned`` event (see
+    :func:`get_pinned_promotion_targets`) — no new table/column; this reuses
+    the SAME append-only ``wave_run_events`` history the board snapshot's own
+    staleness story already relies on. A run created with no
+    ``promotion_targets`` behaves EXACTLY as before this parameter existed:
+    :func:`finalize_wave_run` requires no promotion evidence at all for it.
+    Hashing is best-effort — an unreadable/missing target pins
+    ``base_sha256=None`` (mirrors ``PatchManifest.create_from_file``'s own
+    "unknown base" semantics) rather than failing wave creation.
 
     The returned ``id`` is the immutable ``wave_run_id``: nothing in this
     module ever changes it, and it is the join key for events and children.
@@ -449,6 +495,34 @@ async def create_wave_run(
         },
         actor=actor,
     )
+
+    # 24f5146d — pin base-hash preconditions for any declared docx promotion
+    # targets. Lazy import: meridian.artifact_declaration has no dependency
+    # on meridian.db, but importing it at module scope here would still be
+    # an unnecessary hard coupling for a module (wave_runs.py) most callers
+    # use with zero promotion involvement at all.
+    if promotion_targets:
+        from meridian import artifact_declaration as _artifact_declaration  # noqa: PLC0415
+
+        pinned: list[dict[str, Any]] = []
+        for target in promotion_targets:
+            target_str = str(target)
+            try:
+                base_sha256 = _artifact_declaration.compute_base_sha256(target_str)
+            except Exception:  # noqa: BLE001 — a hashing failure never blocks wave creation
+                base_sha256 = None
+            pinned.append({"target_docx_path": target_str, "base_sha256": base_sha256})
+        await append_wave_run_event(
+            db,
+            run_id,
+            "promotion_precondition_pinned",
+            detail=(
+                f"pinned base-hash preconditions for {len(pinned)} docx "
+                "promotion target(s)"
+            ),
+            payload={"targets": pinned},
+            actor=actor,
+        )
 
     run = await get_wave_run(db, run_id)
     assert run is not None  # just inserted
@@ -826,6 +900,79 @@ def _children_summary(children: list[dict[str, Any]]) -> dict[str, int]:
     return summary
 
 
+def _validate_promotion_evidence(
+    pinned_targets: list[dict[str, Any]], promotion_evidence: Any,
+) -> None:
+    """24f5146d — the docx-promotion half of the finalizer evidence contract.
+
+    Deliberately symmetric to :func:`_validate_finalizer_evidence`: when this
+    run pinned promotion targets at creation
+    (``create_wave_run(promotion_targets=...)``), finalization requires REAL,
+    individually successful ``apply_patch_manifest`` evidence for EVERY one
+    of them — never a self-reported boolean, never inferred from "the wave's
+    tests passed." A run that pinned NO promotion targets requires no
+    ``promotion_evidence`` at all (zero behavior change for every caller that
+    predates this feature — this is the "backward compatible, opt-in" rule
+    the whole capability-manifest family already follows).
+
+    ``promotion_evidence`` must be a ``dict`` keyed by ``target_docx_path``,
+    each value the real
+    ``tools.meridian_fallbacks.transactional_merge.MergeResult.to_dict()``
+    from a non-dry-run ``apply_patch_manifest`` call: ``success is True``,
+    ``dry_run`` falsy, and a non-empty ``final_sha256``. Raises ``ValueError``
+    (fail closed, same convention as ``_validate_finalizer_evidence``) with an
+    actionable message naming every offending target — never a generic
+    "invalid".
+    """
+    if not pinned_targets:
+        return
+    if not isinstance(promotion_evidence, dict):
+        raise ValueError(
+            "Finalization rejected: this wave run pinned "
+            f"{len(pinned_targets)} docx promotion target(s) at creation "
+            "(create_wave_run(promotion_targets=...)), so finalize_wave_run "
+            "requires promotion_evidence — a dict keyed by target_docx_path, "
+            "each value the real "
+            "tools.meridian_fallbacks.transactional_merge.MergeResult.to_dict() "
+            "from a non-dry-run apply_patch_manifest call. A boolean, a "
+            "self-report, or missing evidence is rejected."
+        )
+
+    missing: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for pin in pinned_targets:
+        target = pin.get("target_docx_path")
+        entry = promotion_evidence.get(target)
+        if not isinstance(entry, dict):
+            missing.append(str(target))
+            continue
+        if entry.get("dry_run"):
+            failed.append((str(target), "evidence is a dry_run result, not a committed apply"))
+            continue
+        if not entry.get("success"):
+            failed.append((str(target), str(entry.get("error") or "success=False")))
+            continue
+        if not entry.get("final_sha256"):
+            failed.append((str(target), "evidence is missing final_sha256"))
+
+    if missing:
+        raise ValueError(
+            "Finalization rejected: promotion_evidence is missing an entry "
+            f"for {len(missing)} pinned promotion target(s): {missing}. "
+            "Apply the patch manifest for each pinned target "
+            "(transactional_merge.apply_patch_manifest) and pass its real "
+            "MergeResult before finalizing."
+        )
+    if failed:
+        details = "; ".join(f"{t}: {reason}" for t, reason in failed)
+        raise ValueError(
+            f"Finalization rejected: promotion evidence indicates "
+            f"{len(failed)} unsuccessful docx promotion(s) — {details}. Fix "
+            "and re-apply before finalizing; a wave whose docx promotion "
+            "failed (or was only dry-run) may not be merged."
+        )
+
+
 async def finalize_wave_run(
     db: aiosqlite.Connection,
     wave_run_id: str,
@@ -833,6 +980,7 @@ async def finalize_wave_run(
     evidence: Any = None,
     actor: str | None = None,
     expected_revision_hash: str | None = None,
+    promotion_evidence: Any = None,
 ) -> dict[str, Any]:
     """Finalize a wave run — idempotently — moving it to ``merged``.
 
@@ -853,11 +1001,20 @@ async def finalize_wave_run(
       4. **Failed stop-mode child → refuse** (:class:`WaveRunFinalizationBlocked`,
          a ValueError subclass carrying ``blocking_children``). This is the
          enforcement point that makes ``failure_mode='stop'`` a real contract.
-      5. **Evidence → validate** (see :func:`_validate_finalizer_evidence`).
-      6. Transition to ``merged`` and append exactly ONE ``finalized`` event.
+      5. **Docx promotion evidence → validate** (24f5146d, see
+         :func:`_validate_promotion_evidence`) — ONLY when this run pinned
+         promotion targets at creation (``create_wave_run(promotion_targets=...)``).
+         A run with no pinned targets requires no ``promotion_evidence`` at
+         all; zero behavior change from before this parameter existed.
+      6. **Evidence → validate** (see :func:`_validate_finalizer_evidence`).
+      7. Transition to ``merged`` and append exactly ONE ``finalized`` event,
+         whose payload carries ``promotion_evidence`` alongside ``evidence``
+         so the wave's provenance chain (plan -> pinned base hash -> applied
+         merge result -> finalized) is durably closed in one place.
 
     Returns ``{finalized, already_finalized, wave_run_id, status, finalized_at,
-    finalizer_evidence, children_summary, event_count}``.
+    finalizer_evidence, promotion_evidence, pinned_promotion_targets,
+    children_summary, event_count}``.
     """
     run = await get_wave_run(db, wave_run_id)
     if run is None:
@@ -868,6 +1025,13 @@ async def finalize_wave_run(
     # 1. Idempotent replay — no new row, no new event.
     if run["status"] == "merged":
         events = await get_wave_run_events(db, wave_run_id)
+        replayed_promotion_evidence = None
+        for ev in reversed(events):
+            if ev.get("event_type") == "finalized":
+                replayed_promotion_evidence = (ev.get("payload") or {}).get(
+                    "promotion_evidence"
+                )
+                break
         return {
             "finalized": True,
             "already_finalized": True,
@@ -875,6 +1039,8 @@ async def finalize_wave_run(
             "status": "merged",
             "finalized_at": run.get("finalized_at"),
             "finalizer_evidence": run.get("finalizer_evidence"),
+            "promotion_evidence": replayed_promotion_evidence,
+            "pinned_promotion_targets": await get_pinned_promotion_targets(db, wave_run_id),
             "children_summary": _children_summary(children),
             "event_count": len(events),
         }
@@ -909,10 +1075,15 @@ async def finalize_wave_run(
             blocking,
         )
 
-    # 5. Evidence contract (shared with complete_wave_gate, d2430713).
+    # 5. Docx promotion evidence contract (24f5146d) — opt-in: only enforced
+    # when this run actually pinned promotion targets at creation.
+    pinned_promotion_targets = await get_pinned_promotion_targets(db, wave_run_id)
+    _validate_promotion_evidence(pinned_promotion_targets, promotion_evidence)
+
+    # 6. Evidence contract (shared with complete_wave_gate, d2430713).
     _validate_finalizer_evidence(evidence)
 
-    # 6. Transition + single finalized event.
+    # 7. Transition + single finalized event.
     current = run["status"]
     allowed = WAVE_RUN_TRANSITIONS.get(current, frozenset())
     if "merged" not in allowed:
@@ -937,7 +1108,11 @@ async def finalize_wave_run(
         from_status=current,
         to_status="merged",
         detail=f"wave run finalized ({current} -> merged)",
-        payload={"evidence": evidence},
+        payload={
+            "evidence": evidence,
+            "promotion_evidence": promotion_evidence,
+            "pinned_promotion_targets": pinned_promotion_targets,
+        },
         actor=actor,
     )
 
@@ -951,6 +1126,8 @@ async def finalize_wave_run(
         "status": "merged",
         "finalized_at": merged.get("finalized_at"),
         "finalizer_evidence": merged.get("finalizer_evidence"),
+        "promotion_evidence": promotion_evidence,
+        "pinned_promotion_targets": pinned_promotion_targets,
         "children_summary": _children_summary(children),
         "event_count": len(events),
     }

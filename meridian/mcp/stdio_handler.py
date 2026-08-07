@@ -520,6 +520,21 @@ def build_mcp_server():
                                 "future. deferred_until is NOT cleared."
                             ),
                         },
+                        "selected_item_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "(94f48e4d) Optional list of sprint-item ids to "
+                                "restrict this handoff to -- exactly these items "
+                                "plus their still-open depends_on closure, instead "
+                                "of the full backlog. FAIL-CLOSED (unlike "
+                                "force_include_ids above): any unknown, cross-"
+                                "project, cross-version, or non-pending id refuses "
+                                "the whole call with error=HANDOFF_SELECTION_BLOCKED "
+                                "and a selection_rejected list instead of silently "
+                                "narrowing/widening the scope."
+                            ),
+                        },
                         "strict_evidence": {
                             "type": "boolean",
                             "description": (
@@ -1392,6 +1407,47 @@ def build_mcp_server():
                         "reindex": {"type": "boolean", "description": "Default true — run an incremental Merkle-diff reindex before searching so results reflect the current tree. false searches the last-built index as-is."},
                     },
                     "required": ["root_dir", "query"],
+                },
+            ),
+            Tool(
+                # d5e60791 — was entirely absent from the stdio transport
+                # (no Tool() entry, no dispatch case): a stdio-connected
+                # client got "unknown tool: prospect_symbol" unconditionally,
+                # regardless of whether meridian_codeindex was importable.
+                # Mirrors the HTTP MCP tool schema in meridian/mcp_tools.py
+                # verbatim so all transports advertise the identical contract.
+                name="prospect_symbol",
+                description=(
+                    "2ce5bc76 — ROBUST symbol prospecting with a three-rung "
+                    "fallback chain: tries codebase__search_graph FIRST (fast, "
+                    "graph-indexed); when it returns zero results OR the caller "
+                    "flags a mismatch (stale_graph=true), automatically retries "
+                    "via Serena extractor__find_symbol / "
+                    "extractor__find_declaration (AST-accurate, never stale); "
+                    "falls back to a BM25 keyword grep over search_code_semantic "
+                    "as a last resort so the caller NEVER has to notice a miss "
+                    "and switch tools by hand. Each rung is labelled in the "
+                    "result ({rung: 'graph'|'serena'|'semantic', hits:[...], "
+                    "fallback_reason: str?}) so the caller knows which level "
+                    "succeeded. All three legs are best-effort: a missing "
+                    "tunnel, inactive slot, or missing root_dir degrades to the "
+                    "next rung, never a bare error with no diagnostic — every "
+                    "rung's attempted/selected tool and any dependency/runtime "
+                    "error is recorded under result.rungs."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "symbol": {"type": "string", "description": "The symbol/function/class/method name or short search query to prospect for."},
+                        "project_id": {"type": "string", "description": "Code-intel project id (repo-path slug) passed to codebase__search_graph."},
+                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+                        "root_dir": {"type": "string", "description": "Absolute path to the source tree root — used for the search_code_semantic fallback. If omitted, the semantic leg is skipped."},
+                        "limit": {"type": "integer", "description": "Max results per rung (default 5)."},
+                        "stale_graph": {"type": "boolean", "description": "Set true to SKIP the graph rung and go straight to Serena (e.g. you already know the graph is stale from a _graph_staleness warning)."},
+                        "kind": {"type": "string", "description": "Optional symbol kind filter passed to search_code_semantic fallback (function/class/method/etc)."},
+                        "session_id": {"type": "string", "description": "Optional Meridian session id, purely for prospecting-receipt attribution."},
+                    },
+                    "required": ["symbol"],
                 },
             ),
             Tool(
@@ -2330,6 +2386,14 @@ def build_mcp_server():
                 _raw_stdio_fii = arguments.get("force_include_ids")
                 if isinstance(_raw_stdio_fii, list):
                     _stdio_force_include_ids = [str(x) for x in _raw_stdio_fii if x]
+                # 94f48e4d — mirror handler.py's HTTP MCP dispatch: forward
+                # selected_item_ids through the stdio transport too. See
+                # handoff_module.generate_handoff's own docstring for the
+                # fail-closed contract (differs from force_include_ids above).
+                _stdio_selected_item_ids: list[str] | None = None
+                _raw_stdio_sel = arguments.get("selected_item_ids")
+                if isinstance(_raw_stdio_sel, list):
+                    _stdio_selected_item_ids = [str(x) for x in _raw_stdio_sel if x]
                 _stdio_strict_evidence = bool(arguments.get("strict_evidence"))
                 _stdio_strict_pointer_evidence = bool(
                     arguments.get("strict_pointer_evidence")
@@ -2346,6 +2410,7 @@ def build_mcp_server():
                 _handoff_evidence_blocked = False
                 _handoff_continuation_blocked = False
                 _handoff_stale_reference_blocked = False
+                _handoff_selection_blocked = False
                 try:
                     path, content, _ = await asyncio.wait_for(
                         handoff_module.generate_handoff(
@@ -2356,6 +2421,7 @@ def build_mcp_server():
                             session_id=session_id,
                             version=_stdio_version,
                             force_include_ids=_stdio_force_include_ids,
+                            selected_item_ids=_stdio_selected_item_ids,
                             strict_evidence=_stdio_strict_evidence,
                             strict_pointer_evidence=_stdio_strict_pointer_evidence,
                             force_include_rejected=_stdio_force_include_rejected,
@@ -2404,10 +2470,21 @@ def build_mcp_server():
                         "message": str(exc),
                     }
                     _handoff_stale_reference_blocked = True
+                except handoff_module.HandoffSelectionError as exc:
+                    # 94f48e4d — mirror handler.py's structured refusal: nothing
+                    # was rendered/persisted for this call.
+                    result = {
+                        "error": "HANDOFF_SELECTION_BLOCKED",
+                        "project_id": arguments["project_id"],
+                        "selection_rejected": exc.rejected,
+                        "message": str(exc),
+                    }
+                    _handoff_selection_blocked = True
                 if (
                     not _handoff_evidence_blocked
                     and not _handoff_continuation_blocked
                     and not _handoff_stale_reference_blocked
+                    and not _handoff_selection_blocked
                 ):
                     # a5e8aa74 — return content EXACTLY as generate_handoff rendered
                     # it, via the shared helper meridian/mcp/handler.py and
@@ -2456,6 +2533,7 @@ def build_mcp_server():
                 "audit_figure_table_provenance",
                 "search_outputs",
                 "search_code_semantic",
+                "prospect_symbol",
                 "add_sprint_item",
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",

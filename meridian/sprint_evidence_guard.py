@@ -36,12 +36,24 @@ the already-merged ``meridian.worktree_merge_guard`` (eb2e44f8):
   Callers pass ``repo_root=None`` in that case; those two checks are then
   skipped (not reported as failures — "unverifiable" is not "failed").
 * **Opt-in, never on by default.** This module is never called from
-  ``db.complete_sprint_item``'s default path. It is invoked ONLY by
-  ``meridian.mcp.handlers.sprint_tools.handle_complete_sprint_item`` when the
-  caller explicitly passes ``strict_evidence=true`` (or the item itself has
-  ``require_strict_evidence`` set) — mirroring exactly how eb2e44f8's worktree
-  merge guard only engages when a worktree opted into a persisted manifest.
-  A caller that never asks for strict verification sees zero behavior change.
+  ``db.complete_sprint_item``'s default path. For sprint-item COMPLETION it
+  is invoked ONLY by ``meridian.mcp.handlers.sprint_tools.handle_complete_sprint_item``
+  when the caller explicitly passes ``strict_evidence=true`` (or the item
+  itself has ``require_strict_evidence`` set) — mirroring exactly how
+  eb2e44f8's worktree merge guard only engages when a worktree opted into a
+  persisted manifest. A caller that never asks for strict verification sees
+  zero behavior change.
+* **56e9b3c7 — second caller, advisory-only.** ``meridian.db.sprint_items.
+  classify_stale_claim`` also calls :func:`verify_strict_completion_evidence`
+  (with no ``task_id``/``notes``/``session_id`` — it only inspects the item's
+  OWN already-stored evidence), but ONLY as a downgrade signal on a claim it
+  has already independently classified ``"stale"``: an ``ok=True`` result
+  (real, fresh evidence already on file) downgrades that verdict to
+  ``"ambiguous"`` so autonomous reconciliation never resets what looks like
+  finished-but-unmarked work. This caller never blocks or overrides a
+  completion — it only ever makes stale-claim reconciliation MORE
+  conservative, never less. Self-hosted-only exactly as documented above:
+  when ``repo_root`` is ``None`` this call is skipped entirely.
 * **Overrides are audited, never silent.** :func:`record_strict_evidence_override`
   writes an ``action_audit_log`` row (who, when via ``created_at``, why via the
   required ``reason``) — see ``meridian.db.workspace.record_action_audit_event``,
@@ -352,6 +364,12 @@ async def verify_strict_completion_evidence(
     "message"}, ...]}``. ``ok`` is True only when there are zero entries in
     ``errors``. Every check that fires contributes its own entry — several
     can co-occur (e.g. EVIDENCE_STALE and UNCLAIMED_EDIT are independent).
+
+    56e9b3c7 — ``task_id``/``notes``/``session_id`` are all optional and, when
+    omitted (as ``classify_stale_claim`` does), the checks fall back to
+    whatever is ALREADY stored on ``item`` — i.e. this doubles as a read-only
+    "does this claim already have real completion evidence on file" probe,
+    not just a pre-completion argument-validation gate.
     """
     from .db.sprint_items import _parse_deferral_ts  # noqa: PLC0415
 

@@ -4844,6 +4844,91 @@ def register_output_paths(outputs_dir: str, paths: list[str]) -> dict[str, Any]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# 3b3020ac -- execution-manifest-backed output registration.
+#
+# meridian.executor_contract.aggregate_worker_completions() (a hash-pinned,
+# fail-closed aggregation over a scientific fan-out run's per-worker
+# completion records) is consumed here as a PLAIN DICT, duck-typed -- this
+# package is a separate, optionally-installed extension (not importable
+# from Meridian core's own env by default; see pixi.toml's 52cbe5d8 note)
+# so it cannot import meridian.executor_contract even if it wanted to. A
+# caller (Meridian core, or the thesis project directly) builds the
+# aggregation and passes it straight in.
+#
+# This is a THIN adapter: it never re-implements walking/indexing -- it
+# only decides WHICH paths from an already-computed, already-fail-closed
+# aggregation are trustworthy enough to hand to :func:`register_output_paths`
+# (unchanged, reused verbatim), tagged by the manifest's own raw/DSE domain
+# names so a caller's later search/classify pass can distinguish the two
+# families of registered paths.
+# ---------------------------------------------------------------------------
+
+def register_execution_manifest_outputs(
+    outputs_dir: str, aggregation: "dict[str, Any] | None",
+) -> dict[str, Any]:
+    """Register every COMPLETE worker's output paths from a hash-pinned
+    execution-manifest aggregation with the outputs index, grouped by the
+    manifest's declared domain (raw/dse/"undeclared" when the manifest never
+    declared domains at all).
+
+    Fail-closed at the SOURCE: a run whose ``aggregation`` is not ``ok``
+    (per ``meridian.executor_contract.aggregate_worker_completions``'s own
+    verdict) contributes NOTHING -- an explicit no-op, never a partial
+    best-effort guess at what "looked" done. Only records with
+    ``status == "complete"`` contribute paths; a failed/partial/skipped
+    worker's declared paths are never registered as if they were real,
+    trustworthy outputs -- this is the "consume the manifest, not directory
+    presence" gate applied to output REGISTRATION specifically (sprint spec).
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      aggregation:  The dict returned by
+                    ``meridian.executor_contract.aggregate_worker_completions``
+                    (or an equivalent caller-built dict with the same
+                    ``{ok, worker_records: {worker_id: {status, domain,
+                    output_hashes: {path: sha256}}}}`` shape).
+
+    Returns ``{"registered": bool, "reason": str|None, "by_domain":
+    {domain: <register_output_paths result>}}``. ``registered`` is
+    ``False`` (with an explanatory ``reason``, empty ``by_domain``) when
+    ``aggregation`` is missing/not-ok, or when it IS ok but contributes zero
+    complete-worker output paths. Best effort, never raises.
+    """
+    if not isinstance(aggregation, dict) or not aggregation.get("ok"):
+        status = aggregation.get("status") if isinstance(aggregation, dict) else None
+        return {
+            "registered": False,
+            "reason": (
+                "no ok execution-manifest aggregation supplied "
+                f"(status={status!r}) -- refusing to register outputs from a "
+                "run that did not aggregate as ok"
+            ),
+            "by_domain": {},
+        }
+
+    paths_by_domain: dict[str, list[str]] = {}
+    for rec in (aggregation.get("worker_records") or {}).values():
+        if not isinstance(rec, dict) or rec.get("status") != "complete":
+            continue
+        domain = rec.get("domain") or "undeclared"
+        paths_by_domain.setdefault(str(domain), []).extend(
+            (rec.get("output_hashes") or {}).keys()
+        )
+
+    if not paths_by_domain:
+        return {
+            "registered": False,
+            "reason": "aggregation is ok but contains no complete worker output paths",
+            "by_domain": {},
+        }
+
+    by_domain: dict[str, Any] = {}
+    for domain in sorted(paths_by_domain):
+        by_domain[domain] = register_output_paths(outputs_dir, sorted(set(paths_by_domain[domain])))
+    return {"registered": True, "reason": None, "by_domain": by_domain}
+
+
 def _find_ancestor_cached_index(subtree_dir: str) -> "OutputsFtsIndex | None":
     """Best-effort lookup of an already-cached :class:`OutputsFtsIndex`
     whose ``outputs_dir`` is an ANCESTOR of (or equal to) ``subtree_dir`` --

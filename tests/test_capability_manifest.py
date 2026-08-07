@@ -419,3 +419,37 @@ def test_mcp_set_capability_manifest_rejection_does_not_echo_secret_value(client
     }))
     assert "error" in result
     assert "hunter2" not in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# 45049071 — openai_tunnel_adapter.default_capability_entry() is a REAL
+# consumer of this module's public schema (normalize_capability /
+# normalize_manifest / manifest_hash); capability_manifest.py itself needed
+# no code changes for that feature (see docs/secure-openai-mcp-tunnel-
+# adapter.md) — these tests are the seam-level proof that consuming this
+# module's existing, generic API is sufficient.
+# ---------------------------------------------------------------------------
+
+def test_openai_tunnel_capability_entry_is_a_valid_manifest_entry():
+    from meridian import openai_tunnel_adapter as ota
+
+    entry = ota.default_capability_entry()
+    # default_capability_entry() already normalizes internally; re-running
+    # normalize_capability must be a byte-identical no-op.
+    assert cm.normalize_capability(entry) == entry
+    assert entry["availability_policy"] == "optional"
+
+
+def test_openai_tunnel_capability_entry_round_trips_via_mcp_set_get(client):
+    from meridian import openai_tunnel_adapter as ota
+
+    pid = client.post("/projects", json={"name": "mcp-cap-openai-tunnel"}).json()["id"]
+    entry = ota.default_capability_entry()
+    set_result = _result(_mcp_call(client, "set_capability_manifest", {
+        "project_id": pid, "capabilities": [entry],
+    }))
+    assert "error" not in set_result
+
+    get_result = _result(_mcp_call(client, "get_capability_manifest", {"project_id": pid}))
+    ids = [c["id"] for c in get_result["capabilities"]]
+    assert ota.OPENAI_TUNNEL_CAPABILITY_ID in ids

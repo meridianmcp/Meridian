@@ -509,6 +509,31 @@ def _reset_graph_searcher_resolver():
     _handoff_mod.set_graph_searcher_resolver(None)
 
 
+@pytest.fixture(autouse=True)
+def _reset_tunnel_launcher_diagnostics():
+    """36e46957 — ``tunnel_client._LAUNCHER_RESOLUTION_CACHE`` and
+    ``_SHELL_FALLBACK_COUNTS`` are process-global mutable state (memoized
+    npx/uvx launcher resolution + shell-fallback counters, both deliberately
+    persistent for a real tunnel process's whole lifetime). Left alone across
+    tests, a test that monkeypatches ``shutil.which``/``Path.home``/
+    ``_find_npx``/``_find_uvx`` to assert a specific resolved value (several
+    do, across test_tunnel_client.py and other test_tunnel_*.py files) would
+    read back a PRIOR test's cached value instead of its own mock — silently
+    order-dependent and invisible locally, exactly the class of leak
+    ``_reset_graph_searcher_resolver`` above already guards against for a
+    different module. Reset before AND after every test in the whole suite
+    so no test can leak a resolved launcher path or a stale shell-fallback
+    count into another, regardless of file or xdist scheduling.
+    """
+    from meridian import tunnel_client as _tunnel_client_mod
+
+    _tunnel_client_mod._reset_launcher_resolution_cache()
+    _tunnel_client_mod._reset_shell_fallback_diagnostics()
+    yield
+    _tunnel_client_mod._reset_launcher_resolution_cache()
+    _tunnel_client_mod._reset_shell_fallback_diagnostics()
+
+
 @pytest_asyncio.fixture
 async def db(request):
     """Meridian's schema on the active backend, isolated per test.

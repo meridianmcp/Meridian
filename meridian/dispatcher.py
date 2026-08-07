@@ -40,6 +40,7 @@ from typing import Any, Awaitable, Callable
 
 import aiosqlite
 
+from . import artifact_declaration as artifact_declaration_module
 from . import db as db_module
 from . import enqueue as enqueue_module
 from . import executor_config as executor_config_module
@@ -103,6 +104,28 @@ def _worker_prompt(item: dict[str, Any], project_id: str) -> str:
         f"Claim the item (claim_sprint_item), implement it to production quality, "
         f"run the test suite, then call complete_sprint_item when done."
     )
+
+
+def _promotion_target_for_item(item: dict[str, Any]) -> "str | None":
+    """24f5146d — the docx merger-lock target ``item`` declares, or ``None``.
+
+    Reads ``planned_output.promotion.merger_lock_key`` via
+    :func:`meridian.artifact_declaration.effective_promotion` — the SAME
+    normalized identifier :func:`meridian.artifact_declaration.
+    acquire_promotion_merger_lock` derives its lock key from. An item with
+    no artifact declaration at all (the overwhelming majority of sprint
+    items) returns ``None`` here and is completely unaffected by the
+    merger-lock awareness this function enables in :meth:`Dispatcher.
+    dispatch_once`.
+    """
+    try:
+        promotion = artifact_declaration_module.effective_promotion(item)
+    except Exception:  # noqa: BLE001 — a malformed declaration must never break dispatch
+        return None
+    if not promotion:
+        return None
+    target = promotion.get("merger_lock_key")
+    return target if isinstance(target, str) and target.strip() else None
 
 
 class Dispatcher:
@@ -195,6 +218,13 @@ class Dispatcher:
         # b108f2e0 — last blocker-triage decision this dispatcher observed,
         # for introspection/tests. None until the first dispatch_once pass.
         self.last_blocker_decision: dict[str, Any] | None = None
+        # 24f5146d — items skipped THIS pass because another live session
+        # already holds the ONE canonical docx merger lock
+        # (artifact_declaration.acquire/release/get_promotion_merger_lock)
+        # for their declared promotion target. Diagnostics only — mirrors
+        # last_blocker_decision's introspection role; [] until the first
+        # dispatch_once pass finds a promotion-declaring item at all.
+        self.last_merger_lock_skips: list[dict[str, Any]] = []
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -286,7 +316,25 @@ class Dispatcher:
         quarantine this pass" (dispatch proceeds unfiltered) rather than
         ever silently stopping the dispatcher over an enrichment failure —
         only an ACTUAL fail-closed classification stops it.
+
+        24f5146d — merger-lock awareness: an item declaring a docx
+        promotion target (``planned_output.promotion``) is SKIPPED this pass
+        (never enqueued, never stops the dispatcher) when
+        ``artifact_declaration.get_promotion_merger_lock`` reports another
+        live session already holds that target's ONE canonical merger lock,
+        or when an earlier item in this SAME pass already claimed it —
+        never dispatch two workers at a promotion target concurrently. This
+        is a best-effort, READ-ONLY heuristic: the dispatcher itself never
+        acquires or releases the lock (it only enqueues a worker process; it
+        has no synchronous visibility into when that worker's OWN
+        acquire_promotion_merger_lock / apply_patch_manifest / release
+        lifecycle actually runs) — the real, race-proof guarantee is
+        transactional_merge.apply_patch_manifest's own base-hash staleness
+        check plus the lock itself, enforced wherever a promotion is
+        actually applied. See ``self.last_merger_lock_skips`` for
+        diagnostics.
         """
+        self.last_merger_lock_skips = []
         try:
             decision = await self._evaluate_blockers(
                 self.db, self.project_id, version=self.version,
@@ -358,6 +406,10 @@ class Dispatcher:
             return []
 
         enqueued: list[dict[str, Any]] = []
+        # 24f5146d — targets this SAME pass has already decided to dispatch a
+        # promotion for; a second item in the same pass sharing that target
+        # is deferred to a later pass rather than raced against the first.
+        claimed_targets_this_pass: set[str] = set()
         # Only the first group is safe to fan out simultaneously; later groups
         # depend on it draining. Run one group per pass.
         for item in first_group:
@@ -370,6 +422,30 @@ class Dispatcher:
                 continue
             if in_flight >= cap:
                 break
+            promotion_target = _promotion_target_for_item(item)
+            if promotion_target is not None:
+                try:
+                    lock_status = await artifact_declaration_module.get_promotion_merger_lock(
+                        self.db, promotion_target, self.project_id,
+                    )
+                except Exception:  # noqa: BLE001 — a lock-status read failure never blocks dispatch
+                    logger.exception(
+                        "merger-lock status check failed for target %s", promotion_target,
+                    )
+                    lock_status = None
+                held_by_other = bool((lock_status or {}).get("file_lock"))
+                if held_by_other or promotion_target in claimed_targets_this_pass:
+                    self.last_merger_lock_skips.append({
+                        "item_id": item_id,
+                        "target": promotion_target,
+                        "reason": (
+                            "merger lock held by another live session"
+                            if held_by_other
+                            else "another item in this same pass already claims this target"
+                        ),
+                    })
+                    continue
+                claimed_targets_this_pass.add(promotion_target)
             session_id = await self._ensure_session()
             prompt = _worker_prompt(item, self.project_id)
             try:
