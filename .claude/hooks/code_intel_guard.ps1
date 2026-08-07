@@ -57,6 +57,16 @@ if ($ciVal -ne $null -and [int]$ciVal -eq 1) {
     # ready=false/has_tunnel=false explicitly and fell through to BLOCK for
     # anything unhandled ($slotResp -eq $null, missing ready/has_tunnel keys)
     # -- the exact opposite of the documented policy.
+    #
+    # Verifier-found gap (post-883ce543 fix): PowerShell's -eq coerces its RHS
+    # to the LHS's type, so a non-boolean JSON value like ready=1 (int) makes
+    # "$slotReady -eq $true" coerce $true -> 1 and compare 1 -eq 1 -> True,
+    # wrongly treated as a positive confirmation and BLOCKING -- diverging
+    # from code_intel_guard.sh, whose jq/regex path only ever matches the
+    # literal strings "true"/"false" and fails open on anything else. The
+    # helper below requires the value to actually be PowerShell's native
+    # [bool] type (which ConvertFrom-Json only produces from a real JSON
+    # true/false literal) before the -eq comparison runs, closing that gap.
     $slotReady = $null
     $hasTunnel = $null
     if ($slotResp -ne $null) {
@@ -73,7 +83,8 @@ if ($ciVal -ne $null -and [int]$ciVal -eq 1) {
         $slotReady = $null
         if ($slotResp2 -ne $null) { $slotReady = $slotResp2.ready }
     }
-    if ($slotReady -eq $true -and $hasTunnel -eq $true) {
+    function Test-PositiveBool($v) { ($v -is [bool]) -and ($v -eq $true) }
+    if ((Test-PositiveBool $slotReady) -and (Test-PositiveBool $hasTunnel)) {
         # Positively confirmed ready AND tunneled -- block the tool call.
         [Console]::Error.WriteLine("Meridian code-intel guard (aeba8a80): this project has a code-intel index. Use code-intel tools INSTEAD of ${tool}:
   - find_symbol / extractor__find_symbol        -- exact symbol lookup (fastest, most accurate)
