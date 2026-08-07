@@ -948,7 +948,27 @@ async def handle_claim_sprint_item(
         # would have defeated the whole point of the multi-signal check above.
         # Re-run the (cheap, read-only) classifier here purely to surface WHY.
         _stale_item = await db_module.get_sprint_item(db, args["item_id"])
-        if _stale_item and _stale_item.get("status") == "in_progress":
+        _claim_age_h: float | None = None
+        if _stale_item and _stale_item.get("claimed_at"):
+            from datetime import datetime as _dt_cls  # noqa: PLC0415
+
+            try:
+                _ca = _dt_cls.fromisoformat(_stale_item["claimed_at"].split(".")[0].replace("Z", ""))
+                _claim_age_h = (_dt_cls.utcnow() - _ca).total_seconds() / 3600
+            except Exception:  # noqa: BLE001
+                _claim_age_h = None
+        # Only consult the classifier once a claim is actually old enough to be
+        # a staleness CANDIDATE (db_module._RECONCILE_STALE_HOURS, same
+        # threshold this block always used, re-exported from
+        # sprint_items._CLAIM_OWNERSHIP_STALE_HOURS) — a fresh, genuinely-
+        # active claim must keep falling through to the plain "already_claimed"
+        # / next-item response below unchanged, exactly as it did before this item.
+        if (
+            _stale_item
+            and _stale_item.get("status") == "in_progress"
+            and _claim_age_h is not None
+            and _claim_age_h > db_module._RECONCILE_STALE_HOURS
+        ):
             try:
                 _verdict = await db_module.classify_stale_claim(db, _stale_item)
             except Exception:  # noqa: BLE001
