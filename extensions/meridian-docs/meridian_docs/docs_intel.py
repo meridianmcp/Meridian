@@ -15440,7 +15440,13 @@ def build_document_review(
     }
 
 
-def read_document_snapshot(docx_path: str) -> dict[str, Any]:
+def read_document_snapshot(
+    docx_path: str,
+    page_size: int | None = None,
+    cursor: str | None = None,
+    section_anchor: str | None = None,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
     """Read the saved DOCX snapshot without writing or requiring a close.
 
     Word normally leaves a sibling ~$ lock file while a document is open.
