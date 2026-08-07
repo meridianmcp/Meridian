@@ -99,6 +99,15 @@ def test_execute_batch_has_example():
     assert "execute_batch" in mcp_tools._TOOL_EXAMPLES
 
 
+def test_update_sprint_item_directs_multi_item_patches_to_batch_tool():
+    tool = _find_tool("update_sprint_item")
+    description = tool["description"]
+    assert "execute_batch(operation='item_updates'" in description
+    assert "best_effort" in description
+    assert "all_or_nothing" in description
+    assert "idempotency_key" in description
+
+
 # ---------------------------------------------------------------------------
 # 2. stdio transport advertises the IDENTICAL schema
 # ---------------------------------------------------------------------------

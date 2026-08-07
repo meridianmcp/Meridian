@@ -1878,7 +1878,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "group, deferred_until (enforced deferral), track, or depends_on (dependency ordering). "
         "Only the fields you pass are changed; omitted fields are left untouched. Pass an empty "
         "string for human_id, group, deferred_until, track, or depends_on to clear it. Returns "
-        "the updated item, or an error if the id is unknown.",
+        "the updated item, or an error if the id is unknown. For TWO OR MORE independent item "
+        "patches, prefer the single execute_batch(operation='item_updates', entries=[...], "
+        "mode='best_effort' or 'all_or_nothing', idempotency_key='...') call instead of "
+        "repeating this tool: it validates and reports each item in input order, supports "
+        "per-item correlation_key values, and makes retries idempotent. Use best_effort when "
+        "one invalid item must not block the rest; use all_or_nothing when the whole patch set "
+        "must succeed together.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
