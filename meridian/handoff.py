@@ -6817,6 +6817,8 @@ async def build_continuation_manifest(
 async def build_effective_capability_contract(
     db: Any, project_id: str, *, board_stale: bool = False,
     version: "str | None" = None, items: "list[dict[str, Any]] | None" = None,
+    max_executor_contracts: "int | None" = None,
+    max_contract_list_items: "int | None" = None,
 ) -> "dict[str, Any] | None":
     """98aaccf4 — thin, fully-guarded wrapper over
     ``capability_contract.build_capability_contract`` for the two trusted
@@ -6837,10 +6839,27 @@ async def build_effective_capability_contract(
     section (see ``capability_contract.build_capability_contract`` and
     ``_build_tool_requirements_clause`` above) so it agrees with the batch
     /goal's own ``<tool_requirements>`` clause for the SAME request.
+
+    ``max_executor_contracts`` / ``max_contract_list_items`` (0de0599a) —
+    optional caller-supplied overrides for
+    ``capability_contract.build_capability_contract``'s own bound
+    parameters of the same name. Left ``None`` (the default) for every
+    existing caller, which continues to get that function's own generous
+    defaults -- zero behavior change for ``generate_handoff`` (mcp/handler.py,
+    routes/handoff.py). ``start_session``'s compact orientation is the one
+    caller that passes small explicit caps, since a full per-item
+    breakdown was never needed there and was overflowing the compact
+    response (593KB observed on a real board, 382KB from this field alone).
     """
     try:
+        kwargs: dict[str, Any] = {}
+        if max_executor_contracts is not None:
+            kwargs["max_executor_contracts"] = max_executor_contracts
+        if max_contract_list_items is not None:
+            kwargs["max_contract_list_items"] = max_contract_list_items
         return await capability_contract_module.build_capability_contract(
             db, project_id, board_stale=board_stale, version=version, items=items,
+            **kwargs,
         )
     except Exception:  # noqa: BLE001 — capability contract is best-effort
         return None
