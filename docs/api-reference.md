@@ -1072,6 +1072,7 @@ No auth required.
 | `POST` | `/projects/{project_id}/tasks/release` | Release a previously-claimed task |
 | `GET` | `/projects/{project_id}/tasks/search` | Text search over task descriptions |
 | `GET` | `/projects/{project_id}/timeline` | v1.1.1 — return the data needed to render the Activity Timeline |
+| `GET` | `/projects/{project_id}/wave-summary/{wave_id}` | bbb447ec — the authoritative, immutable completion record for one wave |
 | `GET` | `/projects/{project_id}/webhook-token` | Mint-and-return the project webhook token. Shown ONCE in the UI |
 | `GET` | `/projects/{project_id}/worktrees` | List active git worktrees registered for a project |
 | `POST` | `/projects/{project_id}/worktrees` | Register a git worktree for a session. Call after `git worktree add` |
