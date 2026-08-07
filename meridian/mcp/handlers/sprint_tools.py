@@ -882,9 +882,17 @@ async def handle_claim_sprint_item(
     # CONFLICT check above, this is NEVER softened by worktree isolation —
     # worktrees isolate the working tree, not the eventual merge, so a real
     # symbol-range overlap stays a hard block regardless of isolation mode.
+    # 54d2c2af — opt-in STRICT contract: strict_resource_locking=true rejects
+    # (rather than silently widening) a symbol: resource that can't get a real
+    # symbol-range lock, unless allow_file_fallback=true explicitly approves
+    # that widening for this call. Both default False — zero behavior change
+    # for every existing caller that doesn't pass them.
     _resource_lock_gate = await _sprint_item_resource_claim_gate(
         db, args["project_id"], args["item_id"], args.get("session_id"),
         resource_contents=args.get("resource_contents"),
+        strict_resource_locking=bool(args.get("strict_resource_locking")),
+        allow_file_fallback=bool(args.get("allow_file_fallback")),
+        tenant_id=_mcp_tenant_id,
     )
     if not _resource_lock_gate.get("ok"):
         return _resource_lock_gate
