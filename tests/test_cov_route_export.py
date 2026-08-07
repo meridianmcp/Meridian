@@ -56,13 +56,15 @@ def _hosted_client(monkeypatch, tmp_path):
     monkeypatch.setenv("MERIDIAN_STANDARD_KEY", "")
 
     # Rate-limit state is a module-level singleton that survives reloads; flush
-    # it so the 3/minute cap on /export/my-data doesn't bleed across tests.
-    _deps._reset_limiter_storage()
+    # the counters so the 3/minute cap on /export/my-data doesn't bleed across
+    # tests. Keep the route-limit registrations intact: clearing the whole
+    # storage would disable rate limiting for every later test in the worker.
+    _deps._reset_limiter_counts()
 
     with TestClient(server_module.app) as c:
         yield c
 
-    _deps._reset_limiter_storage()
+    _deps._reset_limiter_counts()
 
 
 def _seed_tenant_session(c, email="export@example.com", **tenant_fields):
