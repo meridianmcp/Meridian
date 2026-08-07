@@ -3664,6 +3664,69 @@ def _resolve_base_url(arg_url: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# OpenAI Secure MCP Tunnel adapter — OPTIONAL, local-only, DIAGNOSTICS ONLY
+# (45049071). This client never spawns or connects an OpenAI tunnel process;
+# it only reports whether one is *configured* locally, alongside Meridian's
+# own tunnel state, so a future ``--status``-style surface (or the
+# server-side diagnostics route in routes/tunnel.py, fed by whatever calls
+# it) can show both transports without conflating them. See
+# meridian.openai_tunnel_adapter for the full schema/scope — this client
+# never uses it to actually run/spawn/connect anything, and Meridian's own
+# tunnel above is completely unaffected either way.
+# ---------------------------------------------------------------------------
+
+def _resolve_openai_tunnel_config_env(raw_env: str | None = None) -> "dict[str, Any] | None":
+    """Best-effort local adapter config, read from
+    ``MERIDIAN_OPENAI_TUNNEL_CONFIG`` (a JSON object) only — never a
+    committed file, never Meridian's own hosted tenant DB — so a user can
+    opt in on THIS machine without that config (or whatever tunnel_id/
+    credential reference it names) ever leaving it via this function.
+    Returns ``None`` when unset or malformed; a caller normalizes via
+    ``openai_tunnel_adapter.normalize_config``, which already treats
+    ``None`` the same as "adapter not configured".
+    """
+    raw = raw_env if raw_env is not None else os.environ.get("MERIDIAN_OPENAI_TUNNEL_CONFIG", "")
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def openai_tunnel_adapter_snapshot(
+    *, raw_env: str | None = None, reported_status: "dict[str, Any] | None" = None,
+) -> "dict[str, Any]":
+    """Local, diagnostics-only snapshot of the OPTIONAL OpenAI Secure MCP
+    Tunnel adapter's config-derived state.
+
+    Reads config from the environment only (see
+    :func:`_resolve_openai_tunnel_config_env`) and never spawns or connects
+    anything itself. A malformed config degrades to an ``"error"``
+    diagnostics entry (never raises) so a caller can always render this
+    alongside the rest of a status surface without a try/except of its own.
+    """
+    from . import openai_tunnel_adapter as _ota  # noqa: PLC0415 — optional feature; lazy import mirrors this module's own tunnel_plugins import pattern (see run_tunnel())
+
+    config = _resolve_openai_tunnel_config_env(raw_env)
+    try:
+        diagnostics = _ota.build_diagnostics(config, reported_status=reported_status)
+    except _ota.OpenAITunnelAdapterError as exc:
+        return {
+            "state": _ota.OpenAITunnelState.ERROR.value,
+            "detail": str(exc),
+            "transport": None,
+            "tenant_id": None,
+            "project_id": None,
+            "allowed_tool_count": 0,
+            "approval_policy": None,
+        }
+    return diagnostics.to_dict()
+
+
+# ---------------------------------------------------------------------------
 # Token cache — ~/.meridian/config.json (30-day expiry, per base_url)
 # ---------------------------------------------------------------------------
 

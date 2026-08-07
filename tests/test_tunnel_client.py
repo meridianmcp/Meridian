@@ -68,6 +68,80 @@ def test_resolve_base_url_strips_trailing_slash(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# OpenAI Secure MCP Tunnel adapter — local, diagnostics-only (45049071)
+# ---------------------------------------------------------------------------
+
+def test_resolve_openai_tunnel_config_env_unset_is_none(monkeypatch):
+    monkeypatch.delenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", raising=False)
+    assert tc._resolve_openai_tunnel_config_env() is None
+
+
+def test_resolve_openai_tunnel_config_env_parses_json(monkeypatch):
+    monkeypatch.setenv(
+        "MERIDIAN_OPENAI_TUNNEL_CONFIG",
+        '{"enabled": true, "transport": "http", "url": "https://openai.example/mcp"}',
+    )
+    parsed = tc._resolve_openai_tunnel_config_env()
+    assert parsed == {
+        "enabled": True, "transport": "http", "url": "https://openai.example/mcp",
+    }
+
+
+def test_resolve_openai_tunnel_config_env_malformed_json_is_none(monkeypatch):
+    monkeypatch.setenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", "{not json")
+    assert tc._resolve_openai_tunnel_config_env() is None
+
+
+def test_resolve_openai_tunnel_config_env_non_object_json_is_none(monkeypatch):
+    monkeypatch.setenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", "[1, 2, 3]")
+    assert tc._resolve_openai_tunnel_config_env() is None
+
+
+def test_resolve_openai_tunnel_config_env_explicit_raw_env_overrides_os_environ(monkeypatch):
+    monkeypatch.setenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", '{"enabled": false}')
+    parsed = tc._resolve_openai_tunnel_config_env(raw_env='{"enabled": true, "transport": "stdio", "command": ["echo"]}')
+    assert parsed["enabled"] is True
+
+
+def test_openai_tunnel_adapter_snapshot_not_configured_by_default(monkeypatch):
+    monkeypatch.delenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", raising=False)
+    snapshot = tc.openai_tunnel_adapter_snapshot()
+    assert snapshot["state"] == "not_configured"
+
+
+def test_openai_tunnel_adapter_snapshot_configured_from_env(monkeypatch):
+    monkeypatch.setenv(
+        "MERIDIAN_OPENAI_TUNNEL_CONFIG",
+        '{"enabled": true, "transport": "stdio", "command": ["npx", "-y", "@openai/mcp-tunnel"]}',
+    )
+    snapshot = tc.openai_tunnel_adapter_snapshot()
+    assert snapshot["state"] == "configured"
+    assert snapshot["transport"] == "stdio"
+
+
+def test_openai_tunnel_adapter_snapshot_invalid_config_degrades_to_error(monkeypatch):
+    # enabled + stdio with no command is invalid -- must degrade to an
+    # "error" diagnostics entry, never raise, so a status surface never
+    # needs its own try/except around this call.
+    monkeypatch.setenv(
+        "MERIDIAN_OPENAI_TUNNEL_CONFIG", '{"enabled": true, "transport": "stdio"}',
+    )
+    snapshot = tc.openai_tunnel_adapter_snapshot()
+    assert snapshot["state"] == "error"
+    assert snapshot["detail"]
+
+
+def test_openai_tunnel_adapter_snapshot_never_touches_meridian_tunnel_state(monkeypatch):
+    # Purely diagnostics-only: calling this must not require/consult any
+    # live Meridian tunnel socket state, token, or base URL.
+    monkeypatch.delenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", raising=False)
+    monkeypatch.delenv("MERIDIAN_API_KEY", raising=False)
+    monkeypatch.delenv("BEARER_TOKEN", raising=False)
+    snapshot = tc.openai_tunnel_adapter_snapshot()
+    assert snapshot["state"] == "not_configured"
+
+
+# ---------------------------------------------------------------------------
 # URL building
 # ---------------------------------------------------------------------------
 
