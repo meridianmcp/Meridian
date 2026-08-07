@@ -181,3 +181,97 @@ def test_jq_fastpath_fails_open_on_invalid_json_with_decoy_shape():
         "jq errors must be silently swallowed and the hook must fall through to regex, "
         "which also finds no extractable tool_name, resulting in exit 0"
     )
+
+
+# ---------------------------------------------------------------------------
+# 883ce543 -- PowerShell path parity: .claude/settings.json wires
+# hitl_guard.ps1 for the real Claude Code client on Windows, while every test
+# above only ever exercises hitl_guard.sh. These tests run the ACTUAL .ps1
+# hook as a subprocess (never in-process -- `exit` inside a dot-sourced/
+# `&`-invoked script would kill the CURRENT PowerShell host, not just return),
+# proving hitl_guard.sh and hitl_guard.ps1 already share one fail-open/block
+# decision table: block ONLY AskUserQuestion (exit 2, redirect to
+# request_hitl), allow every other tool, fail open on any parse error.
+# Unlike code_intel_guard, hitl_guard has no readiness probe to get wrong --
+# this is a parity/coverage gap fix, not a behavior change.
+# ---------------------------------------------------------------------------
+
+_HOOK_PS1 = _REPO / ".claude" / "hooks" / "hitl_guard.ps1"
+
+
+def _powershell_exe() -> str | None:
+    for exe in ("pwsh", "powershell"):
+        found = shutil.which(exe)
+        if found:
+            return found
+    return None
+
+
+_needs_powershell = pytest.mark.skipif(
+    _powershell_exe() is None or not _HOOK_PS1.exists(),
+    reason="no PowerShell interpreter (pwsh/powershell) available, or hitl_guard.ps1 missing",
+)
+
+
+def _run_ps1_hook(payload: str) -> subprocess.CompletedProcess:
+    """Run hitl_guard.ps1 with *payload* on stdin, mirroring _run_hook above."""
+    ps = _powershell_exe()
+    return subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(_HOOK_PS1)],
+        input=payload,
+        cwd=str(_REPO),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+
+
+@_needs_powershell
+def test_ps1_hook_blocks_native_askuserquestion():
+    """Same contract as the .sh hook's test_hook_blocks_native_askuserquestion."""
+    r = _run_ps1_hook('{"tool_name":"AskUserQuestion","tool_input":{}}')
+    assert r.returncode == 2, "exit 2 blocks the tool call"
+    assert "request_hitl" in r.stdout + r.stderr, "must redirect to request_hitl"
+
+
+@_needs_powershell
+@pytest.mark.parametrize("tool", ["Bash", "Edit", "Write", "Read", "request_hitl", "Grep"])
+def test_ps1_hook_allows_every_other_tool(tool):
+    r = _run_ps1_hook(json.dumps({"tool_name": tool, "tool_input": {}}))
+    assert r.returncode == 0, f"{tool} must not be blocked"
+
+
+@_needs_powershell
+@pytest.mark.parametrize("payload", ["", "not json at all", "{}", '{"foo":"bar"}'])
+def test_ps1_hook_fails_open_on_unparseable(payload):
+    assert _run_ps1_hook(payload).returncode == 0, "must fail open, never trap the executor"
+
+
+def test_ps1_hook_is_pure_ascii_and_parses_with_zero_errors():
+    """883ce543 gotcha: BOM-less UTF-8 .ps1 files are read as cp1252 by
+    PowerShell 5.1, so a stray non-ASCII byte can silently corrupt the parse.
+    Verify the shipped hitl_guard.ps1 is pure ASCII and parses cleanly."""
+    raw = _HOOK_PS1.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf"), "hitl_guard.ps1 must not have a UTF-8 BOM"
+    non_ascii = [(i, b) for i, b in enumerate(raw) if b > 0x7F]
+    assert not non_ascii, f"hitl_guard.ps1 has non-ASCII bytes at {non_ascii[:10]}"
+
+    ps = _powershell_exe()
+    if ps is None:
+        pytest.skip("no PowerShell interpreter available on this host")
+    ps_script = (
+        "$tokens=$null;$errors=$null;"
+        "[System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{_HOOK_PS1.as_posix()}',[ref]$tokens,[ref]$errors)|Out-Null;"
+        "if($errors){$errors|ForEach-Object{Write-Output $_.Message};exit 1}"
+        "else{Write-Output 'PARSE_OK';exit 0}"
+    )
+    proc = subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    assert proc.returncode == 0, f"hitl_guard.ps1 failed to parse:\n{proc.stdout}\n{proc.stderr}"
+    assert "PARSE_OK" in proc.stdout
