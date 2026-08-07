@@ -4,12 +4,21 @@ MCP responses, auth routes, team summary, and dashboard.js markers."""
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
 
 from meridian import db as db_module
 from meridian.db import workspace as ws_module
 from meridian.mcp.handlers import session_tools as st_mod
+
+
+def _planning_search_uses_postgres() -> bool:
+    """Match the active test fixture backend, not the developer's default."""
+    return any(
+        (os.environ.get(key) or "").startswith(("postgresql://", "postgres://"))
+        for key in ("TEST_DATABASE_URL", "DATABASE_URL")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2683,7 +2692,12 @@ async def test_planning_search_stemming_sqlite_fts5(db):
     result = await db_module.planning_search(
         db, p["id"], "authenticating", source_types=["note"]
     )
-    assert result["backend"] == "sqlite_fts5_bm25"
+    expected_backend = (
+        "postgres_tsvector_ts_rank"
+        if _planning_search_uses_postgres()
+        else "sqlite_fts5_bm25"
+    )
+    assert result["backend"] == expected_backend
     assert any(r["title"] == "Auth note" for r in result["results"])
 
 
@@ -2703,7 +2717,12 @@ async def test_planning_search_stemming_sqlite_bm25_fallback(db, monkeypatch):
     result = await db_module.planning_search(
         db, p["id"], "authenticating", source_types=["note"]
     )
-    assert result["backend"] == "sqlite_bm25_like_fallback"
+    expected_backend = (
+        "postgres_tsvector_ts_rank"
+        if _planning_search_uses_postgres()
+        else "sqlite_bm25_like_fallback"
+    )
+    assert result["backend"] == expected_backend
     assert any(r["title"] == "Auth note" for r in result["results"])
 
 
@@ -2756,7 +2775,12 @@ async def test_planning_search_phrase_match_sqlite_bm25_fallback(db, monkeypatch
     result = await db_module.planning_search(
         db, p["id"], '"coverage gap"', source_types=["note"]
     )
-    assert result["backend"] == "sqlite_bm25_like_fallback"
+    expected_backend = (
+        "postgres_tsvector_ts_rank"
+        if _planning_search_uses_postgres()
+        else "sqlite_bm25_like_fallback"
+    )
+    assert result["backend"] == expected_backend
     titles = [r["title"] for r in result["results"]]
     assert "Contiguous" in titles
     assert "Scrambled" not in titles
@@ -3120,8 +3144,16 @@ async def test_planning_search_backend_reflects_fts5_probe(db, monkeypatch):
     p = await db_module.create_project(db, "ps-backend-fallback")
     await db_module.add_project_note(db, p["id"], "N", "alpha beta gamma")
     result = await db_module.planning_search(db, p["id"], "alpha", source_types=["note"])
-    assert result["backend"] == "sqlite_bm25_like_fallback"
-    assert result["freshness"]["index_type"] == "computed_bm25_over_candidate_pool"
+    expected_backend = (
+        "postgres_tsvector_ts_rank"
+        if _planning_search_uses_postgres()
+        else "sqlite_bm25_like_fallback"
+    )
+    assert result["backend"] == expected_backend
+    if _planning_search_uses_postgres():
+        assert result["freshness"]["index_type"] == "on_the_fly_tsvector"
+    else:
+        assert result["freshness"]["index_type"] == "computed_bm25_over_candidate_pool"
 
 
 def test_sqlite_fts5_temp_table_never_persists_to_main_schema():

@@ -627,7 +627,11 @@ async def handle_update_custom_hook(
     removed_files: list[str] = []
     _was_enabled = bool(before.get("enabled")) if before else False
     _now_enabled = bool(updated.get("enabled"))
-    if before is not None and _was_enabled and not _now_enabled:
+    # Hosted Meridian cannot safely resolve or mutate a caller's local
+    # repository.  Persist the hook state, but leave local artifact cleanup to
+    # the caller-side handoff/launcher instead of crossing the hosted/local
+    # filesystem boundary (no_local_fs_access guard).
+    if before is not None and _was_enabled and not _now_enabled and not _hosted_mode():
         try:
             from pathlib import Path as _Path  # noqa: PLC0415
             from meridian import handoff as _handoff_module  # noqa: PLC0415
