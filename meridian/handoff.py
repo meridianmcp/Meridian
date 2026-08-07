@@ -1583,6 +1583,60 @@ def _format_content(content) -> str:
 # via that same helper, by generate_handoff itself — see both docstrings.
 _DEFAULT_HANDOFF_MAX_BYTES = 300_000
 
+# 248c0bb9 — mode-aware defaults for the SAME budget above. starter/goal are
+# explicitly meant to be a small, paste-ready executor-continuation block, not
+# a planner-scale dump — 300_000 bytes was never a real bound for them (it
+# only ever kicks in after a board has already ballooned past what a compact
+# mode should render in the first place). full/delta/planner keep the
+# original, generous _DEFAULT_HANDOFF_MAX_BYTES unchanged ("full/planner mode
+# may include full detail as today").
+#
+# These are DEFAULTS only: an explicit max_content_bytes argument to
+# generate_handoff (including None, which opts out of budgeting entirely)
+# always wins for every mode, exactly as before this existed — see
+# _MODE_DEFAULT_MAX_BYTES below and generate_handoff's own docstring.
+#
+# This is a safety net, not the primary compaction mechanism: the real fix is
+# _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS below, which keeps starter/goal content
+# small enough by construction that this budget should rarely if ever have to
+# truncate anything — truncating a token-bound body after the fact is exactly
+# what the handoff-renderer code note (b6510123) says not to rely on for
+# integrity; this budget exists as a last-resort backstop, not the mechanism
+# that makes these modes compact.
+_DEFAULT_STARTER_MAX_BYTES = 16_000
+_DEFAULT_GOAL_MAX_BYTES = 12_000
+
+# Sentinel distinguishing "caller did not pass max_content_bytes" (use the
+# mode-aware default above) from an explicit `None` (which has always meant
+# "opt out of budgeting entirely" — see format_handoff_mcp_content's
+# docstring) or an explicit int (any value, respected exactly). Never exposed
+# outside this module; generate_handoff resolves it to a real value before
+# any mode branch runs.
+_MODE_DEFAULT_MAX_BYTES = object()
+
+# 248c0bb9 — cap on how many pending items' FULL canonical tool_requirements /
+# sprint_item_pointers / artifact_pointer_findings JSON gets INLINED into the
+# /goal block's <tool_requirements>/<sprint_item_pointers>/
+# <artifact_pointer_findings> clauses (see _build_quick_start_goal's
+# full_contract_max_items param). Mirrors the existing
+# capability_contract._DEFAULT_MAX_EXECUTOR_CONTRACTS pattern (deterministic
+# item_id-sorted cap, explicit non-silent truncation marker), extended to the
+# three sections that pattern didn't originally cover — see the confirmed
+# root cause in sprint item 248c0bb9: those three clauses serialized the FULL
+# pending inventory unconditionally, for every mode, which is what produced
+# the ~90k-character goal-mode regression the handoff-renderer code note
+# (b6510123) documents. Only starter/goal pass this explicitly; full/delta
+# leave _build_quick_start_goal's own default (None = unbounded) untouched,
+# so "full/planner mode may include full detail as today" holds exactly.
+# When capped, the omitted items' full contracts remain available two ways:
+# (1) this SAME generate_handoff response's sibling `capability_contract`
+# field (built alongside every mode, not just full/delta — see
+# build_effective_capability_contract in mcp/handler.py), or (2) a follow-up
+# generate_handoff(mode='full') call. Neither requires re-deriving anything —
+# both are the SAME extract_tool_requirements/extract_sprint_item_pointers/
+# extract_artifact_pointer_findings source this clause itself reads.
+_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS = 15
+
 
 def format_handoff_mcp_content(
     content: str, *, max_bytes: "int | None" = _DEFAULT_HANDOFF_MAX_BYTES,
@@ -2664,8 +2718,29 @@ def _build_quick_start_goal(
     execution_policy: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
     selected_scope: "dict[str, Any] | None" = None,
+    full_contract_max_items: "int | None" = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
+
+    ``full_contract_max_items`` (248c0bb9) — optional deterministic cap
+    threaded straight through to ``_build_tool_requirements_clause``/
+    ``_build_pointer_records_clause``/``_build_artifact_pointer_findings_clause``
+    (see each's own ``max_items`` docstring). ``None`` (the default — the
+    full/delta call site in ``generate_handoff``) is UNBOUNDED, byte-for-byte
+    unchanged from before this parameter existed: "full/planner mode may
+    include full detail as today." The starter/compact and goal-only call
+    sites (``_generate_starter_handoff``/``_generate_goal_only_handoff``) pass
+    ``_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS`` so those two profiles stay small
+    even on a large board — this is the direct fix for the confirmed
+    regression in sprint item 248c0bb9 (a ~90k-character goal-mode render on a
+    real board, see the handoff-renderer code note b6510123): those three
+    clauses previously serialized the FULL pending inventory unconditionally
+    for every mode that calls this function, defeating starter/goal's own
+    compactness. Deliberately does NOT touch ``_build_required_tool_clause``/
+    ``_build_executor_routing_clause``/``_build_model_hints_clause``/
+    ``_build_workspace_tool_priority_clause`` — those already operate on the
+    narrower claimable batch (or are already opt-in/bounded by construction)
+    and were never part of the confirmed regression.
 
     ``selected_scope`` (cffb9323) — the dict :func:`_resolve_selected_item_scope`
     returns, or ``None`` (the default — every pre-existing call site) when the
@@ -3310,20 +3385,26 @@ def _build_quick_start_goal(
         # above), not the narrower claimable-now batch the two clauses above
         # use, so this matches capability_contract's item_tool_requirements
         # section exactly.
-        + _build_tool_requirements_clause(_all_pending_for_tool_requirements)
+        + _build_tool_requirements_clause(
+            _all_pending_for_tool_requirements, max_items=full_contract_max_items,
+        )
         # 665 follow-up — typed per-item durable sprint_item_pointers
         # contract: the SAME full pending inventory as the tool_requirements
         # clause above (not the narrower claimable-now batch), so this
         # matches capability_contract's item_sprint_item_pointers section
         # exactly for the same request.
-        + _build_pointer_records_clause(_all_pending_for_tool_requirements)
+        + _build_pointer_records_clause(
+            _all_pending_for_tool_requirements, max_items=full_contract_max_items,
+        )
         # 70c10ca3 (b730 follow-up) — typed per-item artifact-pointer
         # findings (88f82c15's warn/strict verdict + 3196ba0e's readiness
         # verification): the SAME full pending inventory as the two clauses
         # above, so this matches capability_contract's
         # item_artifact_pointer_findings section exactly for the same
         # request.
-        + _build_artifact_pointer_findings_clause(_all_pending_for_tool_requirements)
+        + _build_artifact_pointer_findings_clause(
+            _all_pending_for_tool_requirements, max_items=full_contract_max_items,
+        )
         # 0d0cada7 — lease-local scheduler diagnostics: plan_generation (for
         # claim_parallel_batch's stale-plan check) + any resource_blocked
         # items with poll/backoff guidance, straight from the SAME
@@ -3454,7 +3535,26 @@ def _build_executor_routing_clause(items: list[dict[str, Any]]) -> str:
     return f'\n<executor_routing hash="{_xml_escape(_hash)}">{_xml_escape(body)}</executor_routing>'
 
 
-def _build_tool_requirements_clause(items: list[dict[str, Any]]) -> str:
+def _build_contract_truncation_note(tag: str, total: int, included: int) -> str:
+    """248c0bb9 — non-silent truncation marker shared by the three FULL
+    per-item contract clauses below (tool_requirements/sprint_item_pointers/
+    artifact_pointer_findings), mirroring the structured-tag-plus-XML-comment
+    style already used by ``_excluded_unprospected_note``/
+    ``_excluded_wave_gate_note`` elsewhere in this module. Never a silent
+    drop: names the exact total/included counts and where the rest lives.
+    """
+    return (
+        f'\n<{tag}_truncated total="{total}" included="{included}" />'
+        f"\n<!-- Only the first {included} of {total} pending items' full "
+        f"{tag} JSON is inlined here to keep this handoff compact. The "
+        "complete set is available via this SAME response's capability_contract "
+        "field, or by calling generate_handoff(mode='full'). -->"
+    )
+
+
+def _build_tool_requirements_clause(
+    items: list[dict[str, Any]], *, max_items: "int | None" = None,
+) -> str:
     """76dde31f (665 follow-up) — build a ``<tool_requirements>`` XML clause
     carrying the TYPED, canonical per-item tool-requirement contract.
 
@@ -3471,19 +3571,40 @@ def _build_tool_requirements_clause(items: list[dict[str, Any]]) -> str:
     (``capability_contract.extract_tool_requirements``), two representations
     of the identical data, never two independently-maintained derivations.
 
+    ``max_items`` (248c0bb9) — optional deterministic cap on how many items'
+    entries get inlined, applied AFTER the extraction's own ``item_id`` sort
+    (so the same underlying board always caps to the same subset). ``None``
+    (the default — every pre-existing call site) is UNBOUNDED, byte-for-byte
+    unchanged from before this parameter existed. When given and the
+    candidate count exceeds it, only the first ``max_items`` entries are
+    embedded and a sibling ``<tool_requirements_truncated>`` marker (see
+    ``_build_contract_truncation_note``) records the full picture — never a
+    silent drop.
+
     Returns an empty string when no item in the batch has an effective tool
     requirement, so it never adds noise to an ordinary /goal.
     """
     per_item = capability_contract_module.extract_tool_requirements(items)
     if not per_item:
         return ""
+    _total = len(per_item)
+    _note = ""
+    if max_items is not None and max_items >= 0 and _total > max_items:
+        per_item = per_item[:max_items]
+        _note = _build_contract_truncation_note("tool_requirements", _total, len(per_item))
     body = json.dumps(per_item, sort_keys=True, separators=(",", ":"))
-    return f"\n<tool_requirements>{_xml_escape(body)}</tool_requirements>"
+    return f"\n<tool_requirements>{_xml_escape(body)}</tool_requirements>" + _note
 
 
-def _build_pointer_records_clause(items: list[dict[str, Any]]) -> str:
+def _build_pointer_records_clause(
+    items: list[dict[str, Any]], *, max_items: "int | None" = None,
+) -> str:
     """665 follow-up — build a ``<sprint_item_pointers>`` XML clause carrying
     the TYPED, canonical per-item durable pointer records.
+
+    ``max_items`` (248c0bb9) — same deterministic, non-silent cap contract as
+    ``_build_tool_requirements_clause``'s own ``max_items`` param — see its
+    docstring. ``None`` (every pre-existing call site) is unbounded.
 
     Distinct from ``_build_goal_pointer_lines`` above (compact, human-
     readable lines rendered INSIDE ``<sprint_items>`` — kept byte-for-byte
@@ -3515,11 +3636,18 @@ def _build_pointer_records_clause(items: list[dict[str, Any]]) -> str:
     entries = pointers_module.assemble_pointer_entries_from_annotated_items(items)
     if not entries:
         return ""
+    _total = len(entries)
+    _note = ""
+    if max_items is not None and max_items >= 0 and _total > max_items:
+        entries = entries[:max_items]
+        _note = _build_contract_truncation_note("sprint_item_pointers", _total, len(entries))
     body = json.dumps(entries, sort_keys=True, separators=(",", ":"))
-    return f"\n<sprint_item_pointers>{_xml_escape(body)}</sprint_item_pointers>"
+    return f"\n<sprint_item_pointers>{_xml_escape(body)}</sprint_item_pointers>" + _note
 
 
-def _build_artifact_pointer_findings_clause(items: list[dict[str, Any]]) -> str:
+def _build_artifact_pointer_findings_clause(
+    items: list[dict[str, Any]], *, max_items: "int | None" = None,
+) -> str:
     """70c10ca3 (b730 follow-up) — build an ``<artifact_pointer_findings>``
     XML clause carrying the TYPED, canonical per-item artifact-pointer
     findings: 88f82c15's warn/strict policy verdict (classification,
@@ -3527,6 +3655,10 @@ def _build_artifact_pointer_findings_clause(items: list[dict[str, Any]]) -> str:
     enriched with 3196ba0e's fail-closed readiness verification
     (canonical/archival/unresolved/ambiguous/missing/...) for each pointer
     id the verdict implicates.
+
+    ``max_items`` (248c0bb9) — same deterministic, non-silent cap contract as
+    ``_build_tool_requirements_clause``'s own ``max_items`` param — see its
+    docstring. ``None`` (every pre-existing call site) is unbounded.
 
     Distinct from ``_build_pointer_records_clause`` above (every stored
     pointer's resolved shape + item-level provenance-required state) and
@@ -3554,8 +3686,15 @@ def _build_artifact_pointer_findings_clause(items: list[dict[str, Any]]) -> str:
     entries = pointers_module.assemble_artifact_pointer_findings_from_annotated_items(items)
     if not entries:
         return ""
+    _total = len(entries)
+    _note = ""
+    if max_items is not None and max_items >= 0 and _total > max_items:
+        entries = entries[:max_items]
+        _note = _build_contract_truncation_note(
+            "artifact_pointer_findings", _total, len(entries)
+        )
     body = json.dumps(entries, sort_keys=True, separators=(",", ":"))
-    return f"\n<artifact_pointer_findings>{_xml_escape(body)}</artifact_pointer_findings>"
+    return f"\n<artifact_pointer_findings>{_xml_escape(body)}</artifact_pointer_findings>" + _note
 
 
 # ---------------------------------------------------------------------------
@@ -7566,7 +7705,7 @@ async def generate_handoff(
     strict_pointer_evidence: bool = False,
     related_records_query: str | None = None,
     related_records: dict[str, Any] | None = None,
-    max_content_bytes: "int | None" = _DEFAULT_HANDOFF_MAX_BYTES,
+    max_content_bytes: "int | None" = _MODE_DEFAULT_MAX_BYTES,  # type: ignore[assignment]
     force_include_rejected: "list[dict[str, Any]] | None" = None,
     checkpoint: bool = False,
     strict_continuation: bool = False,
@@ -7598,6 +7737,19 @@ async def generate_handoff(
     (comfortably above every legitimately-sized profile, far below what an
     unbounded render reaches on a large board); pass ``None`` to opt out and
     get the exact prior (unbounded) return value.
+
+    248c0bb9 — the default is now MODE-AWARE: omitting this argument entirely
+    resolves to ``_DEFAULT_STARTER_MAX_BYTES``/``_DEFAULT_GOAL_MAX_BYTES`` for
+    ``mode in {"starter", "compact"}``/``mode == "goal"`` respectively, and
+    ``_DEFAULT_HANDOFF_MAX_BYTES`` (unchanged) for every other mode — resolved
+    ONCE, immediately below, before any mode branch runs. Passing an EXPLICIT
+    value — any int, or ``None`` to opt out of budgeting entirely — always
+    wins for every mode, exactly as before this mode-awareness existed; every
+    existing caller that already passed its own value (or ``None``) sees zero
+    functional change. This is a backstop, not the primary compaction
+    mechanism: see ``full_contract_max_items`` on ``_build_quick_start_goal``
+    for the actual fix (the starter/goal renders are small enough by
+    construction that this budget should rarely have to truncate anything).
 
     Set ``skip_ai_summary=True`` for hot-path / test code that shouldn't
     burn a Haiku call. Pass ``summarizer`` to inject a stub for either
@@ -7818,11 +7970,23 @@ async def generate_handoff(
     project = await db_module.get_project(db, project_id)
     if project is None:
         raise ValueError(f"project not found: {project_id}")
+    # 248c0bb9 — resolve the mode-aware max_content_bytes default ONCE, before
+    # any mode branch below. An explicit argument (any int, or None to opt out
+    # of budgeting) always wins — see the docstring above.
+    if max_content_bytes is _MODE_DEFAULT_MAX_BYTES:
+        if mode in {"starter", "compact"}:
+            _resolved_max_bytes: "int | None" = _DEFAULT_STARTER_MAX_BYTES
+        elif mode == "goal":
+            _resolved_max_bytes = _DEFAULT_GOAL_MAX_BYTES
+        else:
+            _resolved_max_bytes = _DEFAULT_HANDOFF_MAX_BYTES
+    else:
+        _resolved_max_bytes = max_content_bytes  # type: ignore[assignment]
     if mode == "planner":
         _pl_path, _pl_content = await _generate_planner_handoff(db, project_id, output_dir)
         return (
             _pl_path,
-            format_handoff_mcp_content(_pl_content, max_bytes=max_content_bytes),
+            format_handoff_mcp_content(_pl_content, max_bytes=_resolved_max_bytes),
             False,
         )
     # b8f89491 — resolve the effective sprint-version scope ONCE, for every
@@ -7882,7 +8046,7 @@ async def generate_handoff(
         )
         return (
             _st_path,
-            format_handoff_mcp_content(_st_content, max_bytes=max_content_bytes),
+            format_handoff_mcp_content(_st_content, max_bytes=_resolved_max_bytes),
             False,
         )
     if mode == "goal":
@@ -7906,7 +8070,7 @@ async def generate_handoff(
         )
         return (
             _g_path,
-            format_handoff_mcp_content(_g_content, max_bytes=max_content_bytes),
+            format_handoff_mcp_content(_g_content, max_bytes=_resolved_max_bytes),
             False,
         )
     if mode not in {"full", "delta"}:
@@ -8760,7 +8924,7 @@ async def generate_handoff(
     # handoffs table, pending_goal) already persisted the complete render.
     return (
         str(out_path.resolve()),
-        format_handoff_mcp_content(content, max_bytes=max_content_bytes),
+        format_handoff_mcp_content(content, max_bytes=_resolved_max_bytes),
         _amended,
     )
 
@@ -9132,6 +9296,12 @@ async def _generate_starter_handoff(
         execution_policy=_execution_policy_from_settings(settings, _s_execution_mode),
         strict_pointer_evidence=strict_pointer_evidence,
         selected_scope=selected_scope,
+        # 248c0bb9 — starter/compact stays compact even on a large board: cap
+        # the full per-item tool_requirements/sprint_item_pointers/
+        # artifact_pointer_findings JSON instead of inlining the entire
+        # pending inventory. See _build_quick_start_goal's own
+        # full_contract_max_items docstring for the fetch-on-demand fallback.
+        full_contract_max_items=_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
     )
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the
@@ -9426,6 +9596,10 @@ async def _generate_goal_only_handoff(
         execution_policy=_execution_policy_from_settings(proj_settings, _g_execution_mode),
         strict_pointer_evidence=strict_pointer_evidence,
         selected_scope=selected_scope,
+        # 248c0bb9 — goal-only mode stays a genuinely bounded executable block
+        # even on a large board: same cap as starter/compact — see
+        # _build_quick_start_goal's own full_contract_max_items docstring.
+        full_contract_max_items=_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
     )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.
