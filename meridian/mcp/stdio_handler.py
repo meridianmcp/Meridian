@@ -2022,6 +2022,11 @@ def build_mcp_server():
             # execute_batch's request/response contract can never drift between
             # transports — see meridian/batch_ops.py's module docstring.
             _shared_tool("execute_batch"),
+            # 133bfff6 — same _shared_tool() schema-parity pattern as
+            # execute_batch above: batch_read/batch_mutate schemas live once
+            # in meridian/mcp_tools.py's _MCP_TOOLS_LIST, never duplicated.
+            _shared_tool("batch_read"),
+            _shared_tool("batch_mutate"),
             Tool(
                 name="start_session",
                 description=(
@@ -2538,6 +2543,7 @@ def build_mcp_server():
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "execute_batch",
+                "batch_read", "batch_mutate",
                 "add_workspace_note", "get_workspace_notes",
                 "get_workspace_proposals",
                 "pin_workspace_decision", "get_workspace_decisions",
