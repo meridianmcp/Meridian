@@ -11961,6 +11961,10 @@ from .sprint_items import (  # noqa: F401
     _compute_plan_generation,
     _seconds_until,
     _live_resource_holder,
+    # 6b3b2c0e — canonical single-colon-legacy-shorthand classification,
+    # also called directly by tests.
+    _predict_resource_granularity,
+    _is_legacy_file_symbol_shorthand,
 )
 
 
