@@ -928,6 +928,47 @@ def test_score_confidence_lexical_boost_cannot_rescue_low_semantic_score():
     assert m.reason == "below_confidence_threshold"
 
 
+def test_score_confidence_exact_tie_is_reproducible_and_ambiguous():
+    """f30bbd89 — reproducible tie-breaking baseline: two candidates with the
+    EXACT same fused_score (margin == 0.0, not merely "close") must both
+    abstain, and repeated calls on the identical input must produce
+    byte-identical verdicts (same order, same reason) every time — this is
+    the concrete "reproducible" half of the tie-breaking contract a future
+    semantic tool-router would also need."""
+    ranked = [("a", 0.60), ("b", 0.60)]
+    first = score_confidence(ranked, floor=0.37, min_margin=0.05)
+    second = score_confidence(ranked, floor=0.37, min_margin=0.05)
+    assert first == second  # dataclasses are comparable by value — must match exactly
+    for m in first:
+        assert m.margin == 0.0
+        assert m.confident is False
+        assert m.reason == "ambiguous_runner_up"
+    # Stable-sort contract: equal fused_score keeps the ORIGINAL input order
+    # rather than being reordered arbitrarily (Python's sort is stable and
+    # score_confidence must not defeat that by re-keying on id/hash).
+    assert [m.id for m in first] == ["a", "b"]
+
+
+def test_score_confidence_three_way_near_tie_all_abstain():
+    """f30bbd89 — a chain of three near-tied candidates (each adjacent gap
+    below min_margin) must ALL abstain, not just the two closest ones —
+    the margin check compares each candidate to its NEAREST neighbor in
+    either direction, so the middle candidate's two small gaps (to its
+    left AND right neighbor) both fail the margin independently of the
+    top/bottom candidates' single gap."""
+    ranked = [("top", 0.62), ("mid", 0.60), ("bottom", 0.58)]
+    matches = score_confidence(ranked, floor=0.37, min_margin=0.05)
+    by_id = {m.id: m for m in matches}
+    assert by_id["top"].confident is False
+    assert by_id["mid"].confident is False
+    assert by_id["bottom"].confident is False
+    for m in matches:
+        assert m.reason == "ambiguous_runner_up"
+    # The middle candidate's margin is the min of its two (equal) gaps, not
+    # their sum — confirms both-direction nearest-neighbor semantics.
+    assert by_id["mid"].margin == pytest.approx(0.02, abs=1e-9)
+
+
 def test_score_confidence_never_fabricates_ids_outside_input():
     """9149e132 — the structural safety property meridian.db.planning_search's
     optional ``rerank_semantic`` relies on: score_confidence() (and, by

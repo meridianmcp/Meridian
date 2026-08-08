@@ -3925,3 +3925,181 @@ def _select_active_tool_set(
         "keyword_signals": keyword_signals,
         "mode": "deterministic",
     }
+
+
+# ---------------------------------------------------------------------------
+# INVESTIGATE f30bbd89 (item_group: proposal:rag-semantic-tool-routing)
+# "define offline routing benchmarks, shadow-mode telemetry, reproducible
+# tie-breaking, audit provenance, and rollout gates" for a semantic
+# (embedding-based) upgrade to MCP tool-routing/pre-selection.
+#
+# THIS BLOCK IS DESIGN ONLY -- nothing below is wired up or imported by
+# anything. It exists so a future implementer of the "rag-semantic-tool-
+# routing" proposal starts from a grounded design instead of a blank page,
+# and so this investigation is reviewable without an ad hoc root-level
+# markdown file -- mirroring how retrieval_eval.py's and
+# db/vector_index_state.py's own module docstrings already carry design
+# rationale next to the code they describe, rather than in a separate doc.
+#
+# WHAT EXISTS TODAY (read this before building anything new)
+# ---------------------------------------------------------------------
+# There are two unrelated "routing/search" mechanisms in this codebase and
+# it is easy to conflate them:
+#
+#  1. Tool pre-selection (a749f87c, THIS file, `_select_active_tool_set`
+#     above) -- decides which MCP TOOLS to recommend for a session. Pure
+#     keyword-category membership: role -> base category set, /goal text
+#     keywords -> category expansion (`_KEYWORD_CATEGORY_AFFINITY`). No
+#     embeddings, no scores, no ties -- a tool's presence is a boolean
+#     (category in base_cats), not a ranked decision. Its output
+#     (`active_tool_set`) is ADVISORY ONLY today: `meridian/mcp/handlers/
+#     project_tools.py`'s start_session handler stuffs it into the
+#     orientation response, but the MCP `tools/list` surface (server.py,
+#     backed by `_MCP_TOOLS_LIST`) always returns every tool regardless --
+#     `active_tool_set` never filters what a client can actually call. In
+#     the shadow-mode sense used below, this mechanism has effectively
+#     always run in "shadow" (zero power to hide a tool), but with zero
+#     telemetry on whether its recommendation was ever followed.
+#
+#  2. Semantic/RAG content search (56cd8712 / 3d3ccf2d,
+#     meridian/semantic_search.py) -- decides which NOTES / DECISIONS /
+#     SPRINT-ITEMS a keyword-miss query should surface. Real Model2Vec
+#     embeddings, real cosine scores, and an already-built, already-tested
+#     deterministic tie-break/abstention gate (`score_confidence`: absolute
+#     floor + nearest-neighbor margin, see its docstring above in this
+#     module's sibling file). This is the ONLY place in the codebase today
+#     that actually needs, and has, reproducible tie-breaking.
+#
+# The "rag-semantic-tool-routing" proposal is: apply (2)'s machinery -- real
+# embeddings + score_confidence-style scored/ranked candidates + deterministic
+# abstention -- to (1)'s problem (choosing tools), instead of (1)'s current
+# static keyword dict. That introduces something that does NOT exist today: a
+# RANKED, SCORED tool-selection decision that CAN tie -- which is why all 5
+# areas below are real gaps, not already-solved problems.
+#
+# DESIGN -- the 5 areas
+# ---------------------------------------------------------------------
+# (a) Offline routing benchmarks
+#     Reuse retrieval_eval.py's shape rather than reinventing it: a
+#     disposable shadow-project harness (mirroring `run_evaluation`) that
+#     builds a labeled dataset and turns metrics into a pass/fail
+#     `GateDecision` (mirroring `evaluate_gate`). For tool-routing the
+#     "corpus" is (goal_text, role, expected_tools_or_categories) tuples
+#     instead of (query, expected_record_id) -- and most of it can be
+#     MINED, not hand-written: every historical `start_session(role=...)`
+#     paired with the tools a session actually called before its next
+#     `generate_handoff` is a free, real label (goal text -> tools actually
+#     used). `tests/test_a749f87c_tool_preselection.py`'s existing
+#     keyword-expansion cases (code/docx/research) are a ready-made starter
+#     set of hand-labeled positives. Metrics: category-level
+#     precision/recall against the mined "tools actually used" set (NOT
+#     recall@1 -- routing is multi-label; a session legitimately uses many
+#     tools across one goal), false-exclusion rate (a tool the session
+#     needed but the router would have hidden -- the one unacceptable-by-
+#     default metric, mirroring retrieval_eval's zero-leakage hard gate),
+#     and decision churn (how much the active set differs run-to-run for
+#     IDENTICAL input -- see (c), this must be zero).
+#
+# (b) Shadow-mode telemetry
+#     Never change `active_tool_set`'s current advisory-only contract as
+#     part of turning on a semantic scorer. Log BOTH the existing
+#     deterministic result and the new semantic candidate result on every
+#     `_select_active_tool_set` call, tagged with a decision id, without
+#     ever acting on the semantic one. The natural sink is the same
+#     append-only `action_audit_log` table `meridian/code_intel_receipt.py`
+#     already writes prospecting receipts to (a new event_type
+#     discriminates rows in one existing table rather than a new migration)
+#     -- e.g. event_type="tool_routing_shadow_decision" with a JSON payload
+#     of {deterministic_result, semantic_result, agreement, model_version}.
+#     Divergence rate (deterministic active_tools != semantic active_tools)
+#     over real traffic is the headline shadow metric and is a PRECONDITION
+#     for any rollout-gate discussion in (e) -- the offline benchmark in (a)
+#     alone is not sufficient evidence to promote out of shadow.
+#
+# (c) Reproducible tie-breaking
+#     Do not invent a new abstention rule -- port `score_confidence`'s
+#     contract verbatim: an absolute confidence floor on the raw semantic
+#     score (never the fused one) PLUS a nearest-neighbor margin check in
+#     BOTH directions, so two near-tied categories both abstain rather than
+#     one being arbitrarily promoted. For tool-routing specifically,
+#     "abstain" means: keep the CURRENT deterministic keyword result for
+#     that category rather than trusting the semantic scorer -- the
+#     deterministic router is always the safe fallback, exactly the role
+#     keyword-only search already plays for semantic_search.py (never the
+#     other way around). Determinism additionally requires (i) a FIXED
+#     candidate order fed to the embedder -- sorted by tool/category name,
+#     never dict/set iteration order, so re-runs on identical input cannot
+#     silently reorder a tie -- and (ii) rounding scores (score_confidence
+#     already rounds to 4dp) before any equality/margin comparison, so
+#     float noise from a batch-size-dependent encode path can never flip a
+#     decision. The regression tests added alongside this block
+#     (test_score_confidence_exact_tie_is_reproducible_and_ambiguous,
+#     test_score_confidence_three_way_near_tie_all_abstain,
+#     test_select_active_tool_set_is_deterministic_across_repeated_calls)
+#     lock in the CURRENT baseline behavior of both routers that this
+#     future work must not regress.
+#
+# (d) Audit provenance
+#     Mirror `db/vector_index_state.py`'s pattern exactly: persist, per
+#     revision of the routing config (not per call -- volume), the
+#     embedding model name/version (`semantic_search.model_name()` already
+#     exists for this), a hash of the input (goal-text hash, never raw
+#     text -- avoid writing arbitrary user text into a long-lived audit
+#     row), the scored candidates, and the final decision + reason
+#     ("confident_match" / "ambiguous_runner_up" /
+#     "below_confidence_threshold" / "deterministic_fallback" -- the same
+#     vocabulary `score_confidence` already returns, extended with the one
+#     fallback reason that is new to routing). A benchmark-gated enable
+#     flag (e.g. `semantic_routing_enabled`), flipped ONLY by a
+#     `record_tool_routing_benchmark`-shaped function analogous to
+#     `record_vector_backend_benchmark` -- i.e. the flag is evidence-gated,
+#     never hand-flipped, and the evidence blob IS the audit trail (same
+#     "do not introduce X merely because it exists" contract
+#     vector_index_state.py's docstring states for pgvector).
+#
+# (e) Rollout gates
+#     Three stages, phrased with the capability-manifest availability_policy
+#     vocabulary this repo already uses elsewhere (degraded_ok / optional /
+#     required -- AGENTS.md, meridian/capability_manifest.py) so a future
+#     capability id like "semantic_tool_routing" slots into the existing
+#     manifest system without inventing new terminology:
+#       stage 0 "shadow"    -- (b)'s logging only, 0% behavioral effect.
+#                              Gate to stage 1 requires a minimum shadow
+#                              sample size (e.g. >=200 real sessions) AND a
+#                              divergence-rate review showing no systematic
+#                              false-exclusion pattern.
+#       stage 1 "advisory"  -- the semantic result REPLACES the
+#                              deterministic one in `active_tool_set`'s
+#                              advisory metadata (still non-enforcing --
+#                              tools/list is untouched). Gate to stage 2
+#                              requires the offline benchmark (a) passing
+#                              evaluate_gate-style thresholds
+#                              (false_exclusion_rate == 0, precision/recall
+#                              above a floor) AND zero unexplained
+#                              high-severity divergences carried over from
+#                              the stage-0 shadow window.
+#       stage 2 "enforcing" -- `active_tool_set` actually filters the
+#                              tools/list surface. This is a materially
+#                              bigger behavioral change than anything
+#                              semantic_search.py ever makes (that system
+#                              only ever ADDS candidates atop lexical
+#                              results; it never hides one) and needs its
+#                              own separate, explicitly HITL-reviewed
+#                              sprint item before it is ever built --
+#                              deliberately out of scope for this
+#                              investigation.
+#     Any stage can roll back to "shadow" instantly by flipping the
+#     evidence-gated flag in (d) back to disabled -- no code deploy
+#     required, mirroring `pgvector_enabled`'s own rollback story.
+#
+# WHAT THIS INVESTIGATION DELIBERATELY DID NOT BUILD
+# ---------------------------------------------------------------------
+# No new production module, no new DB table/migration, no embedding
+# integration for tool-routing. The lowest-risk, highest-signal next step
+# is the offline benchmark harness (a): it needs no new persistence and no
+# behavioral change, and it would answer whether a semantic scorer even
+# beats the current keyword dict before any telemetry/provenance/rollout
+# machinery is worth building at all. The regression tests added alongside
+# this block establish the CURRENT deterministic behavior of both existing
+# routers as the baseline that harness must be measured against.
+# ---------------------------------------------------------------------------

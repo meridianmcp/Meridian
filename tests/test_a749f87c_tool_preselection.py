@@ -330,3 +330,43 @@ def test_returned_structure_fields() -> None:
         assert isinstance(result["active_categories"], list)
         assert isinstance(result["keyword_signals"], list)
         assert result["mode"] == "deterministic"
+
+
+# ---------------------------------------------------------------------------
+# f30bbd89 — reproducible-tie-breaking baseline for the CURRENT deterministic
+# router, established alongside the "rag-semantic-tool-routing" design write-up
+# (see the INVESTIGATE f30bbd89 comment block at the end of meridian/mcp_tools.py).
+# _select_active_tool_set has no scores and therefore no notion of a "tie" the
+# way meridian.semantic_search.score_confidence does — inclusion is boolean
+# category membership. These tests lock in that (i) repeated calls on
+# identical input are byte-identical (list order included, not just set
+# equality) and (ii) list ordering always follows _MCP_TOOLS_LIST's own fixed
+# declaration order rather than any dict/set iteration order — the concrete
+# baseline a future scored/ranked semantic router must not regress on.
+# ---------------------------------------------------------------------------
+
+def test_select_active_tool_set_is_deterministic_across_repeated_calls() -> None:
+    """f30bbd89 — identical (role, goal_text) input must yield an identical
+    result dict (including list ORDER, not just set membership) on every
+    call — no hidden randomness (e.g. dict/set iteration order) anywhere in
+    the pipeline."""
+    goal = "Refactor the codebase search index and update the thesis docx"
+    for role in (None, "", "executor", "planner", "unknown"):
+        first = _select_active_tool_set(role, goal)
+        second = _select_active_tool_set(role, goal)
+        assert first == second, f"non-deterministic result for role={role!r}"
+        assert first["active_tools"] == second["active_tools"]
+        assert first["excluded_tools"] == second["excluded_tools"]
+        assert first["keyword_signals"] == second["keyword_signals"]
+
+
+def test_select_active_tool_set_active_tools_follow_declared_list_order() -> None:
+    """f30bbd89 — active_tools/excluded_tools preserve _MCP_TOOLS_LIST's own
+    fixed declaration order (a stable filter of that list), not e.g.
+    alphabetical or set-derived order — so two callers filtering the same
+    role never see the same tools in a different order."""
+    result = _select_active_tool_set("executor")
+    all_names_in_order = [t["name"] for t in _MCP_TOOLS_LIST]
+    active_set = set(result["active_tools"])
+    expected_order = [n for n in all_names_in_order if n in active_set]
+    assert result["active_tools"] == expected_order
