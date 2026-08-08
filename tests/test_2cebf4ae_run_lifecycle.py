@@ -229,6 +229,116 @@ def test_lock_reclaim_after_supersede_forces_deletion(tmp_path):
     lock.release()
 
 
+# ---------------------------------------------------------------------------
+# 2b. 424829d1 -- _supersede_previous_owner: truthful --supersede cleanup.
+# Before this fix, main()'s --supersede path called _kill_process_tree and
+# discarded its return value entirely, then unconditionally marked the
+# previous run "cancelled" -- a false-clean cleanup receipt whenever the
+# kill actually failed to reach the real pytest child (superseded_pid is
+# the WRAPPER's own pid, spawned with start_new_session=True specifically
+# so a normal process-tree kill of the CHILD can't reach back into the
+# wrapper's group -- meaning killing the wrapper alone can leave the
+# wrapper's own child/xdist workers alive).
+# ---------------------------------------------------------------------------
+
+
+def test_supersede_previous_owner_confirmed_when_no_survivors(monkeypatch):
+    monkeypatch.setattr(rt, "_kill_process_tree", lambda pid: True)
+    monkeypatch.setattr(rt, "_report_survivors", lambda pids: [])
+    existing = rt.TestRunRecord(run_id="r1", state=rt.STATE_RUNNING, process_tree=[501, 502])
+
+    outcome = rt._supersede_previous_owner(999, existing)
+
+    assert outcome["confirmed"] is True
+    assert outcome["receipt"]["attempted"] is True
+    assert outcome["receipt"]["kill_confirmed"] is True
+    assert outcome["receipt"]["survivors"] == []
+
+
+def test_supersede_previous_owner_not_confirmed_when_survivors_remain(monkeypatch):
+    """The exact bug this fix closes: a kill call that self-reports success
+    must NOT be trusted alone -- a fresh survivor check against the real
+    combined pid set (wrapper + its recorded process_tree) is what actually
+    decides `confirmed`."""
+    monkeypatch.setattr(rt, "_kill_process_tree", lambda pid: True)
+    monkeypatch.setattr(rt, "_report_survivors", lambda pids: [502])
+    existing = rt.TestRunRecord(run_id="r1", state=rt.STATE_RUNNING, process_tree=[501, 502])
+
+    outcome = rt._supersede_previous_owner(999, existing)
+
+    assert outcome["confirmed"] is False
+    assert outcome["receipt"]["survivors"] == [502]
+
+
+def test_supersede_previous_owner_sweeps_recorded_process_tree_not_just_wrapper_pid(monkeypatch):
+    """superseded_pid alone (the wrapper) is not enough -- the previous
+    run's own recorded process_tree (its real pytest child + descendants)
+    must also be targeted, since start_new_session=True means killing the
+    wrapper never reaches them."""
+    killed: list[int] = []
+    monkeypatch.setattr(rt, "_kill_process_tree", lambda pid: killed.append(pid) or True)
+    monkeypatch.setattr(rt, "_report_survivors", lambda pids: [])
+    existing = rt.TestRunRecord(run_id="r1", state=rt.STATE_RUNNING, process_tree=[501, 502])
+
+    rt._supersede_previous_owner(999, existing)
+
+    assert 999 in killed
+    assert 501 in killed
+    assert 502 in killed
+
+
+def test_supersede_previous_owner_no_existing_record_only_targets_wrapper_pid(monkeypatch):
+    killed: list[int] = []
+    monkeypatch.setattr(rt, "_kill_process_tree", lambda pid: killed.append(pid) or True)
+    monkeypatch.setattr(rt, "_report_survivors", lambda pids: [])
+
+    outcome = rt._supersede_previous_owner(999, None)
+
+    assert killed == [999]
+    assert outcome["confirmed"] is True
+
+
+def test_main_supersede_refuses_and_preserves_receipt_when_kill_not_confirmed(tmp_path, monkeypatch, capsys):
+    """The refusal path: main() must NOT mark a possibly-still-alive
+    previous run "cancelled" (a false-clean receipt) when
+    _supersede_previous_owner cannot confirm termination -- it must fail
+    closed (exit code 2) and persist a truthful (not-confirmed) cleanup
+    receipt on the existing record instead."""
+    lock = rt.TestRunLock(tmp_path)
+    lock.path.write_text("999\t1234.0\t/some/old/cwd\n", encoding="utf-8")
+    existing = rt.TestRunRecord(
+        run_id="prev-run", state=rt.STATE_RUNNING, started_at="t0", process_tree=[501],
+    )
+    rt._write_record_atomic(lock.state_path, existing)
+
+    monkeypatch.setattr(rt, "TestRunLock", lambda repo_root: lock)
+    monkeypatch.setattr(rt, "_pid_is_running", lambda pid: True)  # wrapper pid looks alive
+    monkeypatch.setattr(lock, "owner_pid_is_confirmed_alive", lambda: True)
+    monkeypatch.setattr(rt, "_kill_process_tree", lambda pid: False)
+    monkeypatch.setattr(rt, "_report_survivors", lambda pids: [501])
+    # main()'s own tracker.mark_queued() call (this invocation's OWN new
+    # run) writes to the SAME shared lock.state_path before the duplicate/
+    # supersede branch below reads it back as "existing" -- neutralize it
+    # so this test observes the OTHER (previous) run's record undisturbed,
+    # isolating exactly the supersede-refusal behavior under test. (The
+    # mark_queued-before-lock-acquire ordering itself is a separate,
+    # pre-existing quirk noted but out of scope here.)
+    monkeypatch.setattr(rt.TestRunTracker, "mark_queued", lambda self: None)
+
+    exit_code = rt.main(["--supersede"])
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "could not confirm" in captured.err
+    reloaded = rt.TestRunTracker.load_record(lock.state_path)
+    # The previous record must NOT have been marked cancelled/superseded --
+    # only a truthful cleanup receipt was attached.
+    assert reloaded.state == rt.STATE_RUNNING
+    assert reloaded.superseded_by is None
+    assert reloaded.cleanup["kill_confirmed"] is False
+    assert reloaded.cleanup["survivors"] == [501]
+
+
 def test_print_duplicate_report_with_existing_record(tmp_path, capsys):
     record = rt.TestRunRecord(run_id="r1", state=rt.STATE_RUNNING, started_at="t0")
     lock = rt.TestRunLock(tmp_path)
