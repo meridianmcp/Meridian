@@ -1088,6 +1088,57 @@ def _record_superseded_stale_run(lock: "TestRunLock", tracker: "TestRunTracker")
         tracker.record.superseded_run_id = stale.run_id
 
 
+def _supersede_previous_owner(
+    superseded_pid: "int | None", existing: "TestRunRecord | None",
+) -> "dict[str, Any]":
+    """Truthfully attempt to terminate a ``--supersede`` takeover's previous
+    owner and report exactly what happened -- never assume a clean kill that
+    was not independently re-verified.
+
+    Before this fix, ``main()`` called ``_kill_process_tree(superseded_pid)``,
+    discarded its return value entirely, and unconditionally marked the
+    previous run's record ``cancelled`` -- a silently false-clean cleanup
+    receipt whenever the kill actually failed.
+
+    Re-verifying matters here for a second, more concrete reason:
+    ``superseded_pid`` is the WRAPPER process's own pid (``TestRunLock``
+    persists ``os.getpid()``, not the pytest child it supervises). That
+    wrapper spawns its pytest child with ``start_new_session=True``
+    specifically so terminating the CHILD's own process tree (the normal
+    cleanup path) can never reach back into the wrapper's group -- but that
+    same isolation means killing the wrapper alone does not reach the child.
+    A no-psutil environment (this repo's own CI, and any base pixi install
+    without the optional ``[semantic]`` extra) falls back to
+    ``os.killpg``/``os.kill`` on the single given pid with no recursion, so
+    the previous run's actual pytest subprocess (and any xdist workers) can
+    silently survive a "successful" supersede. Sweep the previous run's own
+    recorded ``process_tree`` (its pytest child + descendants) too, then
+    decide truthfully from a fresh :func:`_report_survivors` check against
+    the full combined set -- never from either kill call's own self-reported
+    success alone.
+    """
+    target_pids: "list[int]" = []
+    if superseded_pid is not None:
+        target_pids.append(superseded_pid)
+    child_tree = list(existing.process_tree) if existing is not None else []
+    target_pids.extend(child_tree)
+
+    killed_ok = _kill_process_tree(superseded_pid) if superseded_pid is not None else True
+    for extra_pid in child_tree:
+        _kill_process_tree(extra_pid)
+
+    survivors = _report_survivors(target_pids) if target_pids else []
+    return {
+        "confirmed": not survivors,
+        "receipt": {
+            "attempted": True,
+            "method": "supersede_kill",
+            "kill_confirmed": bool(killed_ok),
+            "survivors": survivors,
+        },
+    }
+
+
 def _print_duplicate_report(existing: "TestRunRecord | None", lock: "TestRunLock") -> None:
     if existing is not None:
         print(
@@ -1149,7 +1200,29 @@ def main(argv: list[str] | None = None) -> int:
             existing = TestRunTracker.load_record(lock.state_path)
             if ns.supersede and lock.owner_pid_is_confirmed_alive():
                 superseded_pid = lock.owner_pid
-                _kill_process_tree(superseded_pid)
+                outcome = _supersede_previous_owner(superseded_pid, existing)
+                cleanup_receipt = outcome["receipt"]
+                if not outcome["confirmed"]:
+                    # NEVER silently mark a run that may still be alive
+                    # "cancelled" -- that is exactly the untruthful cleanup
+                    # report this fix exists to prevent. Leave the (possibly
+                    # still-live) victim's own record untouched aside from a
+                    # truthful cleanup receipt, and fail closed instead of
+                    # stealing its lock out from under it.
+                    if existing is not None:
+                        existing.cleanup = cleanup_receipt
+                        _write_record_atomic(lock.state_path, existing)
+                    print(
+                        "--supersede could not confirm the previous owner "
+                        f"(pid={superseded_pid}) was fully terminated "
+                        f"(kill_confirmed={cleanup_receipt['kill_confirmed']}, "
+                        f"survivors={cleanup_receipt['survivors']}); refusing to take "
+                        "over its lock rather than report a false-clean cleanup. Wait "
+                        "for it to finish, or investigate the still-live process tree "
+                        "manually.",
+                        file=sys.stderr,
+                    )
+                    return 2
                 if existing is not None and existing.state not in TERMINAL_STATES:
                     existing.state = STATE_CANCELLED
                     existing.error = (
@@ -1158,6 +1231,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     existing.terminal_at = _now_wall()
                     existing.superseded_by = tracker.record.run_id
+                    existing.cleanup = cleanup_receipt
                     _write_record_atomic(lock.state_path, existing)
                 if lock.reclaim_after_supersede():
                     lock_owned_by_us = True
