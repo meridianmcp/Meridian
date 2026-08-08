@@ -170,15 +170,31 @@ dev = "uvicorn meridian.server:app --reload --port 7878"
 # genuinely small selections (40 tests or fewer), otherwise -n auto with work stealing and an
 # eight-worker safety cap. The rate-limit module remains explicitly serial
 # because its assertions depend on wall-clock spacing.
-test = "python scripts/run_tests.py tests/ -q --tb=short --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py && python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short"
+#
+# 4f3765c1 — tests marked @pytest.mark.subprocess_isolated (see pytest.ini)
+# spawn a real OS subprocess (bash/PowerShell/python child) -- e.g. the
+# code_intel_guard.sh/.ps1 hook tests and tool_discovery.run_targeted_tests's
+# own subprocess tests. Many xdist workers each spawning subprocesses
+# concurrently under -n auto have produced Windows NTSTATUS crash exit codes
+# (ACCESS_VIOLATION, DLL_NOT_FOUND, CONTROL_C_EXIT) purely from contention,
+# not a real regression (see test_code_intel_guard.py's/_WIN_CRASH_CODES
+# retry workaround, which masks the SYMPTOM per-test but not the underlying
+# contention). Excluded from the main sweep with `-m "not subprocess_isolated"`
+# and rerun as their own dedicated `--serial` step below -- the same isolation
+# pattern already proven for test_rate_limit_serial.py, applied to a
+# different flake mechanism. Routed through `scripts/run_tests.py` (never a
+# raw `pytest` call) so the durable TestRunRecord classification (2cebf4ae:
+# truthful STALLED/TIMED_OUT/CRASHED vs PASSED/FAILED, real exit-code
+# propagation) applies to this step exactly as it does to the other two.
+test = "python scripts/run_tests.py tests/ -q --tb=short --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py -m \"not subprocess_isolated\" && python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short && python scripts/run_tests.py --serial tests/ -q --tb=short -m subprocess_isolated"
 # KEYSTONE 98aa7eb7 — run the SAME suite against real Postgres. The `db`/`client`
 # fixtures (tests/conftest.py) route to Postgres whenever TEST_DATABASE_URL is set,
 # so bugs SQLite :memory: hides (e.g. b7f41c73 datetime serialization) surface.
 # Set the URL first, e.g.:
 #   TEST_DATABASE_URL=postgresql://meridian:meridian@localhost:5432/meridian_test pixi run test-pg
 # Mirrors the CI `test-postgres` job in .github/workflows/test.yml.
-test-pg = "python scripts/run_tests.py tests/ -q --tb=short --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py && python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short"
-test-cov = "python scripts/run_tests.py tests/ -q --tb=short --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py --cov=meridian --cov-config=.coveragerc && python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short --cov=meridian --cov-config=.coveragerc --cov-append --cov-report=term-missing --cov-fail-under=80"
+test-pg = "python scripts/run_tests.py tests/ -q --tb=short --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py -m \"not subprocess_isolated\" && python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short && python scripts/run_tests.py --serial tests/ -q --tb=short -m subprocess_isolated"
+test-cov = "python scripts/run_tests.py tests/ -q --tb=short --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py -m \"not subprocess_isolated\" --cov=meridian --cov-config=.coveragerc && python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short --cov=meridian --cov-config=.coveragerc --cov-append && python scripts/run_tests.py --serial tests/ -q --tb=short -m subprocess_isolated --cov=meridian --cov-config=.coveragerc --cov-append --cov-report=term-missing --cov-fail-under=80"
 test-fast = "python scripts/run_tests.py tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_github.py tests/test_milestones.py tests/test_md_anchors.py tests/test_security.py tests/test_ui.py tests/test_executor_runs.py tests/test_error_alerting.py tests/test_v2_hosted.py -q --tb=short"
 build-exe = "pyinstaller meridian.spec --clean"
 build-connect = "pyinstaller meridian-connect.spec --clean"

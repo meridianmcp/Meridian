@@ -573,6 +573,7 @@ def test_build_item_briefing_omits_tool_discovery_request_when_nothing_declared(
 # 6. run_targeted_tests — exit-code-safe orchestration.
 # ---------------------------------------------------------------------------
 
+@pytest.mark.subprocess_isolated
 async def test_run_targeted_tests_propagates_real_nonzero_exit_code():
     """List-exec form: the REAL exit code of the target process, unmasked."""
     result = await td.run_targeted_tests(
@@ -582,6 +583,7 @@ async def test_run_targeted_tests_propagates_real_nonzero_exit_code():
     assert result["exit_code"] == 3
 
 
+@pytest.mark.subprocess_isolated
 async def test_run_targeted_tests_propagates_real_zero_exit_code():
     result = await td.run_targeted_tests(
         [sys.executable, "-c", "import sys; sys.exit(0)"],
@@ -590,6 +592,7 @@ async def test_run_targeted_tests_propagates_real_zero_exit_code():
     assert result["exit_code"] == 0
 
 
+@pytest.mark.subprocess_isolated
 async def test_run_targeted_tests_parses_pytest_style_pass_fail_counts():
     result = await td.run_targeted_tests([
         sys.executable, "-c",
@@ -601,11 +604,16 @@ async def test_run_targeted_tests_parses_pytest_style_pass_fail_counts():
 
 
 async def test_run_targeted_tests_empty_cmd_is_a_clean_error():
+    """No subprocess_isolated marker: `cmd` is empty, so `run_targeted_tests`
+    short-circuits before ever spawning a process (see its `if not cmd:`
+    guard in meridian/tool_discovery.py) -- nothing here is xdist-contention
+    sensitive."""
     result = await td.run_targeted_tests([])
     assert result["status"] == "error"
     assert result["exit_code"] is None
 
 
+@pytest.mark.subprocess_isolated
 async def test_run_targeted_tests_timeout_kills_process_and_reports_status():
     result = await td.run_targeted_tests(
         [sys.executable, "-c", "import time; time.sleep(5)"],
@@ -615,6 +623,7 @@ async def test_run_targeted_tests_timeout_kills_process_and_reports_status():
     assert result["exit_code"] is None
 
 
+@pytest.mark.subprocess_isolated
 async def test_run_targeted_tests_shell_pipe_can_mask_exit_code_list_form_cannot():
     """Reproduces the EXACT root-cause class this acceptance criterion names
     ('not something masked by a pipe/tail'): a shell string that pipes the

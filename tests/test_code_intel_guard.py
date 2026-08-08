@@ -447,6 +447,7 @@ def _run_hook(
 # ---------------------------------------------------------------------------
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_fails_open_when_server_unreachable(tool):
     """MERIDIAN_URL on an unbound port -- connection refused, hook exits 0."""
@@ -460,6 +461,7 @@ def test_hook_fails_open_when_server_unreachable(tool):
 # ---------------------------------------------------------------------------
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_fails_open_when_code_intel_disabled(tool):
     """code_intel_enabled=0 -- no index, hook exits 0 (nothing to redirect to)."""
@@ -477,6 +479,7 @@ def test_hook_fails_open_when_code_intel_disabled(tool):
 # ---------------------------------------------------------------------------
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_blocks_grep_glob_when_code_intel_enabled(tool):
     """code_intel_enabled=1 -- hook exits 2 and stderr names code-intel tools."""
@@ -493,6 +496,7 @@ def test_hook_blocks_grep_glob_when_code_intel_enabled(tool):
 
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_stderr_names_the_tool_that_was_blocked(tool):
     """The error message names the specific blocked tool (Grep or Glob)."""
@@ -511,6 +515,7 @@ def test_hook_stderr_names_the_tool_that_was_blocked(tool):
 # ---------------------------------------------------------------------------
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize(
     "tool",
     ["Bash", "Edit", "Write", "Read", "AskUserQuestion", "find_symbol",
@@ -532,6 +537,7 @@ def test_hook_allows_all_other_tools(tool):
 # ---------------------------------------------------------------------------
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("payload", ["", "not json at all", "{}", '{"foo":"bar"}'])
 def test_hook_fails_open_on_unparseable(payload):
     """Malformed or missing stdin: hook must never trap the executor."""
@@ -552,6 +558,7 @@ def test_hook_fails_open_on_unparseable(payload):
 # ---------------------------------------------------------------------------
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_fails_open_when_slot_readiness_unreachable_but_settings_ok(tool):
     """settings reports code_intel_enabled=1, but /slot-readiness errors
@@ -573,6 +580,7 @@ def test_hook_fails_open_when_slot_readiness_unreachable_but_settings_ok(tool):
 
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_fails_open_when_slot_readiness_body_unparseable(tool):
     """settings reports code_intel_enabled=1, /slot-readiness returns HTTP 200
@@ -594,6 +602,7 @@ def test_hook_fails_open_when_slot_readiness_body_unparseable(tool):
 
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_fails_open_when_slot_readiness_json_missing_fields(tool):
     """/slot-readiness returns valid JSON (200) but omits ready/has_tunnel
@@ -757,6 +766,7 @@ def _run_ps1_hook(payload: str, *, meridian_url: str) -> subprocess.CompletedPro
 
 
 @_needs_powershell
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_ps1_hook_fails_open_when_code_intel_disabled(tool):
     url, srv, _t = _start_plain_stub(code_intel_enabled=0)
@@ -769,6 +779,7 @@ def test_ps1_hook_fails_open_when_code_intel_disabled(tool):
 
 
 @_needs_powershell
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_ps1_hook_fails_open_when_server_unreachable(tool):
     payload = json.dumps({"tool_name": tool, "tool_input": {}})
@@ -777,6 +788,7 @@ def test_ps1_hook_fails_open_when_server_unreachable(tool):
 
 
 @_needs_powershell
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_ps1_hook_fails_open_when_slot_readiness_unreachable(tool):
     """883ce543 (PS1 side): code_intel_enabled=1 but /slot-readiness errors
@@ -795,6 +807,7 @@ def test_ps1_hook_fails_open_when_slot_readiness_unreachable(tool):
 
 
 @_needs_powershell
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_ps1_hook_fails_open_when_slot_readiness_malformed(tool):
     """883ce543 (PS1 side): code_intel_enabled=1, /slot-readiness returns 200
@@ -815,6 +828,7 @@ def test_ps1_hook_fails_open_when_slot_readiness_malformed(tool):
 
 
 @_needs_powershell
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_ps1_hook_fails_open_when_slot_readiness_missing_fields(tool):
     """883ce543 (PS1 side): valid JSON (200) but missing ready/has_tunnel
@@ -833,6 +847,7 @@ def test_ps1_hook_fails_open_when_slot_readiness_missing_fields(tool):
 
 
 @_needs_powershell
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_ps1_hook_fails_open_when_ready_false(tool):
     url, srv, _t = _start_plain_stub(
@@ -849,6 +864,7 @@ def test_ps1_hook_fails_open_when_ready_false(tool):
 
 
 @_needs_powershell
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_ps1_hook_fails_open_when_has_tunnel_false(tool):
     url, srv, _t = _start_plain_stub(
@@ -865,6 +881,7 @@ def test_ps1_hook_fails_open_when_has_tunnel_false(tool):
 
 
 @_needs_powershell
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_ps1_hook_blocks_when_validated_ready_and_tunnel(tool):
     """The ONLY case that should block: positively confirmed ready=true AND
@@ -888,6 +905,7 @@ def test_ps1_hook_blocks_when_validated_ready_and_tunnel(tool):
 
 
 @_needs_powershell
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 @pytest.mark.parametrize(
     "slot_body",
@@ -921,6 +939,7 @@ def test_ps1_hook_fails_open_on_non_boolean_ready_or_tunnel(tool, slot_body):
 
 
 @_needs_powershell
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("payload", ["", "not json at all", "{}", '{"foo":"bar"}'])
 def test_ps1_hook_fails_open_on_unparseable_payload(payload):
     r = _run_ps1_hook(payload, meridian_url=_free_url())
@@ -928,6 +947,7 @@ def test_ps1_hook_fails_open_on_unparseable_payload(payload):
 
 
 @_needs_powershell
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Bash", "Edit", "Write", "Read", "AskUserQuestion"])
 def test_ps1_hook_allows_all_other_tools(tool):
     url, srv, _t = _start_plain_stub(
@@ -942,6 +962,7 @@ def test_ps1_hook_allows_all_other_tools(tool):
         srv.shutdown()
 
 
+@pytest.mark.subprocess_isolated
 def test_ps1_hook_is_pure_ascii_and_parses_with_zero_errors():
     """883ce543 gotcha: the Edit tool writes BOM-less UTF-8, and PowerShell 5.1
     reads a BOM-less .ps1 as cp1252, so any non-ASCII byte silently corrupts

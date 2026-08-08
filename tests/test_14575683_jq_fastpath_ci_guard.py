@@ -262,6 +262,7 @@ def _start_multi_stub(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.subprocess_isolated
 @_needs_bash
 @_needs_jq_linux
 @_needs_bash_http_reachable
@@ -328,6 +329,7 @@ def test_jq_tool_name_structural_extraction_ignores_nested_decoy():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.subprocess_isolated
 @_needs_bash
 @_needs_jq_linux
 @_needs_bash_http_reachable
@@ -360,6 +362,7 @@ def test_jq_ready_false_triggers_failopen_not_ready_warning():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.subprocess_isolated
 @_needs_bash
 @_needs_jq_linux
 @_needs_bash_http_reachable
@@ -395,6 +398,7 @@ def test_jq_has_tunnel_false_triggers_failopen_no_tunnel_warning():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.subprocess_isolated
 @_needs_bash
 @_needs_jq_linux
 @_needs_bash_http_reachable
@@ -508,6 +512,7 @@ def test_hook_source_contains_jq_fastpath_and_regex_fallbacks():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.subprocess_isolated
 @_needs_bash
 @_needs_jq_linux
 @_needs_bash_http_reachable
