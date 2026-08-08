@@ -793,6 +793,68 @@ class TestUpdateBibliographyEntry:
         assert "error" in res
         assert open(docx, "rb").read() == original
 
+    def test_update_zero_text_runs_returns_error(self, tmp_path):
+        """b6a9ec99 -- an entry paragraph with no <w:t> at all (e.g.
+        hand-edited down to just its bookmark pair) must fail closed
+        instead of silently reporting {"status": "updated"} while writing
+        nothing."""
+        docx = str(tmp_path / "doc.docx")
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="DD0001">
+      <w:pPr><w:pStyle w:val="Bibliography"/></w:pPr>
+      <w:bookmarkStart w:id="0" w:name="bibkey_empty2020"/>
+      <w:bookmarkEnd w:id="0"/>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+        _write_docx(docx, xml)
+        original = open(docx, "rb").read()
+        res = docs_intel.update_bibliography_entry(
+            docx_path=docx,
+            citation_key="empty2020",
+            csl_item=_journal_article(),
+        )
+        assert "error" in res
+        assert "no <w:t>" in res["error"]
+        assert open(docx, "rb").read() == original
+
+    def test_update_ambiguous_multiple_text_runs_returns_error(self, tmp_path):
+        """b6a9ec99 -- an entry paragraph with more than one <w:t> must fail
+        closed rather than silently overwrite only the first and leave the
+        rest holding stale, now-inconsistent old text (real corruption the
+        naive "first match then break" loop produced)."""
+        docx = str(tmp_path / "doc.docx")
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="DD0002">
+      <w:pPr><w:pStyle w:val="Bibliography"/></w:pPr>
+      <w:bookmarkStart w:id="0" w:name="bibkey_split2020"/>
+      <w:r><w:t xml:space="preserve">Smith, J. (2020). </w:t></w:r>
+      <w:r><w:t>Old paper, split across two runs.</w:t></w:r>
+      <w:bookmarkEnd w:id="0"/>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+        _write_docx(docx, xml)
+        original = open(docx, "rb").read()
+        res = docs_intel.update_bibliography_entry(
+            docx_path=docx,
+            citation_key="split2020",
+            csl_item=_journal_article(title="Should not be written"),
+        )
+        assert "error" in res
+        assert "2 text" in res["error"]
+        assert open(docx, "rb").read() == original
+
 
 # ---------------------------------------------------------------------------
 # remove_bibliography_entry

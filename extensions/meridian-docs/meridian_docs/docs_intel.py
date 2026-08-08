@@ -8363,28 +8363,67 @@ def insert_equation_local(
     }
 
 
+def _direct_parent_in_paragraph(
+    para_elem: ET.Element, target: ET.Element
+) -> ET.Element | None:
+    """b6a9ec99 -- find ``target``'s real direct parent within ``para_elem``.
+
+    ``xml.etree.ElementTree`` gives no parent pointers, so this walks every
+    element in the paragraph (itself included) and returns the first one
+    whose immediate children contain ``target`` (by identity -- ``Element``
+    has no custom ``__eq__``, so ``in`` here is exactly "is this the same
+    node", never a structural/content match). Returns ``None`` if ``target``
+    is not a descendant of ``para_elem`` at all.
+    """
+    for candidate in para_elem.iter():
+        if target in list(candidate):
+            return candidate
+    return None
+
+
 def edit_equation_local(
     docx_path: str,
     equation_para_id: str,
     new_payload: str,
+    equation_index: int | None = None,
     index_db_path: str | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Replace the <m:oMath> in an existing equation paragraph.
 
     Locates the paragraph by equation_para_id, verifies it contains at
-    least one <m:oMath>, removes all existing equation containers, and
-    inserts the new equation (resolved from OMML or LaTeX). The replacement
-    occupies the first existing equation slot so surrounding text runs retain
-    their original order.
+    least one <m:oMath>, and replaces exactly ONE targeted equation with a
+    precise single-element swap inside that equation's OWN real parent --
+    the paragraph itself, a display-equation <m:oMathPara> wrapper, or any
+    other container the source document nested it in (e.g. a hyperlink or
+    content control). Every other child of that parent -- other equations,
+    text runs, fields, bookmarks, drawings -- keeps its exact original
+    identity and order; nothing is ever rebuilt or reordered wholesale.
+
+    b6a9ec99 -- fail-closed hardening. The previous implementation rebuilt
+    the paragraph's ENTIRE child list and kept only the FIRST direct
+    <m:oMath>/<m:oMathPara> child, silently discarding every other
+    equation a multi-equation paragraph held (real data loss with no error
+    and no warning). It also picked the first nested <m:oMath> found
+    anywhere in the paragraph via document-order traversal without ever
+    checking whether that pick was unambiguous. Both are fixed here: when
+    the paragraph contains more than one <m:oMath> (direct children,
+    equations nested elsewhere, or several stacked under one shared
+    <m:oMathPara>), equation_index is now REQUIRED -- mirroring
+    append_text_run_after_math's existing math_index contract -- so this
+    function never again guesses which equation to touch.
 
     Args:
         docx_path:         Absolute path to the .docx file (mutated in place).
         equation_para_id:  w14:paraId or p{N} of the equation paragraph.
         new_payload:       Raw OMML XML or LaTeX expression.
+        equation_index:    0-based index (document order) of which equation
+                            to replace when the paragraph holds more than
+                            one. Required in that case; ignored (the sole
+                            equation is used) when there is exactly one.
         index_db_path:     If supplied, sidecar is invalidated after write.
 
     Returns:
-        {status, equation_para_id, omml, docx_path}
+        {status, equation_para_id, equation_index, omml, docx_path}
         or {"error": <message>} on failure.
     """
     if not new_payload or not str(new_payload).strip():
@@ -8411,8 +8450,6 @@ def edit_equation_local(
     _body, para_elem, _cidx = result
 
     m_omath_tag = _qm("oMath")
-    m_omath_para_tag = _qm("oMathPara")
-    equation_container_tags = (m_omath_tag, m_omath_para_tag)
     existing = list(para_elem.iter(m_omath_tag))
     if not existing:
         return {
@@ -8422,36 +8459,42 @@ def edit_equation_local(
             )
         }
 
-    # Replace the first direct equation container in place. A display equation
-    # may be wrapped in <m:oMathPara>; replacing that wrapper preserves the
-    # paragraph child slot just as replacing a direct <m:oMath> does.
-    replacement = ET.fromstring(omml)
-    direct_containers = [
-        child for child in list(para_elem) if child.tag in equation_container_tags
-    ]
-    if direct_containers:
-        new_children = []
-        inserted = False
-        for child in list(para_elem):
-            if child.tag in equation_container_tags:
-                if not inserted:
-                    new_children.append(replacement)
-                    inserted = True
-            else:
-                new_children.append(child)
-        para_elem[:] = new_children
+    if equation_index is None and len(existing) != 1:
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} contains {len(existing)} equations; "
+                "equation_index is required to avoid guessing which one to replace"
+            )
+        }
+    if equation_index is None:
+        selected_index = 0
+    elif not isinstance(equation_index, int) or isinstance(equation_index, bool):
+        return {"error": "equation_index must be a non-negative integer"}
+    elif equation_index < 0 or equation_index >= len(existing):
+        return {
+            "error": (
+                f"equation_index {equation_index} is out of range for "
+                f"{len(existing)} equations"
+            )
+        }
     else:
-        # Preserve legacy behavior for unusual nested equation markup by
-        # replacing the first nested <m:oMath> in its existing parent.
-        parent = next(
-            (candidate for candidate in para_elem.iter() if existing[0] in list(candidate)),
-            None,
-        )
-        if parent is None:
-            return {"error": "could not locate the existing equation container"}
-        children = list(parent)
-        children[children.index(existing[0])] = replacement
-        parent[:] = children
+        selected_index = equation_index
+
+    target_omath = existing[selected_index]
+    target_parent = _direct_parent_in_paragraph(para_elem, target_omath)
+    if target_parent is None:
+        return {"error": "could not locate the existing equation container"}
+
+    # Precise single-slot swap: replace ONLY target_omath within its own
+    # direct parent's children, at its own index. Whether that parent is
+    # the paragraph, an <m:oMathPara> wrapper (preserved intact -- including
+    # any oMathParaPr formatting -- unlike the old wrapper-replacing path),
+    # or a deeper nested container, every sibling keeps its exact identity
+    # and order.
+    replacement = ET.fromstring(omml)
+    siblings = list(target_parent)
+    siblings[siblings.index(target_omath)] = replacement
+    target_parent[:] = siblings
 
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)
@@ -8463,6 +8506,7 @@ def edit_equation_local(
     return {
         "status": "edited",
         "equation_para_id": equation_para_id,
+        "equation_index": selected_index,
         "omml": omml,
         "docx_path": docx_path,
     }
@@ -8525,19 +8569,60 @@ def append_text_run_after_math(
         selected_index = math_index
 
     selected = equations[selected_index]
-    parent = next(
-        (candidate for candidate in para_elem.iter() if selected in list(candidate)),
-        None,
-    )
-    if parent is None:
+    direct_parent = _direct_parent_in_paragraph(para_elem, selected)
+    if direct_parent is None:
         return {"error": "could not locate the selected equation container"}
+
+    # b6a9ec99 -- a bare <w:r> run is not a schema-valid child of
+    # <m:oMathPara> (CT_OMathPara only allows an optional oMathParaPr plus
+    # one or more oMath elements); the old code inserted directly inside it
+    # whenever a display equation happened to be wrapped that way, silently
+    # producing ill-formed OOXML. Climb to insert after the WHOLE wrapper
+    # instead -- but only when `selected` is the SOLE equation inside it: a
+    # multi-equation <m:oMathPara> block has no single unambiguous "right
+    # after this one" slot without splitting the block apart, so that case
+    # is rejected below rather than guessed at.
+    m_omath_para_tag = _qm("oMathPara")
+    if direct_parent.tag == m_omath_para_tag:
+        stacked = [c for c in direct_parent if c.tag == m_omath_tag]
+        if len(stacked) != 1:
+            return {
+                "error": (
+                    f"equation {selected_index} in paragraph {equation_para_id!r} is "
+                    "one of several equations stacked inside a shared <m:oMathPara> "
+                    "block; appending a run immediately after just one of them is "
+                    "ambiguous -- edit the paragraph directly instead"
+                )
+            }
+        container_elem = direct_parent
+        container_parent = _direct_parent_in_paragraph(para_elem, direct_parent)
+    else:
+        container_elem = selected
+        container_parent = direct_parent
+
+    # Fail closed rather than guess: only insert when the resolved slot is a
+    # DIRECT child of the paragraph itself. An equation nested any deeper --
+    # inside a hyperlink, a content control's sdtContent, a drawing's
+    # txbxContent, or similar -- has no single obviously-correct place for a
+    # brand-new run relative to that container's own semantics (e.g.
+    # inserting inside a hyperlink would silently make the appended text
+    # part of the hyperlink).
+    if container_parent is not para_elem:
+        return {
+            "error": (
+                f"equation {selected_index} in paragraph {equation_para_id!r} is "
+                "nested inside a container (hyperlink, content control, drawing "
+                "text box, or similar) this tool will not guess an insertion "
+                "point inside of -- edit the paragraph directly instead"
+            )
+        }
 
     run = ET.Element(_q(_W, "r"))
     text_elem = ET.SubElement(run, _q(_W, "t"))
     text_elem.text = text
-    children = list(parent)
-    children.insert(children.index(selected) + 1, run)
-    parent[:] = children
+    children = list(container_parent)
+    children.insert(children.index(container_elem) + 1, run)
+    container_parent[:] = children
 
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)
@@ -9252,11 +9337,37 @@ def update_bibliography_entry(
     if not formatted_text.strip():
         return {"error": "formatted reference text is empty — malformed CSL-JSON item?"}
 
-    # Replace the first <w:t> text run in the paragraph.
-    for t_el in entry_elem.iter(_q(_W, "t")):
-        t_el.text = formatted_text
-        t_el.set(_q(_XML_NS, "space"), "preserve")
-        break
+    # b6a9ec99 -- fail-closed hardening: the prior implementation replaced
+    # only the FIRST <w:t> found (via document-order iteration) and `break`,
+    # unconditionally. Two related gaps: a paragraph with zero <w:t> runs
+    # (e.g. hand-edited down to just its bookmark pair) silently reported
+    # {"status": "updated"} despite writing nothing; a paragraph with MORE
+    # than one <w:t> silently overwrote only the first and left every other
+    # run's stale old text sitting right next to the new text -- corrupting
+    # the entry rather than updating it. Both now fail closed instead of
+    # guessing. This does not touch element order/structure at all (only
+    # .text on the single matched node), so it carries no OMML/child-order
+    # risk of its own -- it does not share edit_equation_local's rewrite path.
+    text_elems = list(entry_elem.iter(_q(_W, "t")))
+    if not text_elems:
+        return {
+            "error": (
+                f"bibliography entry {clean_key!r} has no <w:t> text run to update "
+                "-- the paragraph may have been hand-edited into an unexpected "
+                "shape; fix it in Word or remove and re-insert the entry"
+            )
+        }
+    if len(text_elems) > 1:
+        return {
+            "error": (
+                f"bibliography entry {clean_key!r} contains {len(text_elems)} text "
+                "runs; refusing to guess which one holds the reference text -- "
+                "silently overwriting the first and leaving the rest stale would "
+                "corrupt the entry -- fix it in Word or remove and re-insert it"
+            )
+        }
+    text_elems[0].text = formatted_text
+    text_elems[0].set(_q(_XML_NS, "space"), "preserve")
 
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)

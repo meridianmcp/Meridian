@@ -733,6 +733,200 @@ def test_append_text_run_after_math_selects_by_index(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# b6a9ec99 -- fail-closed hardening: edit_equation_local /
+# append_text_run_after_math must never flatten (silently drop/reorder) a
+# mixed run/OMML/field/bookmark/drawing paragraph, and must reject ambiguous
+# targets with a clear error instead of guessing.
+# ---------------------------------------------------------------------------
+
+# A paragraph mixing: a bookmark pair, plain text runs, TWO direct-child
+# equations, a SEQ fldSimple field, and a drawing-bearing run -- every
+# non-text sibling kind the sprint item calls out by name.
+_MIXED_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+    xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+  <w:body>
+    <w:p w14:paraId="0000E001">
+      <w:bookmarkStart w:id="5" w:name="MixedAnchor"/>
+      <w:r><w:t xml:space="preserve">Start </w:t></w:r>
+      <m:oMath><m:r><m:t>alpha</m:t></m:r></m:oMath>
+      <w:fldSimple w:instr="SEQ Equation \\* ARABIC"><w:r><w:t>1</w:t></w:r></w:fldSimple>
+      <m:oMath><m:r><m:t>beta</m:t></m:r></m:oMath>
+      <w:r><w:drawing/></w:r>
+      <w:r><w:t xml:space="preserve"> end</w:t></w:r>
+      <w:bookmarkEnd w:id="5"/>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+# A display equation wrapped the way real Word documents wrap it: inside
+# <m:oMathPara>. A bare <w:r> is NOT a schema-valid child of oMathPara.
+_OMATHPARA_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+    xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+  <w:body>
+    <w:p w14:paraId="0000F001">
+      <w:r><w:t xml:space="preserve">Display: </w:t></w:r>
+      <m:oMathPara>
+        <m:oMath><m:r><m:t>gamma</m:t></m:r></m:oMath>
+      </m:oMathPara>
+      <w:r><w:t xml:space="preserve"> tail</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+# Two equations stacked inside ONE shared <m:oMathPara> -- there is no single
+# unambiguous "immediately after this one" slot without splitting the block.
+_STACKED_OMATHPARA_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+    xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+  <w:body>
+    <w:p w14:paraId="0000F002">
+      <m:oMathPara>
+        <m:oMath><m:r><m:t>p</m:t></m:r></m:oMath>
+        <m:oMath><m:r><m:t>q</m:t></m:r></m:oMath>
+      </m:oMathPara>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+# An equation nested inside a hyperlink -- a container this tool must never
+# guess an insertion point inside of.
+_HYPERLINK_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+    xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math">
+  <w:body>
+    <w:p w14:paraId="0000F003">
+      <w:hyperlink w:anchor="somewhere">
+        <m:oMath><m:r><m:t>z</m:t></m:r></m:oMath>
+      </w:hyperlink>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+
+def test_edit_equation_local_rejects_ambiguous_multi_equation_paragraph(tmp_path):
+    """A paragraph with 2 equations must require equation_index, never
+    silently pick (and drop) one of them."""
+    path = _write_docx(tmp_path, _MIXED_XML)
+    before = _read_docx_xml(path)
+
+    result = docs_intel.edit_equation_local(path, "0000E001", _SIMPLE_OMATH)
+
+    assert "error" in result
+    assert "equation_index is required" in result["error"]
+    assert _read_docx_xml(path) == before
+
+
+def test_edit_equation_local_by_index_preserves_mixed_siblings_and_order(tmp_path):
+    """Replacing equation_index=1 (beta) must leave alpha, the bookmark
+    pair, the SEQ field, and the drawing run untouched and in their original
+    order -- reloading the written ZIP to verify structurally."""
+    path = _write_docx(tmp_path, _MIXED_XML)
+    new_omml = f'<m:oMath xmlns:m="{_M}"><m:r><m:t>REPLACED</m:t></m:r></m:oMath>'
+
+    result = docs_intel.edit_equation_local(path, "0000E001", new_omml, equation_index=1)
+
+    assert "error" not in result, result.get("error")
+    assert result["status"] == "edited"
+    assert result["equation_index"] == 1
+
+    import xml.etree.ElementTree as ET  # noqa: PLC0415
+    root = ET.fromstring(_read_docx_xml(path))
+    para = next(p for p in root.iter(f"{{{_W}}}p") if p.get(f"{{{_W14}}}paraId") == "0000E001")
+    children = list(para)
+    tags = [c.tag.split("}")[-1] for c in children]
+
+    # Original slot sequence, unchanged: bookmarkStart, r, oMath, fldSimple,
+    # oMath, r, r, bookmarkEnd. Only the SECOND oMath's content changed.
+    assert tags == [
+        "bookmarkStart", "r", "oMath", "fldSimple", "oMath", "r", "r", "bookmarkEnd",
+    ]
+    assert children[0].get(f"{{{_W}}}name") == "MixedAnchor"  # bookmark preserved
+    assert children[3].get(f"{{{_W}}}instr") == "SEQ Equation \\* ARABIC"  # field preserved
+    assert children[5].find(f"{{{_W}}}drawing") is not None  # drawing preserved
+
+    def _flat(omath_elem):
+        return "".join(t.text or "" for t in omath_elem.iter(f"{{{_M}}}t"))
+
+    assert _flat(children[2]) == "alpha"     # untouched equation, byte-identical content
+    assert _flat(children[4]) == "REPLACED"  # targeted equation actually replaced
+
+
+def test_edit_equation_local_index_out_of_range_returns_error(tmp_path):
+    path = _write_docx(tmp_path, _MIXED_XML)
+    before = _read_docx_xml(path)
+    result = docs_intel.edit_equation_local(path, "0000E001", _SIMPLE_OMATH, equation_index=5)
+    assert "error" in result
+    assert "out of range" in result["error"]
+    assert _read_docx_xml(path) == before
+
+
+def test_append_text_run_after_math_climbs_past_omathpara_wrapper(tmp_path):
+    """A display equation wrapped in <m:oMathPara> (Word's standard wrapper)
+    must get the new run inserted AFTER the wrapper, not as an illegal
+    child inside it."""
+    path = _write_docx(tmp_path, _OMATHPARA_XML)
+
+    result = docs_intel.append_text_run_after_math(path, "0000F001", " note")
+
+    assert result["status"] == "appended"
+    import xml.etree.ElementTree as ET  # noqa: PLC0415
+    root = ET.fromstring(_read_docx_xml(path))
+    para = next(p for p in root.iter(f"{{{_W}}}p") if p.get(f"{{{_W14}}}paraId") == "0000F001")
+    children = list(para)
+    tags = [c.tag.split("}")[-1] for c in children]
+    assert tags == ["r", "oMathPara", "r", "r"]  # new run is a PARAGRAPH sibling
+
+    omath_para = children[1]
+    # The oMathPara wrapper itself must still contain ONLY the oMath -- no
+    # <w:r> was smuggled inside it (which would be schema-invalid OOXML).
+    assert [c.tag.split("}")[-1] for c in omath_para] == ["oMath"]
+
+    new_run = children[2]
+    text = new_run.find(f"{{{_W}}}t")
+    assert text is not None and text.text == " note"
+
+
+def test_append_text_run_after_math_rejects_stacked_omathpara_equations(tmp_path):
+    """Two equations sharing one <m:oMathPara> have no single unambiguous
+    'right after this one' slot; must fail closed."""
+    path = _write_docx(tmp_path, _STACKED_OMATHPARA_XML)
+    before = _read_docx_xml(path)
+
+    result = docs_intel.append_text_run_after_math(path, "0000F002", " note", math_index=0)
+
+    assert "error" in result
+    assert "ambiguous" in result["error"]
+    assert _read_docx_xml(path) == before
+
+
+def test_append_text_run_after_math_rejects_hyperlink_nested_equation(tmp_path):
+    """Must not guess an insertion point inside a hyperlink (or any other
+    nested run-container); reject with a clear error instead."""
+    path = _write_docx(tmp_path, _HYPERLINK_XML)
+    before = _read_docx_xml(path)
+
+    result = docs_intel.append_text_run_after_math(path, "0000F003", " note")
+
+    assert "error" in result
+    assert "nested inside a container" in result["error"]
+    assert _read_docx_xml(path) == before
+
+
+# ---------------------------------------------------------------------------
 # remove_equation_local — display-mode (whole paragraph)
 # ---------------------------------------------------------------------------
 

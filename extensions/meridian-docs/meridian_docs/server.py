@@ -1329,19 +1329,29 @@ def edit_equation(
     docx_path: str,
     equation_para_id: str,
     new_payload: str,
+    equation_index: int | None = None,
     index_db_path: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Replace the <m:oMath> in an existing equation paragraph.
 
     Locates the paragraph by equation_para_id, verifies it contains at least
-    one <m:oMath>, removes the existing equation content, and inserts the new
-    equation resolved from OMML or LaTeX.
+    one <m:oMath>, and replaces exactly ONE targeted equation with a precise
+    single-element swap, preserving every other child of the paragraph (other
+    equations, text runs, fields, bookmarks, drawings) in its exact original
+    order.
+
+    b6a9ec99 — when a paragraph contains multiple equations, equation_index
+    is required so the operation never guesses (and never silently drops
+    the equations it doesn't touch).
 
     Args:
       docx_path:         Absolute path to the .docx file (mutated in place).
       equation_para_id:  w14:paraId or p{N} of the equation paragraph.
       new_payload:       Replacement OMML XML or LaTeX expression.
+      equation_index:    0-based index (document order) of which equation to
+                         replace when the paragraph holds more than one.
+                         Required in that case.
       index_db_path:     If supplied, sidecar is invalidated after write.
       session_id:        273df573 — identifies the calling Meridian session
                          to the tunnel-layer DOCX region-claim guard
@@ -1351,13 +1361,14 @@ def edit_equation(
                          tunnel (e.g. standalone `uvx meridian-docs`).
 
     Returns:
-      {status, equation_para_id, omml, docx_path}
+      {status, equation_para_id, equation_index, omml, docx_path}
       or {error: <message>} on failure.
     """
     return docs_intel.edit_equation_local(
         docx_path=docx_path,
         equation_para_id=equation_para_id,
         new_payload=new_payload,
+        equation_index=equation_index,
         index_db_path=index_db_path,
     )
 
