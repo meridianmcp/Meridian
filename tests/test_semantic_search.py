@@ -928,6 +928,22 @@ def test_score_confidence_lexical_boost_cannot_rescue_low_semantic_score():
     assert m.reason == "below_confidence_threshold"
 
 
+def test_score_confidence_never_fabricates_ids_outside_input():
+    """9149e132 — the structural safety property meridian.db.planning_search's
+    optional ``rerank_semantic`` relies on: score_confidence() (and, by
+    construction, SemanticSearcher.rank()/rank_confident()) can only ever
+    return ids that were present in its `ranked` input — never an id it
+    invented. This is what makes it safe to layer over an already
+    lexically-retrieved result set: reordering that set can never silently
+    smuggle in a candidate lexical search did not already find, because the
+    ranker has no way to produce an id it wasn't given."""
+    ranked = [("real-a", 0.9), ("real-b", 0.5)]
+    matches = score_confidence(ranked, floor=0.0, min_margin=0.0)
+    ids = {m.id for m in matches}
+    assert ids == {"real-a", "real-b"}
+    assert "fabricated-id" not in ids
+
+
 def test_rank_confident_wraps_rank_and_scores(monkeypatch):
     """SemanticSearcher.rank_confident() = rank() + score_confidence(): only
     candidates that survive rank()'s own floor filter reach scoring at all."""
