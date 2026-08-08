@@ -301,6 +301,19 @@ def _pid_is_running(pid: int) -> bool:
             pass  # fall through to the OS-level probes below
     if sys.platform == "win32":
         return _win32_pid_is_running(pid)
+    # A child that we just signalled can remain as a POSIX zombie until its
+    # parent reaps it.  ``os.kill(pid, 0)`` reports that zombie as existing,
+    # which made the psutil-free cleanup fallback wait the full 10-second
+    # poll window and then incorrectly return ``False``.  When procfs is
+    # available, distinguish the zombie state from a live process before
+    # falling back to the portable signal probe (macOS has no procfs).
+    try:
+        proc_stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        comm_end = proc_stat.rfind(")")
+        if comm_end >= 0 and len(proc_stat) > comm_end + 2:
+            return proc_stat[comm_end + 2] != "Z"
+    except (FileNotFoundError, OSError, UnicodeError):
+        pass
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
