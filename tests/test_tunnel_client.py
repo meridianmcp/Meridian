@@ -4702,6 +4702,60 @@ def test_kill_reason_states_cover_every_reason_used_by_call_sites():
     assert tc._KILL_REASON_STATES["stopped"] is tc.SlotState.STOPPED
 
 
+# ---------------------------------------------------------------------------
+# dd46f899 — "automatic idle tunnel restart" end-to-end regression lock.
+#
+# Prior tests exercise _idle_killer's decision (idle_seconds() > threshold ->
+# kill(reason="idle_killed")) and ensure_running's cold-spawn path separately,
+# but nothing chains them: kill(reason="idle_killed") -> is_running goes
+# False -> a later ensure_running() call actually respawns and reaches
+# HEALTHY again. That full loop IS the "automatic restart" the investigation
+# item asked about, so lock it in explicitly rather than relying on the two
+# halves being independently green.
+# ---------------------------------------------------------------------------
+
+def test_idle_kill_then_ensure_running_respawns_automatically(monkeypatch):
+    """An idle-killed slot is not stuck down — the next ensure_running() call
+    (as would happen on the next incoming request) spawns a fresh proxy and
+    the slot reaches HEALTHY again, with a fresh PID."""
+    spawned = []
+
+    def fake_popen(cmd, env=None, **kw):
+        proc = _FakeProc()
+        proc.pid = 1000 + len(spawned)
+        spawned.append(cmd)
+        return proc
+
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_clear_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_terminate_proc_tree", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9299"], 9299, "idle-restart", client_id="cl-idle")
+
+    # First spawn (e.g. the first real request ever routed to this slot).
+    _run_sync(_run_ensure(proxy))
+    assert len(spawned) == 1
+    assert proxy.is_running
+    assert proxy.diagnostics.state is tc.SlotState.HEALTHY
+    first_pid = proxy._proc.pid
+
+    # The idle-killer fires after the configured idle window.
+    proxy.kill(reason="idle_killed")
+    assert not proxy.is_running
+    assert proxy.diagnostics.state is tc.SlotState.IDLE_KILLED
+
+    # The next incoming request calls ensure_running() again — must respawn
+    # automatically, with no manual intervention.
+    _run_sync(_run_ensure(proxy))
+    assert len(spawned) == 2, "idle-killed slot must respawn on next ensure_running()"
+    assert proxy.is_running
+    assert proxy.diagnostics.state is tc.SlotState.HEALTHY
+    assert proxy._proc.pid != first_pid, "respawn should produce a fresh process, not reuse the dead one"
+
+
 def test_reconnect_loop_lazy_transient_startup_timeout_never_quarantines(monkeypatch):
     """Mirror image of the deterministic-quarantine test: a slot whose readiness
     probe repeatedly misses (STARTUP_TIMEOUT — a cold cache that just needs more

@@ -1177,6 +1177,98 @@ async def _idle_killer(proxy: "SlotProxy", idle_seconds: float = _IDLE_KILL_SECO
             proxy.kill(reason="idle_killed")
 
 
+# ---------------------------------------------------------------------------
+# INVESTIGATE dd46f899 (item_group: tunnel-control-plane)
+# "automatic idle tunnel restart, safe child recovery, and update policy"
+#
+# This item was added 2026-08-04 and sat unclaimed/orphaned for 4+ days
+# while a batch of adjacent, independently-tracked items shipped real,
+# tested code covering the exact same three concerns. Rather than restart
+# an investigation from a blank page (and risk re-deriving/duplicating
+# work already landed elsewhere), this write-up records what was found for
+# each of the item's three named concerns, with concrete pointers, so a
+# future reader does not have to re-run this same search.
+#
+# 1) AUTOMATIC IDLE TUNNEL RESTART -- already implemented, right here.
+#    ``_idle_killer`` (above) tears a slot down with reason="idle_killed"
+#    once it has been running-but-unused for longer than
+#    ``_IDLE_KILL_SECONDS`` (30min default). The restart half is NOT a
+#    separate proactive mechanism -- it falls out of ``SlotProxy.kill()``
+#    clearing ``self._proc`` (so ``is_running`` goes False) combined with
+#    ``SlotProxy.ensure_running()`` already being called, lazily, on every
+#    slot before it serves a request. The next request after an idle-kill
+#    is therefore what triggers the respawn -- this is intentional (a
+#    genuinely idle tunnel should not burn a background timer respawning
+#    itself with nothing to serve; see ``run_tunnel``'s
+#    "Proxies start on first use; idle for >Nmin -> auto-kill + restart"
+#    banner). ``ensure_running`` was already heavily tested in isolation
+#    (``tests/test_tunnel_client.py``'s ``test_ensure_running_*`` family),
+#    but nothing chained kill(reason="idle_killed") -> ensure_running()
+#    end-to-end, so that gap is closed by
+#    ``test_idle_kill_then_ensure_running_respawns_automatically`` (same
+#    test file), which locks in: idle-kill drops the slot to IDLE_KILLED
+#    with is_running False, and the very next ensure_running() call
+#    respawns a fresh process and reaches HEALTHY again.
+#
+# 2) SAFE CHILD RECOVERY -- already implemented, across three
+#    complementary, already-shipped layers (no single item owns all of it,
+#    which is likely why this looked like an open investigation):
+#      - a3410a9c (done) -- per-slot watchdog escalation: a dead core slot
+#        (fs/code/extract) gets bounded retries with cooldown instead of
+#        retrying forever or giving up silently; once retries are
+#        exhausted the slot is marked unhealthy so ``list_tunnel_tools``
+#        stops advertising tools that would just 503, and a background
+#        re-probe every 60s auto-recovers the slot if the underlying
+#        binary becomes available again. See
+#        ``test_proc_watchdog_relaunches_on_exit`` /
+#        ``test_proc_watchdog_cools_down_instead_of_giving_up`` /
+#        ``test_proc_watchdog_healthy_tick_resets_failure_streak``.
+#      - commit ed2a882c (feat(a898710a): DC persistent-slot recovery +
+#        unhealthy badge, client side) -- Desktop-Commander's persistent
+#        session slot gets the same recover-or-badge-unhealthy treatment
+#        surfaced in the dashboard.
+#      - ``meridian/process_lifecycle.py`` (3c4ed79d) -- the actual "safe"
+#        part: an OS-level container for every owned spawn (Windows Job
+#        Object / POSIX process-group+session) so a whole process TREE
+#        (including grandchildren a child spawns before Meridian can
+#        record them) is torn down atomically, plus a PID-reuse guard
+#        (``verify_handle_live`` -- a pid read back later is confirmed to
+#        still be the SAME process, by identity/create_time, before any
+#        recovery action touches it) and ``meridian/orphan_reaper.py``
+#        (e401221d/f7084ed0), which reaps orphaned pixi/python/node
+#        children left by dead worktree sessions using that identical
+#        create-time identity check (``_identity_matches``) so a recycled
+#        PID is never killed by mistake.
+#    Together these cover the item's "safe" qualifier concretely: bounded
+#    retry (not infinite respawn storms), tree-safe teardown (not
+#    root-PID-only), and identity-verified kills (not bare-PID kills) --
+#    the three failure modes an *unsafe* child-recovery implementation
+#    would actually hit.
+#
+# 3) UPDATE POLICY -- already implemented and shipped as 23ba76a2 (done):
+#    tiered ``MERIDIAN_TUNNEL_UPDATE_MODE`` (off/warn/ask/full-auto), SAFE
+#    DEFAULT is "ask" = notify-then-explicit-confirm (never silent
+#    full-auto), wired at the existing ``/me`` server_version nudge
+#    (4bde9437) in ``run_tunnel()``. Degrades to notify-only when stdin
+#    isn't a TTY (a backgrounded tunnel can never be prompted, so it must
+#    not block/hang), and never hot-swaps the running process mid-session
+#    -- it installs then instructs a restart. See
+#    ``tests/test_tunnel_update.py`` (15 tests, referenced in 23ba76a2's
+#    own completion notes) for the full off/warn/ask/full-auto x
+#    TTY/non-TTY decision matrix.
+#
+# CONCLUSION -- no further code is needed under THIS item id. All three
+# named concerns are covered by shipped, tested, production code that
+# landed under other item ids after dd46f899 was originally added; the
+# one concrete, previously-untested seam (the idle-kill -> respawn chain
+# in area 1) now has a dedicated regression test. This block is the
+# "finding/write-up" deliverable the RESCUE-A requeue note flagged as
+# missing, kept next to the code it describes rather than in a
+# standalone root-level markdown file, per the same rationale
+# f30bbd89/5bedd35e used in meridian/mcp_tools.py.
+# ---------------------------------------------------------------------------
+
+
 async def _budget_watchdog(
     proxy: "SlotProxy",
     budget: "_process_budget.ProcessBudget | None" = None,
