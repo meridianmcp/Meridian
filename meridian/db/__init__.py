@@ -1136,6 +1136,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_wave_run_summaries(db)
     await _migrate_decision_evidence(db)
     await _migrate_ai_log_events_table(db)
+    await _migrate_proposal_intake_drafts(db)
     return db
 
 
@@ -12381,6 +12382,12 @@ from .workspace import (  # noqa: F401
     promote_workspace_proposal,
     set_proposal_github_issue,
     delete_workspace_proposal,
+    # 3f892ea6 — deterministic proposal intake blocks
+    parse_proposal_intake_blocks,
+    _migrate_proposal_intake_drafts,
+    ingest_proposal_intake,
+    get_proposal_intake_drafts,
+    promote_intake_draft,
     # Public workspace sprint-board functions
     add_workspace_sprint_item,
     get_workspace_sprint_items,

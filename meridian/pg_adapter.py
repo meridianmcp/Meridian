@@ -3193,6 +3193,51 @@ async def _migrate_pg_ai_log_events(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_proposal_intake_drafts(conn: PostgresConnection) -> None:
+    """3f892ea6 — proposal_intake_drafts: one row per parsed, non-code
+    deterministic proposal-intake block (mirrors
+    db.workspace._migrate_proposal_intake_drafts). Not present in the base
+    CREATE_TABLES_CORE literal — this guarded migration is the only creation
+    path on Postgres, matching _migrate_pg_proposal_evidence_links.
+
+    The UNIQUE index on (proposal_id, block_id) is what makes
+    ingest_proposal_intake's upsert-by-block-position logic correct.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS proposal_intake_drafts ("
+        "    id TEXT PRIMARY KEY,"
+        "    proposal_id TEXT NOT NULL,"
+        "    tenant_id TEXT,"
+        "    block_id TEXT NOT NULL,"
+        "    position INTEGER NOT NULL,"
+        "    intake_key TEXT NOT NULL,"
+        "    text TEXT NOT NULL,"
+        "    source_hash TEXT NOT NULL,"
+        "    route TEXT,"
+        "    candidate_ids TEXT NOT NULL DEFAULT '[]',"
+        "    is_code INTEGER NOT NULL DEFAULT 0,"
+        "    is_duplicate INTEGER NOT NULL DEFAULT 0,"
+        "    duplicate_of_block_id TEXT,"
+        "    revision INTEGER NOT NULL DEFAULT 1,"
+        "    history TEXT NOT NULL DEFAULT '[]',"
+        "    status TEXT NOT NULL DEFAULT 'draft',"
+        "    line_start INTEGER,"
+        "    line_end INTEGER,"
+        "    promoted_to_sprint_item_id TEXT,"
+        "    promoted_to_project_id TEXT,"
+        "    promoted_at TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_intake_drafts_block "
+        "ON proposal_intake_drafts(proposal_id, block_id);"
+        "CREATE INDEX IF NOT EXISTS idx_proposal_intake_drafts_position "
+        "ON proposal_intake_drafts(proposal_id, position);"
+        "CREATE INDEX IF NOT EXISTS idx_proposal_intake_drafts_promoted "
+        "ON proposal_intake_drafts(promoted_to_sprint_item_id);"
+    )
+
+
 async def _migrate_pg_session_goal_compliance(conn: PostgresConnection) -> None:
     """5abf3e12 — sessions.goal_compliance: stored per-session goal-compliance
     metric (JSON: listed N vs completed M vs fully_completed).
@@ -4476,4 +4521,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_wave_run_summaries,
     _migrate_pg_decision_evidence,
     _migrate_pg_ai_log_events,
+    _migrate_pg_proposal_intake_drafts,
 )
