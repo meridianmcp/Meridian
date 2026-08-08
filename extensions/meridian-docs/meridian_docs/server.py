@@ -334,6 +334,41 @@ def get_document_review(
 
 
 @mcp.tool()
+def audit_document(
+    docx_path: str,
+    index_db_path: str | None = None,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """d092d2a4 -- read-only, authoritative figure/table/caption OWNERSHIP
+    audit: reconciles headings, paragraphs, captions, embedded media,
+    relationships, and tables into ONE structural-ownership graph (nodes +
+    edges, each id from the SAME stable id scheme locate_anchor /
+    get_paragraph / insert_caption already resolve), plus a findings list
+    covering orphan_image, repeated_embed, caption_only_figure,
+    non_adjacent_caption_attachment, table_cell_image_ambiguity,
+    duplicate_para_id, and (when index_db_path is given)
+    stale_or_empty_sidecar.
+
+    This is the read-only detector build_document_review's "structure" /
+    "ownership" categories were left reserved for -- kept as its own tool
+    since it does meaningfully more work (a second document_content_tree
+    walk plus a raw-XML image/table-cell scan) than build_document_review's
+    existing primitives. Composes existing read-only helpers only; never
+    uses vector/semantic search as authority for XML integrity, and never
+    mutates docx_path. Pass expected_source_fingerprint (a value previously
+    returned as source_fingerprint) to detect the document having changed
+    since a stashed audit -- a mismatch returns {"status": "stale", ...}
+    with empty findings. See :func:`meridian_docs.docs_intel.audit_document`
+    for the full contract.
+    """
+    return docs_intel.audit_document(
+        docx_path,
+        index_db_path=index_db_path,
+        expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
+@mcp.tool()
 def check_render_capability(docx_path: str) -> dict[str, Any]:
     """93cd9798 -- lightweight render-capability detection for visual QA.
 

@@ -16665,6 +16665,502 @@ def build_document_review(
     }
 
 
+# ---------------------------------------------------------------------------
+# d092d2a4 -- authoritative figure/table/caption OWNERSHIP graph, read-only.
+#
+# build_document_review (b67ec6b5, above) intentionally reserves "structure"
+# / "section_page" / "ownership" as always-0 categories in its first version
+# (see REVIEW_CATEGORIES's docstring -- "reserved ... see the sprint item
+# notes"). This is that follow-up: a dedicated read-only audit exposing the
+# ownership/structural-integrity detectors those placeholders were left for.
+# Kept as its OWN tool rather than folded into build_document_review because
+# it does real additional work (a second document_content_tree walk plus a
+# raw-XML image/table-cell scan) that a caller who only wants the lighter
+# equation/caption/provenance findings should not have to pay for.
+#
+# Composes ONLY existing read-only primitives -- document_content_tree (via
+# the vendored copy; duplicate_para_ids/w14:paraId-collision detection comes
+# for free from it), _direct_body_image_paragraphs / _has_figure_seq_field /
+# _image_paragraph_relationship_ids (the SAME building blocks
+# _verify_image_ownership composes -- reused directly rather than
+# re-derived), _is_figure_caption / _is_table_caption / _seq_cached_number,
+# find_image_paragraph (cross-check for the total image-paragraph count,
+# body + table cells), get_structure_freshness / get_local_structure_elements
+# (sidecar staleness/emptiness), and _find_para_by_id (round-trip validation
+# that every emitted node id actually resolves). No detector here mutates
+# anything, and none uses vector/semantic search as authority for XML
+# integrity -- every finding is derived from parsed OOXML structure.
+#
+# Every paragraph/heading node's "id" is the SAME three-tier scheme
+# _find_para_by_id / document_content_tree already resolve (native
+# w14:paraId > synthesized sp<hash> > legacy p{N}), so an id returned here
+# resolves correctly through locate_anchor / get_paragraph / insert_caption
+# without a second id space. Tables (no native paraId of their own) get a
+# stable f"table:{body_index}" id.
+# ---------------------------------------------------------------------------
+
+def _stable_body_id(
+    blocks_by_index: dict[int, dict[str, Any]],
+    index: int,
+    element: ET.Element | None,
+) -> str:
+    """Resolve the stable structural id for body-child *index*.
+
+    Prefers the native ``w14:paraId`` straight off *element*; falls back to
+    the matching :func:`document_content_tree` block's own ``para_id``
+    (covers the synthesized ``sp<hash>`` scheme for paragraphs with no
+    native id -- the same synth-id algorithm :func:`_find_para_by_id` itself
+    resolves, via the shared ``_vendored_content_tree`` module); falls back
+    to the ``body-index-N`` fallback :func:`_verify_image_ownership` already
+    uses for anything neither source resolves (a table, or an element
+    ``document_content_tree`` didn't emit a block for).
+    """
+    if element is not None:
+        native = element.get(_q(_W14, "paraId"))
+        if native:
+            return native
+    block = blocks_by_index.get(index)
+    if block is not None and block.get("para_id"):
+        return block["para_id"]
+    return f"body-index-{index}"
+
+
+def _table_cell_image_findings(body: ET.Element) -> list[dict[str, Any]]:
+    """Images embedded inside table cells can never be resolved by the
+    direct-body "immediately followed by a SEQ Figure caption" ownership
+    rule every other detector in this module relies on -- a caption
+    paragraph is, per that same OOXML idiom, a DIRECT BODY sibling, never a
+    table-cell paragraph, so a table-cell image's caption (if any) cannot be
+    attributed positionally. Every such image is reported as an ownership
+    ambiguity -- informational, not necessarily a defect -- rather than
+    silently assumed orphaned or silently assumed fine.
+    """
+    findings: list[dict[str, Any]] = []
+    w_p = _q(_W, "p")
+    w_tbl = _q(_W, "tbl")
+    w_tr = _q(_W, "tr")
+    w_tc = _q(_W, "tc")
+    w_drawing = _q(_W, "drawing")
+    w_pict = _q(_W, "pict")
+
+    for table_index, table_el in enumerate(body):
+        if table_el.tag != w_tbl:
+            continue
+        # Matches the f"table:{idx}" id every table node is given above --
+        # both derive from the same direct-body-child index.
+        table_id = f"table:{table_index}"
+        for row_idx, tr in enumerate(table_el.findall(w_tr)):
+            for col_idx, tc in enumerate(tr.findall(w_tc)):
+                for cell_para in tc.findall(w_p):
+                    has_image = (
+                        cell_para.find(f".//{w_drawing}") is not None
+                        or cell_para.find(f".//{w_pict}") is not None
+                    )
+                    if not has_image:
+                        continue
+                    findings.append({
+                        "type": "table_cell_image_ambiguity",
+                        "severity": "info",
+                        "table_id": table_id,
+                        "table_body_index": table_index,
+                        "row": row_idx,
+                        "col": col_idx,
+                        "relationship_ids": _image_paragraph_relationship_ids(cell_para),
+                        "detail": (
+                            "image embedded inside a table cell; ownership by "
+                            "position cannot be resolved the way direct-body "
+                            "image/caption adjacency can -- reported for "
+                            "manual review, not auto-classified as orphaned"
+                        ),
+                    })
+    return findings
+
+
+def audit_document(
+    docx_path: str,
+    *,
+    index_db_path: str | None = None,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """d092d2a4 -- read-only, authoritative figure/table/caption ownership
+    audit: reconciles headings, paragraphs, captions, embedded media,
+    relationships, and tables into ONE structural-ownership graph with
+    stable ids, plus a findings list for known integrity defect classes.
+
+    Re-reads ``docx_path`` FRESH FROM DISK on every call -- same "no sidecar
+    index, so nothing can go stale between calls" discipline as
+    :func:`locate_anchor` / :func:`build_document_review`. Pass
+    ``expected_source_fingerprint`` (a value previously returned as
+    ``source_fingerprint``) to detect the document having changed underneath
+    a stashed audit; a mismatch short-circuits to ``{"status": "stale", ...}``
+    with empty findings rather than resolving against what may now be the
+    wrong document.
+
+    Detects, as distinct finding ``type`` values:
+
+      * ``orphan_image``                  -- an image paragraph (or adjacent
+                                              multi-image composite) not
+                                              immediately followed by a SEQ
+                                              Figure caption.
+      * ``repeated_embed``                -- the same ``r:embed``
+                                              relationship id referenced by
+                                              more than one independent image
+                                              block (a copy/duplicate
+                                              operation that forgot to mint a
+                                              fresh relationship).
+      * ``caption_only_figure``           -- a SEQ Figure caption with no
+                                              image paragraph immediately
+                                              before or nearby.
+      * ``non_adjacent_caption_attachment`` -- a SEQ Figure caption not
+                                              immediately preceded by an
+                                              image, but with one nearby
+                                              (within a small backward
+                                              window, not crossing a
+                                              heading) -- likely mis-anchored
+                                              rather than truly orphaned.
+      * ``table_cell_image_ambiguity``    -- an image embedded in a table
+                                              cell, whose ownership cannot be
+                                              resolved by direct-body
+                                              adjacency at all.
+      * ``duplicate_para_id``             -- a native ``w14:paraId`` value
+                                              assigned to more than one
+                                              paragraph (via
+                                              ``document_content_tree``'s own
+                                              collision report -- this
+                                              function never renumbers or
+                                              otherwise repairs one it
+                                              finds).
+      * ``stale_or_empty_sidecar``        -- (only when ``index_db_path`` is
+                                              given) the structural sidecar
+                                              is not trustworthy (stale/
+                                              incomplete), or is trustworthy
+                                              but reports zero headings/
+                                              figures/tables while the source
+                                              document is non-empty.
+      * ``unresolvable_structural_id``    -- (defensive) an emitted node id
+                                              did not round-trip through
+                                              :func:`_find_para_by_id`; would
+                                              indicate an id-scheme drift bug
+                                              in this function itself, never
+                                              expected in normal operation.
+
+    Returns ``{status: "ok", docx_path, source_fingerprint, nodes, edges,
+    duplicate_relationships, total_image_paragraphs, sidecar, findings,
+    finding_count, findings_by_type}`` on success, ``{status: "stale", ...}``
+    on a fingerprint mismatch, or ``{"error": <message>}`` when the file
+    cannot be read or parsed. Never mutates ``docx_path``.
+    """
+    try:
+        with open(docx_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    source_fingerprint = _source_fingerprint(raw)
+    if expected_source_fingerprint and expected_source_fingerprint != source_fingerprint:
+        return {
+            "status": "stale",
+            "docx_path": docx_path,
+            "reason": "source_fingerprint_mismatch",
+            "expected_source_fingerprint": expected_source_fingerprint,
+            "source_fingerprint": source_fingerprint,
+            "nodes": [],
+            "edges": [],
+            "findings": [],
+            "finding_count": 0,
+            "findings_by_type": {},
+        }
+
+    from ._vendored_content_tree import document_content_tree  # noqa: PLC0415
+
+    try:
+        tree = document_content_tree(raw)
+    except (zipfile.BadZipFile, ET.ParseError, KeyError) as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw2, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    blocks: list[dict[str, Any]] = tree.get("blocks") or []
+    blocks_by_index = {b["index"]: b for b in blocks}
+    body_list = list(body)
+    w_p = _q(_W, "p")
+
+    # ---- Nodes: one entry per heading/paragraph/table. ----
+    nodes: list[dict[str, Any]] = []
+    for block in blocks:
+        idx = block["index"]
+        if block["kind"] == "table":
+            nodes.append({
+                "id": f"table:{idx}", "kind": "table", "index": idx,
+                "row_count": block.get("row_count", 0),
+                "col_count": block.get("col_count", 0),
+            })
+            continue
+        node: dict[str, Any] = {
+            "id": block.get("para_id") or f"p{idx}",
+            "kind": block["kind"],
+            "index": idx,
+            "text": (block.get("text") or "")[:200],
+        }
+        if block["kind"] == "heading":
+            node["level"] = block.get("level")
+        if _is_figure_caption(block):
+            node["role"] = "figure_caption"
+            node["seq_number"] = _seq_cached_number(block, _SEQ_FIGURE_RE)
+        elif _is_table_caption(block):
+            node["role"] = "table_caption"
+            node["seq_number"] = _seq_cached_number(block, _SEQ_TABLE_RE)
+        nodes.append(node)
+
+    # ---- Image ownership: the SAME grouping _verify_image_ownership uses. ----
+    image_paras = _direct_body_image_paragraphs(body)
+    image_para_indices = {idx for idx, _ in image_paras}
+
+    image_nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    relationship_owners: dict[str, list[str]] = {}
+    orphan_or_uncaptioned: list[dict[str, Any]] = []
+
+    pos = 0
+    while pos < len(image_paras):
+        group_start = pos
+        while (
+            pos + 1 < len(image_paras)
+            and image_paras[pos + 1][0] == image_paras[pos][0] + 1
+        ):
+            pos += 1
+        group = image_paras[group_start:pos + 1]
+        pos += 1
+
+        block_key = _stable_body_id(blocks_by_index, group[0][0], group[0][1])
+        member_ids: list[str] = []
+        for member_idx, member_el in group:
+            member_id = _stable_body_id(blocks_by_index, member_idx, member_el)
+            member_ids.append(member_id)
+            rel_ids = _image_paragraph_relationship_ids(member_el)
+            for rel_id in rel_ids:
+                relationship_owners.setdefault(rel_id, []).append(block_key)
+            image_nodes.append({
+                "id": member_id, "kind": "image", "index": member_idx,
+                "relationship_ids": rel_ids, "composite_key": block_key,
+                "composite_size": len(group),
+            })
+
+        last_idx = group[-1][0]
+        next_idx = last_idx + 1
+        has_caption = (
+            next_idx < len(body_list)
+            and body_list[next_idx].tag == w_p
+            and _has_figure_seq_field(body_list[next_idx])
+        )
+        if has_caption:
+            caption_id = _stable_body_id(blocks_by_index, next_idx, body_list[next_idx])
+            for member_id in member_ids:
+                edges.append({
+                    "type": "image_caption", "image_id": member_id,
+                    "caption_id": caption_id,
+                })
+        else:
+            orphan_or_uncaptioned.append({
+                "composite_key": block_key, "image_ids": member_ids,
+                "composite_size": len(group),
+            })
+
+    duplicate_relationships = {
+        rel_id: sorted(set(owners))
+        for rel_id, owners in relationship_owners.items()
+        if len(set(owners)) > 1
+    }
+
+    findings: list[dict[str, Any]] = []
+
+    for orphan in orphan_or_uncaptioned:
+        findings.append({
+            "type": "orphan_image",
+            "severity": "warning",
+            "composite_key": orphan["composite_key"],
+            "image_ids": orphan["image_ids"],
+            "composite_size": orphan["composite_size"],
+            "detail": (
+                "image paragraph(s) not immediately followed by a SEQ "
+                "Figure caption"
+            ),
+        })
+
+    for rel_id, owners in duplicate_relationships.items():
+        findings.append({
+            "type": "repeated_embed",
+            "severity": "error",
+            "relationship_id": rel_id,
+            "owning_blocks": owners,
+            "detail": (
+                "the same r:embed relationship id is referenced by more "
+                "than one independent image block -- a copy/duplicate "
+                "operation likely reused a relationship instead of minting "
+                "a fresh one"
+            ),
+        })
+
+    # Caption-only figures / non-adjacent caption attachment: a figure
+    # caption whose immediately preceding body child is NOT an image. Look a
+    # bounded window backward (stopping at a heading boundary) for a nearby
+    # image before concluding there is no image at all.
+    for block in blocks:
+        if block["kind"] != "paragraph" or not _is_figure_caption(block):
+            continue
+        idx = block["index"]
+        if (idx - 1) in image_para_indices:
+            continue  # immediately-adjacent case is not a defect.
+        caption_id = block.get("para_id") or f"p{idx}"
+        nearby_image_idx: int | None = None
+        for lookback in range(1, 4):
+            candidate = idx - lookback
+            if candidate < 0:
+                break
+            candidate_block = blocks_by_index.get(candidate)
+            if candidate_block is not None and candidate_block["kind"] == "heading":
+                break
+            if candidate in image_para_indices:
+                nearby_image_idx = candidate
+                break
+        if nearby_image_idx is not None:
+            findings.append({
+                "type": "non_adjacent_caption_attachment",
+                "severity": "warning",
+                "caption_id": caption_id,
+                "distance": idx - nearby_image_idx,
+                "detail": (
+                    "SEQ Figure caption is not immediately preceded by an "
+                    "image paragraph, but one appears nearby -- caption may "
+                    "be mis-anchored"
+                ),
+            })
+        else:
+            findings.append({
+                "type": "caption_only_figure",
+                "severity": "warning",
+                "caption_id": caption_id,
+                "detail": (
+                    "SEQ Figure caption has no image paragraph immediately "
+                    "before or nearby -- caption with nothing to caption"
+                ),
+            })
+
+    findings.extend(_table_cell_image_findings(body))
+
+    for dup in tree.get("duplicate_para_ids") or []:
+        findings.append({
+            "type": "duplicate_para_id",
+            "severity": "error",
+            "para_id": dup["para_id"],
+            "occurrence_count": dup["occurrence_count"],
+            "occurrences": dup["occurrences"],
+            "detail": (
+                f"native w14:paraId {dup['para_id']!r} is assigned to "
+                f"{dup['occurrence_count']} paragraphs -- ids must be "
+                "document-unique"
+            ),
+        })
+
+    # Cross-check against find_image_paragraph's independent body+table-cell
+    # walk -- purely informational (never itself raises a finding), reused
+    # per this item's notes rather than re-deriving a second body-walk.
+    total_image_paragraphs: int | None = None
+    try:
+        all_images = find_image_paragraph(docx_path)
+    except Exception:  # noqa: BLE001 -- cross-check must never break the audit
+        all_images = None
+    if isinstance(all_images, dict) and "error" not in all_images:
+        total_image_paragraphs = all_images.get("count")
+
+    sidecar: dict[str, Any] | None = None
+    if index_db_path is not None:
+        freshness = get_structure_freshness(index_db_path)
+        sidecar = dict(freshness)
+        if freshness.get("indexed") and freshness.get("trustworthy"):
+            try:
+                elements = get_local_structure_elements(index_db_path, allow_stale=True)
+            except sqlite3.OperationalError:
+                elements = {"headings": [], "figures": [], "tables": []}
+            sidecar_empty = not (
+                elements.get("headings") or elements.get("figures") or elements.get("tables")
+            )
+            doc_nonempty = bool(
+                tree.get("heading_count")
+                or tree.get("table_count")
+                or any(
+                    _is_figure_caption(b) for b in blocks if b["kind"] == "paragraph"
+                )
+            )
+            sidecar["empty"] = sidecar_empty
+            if sidecar_empty and doc_nonempty:
+                findings.append({
+                    "type": "stale_or_empty_sidecar",
+                    "severity": "warning",
+                    "index_db_path": index_db_path,
+                    "detail": (
+                        "structural sidecar reports as trustworthy/complete "
+                        "but has zero headings/figures/tables while the "
+                        "source document is non-empty -- likely built "
+                        "against an empty/placeholder document, or never "
+                        "actually populated"
+                    ),
+                })
+        elif not freshness.get("trustworthy", True):
+            sidecar["empty"] = None
+            findings.append({
+                "type": "stale_or_empty_sidecar",
+                "severity": "warning",
+                "index_db_path": index_db_path,
+                "detail": (
+                    "structural sidecar is not trustworthy: "
+                    f"{freshness.get('reason')}"
+                ),
+            })
+
+    # Defensive round-trip: every paragraph/heading node id must resolve
+    # back through the SAME lookup callers (locate_anchor, get_paragraph,
+    # insert_caption, ...) already use.
+    for node in nodes:
+        if node["kind"] not in ("paragraph", "heading"):
+            continue
+        if _find_para_by_id(root, node["id"]) is None:
+            findings.append({
+                "type": "unresolvable_structural_id",
+                "severity": "error",
+                "node_id": node["id"],
+                "detail": (
+                    f"node id {node['id']!r} did not resolve via "
+                    "_find_para_by_id -- id-scheme drift bug"
+                ),
+            })
+
+    findings_by_type: dict[str, int] = {}
+    for f in findings:
+        findings_by_type[f["type"]] = findings_by_type.get(f["type"], 0) + 1
+
+    return {
+        "status": "ok",
+        "docx_path": docx_path,
+        "source_fingerprint": source_fingerprint,
+        "nodes": nodes + image_nodes,
+        "edges": edges,
+        "duplicate_relationships": duplicate_relationships,
+        "total_image_paragraphs": total_image_paragraphs,
+        "sidecar": sidecar,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+    }
+
+
 def read_document_snapshot(
     docx_path: str,
     page_size: int | None = None,
