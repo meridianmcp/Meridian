@@ -204,7 +204,7 @@ _PLANNED_OUTPUT_SCHEMA: dict[str, Any] = {
         "source_type": {"type": "string", "description": "e.g. 'code', 'docs', 'experiment' — what kind of source the target lives in."},
         "targets": {
             "type": "array",
-            "description": "Non-empty array of {uri, selector, target_kind?, subSelector?} — see add_sprint_item_pointer for the full selector shape (range/symbol/node_id/zotero_key/text_quote/finding_id).",
+            "description": "Non-empty array of {uri, selector, target_kind?, subSelector?, freshness?} — see add_sprint_item_pointer for the full selector shape (range/symbol/node_id/zotero_key/text_quote/finding_id/directory/git/remote_fs/artifact, 62640241).",
             "items": {"type": "object"},
         },
         "label": {"type": "string", "description": "Optional human-readable label for this output."},
@@ -1318,38 +1318,85 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "\"value\".\n"
         "• zotero_key — {\"type\":\"zotero_key\", \"key\":\"<zotero-key>\"} of a Zotero "
         "library item.\n"
+        "• text_quote — {\"type\":\"text_quote\", \"exact\":str, \"prefix\"?:str, "
+        "\"suffix\"?:str, \"archived_url\"?:str, \"archived_at\"?:str, "
+        "\"canonical_url\"?:str, \"retrieval_hash\"?:str} (W3C TextQuoteSelector; "
+        "source_type \"web\" — a URL — OR a local .docx path, resolving via a docx "
+        "paragraph-text match instead of an HTTP GET). Resolving re-fetches live and "
+        "flags content drift (the cited passage silently changed/vanished).\n"
+        "• finding_id — {\"type\":\"finding_id\", \"id\":\"<finding-note-id>\"} "
+        "(source_type \"experiment\") addresses a save_finding artifact.\n"
+        "• directory — {\"type\":\"directory\", \"root\":str, \"include\"?:[str,...], "
+        "\"exclude\"?:[str,...], \"manifest_id\"?:str, \"snapshot_id\"?:str} "
+        "(62640241) — a directory ROOT + glob include/exclude selector + optional "
+        "snapshot/manifest identity. Resolving it (local paths only by default) walks "
+        "the tree and returns a deterministic manifest + manifest_hash.\n"
+        "• git — {\"type\":\"git\", \"repository\":str, \"ref\"?:str, \"commit\"?:str, "
+        "\"path\"?:str} (62640241) — a Git repository identity; at least one of "
+        "\"ref\"/\"commit\" is required. A line range within \"path\" is expressed via "
+        "subSelector (a nested range), NOT a new field. Resolving it (local clones only "
+        "by default) checks reachability against the repo's current HEAD via `git "
+        "rev-parse`.\n"
+        "• remote_fs — {\"type\":\"remote_fs\", \"host_id\":str, \"filesystem_slot\":str, "
+        "\"path\":str, \"lease_id\"?:str, \"session_id\"?:str, \"snapshot_id\"?:str} "
+        "(62640241) — an opaque tunnel-connector host + filesystem slot + remote path, "
+        "optionally bound to the lease/session that captured it. No core-local default "
+        "resolver exists (requires an injected, tunnel-backed resolver) — reported "
+        "explicitly unresolved without one, never silently dropped.\n"
+        "• artifact — {\"type\":\"artifact\", \"manifest_uri\":str, \"fingerprint\"?:str, "
+        "\"run_id\"?:str, \"item_id\"?:str, \"provenance_id\"?:str} (62640241) — a "
+        "build/output artifact's manifest URI plus an optional fingerprint and a link to "
+        "the producing run/sprint-item/provenance record. Resolving it (local files only "
+        "by default) hashes the manifest file to report its current fingerprint.\n"
         "An optional selector.subSelector nests finer granularity (W3C hasSubSelector) — "
         "e.g. {\"type\":\"symbol\", \"qualified_name\":\"a.b.f\", \"subSelector\": "
         "{\"type\":\"range\", \"start_line\":3, \"end_line\":4}} = 'these lines, within "
         "this function'. A subSelector is itself a FULL selector and MUST carry its OWN "
         "explicit \"type\" (it does not inherit the parent's). source_type names the "
-        "domain (code | docs | citation | …). Each target may also carry "
-        "target_kind: \"existing\" | \"planned_new\" (300a063d) — set \"existing\" ONLY "
-        "when the file/symbol already exists (this is checked against the real "
+        "domain (code | docs | citation | web | experiment | …). Each target may also "
+        "carry target_kind: \"existing\" | \"planned_new\" (300a063d) — set \"existing\" "
+        "ONLY when the file/symbol already exists (this is checked against the real "
         "filesystem and REJECTED if the path isn't there); set \"planned_new\" for a "
         "file this sprint item will CREATE, which is explicitly exempt from that check. "
         "Omitting target_kind keeps the pre-existing, unchecked behavior (defaults to "
         "\"existing\" in the stored shape but is never filesystem-verified) — set it "
-        "explicitly to get real verification. Malformed pointers are rejected with a "
+        "explicitly to get real verification. 62640241 — a target may ALSO carry an "
+        "optional freshness proof: {\"content_hash\"?:str, \"source_revision\"?:str, "
+        "\"resolver_version\"?:str, \"captured_at\"?:str, \"state\"?: \"current\"|"
+        "\"stale\"|\"unknown\"|\"unavailable\"|\"ambiguous\"}. Purely additive/opt-in; "
+        "resolve_sprint_item_pointers recomputes a LIVE freshness_state for directory/"
+        "git/remote_fs/artifact/text_quote targets by comparing this declared proof "
+        "against what resolution finds right now. Malformed pointers are rejected with a "
         "clear error: a bad/missing selector.type, a missing required selector field "
-        "(e.g. node_id without \"id\", a subSelector with no \"type\", an invalid "
-        "target_kind, or target_kind=\"existing\" at a path that doesn't exist). "
-        "Returns the stored pointer.",
+        "(e.g. node_id without \"id\", git without ref or commit, a subSelector with no "
+        "\"type\", an invalid target_kind or freshness.state, or target_kind=\"existing\" "
+        "at a path that doesn't exist). Returns the stored pointer.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "sprint_item_id": {"type": "string", "description": "The sprint item to attach the pointer to."},
-         "source_type": {"type": "string", "description": "Domain of the pointer: code | docs | citation | … (free text)."},
+         "source_type": {"type": "string", "description": "Domain of the pointer: code | docs | citation | web | experiment | … (free text)."},
          "targets": {"type": "array", "description":
-             "Non-empty array of {uri, selector, subSelector?, target_kind?} targets. "
-             "Each selector is an object carrying an explicit \"type\" plus that type's "
-             "field: range {\"type\":\"range\", start_line, end_line, start_char?, "
-             "end_char?}; symbol {\"type\":\"symbol\", qualified_name}; node_id "
-             "{\"type\":\"node_id\", id} (field is \"id\", NOT \"value\"); zotero_key "
-             "{\"type\":\"zotero_key\", key}. An optional subSelector is itself a full "
-             "selector and MUST carry its own \"type\". target_kind is \"existing\" "
-             "(default; explicit \"existing\" is verified against the real filesystem) "
-             "or \"planned_new\" (a file not created yet — exempt from that check).",
+             "Non-empty array of {uri, selector, subSelector?, target_kind?, freshness?} "
+             "targets. Each selector is an object carrying an explicit \"type\" plus that "
+             "type's field(s): range {\"type\":\"range\", start_line, end_line, "
+             "start_char?, end_char?}; symbol {\"type\":\"symbol\", qualified_name}; "
+             "node_id {\"type\":\"node_id\", id} (field is \"id\", NOT \"value\"); "
+             "zotero_key {\"type\":\"zotero_key\", key}; text_quote {\"type\":"
+             "\"text_quote\", exact, prefix?, suffix?, archived_url?, archived_at?, "
+             "canonical_url?, retrieval_hash?}; finding_id {\"type\":\"finding_id\", id}; "
+             "directory {\"type\":\"directory\", root, include?, exclude?, manifest_id?, "
+             "snapshot_id?}; git {\"type\":\"git\", repository, ref?, commit? "
+             "(>=1 required), path?}; remote_fs {\"type\":\"remote_fs\", host_id, "
+             "filesystem_slot, path, lease_id?, session_id?, snapshot_id?}; artifact "
+             "{\"type\":\"artifact\", manifest_uri, fingerprint?, run_id?, item_id?, "
+             "provenance_id?} (62640241 for the last five). An optional subSelector is "
+             "itself a full selector and MUST carry its own \"type\". target_kind is "
+             "\"existing\" (default; explicit \"existing\" is verified against the real "
+             "filesystem) or \"planned_new\" (a file not created yet — exempt from that "
+             "check). freshness (62640241) is an optional {content_hash?, "
+             "source_revision?, resolver_version?, captured_at?, state?} proof of what "
+             "the source looked like at capture time.",
              "items": {"type": "object"}},
          "label": {"type": "string", "description": "Optional human-readable label for the pointer."}},
          "required": ["sprint_item_id", "source_type", "targets"]}},
@@ -1370,13 +1417,23 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "chain prospect_symbol uses (graph → Serena → semantic, 653579c5) when this "
         "session has an active code tunnel, falling back to the cached code-graph "
         "snapshot when it doesn't; node_id looks the element up in the doc-structure "
-        "store; zotero_key resolves via Zotero's local API. A subSelector narrows the "
-        "outer resolution ('these lines, within this function'). Every dispatch is "
-        "best-effort: an unresolvable target yields {resolved:false, reason} instead "
-        "of an error, and the pass NEVER fails. Returns {pointers:[{id, source_type, "
-        "label, targets:[<resolved-target>]}]}. Requires no network for range/symbol/"
-        "node_id; zotero_key needs Zotero running locally (else that target is just "
-        "unresolved).",
+        "store; zotero_key resolves via Zotero's local API; text_quote re-fetches the "
+        "URL (or docx paragraph text) and flags content drift; finding_id looks up a "
+        "save_finding artifact note. 62640241 — directory walks the local root and "
+        "returns a manifest + manifest_hash; git shells out to `git rev-parse` against a "
+        "local clone to check ref/commit reachability against HEAD; artifact hashes a "
+        "local manifest file for its current fingerprint; remote_fs has no core-local "
+        "default (requires a tunnel-backed resolver — reported explicitly unresolved "
+        "without one). Every one of these five ALSO gets a recomputed freshness_state "
+        "(current/stale/unknown/unavailable/ambiguous) on its resolved target, comparing "
+        "the target's declared freshness proof (if any) against what resolution finds "
+        "right now. A subSelector narrows the outer resolution ('these lines, within "
+        "this function'). Every dispatch is best-effort: an unresolvable target yields "
+        "{resolved:false, reason} instead of an error, and the pass NEVER fails. Returns "
+        "{pointers:[{id, source_type, label, targets:[<resolved-target>]}]}. Requires no "
+        "network for range/symbol/node_id/directory/git(local)/artifact(local); "
+        "zotero_key needs Zotero running locally and text_quote needs live web access "
+        "(else those targets are just unresolved).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},

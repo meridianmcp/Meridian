@@ -2488,6 +2488,8 @@ def test_aggregate_pointer_evidence_empty_list_is_not_vacuously_true():
         "target_resolved": False,
         "provenance_verified": None,
         "resolution_source": "not_applicable",
+        # 62640241 — additive freshness rollup, same "not vacuously true" rule.
+        "freshness_verified": None,
     }
 
 
@@ -2919,3 +2921,721 @@ class TestVerifyExecutionManifestTargetReadiness:
         )
         assert out["ready"] is True
         assert out["manifest_verified"] is True
+
+
+# ---------------------------------------------------------------------------
+# S5 — typed external pointer targets + freshness proofs (62640241)
+#
+# Covers the FEAT: directory / git / remote_fs / artifact selector types,
+# text_quote's additive canonical_url/retrieval_hash fields, the universal
+# opt-in `freshness` proof on any target, resolve_pointer's live
+# freshness_state recomputation, the build_typed_pointer_record /
+# aggregate_pointer_evidence freshness rollups, and strict_freshness_gate.
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib_s5
+import os as _os_s5
+import shutil as _shutil_s5
+import subprocess as _subprocess_s5
+
+from meridian.pointers import (  # noqa: E402
+    build_typed_pointer_record,
+    aggregate_pointer_evidence,
+    strict_freshness_gate,
+)
+
+
+# --- validation: directory ---------------------------------------------------
+
+def test_validate_directory_selector_round_trips():
+    ptr = validate_pointer({
+        "source_type": "infra",
+        "targets": [{"uri": "some/dir", "selector": {
+            "type": "directory", "root": "some/dir",
+            "include": ["*.py"], "exclude": ["**/test_*.py"],
+            "manifest_id": "m1", "snapshot_id": "s1",
+        }}],
+    })
+    sel = ptr["targets"][0]["selector"]
+    assert sel == {
+        "type": "directory", "root": "some/dir",
+        "include": ["*.py"], "exclude": ["**/test_*.py"],
+        "manifest_id": "m1", "snapshot_id": "s1",
+    }
+
+
+@pytest.mark.parametrize("bad_sel", [
+    {"type": "directory"},                                    # missing root
+    {"type": "directory", "root": "   "},                     # blank root
+    {"type": "directory", "root": "d", "include": []},        # empty include list
+    {"type": "directory", "root": "d", "include": "*.py"},    # not a list
+    {"type": "directory", "root": "d", "include": [5]},       # non-str entry
+    {"type": "directory", "root": "d", "manifest_id": ""},    # blank manifest_id
+])
+def test_validate_directory_rejects_malformed(bad_sel):
+    with pytest.raises(PointerValidationError):
+        validate_pointer({"source_type": "infra", "targets": [{"uri": "u", "selector": bad_sel}]})
+
+
+# --- validation: git ----------------------------------------------------------
+
+def test_validate_git_selector_ref_or_commit_required():
+    ptr = validate_pointer({
+        "source_type": "code",
+        "targets": [{"uri": "repo", "selector": {
+            "type": "git", "repository": "/path/to/repo", "commit": "abc123",
+        }}],
+    })
+    assert ptr["targets"][0]["selector"] == {
+        "type": "git", "repository": "/path/to/repo", "commit": "abc123",
+    }
+
+    ptr2 = validate_pointer({
+        "source_type": "code",
+        "targets": [{"uri": "repo", "selector": {
+            "type": "git", "repository": "/path/to/repo", "ref": "main", "path": "src/x.py",
+        }}],
+    })
+    assert ptr2["targets"][0]["selector"]["ref"] == "main"
+    assert ptr2["targets"][0]["selector"]["path"] == "src/x.py"
+
+
+@pytest.mark.parametrize("bad_sel", [
+    {"type": "git"},                                                # missing repository
+    {"type": "git", "repository": "  "},                            # blank repository
+    {"type": "git", "repository": "r"},                             # neither ref nor commit
+    {"type": "git", "repository": "r", "ref": ""},                  # blank ref
+    {"type": "git", "repository": "r", "commit": "  "},             # blank commit
+    {"type": "git", "repository": "r", "ref": "main", "path": ""},  # blank path
+])
+def test_validate_git_rejects_malformed(bad_sel):
+    with pytest.raises(PointerValidationError):
+        validate_pointer({"source_type": "code", "targets": [{"uri": "u", "selector": bad_sel}]})
+
+
+def test_validate_git_range_within_path_uses_subselector():
+    """Acceptance-relevant design choice: a line range within a git target's
+    ``path`` reuses the EXISTING subSelector mechanism rather than a
+    duplicated field."""
+    ptr = validate_pointer({
+        "source_type": "code",
+        "targets": [{"uri": "repo", "selector": {
+            "type": "git", "repository": "r", "commit": "abc", "path": "a.py",
+            "subSelector": {"type": "range", "start_line": 1, "end_line": 4},
+        }}],
+    })
+    sub = ptr["targets"][0]["selector"]["subSelector"]
+    assert sub == {"type": "range", "start_line": 1, "end_line": 4}
+
+
+# --- validation: remote_fs -----------------------------------------------------
+
+def test_validate_remote_fs_selector_round_trips():
+    ptr = validate_pointer({
+        "source_type": "infra",
+        "targets": [{"uri": "remote://host/x", "selector": {
+            "type": "remote_fs", "host_id": "h1", "filesystem_slot": "Filesystem",
+            "path": "/data/x", "lease_id": "lease-1", "session_id": "sess-1",
+            "snapshot_id": "snap-1",
+        }}],
+    })
+    sel = ptr["targets"][0]["selector"]
+    assert sel["host_id"] == "h1" and sel["filesystem_slot"] == "Filesystem"
+    assert sel["path"] == "/data/x"
+    assert sel["lease_id"] == "lease-1" and sel["session_id"] == "sess-1"
+    assert sel["snapshot_id"] == "snap-1"
+
+
+@pytest.mark.parametrize("bad_sel", [
+    {"type": "remote_fs"},                                            # missing host_id
+    {"type": "remote_fs", "host_id": "h"},                            # missing filesystem_slot
+    {"type": "remote_fs", "host_id": "h", "filesystem_slot": "f"},    # missing path
+    {"type": "remote_fs", "host_id": "h", "filesystem_slot": "f", "path": "p", "lease_id": ""},
+])
+def test_validate_remote_fs_rejects_malformed(bad_sel):
+    with pytest.raises(PointerValidationError):
+        validate_pointer({"source_type": "infra", "targets": [{"uri": "u", "selector": bad_sel}]})
+
+
+# --- validation: artifact -------------------------------------------------------
+
+def test_validate_artifact_selector_round_trips():
+    ptr = validate_pointer({
+        "source_type": "experiment",
+        "targets": [{"uri": "artifact://x", "selector": {
+            "type": "artifact", "manifest_uri": "out/manifest.json",
+            "fingerprint": "sha256:abc", "run_id": "run-1", "item_id": "item-1",
+            "provenance_id": "prov-1",
+        }}],
+    })
+    sel = ptr["targets"][0]["selector"]
+    assert sel["manifest_uri"] == "out/manifest.json"
+    assert sel["fingerprint"] == "sha256:abc"
+    assert sel["run_id"] == "run-1" and sel["item_id"] == "item-1"
+    assert sel["provenance_id"] == "prov-1"
+
+
+@pytest.mark.parametrize("bad_sel", [
+    {"type": "artifact"},                                      # missing manifest_uri
+    {"type": "artifact", "manifest_uri": "  "},                # blank
+    {"type": "artifact", "manifest_uri": "m", "fingerprint": ""},
+])
+def test_validate_artifact_rejects_malformed(bad_sel):
+    with pytest.raises(PointerValidationError):
+        validate_pointer({"source_type": "experiment", "targets": [{"uri": "u", "selector": bad_sel}]})
+
+
+# --- validation: text_quote additive web fields ---------------------------------
+
+def test_validate_text_quote_canonical_url_and_retrieval_hash_additive():
+    ptr = validate_pointer({
+        "source_type": "web",
+        "targets": [{"uri": "https://example.com/a", "selector": {
+            "type": "text_quote", "exact": "the cited passage",
+            "canonical_url": "https://example.com/canonical/a",
+            "retrieval_hash": "sha256:deadbeef",
+        }}],
+    })
+    sel = ptr["targets"][0]["selector"]
+    assert sel["canonical_url"] == "https://example.com/canonical/a"
+    assert sel["retrieval_hash"] == "sha256:deadbeef"
+
+
+# --- validation: universal freshness proof --------------------------------------
+
+def test_validate_freshness_proof_round_trips_and_defaults_unknown_state():
+    ptr = validate_pointer({
+        "source_type": "infra",
+        "targets": [{"uri": "d", "selector": {"type": "directory", "root": "d"},
+                     "freshness": {"content_hash": "abc", "captured_at": "2026-08-08T00:00:00Z"}}],
+    })
+    fresh = ptr["targets"][0]["freshness"]
+    assert fresh["content_hash"] == "abc"
+    assert fresh["captured_at"] == "2026-08-08T00:00:00Z"
+    assert fresh["state"] == "unknown"  # default when omitted
+
+
+def test_validate_freshness_explicit_state_and_all_states_accepted():
+    for state in ("current", "stale", "unknown", "unavailable", "ambiguous"):
+        ptr = validate_pointer({
+            "source_type": "infra",
+            "targets": [{"uri": "d", "selector": {"type": "directory", "root": "d"},
+                         "freshness": {"state": state}}],
+        })
+        assert ptr["targets"][0]["freshness"]["state"] == state
+
+
+@pytest.mark.parametrize("bad_freshness", [
+    "not-a-dict",
+    {"state": "not-a-real-state"},
+    {"content_hash": 5},
+    {"content_hash": ""},
+    {"source_revision": None, "captured_at": 5},
+])
+def test_validate_freshness_rejects_malformed(bad_freshness):
+    with pytest.raises(PointerValidationError):
+        validate_pointer({
+            "source_type": "infra",
+            "targets": [{"uri": "d", "selector": {"type": "directory", "root": "d"},
+                         "freshness": bad_freshness}],
+        })
+
+
+def test_validate_pointer_omits_freshness_key_when_not_supplied():
+    ptr = validate_pointer({
+        "source_type": "infra",
+        "targets": [{"uri": "d", "selector": {"type": "directory", "root": "d"}}],
+    })
+    assert "freshness" not in ptr["targets"][0]
+
+
+# --- resolution: directory ------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_directory_default_resolver_real_filesystem(tmp_path):
+    (tmp_path / "a.py").write_text("print('a')")
+    (tmp_path / "b.py").write_text("print('b')")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "c.py").write_text("print('c')")
+    (tmp_path / "notes.txt").write_text("hi")
+
+    ptr = {"source_type": "infra", "targets": [{"uri": str(tmp_path), "selector": {
+        "type": "directory", "root": str(tmp_path), "include": ["*.py"],
+    }}]}
+    out = (await resolve_pointer(None, ptr))["targets"][0]
+    assert out["resolved"] is True
+    manifest = out["manifest"]
+    assert manifest["entry_count"] == 3
+    assert all(e.endswith(".py") for e in manifest["entries"])
+    assert manifest["manifest_hash"]
+    # freshness: no declared proof on the target -> "unknown"
+    assert out["freshness_state"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_resolve_directory_missing_root_is_unresolved():
+    ptr = {"source_type": "infra", "targets": [{"uri": "nope", "selector": {
+        "type": "directory", "root": "C:/definitely/not/a/real/dir/62640241",
+    }}]}
+    out = (await resolve_pointer(None, ptr))["targets"][0]
+    assert out["resolved"] is False
+    assert out["freshness_state"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_resolve_directory_resolver_exception_is_guarded():
+    async def boom(_selector):
+        raise RuntimeError("disk error")
+    ptr = {"source_type": "infra", "targets": [{"uri": "d", "selector": {
+        "type": "directory", "root": "d",
+    }}]}
+    out = (await resolve_pointer(None, ptr, directory_resolver=boom))["targets"][0]
+    assert out["resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_directory_freshness_current_and_stale(tmp_path):
+    (tmp_path / "a.py").write_text("x")
+    selector = {"type": "directory", "root": str(tmp_path), "include": ["*.py"]}
+    live = (await resolve_pointer(
+        None, {"source_type": "infra", "targets": [{"uri": str(tmp_path), "selector": selector}]},
+    ))["targets"][0]
+    live_hash = live["manifest"]["manifest_hash"]
+
+    ptr_current = {"source_type": "infra", "targets": [{
+        "uri": str(tmp_path), "selector": selector,
+        "freshness": {"content_hash": live_hash},
+    }]}
+    out_current = (await resolve_pointer(None, ptr_current))["targets"][0]
+    assert out_current["freshness_state"] == "current"
+
+    ptr_stale = {"source_type": "infra", "targets": [{
+        "uri": str(tmp_path), "selector": selector,
+        "freshness": {"content_hash": "not-the-real-hash"},
+    }]}
+    out_stale = (await resolve_pointer(None, ptr_stale))["targets"][0]
+    assert out_stale["freshness_state"] == "stale"
+
+
+# --- resolution: git -------------------------------------------------------------
+
+def _init_git_repo_s5(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {**_os_s5.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.com",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.com"}
+
+    def run(*args):
+        return _subprocess_s5.run(
+            ["git", *args], cwd=str(repo), capture_output=True, text=True,
+            check=True, env=env,
+        )
+
+    run("init")
+    run("config", "user.email", "t@t.com")
+    run("config", "user.name", "t")
+    (repo / "f.txt").write_text("v1")
+    run("add", "f.txt")
+    run("commit", "-m", "v1")
+    sha1 = run("rev-parse", "HEAD").stdout.strip()
+    return repo, sha1
+
+
+_HAS_GIT_S5 = _shutil_s5.which("git") is not None
+
+
+@pytest.mark.skipif(not _HAS_GIT_S5, reason="git CLI not available")
+@pytest.mark.asyncio
+async def test_resolve_git_default_resolver_reachable_commit(tmp_path):
+    repo, sha1 = _init_git_repo_s5(tmp_path)
+    ptr = {"source_type": "code", "targets": [{"uri": str(repo), "selector": {
+        "type": "git", "repository": str(repo), "commit": sha1,
+    }}]}
+    out = (await resolve_pointer(None, ptr))["targets"][0]
+    assert out["resolved"] is True
+    assert out["head"] == sha1
+    assert out["requested_sha"] == sha1
+    assert out["freshness_state"] == "unknown"  # no declared proof
+
+
+@pytest.mark.skipif(not _HAS_GIT_S5, reason="git CLI not available")
+@pytest.mark.asyncio
+async def test_resolve_git_unreachable_ref_is_unresolved_with_reason(tmp_path):
+    repo, _sha1 = _init_git_repo_s5(tmp_path)
+    ptr = {"source_type": "code", "targets": [{"uri": str(repo), "selector": {
+        "type": "git", "repository": str(repo), "ref": "totally-not-a-real-branch",
+    }}]}
+    out = (await resolve_pointer(None, ptr))["targets"][0]
+    assert out["resolved"] is False
+    assert "not reachable" in out["reason"]
+    assert out["freshness_state"] == "unavailable"
+
+
+@pytest.mark.skipif(not _HAS_GIT_S5, reason="git CLI not available")
+@pytest.mark.asyncio
+async def test_resolve_git_freshness_current_and_stale_by_source_revision(tmp_path):
+    repo, sha1 = _init_git_repo_s5(tmp_path)
+    selector = {"type": "git", "repository": str(repo), "commit": sha1}
+
+    ptr_current = {"source_type": "code", "targets": [{
+        "uri": str(repo), "selector": selector, "freshness": {"source_revision": sha1},
+    }]}
+    out_current = (await resolve_pointer(None, ptr_current))["targets"][0]
+    assert out_current["freshness_state"] == "current"
+
+    ptr_stale = {"source_type": "code", "targets": [{
+        "uri": str(repo), "selector": selector, "freshness": {"source_revision": "0" * 40},
+    }]}
+    out_stale = (await resolve_pointer(None, ptr_stale))["targets"][0]
+    assert out_stale["freshness_state"] == "stale"
+
+
+@pytest.mark.asyncio
+async def test_resolve_git_non_local_repository_is_unresolved():
+    ptr = {"source_type": "code", "targets": [{"uri": "u", "selector": {
+        "type": "git", "repository": "https://github.com/example/repo.git", "ref": "main",
+    }}]}
+    out = (await resolve_pointer(None, ptr))["targets"][0]
+    assert out["resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_git_resolver_exception_is_guarded():
+    async def boom(_selector):
+        raise RuntimeError("git binary missing")
+    ptr = {"source_type": "code", "targets": [{"uri": "u", "selector": {
+        "type": "git", "repository": "r", "commit": "abc",
+    }}]}
+    out = (await resolve_pointer(None, ptr, git_resolver=boom))["targets"][0]
+    assert out["resolved"] is False
+
+
+# --- resolution: remote_fs (no core-local default) --------------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_remote_fs_without_injected_resolver_is_unresolved():
+    ptr = {"source_type": "infra", "targets": [{"uri": "remote://h/p", "selector": {
+        "type": "remote_fs", "host_id": "h1", "filesystem_slot": "Filesystem", "path": "/p",
+    }}]}
+    out = (await resolve_pointer(None, ptr))["targets"][0]
+    assert out["resolved"] is False
+    assert "no remote filesystem resolver" in out["reason"]
+    assert out["freshness_state"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_resolve_remote_fs_with_injected_resolver_resolves():
+    async def fake_remote_fs(selector):
+        assert selector["host_id"] == "h1"
+        return {"content_hash": "live-hash-1", "size": 42}
+
+    ptr = {"source_type": "infra", "targets": [{"uri": "remote://h/p", "selector": {
+        "type": "remote_fs", "host_id": "h1", "filesystem_slot": "Filesystem", "path": "/p",
+    }, "freshness": {"content_hash": "live-hash-1"}}]}
+    out = (await resolve_pointer(None, ptr, remote_fs_resolver=fake_remote_fs))["targets"][0]
+    assert out["resolved"] is True
+    assert out["manifest"]["content_hash"] == "live-hash-1"
+    assert out["freshness_state"] == "current"
+
+
+@pytest.mark.asyncio
+async def test_resolve_remote_fs_injected_resolver_exception_is_guarded():
+    async def boom(_selector):
+        raise RuntimeError("tunnel down")
+    ptr = {"source_type": "infra", "targets": [{"uri": "u", "selector": {
+        "type": "remote_fs", "host_id": "h", "filesystem_slot": "f", "path": "p",
+    }}]}
+    out = (await resolve_pointer(None, ptr, remote_fs_resolver=boom))["targets"][0]
+    assert out["resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_remote_fs_no_leakage_across_two_projects():
+    """62640241 acceptance criterion 5, at the pure-function layer this
+    module owns: resolve_pointer keeps NO module-global cache — every
+    resolver seam is per-call — so two independently-injected resolvers
+    for two different "projects" sharing the SAME host_id never share
+    state or answers. (A live, DB-backed two-tenant test belongs at the
+    tunnel/routes layer, out of scope for this pure module.)"""
+    async def resolver_for_project(pid):
+        async def _r(selector):
+            return {"content_hash": f"{pid}-hash", "seen_host": selector["host_id"]}
+        return _r
+
+    selector = {"type": "remote_fs", "host_id": "shared-host",
+                "filesystem_slot": "f", "path": "/x"}
+    ptr_p1 = {"source_type": "infra", "targets": [{"uri": "u", "selector": selector}]}
+    ptr_p2 = {"source_type": "infra", "targets": [{"uri": "u", "selector": selector}]}
+
+    out1 = (await resolve_pointer(
+        None, ptr_p1, project_id="project-1",
+        remote_fs_resolver=await resolver_for_project("project-1"),
+    ))["targets"][0]
+    out2 = (await resolve_pointer(
+        None, ptr_p2, project_id="project-2",
+        remote_fs_resolver=await resolver_for_project("project-2"),
+    ))["targets"][0]
+
+    assert out1["manifest"]["content_hash"] == "project-1-hash"
+    assert out2["manifest"]["content_hash"] == "project-2-hash"
+
+
+# --- resolution: artifact ---------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_artifact_default_resolver_hashes_local_file(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b'{"ok": true}')
+    expected = _hashlib_s5.sha256(b'{"ok": true}').hexdigest()
+
+    ptr = {"source_type": "experiment", "targets": [{"uri": str(manifest), "selector": {
+        "type": "artifact", "manifest_uri": str(manifest),
+    }}]}
+    out = (await resolve_pointer(None, ptr))["targets"][0]
+    assert out["resolved"] is True
+    assert out["manifest"]["content_hash"] == expected
+
+
+@pytest.mark.asyncio
+async def test_resolve_artifact_missing_file_is_unresolved(tmp_path):
+    missing = tmp_path / "does-not-exist.json"
+    ptr = {"source_type": "experiment", "targets": [{"uri": str(missing), "selector": {
+        "type": "artifact", "manifest_uri": str(missing),
+    }}]}
+    out = (await resolve_pointer(None, ptr))["targets"][0]
+    assert out["resolved"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_artifact_freshness_current_and_stale(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(b"payload-v1")
+    real_hash = _hashlib_s5.sha256(b"payload-v1").hexdigest()
+
+    selector = {"type": "artifact", "manifest_uri": str(manifest)}
+    ptr_current = {"source_type": "experiment", "targets": [{
+        "uri": str(manifest), "selector": selector, "freshness": {"content_hash": real_hash},
+    }]}
+    out_current = (await resolve_pointer(None, ptr_current))["targets"][0]
+    assert out_current["freshness_state"] == "current"
+
+    ptr_stale = {"source_type": "experiment", "targets": [{
+        "uri": str(manifest), "selector": selector, "freshness": {"content_hash": "stale-hash"},
+    }]}
+    out_stale = (await resolve_pointer(None, ptr_stale))["targets"][0]
+    assert out_stale["freshness_state"] == "stale"
+
+
+@pytest.mark.asyncio
+async def test_resolve_artifact_resolver_exception_is_guarded():
+    async def boom(_selector):
+        raise RuntimeError("hash read failed")
+    ptr = {"source_type": "experiment", "targets": [{"uri": "u", "selector": {
+        "type": "artifact", "manifest_uri": "m",
+    }}]}
+    out = (await resolve_pointer(None, ptr, artifact_resolver=boom))["targets"][0]
+    assert out["resolved"] is False
+
+
+# --- resolution: text_quote freshness_state reuses drift ---------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_text_quote_freshness_state_mirrors_drift():
+    ptr = {"source_type": "web", "targets": [{"uri": "https://x/a", "selector": {
+        "type": "text_quote", "exact": "the cited passage",
+    }}]}
+
+    async def present(_uri): return "... the cited passage lives here ..."
+    hit = (await resolve_pointer(None, ptr, web_fetcher=present))["targets"][0]
+    assert hit["freshness_state"] == "current"
+
+    async def changed(_uri): return "totally different content now"
+    drift = (await resolve_pointer(None, ptr, web_fetcher=changed))["targets"][0]
+    assert drift["freshness_state"] == "stale"
+
+    async def nothing(_uri): return None
+    n = (await resolve_pointer(None, ptr, web_fetcher=nothing))["targets"][0]
+    assert n["freshness_state"] == "unavailable"
+
+
+# --- freshness concept is a no-op for the six original selector types --------------
+
+@pytest.mark.asyncio
+async def test_freshness_state_not_applicable_for_original_selector_types():
+    ptr = {"source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2}},
+        {"uri": "a.py", "selector": {"type": "symbol", "qualified_name": "a.b"}},
+        {"uri": "u", "selector": {"type": "zotero_key", "key": "K1"}},
+    ]}
+    async def sym_resolver(_db, _pid, _q, _lim): return []
+    async def cite_resolver(_ref): return None
+    out = await resolve_pointer(
+        None, ptr, symbol_resolver=sym_resolver, citation_resolver=cite_resolver,
+    )
+    for t in out["targets"]:
+        assert "freshness_state" not in t
+
+
+# --- subSelector threads new resolver kwargs through --------------------------------
+
+@pytest.mark.asyncio
+async def test_subselector_directory_resolves_with_new_resolver_kwargs(tmp_path):
+    (tmp_path / "a.py").write_text("x")
+    ptr = {"source_type": "infra", "targets": [{
+        "uri": "outer", "selector": {
+            "type": "finding_id", "id": "f1",
+            "subSelector": {"type": "directory", "root": str(tmp_path)},
+        },
+    }]}
+    async def finder(_id): return {"id": "f1", "title": "t", "body": "b"}
+    out = (await resolve_pointer(None, ptr, finding_resolver=finder))["targets"][0]
+    assert out["subResolved"]["resolved"] is True
+
+
+# --- typed record + rollup integration -----------------------------------------------
+
+@pytest.mark.asyncio
+async def test_typed_record_carries_freshness_state_and_declared_proof(tmp_path):
+    (tmp_path / "a.py").write_text("x")
+    selector = {"type": "directory", "root": str(tmp_path), "include": ["*.py"]}
+    stored = {"id": "ptr-1", "source_type": "infra", "targets": [
+        {"uri": str(tmp_path), "selector": selector, "target_kind": "existing",
+         "freshness": {"content_hash": "stale-value", "state": "unknown"}},
+    ]}
+    resolved = await resolve_pointer(None, stored)
+    record = build_typed_pointer_record(stored, resolved)
+    target_entry = record["targets"][0]
+    assert target_entry["freshness"]["content_hash"] == "stale-value"
+    assert target_entry["freshness_state"] == "stale"
+    assert record["freshness_verified"] is False
+    assert "not current" in record["freshness_reason"]
+
+
+@pytest.mark.asyncio
+async def test_typed_record_freshness_verified_true_when_current(tmp_path):
+    (tmp_path / "a.py").write_text("x")
+    selector = {"type": "directory", "root": str(tmp_path), "include": ["*.py"]}
+    live = (await resolve_pointer(
+        None, {"source_type": "infra", "targets": [{"uri": str(tmp_path), "selector": selector}]},
+    ))["targets"][0]
+    live_hash = live["manifest"]["manifest_hash"]
+
+    stored = {"id": "ptr-2", "source_type": "infra", "targets": [
+        {"uri": str(tmp_path), "selector": selector, "target_kind": "existing",
+         "freshness": {"content_hash": live_hash}},
+    ]}
+    resolved = await resolve_pointer(None, stored)
+    record = build_typed_pointer_record(stored, resolved)
+    assert record["targets"][0]["freshness_state"] == "current"
+    assert record["freshness_verified"] is True
+    assert "freshness_reason" not in record
+
+
+def test_typed_record_freshness_verified_none_when_not_applicable():
+    stored = {"id": "ptr-3", "source_type": "code", "targets": [
+        {"uri": "a.py", "selector": {"type": "range", "start_line": 1, "end_line": 2},
+         "target_kind": "existing"},
+    ]}
+    resolved = {"source_type": "code", "targets": [
+        {"resolved": True, "selector_type": "range", "uri": "a.py", "range": {}},
+    ]}
+    record = build_typed_pointer_record(stored, resolved)
+    assert "freshness_state" not in record["targets"][0]
+    assert record["freshness_verified"] is None
+
+
+def test_aggregate_pointer_evidence_freshness_rollup():
+    fresh_ok = {"structural_valid": True, "target_resolved": True,
+                "provenance_verified": None, "resolution_source": "not_applicable",
+                "freshness_verified": True}
+    fresh_bad = {"structural_valid": True, "target_resolved": True,
+                 "provenance_verified": None, "resolution_source": "not_applicable",
+                 "freshness_verified": False}
+    fresh_na = {"structural_valid": True, "target_resolved": True,
+                "provenance_verified": None, "resolution_source": "not_applicable",
+                "freshness_verified": None}
+
+    assert aggregate_pointer_evidence([fresh_ok])["freshness_verified"] is True
+    assert aggregate_pointer_evidence([fresh_ok, fresh_bad])["freshness_verified"] is False
+    assert aggregate_pointer_evidence([fresh_na])["freshness_verified"] is None
+    assert aggregate_pointer_evidence([])["freshness_verified"] is None
+
+
+# --- strict_freshness_gate -----------------------------------------------------------
+
+def test_strict_freshness_gate_passes_when_all_current_or_not_applicable():
+    records = [
+        {"id": "p1", "source_type": "infra", "targets": [
+            {"uri": "d", "freshness_state": "current"},
+            {"uri": "a.py"},  # no freshness concept — never blocking
+        ]},
+    ]
+    ok, reasons = strict_freshness_gate(records)
+    assert ok is True
+    assert reasons == []
+
+
+def test_strict_freshness_gate_empty_records_passes():
+    ok, reasons = strict_freshness_gate([])
+    assert ok is True and reasons == []
+
+
+@pytest.mark.parametrize("state", ["stale", "unknown", "unavailable", "ambiguous"])
+def test_strict_freshness_gate_blocks_on_each_bad_state(state):
+    records = [
+        {"id": "p1", "source_type": "infra", "targets": [
+            {"uri": "target-uri", "freshness_state": state},
+        ]},
+    ]
+    ok, reasons = strict_freshness_gate(records)
+    assert ok is False
+    assert len(reasons) == 1
+    assert "target-uri" in reasons[0]
+    assert state in reasons[0]
+    assert "p1" in reasons[0]
+
+
+def test_strict_freshness_gate_reports_one_reason_per_blocking_target():
+    records = [
+        {"id": "p1", "source_type": "infra", "targets": [
+            {"uri": "a", "freshness_state": "stale"},
+            {"uri": "b", "freshness_state": "current"},
+        ]},
+        {"source_type": "code", "targets": [
+            {"uri": "c", "freshness_state": "unknown"},
+        ]},
+    ]
+    ok, reasons = strict_freshness_gate(records)
+    assert ok is False
+    assert len(reasons) == 2
+
+
+def test_strict_freshness_gate_ignores_malformed_entries():
+    ok, reasons = strict_freshness_gate([None, {"targets": "not-a-list"}, {"targets": [None]}])
+    assert ok is True and reasons == []
+
+
+# --- tool-manifest parity: the new selector types are advertised ---------------------
+
+def test_add_sprint_item_pointer_schema_advertises_new_selector_types():
+    """62640241 — the notes flagged that text_quote/finding_id existed
+    internally but weren't consistently advertised in the public
+    add_sprint_item_pointer schema; the new directory/git/remote_fs/artifact
+    types + the freshness proof must not repeat that gap."""
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    tool = by_name["add_sprint_item_pointer"]
+    haystack = tool["description"] + tool["inputSchema"]["properties"]["targets"]["description"]
+    for token in (
+        "directory", "git", "remote_fs", "artifact", "text_quote", "finding_id",
+        "freshness", "canonical_url", "retrieval_hash",
+    ):
+        assert token in haystack, f"{token!r} not advertised in add_sprint_item_pointer schema"
+
+
+def test_resolve_sprint_item_pointers_schema_mentions_freshness_state():
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+    desc = by_name["resolve_sprint_item_pointers"]["description"]
+    assert "freshness_state" in desc
+    assert "directory" in desc and "git" in desc and "artifact" in desc
