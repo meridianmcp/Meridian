@@ -130,6 +130,7 @@ from . import goal_md as goal_md_module
 from . import enqueue as enqueue_module
 from . import dispatcher as dispatcher_module
 from . import handoff as handoff_module
+from . import hook_paths as hook_paths_module
 from . import toml_config as toml_config_module
 from . import md_anchors as md_anchors_module
 from . import git_md as git_md_module
@@ -6456,14 +6457,13 @@ def _normalize_hook_cwd_path(path: str) -> str:
     Mirrors the nested ``_normalize_hook_cwd`` in ``hooks_session_start`` so the
     stop hook resolves a project from a cwd the exact same way session-start
     does (WSL /mnt/c/... → C:/..., backslashes → forward slashes, no trailing /).
+
+    e5eec33b — delegates to ``hook_paths.normalize_wsl_path``, the one
+    canonical implementation shared by the active-repository hook-path
+    resolver, so this and every other WSL-aware path consumer never drift
+    apart.
     """
-    value = (path or "").strip().replace("\\", "/")
-    m = re.match(r"^/mnt/([a-zA-Z])(?:/(.*))?$", value)
-    if m:
-        drive = m.group(1).upper()
-        rest = (m.group(2) or "").strip("/")
-        value = f"{drive}:/{rest}" if rest else f"{drive}:/"
-    return value.rstrip("/")
+    return hook_paths_module.normalize_wsl_path(path)
 
 
 async def _resolve_hook_project_id(
