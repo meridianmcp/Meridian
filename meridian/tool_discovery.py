@@ -79,7 +79,13 @@ Four pieces, matching the sprint item's four asks:
    stored project-wide ``test_cmd``): spawn via argument-list
    ``create_subprocess_exec`` (no shell, no pipe) whenever the caller
    supplies a token list, so ``proc.returncode`` IS the real target-process
-   exit status, never masked by an intermediate pipeline stage.
+   exit status, never masked by an intermediate pipeline stage. e24f2daa
+   additionally routes that real exit code (plus signal/timeout/captured
+   output) through :func:`meridian.test_run_receipt.classify_subprocess_result`
+   before returning, so a thin/empty result (``exit_code=0``, no output, no
+   parsed counts) is never indistinguishable from a genuine pass, and an
+   xdist/pytest infrastructure crash (exit 3/4, a recognized crash-text
+   marker) is never misreported as an ordinary test failure.
 
 Every public function here is fully guarded against unexpected errors from
 its DB-backed dependencies (mirrors the rest of this codebase's
@@ -94,6 +100,7 @@ import re
 from typing import Any
 
 from . import code_intel_receipt as _code_intel_receipt
+from . import test_run_receipt as _test_run_receipt
 from . import tool_requirements as _tool_requirements
 
 TOOL_DISCOVERY_SCHEMA_VERSION = 1
@@ -641,12 +648,29 @@ async def run_targeted_tests(
     ``passed``/``failed`` (best-effort parsed counts), ``stdout_tail``/
     ``stderr_tail`` (last :data:`_TAIL_BYTES` bytes each), ``cmd`` (echoed
     back for the caller's own logging).
+
+    e24f2daa — also carries ``classification`` (one of
+    :data:`meridian.test_run_receipt.CLASSIFICATIONS`) and
+    ``classification_reason``: this function's own exit-code/signal safety
+    guarantee (above) only protects against a WRAPPING shell masking the
+    real exit code — it says nothing about whether ``exit_code=0`` with an
+    EMPTY captured log is genuine evidence of a pass (it is not), or whether
+    a nonzero code came from a real assertion failure versus pytest's own
+    INTERNAL_ERROR/USAGE_ERROR exit codes (3/4, an infrastructure crash, not
+    a code regression). ``classify_subprocess_result`` applies that same
+    fail-closed discipline the durable ``TestRunRecord`` consumer applies to
+    a full-suite run — never silently treating a thin/empty result as
+    ``passed``. ``status``/``exit_code``/``passed``/``failed`` above are
+    UNCHANGED (this is a pure addition) for every existing caller.
     """
     if not cmd:
+        _empty_classified = _test_run_receipt.classify_subprocess_result(exit_code=None)
         return {
             "status": "error", "message": "cmd is empty", "exit_code": None,
             "passed": None, "failed": None, "stdout_tail": "", "stderr_tail": "",
             "cmd": cmd,
+            "classification": _empty_classified["classification"],
+            "classification_reason": "cmd is empty -- no command was ever executed",
         }
 
     try:
@@ -681,12 +705,18 @@ async def run_targeted_tests(
                 "message": f"command timed out after {timeout:.0f}s",
                 "exit_code": None, "passed": None, "failed": None,
                 "stdout_tail": "", "stderr_tail": "", "cmd": cmd,
+                "classification": _test_run_receipt.CLASS_TIMEOUT,
+                "classification_reason": f"command timed out after {timeout:.0f}s",
             }
 
         exit_code: int = proc.returncode if proc.returncode is not None else -1
         stdout_str = stdout_b[-_TAIL_BYTES:].decode("utf-8", errors="replace") if stdout_b else ""
         stderr_str = stderr_b[-_TAIL_BYTES:].decode("utf-8", errors="replace") if stderr_b else ""
         passed, failed = _parse_test_counts(stdout_str + "\n" + stderr_str)
+        _classified = _test_run_receipt.classify_subprocess_result(
+            exit_code=exit_code, stdout=stdout_str, stderr=stderr_str,
+            passed=passed, failed=failed,
+        )
 
         return {
             "status": "ok",
@@ -696,12 +726,16 @@ async def run_targeted_tests(
             "stdout_tail": stdout_str,
             "stderr_tail": stderr_str,
             "cmd": cmd,
+            "classification": _classified["classification"],
+            "classification_reason": _classified["reason"],
         }
     except Exception as exc:  # noqa: BLE001 — a broken runner must report, never crash the caller
         return {
             "status": "error", "message": str(exc), "exit_code": None,
             "passed": None, "failed": None, "stdout_tail": "", "stderr_tail": "",
             "cmd": cmd,
+            "classification": _test_run_receipt.CLASS_INFRA_CRASH,
+            "classification_reason": f"failed to spawn/communicate with the target process: {exc}",
         }
 
 

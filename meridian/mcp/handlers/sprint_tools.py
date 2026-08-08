@@ -30,6 +30,7 @@ import meridian.server as _server
 from meridian import continuation_gate as continuation_gate_module
 from meridian import db as db_module
 from meridian import goal_md as goal_md_module
+from meridian import test_run_receipt as test_run_receipt_module
 from meridian._deps import validate_input_size, _hosted_mode
 
 
@@ -1637,6 +1638,65 @@ async def handle_complete_sprint_item(
                     ),
                 }
 
+    # e24f2daa — fail-closed TEST-RUN-RECEIPT gate + evidence surfacing.
+    # Two independent pieces, mirroring the strict_evidence/code_intel_receipt
+    # blocks above exactly:
+    #   1. ALWAYS best-effort (never raises, never blocks on its own): looks
+    #      up the current durable test-run receipt for this checkout
+    #      (scripts/run_tests.py's TestRunRecord, via test_run_receipt.py) and
+    #      classifies it -- attached to the completed item below regardless
+    #      of whether the strict gate engages, so run_id/state/exit_code/
+    #      signal/phase/last_progress/timeout_kind/cleanup_status are always
+    #      visible completion evidence, not just a pass/fail boolean.
+    #   2. OPT-IN (strict_test_evidence=true, or the item's own
+    #      require_strict_test_evidence flag): a real fail-closed reject
+    #      unless the resolved evidence classifies as "passed" -- missing,
+    #      non-terminal, crashed, timed-out, cancelled, or an
+    #      insufficiently-evidenced "passed" record are ALL refused, never
+    #      silently treated as success. override_test_run_receipt=true with a
+    #      non-empty override_reason acknowledges and completes anyway
+    #      (audited via record_test_run_receipt_override), same pattern as
+    #      override_strict_evidence / override_code_intel_receipt.
+    _test_run_evidence: dict[str, Any] | None = None
+    _test_run_receipt_override: dict[str, Any] | None = None
+    try:
+        _test_run_repo_root = await test_run_receipt_module.resolve_repo_root_for_session(
+            db, _server._REPO_ROOT, _complete_session_id or None,
+        )
+        _test_run_evidence = test_run_receipt_module.get_test_run_evidence(_test_run_repo_root)
+    except Exception:  # noqa: BLE001 — evidence surfacing must never block completion
+        _test_run_evidence = None
+    _strict_test_evidence = bool(args.get("strict_test_evidence")) or bool(
+        (_pre_item or {}).get("require_strict_test_evidence")
+    )
+    if (
+        _strict_test_evidence
+        and _pre_item is not None
+        and _pre_item.get("project_id") == args["project_id"]
+    ):
+        _tr_check = await test_run_receipt_module.verify_test_run_receipt_evidence(
+            db, _server._REPO_ROOT, _pre_item, session_id=_complete_session_id or None,
+        )
+        _test_run_evidence = _tr_check.get("evidence") or _test_run_evidence
+        if not _tr_check.get("ok"):
+            _tr_override_requested = bool(args.get("override_test_run_receipt"))
+            _tr_override_reason = (args.get("override_reason") or "").strip()
+            if _tr_override_requested and _tr_override_reason:
+                _test_run_receipt_override = await test_run_receipt_module.record_test_run_receipt_override(
+                    db, args["project_id"], args["item_id"],
+                    actor=_complete_actor,
+                    reason=_tr_override_reason,
+                    evidence=_tr_check.get("evidence") or {},
+                    tenant_id=(tenant or {}).get("id"),
+                )
+            else:
+                return {
+                    "error": _tr_check.get("code") or "TEST_RUN_RECEIPT_BLOCKED",
+                    "item_id": args["item_id"],
+                    "test_run_receipt": _tr_check.get("evidence"),
+                    "message": _tr_check.get("message"),
+                }
+
     # 5823db0b — quality gate + actor attribution. Pass evidence notes and
     # the completing actor; surface the required_notes gate as a clean error.
     try:
@@ -1730,6 +1790,15 @@ async def handle_complete_sprint_item(
             item["code_intel_receipt"] = _code_intel_check.get("receipt")
         if _code_intel_override:
             item["code_intel_receipt_override"] = _code_intel_override
+    if _test_run_evidence is not None:
+        # e24f2daa — always surface the current test-run receipt classification
+        # (run_id/state/exit_code/signal/phase/last_progress_at/timeout_kind/
+        # cleanup_status) on the completed item, regardless of whether the
+        # strict gate above engaged — this is evidence, not just a verdict.
+        item = dict(item)
+        item["test_run_receipt"] = _test_run_evidence
+        if _test_run_receipt_override:
+            item["test_run_receipt_override"] = _test_run_receipt_override
     # fdaa5b55 — item has a linked GitHub issue: auto-close (meridian_auto)
     # or post a proposed-closure comment + non-blocking HITL (manual/unset).
     # Never lets a GitHub failure undo the completion that already succeeded
