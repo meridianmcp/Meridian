@@ -5771,10 +5771,21 @@ def test_close_owned_process_real_windows_backend_skips_signal_on_pid_reuse(monk
 # ---------------------------------------------------------------------------
 
 
+class _FakeLease:
+    def __init__(self, run_id, pid):
+        self.run_id = run_id
+        self.pid = pid
+
+
 class _FakeLeaseBroker:
     def __init__(self):
         self.registered = []
         self.released = []
+        # 39c8cf2c — acquire_exclusive support for the wrapper-lease tests
+        # below. `raise_conflict`, when set, makes the NEXT acquire_exclusive
+        # call raise it (simulating a genuinely live prior wrapper).
+        self.acquire_exclusive_calls = []
+        self.raise_conflict: "Exception | None" = None
 
     def register(self, client, pid, **kwargs):
         self.registered.append((client, pid, kwargs))
@@ -5782,6 +5793,13 @@ class _FakeLeaseBroker:
 
     def release(self, client, run_id):
         self.released.append((client, run_id))
+
+    def acquire_exclusive(self, client, owner_key, pid, **kwargs):
+        self.acquire_exclusive_calls.append((client, owner_key, pid, kwargs))
+        if self.raise_conflict is not None:
+            exc, self.raise_conflict = self.raise_conflict, None
+            raise exc
+        return _FakeLease(run_id=f"run-{pid}", pid=pid)
 
 
 def test_process_leases_enabled_default_off(monkeypatch):
@@ -5943,3 +5961,273 @@ def test_close_owned_process_releases_lease_when_enabled(monkeypatch):
     ok = tc._close_owned_process(handle)
     assert ok is True
     assert fake_broker.released == [(tc._LEASE_CLIENT_NAME, "close-me")]
+
+
+# ---------------------------------------------------------------------------
+# 39c8cf2c — single-owner wrapper lease (_acquire_wrapper_lease /
+# _release_wrapper_lease). Opt-in via MERIDIAN_PROCESS_LEASES_ENABLED=1, same
+# gate as the child-spawn lease helpers above. Never touches a real process —
+# the broker is fully faked.
+# ---------------------------------------------------------------------------
+
+
+def test_wrapper_owner_key_is_keyed_by_repo_path():
+    assert tc._wrapper_owner_key("/repo/a") != tc._wrapper_owner_key("/repo/b")
+    assert tc._wrapper_owner_key("/repo/a") == tc._wrapper_owner_key("/repo/a")
+    assert "/repo/a" in tc._wrapper_owner_key("/repo/a")
+
+
+def test_acquire_wrapper_lease_noop_when_disabled(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    assert tc._acquire_wrapper_lease("/repo") is None
+    assert fake_broker.acquire_exclusive_calls == []
+
+
+def test_acquire_wrapper_lease_cold_start_returns_run_id(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    run_id = tc._acquire_wrapper_lease("/repo")
+    assert run_id is not None
+    assert len(fake_broker.acquire_exclusive_calls) == 1
+    client, owner_key, pid, kwargs = fake_broker.acquire_exclusive_calls[0]
+    assert client == tc._LEASE_CLIENT_NAME
+    assert owner_key == tc._wrapper_owner_key("/repo")
+    assert pid == os.getpid()
+
+
+def test_acquire_wrapper_lease_reports_conflict_and_does_not_raise(monkeypatch, capsys):
+    """A genuinely live prior wrapper must be reported (stderr warning), not
+    raised out of run_tunnel's startup and not silently swallowed either —
+    the caller gets None back (meaning "no lease acquired, but keep going")."""
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    conflict_lease = _FakeLease(run_id="old-run", pid=4242)
+    fake_broker.raise_conflict = tc._process_registry.OwnerConflictError(
+        tc._LEASE_CLIENT_NAME, tc._wrapper_owner_key("/repo"), conflict_lease
+    )
+
+    run_id = tc._acquire_wrapper_lease("/repo")
+    assert run_id is None
+    captured = capsys.readouterr()
+    assert "4242" in captured.err
+    assert "/repo" in captured.err
+    assert "warning" in captured.err.lower()
+
+
+def test_acquire_wrapper_lease_best_effort_on_generic_broker_error(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+
+    class _BoomBroker:
+        def acquire_exclusive(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: _BoomBroker())
+    assert tc._acquire_wrapper_lease("/repo") is None  # must not raise
+
+
+def test_release_wrapper_lease_noop_when_disabled_or_none(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    tc._release_wrapper_lease("some-run-id")  # disabled → no-op
+    assert fake_broker.released == []
+
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    tc._release_wrapper_lease(None)  # None run_id → no-op even when enabled
+    assert fake_broker.released == []
+
+
+def test_release_wrapper_lease_releases_when_enabled(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    tc._release_wrapper_lease("run-123")
+    assert fake_broker.released == [(tc._LEASE_CLIENT_NAME, "run-123")]
+
+
+def test_release_wrapper_lease_best_effort_on_broker_error(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+
+    class _BoomBroker:
+        def release(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: _BoomBroker())
+    tc._release_wrapper_lease("run-123")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# 39c8cf2c — readiness gating (_run_connection / _run_connection_lazy).
+# Covers the deterministic lifecycle contract's core, incident-relevant fix:
+# READY is announced on first inbound frame OR a bounded grace window,
+# whichever is first; a connection that opens then closes before either
+# raises TunnelNeverReadyError. Every FakeWS below is entirely in-process —
+# no real socket, no real subprocess, no real ambient process touched.
+# ---------------------------------------------------------------------------
+
+
+class _QueueWS:
+    """Minimal fake WebSocket: yields queued messages, then ends the
+    iteration (StopAsyncIteration) — mirrors the FakeWS shape already used
+    throughout this file and test_cov_tunnel_client.py."""
+
+    def __init__(self, messages):
+        self._msgs = list(messages)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        pass
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._msgs:
+            raise StopAsyncIteration
+        return self._msgs.pop(0)
+
+    async def send(self, data):
+        pass
+
+
+class _FakeHttpClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        pass
+
+
+def _patch_ws_and_http(monkeypatch, ws):
+    import httpx as _httpx
+    import websockets as _ws
+
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: ws)
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: _FakeHttpClient())
+
+
+def test_run_connection_reaches_ready_on_first_message(monkeypatch):
+    ws = _QueueWS([json.dumps({"type": "ping"})])
+    _patch_ws_and_http(monkeypatch, ws)
+    lifecycle = tc._tunnel_lifecycle.TunnelLifecycle(label="fs")
+
+    asyncio.run(tc._run_connection("wss://x/tunnel/t", 8808, "fs", lifecycle=lifecycle))
+
+    assert lifecycle.state is tc._tunnel_lifecycle.LifecycleState.READY
+    assert lifecycle.is_ready is True
+
+
+def test_run_connection_never_ready_raises_and_marks_lifecycle(monkeypatch):
+    ws = _QueueWS([])  # zero messages — closes immediately
+    _patch_ws_and_http(monkeypatch, ws)
+    lifecycle = tc._tunnel_lifecycle.TunnelLifecycle(label="fs")
+
+    with pytest.raises(tc._tunnel_lifecycle.TunnelNeverReadyError) as excinfo:
+        asyncio.run(tc._run_connection("wss://x/tunnel/t", 8808, "fs", lifecycle=lifecycle))
+
+    assert excinfo.value.label == "fs"
+    assert lifecycle.state is tc._tunnel_lifecycle.LifecycleState.NEVER_READY
+
+
+def test_run_connection_never_ready_without_lifecycle_still_raises(monkeypatch):
+    """lifecycle is optional — the readiness gate itself must not depend on
+    a lifecycle object being supplied."""
+    ws = _QueueWS([])
+    _patch_ws_and_http(monkeypatch, ws)
+    with pytest.raises(tc._tunnel_lifecycle.TunnelNeverReadyError):
+        asyncio.run(tc._run_connection("wss://x/tunnel/t", 8808, "fs"))
+
+
+def test_run_connection_lazy_reaches_ready_on_first_message(monkeypatch):
+    ws = _QueueWS([json.dumps({"type": "ping"})])
+    _patch_ws_and_http(monkeypatch, ws)
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+    lifecycle = tc._tunnel_lifecycle.TunnelLifecycle(label="fs")
+
+    asyncio.run(
+        tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs", lifecycle=lifecycle)
+    )
+
+    assert lifecycle.state is tc._tunnel_lifecycle.LifecycleState.READY
+
+
+def test_run_connection_lazy_never_ready_raises_and_marks_lifecycle(monkeypatch):
+    ws = _QueueWS([])
+    _patch_ws_and_http(monkeypatch, ws)
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+    lifecycle = tc._tunnel_lifecycle.TunnelLifecycle(label="fs")
+
+    with pytest.raises(tc._tunnel_lifecycle.TunnelNeverReadyError):
+        asyncio.run(
+            tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs", lifecycle=lifecycle)
+        )
+    assert lifecycle.state is tc._tunnel_lifecycle.LifecycleState.NEVER_READY
+
+
+def test_reconnect_loop_backs_off_on_repeated_never_ready_not_busy_loop(monkeypatch):
+    """39c8cf2c — the actual bug this item fixes: before this change, a
+    connection that opened and then closed with zero messages exchanged
+    (e.g. an immediate server-side auth/plan rejection right after accept)
+    made _run_connection return NORMALLY, which _reconnect_loop treated as a
+    SUCCESSFUL attempt — resetting backoff to 1.0 and looping again
+    immediately, with no sleep at all, forever. Driving the REAL
+    _run_connection (not a mock) through _reconnect_loop against a server
+    that keeps closing immediately must now back off and climb exactly like
+    any other repeated failure."""
+    ws = _QueueWS([])  # every (re)connect attempt gets zero messages
+    _patch_ws_and_http(monkeypatch, ws)
+
+    sleeps: list[float] = []
+    attempts = {"n": 0}
+
+    async def fake_sleep(n):
+        sleeps.append(n)
+        attempts["n"] += 1
+        if attempts["n"] >= 3:
+            raise asyncio.CancelledError  # stop the loop after 3 backoff sleeps
+
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tc._reconnect_loop("wss://x", 8808, "fs"))
+
+    # Backoff must have actually happened AND climbed each time — not reset
+    # to (and stayed at) 1.0 forever, which is what the pre-fix "return
+    # normally" behavior produced.
+    assert len(sleeps) == 3
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+def test_reconnect_loop_lazy_backs_off_on_repeated_never_ready_not_busy_loop(monkeypatch):
+    """Same fix, applied to the LIVE code path run_tunnel actually schedules."""
+    ws = _QueueWS([])
+    _patch_ws_and_http(monkeypatch, ws)
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+
+    sleeps: list[float] = []
+    attempts = {"n": 0}
+
+    async def fake_sleep(n):
+        sleeps.append(n)
+        attempts["n"] += 1
+        if attempts["n"] >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tc._reconnect_loop_lazy("wss://x/tunnel/t", proxy, "fs"))
+
+    assert len(sleeps) == 3
+    assert sleeps == [1.0, 2.0, 4.0]

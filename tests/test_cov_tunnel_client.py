@@ -30,6 +30,22 @@ def _http_error(status_code: int) -> httpx.HTTPStatusError:
     return httpx.HTTPStatusError(str(status_code), request=request, response=response)
 
 
+async def _tolerate_never_ready(coro):
+    """39c8cf2c — a handful of pre-existing tests in this file drive
+    _run_connection/_run_connection_lazy with a FakeWS that closes having
+    delivered zero messages, purely as inert scaffolding for asserting on
+    something else entirely (e.g. the kwargs passed to websockets.connect).
+    That shape is now indistinguishable from a genuine "opened then closed
+    before ever becoming ready" connection, so those two functions correctly
+    raise TunnelNeverReadyError for it (see tests/test_tunnel_client.py for
+    dedicated behavior coverage of that new exception). Swallow it here so
+    tests whose actual assertions happened before the raise are unaffected."""
+    try:
+        await coro
+    except tc._tunnel_lifecycle.TunnelNeverReadyError:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # _write_cached_token — chmod failure tolerated; malformed existing file
 # ---------------------------------------------------------------------------
@@ -308,10 +324,20 @@ def test_websocket_connect_sites_set_explicit_ping_timeout(monkeypatch):
     monkeypatch.setattr(_ws, "connect", fake_connect)
     monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
 
-    asyncio.run(tc._run_connection("wss://x/tunnel/t", 8808, "fs"))
+    # 39c8cf2c — a FakeWS delivering zero messages before closing is exactly
+    # the "opened then closed before ever becoming ready" case _run_connection
+    # / _run_connection_lazy now correctly refuse to call a successful
+    # "connected" (see test_tunnel_client_readiness_gating.py-equivalent
+    # coverage in tests/test_tunnel_client.py for the dedicated behavior
+    # tests). This test only cares about the kwargs each connect() call site
+    # was given, which `fake_connect` already captured before either function
+    # got a chance to raise — tolerate the new exception here.
+    asyncio.run(_tolerate_never_ready(tc._run_connection("wss://x/tunnel/t", 8808, "fs")))
 
     proxy = tc.SlotProxy(["x"], 8808, "fs")
-    asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
+    asyncio.run(_tolerate_never_ready(
+        tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs")
+    ))
 
     pool = MagicMock()
     asyncio.run(
@@ -390,10 +416,12 @@ def test_websocket_connect_sites_set_explicit_open_timeout(monkeypatch):
     monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: FakeHttpClient())
     monkeypatch.setenv("MERIDIAN_TUNNEL_CONNECT_TIMEOUT", "37")
 
-    asyncio.run(tc._run_connection("wss://x/tunnel/t", 8808, "fs"))
+    asyncio.run(_tolerate_never_ready(tc._run_connection("wss://x/tunnel/t", 8808, "fs")))
 
     proxy = tc.SlotProxy(["x"], 8808, "fs")
-    asyncio.run(tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs"))
+    asyncio.run(_tolerate_never_ready(
+        tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs")
+    ))
 
     pool = MagicMock()
     asyncio.run(

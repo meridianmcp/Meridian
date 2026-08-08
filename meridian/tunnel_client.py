@@ -42,6 +42,7 @@ from . import process_budget as _process_budget
 from . import process_lifecycle as _process_lifecycle
 from . import process_registry as _process_registry
 from . import serena_pool as _serena_pool
+from . import tunnel_lifecycle as _tunnel_lifecycle
 from .serena_pool import SerenaDaemonPool, SERENA_POOL_BASE_PORT
 
 DEFAULT_BASE_URL = "https://usemeridian.us"
@@ -1738,6 +1739,7 @@ async def _run_connection_lazy(
     label: str = "fs",
     tool_prefix: str | None = None,
     known_repo_paths: "list[str] | None" = None,
+    lifecycle: "_tunnel_lifecycle.TunnelLifecycle | None" = None,
 ) -> None:
     """Hold one WebSocket session open with lazy proxy spawning.
 
@@ -1752,6 +1754,16 @@ async def _run_connection_lazy(
     *known_repo_paths* are trusted root anchors: if a path-not-allowed error
     falls under one of these roots the proxy is automatically expanded and the
     request retried once (b9d1b606).
+
+    39c8cf2c — this is the LIVE code path ``run_tunnel`` actually schedules
+    for the fs/code/extract-default/office/custom-office slots (unlike
+    ``_run_connection``, which is no longer wired into ``run_tunnel``), so
+    the same readiness-gating fix as ``_run_connection`` is applied here too:
+    "connected (lazy mode)" is announced on first inbound frame OR after a
+    bounded grace window, whichever is first, and a connection that opens
+    and then ends without ever reaching either raises
+    :class:`_tunnel_lifecycle.TunnelNeverReadyError` — see
+    :func:`_run_connection`'s docstring for the full rationale.
     """
     import httpx
     import websockets
@@ -1880,15 +1892,27 @@ async def _run_connection_lazy(
         if _reprobe_task is None:
             _reprobe_task = asyncio.ensure_future(_reprobe())
 
+    gate = _tunnel_lifecycle.ReadinessGate()
+    timer_task: "asyncio.Task | None" = None
+
+    def _announce() -> None:
+        if gate.announce():
+            if lifecycle is not None:
+                lifecycle.mark_ready()
+            print(f"tunnel:{label}: connected (lazy mode)", flush=True)
+
     try:
         async with websockets.connect(
             ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
             open_timeout=_tunnel_connect_timeout(),
         ) as ws:
-            print(f"tunnel:{label}: connected (lazy mode)", flush=True)
+            if lifecycle is not None:
+                lifecycle.mark_ws_open()
+            timer_task = _tunnel_lifecycle.start_grace_timer(_announce)
             local_base = f"http://127.0.0.1:{proxy.port}"
             async with httpx.AsyncClient() as http_client:
                 async for raw in ws:
+                    _announce()
                     try:
                         msg = json.loads(raw)
                     except (ValueError, TypeError):
@@ -2030,6 +2054,13 @@ async def _run_connection_lazy(
         # outlive the WebSocket it reports on (a3410a9c).
         if _reprobe_task is not None:
             _reprobe_task.cancel()
+        # 39c8cf2c — stop the readiness grace timer the same way; a no-op if
+        # it already fired or the connection never got past connect().
+        await _tunnel_lifecycle.stop_grace_timer(timer_task)
+    if not gate.announced:
+        if lifecycle is not None:
+            lifecycle.mark_never_ready()
+        raise _tunnel_lifecycle.TunnelNeverReadyError(label)
 
 
 async def _reconnect_loop_lazy(
@@ -3212,6 +3243,77 @@ def _release_owned_process_lease(
         _process_registry.get_broker().release(_LEASE_CLIENT_NAME, handle.run_id)
     except Exception:  # noqa: BLE001 — best-effort, never raise (already-released,
         pass         # never-registered, etc. are all fine to silently ignore here)
+
+
+# 39c8cf2c — single-owner lease for the WHOLE tunnel wrapper process (as
+# opposed to _register_owned_process_lease above, which leases individual
+# spawned CHILDREN). This is the "old wrapper remained alive" guardrail: a
+# fresh `run_tunnel` invocation acquires this lease before spawning anything,
+# so a genuinely-still-running prior wrapper for the SAME repo_path is
+# detected (verified via PID + create_time, never a bare pid_exists) rather
+# than silently coexisting with a brand new one. Same opt-in gate
+# (MERIDIAN_PROCESS_LEASES_ENABLED=1) and client name as every other lease
+# integration in this module — disabled by default, zero behavior change for
+# anyone who hasn't opted in.
+def _wrapper_owner_key(repo_path: str) -> str:
+    """Logical single-owner identity for one repo's tunnel wrapper. Keyed by
+    repo_path so independent tunnels for DIFFERENT repos on one machine are
+    legitimate concurrent owners, never a conflict."""
+    return f"tunnel-wrapper:{repo_path}"
+
+
+def _acquire_wrapper_lease(repo_path: str) -> "str | None":
+    """Best-effort: acquire the single-owner lease for this whole tunnel
+    wrapper process. Returns the acquired lease's ``run_id`` (hand it to
+    :func:`_release_wrapper_lease` at shutdown), or ``None`` when leasing is
+    disabled/unavailable.
+
+    A STALE prior lease (its process verified no longer alive) is silently
+    replaced — see ``ProcessLeaseBroker.acquire_exclusive``. A genuinely LIVE
+    prior wrapper for this same repo_path is reported via a clear stderr
+    warning but does NOT block this process from starting: refusing to start
+    outright is a bigger, riskier behavior change than an opt-in, report-only
+    MVP should make in one pass — see this sprint item's follow-up notes for
+    a proposed strict/fail-closed mode. Never kills the other process.
+    """
+    if not _process_leases_enabled():
+        return None
+    try:
+        pid = os.getpid()
+        create_time: "float | None" = None
+        try:
+            import psutil  # type: ignore
+            create_time = psutil.Process(pid).create_time()
+        except Exception:  # noqa: BLE001 — psutil unavailable; degrade gracefully
+            create_time = None
+        lease = _process_registry.get_broker().acquire_exclusive(
+            _LEASE_CLIENT_NAME, _wrapper_owner_key(repo_path), pid,
+            executable=sys.executable, cwd=repo_path,
+            cmdline=list(sys.argv), create_time=create_time,
+        )
+        return lease.run_id
+    except _process_registry.OwnerConflictError as exc:
+        print(
+            f"tunnel: warning — another tunnel wrapper for {repo_path!r} appears "
+            f"to still be running (pid {exc.lease.pid}, verified alive) — "
+            "starting anyway, but two wrappers serving the same repo can race "
+            "for ports and produce duplicate slot processes. Stop the other one "
+            "first if this is unexpected.",
+            file=sys.stderr, flush=True,
+        )
+        return None
+    except Exception:  # noqa: BLE001 — best-effort, never block tunnel startup
+        return None
+
+
+def _release_wrapper_lease(run_id: "str | None") -> None:
+    """Best-effort counterpart to :func:`_acquire_wrapper_lease`. Never raises."""
+    if run_id is None or not _process_leases_enabled():
+        return
+    try:
+        _process_registry.get_broker().release(_LEASE_CLIENT_NAME, run_id)
+    except Exception:  # noqa: BLE001 — best-effort, never raise
+        pass
 
 
 def _spawn_owned_with_cache_retry(
@@ -6002,33 +6104,71 @@ async def _fetch_me_with_retry(
 
 
 async def _run_connection(
-    ws_url: str, port: int, label: str = "fs", tool_prefix: str | None = None
+    ws_url: str, port: int, label: str = "fs", tool_prefix: str | None = None,
+    lifecycle: "_tunnel_lifecycle.TunnelLifecycle | None" = None,
 ) -> None:
-    """Hold one WebSocket session open, relaying requests until it drops."""
+    """Hold one WebSocket session open, relaying requests until it drops.
+
+    39c8cf2c — readiness ("connected") is no longer declared the instant the
+    WS transport handshake completes: the server
+    (routes/tunnel.py:tunnel_ws) accepts the socket THEN authenticates, and
+    closes immediately on a bad token / disallowed plan, so declaring
+    "connected" right after ``connect()`` returns could report success for a
+    connection that was about to be torn down a moment later — the
+    "reported Connected... then disconnected" incident pattern this fix
+    addresses. READY is now announced the moment EITHER (a) the first
+    inbound frame arrives, or (b) the socket has stayed open for
+    ``_tunnel_lifecycle.DEFAULT_READY_GRACE_SECONDS`` without closing —
+    whichever happens first (see :func:`_tunnel_lifecycle.start_grace_timer`
+    for why a bounded grace window, not "wait for the first frame",  is used).
+    If the connection ends before either happens, this raises
+    :class:`_tunnel_lifecycle.TunnelNeverReadyError` instead of returning
+    normally, so :func:`_reconnect_loop` applies its normal backoff rather
+    than busy-looping with zero backoff against a server that keeps
+    rejecting the connection immediately.
+    """
     import httpx
     import websockets
 
     local_base = f"http://127.0.0.1:{port}"
+    gate = _tunnel_lifecycle.ReadinessGate()
+
+    def _announce() -> None:
+        if gate.announce():
+            if lifecycle is not None:
+                lifecycle.mark_ready()
+            print(f"tunnel:{label}: connected", flush=True)
+
     async with websockets.connect(
         ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
         open_timeout=_tunnel_connect_timeout(),
     ) as ws:
-        print(f"tunnel:{label}: connected", flush=True)
-        async with httpx.AsyncClient() as http_client:
-            async for raw in ws:
-                try:
-                    msg = json.loads(raw)
-                except (ValueError, TypeError):
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("type") == "ping":
-                    continue
-                if msg.get("type") == "request":
-                    resp = await _relay_request(
-                        http_client, local_base, msg, tool_prefix=tool_prefix
-                    )
-                    await ws.send(json.dumps(resp))
+        if lifecycle is not None:
+            lifecycle.mark_ws_open()
+        timer_task = _tunnel_lifecycle.start_grace_timer(_announce)
+        try:
+            async with httpx.AsyncClient() as http_client:
+                async for raw in ws:
+                    _announce()
+                    try:
+                        msg = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("type") == "ping":
+                        continue
+                    if msg.get("type") == "request":
+                        resp = await _relay_request(
+                            http_client, local_base, msg, tool_prefix=tool_prefix
+                        )
+                        await ws.send(json.dumps(resp))
+        finally:
+            await _tunnel_lifecycle.stop_grace_timer(timer_task)
+    if not gate.announced:
+        if lifecycle is not None:
+            lifecycle.mark_never_ready()
+        raise _tunnel_lifecycle.TunnelNeverReadyError(label)
 
 
 # ---------------------------------------------------------------------------
@@ -6750,6 +6890,10 @@ async def run_tunnel(
     # Threaded through every SlotProxy so claim files can be attributed to this
     # run vs. a prior-generation tunnel that left orphans.
     _client_id: str = str(uuid.uuid4())
+    # 39c8cf2c — single-owner lease for this whole wrapper process (opt-in via
+    # MERIDIAN_PROCESS_LEASES_ENABLED=1; see _acquire_wrapper_lease). Released
+    # in the shutdown `finally` block below, alongside every other teardown step.
+    _wrapper_lease_run_id = _acquire_wrapper_lease(repo_path)
     # SlotProxy objects (one per enabled slot) replace the old proc_holders list.
     slot_proxies: list[SlotProxy] = []
     # Track which built-in slots have a registered SlotProxy (for URL printing).
@@ -7251,4 +7395,7 @@ async def run_tunnel(
         # Kill custom (eager) plugin processes.
         for holder in proc_holders:
             _terminate_proc_tree(holder.get("proc"))
+        # 39c8cf2c — release the whole-wrapper single-owner lease acquired at
+        # startup (no-op when leasing is disabled or was never acquired).
+        _release_wrapper_lease(_wrapper_lease_run_id)
     return 0
