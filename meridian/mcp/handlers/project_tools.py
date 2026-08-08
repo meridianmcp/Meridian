@@ -367,11 +367,29 @@ async def handle_start_session(
     # unconsumed handoff is a reasonable proxy for "the board/profile
     # snapshot behind this contract may itself be stale." Fully guarded: a
     # failure here degrades to no field rather than breaking start_session.
+    #
+    # 0de0599a — the compact orientation must stay small BY CONSTRUCTION:
+    # the per-item item_tool_requirements/item_sprint_item_pointers/
+    # item_artifact_pointer_findings/item_executor_contracts sections were
+    # observed inflating a real board's compact response to ~593KB (382KB
+    # from this field alone). Those per-item breakdowns exist for handoff
+    # consumers (planner/executor routing), not for a session-start check —
+    # a compact caller only needs the scalar executable/executable_reasons/
+    # availability/manifest_hash fields, so cap the list sections to 0 for
+    # compact=True. compact=False keeps the full, uncapped contract exactly
+    # as before (identical to every generate_handoff call site, which never
+    # pass these overrides).
+    _is_compact = bool(args.get("compact", True))
     try:
         if isinstance(result, dict):
             from meridian import handoff as _handoff_module  # noqa: PLC0415
+            _cc_kwargs: dict[str, Any] = {}
+            if _is_compact:
+                _cc_kwargs["max_executor_contracts"] = 0
+                _cc_kwargs["max_contract_list_items"] = 0
             result["capability_contract"] = await _handoff_module.build_effective_capability_contract(
                 db, _pid, board_stale=bool(result.get("pending_goal_stale")),
+                **_cc_kwargs,
             )
     except Exception:  # noqa: BLE001 — capability contract is best-effort
         pass

@@ -557,6 +557,38 @@ async def _resolve_pending_items_for_contract(
 
 _DEFAULT_MAX_EXECUTOR_CONTRACTS = 25
 
+# 248c0bb9 — the cap above only ever bounded item_executor_contracts. The
+# other three per-item sections (item_tool_requirements,
+# item_sprint_item_pointers, item_artifact_pointer_findings) had NO cap at
+# all: on a large board they could each grow to the full pending inventory,
+# same class of unbounded-size risk item_executor_contracts already needed
+# de4d4293's cap for (see build_capability_contract's own docstring for that
+# incident). This is the SAME deterministic, item_id-sorted, non-silent-
+# truncation pattern, generalized to the sections that pattern didn't
+# originally cover. A generous default (well above every legitimately-sized
+# project observed so far) so an ordinary board never truncates — this
+# exists to bound the WORST case, not to shrink the common case.
+_DEFAULT_MAX_CONTRACT_LIST_ITEMS = 200
+
+
+def _cap_contract_list(
+    entries: list[dict[str, Any]], max_items: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """248c0bb9 — deterministically cap an already ``item_id``-sorted list of
+    contract entries, mirroring ``item_executor_contracts``'
+    ``item_executor_contracts_truncated`` shape exactly so a caller checks
+    both the same way. Never a silent drop: ``truncated`` records whether
+    anything was actually cut, alongside the real total/included counts.
+    """
+    total = len(entries)
+    cap = max(0, int(max_items or 0))
+    capped = entries[:cap]
+    return capped, {
+        "truncated": total > len(capped),
+        "total_candidates": total,
+        "included": len(capped),
+    }
+
 
 async def build_capability_contract(
     db: Any,
@@ -568,8 +600,22 @@ async def build_capability_contract(
     version: "str | None" = None,
     items: "list[dict[str, Any]] | None" = None,
     max_executor_contracts: int = _DEFAULT_MAX_EXECUTOR_CONTRACTS,
+    max_contract_list_items: int = _DEFAULT_MAX_CONTRACT_LIST_ITEMS,
 ) -> dict[str, Any]:
     """Build the effective capability contract for ``project_id``.
+
+    ``max_contract_list_items`` (248c0bb9) — caps ``item_tool_requirements``,
+    ``item_sprint_item_pointers``, and ``item_artifact_pointer_findings``
+    the SAME way ``max_executor_contracts`` already caps
+    ``item_executor_contracts`` below: applied AFTER each section's own
+    deterministic ``item_id`` sort, with a sibling
+    ``item_<section>_truncated`` dict (``_cap_contract_list``) recording
+    ``{truncated, total_candidates, included}`` — never a silent drop. A
+    board at or under the cap (the overwhelming common case) sees the exact
+    same output as before this parameter existed. See
+    ``_DEFAULT_MAX_CONTRACT_LIST_ITEMS``'s own comment for why this exists:
+    these three sections had no bound at all before, unlike
+    ``item_executor_contracts``.
 
     ``board_stale`` — caller-supplied signal that the sprint-board/profile
     snapshot backing this contract is known stale (e.g. ``start_session``'s
@@ -667,6 +713,20 @@ async def build_capability_contract(
         )
     except Exception:  # noqa: BLE001 — contract building must never break on this
         item_artifact_pointer_findings = []
+
+    # 248c0bb9 — cap the three sections above the SAME way item_executor_
+    # contracts is capped below (see max_contract_list_items's docstring):
+    # each is already item_id-sorted by its own extractor, so capping here is
+    # deterministic and byte-for-byte stable across builds of the same board.
+    item_tool_requirements, item_tool_requirements_truncated = _cap_contract_list(
+        item_tool_requirements, max_contract_list_items,
+    )
+    item_sprint_item_pointers, item_sprint_item_pointers_truncated = _cap_contract_list(
+        item_sprint_item_pointers, max_contract_list_items,
+    )
+    item_artifact_pointer_findings, item_artifact_pointer_findings_truncated = (
+        _cap_contract_list(item_artifact_pointer_findings, max_contract_list_items)
+    )
 
     # 23e20656 (665 follow-up) — one canonical per-item executor_contract,
     # composing item_tool_requirements/item_sprint_item_pointers above with
@@ -828,8 +888,11 @@ async def build_capability_contract(
         },
         "manifest_hash": effective_hash,
         "item_tool_requirements": item_tool_requirements,
+        "item_tool_requirements_truncated": item_tool_requirements_truncated,
         "item_sprint_item_pointers": item_sprint_item_pointers,
+        "item_sprint_item_pointers_truncated": item_sprint_item_pointers_truncated,
         "item_artifact_pointer_findings": item_artifact_pointer_findings,
+        "item_artifact_pointer_findings_truncated": item_artifact_pointer_findings_truncated,
         "item_executor_contracts": item_executor_contracts,
         "item_executor_contracts_truncated": item_executor_contracts_truncated,
         "item_routing_summary": item_routing_summary,

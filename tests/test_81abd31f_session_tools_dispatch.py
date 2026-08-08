@@ -145,6 +145,116 @@ async def test_list_sessions_all_status(db, project, session):
 
 
 # ---------------------------------------------------------------------------
+# list_sessions — stale-session expiry parity with the HTTP route (8510d76b)
+#
+# handle_list_sessions previously called db_module.get_sessions() directly,
+# so a session idle >30 min stayed 'active' forever on the MCP path (nothing
+# ever ran the expiry sweep) while the HTTP GET /projects/{id}/sessions route
+# already called _expire_and_generate_handoffs() first. These tests pin parity
+# between the two paths. _REPO_ROOT is monkeypatched to tmp_path in every test
+# that exercises the real expiry call, since _regenerate_claude_md writes to
+# the real repo's CLAUDE.md otherwise (see test_expire_regenerates_claude_md
+# in test_core.py for the same precaution).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_list_sessions_expires_stale_active_session(db, project, tmp_path, monkeypatch):
+    monkeypatch.setattr(meridian.server, "_REPO_ROOT", tmp_path)
+    stale = await db_module.register_session(db, project["id"], "stale-session")
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-60 minutes') WHERE id = ?",
+        (stale["id"],),
+    )
+    await db.commit()
+
+    result = await st_mod.handle_list_sessions(
+        {"project_id": project["id"]}, db, str(tmp_path), None, None
+    )
+    row = next(s for s in result if s["id"] == stale["id"])
+    assert row["status"] == "idle", (
+        "a session idle >30 min must be expired by the MCP list_sessions path, "
+        "matching the HTTP route's _expire_and_generate_handoffs behavior"
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_leaves_fresh_session_active(db, project, session, tmp_path, monkeypatch):
+    monkeypatch.setattr(meridian.server, "_REPO_ROOT", tmp_path)
+    result = await st_mod.handle_list_sessions(
+        {"project_id": project["id"]}, db, str(tmp_path), None, None
+    )
+    row = next(s for s in result if s["id"] == session["id"])
+    assert row["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_already_idle_session_still_visible(db, project, tmp_path, monkeypatch):
+    """Re-running the expiry sweep on an already-idle session must not make it
+    disappear or error out."""
+    monkeypatch.setattr(meridian.server, "_REPO_ROOT", tmp_path)
+    already_idle = await db_module.register_session(db, project["id"], "already-idle")
+    await db.execute(
+        "UPDATE sessions SET status = 'idle', last_seen = datetime('now', '-90 minutes') WHERE id = ?",
+        (already_idle["id"],),
+    )
+    await db.commit()
+
+    result = await st_mod.handle_list_sessions(
+        {"project_id": project["id"]}, db, str(tmp_path), None, None
+    )
+    row = next(s for s in result if s["id"] == already_idle["id"])
+    assert row["status"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_result_stays_project_scoped(db, tmp_path, monkeypatch):
+    """The returned list stays scoped to the requested project even though the
+    underlying expiry sweep runs globally across all projects — matching the
+    HTTP route's own pre-existing global-sweep behavior, not a regression
+    introduced here."""
+    monkeypatch.setattr(meridian.server, "_REPO_ROOT", tmp_path)
+    proj_a = await db_module.create_project(db, "tenant-a-8510d76b")
+    proj_b = await db_module.create_project(db, "tenant-b-8510d76b")
+    sess_a = await db_module.register_session(db, proj_a["id"], "a-stale")
+    sess_b = await db_module.register_session(db, proj_b["id"], "b-stale")
+    for sid in (sess_a["id"], sess_b["id"]):
+        await db.execute(
+            "UPDATE sessions SET last_seen = datetime('now', '-60 minutes') WHERE id = ?",
+            (sid,),
+        )
+    await db.commit()
+
+    result = await st_mod.handle_list_sessions(
+        {"project_id": proj_a["id"]}, db, str(tmp_path), None, None
+    )
+    ids = {s["id"] for s in result}
+    assert sess_a["id"] in ids
+    assert sess_b["id"] not in ids, "list_sessions must not leak another project's sessions"
+
+    # Both were still expired by the (pre-existing, global) sweep side effect.
+    all_b = await db_module.get_sessions(db, proj_b["id"], active_only=False)
+    assert next(s for s in all_b if s["id"] == sess_b["id"])["status"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_dispatch_table_also_expires_stale(db, project, tmp_path, monkeypatch):
+    """Same guarantee through the full _handle_session_tools dispatch path."""
+    monkeypatch.setattr(meridian.server, "_REPO_ROOT", tmp_path)
+    stale = await db_module.register_session(db, project["id"], "stale-dispatch")
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now', '-60 minutes') WHERE id = ?",
+        (stale["id"],),
+    )
+    await db.commit()
+
+    result = await mh._handle_session_tools(
+        "list_sessions", {"project_id": project["id"]}, db, str(tmp_path), None, None
+    )
+    row = next(s for s in result if s["id"] == stale["id"])
+    assert row["status"] == "idle"
+
+
+# ---------------------------------------------------------------------------
 # get_context_block
 # ---------------------------------------------------------------------------
 
