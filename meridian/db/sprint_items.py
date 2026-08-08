@@ -32,6 +32,7 @@ from meridian.db import (  # noqa: PLC0415
     serialize_touches_resources,
     parse_touches_resources,
     _resource_sets_conflict,
+    _resource_file_of,
     get_executor_config,
     get_project,
     set_executor_config,
@@ -4712,6 +4713,24 @@ def pack_groups_into_macro_waves(
     return macro_waves
 
 
+def _is_legacy_file_symbol_shorthand(resource: str) -> bool:
+    """6b3b2c0e — True when a ``file:`` resource id uses the legacy
+    single-colon ``file:<path>:<symbol>`` shorthand (2a176d6d's accepted
+    "preferred form" per the SYMBOL_SCOPE_HINT hint in meridian.mcp.handler)
+    rather than a plain ``file:<path>``.
+
+    Delegates entirely to :func:`_resource_file_of` — the ONE place that
+    already knows how to tell the two apart (including the Windows
+    drive-letter exemption, ``file:C:/repo/x.py``) for scheduler conflict
+    comparison (63b030a6/2a176d6d) — so this classification can never drift
+    from the real-file resolution the scheduler already relies on. False for
+    a non-``file:`` resource.
+    """
+    if not resource.startswith("file:"):
+        return False
+    return _resource_file_of(resource) != resource[len("file:"):]
+
+
 def _predict_resource_granularity(resource: str) -> str:
     """2a176d6d — STATIC, planning-time classification of one normalized
     ``touches_resources`` entry, based purely on its string shape (never an
@@ -4724,6 +4743,14 @@ def _predict_resource_granularity(resource: str) -> str:
 
     Returns one of:
       * ``"file"``   — a well-formed ``file:<path>`` resource.
+      * ``"file_legacy_symbol_suffix"`` (6b3b2c0e) — the single-colon
+        ``file:<path>:<symbol>`` shorthand (see
+        :func:`_is_legacy_file_symbol_shorthand`). Still resolves, for
+        LOCKING purposes, to the whole real file ``<path>`` — this
+        classification exists purely so a caller can SEE that a resource
+        used the coarse legacy shape instead of the canonical
+        ``symbol:<path>::<name>`` double-colon form, rather than that fact
+        being invisible until something goes wrong at claim time.
       * ``"symbol"`` — a well-formed ``symbol:<path>::<name>`` resource.
       * ``"malformed_symbol"`` — a bare ``symbol:<name>`` with no ``::`` file
         scope (finding 3's zero-lock case) — will acquire NO lock at claim
@@ -4731,7 +4758,7 @@ def _predict_resource_granularity(resource: str) -> str:
       * ``"other"``  — any other typed resource (``db:``, ``route:``, ...).
     """
     if resource.startswith("file:"):
-        return "file"
+        return "file_legacy_symbol_suffix" if _is_legacy_file_symbol_shorthand(resource) else "file"
     if resource.startswith("symbol:"):
         value = resource[len("symbol:"):]
         _path, sep, _sym = value.partition("::")
@@ -4818,11 +4845,23 @@ async def _live_resource_holder(
     ``{"holder_session_id", "lease_expiry", "claim_granularity"}`` when held.
     Mirrors the file⊃symbol hierarchy claim_symbol/claim_file already enforce:
     a whole-file lock blocks every symbol in that file too.
+
+    6b3b2c0e — the ``file:`` branch resolves through :func:`_resource_file_of`,
+    the SAME canonical real-file identity the scheduler's conflict coloring
+    (63b030a6/2a176d6d) already uses, instead of the raw
+    ``resource[len("file:"):]`` suffix. Without this, a legacy single-colon
+    ``file:<path>:<symbol>`` declaration (2a176d6d's accepted "preferred
+    form") checked liveness against a fabricated, per-declaration-unique key
+    ("<path>:<symbol>") that no other claim ever writes to — so this function
+    silently reported the resource as FREE even when the real file <path> was
+    genuinely held by another live session (the confirmed 6b3b2c0e planning
+    gap: scheduler prediction and claim-time enforcement disagreed on what
+    the resource actually was).
     """
     from meridian.db import get_file_claims, get_symbol_claims, get_resource_claims  # noqa: PLC0415
 
     if resource.startswith("file:"):
-        file_path = resource[len("file:"):]
+        file_path = _resource_file_of(resource) or resource[len("file:"):]
         claims = await get_file_claims(db, file_path)
         lock = claims.get("file_lock")
         if lock and lock.get("session_id"):
@@ -5308,6 +5347,19 @@ async def _claim_batch_resource(
         calling a zero-lock resource "claimed".
       * ``"n/a"`` — a non-code typed resource (``db:``, ``route:``, ...)
         where the file/symbol distinction does not apply.
+
+    6b3b2c0e — the ``file:`` branch below resolves the ACTUAL lock key
+    through :func:`_resource_file_of`, the same canonical real-file identity
+    the scheduler's conflict coloring already uses, instead of the raw
+    ``resource[len("file:"):]`` suffix. Before this fix, a legacy
+    single-colon ``file:<path>:<symbol>`` declaration (2a176d6d's accepted
+    "preferred form") was claimed under a fabricated, per-declaration-unique
+    key ("<path>:<symbol>") instead of the real file "<path>" — so two items
+    declaring ``file:x.py:funcA`` and ``file:x.py:funcB`` could BOTH acquire
+    a "lock" concurrently even though get_parallelizable_groups already
+    proves (and always has) that they must be treated as the SAME real file
+    and serialized. The outcome dict's ``resolved_from_legacy_shorthand``
+    flag makes that resolution auditable for a caller/test.
     """
     from meridian.db import (  # noqa: PLC0415
         claim_file, claim_symbol, claim_resource,
@@ -5315,23 +5367,30 @@ async def _claim_batch_resource(
     )
 
     if resource.startswith("file:"):
-        file_path = resource[len("file:"):]
+        file_path = _resource_file_of(resource) or resource[len("file:"):]
+        legacy_shorthand = file_path != resource[len("file:"):]
         pre = await get_file_claims(db, file_path)
         pre_held = bool((pre.get("file_lock") or {}).get("session_id") == session_id)
         result = await claim_file(db, file_path, session_id, mode="write")
         if result.get("claimed"):
-            return {
+            outcome = {
                 "acquired": True, "scope": "file", "resource": resource,
                 "file_path": file_path, "newly_acquired": not pre_held,
                 "claim_granularity": "file",
             }
-        return {
+            if legacy_shorthand:
+                outcome["resolved_from_legacy_shorthand"] = True
+            return outcome
+        outcome = {
             "acquired": False, "scope": "file", "resource": resource,
             "file_path": file_path,
             "holder_session_id": result.get("holder_session_id"),
             "reason": result.get("reason") or "locked",
             "claim_granularity": "file",
         }
+        if legacy_shorthand:
+            outcome["resolved_from_legacy_shorthand"] = True
+        return outcome
 
     if resource.startswith("symbol:"):
         value = resource[len("symbol:"):]
@@ -5783,13 +5842,21 @@ async def claim_parallel_batch(
             # resources landed a real symbol-range claim vs. a coarse
             # whole-file fallback, rather than inferring it from
             # fallback_reason presence/absence downstream.
-            resource_claims.append({
+            _resource_claim_record = {
                 "item_id": iid,
                 "resource": resource,
                 "scope": outcome.get("scope"),
                 "claim_granularity": outcome.get("claim_granularity"),
                 "fallback_reason": outcome.get("fallback_reason"),
-            })
+            }
+            # 6b3b2c0e — surface the legacy single-colon file:<path>:<symbol>
+            # classification on the PUBLIC batch result too (not just the
+            # internal _claim_batch_resource outcome), so a caller can audit
+            # which resources in a successful batch resolved through the
+            # legacy shorthand rather than a canonical declaration.
+            if outcome.get("resolved_from_legacy_shorthand"):
+                _resource_claim_record["resolved_from_legacy_shorthand"] = True
+            resource_claims.append(_resource_claim_record)
             if outcome.get("newly_acquired"):
                 outcome["_item_id"] = iid
                 outcome["_session_id"] = claim_session
