@@ -3034,6 +3034,33 @@ async def toggle_orphan_reaper(
     }
 
 
+# ---------------------------------------------------------------------------
+# 60a96ece — runtime-pressure diagnostics (read-only; never kills anything)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/projects/{project_id}/runtime_diagnostics")
+async def get_runtime_diagnostics(project_id: str, request: Request) -> dict[str, Any]:
+    """60a96ece — dashboard-visible, opt-in diagnostic snapshot of
+    Meridian-relevant Serena/MCP runtime processes on the machine running
+    this server: live-process enumeration, duplicate (repo, runtime_kind)
+    fingerprint groups, and best-effort per-process kernel-pool/
+    process-group evidence (see ``orphan_reaper.diagnose_runtime_pressure``
+    for the full contract). Purely observational — this route NEVER kills,
+    signals, or otherwise mutates any process, matching its sibling
+    ``GET .../orphan_reaper`` status route's read-only contract. Does not
+    require the orphan-reaper hook to be registered or enabled for this
+    project; it is independent of that opt-in cleanup feature.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    from . import orphan_reaper as orphan_reaper_module  # noqa: PLC0415 — avoid import cycle at module load
+
+    return orphan_reaper_module.diagnose_runtime_pressure()
+
+
 # Decisions routes → meridian/routes/decisions.py
 # ---------------------------------------------------------------------------
 # v2.4 — HITL (human-in-the-loop) queue
