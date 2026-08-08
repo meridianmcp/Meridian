@@ -276,3 +276,61 @@ def test_settings_json_registers_bash_hook():
         if "dependency_install_guard.ps1" in hook.get("command", "")
     ]
     assert matches, "settings.json must register dependency_install_guard.ps1 under PreToolUse matcher 'Bash'"
+
+
+# ---------------------------------------------------------------------------
+# Active-repository hook-path resolution (e5eec33b)
+#
+# Reproduced 2026-08-07: this exact hook's configured command
+# ("$CLAUDE_PROJECT_DIR\.claude\hooks\dependency_install_guard.ps1")
+# collapsed to a bare, unresolvable fragment when CLAUDE_PROJECT_DIR was
+# empty in the launcher shell, even though dependency_install_guard.ps1
+# genuinely exists on disk. See meridian.hook_paths for the resolver.
+# ---------------------------------------------------------------------------
+
+def test_dependency_install_guard_command_is_project_scoped_required_hook():
+    from meridian import hook_paths
+
+    settings = json.loads(_SETTINGS.read_text(encoding="utf-8"))
+    command = next(
+        hook.get("command", "")
+        for entry in settings["hooks"]["PreToolUse"]
+        if entry.get("matcher") == "Bash"
+        for hook in entry.get("hooks", [])
+        if "dependency_install_guard.ps1" in hook.get("command", "")
+    )
+    assert hook_paths.is_project_relative_command(command) is True
+
+
+def test_dependency_install_guard_command_resolves_ok_against_real_repo_root():
+    """Generated <-> configured parity for this specific hook: the script
+    _write_sprint_guard_hooks-adjacent tooling expects on disk is exactly
+    what the configured settings.json command resolves to, against the
+    real repo root -- never a bare root-relative path."""
+    from meridian import hook_paths
+
+    settings = json.loads(_SETTINGS.read_text(encoding="utf-8"))
+    command = next(
+        hook.get("command", "")
+        for entry in settings["hooks"]["PreToolUse"]
+        if entry.get("matcher") == "Bash"
+        for hook in entry.get("hooks", [])
+        if "dependency_install_guard.ps1" in hook.get("command", "")
+    )
+    diag = hook_paths.resolve_configured_hook_command(command, _REPO)
+    assert diag["status"] == hook_paths.STATUS_OK, diag
+    assert diag["resolved_path"] == str(_HOOK_PS1)
+
+
+def test_dependency_install_guard_resolves_via_cwd_when_claude_project_dir_empty():
+    """The core regression, exercised end-to-end for this hook: empty
+    CLAUDE_PROJECT_DIR must fall back to a real repo root derived from cwd
+    (this test's own repo checkout), not collapse to "\\.claude\\hooks\\...".
+    """
+    from meridian import hook_paths
+
+    repo_root = hook_paths.resolve_active_repo_root(claude_project_dir="", cwd=str(_REPO))
+    assert repo_root is not None
+    command = '& "$CLAUDE_PROJECT_DIR\\.claude\\hooks\\dependency_install_guard.ps1"'
+    diag = hook_paths.resolve_configured_hook_command(command, repo_root)
+    assert diag["status"] == hook_paths.STATUS_OK, diag
