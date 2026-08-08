@@ -1133,6 +1133,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_vector_index_state(db)
     await _migrate_pixi_env_roots(db)
     await _migrate_wave_run_summaries(db)
+    await _migrate_decision_evidence(db)
     return db
 
 
@@ -5109,6 +5110,16 @@ _PLANNING_SOURCE_SPECS: dict[str, dict[str, Any]] = {
         "title_col": "title", "body_col": "content", "created_col": "created_at",
         "status_col": None, "version_col": None, "scope_col": "project_id",
     },
+    # 9149e132 — typed, code-linked decision evidence (meridian.db.decision_evidence).
+    # No title column (mirrors "task"/"finding": title is derived from the body's
+    # first line via _planning_derive_title). status defaults to active-only, same
+    # convention as "decision" — see the stype == "decision" branches below, both
+    # extended to also cover "decision_evidence".
+    "decision_evidence": {
+        "table": "decision_evidence", "id_col": "id", "text_cols": ("evidence",),
+        "title_col": None, "body_col": "evidence", "created_col": "created_at",
+        "status_col": "status", "version_col": "version", "scope_col": "project_id",
+    },
 }
 _PLANNING_SOURCE_TYPES: "tuple[str, ...]" = tuple(_PLANNING_SOURCE_SPECS.keys())
 
@@ -5408,9 +5419,13 @@ async def _planning_pg_source_results(
         placeholders = ", ".join("?" for _ in status_list)
         where_parts.append(f"{status_col} IN ({placeholders})")
         params.extend(status_list)
-    elif status_list is None and status_col is not None and stype == "decision":
+    elif status_list is None and status_col is not None and stype in (
+        "decision", "decision_evidence",
+    ):
         # Preserve the convention every other read path in this module uses:
-        # decisions default to active-only unless a status is explicitly given.
+        # decisions (and, since 9149e132, decision_evidence links) default to
+        # active-only unless a status is explicitly given — a superseded or
+        # reversed evidence link is excluded by default, not just marked.
         where_parts.append("status = 'active'")
 
     tsq = _planning_pg_tsquery_source(query)
@@ -5492,7 +5507,13 @@ async def _planning_sqlite_source_results(
         placeholders = ", ".join("?" for _ in status_list)
         where_parts.append(f"{status_col} IN ({placeholders})")
         params.extend(status_list)
-    elif status_list is None and status_col is not None and stype == "decision":
+    elif status_list is None and status_col is not None and stype in (
+        "decision", "decision_evidence",
+    ):
+        # 9149e132 — mirrors the Postgres path above: decisions (and
+        # decision_evidence links) default to active-only unless a status is
+        # explicitly given, so a superseded/reversed link is excluded by
+        # default, not just marked.
         where_parts.append("status = 'active'")
     where_sql = " AND ".join(where_parts)
 
@@ -5549,6 +5570,7 @@ async def planning_search(
     status: "str | list[str] | None" = None,
     limit: int = 20,
     cursor: int = 0,
+    rerank_semantic: bool = False,
 ) -> dict[str, Any]:
     """0dc5a35d — ranked, scoped planning search (v1).
 
@@ -5576,16 +5598,42 @@ async def planning_search(
         cursor: zero-based OFFSET into the fully-ranked result list (mirrors
             get_project_notes_page's cursor contract). Pass the previous
             response's ``next_cursor`` to fetch the next page.
+        rerank_semantic: 9149e132 — OPTIONAL, OFF BY DEFAULT. When True (and
+            :func:`meridian.semantic_search.is_available` — itself gated
+            behind ``MERIDIAN_SEMANTIC_ENABLED`` + an importable model2vec,
+            off by default), re-orders the ALREADY-RETRIEVED ``all_results``
+            candidate set by a lexical/semantic FUSED score
+            (:func:`meridian.semantic_search.score_confidence`'s existing
+            0.6/0.4 blend). This is deliberately NOT the same shape as
+            :func:`_maybe_semantic_escalate` (used by :func:`search_all`),
+            which ESCALATES — adds NEW rows semantic search alone found when
+            lexical search found nothing. Reranking here NEVER adds or drops
+            a row: lexical retrieval alone decides the CANDIDATE SET (what
+            can appear at all); semantic scoring only ever decides the
+            ORDER of that already-fixed set, and every row's fused score
+            always includes its own lexical component (rows here all came
+            from lexical retrieval, so a "semantic-only" ranking of a row
+            lexical search never found is structurally impossible). See
+            ``freshness.reranked`` / ``freshness.rerank_backend`` on the
+            response, and each reranked result's additive ``semantic`` field
+            (semantic_score/fused_score/confident/reason). Unavailable or
+            no-op semantic search silently leaves lexical ordering untouched
+            — never an error.
 
     Returns a dict with ``query``, ``filters``, ``results`` (each carrying
     source_type/source_id/title/snippet/score/rank_explanation/status/
-    version/created_at), ``total_matched``, ``has_more``, ``next_cursor``,
-    ``backend``, ``freshness`` (index_type/generated_at/stale/capped/
-    capped_source_types/pool_cap), and ``skipped_source_types`` (a
+    version/created_at, plus an optional additive ``semantic`` breakdown when
+    reranked), ``total_matched``, ``has_more``, ``next_cursor``, ``backend``,
+    ``freshness`` (index_type/generated_at/stale/capped/capped_source_types/
+    pool_cap/reranked/rerank_backend), and ``skipped_source_types`` (a
     type -> reason map for e.g. workspace_proposal when no tenant can be
     resolved for this project).
 
-    No LLM or embedding call anywhere in this function.
+    No LLM call anywhere in this function. The only embedding call possible
+    is the OPTIONAL, off-by-default ``rerank_semantic`` path above, and even
+    then it never authorizes a mutation or expands what lexical search
+    already found — see :mod:`meridian.db.decision_evidence`'s module
+    docstring for the full safety contract this exists to uphold.
     """
     limit = max(1, min(int(limit or 20), 100))
     cursor = max(0, int(cursor or 0))
@@ -5648,6 +5696,60 @@ async def planning_search(
     all_results.sort(key=lambda r: r.get("created_at") or "", reverse=True)
     all_results.sort(key=lambda r: r["score"], reverse=True)
 
+    # 9149e132 — OPTIONAL, READ-ONLY semantic rerank. See the `rerank_semantic`
+    # docstring above for the full contract; in short: this can only re-sort
+    # `all_results` (already fully assembled by lexical retrieval above), it
+    # can never add a row lexical search did not already find, and every
+    # fused score always includes its own lexical component (never
+    # semantic-only), so it can never become the sole ranking signal.
+    reranked = False
+    rerank_backend: str | None = None
+    if rerank_semantic and all_results:
+        from meridian import semantic_search  # noqa: PLC0415 — lazy, mirrors _maybe_semantic_escalate
+
+        if semantic_search.is_available():
+            raw_scores = [r["score"] for r in all_results]
+            lo, hi = min(raw_scores), max(raw_scores)
+            span = (hi - lo) or 1.0
+            # Normalized to [0, 1] purely as fusion/fallback-ordering input —
+            # the authoritative `score` field on each result is never
+            # overwritten by this block.
+            lexical_scores = {
+                f"{r['source_type']}:{r['source_id']}": (r["score"] - lo) / span
+                for r in all_results
+            }
+            candidates = [
+                (f"{r['source_type']}:{r['source_id']}", f"{r['title']} {r['snippet']}")
+                for r in all_results
+            ]
+            matches = semantic_search.rank_confident(
+                query, candidates, lexical_scores=lexical_scores,
+            )
+            if matches:
+                fused_by_id = {m.id: m for m in matches}
+
+                def _rerank_key(r: "dict[str, Any]") -> float:
+                    rid = f"{r['source_type']}:{r['source_id']}"
+                    m = fused_by_id.get(rid)
+                    # A row with no semantic verdict (below the cosine floor,
+                    # or embedding failed) keeps its normalized lexical score
+                    # — it is never dropped, only possibly out-ranked by rows
+                    # whose fused score is higher.
+                    return m.fused_score if m is not None else lexical_scores[rid]
+
+                all_results.sort(key=_rerank_key, reverse=True)  # stable: ties keep lexical order
+                reranked = True
+                rerank_backend = semantic_search.model_name()
+                for r in all_results:
+                    m = fused_by_id.get(f"{r['source_type']}:{r['source_id']}")
+                    if m is not None:
+                        r["semantic"] = {
+                            "semantic_score": m.semantic_score,
+                            "fused_score": m.fused_score,
+                            "confident": m.confident,
+                            "reason": m.reason,
+                        }
+
     total_matched = len(all_results)
     page = all_results[cursor: cursor + limit]
     has_more = (cursor + limit) < total_matched
@@ -5682,6 +5784,11 @@ async def planning_search(
                 "status": r.get("status"),
                 "version": r.get("version"),
                 "created_at": r.get("created_at"),
+                # 9149e132 — additive, only present when rerank_semantic=True
+                # AND semantic search was available AND this row cleared the
+                # cosine floor. Advisory ranking metadata only — never used
+                # to authorize a mutation or to decide what to retrieve.
+                **({"semantic": r["semantic"]} if "semantic" in r else {}),
             }
             for r in page
         ],
@@ -5696,6 +5803,8 @@ async def planning_search(
             "capped": bool(capped_types),
             "capped_source_types": sorted(capped_types),
             "pool_cap": _PLANNING_SEARCH_POOL_CAP,
+            "reranked": reranked,
+            "rerank_backend": rerank_backend,
         },
         "skipped_source_types": skipped_types,
     }
@@ -12405,4 +12514,20 @@ from .worktrees import (  # noqa: F401
     get_pixi_env_root_for_worktree,
     list_unreclaimed_pixi_env_roots,
     mark_pixi_env_root_reclaimed,
+)
+
+
+# 9149e132 — typed, code-linked decision evidence + deterministic planning
+# retrieval. Imported last (after everything above) — a single-table,
+# no-state-machine shape, mirroring the vector_index_state import above.
+# Wired into planning_search via the _PLANNING_SOURCE_SPECS["decision_evidence"]
+# entry earlier in this file, not via anything imported here.
+from .decision_evidence import (  # noqa: F401
+    DECISION_EVIDENCE_STATUSES,
+    _migrate_decision_evidence,
+    create_decision_evidence,
+    get_decision_evidence,
+    list_decision_evidence,
+    supersede_decision_evidence,
+    reverse_decision_evidence,
 )

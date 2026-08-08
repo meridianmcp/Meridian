@@ -631,6 +631,91 @@ def test_decision_without_assumption_has_null_status():
         _run(db.close())
 
 
+# ---------------------------------------------------------------------------
+# 9149e132 — pin_decision's optional `evidence` param (typed, code-linked
+# decision_evidence). handle_pin_decision is the ONLY touched MCP handler
+# for this item; planning_search itself is exercised in test_new_v25.py.
+# ---------------------------------------------------------------------------
+
+
+def test_pin_decision_without_evidence_is_unchanged():
+    """Omitting `evidence` entirely is a complete no-op change from before
+    this item — same call, same return shape, no evidence key at all."""
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(db_module.create_project(db, "pd-no-evidence"))
+        res = _run(mh._dispatch_mcp_tool("pin_decision", {
+            "project_id": proj["id"], "title": "Use psycopg3", "body": "body text",
+        }, db, "/tmp"))
+        assert "evidence" not in res
+        assert "evidence_error" not in res
+        assert res["title"] == "Use psycopg3"
+    finally:
+        _run(db.close())
+
+
+def test_pin_decision_with_valid_evidence_creates_linked_row():
+    """A well-formed `evidence` param atomically attaches a typed,
+    code-linked decision_evidence row to the freshly pinned decision."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "pd-evidence"))
+        res = _run(mh._dispatch_mcp_tool("pin_decision", {
+            "project_id": proj["id"], "title": "Use psycopg3",
+            "body": "asyncpg has DLL issues on Windows",
+            "evidence": {
+                "pointer": {
+                    "source_type": "code",
+                    "targets": [{
+                        "uri": "meridian/pg_adapter.py",
+                        "selector": {"type": "symbol", "qualified_name": "PostgresPool"},
+                    }],
+                },
+                "text": "PostgresPool wraps psycopg3's AsyncConnectionPool directly",
+                "assumptions": "pool handles our concurrency",
+                "confidence": 0.9,
+            },
+        }, db, "/tmp"))
+        assert "evidence_error" not in res
+        ev = res["evidence"]
+        assert ev["decision_id"] == res["id"]
+        assert ev["project_id"] == proj["id"]
+        assert ev["status"] == "active"
+        assert ev["confidence"] == 0.9
+        assert ev["pointer"]["targets"][0]["uri"] == "meridian/pg_adapter.py"
+        # Durably persisted — resolvable without relying on Serena memories.
+        fetched = _run(db_module.get_decision_evidence(db, ev["id"], project_id=proj["id"]))
+        assert fetched is not None and fetched["evidence"] == ev["evidence"]
+    finally:
+        _run(db.close())
+
+
+def test_pin_decision_with_malformed_pointer_reports_evidence_error_not_failure():
+    """A malformed pointer degrades to evidence_error on the result — the
+    decision itself is never lost because its evidence was malformed."""
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(db_module.create_project(db, "pd-bad-evidence"))
+        res = _run(mh._dispatch_mcp_tool("pin_decision", {
+            "project_id": proj["id"], "title": "Some decision", "body": "body",
+            "evidence": {
+                "pointer": {"source_type": "code", "targets": [{"uri": "x"}]},  # missing selector
+                "text": "some evidence text",
+            },
+        }, db, "/tmp"))
+        assert "evidence" not in res
+        assert "evidence_error" in res
+        # The decision itself still committed successfully.
+        assert res["title"] == "Some decision"
+        again = _run(db_module.get_pinned_decision(db, res["id"]))
+        assert again is not None
+    finally:
+        _run(db.close())
+
+
 def test_validate_assumption_confirmed():
     # 8ec5493b — confirm: stamps status, saves code-anchored note, no HITL.
     import meridian.db as db_module

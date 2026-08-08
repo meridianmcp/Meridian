@@ -2620,7 +2620,12 @@ async def test_planning_search_result_contract_shape(db):
     assert set(freshness.keys()) == {
         "index_type", "generated_at", "stale", "capped",
         "capped_source_types", "pool_cap",
+        # 9149e132 — optional semantic-rerank metadata, always present (False/
+        # None when rerank_semantic=False, the default this test exercises).
+        "reranked", "rerank_backend",
     }
+    assert result["freshness"]["reranked"] is False
+    assert result["freshness"]["rerank_backend"] is None
     assert result["backend"] in (
         "sqlite_fts5_bm25", "sqlite_bm25_like_fallback", "postgres_tsvector_ts_rank",
     )
@@ -3168,4 +3173,391 @@ async def test_handle_planning_search_accepts_empty_query(db):
         {"project_id": p["id"], "query": ""}, db, "/tmp", None, None,
     )
     assert "error" not in result
+
+
+# ---------------------------------------------------------------------------
+# 9149e132 — typed, code-linked decision_evidence + its wiring into
+# planning_search. See meridian/db/decision_evidence.py's module docstring
+# for the full design + safety contract this section verifies.
+# ---------------------------------------------------------------------------
+
+_CODE_POINTER = {
+    "source_type": "code",
+    "targets": [{
+        "uri": "meridian/pg_adapter.py",
+        "selector": {"type": "symbol", "qualified_name": "PostgresPool"},
+    }],
+}
+
+
+def _range_pointer(uri: str) -> dict:
+    return {
+        "source_type": "code",
+        "targets": [{
+            "uri": uri,
+            "selector": {"type": "range", "start_line": 1, "end_line": 2},
+        }],
+    }
+
+
+@pytest.mark.asyncio
+async def test_decision_evidence_create_and_get_resolves_pointer(db):
+    """A decision-evidence link resolves to a real symbol/file/pointer —
+    the stored pointer round-trips exactly through meridian.pointers'
+    validate_pointer, not a free-text string."""
+    p = await db_module.create_project(db, "de-create")
+    dec = await db_module.pin_decision(db, p["id"], "Use psycopg3", "body text")
+    ev = await db_module.create_decision_evidence(
+        db, p["id"], dec["id"], _CODE_POINTER,
+        "PostgresPool wraps psycopg3's AsyncConnectionPool directly",
+        assumptions="pool handles our concurrency",
+        applicability_scope="meridian/pg_adapter.py only",
+        confidence=0.85,
+    )
+    assert ev["decision_id"] == dec["id"]
+    assert ev["project_id"] == p["id"]
+    assert ev["status"] == "active"
+    assert ev["confidence"] == 0.85
+    assert ev["pointer"]["source_type"] == "code"
+    target = ev["pointer"]["targets"][0]
+    assert target["uri"] == "meridian/pg_adapter.py"
+    assert target["selector"]["type"] == "symbol"
+    assert target["selector"]["qualified_name"] == "PostgresPool"
+
+    fetched = await db_module.get_decision_evidence(db, ev["id"], project_id=p["id"])
+    assert fetched == ev
+
+
+@pytest.mark.asyncio
+async def test_decision_evidence_confidence_is_clamped():
+    """confidence is clamped to [0.0, 1.0] — never stored out of range."""
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "de-confidence-clamp")
+        dec = await db_module.pin_decision(db, p["id"], "D", "body")
+        ev = await db_module.create_decision_evidence(
+            db, p["id"], dec["id"], _range_pointer("a.py"), "evidence text",
+            confidence=5.0,
+        )
+        assert ev["confidence"] == 1.0
+        ev2 = await db_module.create_decision_evidence(
+            db, p["id"], dec["id"], _range_pointer("b.py"), "evidence text 2",
+            confidence=-3.0,
+        )
+        assert ev2["confidence"] == 0.0
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_decision_evidence_malformed_pointer_raises_before_any_write():
+    """A malformed pointer raises (PointerValidationError, a ValueError
+    subclass) BEFORE any row is written — mirrors add_sprint_item_pointer's
+    validate-then-insert contract."""
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "de-malformed")
+        dec = await db_module.pin_decision(db, p["id"], "D", "body")
+        with pytest.raises(ValueError):
+            await db_module.create_decision_evidence(
+                db, p["id"], dec["id"],
+                {"source_type": "code", "targets": [{"uri": "a.py"}]},  # no selector
+                "evidence text",
+            )
+        rows = await db_module.list_decision_evidence(db, p["id"], dec["id"], include_superseded=True)
+        assert rows == []
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_decision_evidence_surfaced_by_planning_search(db):
+    """planning_search surfaces decision-evidence results, correctly ranked
+    and carrying the full result contract (same shape every other source
+    type already produces)."""
+    p = await db_module.create_project(db, "de-search")
+    dec = await db_module.pin_decision(db, p["id"], "Use psycopg3", "body")
+    await db_module.create_decision_evidence(
+        db, p["id"], dec["id"], _CODE_POINTER,
+        "img127 coverage gap: PostgresPool AsyncConnectionPool wiring",
+    )
+    await db_module.create_decision_evidence(
+        db, p["id"], dec["id"], _range_pointer("unrelated.py"),
+        "completely unrelated billing configuration text",
+    )
+    result = await db_module.planning_search(
+        db, p["id"], "img127 coverage gap", source_types=["decision_evidence"],
+    )
+    assert result["results"], "expected the matching evidence row to be found"
+    row = result["results"][0]
+    assert row["source_type"] == "decision_evidence"
+    assert "img127" in row["snippet"].lower()
+    assert row["status"] == "active"
+    assert set(row.keys()) >= {
+        "source_type", "source_id", "title", "snippet", "score",
+        "rank_explanation", "status", "version", "created_at",
+    }
+    titles_or_snippets = [r["snippet"] for r in result["results"]]
+    assert not any("billing" in s.lower() for s in titles_or_snippets)
+
+
+@pytest.mark.asyncio
+async def test_decision_evidence_project_isolation(db):
+    """A decision-evidence link in project A never leaks into project B's
+    planning_search, even for an identical query."""
+    p1 = await db_module.create_project(db, "de-iso-a")
+    p2 = await db_module.create_project(db, "de-iso-b")
+    dec1 = await db_module.pin_decision(db, p1["id"], "D1", "body")
+    await db_module.create_decision_evidence(
+        db, p1["id"], dec1["id"], _range_pointer("a.py"),
+        "unique-marker-alpha evidence text",
+    )
+    result_a = await db_module.planning_search(
+        db, p1["id"], "unique-marker-alpha", source_types=["decision_evidence"],
+    )
+    result_b = await db_module.planning_search(
+        db, p2["id"], "unique-marker-alpha", source_types=["decision_evidence"],
+    )
+    assert result_a["results"], "project A should find its own evidence"
+    assert result_b["results"] == [], "project B must never see project A's evidence"
+
+
+@pytest.mark.asyncio
+async def test_decision_evidence_version_scoping(db):
+    """version is an exact-match filter, mirroring sprint_item's contract."""
+    p = await db_module.create_project(db, "de-version")
+    dec = await db_module.pin_decision(db, p["id"], "D", "body")
+    await db_module.create_decision_evidence(
+        db, p["id"], dec["id"], _range_pointer("a.py"),
+        "versioned-marker-zzz evidence for v1", version="v1",
+    )
+    result_v1 = await db_module.planning_search(
+        db, p["id"], "versioned-marker-zzz", source_types=["decision_evidence"], version="v1",
+    )
+    result_v2 = await db_module.planning_search(
+        db, p["id"], "versioned-marker-zzz", source_types=["decision_evidence"], version="v2",
+    )
+    assert result_v1["results"]
+    assert result_v2["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_decision_evidence_supersede_requires_exact_id_and_excludes_old_by_default(db):
+    """Supersession: the OLD evidence link is marked (not deleted) and
+    EXCLUDED from planning_search's default view, exactly like a superseded
+    decision already behaves."""
+    p = await db_module.create_project(db, "de-supersede")
+    dec = await db_module.pin_decision(db, p["id"], "D", "body")
+    old = await db_module.create_decision_evidence(
+        db, p["id"], dec["id"], _range_pointer("a.py"),
+        "supersede-marker-old original evidence",
+    )
+    # A made-up id is correctly rejected — no fuzzy/best-effort resolution.
+    with pytest.raises(ValueError, match="not found"):
+        await db_module.supersede_decision_evidence(
+            db, p["id"], "not-a-real-evidence-id", _range_pointer("a.py"), "x",
+        )
+    new = await db_module.supersede_decision_evidence(
+        db, p["id"], old["id"], _range_pointer("a.py"),
+        "supersede-marker-old corrected evidence",
+    )
+    assert new["supersedes_id"] == old["id"]
+    assert new["status"] == "active"
+    refreshed_old = await db_module.get_decision_evidence(db, old["id"], project_id=p["id"])
+    assert refreshed_old["status"] == "superseded"
+    assert refreshed_old["superseded_by"] == new["id"]
+
+    # Default planning_search view: only the new (active) row is surfaced.
+    result = await db_module.planning_search(
+        db, p["id"], "supersede-marker-old", source_types=["decision_evidence"],
+    )
+    ids = {r["source_id"] for r in result["results"]}
+    assert new["id"] in ids
+    assert old["id"] not in ids
+
+    # Explicitly asking for the superseded status still finds the old row —
+    # nothing was deleted, only excluded from the default view.
+    result_all = await db_module.planning_search(
+        db, p["id"], "supersede-marker-old", source_types=["decision_evidence"],
+        status=["active", "superseded"],
+    )
+    ids_all = {r["source_id"] for r in result_all["results"]}
+    assert {old["id"], new["id"]} <= ids_all
+
+    history = await db_module.list_decision_evidence(
+        db, p["id"], dec["id"], include_superseded=True,
+    )
+    assert {h["id"] for h in history} == {old["id"], new["id"]}
+
+
+@pytest.mark.asyncio
+async def test_decision_evidence_reversal_requires_reason_and_excludes_by_default(db):
+    """reverse_decision_evidence: distinct from supersession (the evidence
+    turned out to be wrong, not merely replaced); requires a non-empty
+    reason; also excluded from planning_search's default active-only view."""
+    p = await db_module.create_project(db, "de-reverse")
+    dec = await db_module.pin_decision(db, p["id"], "D", "body")
+    ev = await db_module.create_decision_evidence(
+        db, p["id"], dec["id"], _range_pointer("a.py"),
+        "reverse-marker-xyz evidence that turned out to be wrong",
+    )
+    with pytest.raises(ValueError, match="non-empty reason"):
+        await db_module.reverse_decision_evidence(db, p["id"], ev["id"], "")
+    with pytest.raises(ValueError, match="not found"):
+        await db_module.reverse_decision_evidence(db, p["id"], "bogus-id", "some reason")
+
+    updated = await db_module.reverse_decision_evidence(
+        db, p["id"], ev["id"], "the benchmark this rested on was flawed",
+    )
+    assert updated["status"] == "reversed"
+    assert updated["reversal_reason"] == "the benchmark this rested on was flawed"
+
+    result = await db_module.planning_search(
+        db, p["id"], "reverse-marker-xyz", source_types=["decision_evidence"],
+    )
     assert result["results"] == []
+
+
+def test_decision_evidence_mutations_never_accept_a_query_or_score_param():
+    """CRITICAL SAFETY: supersede_decision_evidence / reverse_decision_evidence
+    take an EXACT evidence_id — never a search query or a similarity score.
+    Structurally, there is no parameter path from "the top semantic/ranked
+    match" to a mutation in this module."""
+    import inspect
+    for fn in (db_module.supersede_decision_evidence, db_module.reverse_decision_evidence):
+        params = set(inspect.signature(fn).parameters)
+        assert "query" not in params
+        assert not any(
+            ("score" in p or "similar" in p or "semantic" in p or "rank" in p)
+            for p in params
+        )
+
+
+@pytest.mark.asyncio
+async def test_planning_search_rerank_semantic_off_by_default_is_unchanged(db):
+    """rerank_semantic defaults to False — omitting it is a byte-identical
+    result to before this item existed (freshness carries the two new
+    always-present, inert keys only)."""
+    p = await db_module.create_project(db, "de-rerank-default")
+    dec = await db_module.pin_decision(db, p["id"], "D", "body")
+    await db_module.create_decision_evidence(
+        db, p["id"], dec["id"], _range_pointer("a.py"), "default-rerank-marker text",
+    )
+    result = await db_module.planning_search(
+        db, p["id"], "default-rerank-marker", source_types=["decision_evidence"],
+    )
+    assert result["freshness"]["reranked"] is False
+    assert result["freshness"]["rerank_backend"] is None
+    assert all("semantic" not in r for r in result["results"])
+
+
+@pytest.mark.asyncio
+async def test_planning_search_rerank_semantic_noop_when_unavailable(db, monkeypatch):
+    """rerank_semantic=True is a silent no-op (never an error) when
+    semantic_search.is_available() is False — the default, off-by-default
+    posture (MERIDIAN_SEMANTIC_ENABLED unset / model2vec not importable)."""
+    import meridian.semantic_search as semsearch_mod
+    monkeypatch.setattr(semsearch_mod, "is_available", lambda: False)
+    p = await db_module.create_project(db, "de-rerank-unavailable")
+    dec = await db_module.pin_decision(db, p["id"], "D", "body")
+    await db_module.create_decision_evidence(
+        db, p["id"], dec["id"], _range_pointer("a.py"), "unavailable-rerank-marker text",
+    )
+    result = await db_module.planning_search(
+        db, p["id"], "unavailable-rerank-marker", source_types=["decision_evidence"],
+        rerank_semantic=True,
+    )
+    assert result["freshness"]["reranked"] is False
+    assert result["results"]
+
+
+@pytest.mark.asyncio
+async def test_planning_search_rerank_semantic_cannot_expand_scope(db, monkeypatch):
+    """CRITICAL SAFETY: construct a case where lexical search would NOT
+    surface a result but a (mocked, maximally adversarial) semantic layer
+    would — and confirm the semantic layer cannot inject it. Reranking may
+    only re-ORDER `all_results` (the exact set lexical retrieval already
+    produced); it structurally cannot add a row, because the sort/annotate
+    loop only ever iterates over ids already in that list."""
+    import meridian.semantic_search as semsearch_mod
+    from meridian.semantic_search import SemanticMatch
+
+    p = await db_module.create_project(db, "de-rerank-scope")
+    dec = await db_module.pin_decision(db, p["id"], "D", "body")
+    target = await db_module.create_decision_evidence(
+        db, p["id"], dec["id"], _range_pointer("a.py"),
+        "the zzzqqqmarker lives right here",
+    )
+    # Decoy: lexically UNRELATED to the query below — real FTS/BM25/tsvector
+    # will never surface it for "zzzqqqmarker".
+    decoy = await db_module.create_decision_evidence(
+        db, p["id"], dec["id"], _range_pointer("b.py"),
+        "totally unrelated billing configuration paragraph",
+    )
+
+    monkeypatch.setattr(semsearch_mod, "is_available", lambda: True)
+    monkeypatch.setattr(semsearch_mod, "model_name", lambda: "fake-test-model")
+
+    def _fake_rank_confident(query, candidates, *, floor=None, min_margin=None, lexical_scores=None):
+        candidate_ids = {cid for cid, _ in candidates}
+        # Lexical retrieval must not have handed the decoy to the semantic
+        # layer at all — it was never a candidate in the first place.
+        assert f"decision_evidence:{decoy['id']}" not in candidate_ids
+        # Adversarial: report a maximally confident match for the decoy
+        # anyway (simulating a buggy/malicious semantic backend).
+        return [SemanticMatch(
+            id=f"decision_evidence:{decoy['id']}", lexical_score=None,
+            semantic_score=0.99, fused_score=0.99, threshold=0.37,
+            margin=0.5, confident=True, reason="confident_match",
+        )]
+
+    monkeypatch.setattr(semsearch_mod, "rank_confident", _fake_rank_confident)
+
+    result = await db_module.planning_search(
+        db, p["id"], "zzzqqqmarker", source_types=["decision_evidence"],
+        rerank_semantic=True,
+    )
+    ids = {r["source_id"] for r in result["results"]}
+    assert ids == {target["id"]}
+    assert decoy["id"] not in ids, (
+        "semantic rerank must NEVER expand result scope beyond what lexical "
+        "search already found"
+    )
+    # And the mutation path still requires the EXACT pointer/id — not
+    # whatever the (adversarial, mocked) semantic layer claimed was the
+    # best match.
+    with pytest.raises(ValueError, match="not found"):
+        await db_module.supersede_decision_evidence(
+            db, p["id"], f"decision_evidence:{decoy['id']}",  # not a real row id
+            _range_pointer("b.py"), "x",
+        )
+    # The decoy's REAL id, however, still works — proving supersession is
+    # gated on the exact stored primary key, never on anything the semantic
+    # layer reported.
+    real_supersede = await db_module.supersede_decision_evidence(
+        db, p["id"], decoy["id"], _range_pointer("b.py"), "corrected decoy evidence",
+    )
+    assert real_supersede["supersedes_id"] == decoy["id"]
+
+
+@pytest.mark.asyncio
+async def test_handle_planning_search_finds_decision_evidence_with_zero_handler_changes(db):
+    """9149e132 — handle_planning_search is a thin, unmodified passthrough
+    (it already forwards source_types generically to db.planning_search);
+    the NEW "decision_evidence" source type works through the EXISTING,
+    untouched handler with no dispatch/schema change needed."""
+    p = await db_module.create_project(db, "de-handler")
+    dec = await db_module.pin_decision(db, p["id"], "D", "body")
+    await db_module.create_decision_evidence(
+        db, p["id"], dec["id"], _range_pointer("a.py"),
+        "handler-marker-qed evidence text",
+    )
+    result = await st_mod.handle_planning_search(
+        {
+            "project_id": p["id"], "query": "handler-marker-qed",
+            "source_types": ["decision_evidence"],
+        },
+        db, "/tmp", None, None,
+    )
+    assert result["results"]
+    assert result["results"][0]["source_type"] == "decision_evidence"

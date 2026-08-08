@@ -3100,6 +3100,45 @@ async def _migrate_pg_project_parent_id(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_decision_evidence(conn: PostgresConnection) -> None:
+    """9149e132 — decision_evidence: typed, code-linked decision evidence
+    (mirrors db.decision_evidence._migrate_decision_evidence).
+
+    One row per typed evidence link: a decision_id, a durable pointer (JSON,
+    the same meridian.pointers shape sprint_item_pointers already uses),
+    searchable evidence text, optional assumptions/applicability_scope/
+    confidence, and a supersession/reversal lineage (status +
+    supersedes_id/superseded_by/reversal_reason) — nothing is ever hard
+    deleted. Wired into planning_search via the
+    _PLANNING_SOURCE_SPECS["decision_evidence"] entry in db/__init__.py, the
+    same generic lexical-only retrieval path every other source type uses.
+    CREATE TABLE / INDEX IF NOT EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS decision_evidence ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    decision_id TEXT NOT NULL,"
+        "    version TEXT,"
+        "    pointer TEXT NOT NULL,"
+        "    evidence TEXT NOT NULL,"
+        "    assumptions TEXT,"
+        "    applicability_scope TEXT,"
+        "    confidence REAL,"
+        "    status TEXT NOT NULL DEFAULT 'active',"
+        "    supersedes_id TEXT,"
+        "    superseded_by TEXT,"
+        "    reversal_reason TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')),"
+        "    updated_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_decision_evidence_decision "
+        "ON decision_evidence(decision_id);"
+        "CREATE INDEX IF NOT EXISTS idx_decision_evidence_project "
+        "ON decision_evidence(project_id);"
+    )
+
+
 async def _migrate_pg_session_goal_compliance(conn: PostgresConnection) -> None:
     """5abf3e12 — sessions.goal_compliance: stored per-session goal-compliance
     metric (JSON: listed N vs completed M vs fully_completed).
@@ -4334,4 +4373,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_vector_index_state,
     _migrate_pg_pixi_env_roots,
     _migrate_pg_wave_run_summaries,
+    _migrate_pg_decision_evidence,
 )
