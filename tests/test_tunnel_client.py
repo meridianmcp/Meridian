@@ -5692,6 +5692,78 @@ def test_owned_process_backend_selects_by_platform(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 268d4e9b — real-backend integration through the tunnel_client wrapper.
+#
+# The existing coverage above (test_close_owned_process_delegates_to_backend)
+# monkeypatches `_owned_process_backend` itself with a `_FakeBackend` whose
+# `close()` is a trivial `return True` — it proves the wrapper CALLS the
+# backend, but never exercises the backend's own PID-reuse guard (see
+# process_lifecycle.verify_handle_live / tests/test_process_lifecycle.py's
+# test_posix_backend_close_skips_when_pid_reused +
+# test_windows_backend_close_skips_when_pid_reused, which cover that guard
+# at the BACKEND layer in isolation). Nothing exercises the two wired
+# together: tc._close_owned_process -> the REAL platform-selected backend
+# class (not a fake stand-in) -> its real close()'s PID-reuse skip. These
+# two tests close that gap, one per platform, using the same "patch
+# pl._killpg / pl.verify_handle_live / subprocess.run, never a real OS
+# signal" technique test_process_lifecycle.py already established as safe
+# to run on a Windows dev box.
+# ---------------------------------------------------------------------------
+
+
+def test_close_owned_process_real_posix_backend_skips_signal_on_pid_reuse(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    signal_calls = []
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(pl, "_killpg", lambda pgid, sig: signal_calls.append((pgid, sig)))
+    monkeypatch.setattr(pl, "verify_handle_live", lambda handle: False)
+
+    # _owned_process_backend() itself is NOT monkeypatched — it resolves the
+    # real PosixProcessGroupBackend via _process_lifecycle.get_default_backend().
+    backend = tc._owned_process_backend()
+    assert isinstance(backend, pl.PosixProcessGroupBackend)
+
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=4321, executable="node", cwd=None, cmdline=["node"],
+        create_time=123.0, group_id=4321,
+    )
+    ok = tc._close_owned_process(handle)
+    assert ok is True
+    assert handle.closed is True
+    assert signal_calls == []  # PID may have been reused -- never signalled
+
+
+def test_close_owned_process_real_windows_backend_skips_signal_on_pid_reuse(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    run_calls = []
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
+    monkeypatch.setattr(pl, "verify_handle_live", lambda handle: False)
+
+    # Real WindowsJobObjectBackend class (not a _FakeBackend), with only the
+    # win32 kernel32 API loader faked out — the same pattern
+    # test_spawn_owned_with_cache_retry_windows_assigns_job already uses so
+    # this is runnable without a real ctypes.WinDLL.
+    monkeypatch.setattr(
+        tc._process_lifecycle, "get_default_backend",
+        lambda: pl.WindowsJobObjectBackend(api_loader=lambda: _FakeWin32JobAPIForTunnel()),
+    )
+    backend = tc._owned_process_backend()
+    assert isinstance(backend, pl.WindowsJobObjectBackend)
+
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=1234, executable="node.exe", cwd=None, cmdline=["node.exe"],
+        create_time=1.0,
+    )
+    ok = tc._close_owned_process(handle)
+    assert ok is True
+    assert handle.closed is True
+    assert run_calls == []  # taskkill skipped entirely -- PID may have been reused
+
+
+# ---------------------------------------------------------------------------
 # 315b0a63 — opt-in process_registry lease wiring for owned spawns. Gated
 # OFF by default (MERIDIAN_PROCESS_LEASES_ENABLED != "1") so every test
 # above this section runs with ZERO behavior change and zero disk I/O —
