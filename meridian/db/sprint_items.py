@@ -344,7 +344,15 @@ _SPRINT_PRIORITY_DEFAULT_RANK = _SPRINT_PRIORITY_RANK["normal"]
 # again in the next, since nothing but human judgment stopped it. 'superseded'
 # is therefore a HARD gate, enforced inside claim_sprint_item itself (see the
 # blocked-dict check below), unlike 'manual's listing-only exclusion.
-_VALID_SPRINT_BLOCKER_KINDS = ("manual", "superseded")
+#
+# cc3864bd — 'systemic_invalidated_run' = the item belongs to a wave run whose
+# FOUNDATIONAL HYPOTHESIS was systemically invalidated (see
+# meridian.db.wave_runs.abort_wave_run_systemic /
+# block_sprint_items_for_systemic_invalidation) — a stronger, deterministic-
+# evidence-gated cousin of 'superseded'. Also a HARD gate, same enforcement
+# point, for the same reason: a stale goal block or prior session memory can
+# still hand an executor this item_id directly.
+_VALID_SPRINT_BLOCKER_KINDS = ("manual", "superseded", "systemic_invalidated_run")
 
 # 7c82f7c8 — github_channel values, mirroring the fdaa5b55 auto-filed-issue
 # labeling scheme (channel:nightly / channel:stable GitHub labels). NULL =
@@ -2424,6 +2432,29 @@ async def claim_sprint_item(
                 "as-is. See the item's notes for what superseded it. A human "
                 "must clear blocker_kind via update_sprint_item to make it "
                 "claimable again."
+                + (f" Notes: {_notes}" if _notes else "")
+            ),
+            "item_id": item_id,
+        }
+    # cc3864bd — refuse an item blocked by a wave run's systemic invalidation.
+    # Hard gate, same enforcement point as 'superseded' above (a stale goal
+    # block or prior session memory can hand an executor this item_id
+    # directly, bypassing any listing filter) — see
+    # meridian.db.wave_runs.abort_wave_run_systemic /
+    # block_sprint_items_for_systemic_invalidation for how this gets set.
+    if (item.get("blocker_kind") or "").strip() == "systemic_invalidated_run":
+        _notes = (item.get("notes") or "").strip()
+        return {
+            "blocked": True,
+            "error": "SYSTEMIC_INVALIDATED_RUN",
+            "reason": (
+                "Sprint item is marked blocker_kind='systemic_invalidated_run' "
+                "— the wave run it belonged to was aborted because its "
+                "foundational hypothesis was systemically invalidated (see "
+                "the item's notes, and the wave run's executor_reports entry, "
+                "for the evidence). It must not be executed until a planner "
+                "reviews the evidence and clears blocker_kind via "
+                "update_sprint_item on a corrected board revision."
                 + (f" Notes: {_notes}" if _notes else "")
             ),
             "item_id": item_id,
@@ -7094,6 +7125,83 @@ async def evaluate_board_blockers(
     )
     decision["policy_source"] = policy_row.get("source")
     return decision
+
+
+async def block_sprint_items_for_systemic_invalidation(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_ids: "list[str]",
+    *,
+    wave_run_id: str,
+    reason_code: str,
+    basis: str,
+    actor: "str | None" = None,
+) -> dict[str, Any]:
+    """cc3864bd — mark every LIVE item in ``item_ids`` blocked by a wave
+    run's systemic invalidation, via the existing ``blocker_kind`` hard-gate
+    mechanism (:data:`_VALID_SPRINT_BLOCKER_KINDS`, same claim-time
+    enforcement point as ``'superseded'`` in :func:`claim_sprint_item`) —
+    never a new status value, so no existing status-dependent invariant
+    elsewhere in this module changes shape. Called from
+    :func:`meridian.db.wave_runs.abort_wave_run_systemic`; kept here (not
+    there) because it is fundamentally a sprint-item write, matching this
+    module's existing division of labor with ``wave_runs.py``.
+
+    Preserves independent completed evidence: an item already
+    ``status in {'done', 'skipped'}`` is NEVER touched — reported separately
+    under ``preserved_item_ids``. The entire point of quarantining rather
+    than reverting a systemically-invalidated run is that work already
+    verified independently STAYS verified.
+
+    Project isolation: an id that does not resolve to a live item inside
+    ``project_id`` is silently skipped (reported under
+    ``skipped_other_project_or_missing_ids``) rather than raising. A wave
+    run's own ``item_ids``/children are already project-scoped by
+    construction, but a caller-supplied ``evidence.affected_item_ids`` is
+    not trusted input — this is what stops one project's systemic
+    invalidation from ever reaching into another project's board.
+
+    Idempotent: an item already ``blocker_kind == 'systemic_invalidated_run'``
+    is left completely untouched (no duplicate write, no duplicate cache
+    invalidation) but still counted in ``blocked_item_ids`` — calling this
+    twice with the same inputs is a no-op the second time, matching
+    :func:`meridian.db.wave_runs.abort_wave_run_systemic`'s own idempotent
+    contract.
+
+    Returns ``{blocked_item_ids, preserved_item_ids,
+    skipped_other_project_or_missing_ids}`` (each sorted).
+    """
+    blocked: list[str] = []
+    preserved: list[str] = []
+    skipped: list[str] = []
+    marker = (
+        f"[blocker_kind=systemic_invalidated_run wave_run={wave_run_id} "
+        f"reason_code={reason_code}] {basis}"
+    )
+    for item_id in item_ids:
+        item = await get_sprint_item(db, item_id)
+        if item is None or item.get("project_id") != project_id:
+            skipped.append(item_id)
+            continue
+        if (item.get("status") or "") in ("done", "skipped"):
+            preserved.append(item_id)
+            continue
+        if (item.get("blocker_kind") or "").strip() == "systemic_invalidated_run":
+            blocked.append(item_id)
+            continue
+        existing_notes = (item.get("notes") or "").strip()
+        new_notes = f"{marker}\n\n{existing_notes}" if existing_notes else marker
+        await patch_sprint_item(
+            db, project_id, item_id,
+            blocker_kind="systemic_invalidated_run",
+            notes=new_notes,
+        )
+        blocked.append(item_id)
+    return {
+        "blocked_item_ids": sorted(blocked),
+        "preserved_item_ids": sorted(preserved),
+        "skipped_other_project_or_missing_ids": sorted(skipped),
+    }
 
 
 # ---------------------------------------------------------------------------

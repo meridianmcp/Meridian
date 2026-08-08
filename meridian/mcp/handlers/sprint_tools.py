@@ -2449,6 +2449,62 @@ async def handle_finalize_wave_run(
         return {"error": str(exc), "finalized": False}
 
 
+async def handle_abort_wave_run_systemic(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: abort_wave_run_systemic.
+
+    cc3864bd — fail closed: abort a wave run because its FOUNDATIONAL
+    HYPOTHESIS was systemically invalidated, as opposed to an ordinary
+    per-item failure (which stays on the existing finalize_wave_run /
+    failure_mode contract, untouched by this tool). ``evidence`` must be a
+    dict with ``reason_code`` (one of
+    ``meridian.db.wave_runs.SYSTEMIC_INVALIDATION_REASONS``) and a non-blank
+    ``basis`` — see :func:`meridian.db.wave_runs.validate_systemic_invalidation_evidence`
+    for the full deterministic-policy gate; a bare guess is refused.
+
+    On success: the run moves to 'aborted', every affected pending/in-flight
+    sprint item (this run's own item_ids/children, plus any explicit
+    ``evidence.affected_item_ids``) is marked
+    ``blocker_kind='systemic_invalidated_run'`` (a claim-time hard gate — see
+    ``claim_sprint_item``), items with an already-``succeeded`` outcome are
+    left untouched, and a non-executable executor-to-planner corrective
+    report is durably recorded (``meridian.db.executor_reports``) for a
+    planner to review before creating a corrected board revision and
+    starting a NEW wave run. Idempotent on retry with identical evidence.
+
+    NOTE (deliberate, documented scope decision — see the cc3864bd session
+    report): this handler is not yet registered in mcp_tools.py's tool-schema
+    list or mcp/handler.py's dispatch table. Both files sit outside this
+    item's resource-claim scope (AGENTS.md e2ac066b) — wiring the schema/
+    dispatch entry is an explicit, flagged follow-up, not a silent omission.
+    The full DB-layer contract (this function's callee) is complete and
+    tested independent of that wiring.
+    """
+    wave_run_id = str(args.get("wave_run_id") or "").strip()
+    if not wave_run_id:
+        return {"error": "wave_run_id is required"}
+
+    evidence = args.get("evidence")
+    actor = str(args.get("actor") or "").strip() or None
+
+    from ...db.wave_runs import abort_wave_run_systemic  # noqa: PLC0415
+    try:
+        return await abort_wave_run_systemic(
+            db, wave_run_id, evidence=evidence, actor=actor,
+        )
+    except ValueError as exc:
+        # Covers both SystemicInvalidationRejected (a ValueError subclass —
+        # bad/missing evidence) and every other fail-closed refusal
+        # abort_wave_run_systemic raises (unknown run, already terminal for
+        # a different reason, merged, transition-table refusal).
+        return {"error": str(exc), "aborted": False}
+
+
 # efaa918a — token-outcome -> actionable hint, distinguishing genuine spoofing
 # signals from "a sibling likely already acted" per AGENTS.md's b763d2ba/
 # ed71ef9b guidance. Attached to resume_wave's error message so a caller

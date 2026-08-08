@@ -144,6 +144,92 @@ WAVE_RUN_CHILD_STATUSES: frozenset[str] = frozenset({
 })
 
 
+#: Deterministic, closed set of reasons that may justify declaring a wave
+#: run's FOUNDATIONAL HYPOTHESIS systemically invalid, as distinct from an
+#: ordinary per-item failure (cc3864bd). Each corresponds 1:1 to one of the
+#: four examples the sprint-item spec names: a required Wave-1 invariant
+#: failing, a shared artifact/schema assumption being disproven, independent
+#: verification finding the SAME premise wrong across multiple items, or a
+#: safety/integrity gate failing. This is the deterministic-policy half of
+#: "a systemic signal may be declared only from explicit evidence and a
+#: deterministic policy... do not let an LLM guess alone abort a run" — see
+#: :func:`validate_systemic_invalidation_evidence`, which refuses anything
+#: outside this closed set.
+SYSTEMIC_INVALIDATION_REASONS: frozenset[str] = frozenset({
+    "wave1_invariant_failed",
+    "shared_artifact_disproven",
+    "cross_item_premise_wrong",
+    "safety_integrity_gate_failed",
+})
+
+
+class SystemicInvalidationRejected(ValueError):
+    """Raised when systemic-invalidation evidence fails the deterministic
+    policy gate — see :data:`SYSTEMIC_INVALIDATION_REASONS` and
+    :func:`validate_systemic_invalidation_evidence`. Never raised for an
+    ordinary per-item failure; that path is :class:`WaveRunFinalizationBlocked`
+    (a failed ``failure_mode='stop'`` child) or a plain ``continue``-mode
+    failure, both entirely untouched by this feature.
+    """
+
+
+def validate_systemic_invalidation_evidence(evidence: Any) -> dict[str, Any]:
+    """Fail-closed validation of systemic-invalidation evidence.
+
+    Requires a ``dict`` with:
+
+      * ``reason_code`` — one of :data:`SYSTEMIC_INVALIDATION_REASONS`.
+      * ``basis`` — a non-blank string naming the CONCRETE evidence (which
+        invariant failed, which items independently found the same wrong
+        premise, etc.). A bare ``reason_code`` with no ``basis`` is exactly
+        the "LLM guess alone" the sprint-item spec prohibits.
+
+    ``affected_item_ids`` (optional) must be a list of id strings when
+    given — the sprint items this evidence implicates, beyond whatever the
+    wave run already recorded as its own children/``item_ids``.
+
+    Returns the evidence dict with ``affected_item_ids`` normalized to a
+    (possibly empty) list. Raises :class:`SystemicInvalidationRejected` on
+    anything else — never silently coerces, defaults, or guesses a missing
+    field, mirroring :func:`_validate_finalizer_evidence`'s fail-closed
+    discipline for the (unrelated) finalization evidence contract.
+    """
+    if not isinstance(evidence, dict):
+        raise SystemicInvalidationRejected(
+            "Systemic invalidation requires an evidence dict with "
+            "'reason_code' and 'basis' — a bare string, boolean, or "
+            "self-report is rejected. This is the deterministic policy gate "
+            "named in the spec: an unsupported guess is never sufficient "
+            "grounds to abort a wave run and block its dependents."
+        )
+    reason_code = evidence.get("reason_code")
+    if reason_code not in SYSTEMIC_INVALIDATION_REASONS:
+        raise SystemicInvalidationRejected(
+            "Systemic invalidation rejected: reason_code must be one of "
+            f"{sorted(SYSTEMIC_INVALIDATION_REASONS)}, got {reason_code!r}. "
+            "An ordinary per-item failure should use the existing "
+            "failure_mode='stop'/'continue' contract instead of this path."
+        )
+    basis = evidence.get("basis")
+    if not isinstance(basis, str) or not basis.strip():
+        raise SystemicInvalidationRejected(
+            "Systemic invalidation rejected: evidence.basis must be a "
+            "non-blank string describing the concrete evidence (which "
+            "invariant failed, which items independently found the same "
+            "wrong premise, etc.) — a reason_code with no basis is exactly "
+            "the unsupported guess this gate exists to refuse."
+        )
+    affected = evidence.get("affected_item_ids") or []
+    if not isinstance(affected, list) or not all(isinstance(i, str) for i in affected):
+        raise SystemicInvalidationRejected(
+            "Systemic invalidation rejected: affected_item_ids must be a "
+            "list of sprint-item id strings when given."
+        )
+    out = dict(evidence)
+    out["affected_item_ids"] = list(affected)
+    return out
+
+
 class WaveRunFinalizationBlocked(ValueError):
     """Raised when a ``failure_mode='stop'`` child has failed.
 
@@ -633,6 +719,228 @@ async def advance_wave_run_status(
     updated = await get_wave_run(db, wave_run_id)
     assert updated is not None  # existed a statement ago
     return updated
+
+
+async def abort_wave_run_systemic(
+    db: aiosqlite.Connection,
+    wave_run_id: str,
+    *,
+    evidence: Any,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """Fail-closed: abort a wave run because its FOUNDATIONAL HYPOTHESIS was
+    systemically invalidated (cc3864bd) — distinct from an ordinary per-item
+    failure, which stays on the existing :class:`WaveRunFinalizationBlocked` /
+    ``failure_mode`` contract untouched by this function.
+
+    Order of operations (deliberately mirrors :func:`finalize_wave_run`'s own
+    documented order):
+
+      1. **Evidence → validate** (:func:`validate_systemic_invalidation_evidence`).
+         A bare guess is refused before anything else happens.
+      2. **Already aborted for the SAME reason → idempotent replay.** Checked
+         before any other terminal-state handling so a retry after a dropped
+         connection is safe: returns the ORIGINAL result, writes no row,
+         appends no event, re-blocks nothing. Aborted for a DIFFERENT reason
+         (an ordinary abort, or a different systemic reason) is refused —
+         terminal history is never silently reinterpreted.
+      3. **Merged → refuse.** Finalized work is never retroactively marked
+         invalid; start a new wave run for the corrected work instead.
+      4. **Transition-table check** — 'aborted' must be reachable from the
+         run's current status (see :data:`WAVE_RUN_TRANSITIONS`; every
+         non-terminal status already permits it, so this is defense in depth
+         against a future change to that table, not a live restriction today).
+      5. **Compute preserved vs. affected.** A child whose recorded outcome is
+         ``'succeeded'`` is PRESERVED — never touched, never blocked; that
+         independent evidence survives the abort exactly as recorded. Every
+         other item this run's own ``item_ids``/children name, plus any
+         ``evidence.affected_item_ids`` the caller named explicitly, is
+         AFFECTED.
+      6. **Transition to 'aborted' + block affected items.** Blocking reuses
+         the existing hard-gate mechanism
+         (:func:`meridian.db.sprint_items.block_sprint_items_for_systemic_invalidation`,
+         the same ``blocker_kind`` enforcement point ``claim_sprint_item``
+         already uses for ``'superseded'``) — no new sprint-item status value,
+         so no existing status-dependent invariant elsewhere changes shape.
+         Project-isolated and idempotent by construction — see that
+         function's own docstring.
+      7. **Emit a non-executable executor-to-planner corrective report.**
+         Reuses the existing durable ``executor_reports`` data layer (9154aa9a)
+         via :func:`meridian.db.executor_reports.create_executor_report` —
+         deliberately NOT a new parallel mechanism. The report's ``blockers``
+         entry carries the full evidence; ``recommended_next_actions`` tells
+         the planner explicitly to review the evidence, create a corrected
+         board revision, and start a NEW wave run rather than resuming or
+         mixing this aborted one with the fix. ``idempotency_key`` is
+         ``f"systemic-invalidation:{wave_run_id}:{reason_code}"`` so a retried
+         call (outside the already-aborted fast path — e.g. the DB write for
+         the run itself landed but the caller's connection dropped before it
+         saw the response) reuses the same report row instead of duplicating
+         it.
+      8. **Append exactly ONE 'systemic_invalidated' event** carrying the full
+         payload (reason_code, basis, affected/preserved/blocked item ids,
+         the executor_report id) — this is what makes step 2's idempotent
+         replay possible on a later retry.
+
+    Returns ``{aborted, already_aborted, wave_run_id, status, reason_code,
+    basis, affected_item_ids, preserved_item_ids, blocked_sprint_item_ids,
+    executor_report_id, executable, event_count}``. ``executable`` is always
+    ``False`` — an aborted-for-systemic-reasons run is, by definition, not a
+    thing any executor should resume work against.
+    """
+    validated = validate_systemic_invalidation_evidence(evidence)
+    reason_code = validated["reason_code"]
+    basis = validated["basis"]
+    explicit_affected = validated["affected_item_ids"]
+
+    run = await get_wave_run(db, wave_run_id)
+    if run is None:
+        raise ValueError(f"Wave run {wave_run_id!r} not found.")
+
+    if run["status"] == "aborted":
+        events = await get_wave_run_events(db, wave_run_id, include_superseded=False)
+        prior_systemic = next(
+            (e for e in reversed(events) if e.get("event_type") == "systemic_invalidated"),
+            None,
+        )
+        prior_payload = (prior_systemic or {}).get("payload") or {}
+        if (
+            prior_systemic is not None
+            and prior_payload.get("reason_code") == reason_code
+            and prior_payload.get("basis") == basis
+        ):
+            all_events = await get_wave_run_events(db, wave_run_id)
+            return {
+                "aborted": True,
+                "already_aborted": True,
+                "wave_run_id": wave_run_id,
+                "status": "aborted",
+                "reason_code": reason_code,
+                "basis": basis,
+                "affected_item_ids": prior_payload.get("affected_item_ids", []),
+                "preserved_item_ids": prior_payload.get("preserved_item_ids", []),
+                "blocked_sprint_item_ids": prior_payload.get("blocked_sprint_item_ids", []),
+                "executor_report_id": prior_payload.get("executor_report_id"),
+                "executable": False,
+                "event_count": len(all_events),
+            }
+        raise ValueError(
+            f"Wave run {wave_run_id!r} is already terminal (status='aborted') "
+            "for a different reason than the one given here "
+            f"(prior systemic-invalidation event: {prior_systemic!r}). "
+            "Aborted is terminal — a terminal run's history is never "
+            "silently reinterpreted. Start a new wave run for the corrected "
+            "work instead."
+        )
+    if run["status"] == "merged":
+        raise ValueError(
+            f"Wave run {wave_run_id!r} was already merged and cannot be "
+            "retroactively marked systemically invalid. Merged is terminal "
+            "— never resurrect or reinterpret finalized work."
+        )
+
+    current = run["status"]
+    allowed = WAVE_RUN_TRANSITIONS.get(current, frozenset())
+    if "aborted" not in allowed:
+        raise ValueError(
+            f"Cannot abort wave run {wave_run_id!r} from status {current!r}. "
+            f"Allowed from {current!r}: {sorted(allowed) or '(none — terminal)'}."
+        )
+
+    children = await get_wave_run_children(db, wave_run_id)
+    preserved_item_ids = sorted({
+        c["sprint_item_id"] for c in children if c.get("status") == "succeeded"
+    })
+    run_item_ids = set(run.get("item_ids") or [])
+    child_item_ids = {c["sprint_item_id"] for c in children}
+    candidate_ids = (
+        (run_item_ids | child_item_ids | set(explicit_affected))
+        - set(preserved_item_ids)
+    )
+    affected_item_ids = sorted(candidate_ids)
+
+    await db.execute(
+        "UPDATE wave_runs SET status = 'aborted', updated_at = datetime('now') "
+        "WHERE id = ?",
+        (wave_run_id,),
+    )
+    await db.commit()
+
+    # Lazy, direct submodule imports (not the `meridian.db` package aggregator)
+    # — mirrors create_wave_run's own lazy-import precedent above, and avoids
+    # any dependency on the aggregator's re-export list.
+    from meridian.db.sprint_items import (  # noqa: PLC0415
+        block_sprint_items_for_systemic_invalidation,
+    )
+    block_result = await block_sprint_items_for_systemic_invalidation(
+        db,
+        run["project_id"],
+        affected_item_ids,
+        wave_run_id=wave_run_id,
+        reason_code=reason_code,
+        basis=basis,
+        actor=actor,
+    )
+    blocked_sprint_item_ids = block_result["blocked_item_ids"]
+
+    from meridian.db.executor_reports import create_executor_report  # noqa: PLC0415
+    report = await create_executor_report(
+        db,
+        run["project_id"],
+        version=run.get("version"),
+        session_id=actor,
+        board_revision_hash=run.get("revision_hash"),
+        blockers=[{
+            "wave_run_id": wave_run_id,
+            "reason_code": reason_code,
+            "reason": basis,
+            "classification": "systemic_invalidated_run",
+            "affected_item_ids": affected_item_ids,
+        }],
+        recommended_next_actions=[
+            "Review the evidence and the blocked sprint items it names.",
+            "Create a corrected board revision addressing the invalidated "
+            "premise before any blocked item is unblocked.",
+            "Start a NEW wave run against the corrected revision — do not "
+            "resume or mix this aborted run with the corrected work.",
+        ],
+        idempotency_key=f"systemic-invalidation:{wave_run_id}:{reason_code}",
+    )
+
+    payload = {
+        "reason_code": reason_code,
+        "basis": basis,
+        "affected_item_ids": affected_item_ids,
+        "preserved_item_ids": preserved_item_ids,
+        "blocked_sprint_item_ids": blocked_sprint_item_ids,
+        "executor_report_id": report.get("id"),
+    }
+    await append_wave_run_event(
+        db,
+        wave_run_id,
+        "systemic_invalidated",
+        from_status=current,
+        to_status="aborted",
+        detail=f"systemic invalidation ({reason_code}): {basis}",
+        payload=payload,
+        actor=actor,
+    )
+
+    events_after = await get_wave_run_events(db, wave_run_id)
+    return {
+        "aborted": True,
+        "already_aborted": False,
+        "wave_run_id": wave_run_id,
+        "status": "aborted",
+        "reason_code": reason_code,
+        "basis": basis,
+        "affected_item_ids": affected_item_ids,
+        "preserved_item_ids": preserved_item_ids,
+        "blocked_sprint_item_ids": blocked_sprint_item_ids,
+        "executor_report_id": report.get("id"),
+        "executable": False,
+        "event_count": len(events_after),
+    }
 
 
 async def record_degraded_tool(
