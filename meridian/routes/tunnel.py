@@ -38,11 +38,13 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
 from .. import db as db_module
+from .. import process_registry as process_registry_module
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
     migrate_retired_overrides, config_fingerprint,
 )
+from ..openai_tunnel_adapter import combined_diagnostics, OpenAITunnelAdapterError
 
 router = APIRouter()
 _log = logging.getLogger(__name__)
@@ -1836,6 +1838,55 @@ async def tunnel_status(tenant_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# POST /tunnel/openai/diagnostics/{tenant_id} — OPTIONAL OpenAI Secure MCP
+# Tunnel transport adapter diagnostics (45049071), explicitly namespaced
+# apart from tunnel_status()'s Meridian-tunnel socket state above so the two
+# transports can never be conflated by a caller. This endpoint does NOT
+# persist anything server-side (no new DB column, no change to production
+# credentials/connections) — the caller (dashboard, or the local
+# `meridian --tunnel` client's own tunnel_client.openai_tunnel_adapter_snapshot())
+# supplies the locally-known stdio/HTTP config each call. Persistence is an
+# explicit documented follow-up — see docs/secure-openai-mcp-tunnel-adapter.md.
+# ---------------------------------------------------------------------------
+
+@router.post("/tunnel/openai/diagnostics/{tenant_id}")
+async def openai_tunnel_diagnostics(tenant_id: str, request: Request) -> Response:
+    """Compose OpenAI Secure MCP Tunnel adapter diagnostics for *tenant_id*,
+    alongside Meridian's own tunnel socket state (see :func:`tunnel_status`).
+
+    Body (all optional): ``{"openai_tunnel_config": {...}, "reported_status":
+    {...}}``. ``openai_tunnel_config`` is validated via
+    ``openai_tunnel_adapter.normalize_config`` — a malformed config yields a
+    400 with the validation error, never a partial/best-guess diagnostics
+    response. ``reported_status`` optionally carries a live ``{"state": ...,
+    "detail": ...}`` health report from wherever actually probes the OpenAI
+    tunnel (out of scope for this item; see the adapter module's docstring).
+    Omitting both reports ``not_configured`` — no auth required, mirroring
+    :func:`tunnel_status`'s own lightweight, read-only status check.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 — empty/invalid body -> treat as "no config supplied"
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    openai_config = body.get("openai_tunnel_config")
+    reported_status = body.get("reported_status")
+    if reported_status is not None and not isinstance(reported_status, dict):
+        reported_status = None
+    try:
+        diagnostics = combined_diagnostics(
+            tenant_id,
+            openai_config=openai_config,
+            reported_status=reported_status,
+            meridian_tunnel_active=tenant_id in _tunnel_sockets,
+        )
+    except OpenAITunnelAdapterError as exc:
+        return _json_response({"error": str(exc)}, status_code=400)
+    return _json_response(diagnostics)
+
+
+# ---------------------------------------------------------------------------
 # Tunnel plugin registry — per-tenant config (dashboard Settings → Tunnel Plugins)
 # ---------------------------------------------------------------------------
 
@@ -2242,13 +2293,46 @@ def _config_manifest_hash(config: Any) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def _local_process_lease_summary() -> dict:
+    """315b0a63 — best-effort summary of THIS SERVER PROCESS's own local
+    worker-lease registry (meridian/process_registry.py).
+
+    Only meaningful when this FastAPI process shares a filesystem/host with
+    the client(s) that registered leases — e.g. a self-hosted, single-
+    machine install running the dashboard alongside ``--mcp``/``--tunnel``.
+    A remote, multi-tenant hosted instance (Fly.io) has no visibility into
+    a developer's local laptop and correctly reports zero leases here; it
+    is NOT a promise about the tenant's own machine, only about this
+    server process's local disk. Never raises — a registry read failure
+    degrades to an unavailable-shaped summary rather than breaking
+    diagnostics."""
+    try:
+        broker = process_registry_module.get_broker()
+        active = broker.list_leases()
+        survivors = broker.report_unowned_survivors()
+        return {
+            "available": True,
+            "active": len(active),
+            "unowned_survivors": len(survivors),
+        }
+    except Exception:  # noqa: BLE001 — diagnostics must never fail on this
+        return {"available": False, "active": 0, "unowned_survivors": 0}
+
+
 def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = None) -> dict:
     """Assemble the full layered diagnostic snapshot for one tenant (f1e0df55).
 
     Shared by the ``GET /tunnel/diagnostics/{tenant_id}`` HTTP route and the
     ``get_tunnel_diagnostics`` MCP tool so both surfaces report identically.
     Returns an unauthenticated-shaped stub (empty slots, no tenant) when
-    ``tenant`` is None, mirroring ``get_tunnel_plugins``'s existing contract."""
+    ``tenant`` is None, mirroring ``get_tunnel_plugins``'s existing contract.
+
+    315b0a63 — both branches include ``process_leases``: a best-effort local
+    summary of this server process's own worker-lease registry (see
+    :func:`_local_process_lease_summary`). Included even in the
+    unauthenticated/no-tenant branch because that is exactly the shape
+    self-hosted callers get — the case where this field is actually most
+    useful."""
     run_id = uuid.uuid4().hex
     generated_at = time.time()
     if tenant is None:
@@ -2266,6 +2350,7 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
                 "manifest_hash": _config_manifest_hash(None),
                 "tools_list_stale": False,
             },
+            "process_leases": _local_process_lease_summary(),
         }
 
     tid = tenant.get("id")
@@ -2336,6 +2421,7 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
             "manifest_hash": _config_manifest_hash(parsed),
             "tools_list_stale": tid in _tools_list_changed_pending,
         },
+        "process_leases": _local_process_lease_summary(),
     }
 
 

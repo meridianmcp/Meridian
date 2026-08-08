@@ -7295,6 +7295,264 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
+  // meridian/static/dashboard-documents.ts
+  var REVIEW_CATEGORY_LABELS = {
+    structure: "Structure",
+    section_page: "Sections & pages",
+    caption: "Captions",
+    equation: "Equations",
+    ownership: "Ownership",
+    provenance: "Provenance",
+    render_integrity: "Render & integrity"
+  };
+  var REVIEW_CATEGORY_ORDER = Object.keys(REVIEW_CATEGORY_LABELS);
+  var REVIEW_SEVERITY_ORDER = { error: 0, warning: 1, info: 2 };
+  var REVIEW_SEVERITY_LABELS = { error: "Error", warning: "Warning", info: "Info" };
+  var REVIEW_SEVERITY_COLOR = {
+    error: "var(--error, #f85149)",
+    warning: "var(--warning, #d29922)",
+    info: "var(--muted)"
+  };
+  var MAX_PREVIEW_CHARS = 140;
+  function truncatePreview(text, max = MAX_PREVIEW_CHARS) {
+    const s3 = String(text || "");
+    if (s3.length <= max) return { text: s3, truncated: false, fullText: s3 };
+    return { text: s3.slice(0, max).trimEnd() + "\u2026", truncated: true, fullText: s3 };
+  }
+  function groupFindingsByCategory(findings, categories) {
+    const cats = categories && categories.length ? categories.slice() : REVIEW_CATEGORY_ORDER.slice();
+    const byCat = /* @__PURE__ */ new Map();
+    for (const c3 of cats) byCat.set(c3, []);
+    for (const f4 of findings || []) {
+      if (!f4) continue;
+      if (!byCat.has(f4.category)) byCat.set(f4.category, []);
+      byCat.get(f4.category).push(f4);
+    }
+    const ordered = [...byCat.keys()].sort((a3, b2) => {
+      const ia = REVIEW_CATEGORY_ORDER.indexOf(a3);
+      const ib = REVIEW_CATEGORY_ORDER.indexOf(b2);
+      if (ia === -1 && ib === -1) return a3.localeCompare(b2);
+      if (ia === -1) return 1;
+      if (ib === -1) return -1;
+      return ia - ib;
+    });
+    return ordered.map((category) => ({
+      category,
+      label: REVIEW_CATEGORY_LABELS[category] || category,
+      findings: byCat.get(category).slice().sort(
+        (a3, b2) => (REVIEW_SEVERITY_ORDER[a3.severity] ?? 9) - (REVIEW_SEVERITY_ORDER[b2.severity] ?? 9)
+      )
+    }));
+  }
+  function isReviewEmpty(review) {
+    if (!review || review.error) return false;
+    if (review.status && review.status !== "ok") return false;
+    return !(review.findings && review.findings.length);
+  }
+  function isReviewStale(review) {
+    return !!review && review.status === "stale";
+  }
+  function isReviewError(review) {
+    return !!review && !!review.error;
+  }
+  function summarizeLocator(locator) {
+    const status = locator && locator.status || "unknown";
+    if (status === "resolved") {
+      const raw = locator.quoted_text || locator.leading_text_preview || locator.first_words || "";
+      const { text, truncated, fullText } = truncatePreview(raw);
+      return {
+        kind: "resolved",
+        sectionPath: locator.section_path || "(document root)",
+        preview: text,
+        fullText,
+        truncated,
+        wordSearchLocator: locator.word_search_locator || locator.first_words || "",
+        bookmarkExists: !!locator.bookmark_exists,
+        candidateCount: 0,
+        candidates: [],
+        reason: ""
+      };
+    }
+    if (status === "ambiguous") {
+      const candidates = (locator?.candidates || []).map((c3) => ({
+        label: c3.target_para_id || c3.element_type || "candidate",
+        sectionPath: c3.section_path || "(document root)",
+        preview: truncatePreview(c3.leading_text_preview).text
+      }));
+      return {
+        kind: "ambiguous",
+        sectionPath: "",
+        preview: "",
+        fullText: "",
+        truncated: false,
+        wordSearchLocator: "",
+        bookmarkExists: false,
+        candidateCount: candidates.length,
+        candidates,
+        reason: locator?.reason || "multiple elements matched this location \u2014 showing candidates instead of guessing"
+      };
+    }
+    if (status === "stale") {
+      return {
+        kind: "stale",
+        sectionPath: "",
+        preview: "",
+        fullText: "",
+        truncated: false,
+        wordSearchLocator: "",
+        bookmarkExists: false,
+        candidateCount: 0,
+        candidates: [],
+        reason: locator?.reason || "the document changed since this location was resolved"
+      };
+    }
+    if (status === "not_applicable") {
+      return {
+        kind: "not_applicable",
+        sectionPath: "",
+        preview: "",
+        fullText: "",
+        truncated: false,
+        wordSearchLocator: "",
+        bookmarkExists: false,
+        candidateCount: 0,
+        candidates: [],
+        reason: "this finding has no single paragraph-level location"
+      };
+    }
+    return {
+      kind: "not_found",
+      sectionPath: "",
+      preview: "",
+      fullText: "",
+      truncated: false,
+      wordSearchLocator: "",
+      bookmarkExists: false,
+      candidateCount: 0,
+      candidates: [],
+      reason: locator?.reason || "location could not be resolved"
+    };
+  }
+  var _reviewFingerprints = /* @__PURE__ */ new Map();
+  function _findingRow(f4) {
+    const sev = String(f4.severity || "info");
+    const color = REVIEW_SEVERITY_COLOR[sev] || "var(--muted)";
+    const loc = summarizeLocator(f4.locator);
+    let locHtml;
+    if (loc.kind === "resolved") {
+      const copyText = escapeHtml(loc.wordSearchLocator || "");
+      locHtml = `<div style="margin-top:4px;font-size:9px;color:var(--muted)">${escapeHtml(loc.sectionPath)}</div>
+      <div style="margin-top:2px;font-size:10px;color:var(--text);font-style:italic">&ldquo;${escapeHtml(loc.preview)}&rdquo;${loc.truncated ? ' <span style="color:var(--muted);font-style:normal">(truncated)</span>' : ""}</div>
+      <div style="margin-top:4px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <button class="review-copy-locator-btn secondary" data-locator="${copyText}" style="font-size:8px;padding:1px 6px">Copy Word Ctrl+F text</button>
+        <span style="font-size:8px;color:var(--muted)">${loc.bookmarkExists ? "bookmark/REF found" : "no bookmark/REF"}</span>
+      </div>`;
+    } else if (loc.kind === "ambiguous") {
+      locHtml = `<div style="margin-top:4px;font-size:9px;color:var(--warning,#d29922)">${escapeHtml(loc.reason)}</div>
+      <div style="margin-top:2px">${loc.candidates.map(
+        (c3) => `<div style="font-size:9px;color:var(--muted);padding:2px 0 2px 8px;border-left:2px solid var(--border)">${escapeHtml(c3.sectionPath)} &mdash; &ldquo;${escapeHtml(c3.preview)}&rdquo;</div>`
+      ).join("")}</div>`;
+    } else {
+      locHtml = `<div style="margin-top:4px;font-size:9px;color:var(--muted)">${escapeHtml(loc.reason)}</div>`;
+    }
+    return `<div style="border:1px solid var(--border);border-left:3px solid ${color};border-radius:0 4px 4px 0;padding:6px 10px;margin-bottom:6px;background:var(--surface-1)">
+    <div style="display:flex;align-items:center;gap:6px">
+      <span style="font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:${color}">${escapeHtml(REVIEW_SEVERITY_LABELS[sev] || sev)}</span>
+      <span style="font-size:10px;color:var(--text);font-weight:600">${escapeHtml(String(f4.type || "").replace(/_/g, " "))}</span>
+    </div>
+    ${locHtml}
+  </div>`;
+  }
+  function renderDocumentReview(review, targetId) {
+    const target = document.getElementById(targetId);
+    if (!target) return;
+    if (isReviewError(review)) {
+      target.innerHTML = `<div style="font-size:9px;color:var(--error)">${escapeHtml(String(review.error))}</div>`;
+      return;
+    }
+    if (isReviewStale(review)) {
+      _reviewFingerprints.delete(targetId);
+      target.innerHTML = `<div style="font-size:9px;color:var(--warning,#d29922)">Document changed since the last review (${escapeHtml(String(review.reason || "stale snapshot"))}). <button class="review-recheck-btn secondary" data-target="${escapeHtml(targetId)}" style="font-size:8px;padding:1px 6px;margin-left:4px">Re-check</button></div>`;
+      return;
+    }
+    if (review && review.source_fingerprint) _reviewFingerprints.set(targetId, review.source_fingerprint);
+    const banner = `<div style="font-size:8px;color:var(--muted);margin-bottom:6px;padding:3px 6px;border:1px solid var(--border);border-radius:3px;display:inline-block">READ-ONLY RECOMMENDATION &mdash; no DOCX writes; draft-overlay and committed-mutation review tiers are not yet available</div>`;
+    if (isReviewEmpty(review)) {
+      target.innerHTML = `${banner}<div class="empty" style="color:var(--muted);padding:6px 0">No findings \u2014 this document looks clean across every checked category.</div>`;
+      return;
+    }
+    const groups = groupFindingsByCategory(review.findings, review.categories);
+    let html = banner;
+    html += `<div style="font-size:9px;color:var(--muted);margin-bottom:8px">${review.finding_count ?? (review.findings || []).length} finding(s) across ${groups.filter((g2) => g2.findings.length).length} categor${groups.filter((g2) => g2.findings.length).length === 1 ? "y" : "ies"}.</div>`;
+    for (const g2 of groups) {
+      if (!g2.findings.length) continue;
+      html += `<div style="margin:8px 0 4px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--accent)">${escapeHtml(g2.label)} <span style="color:var(--muted);font-weight:400">${g2.findings.length}</span></div>`;
+      for (const f4 of g2.findings) html += _findingRow(f4);
+    }
+    target.innerHTML = html;
+    target.querySelectorAll(".review-copy-locator-btn").forEach((el2) => {
+      el2.addEventListener("click", () => {
+        const txt = el2.getAttribute("data-locator") || "";
+        try {
+          navigator.clipboard.writeText(txt);
+        } catch (_2) {
+        }
+        const prev = el2.textContent;
+        el2.textContent = "Copied \u2713";
+        setTimeout(() => {
+          el2.textContent = prev || "Copy Word Ctrl+F text";
+        }, 1500);
+      });
+    });
+  }
+  async function loadDocumentReview(projectId, filePath, targetId, expectedFingerprint) {
+    const target = document.getElementById(targetId);
+    if (!target) return;
+    target.innerHTML = '<span style="font-size:9px;color:var(--muted)">loading review\u2026</span>';
+    try {
+      let url = `/projects/${projectId}/document-review?path=${encodeURIComponent(filePath)}`;
+      if (expectedFingerprint) url += `&expected_source_fingerprint=${encodeURIComponent(expectedFingerprint)}`;
+      const review = await api(url);
+      renderDocumentReview(review, targetId);
+    } catch (e3) {
+      target.innerHTML = `<span style="font-size:9px;color:var(--error)">Review failed: ${escapeHtml(String(e3))}</span>`;
+    }
+  }
+  function wireDocumentReviewButtons2(projectId, root = document) {
+    root.querySelectorAll(".doc-review-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const fp = btn.getAttribute("data-fp") || "";
+        const did = btn.getAttribute("data-did") || "";
+        const targetId = `doc-review-${did}`;
+        await loadDocumentReview(projectId, fp, targetId);
+      });
+    });
+    root.querySelectorAll(".review-recheck-btn").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const targetId = btn.getAttribute("data-target") || "";
+        const target = document.getElementById(targetId);
+        const fp = target ? target.getAttribute("data-fp") || "" : "";
+        if (!fp) return;
+        const prevFingerprint = _reviewFingerprints.get(targetId) || null;
+        await loadDocumentReview(projectId, fp, targetId, prevFingerprint);
+      });
+    });
+  }
+  try {
+    Object.assign(window, {
+      groupFindingsByCategory,
+      summarizeLocator,
+      truncatePreview,
+      isReviewEmpty,
+      isReviewStale,
+      isReviewError,
+      renderDocumentReview,
+      loadDocumentReview,
+      wireDocumentReviewButtons: wireDocumentReviewButtons2
+    });
+  } catch (e3) {
+  }
+
   // meridian/static/dashboard-files.ts
   function _rewriteRepoImages(container, projectId) {
     if (!container || !projectId) return;
@@ -14224,7 +14482,10 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         </div>
         ${fp ? `<div style="font-size:9px;color:var(--muted);font-family:var(--font-mono);margin-top:3px;word-break:break-all">${escapeHtml(String(fp))}</div>` : ""}
         ${tags.length ? `<div style="margin-top:4px;display:flex;gap:3px;flex-wrap:wrap">${tags.map((t3) => `<span style="font-size:8px;padding:1px 4px;border-radius:3px;background:var(--surface-1);border:1px solid var(--border);color:var(--muted)">#${escapeHtml(String(t3))}</span>`).join("")}</div>` : ""}
-        ${fp ? `<div style="margin-top:6px"><button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button></div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div>` : '<div style="font-size:9px;color:var(--muted);margin-top:4px">No server-side file_path \u2014 structure view unavailable.</div>'}
+        ${fp ? `<div style="margin-top:6px;display:flex;gap:6px">
+              <button class="doc-struct-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">View structure</button>
+              ${String(fp).toLowerCase().endsWith(".docx") ? `<button class="doc-review-btn" data-fp="${escapeHtml(String(fp))}" data-did="${escapeHtml(did)}" style="font-size:9px;padding:2px 8px">Review findings</button>` : ""}
+            </div><div id="doc-struct-${escapeHtml(did)}" style="margin-top:6px"></div><div id="doc-review-${escapeHtml(did)}" data-fp="${escapeHtml(String(fp))}" style="margin-top:6px"></div>` : '<div style="font-size:9px;color:var(--muted);margin-top:4px">No server-side file_path \u2014 structure view unavailable.</div>'}
       </div>`;
       }
       html += `<div style="font-size:9px;color:var(--muted);margin-top:6px">Structure = heading tree + paragraph/heading counts (docs_intel Phase 1). Figures, cross-references, equations and comments are not yet extracted. Structure needs the file on the tunnel/self-host server.</div>`;
@@ -14336,6 +14597,7 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
         }
       });
     });
+    wireDocumentReviewButtons(projectId, body);
   }
   async function loadCodeIntelTab(projectId) {
     const body = document.getElementById(`codeintel-body-${projectId}`);

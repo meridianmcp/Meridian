@@ -383,3 +383,106 @@ async def test_dispatch_once_uses_real_evaluate_board_blockers_by_default(db, pr
     assert len(enqueued) == 1
     assert "Fine Item" in fake.calls[0]["prompt"]
     assert disp._stopped is False
+
+
+# --- 315b0a63: optional worker-lease sweep hook ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_skips_lease_sweep_when_not_wired(db, project):
+    """Default (lease_sweep_fn=None) — no hook call, dispatch behaves
+    exactly as before this feature existed."""
+    fake = _FakeEnqueue()
+    disp = Dispatcher(db, project, enqueue_fn=fake)
+    await disp.dispatch_once()
+    assert disp.last_lease_sweep is None
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_calls_lease_sweep_when_wired(db, project):
+    calls = []
+
+    def _sweep():
+        calls.append(1)
+        return [{"run_id": "orphan-1"}]
+
+    fake = _FakeEnqueue()
+    disp = Dispatcher(db, project, enqueue_fn=fake, lease_sweep_fn=_sweep)
+    await disp.dispatch_once()
+    assert calls == [1]
+    assert disp.last_lease_sweep == [{"run_id": "orphan-1"}]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_survives_lease_sweep_failure(db, project):
+    """A broken lease-sweep hook must not break dispatch — same contract
+    as blocker-policy evaluation failures."""
+    await db_module.add_sprint_item(
+        db, project, "v1", "Item A", touches_resources=["file:a"]
+    )
+
+    def _boom_sweep():
+        raise RuntimeError("sweep blew up")
+
+    fake = _FakeEnqueue()
+    disp = Dispatcher(db, project, enqueue_fn=fake, lease_sweep_fn=_boom_sweep)
+    enqueued = await disp.dispatch_once()
+    assert len(enqueued) == 1
+    assert disp._stopped is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_lease_sweep_empty_result_recorded(db, project):
+    fake = _FakeEnqueue()
+    disp = Dispatcher(db, project, enqueue_fn=fake, lease_sweep_fn=lambda: [])
+    await disp.dispatch_once()
+    assert disp.last_lease_sweep == []
+
+
+@pytest.mark.asyncio
+async def test_start_if_enabled_wires_default_lease_sweep(monkeypatch, db, project, tmp_path):
+    """start_dispatcher_if_enabled wires a real, working default hook once
+    the dispatcher itself is opted in — read-only (report_unowned_
+    survivors), so it adds no new side effects for a host that never
+    registers any lease. Uses a tmp_path-isolated registry (and resets the
+    process_registry module singleton before/after) so this test never
+    reads/pollutes a real home directory or a sibling test's state."""
+    from meridian import process_registry as process_registry_module
+
+    monkeypatch.setenv(dispatcher_module.ENABLE_ENV_VAR, "1")
+    monkeypatch.setenv("MERIDIAN_LEASE_REGISTRY_PATH", str(tmp_path / "leases.json"))
+    process_registry_module.reset_default_broker()
+    fake = _FakeEnqueue()
+
+    class _App:
+        class state:  # noqa: N801
+            pass
+
+    try:
+        disp = start_dispatcher_if_enabled(_App, db, project, interval=0.05, enqueue_fn=fake)
+        assert disp is not None
+        assert disp._lease_sweep is not None
+        result = disp._lease_sweep()
+        assert result == []  # nothing registered — report_unowned_survivors is empty
+        await disp.stop()
+    finally:
+        process_registry_module.reset_default_broker()
+
+
+@pytest.mark.asyncio
+async def test_start_if_enabled_explicit_none_lease_sweep_opts_out(monkeypatch, db, project):
+    """An explicit lease_sweep_fn=None from the caller wins over the
+    default wiring — setdefault() must not clobber an explicit opt-out."""
+    monkeypatch.setenv(dispatcher_module.ENABLE_ENV_VAR, "1")
+    fake = _FakeEnqueue()
+
+    class _App:
+        class state:  # noqa: N801
+            pass
+
+    disp = start_dispatcher_if_enabled(
+        _App, db, project, interval=0.05, enqueue_fn=fake, lease_sweep_fn=None,
+    )
+    assert disp is not None
+    assert disp._lease_sweep is None
+    await disp.stop()

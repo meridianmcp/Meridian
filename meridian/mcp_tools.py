@@ -113,6 +113,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "add_custom_hook": 'add_custom_hook(project_id="abc-123", name="no-secrets", event="PreToolUse", matcher="Read|Bash", script_sh="grep -q SECRET_KEY <<<\\"$(cat)\\" && exit 2 || exit 0", blocking=True)',
     "get_custom_hooks": 'get_custom_hooks(project_id="abc-123", event="PreToolUse")',
     "delete_custom_hook": 'delete_custom_hook(project_id="abc-123", hook_id="hook-uuid")',
+    "update_custom_hook": 'update_custom_hook(project_id="abc-123", hook_id="hook-uuid", enabled=False)  # or edit name/event/matcher/script_sh/script_ps1/blocking',
 }
 
 
@@ -2939,6 +2940,32 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "hook_id": {"type": "string", "description": "The hook id to delete."}},
          "required": ["hook_id"]}},
+    {"name": "update_custom_hook", "description":
+        "b4f4627f — the previously-missing generic enable/disable/edit path for a "
+        "user-defined hook (id returned by add_custom_hook / get_custom_hooks): patches "
+        "name, event, matcher, script_sh, script_ps1, blocking, and/or enabled without "
+        "the delete+recreate round-trip add_custom_hook/delete_custom_hook would "
+        "otherwise require. At least one editable field is required. Renaming re-derives "
+        "the slug (same reserved-name / uniqueness checks as add_custom_hook); the db "
+        "layer raises ValueError for a bad event, the reserved 'sprint_guard' name, or a "
+        "slug collision — surfaced as {error}. Returns {error} (never raises) when "
+        "hook_id doesn't resolve for this project. Flipping enabled true -> false also "
+        "removes any already-written .claude/hooks/<slug>.* files immediately (best-"
+        "effort, when the project has a resolvable repo_path) instead of waiting for the "
+        "next generate_handoff to simply stop re-writing them — reported back as "
+        "removed_files when any were deleted.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "hook_id": {"type": "string", "description": "The hook id to update."},
+         "name": {"type": "string", "description": "New human-readable name; re-derives the slug (must not be 'sprint_guard' or collide with another hook's slug on this project)."},
+         "event": {"type": "string", "enum": ["PreToolUse", "PostToolUse", "Stop"], "description": "New hook event."},
+         "script_sh": {"type": "string", "description": "New POSIX shell script body."},
+         "script_ps1": {"type": "string", "description": "New PowerShell script body."},
+         "matcher": {"type": "string", "description": "New Claude Code tool-name matcher regex; ignored for Stop hooks."},
+         "blocking": {"type": "boolean", "description": "true = real exit-code-blocking semantics. false = advisory/non-blocking."},
+         "enabled": {"type": "boolean", "description": "Enable/disable this hook. Disabling immediately removes any already-written artifact files for it (best-effort)."}},
+         "required": ["hook_id"]}},
 ]
 
 _READ_ONLY_TOOLS = {
@@ -3182,6 +3209,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "add_custom_hook":     "config",
     "get_custom_hooks":    "config",
     "delete_custom_hook":  "config",
+    "update_custom_hook":  "config",
     # research
     "paper_search": "research",
     "social_search": "research",
@@ -3306,6 +3334,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "add_custom_hook":           "both",
     "get_custom_hooks":          "both",
     "delete_custom_hook":        "both",
+    "update_custom_hook":        "both",
     "add_note":                  "both",
     "get_notes":                 "both",
     "read_note":                 "both",
@@ -3516,6 +3545,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "add_custom_hook":            "maintenance-only",
     "get_custom_hooks":           "maintenance-only",
     "delete_custom_hook":         "maintenance-only",
+    "update_custom_hook":         "maintenance-only",
     # goal / sprint editing (planning boundaries only)
     "set_goal":                   "maintenance-only",
     "set_north_star":             "maintenance-only",

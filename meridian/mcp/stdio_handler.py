@@ -520,6 +520,21 @@ def build_mcp_server():
                                 "future. deferred_until is NOT cleared."
                             ),
                         },
+                        "selected_item_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "(94f48e4d) Optional list of sprint-item ids to "
+                                "restrict this handoff to -- exactly these items "
+                                "plus their still-open depends_on closure, instead "
+                                "of the full backlog. FAIL-CLOSED (unlike "
+                                "force_include_ids above): any unknown, cross-"
+                                "project, cross-version, or non-pending id refuses "
+                                "the whole call with error=HANDOFF_SELECTION_BLOCKED "
+                                "and a selection_rejected list instead of silently "
+                                "narrowing/widening the scope."
+                            ),
+                        },
                         "strict_evidence": {
                             "type": "boolean",
                             "description": (
@@ -2376,6 +2391,14 @@ def build_mcp_server():
                 _raw_stdio_fii = arguments.get("force_include_ids")
                 if isinstance(_raw_stdio_fii, list):
                     _stdio_force_include_ids = [str(x) for x in _raw_stdio_fii if x]
+                # 94f48e4d — mirror handler.py's HTTP MCP dispatch: forward
+                # selected_item_ids through the stdio transport too. See
+                # handoff_module.generate_handoff's own docstring for the
+                # fail-closed contract (differs from force_include_ids above).
+                _stdio_selected_item_ids: list[str] | None = None
+                _raw_stdio_sel = arguments.get("selected_item_ids")
+                if isinstance(_raw_stdio_sel, list):
+                    _stdio_selected_item_ids = [str(x) for x in _raw_stdio_sel if x]
                 _stdio_strict_evidence = bool(arguments.get("strict_evidence"))
                 _stdio_strict_pointer_evidence = bool(
                     arguments.get("strict_pointer_evidence")
@@ -2392,6 +2415,7 @@ def build_mcp_server():
                 _handoff_evidence_blocked = False
                 _handoff_continuation_blocked = False
                 _handoff_stale_reference_blocked = False
+                _handoff_selection_blocked = False
                 try:
                     path, content, _ = await asyncio.wait_for(
                         handoff_module.generate_handoff(
@@ -2402,6 +2426,7 @@ def build_mcp_server():
                             session_id=session_id,
                             version=_stdio_version,
                             force_include_ids=_stdio_force_include_ids,
+                            selected_item_ids=_stdio_selected_item_ids,
                             strict_evidence=_stdio_strict_evidence,
                             strict_pointer_evidence=_stdio_strict_pointer_evidence,
                             force_include_rejected=_stdio_force_include_rejected,
@@ -2450,10 +2475,21 @@ def build_mcp_server():
                         "message": str(exc),
                     }
                     _handoff_stale_reference_blocked = True
+                except handoff_module.HandoffSelectionError as exc:
+                    # 94f48e4d — mirror handler.py's structured refusal: nothing
+                    # was rendered/persisted for this call.
+                    result = {
+                        "error": "HANDOFF_SELECTION_BLOCKED",
+                        "project_id": arguments["project_id"],
+                        "selection_rejected": exc.rejected,
+                        "message": str(exc),
+                    }
+                    _handoff_selection_blocked = True
                 if (
                     not _handoff_evidence_blocked
                     and not _handoff_continuation_blocked
                     and not _handoff_stale_reference_blocked
+                    and not _handoff_selection_blocked
                 ):
                     # a5e8aa74 — return content EXACTLY as generate_handoff rendered
                     # it, via the shared helper meridian/mcp/handler.py and

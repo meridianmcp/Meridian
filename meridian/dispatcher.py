@@ -44,6 +44,7 @@ from . import artifact_declaration as artifact_declaration_module
 from . import db as db_module
 from . import enqueue as enqueue_module
 from . import executor_config as executor_config_module
+from . import process_registry as process_registry_module
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,12 @@ DEFAULT_MAX_IN_FLIGHT = executor_config_module.DEFAULT_PARALLELISM_TARGET
 # Signature of the enqueue primitive — injectable so tests can substitute a
 # fake that never spawns a real subprocess.
 EnqueueFn = Callable[..., Awaitable[dict[str, Any]]]
+
+# 315b0a63 — signature of the optional lease-sweep hook: a zero-arg callable
+# returning the list of expired-but-still-alive worker leases (see
+# process_registry.ProcessLeaseBroker.report_unowned_survivors). Sync, not
+# async — the broker itself does only local file/dict I/O, never network.
+LeaseSweepFn = Callable[[], "list[dict[str, Any]]"]
 
 
 def is_enabled() -> bool:
@@ -141,6 +148,7 @@ class Dispatcher:
         enqueue_fn: EnqueueFn | None = None,
         get_groups_fn: Callable[..., Awaitable[dict[str, Any]]] | None = None,
         evaluate_blockers_fn: Callable[..., Awaitable[dict[str, Any]]] | None = None,
+        lease_sweep_fn: "LeaseSweepFn | None" = None,
     ) -> None:
         self.db = db
         self.project_id = project_id
@@ -181,6 +189,17 @@ class Dispatcher:
         # evaluator. Injectable so tests can assert dispatch_once's
         # quarantine/run-stop behavior without a real board.
         self._evaluate_blockers = evaluate_blockers_fn or db_module.evaluate_board_blockers
+        # 315b0a63 — None (default) disables the lease-sweep hook entirely,
+        # matching this module's own "ships disabled unless explicitly
+        # wired" guardrail: a caller opts in by passing a real sweep
+        # function (see start_dispatcher_if_enabled below) or a test
+        # double. Never constructed internally from here — this class stays
+        # decoupled from process_registry unless a caller asks for it.
+        self._lease_sweep = lease_sweep_fn
+        # Most recent lease-sweep result (list of expired-but-alive lease
+        # dicts), for introspection/tests. None until the hook is wired AND
+        # a pass has run at least once.
+        self.last_lease_sweep: "list[dict[str, Any]] | None" = None
         # Event the loop awaits with a timeout; set() forces an immediate pass.
         self._wake = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
@@ -325,6 +344,25 @@ class Dispatcher:
             decision = None
         self.last_blocker_decision = decision
 
+        # 315b0a63 — optional, best-effort worker-lease sweep. Runs before
+        # any enqueue this pass so a stale/crashed-worker report is fresh
+        # by the time this pass's decisions are logged; a sweep failure
+        # never blocks or alters dispatch (same "must not break dispatch"
+        # contract as blocker-policy evaluation above).
+        if self._lease_sweep is not None:
+            try:
+                survivors = list(self._lease_sweep() or [])
+                self.last_lease_sweep = survivors
+                if survivors:
+                    logger.warning(
+                        "dispatcher: %d worker lease(s) expired with process still "
+                        "alive (crashed client?): %s",
+                        len(survivors),
+                        [s.get("run_id") for s in survivors if isinstance(s, dict)],
+                    )
+            except Exception:  # noqa: BLE001 — best-effort, must not break dispatch
+                logger.exception("worker-lease sweep failed")
+
         if decision and decision.get("run_stop"):
             logger.warning(
                 "dispatcher halted by fail-closed blocker policy: %s",
@@ -443,6 +481,20 @@ def start_dispatcher_if_enabled(
     """
     if not is_enabled():
         return None
+    # 315b0a63 — wire the real lease-sweep hook by default once the
+    # dispatcher itself is (explicitly, opt-in) enabled: report_unowned_
+    # survivors() is read-only (no directory/file created unless a lease
+    # was actually ever registered) so this adds no new side effects for a
+    # host that never uses the worker-lease broker at all. A caller that
+    # explicitly passes lease_sweep_fn (e.g. a test double, or None to
+    # opt out) always wins over this default.
+    kwargs.setdefault(
+        "lease_sweep_fn",
+        lambda: [
+            lease.to_dict()
+            for lease in process_registry_module.get_broker().report_unowned_survivors()
+        ],
+    )
     dispatcher = Dispatcher(db, project_id, **kwargs)
     dispatcher.start()
     try:

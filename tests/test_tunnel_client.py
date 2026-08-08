@@ -14,6 +14,7 @@ import os
 from unittest.mock import AsyncMock
 
 import httpx
+import pytest
 
 from meridian import tunnel_client as tc
 
@@ -65,6 +66,80 @@ def test_resolve_base_url_arg_overrides_env(monkeypatch):
 def test_resolve_base_url_strips_trailing_slash(monkeypatch):
     monkeypatch.setenv("MERIDIAN_URL", "https://x.example.com/")
     assert tc._resolve_base_url() == "https://x.example.com"
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Secure MCP Tunnel adapter — local, diagnostics-only (45049071)
+# ---------------------------------------------------------------------------
+
+def test_resolve_openai_tunnel_config_env_unset_is_none(monkeypatch):
+    monkeypatch.delenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", raising=False)
+    assert tc._resolve_openai_tunnel_config_env() is None
+
+
+def test_resolve_openai_tunnel_config_env_parses_json(monkeypatch):
+    monkeypatch.setenv(
+        "MERIDIAN_OPENAI_TUNNEL_CONFIG",
+        '{"enabled": true, "transport": "http", "url": "https://openai.example/mcp"}',
+    )
+    parsed = tc._resolve_openai_tunnel_config_env()
+    assert parsed == {
+        "enabled": True, "transport": "http", "url": "https://openai.example/mcp",
+    }
+
+
+def test_resolve_openai_tunnel_config_env_malformed_json_is_none(monkeypatch):
+    monkeypatch.setenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", "{not json")
+    assert tc._resolve_openai_tunnel_config_env() is None
+
+
+def test_resolve_openai_tunnel_config_env_non_object_json_is_none(monkeypatch):
+    monkeypatch.setenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", "[1, 2, 3]")
+    assert tc._resolve_openai_tunnel_config_env() is None
+
+
+def test_resolve_openai_tunnel_config_env_explicit_raw_env_overrides_os_environ(monkeypatch):
+    monkeypatch.setenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", '{"enabled": false}')
+    parsed = tc._resolve_openai_tunnel_config_env(raw_env='{"enabled": true, "transport": "stdio", "command": ["echo"]}')
+    assert parsed["enabled"] is True
+
+
+def test_openai_tunnel_adapter_snapshot_not_configured_by_default(monkeypatch):
+    monkeypatch.delenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", raising=False)
+    snapshot = tc.openai_tunnel_adapter_snapshot()
+    assert snapshot["state"] == "not_configured"
+
+
+def test_openai_tunnel_adapter_snapshot_configured_from_env(monkeypatch):
+    monkeypatch.setenv(
+        "MERIDIAN_OPENAI_TUNNEL_CONFIG",
+        '{"enabled": true, "transport": "stdio", "command": ["npx", "-y", "@openai/mcp-tunnel"]}',
+    )
+    snapshot = tc.openai_tunnel_adapter_snapshot()
+    assert snapshot["state"] == "configured"
+    assert snapshot["transport"] == "stdio"
+
+
+def test_openai_tunnel_adapter_snapshot_invalid_config_degrades_to_error(monkeypatch):
+    # enabled + stdio with no command is invalid -- must degrade to an
+    # "error" diagnostics entry, never raise, so a status surface never
+    # needs its own try/except around this call.
+    monkeypatch.setenv(
+        "MERIDIAN_OPENAI_TUNNEL_CONFIG", '{"enabled": true, "transport": "stdio"}',
+    )
+    snapshot = tc.openai_tunnel_adapter_snapshot()
+    assert snapshot["state"] == "error"
+    assert snapshot["detail"]
+
+
+def test_openai_tunnel_adapter_snapshot_never_touches_meridian_tunnel_state(monkeypatch):
+    # Purely diagnostics-only: calling this must not require/consult any
+    # live Meridian tunnel socket state, token, or base URL.
+    monkeypatch.delenv("MERIDIAN_OPENAI_TUNNEL_CONFIG", raising=False)
+    monkeypatch.delenv("MERIDIAN_API_KEY", raising=False)
+    monkeypatch.delenv("BEARER_TOKEN", raising=False)
+    snapshot = tc.openai_tunnel_adapter_snapshot()
+    assert snapshot["state"] == "not_configured"
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +370,26 @@ def test_build_extractor_proxy_command_shell_for_cmd_inner_on_windows(monkeypatc
     assert cmd[sep + 1:] == inner
 
 
+def test_build_extractor_proxy_command_shell_fallback_is_counted(monkeypatch):
+    # 36e46957 — every --shell branch fire is explicit/counted/diagnosable.
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    inner = [r"C:\some\tool.cmd", "mcp-server-code-extractor"]
+    assert tc._shell_fallback_diagnostics() == {}
+    tc._build_extractor_proxy_command(r"C:\npm\npx.cmd", inner, port=9010)
+    diag = tc._shell_fallback_diagnostics()
+    assert sum(diag.values()) == 1
+    assert any(k.startswith("extractor:") for k in diag)
+
+
+def test_build_extractor_proxy_command_no_shell_means_no_fallback_recorded(monkeypatch):
+    # 36e46957 — the direct-executable path (no .cmd/.bat inner) must NOT
+    # record a shell-fallback occurrence: only the actual fallback is counted.
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    inner = ["uvx", "mcp-server-code-extractor"]
+    tc._build_extractor_proxy_command("npx", inner, port=9010)
+    assert tc._shell_fallback_diagnostics() == {}
+
+
 def test_build_extractor_proxy_command_python_module_inner(monkeypatch):
     # pip fallback: inner is `python -m code_extractor`.
     monkeypatch.setattr(tc.sys, "platform", "linux")
@@ -327,6 +422,67 @@ def test_find_uvx_returns_none_when_absent(monkeypatch, tmp_path):
     monkeypatch.setattr(tc.shutil, "which", lambda name: None)
     monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
     assert tc._find_uvx() is None
+
+
+# ---------------------------------------------------------------------------
+# 36e46957 — _cached_npx / _cached_uvx: reuse resolved launchers instead of
+# re-probing PATH/the filesystem on every call. conftest.py's autouse
+# _reset_tunnel_launcher_diagnostics fixture clears the cache before AND
+# after every test, so these tests (and every other test in the suite that
+# monkeypatches _find_npx/_find_uvx directly) stay independent regardless of
+# execution order.
+# ---------------------------------------------------------------------------
+
+def test_cached_npx_resolves_once_and_reuses_value(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_find_npx():
+        calls["n"] += 1
+        return "/resolved/npx"
+
+    monkeypatch.setattr(tc, "_find_npx", fake_find_npx)
+    first = tc._cached_npx()
+    second = tc._cached_npx()
+    third = tc._cached_npx()
+    assert first == second == third == "/resolved/npx"
+    assert calls["n"] == 1  # only the FIRST call actually probed
+
+
+def test_cached_uvx_resolves_once_and_reuses_value(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_find_uvx():
+        calls["n"] += 1
+        return "/resolved/uvx"
+
+    monkeypatch.setattr(tc, "_find_uvx", fake_find_uvx)
+    assert tc._cached_uvx() == "/resolved/uvx"
+    assert tc._cached_uvx() == "/resolved/uvx"
+    assert calls["n"] == 1
+
+
+def test_cached_uvx_caches_a_none_result_too(monkeypatch):
+    # uvx genuinely absent (None) must also be memoized — not re-probed
+    # forever because "not in cache" would otherwise mis-treat a falsy
+    # cached value as a miss.
+    calls = {"n": 0}
+
+    def fake_find_uvx():
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(tc, "_find_uvx", fake_find_uvx)
+    assert tc._cached_uvx() is None
+    assert tc._cached_uvx() is None
+    assert calls["n"] == 1
+
+
+def test_reset_launcher_resolution_cache_clears_between_calls(monkeypatch):
+    monkeypatch.setattr(tc, "_find_npx", lambda: "/first/npx")
+    assert tc._cached_npx() == "/first/npx"
+    tc._reset_launcher_resolution_cache()
+    monkeypatch.setattr(tc, "_find_npx", lambda: "/second/npx")
+    assert tc._cached_npx() == "/second/npx"
 
 
 def test_resolve_extractor_inner_prefers_uvx(monkeypatch):
@@ -1921,6 +2077,61 @@ def test_build_proxy_for_inner_shell_for_cmd_shim_on_windows(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 36e46957 — shell-fallback diagnostics: explicit, counted, rate-limited,
+# diagnosable accounting for every --shell branch fired by the proxy
+# builders, plus _proc_watchdog relaunches of an already shell-wrapped cmd.
+# ---------------------------------------------------------------------------
+
+def test_build_proxy_for_inner_shell_fallback_is_counted(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    assert tc._shell_fallback_diagnostics() == {}
+    tc._build_proxy_for_inner("npx.cmd", ["codegraph.cmd"], 8809)
+    diag = tc._shell_fallback_diagnostics()
+    assert sum(diag.values()) == 1
+    assert any(k.startswith("proxy_for_inner:") for k in diag)
+
+
+def test_build_proxy_for_inner_direct_exe_records_no_shell_fallback(monkeypatch):
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    tc._build_proxy_for_inner("npx.cmd", ["codegraph.exe"], 8809)
+    assert tc._shell_fallback_diagnostics() == {}
+
+
+def test_build_proxy_for_inner_non_windows_records_no_shell_fallback(monkeypatch):
+    # POSIX never needs --shell regardless of inner extension.
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    tc._build_proxy_for_inner("npx", ["codegraph.cmd"], 8809)
+    assert tc._shell_fallback_diagnostics() == {}
+
+
+def test_shell_fallback_diagnostics_accumulates_per_reason(monkeypatch):
+    assert tc._note_shell_fallback("reason-a") == 1
+    assert tc._note_shell_fallback("reason-a") == 2
+    assert tc._note_shell_fallback("reason-b") == 1
+    diag = tc._shell_fallback_diagnostics()
+    assert diag == {"reason-a": 2, "reason-b": 1}
+
+
+def test_shell_fallback_print_is_rate_limited_but_count_is_not(monkeypatch, capsys):
+    # Rate-limited: only the first _SHELL_FALLBACK_PRINT_LIMIT occurrences of
+    # a given reason print to stderr; the counter itself keeps climbing past
+    # that so a flapping slot's terminal isn't spammed but nothing is lost.
+    for _ in range(tc._SHELL_FALLBACK_PRINT_LIMIT + 5):
+        tc._note_shell_fallback("flapping-slot")
+    assert tc._shell_fallback_diagnostics()["flapping-slot"] == tc._SHELL_FALLBACK_PRINT_LIMIT + 5
+    captured = capsys.readouterr()
+    printed_lines = [ln for ln in captured.err.splitlines() if "flapping-slot" in ln]
+    assert len(printed_lines) == tc._SHELL_FALLBACK_PRINT_LIMIT
+
+
+def test_reset_shell_fallback_diagnostics_clears_counts():
+    tc._note_shell_fallback("some-reason")
+    assert tc._shell_fallback_diagnostics() != {}
+    tc._reset_shell_fallback_diagnostics()
+    assert tc._shell_fallback_diagnostics() == {}
+
+
+# ---------------------------------------------------------------------------
 # 4ea1b9d5 — session_mode: persistent slots omit --stateless
 # ---------------------------------------------------------------------------
 
@@ -3109,6 +3320,253 @@ def test_proc_watchdog_healthy_tick_resets_failure_streak(monkeypatch):
 
     # Recovered repeatedly — relaunch count exceeds max_retries, so it never gave up.
     assert len(spawned) > 3
+
+
+# ---------------------------------------------------------------------------
+# 9c8336c4 — host-local memory/CPU budgets + quarantine for owned processes
+# ---------------------------------------------------------------------------
+
+
+class _FakeOwnedProc:
+    """Minimal Popen stand-in used by the owned-lifecycle spawn tests."""
+    def __init__(self, pid=54321):
+        self.pid = pid
+    def poll(self):
+        return None  # alive
+
+
+def test_slot_proxy_use_owned_lifecycle_defaults_false():
+    """A slot built the old way keeps the pre-9c8336c4 behaviour — the owned
+    lifecycle path is strictly opt-in, same contract as reuse_existing."""
+    proxy = tc.SlotProxy(["cmd"], 9400, "fs")
+    assert proxy.use_owned_lifecycle is False
+    assert proxy.owned_handle is None
+
+
+def test_ensure_running_owned_lifecycle_spawns_via_owned_backend(monkeypatch):
+    """use_owned_lifecycle=True routes ensure_running through
+    _spawn_owned_with_cache_retry and captures the returned handle onto
+    proxy.owned_handle, instead of the plain _spawn_with_cache_retry path."""
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    fake_handle = object()
+    calls = []
+
+    def fake_spawn_owned(cmd, env, label, diagnostics=None):
+        calls.append((cmd, label))
+        return _FakeOwnedProc(), fake_handle
+
+    monkeypatch.setattr(tc, "_spawn_owned_with_cache_retry", fake_spawn_owned)
+    monkeypatch.setattr(
+        tc, "_spawn_with_cache_retry",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("plain spawn path must not run")),
+    )
+
+    proxy = tc.SlotProxy(
+        ["mcp-proxy", "--port", "9401"], 9401, "owned-test",
+        use_owned_lifecycle=True,
+    )
+    _run_sync(_run_ensure(proxy))
+
+    assert len(calls) == 1
+    assert proxy.owned_handle is fake_handle
+    assert proxy.is_running
+
+
+def test_ensure_running_non_owned_lifecycle_never_sets_owned_handle(monkeypatch):
+    """Every existing (non-opted-in) slot must never end up with an
+    owned_handle — the owned path is additive, not a silent default change."""
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _FakeOwnedProc())
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9402"], 9402, "plain-test")
+    _run_sync(_run_ensure(proxy))
+
+    assert proxy.owned_handle is None
+    assert proxy.is_running
+
+
+def test_kill_with_owned_handle_uses_close_owned_process(monkeypatch):
+    """kill() on a slot holding an owned_handle tears down via
+    _close_owned_process (whole job/process-group tree) instead of
+    _terminate_proc_tree, clears owned_handle, and returns that call's
+    confirmed-gone bool."""
+    proxy = tc.SlotProxy(["cmd"], 9403, "owned-kill-test", use_owned_lifecycle=True)
+    proxy._proc = _FakeOwnedProc()
+    proxy.holder["proc"] = proxy._proc
+    fake_handle = object()
+    proxy.owned_handle = fake_handle
+
+    close_calls = []
+    monkeypatch.setattr(tc, "_close_owned_process", lambda h, **kw: close_calls.append(h) or True)
+    monkeypatch.setattr(
+        tc, "_terminate_proc_tree",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not use the non-owned teardown path")),
+    )
+    monkeypatch.setattr(tc, "_clear_slot_claim", lambda *a, **kw: None)
+
+    result = proxy.kill(reason="budget_quarantined")
+
+    assert close_calls == [fake_handle]
+    assert proxy.owned_handle is None
+    assert proxy._proc is None
+    assert result is True
+    assert proxy.diagnostics.state == tc.SlotState.QUARANTINED
+
+
+def test_kill_without_owned_handle_uses_terminate_proc_tree(monkeypatch):
+    """Backward compatibility: a slot that never opted into the owned
+    lifecycle keeps tearing down via _terminate_proc_tree and kill() returns
+    None (no confirmation available for that path)."""
+    proxy = tc.SlotProxy(["cmd"], 9404, "plain-kill-test")
+    proxy._proc = _FakeOwnedProc()
+    proxy.holder["proc"] = proxy._proc
+
+    terminate_calls = []
+    monkeypatch.setattr(tc, "_terminate_proc_tree", lambda proc: terminate_calls.append(proc))
+    monkeypatch.setattr(tc, "_clear_slot_claim", lambda *a, **kw: None)
+
+    result = proxy.kill()
+
+    assert len(terminate_calls) == 1
+    assert result is None
+    assert proxy._proc is None
+
+
+def _budget_breaching_sample(pid):
+    return tc._process_budget.BudgetSample(pid=pid, sample_time=1.0, current_bytes=10**10)
+
+
+def _budget_healthy_sample(pid):
+    return tc._process_budget.BudgetSample(pid=pid, sample_time=1.0, current_bytes=100)
+
+
+def test_budget_watchdog_noop_without_owned_handle(monkeypatch):
+    """No owned_handle (every slot that never opted in) — the watchdog never
+    samples or acts, every tick."""
+    proxy = tc.SlotProxy(["cmd"], 9405, "no-handle-test")
+
+    sample_calls = []
+    monkeypatch.setattr(
+        tc._process_budget, "sample_process",
+        lambda pid, **kw: sample_calls.append(pid) or _budget_healthy_sample(pid),
+    )
+
+    async def fake_sleep(_d):
+        raise _StopLoop()
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    cfg = tc._process_budget.ProcessBudget(enabled=True, sample_interval_seconds=0)
+    try:
+        asyncio.run(tc._budget_watchdog(proxy, budget=cfg))
+    except _StopLoop:
+        pass
+
+    assert sample_calls == []
+
+
+def test_budget_watchdog_quiesces_then_kills_over_budget_owned_process(monkeypatch):
+    proxy = tc.SlotProxy(["cmd"], 9406, "owned-budget-test", use_owned_lifecycle=True)
+    proxy._proc = _FakeOwnedProc(pid=77777)
+    proxy.holder["proc"] = proxy._proc
+    fake_handle = tc._process_lifecycle.OwnedProcessHandle(
+        run_id="r1", pid=77777, executable="x", cwd=None, cmdline=["x"],
+    )
+    proxy.owned_handle = fake_handle
+
+    monkeypatch.setattr(tc._process_budget, "sample_process", lambda pid, **kw: _budget_breaching_sample(pid))
+    monkeypatch.setattr(tc._process_lifecycle, "verify_handle_live", lambda h: True)
+
+    kill_calls = []
+    real_kill = proxy.kill
+    def spy_kill(reason="stopped"):
+        kill_calls.append(reason)
+        return real_kill(reason=reason)
+    proxy.kill = spy_kill
+    monkeypatch.setattr(tc, "_close_owned_process", lambda h, **kw: True)
+    monkeypatch.setattr(tc, "_clear_slot_claim", lambda *a, **kw: None)
+
+    calls = {"n": 0}
+    async def fake_sleep(_d):
+        calls["n"] += 1
+        if calls["n"] >= 3:  # let 2 loop bodies run (quiesce, then kill), then break
+            raise _StopLoop()
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    cfg = tc._process_budget.ProcessBudget(enabled=True, max_memory_bytes=1024, sample_interval_seconds=0)
+    try:
+        asyncio.run(tc._budget_watchdog(proxy, budget=cfg))
+    except _StopLoop:
+        pass
+
+    # First tick: quiesce warning only, nothing killed. Second tick: still
+    # breached -> forced kill.
+    assert kill_calls == ["budget_quarantined"]
+    assert proxy.owned_handle is None
+
+
+def test_budget_watchdog_healthy_process_never_killed(monkeypatch):
+    proxy = tc.SlotProxy(["cmd"], 9407, "healthy-budget-test", use_owned_lifecycle=True)
+    proxy._proc = _FakeOwnedProc(pid=88888)
+    proxy.holder["proc"] = proxy._proc
+    proxy.owned_handle = tc._process_lifecycle.OwnedProcessHandle(
+        run_id="r2", pid=88888, executable="x", cwd=None, cmdline=["x"],
+    )
+
+    monkeypatch.setattr(tc._process_budget, "sample_process", lambda pid, **kw: _budget_healthy_sample(pid))
+    monkeypatch.setattr(tc._process_lifecycle, "verify_handle_live", lambda h: True)
+
+    kill_calls = []
+    proxy.kill = lambda reason="stopped": kill_calls.append(reason)
+
+    calls = {"n": 0}
+    async def fake_sleep(_d):
+        calls["n"] += 1
+        if calls["n"] >= 4:
+            raise _StopLoop()
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    cfg = tc._process_budget.ProcessBudget(enabled=True, max_memory_bytes=1024 * 1024, sample_interval_seconds=0)
+    try:
+        asyncio.run(tc._budget_watchdog(proxy, budget=cfg))
+    except _StopLoop:
+        pass
+
+    assert kill_calls == []
+
+
+def test_budget_watchdog_disabled_budget_never_acts(monkeypatch):
+    proxy = tc.SlotProxy(["cmd"], 9408, "disabled-budget-test", use_owned_lifecycle=True)
+    proxy._proc = _FakeOwnedProc(pid=99999)
+    proxy.holder["proc"] = proxy._proc
+    proxy.owned_handle = tc._process_lifecycle.OwnedProcessHandle(
+        run_id="r3", pid=99999, executable="x", cwd=None, cmdline=["x"],
+    )
+
+    sample_calls = []
+    monkeypatch.setattr(
+        tc._process_budget, "sample_process",
+        lambda pid, **kw: sample_calls.append(pid) or _budget_breaching_sample(pid),
+    )
+
+    calls = {"n": 0}
+    async def fake_sleep(_d):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise _StopLoop()
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    cfg = tc._process_budget.ProcessBudget(enabled=False, sample_interval_seconds=0)
+    try:
+        asyncio.run(tc._budget_watchdog(proxy, budget=cfg))
+    except _StopLoop:
+        pass
+
+    assert sample_calls == []  # disabled — never even samples
 
 
 # ---------------------------------------------------------------------------
@@ -5231,3 +5689,185 @@ def test_owned_process_backend_selects_by_platform(monkeypatch):
 
     monkeypatch.setattr(tc.sys, "platform", "linux")
     assert isinstance(tc._owned_process_backend(), pl.PosixProcessGroupBackend)
+
+
+# ---------------------------------------------------------------------------
+# 315b0a63 — opt-in process_registry lease wiring for owned spawns. Gated
+# OFF by default (MERIDIAN_PROCESS_LEASES_ENABLED != "1") so every test
+# above this section runs with ZERO behavior change and zero disk I/O —
+# these tests exercise the gate itself plus the opted-in path.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLeaseBroker:
+    def __init__(self):
+        self.registered = []
+        self.released = []
+
+    def register(self, client, pid, **kwargs):
+        self.registered.append((client, pid, kwargs))
+        return object()
+
+    def release(self, client, run_id):
+        self.released.append((client, run_id))
+
+
+def test_process_leases_enabled_default_off(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    assert tc._process_leases_enabled() is False
+
+
+@pytest.mark.parametrize("val", ["0", "true", "TRUE", "yes", "", "on"])
+def test_process_leases_enabled_strict(monkeypatch, val):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, val)
+    assert tc._process_leases_enabled() is False
+
+
+def test_process_leases_enabled_one(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    assert tc._process_leases_enabled() is True
+
+
+def test_register_owned_process_lease_noop_when_disabled(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(run_id="r1", pid=1, executable="x", cwd=None, cmdline=["x"])
+    tc._register_owned_process_lease(handle)
+    assert fake_broker.registered == []
+
+
+def test_register_owned_process_lease_noop_for_none_handle(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+    tc._register_owned_process_lease(None)
+    assert fake_broker.registered == []
+
+
+def test_register_owned_process_lease_registers_when_enabled(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(
+        run_id="r1", pid=42, executable="node", cwd="/repo", cmdline=["node", "x.js"],
+        create_time=1.0, group_id=42, job_id=None,
+    )
+    tc._register_owned_process_lease(handle)
+
+    assert len(fake_broker.registered) == 1
+    client, pid, kwargs = fake_broker.registered[0]
+    assert client == tc._LEASE_CLIENT_NAME
+    assert pid == 42
+    assert kwargs["run_id"] == "r1"
+    assert kwargs["executable"] == "node"
+    assert kwargs["cwd"] == "/repo"
+    assert kwargs["cmdline"] == ["node", "x.js"]
+    assert kwargs["create_time"] == 1.0
+    assert kwargs["group_id"] == 42
+    assert kwargs["job_id"] is None
+
+
+def test_register_owned_process_lease_best_effort_on_broker_error(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+
+    class _BoomBroker:
+        def register(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: _BoomBroker())
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(run_id="r1", pid=1, executable="x", cwd=None, cmdline=["x"])
+    tc._register_owned_process_lease(handle)  # must not raise
+
+
+def test_release_owned_process_lease_noop_when_disabled(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(run_id="r1", pid=1, executable="x", cwd=None, cmdline=["x"])
+    tc._release_owned_process_lease(handle)
+    assert fake_broker.released == []
+
+
+def test_release_owned_process_lease_releases_when_enabled(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(run_id="r1", pid=1, executable="x", cwd=None, cmdline=["x"])
+    tc._release_owned_process_lease(handle)
+    assert fake_broker.released == [(tc._LEASE_CLIENT_NAME, "r1")]
+
+
+def test_release_owned_process_lease_best_effort_on_broker_error(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+
+    class _BoomBroker:
+        def release(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: _BoomBroker())
+
+    from meridian import process_lifecycle as pl
+    handle = pl.OwnedProcessHandle(run_id="r1", pid=1, executable="x", cwd=None, cmdline=["x"])
+    tc._release_owned_process_lease(handle)  # must not raise
+
+
+def test_spawn_owned_with_cache_retry_registers_lease_when_enabled(monkeypatch):
+    """End-to-end: the real spawn/adopt path also registers a lease when
+    the feature is opted in."""
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _OwnedFakeProc(pid=777))
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    proc, handle = tc._spawn_owned_with_cache_retry(["node", "x.js"], None, "test")
+    assert handle is not None
+    assert len(fake_broker.registered) == 1
+    assert fake_broker.registered[0][1] == 777
+
+
+def test_spawn_owned_with_cache_retry_no_lease_call_when_disabled(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    monkeypatch.setattr(tc.subprocess, "Popen", lambda cmd, env=None, **kw: _OwnedFakeProc(pid=778))
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_resolve_stable_cache_env", lambda: {})
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+
+    tc._spawn_owned_with_cache_retry(["node", "x.js"], None, "test")
+    assert fake_broker.registered == []
+
+
+def test_close_owned_process_releases_lease_when_enabled(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    from meridian import process_lifecycle as pl
+
+    class _FakeBackend:
+        def close(self, handle, *, grace_seconds=5.0):
+            return True
+
+    handle = pl.OwnedProcessHandle(run_id="close-me", pid=1, executable="x", cwd=None, cmdline=["x"])
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+
+    ok = tc._close_owned_process(handle)
+    assert ok is True
+    assert fake_broker.released == [(tc._LEASE_CLIENT_NAME, "close-me")]

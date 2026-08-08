@@ -38,7 +38,9 @@ from enum import Enum
 from pathlib import Path
 
 from . import __version__
+from . import process_budget as _process_budget
 from . import process_lifecycle as _process_lifecycle
+from . import process_registry as _process_registry
 from . import serena_pool as _serena_pool
 from .serena_pool import SerenaDaemonPool, SERENA_POOL_BASE_PORT
 
@@ -482,6 +484,10 @@ _KILL_REASON_STATES: "dict[str, SlotState]" = {
     "reprobe_restart": SlotState.RECONNECTING,
     "config_reload": SlotState.STOPPED,
     "stopped": SlotState.STOPPED,
+    # 9c8336c4 — a host-local memory/CPU budget breach that survived one
+    # graceful quiesce warning and was force-terminated via the owned-process
+    # lifecycle backend.
+    "budget_quarantined": SlotState.QUARANTINED,
 }
 
 
@@ -759,6 +765,7 @@ class SlotProxy:
         env: "dict | None" = None,
         client_id: str = "",
         reuse_existing: bool = False,
+        use_owned_lifecycle: bool = False,
     ) -> None:
         self.cmd = cmd
         self.port = port
@@ -766,7 +773,16 @@ class SlotProxy:
         self.env = env
         self.client_id: str = client_id
         self.reuse_existing = reuse_existing
+        # 9c8336c4 — opt-in per call site (same contract as
+        # _spawn_owned_with_cache_retry itself): when True, ensure_running()
+        # spawns via the portable owned-process lifecycle backend and keeps
+        # an OwnedProcessHandle on self.owned_handle, which is what makes
+        # this slot eligible for host-local budget enforcement (see
+        # _budget_watchdog). Defaults False — every existing slot's spawn
+        # behaviour is byte-identical unless it explicitly opts in.
+        self.use_owned_lifecycle = use_owned_lifecycle
         self._proc: "subprocess.Popen | None" = None
+        self.owned_handle: "_process_lifecycle.OwnedProcessHandle | None" = None
         # 8e10fb80 — True while this slot is fronting a process we did NOT
         # spawn (detected via reuse_existing). Distinct from ``_proc`` so
         # ``is_running``/``kill`` can tell "we own this" from "someone else
@@ -965,9 +981,22 @@ class SlotProxy:
                 # spawn failure (e.g. a Python child dying on ModuleNotFoundError at
                 # import time) gets classified onto it (dependency_missing vs a
                 # generic child_crashed) instead of surfacing only as a bare log line.
-                self._proc = await asyncio.to_thread(
-                    _spawn_with_cache_retry, self.cmd, self.env, self.label, self.diagnostics
-                )
+                #
+                # 9c8336c4 — a slot that opted into use_owned_lifecycle spawns via
+                # _spawn_owned_with_cache_retry instead, additionally capturing an
+                # OwnedProcessHandle (job-object/process-group tracked) so the
+                # budget watchdog has something it can prove ownership of before
+                # throttling/terminating it. Every other slot's spawn call and
+                # return type is byte-identical to before this feature existed.
+                if self.use_owned_lifecycle:
+                    self._proc, self.owned_handle = await asyncio.to_thread(
+                        _spawn_owned_with_cache_retry,
+                        self.cmd, self.env, self.label, self.diagnostics,
+                    )
+                else:
+                    self._proc = await asyncio.to_thread(
+                        _spawn_with_cache_retry, self.cmd, self.env, self.label, self.diagnostics
+                    )
                 self.holder["proc"] = self._proc
                 # aaddb273 — record ownership so a subsequent tunnel startup can
                 # distinguish this live process from an orphan (see _write_slot_claim).
@@ -978,6 +1007,7 @@ class SlotProxy:
                     file=sys.stderr, flush=True,
                 )
                 self._proc = None
+                self.owned_handle = None
                 self.holder["proc"] = None
                 # ddd46cc8 — classify the launch failure (missing interpreter/binary
                 # vs a generic launch crash) so callers reading .diagnostics can tell
@@ -1068,7 +1098,7 @@ class SlotProxy:
                 )
             self.touch()
 
-    def kill(self, reason: str = "stopped") -> None:
+    def kill(self, reason: str = "stopped") -> "bool | None":
         """Terminate the proxy process (best-effort, no-op if not running).
 
         aaddb273 — also clears the slot-claim file so a subsequent startup does
@@ -1089,11 +1119,25 @@ class SlotProxy:
         ``"stopped"``). An unrecognised reason maps to STOPPED rather than
         raising. Not recorded on the reused-occupant early return above — we
         did not actually tear anything down in that case.
+
+        9c8336c4 — a slot holding an ``owned_handle`` (only true for a slot
+        that opted into ``use_owned_lifecycle``) tears down via
+        :func:`_close_owned_process` (the WHOLE owned tree, job-object/
+        process-group) instead of :func:`_terminate_proc_tree`, and this
+        returns that call's confirmed-gone bool (``None`` for every other
+        slot/path, where no such confirmation exists) so a caller like the
+        budget watchdog can tell a confirmed kill apart from a survivor
+        without re-probing the port itself.
         """
         if self._reused:
             self._reused = False
-            return
-        _terminate_proc_tree(self._proc)
+            return None
+        if self.owned_handle is not None:
+            confirmed_gone = _close_owned_process(self.owned_handle)
+            self.owned_handle = None
+        else:
+            _terminate_proc_tree(self._proc)
+            confirmed_gone = None
         self._proc = None
         self.holder["proc"] = None
         _clear_slot_claim(self.port)
@@ -1101,6 +1145,7 @@ class SlotProxy:
             _KILL_REASON_STATES.get(reason, SlotState.STOPPED),
             phase=reason, root_cause=reason,
         )
+        return confirmed_gone
 
     def sync_holder(self) -> None:
         """Sync the holder's proc reference (watchdog may have replaced it)."""
@@ -1129,6 +1174,64 @@ async def _idle_killer(proxy: "SlotProxy", idle_seconds: float = _IDLE_KILL_SECO
             # ddd46cc8 — reason="idle_killed" so diagnostics distinguish this
             # intentional teardown from a crash/timeout-triggered kill.
             proxy.kill(reason="idle_killed")
+
+
+async def _budget_watchdog(
+    proxy: "SlotProxy",
+    budget: "_process_budget.ProcessBudget | None" = None,
+) -> None:
+    """Periodically sample and enforce a host-local memory/CPU budget
+    (9c8336c4) for a slot spawned via the owned-process lifecycle.
+
+    Runs forever (until cancelled), same shape as :func:`_idle_killer`.
+    A no-op tick whenever ``proxy.owned_handle`` is ``None`` — which is
+    every slot today unless it explicitly opted into
+    ``use_owned_lifecycle=True`` (see :class:`SlotProxy`'s docstring) — so
+    scheduling this task alongside every slot's watchdog/idle-killer is
+    inert by default and only takes effect for a caller that opts a
+    specific slot in.
+
+    Only ever acts on ``proxy.owned_handle`` after
+    :func:`process_lifecycle.verify_handle_live` confirms it is still the
+    SAME process that was originally spawned (the PID-reuse guard) — never
+    a bare pid pulled from anywhere else. This is the sprint's "only
+    processes proven owned by the run registry/job/process-group may be
+    throttled or terminated" rule.
+
+    The first consecutive breach is a "quiesce" warning only (logged, not
+    acted on) — the process gets one full sample interval to come back
+    under budget on its own. Only a SECOND, still-breached sample escalates
+    to a forced :meth:`SlotProxy.kill` (reason ``"budget_quarantined"``,
+    surfaced on ``proxy.diagnostics`` as :data:`SlotState.QUARANTINED`).
+    """
+    cfg = budget or _process_budget.load_host_budget_config()
+    monitor = _process_budget.ProcessBudgetMonitor(proxy.label, cfg)
+    while True:
+        await asyncio.sleep(cfg.sample_interval_seconds)
+        if not cfg.enabled:
+            continue
+        handle = proxy.owned_handle
+        if handle is None or not proxy.is_running:
+            continue
+        if not _process_lifecycle.verify_handle_live(handle):
+            continue
+        sample = _process_budget.sample_process(handle.pid)
+        report = monitor.evaluate(handle.pid, sample)
+        if report.action == "quiesce":
+            print(
+                f"tunnel:{proxy.label}: budget warning ({report.reason}) — "
+                "quiesce signal; will terminate if still over budget on the "
+                "next check",
+                file=sys.stderr, flush=True,
+            )
+        elif report.action == "kill":
+            print(
+                f"tunnel:{proxy.label}: budget exceeded ({report.reason}) — "
+                "quarantining (terminating owned process tree)",
+                file=sys.stderr, flush=True,
+            )
+            confirmed_gone = proxy.kill(reason="budget_quarantined")
+            monitor.record_kill_outcome(survived=confirmed_gone is False)
 
 
 def _tunnel_client_git_root() -> str:
@@ -2193,6 +2296,108 @@ def _spawn_kwargs() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Launcher resolution cache (36e46957) — reuse resolved npx/uvx launchers
+# instead of re-probing PATH/the filesystem on every slot build, retry, or
+# pooled spawn within one tunnel process's lifetime. PATH does not change
+# mid-process, so a second (or hundredth) ``shutil.which``/existence probe
+# for the same launcher is pure waste — and on a machine with a slow/AV-
+# hooked filesystem, waste that adds up across every Serena daemon spawn
+# (:func:`_serena_pool_spawn` re-resolves uvx once per repo_path) and every
+# proxy build that carries a literal ``"npx"`` inner token
+# (:func:`_build_proxy_for_inner`).
+#
+# _find_npx / _find_uvx themselves are DELIBERATELY left untouched: they stay
+# the raw, directly-monkeypatchable resolution primitives their existing unit
+# tests exercise against varying PATH/filesystem state. _cached_npx /
+# _cached_uvx are thin memoizing wrappers that every repeated-call site now
+# goes through instead — this module-level dict is what "reuse resolved
+# launchers" means operationally. Production code never resets it (PATH is
+# stable for the tunnel's whole life); _reset_launcher_resolution_cache is a
+# test-only hook so tests exercising different mocked PATH states don't leak
+# a stale resolution across test functions in the same process.
+# ---------------------------------------------------------------------------
+
+_LAUNCHER_RESOLUTION_CACHE: "dict[str, str | None]" = {}
+
+
+def _reset_launcher_resolution_cache() -> None:
+    """Test-only: clear the memoized npx/uvx launcher-path cache (36e46957)."""
+    _LAUNCHER_RESOLUTION_CACHE.clear()
+
+
+def _cached_npx() -> str:
+    """Memoized wrapper around :func:`_find_npx` — see module note above."""
+    if "npx" not in _LAUNCHER_RESOLUTION_CACHE:
+        _LAUNCHER_RESOLUTION_CACHE["npx"] = _find_npx()
+    return _LAUNCHER_RESOLUTION_CACHE["npx"]
+
+
+def _cached_uvx() -> "str | None":
+    """Memoized wrapper around :func:`_find_uvx` — see module note above."""
+    if "uvx" not in _LAUNCHER_RESOLUTION_CACHE:
+        _LAUNCHER_RESOLUTION_CACHE["uvx"] = _find_uvx()
+    return _LAUNCHER_RESOLUTION_CACHE["uvx"]
+
+
+# ---------------------------------------------------------------------------
+# Shell-fallback diagnostics (36e46957) — explicit, counted, rate-limited,
+# diagnosable accounting for every place a Meridian-owned proxy spawn is
+# forced through mcp-proxy's ``--shell`` (itself Windows' unavoidable
+# cmd.exe-for-.cmd/.bat behaviour — see :func:`_build_proxy_for_inner` and
+# :func:`_build_extractor_proxy_command`). This does NOT reduce or suppress a
+# single required shell fallback — every one of those is structurally
+# necessary and stays exactly as before — it only makes each occurrence
+# visible and countable instead of a silently-appended flag, so a human or a
+# future dashboard panel can correlate "N shell-wrapped spawns" against the
+# kernel-pool paged-pool-growth investigation. This item does NOT claim, by
+# itself, to fix that kernel-level issue.
+# ---------------------------------------------------------------------------
+
+_SHELL_FALLBACK_COUNTS: "dict[str, int]" = {}
+_SHELL_FALLBACK_PRINT_LIMIT = 3  # rate limit: full print only for the first N per reason
+
+
+def _reset_shell_fallback_diagnostics() -> None:
+    """Test-only: clear shell-fallback counters (36e46957)."""
+    _SHELL_FALLBACK_COUNTS.clear()
+
+
+def _note_shell_fallback(reason: str) -> int:
+    """Record one shell-fallback occurrence for *reason*; return the new count.
+
+    * **Explicit** — always recorded (never a silent ``cmd.append("--shell")``).
+    * **Counted** — every call increments ``_SHELL_FALLBACK_COUNTS[reason]``,
+      queryable via :func:`_shell_fallback_diagnostics`.
+    * **Rate-limited** — only the first ``_SHELL_FALLBACK_PRINT_LIMIT``
+      occurrences of a given *reason* print to stderr; a flapping slot (e.g.
+      a watchdog relaunching a shell-wrapped command every few seconds)
+      can't spam the terminal. The counter itself is never rate-limited —
+      it stays authoritative even once printing stops.
+    * **Diagnosable** — :func:`_shell_fallback_diagnostics` exposes a
+      read-only snapshot of the live counts.
+    """
+    count = _SHELL_FALLBACK_COUNTS.get(reason, 0) + 1
+    _SHELL_FALLBACK_COUNTS[reason] = count
+    if count <= _SHELL_FALLBACK_PRINT_LIMIT:
+        suffix = (
+            " (further occurrences of this reason are counted but not printed)"
+            if count == _SHELL_FALLBACK_PRINT_LIMIT else ""
+        )
+        print(
+            f"tunnel: shell fallback engaged ({reason}) — occurrence #{count}; "
+            "this is the platform-required cmd.exe wrapper for a .cmd/.bat "
+            f"launcher, not a bug.{suffix}",
+            file=sys.stderr, flush=True,
+        )
+    return count
+
+
+def _shell_fallback_diagnostics() -> "dict[str, int]":
+    """Read-only snapshot of shell-fallback counts by reason (36e46957)."""
+    return dict(_SHELL_FALLBACK_COUNTS)
+
+
+# ---------------------------------------------------------------------------
 # Scoped cache-clear + spawn retry (a9d1ef7f)
 # ---------------------------------------------------------------------------
 
@@ -2942,7 +3147,25 @@ def _spawn_with_cache_retry(
 # process already spawned through them (every current slot) do not change.
 # Adopting a new spawn site into the owned-tracking path (job-object on
 # Windows / process-group on POSIX) is opt-in per call site.
+#
+# 315b0a63 — additionally, best-effort register/release each owned spawn as
+# a lease in meridian/process_registry.py (client="meridian-tunnel_client")
+# so this process's OWN spawns show up in the same cross-client lease view
+# external clients (Claude Code/Codex/Claude Desktop) register into. Gated
+# OFF by default via MERIDIAN_PROCESS_LEASES_ENABLED (mirrors dispatcher.py's
+# own "ships disabled unless explicitly opted in" guardrail) so this never
+# changes existing behaviour, never touches disk, and never affects any
+# existing test unless a test explicitly opts in.
 # ---------------------------------------------------------------------------
+
+# Env var gate for the lease-registry integration below — strict "1" check,
+# same pattern as dispatcher.ENABLE_ENV_VAR.
+_PROCESS_LEASES_ENABLED_ENV_VAR = "MERIDIAN_PROCESS_LEASES_ENABLED"
+_LEASE_CLIENT_NAME = "meridian-tunnel_client"
+
+
+def _process_leases_enabled() -> bool:
+    return os.environ.get(_PROCESS_LEASES_ENABLED_ENV_VAR) == "1"
 
 
 def _owned_process_backend() -> "_process_lifecycle.PosixProcessGroupBackend | _process_lifecycle.WindowsJobObjectBackend":
@@ -2950,6 +3173,45 @@ def _owned_process_backend() -> "_process_lifecycle.PosixProcessGroupBackend | _
     A fresh instance per call — both backends are stateless aside from the
     (lazily-invoked) Windows job-API loader, so there is nothing to cache."""
     return _process_lifecycle.get_default_backend()
+
+
+def _register_owned_process_lease(
+    handle: "_process_lifecycle.OwnedProcessHandle | None",
+) -> None:
+    """Best-effort: register *handle* with the local process-lease broker
+    (315b0a63) when MERIDIAN_PROCESS_LEASES_ENABLED=1. A no-op (including
+    when the handle is None, the feature is disabled, or the broker raises
+    for any reason) — this must never turn a working spawn into a failed
+    one, matching _spawn_owned_with_cache_retry's own "best-effort" clause."""
+    if handle is None or not _process_leases_enabled():
+        return
+    try:
+        _process_registry.get_broker().register(
+            _LEASE_CLIENT_NAME,
+            handle.pid,
+            run_id=handle.run_id,
+            executable=handle.executable,
+            cwd=handle.cwd,
+            cmdline=list(handle.cmdline),
+            create_time=handle.create_time,
+            group_id=handle.group_id,
+            job_id=handle.job_id,
+        )
+    except Exception:  # noqa: BLE001 — best-effort, never raise
+        pass
+
+
+def _release_owned_process_lease(
+    handle: "_process_lifecycle.OwnedProcessHandle | None",
+) -> None:
+    """Best-effort counterpart to :func:`_register_owned_process_lease`,
+    called from :func:`_close_owned_process`. Never raises."""
+    if handle is None or not _process_leases_enabled():
+        return
+    try:
+        _process_registry.get_broker().release(_LEASE_CLIENT_NAME, handle.run_id)
+    except Exception:  # noqa: BLE001 — best-effort, never raise (already-released,
+        pass         # never-registered, etc. are all fine to silently ignore here)
 
 
 def _spawn_owned_with_cache_retry(
@@ -2989,6 +3251,7 @@ def _spawn_owned_with_cache_retry(
         handle = _owned_process_backend().adopt(proc, cmd=cmd)
     except Exception:  # noqa: BLE001 — best-effort; the spawn itself already succeeded
         handle = None
+    _register_owned_process_lease(handle)
     return proc, handle
 
 
@@ -3002,7 +3265,9 @@ def _close_owned_process(
     no-op contract so callers can pass either interchangeably."""
     if handle is None:
         return True
-    return _owned_process_backend().close(handle, grace_seconds=grace_seconds)
+    result = _owned_process_backend().close(handle, grace_seconds=grace_seconds)
+    _release_owned_process_lease(handle)
+    return result
 
 
 def _plugin_spawn_env(env: object) -> "dict[str, str] | None":
@@ -3265,9 +3530,15 @@ def _serena_pool_spawn(cmd: "list[str]") -> "subprocess.Popen":
     full path when :func:`_find_uvx` can find it; a machine where it truly
     can't be found keeps the original bare token, so the OS's own error
     surfaces exactly as before rather than this function inventing one.
+
+    36e46957 — resolves via :func:`_cached_uvx` rather than calling
+    :func:`_find_uvx` directly: the pool calls this once per repo_path, so
+    a busy tunnel with several projects open re-hits this path repeatedly —
+    memoizing avoids re-probing PATH/the filesystem for the same answer
+    every time.
     """
     if cmd and cmd[0] == "uvx":
-        _resolved_uvx = _find_uvx()
+        _resolved_uvx = _cached_uvx()
         if _resolved_uvx:
             cmd = [_resolved_uvx, *cmd[1:]]
     proc = subprocess.Popen(cmd, **_spawn_kwargs())
@@ -3664,6 +3935,69 @@ def _resolve_base_url(arg_url: str | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# OpenAI Secure MCP Tunnel adapter — OPTIONAL, local-only, DIAGNOSTICS ONLY
+# (45049071). This client never spawns or connects an OpenAI tunnel process;
+# it only reports whether one is *configured* locally, alongside Meridian's
+# own tunnel state, so a future ``--status``-style surface (or the
+# server-side diagnostics route in routes/tunnel.py, fed by whatever calls
+# it) can show both transports without conflating them. See
+# meridian.openai_tunnel_adapter for the full schema/scope — this client
+# never uses it to actually run/spawn/connect anything, and Meridian's own
+# tunnel above is completely unaffected either way.
+# ---------------------------------------------------------------------------
+
+def _resolve_openai_tunnel_config_env(raw_env: str | None = None) -> "dict[str, Any] | None":
+    """Best-effort local adapter config, read from
+    ``MERIDIAN_OPENAI_TUNNEL_CONFIG`` (a JSON object) only — never a
+    committed file, never Meridian's own hosted tenant DB — so a user can
+    opt in on THIS machine without that config (or whatever tunnel_id/
+    credential reference it names) ever leaving it via this function.
+    Returns ``None`` when unset or malformed; a caller normalizes via
+    ``openai_tunnel_adapter.normalize_config``, which already treats
+    ``None`` the same as "adapter not configured".
+    """
+    raw = raw_env if raw_env is not None else os.environ.get("MERIDIAN_OPENAI_TUNNEL_CONFIG", "")
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def openai_tunnel_adapter_snapshot(
+    *, raw_env: str | None = None, reported_status: "dict[str, Any] | None" = None,
+) -> "dict[str, Any]":
+    """Local, diagnostics-only snapshot of the OPTIONAL OpenAI Secure MCP
+    Tunnel adapter's config-derived state.
+
+    Reads config from the environment only (see
+    :func:`_resolve_openai_tunnel_config_env`) and never spawns or connects
+    anything itself. A malformed config degrades to an ``"error"``
+    diagnostics entry (never raises) so a caller can always render this
+    alongside the rest of a status surface without a try/except of its own.
+    """
+    from . import openai_tunnel_adapter as _ota  # noqa: PLC0415 — optional feature; lazy import mirrors this module's own tunnel_plugins import pattern (see run_tunnel())
+
+    config = _resolve_openai_tunnel_config_env(raw_env)
+    try:
+        diagnostics = _ota.build_diagnostics(config, reported_status=reported_status)
+    except _ota.OpenAITunnelAdapterError as exc:
+        return {
+            "state": _ota.OpenAITunnelState.ERROR.value,
+            "detail": str(exc),
+            "transport": None,
+            "tenant_id": None,
+            "project_id": None,
+            "allowed_tool_count": 0,
+            "approval_policy": None,
+        }
+    return diagnostics.to_dict()
+
+
+# ---------------------------------------------------------------------------
 # Token cache — ~/.meridian/config.json (30-day expiry, per base_url)
 # ---------------------------------------------------------------------------
 
@@ -4022,10 +4356,11 @@ def _extract_slot_diagnostics(
     PACKAGE (see :func:`_extract_slot_package_name`), the Python runtime
     running this tunnel process, the effective cwd (``--project``), and a
     dependency preflight signal (whether ``uvx`` is resolvable on this
-    machine at all — see :func:`_find_uvx`). Intended for the startup
-    banner and a future dashboard "repair" panel. Pure aside from the
-    ``uvx`` PATH/well-known-location probe, so it never spawns anything and
-    never prints anything sensitive.
+    machine at all — see :func:`_find_uvx`, resolved here via the memoized
+    :func:`_cached_uvx`, 36e46957). Intended for the startup banner and a
+    future dashboard "repair" panel. Pure aside from the ``uvx`` PATH/well-
+    known-location probe (skipped entirely once cached), so it never spawns
+    anything and never prints anything sensitive.
     """
     from .tunnel_plugins import SERENA_EXTRACT_COMMAND  # deferred — see _resolve_extract_slot_command
 
@@ -4035,7 +4370,7 @@ def _extract_slot_diagnostics(
         "package": _extract_slot_package_name(resolved),
         "python_runtime": sys.executable,
         "cwd": repo_path,
-        "uvx_available": _find_uvx() is not None,
+        "uvx_available": _cached_uvx() is not None,
     }
 
 
@@ -4058,8 +4393,11 @@ def _resolve_extractor_inner_cmd() -> "list[str] | None":
     interpreter's environment and run it as ``python -m code_extractor`` (the
     module is ``code_extractor``). Returns the inner-command token list, or None
     if neither path is available.
+
+    36e46957 — resolves ``uvx`` via the memoized :func:`_cached_uvx` rather
+    than calling :func:`_find_uvx` directly (reuse resolved launchers).
     """
-    uvx = _find_uvx()
+    uvx = _cached_uvx()
     if uvx:
         return [uvx, "mcp-server-code-extractor"]
     # Fallback: ensure the package is importable in this env, then run as a module.
@@ -4097,11 +4435,18 @@ def _build_extractor_proxy_command(
     ``.bat`` shim (Node 24's CVE-2024-27980 mitigation blocks direct ``.cmd``
     spawns). ``uvx.exe`` / ``python.exe`` are real executables that spawn directly
     and preserve support for paths with spaces, so no shell is needed for them.
+
+    36e46957 — every time the ``.cmd``/``.bat`` branch fires, the occurrence is
+    recorded via :func:`_note_shell_fallback` (explicit/counted/rate-limited/
+    diagnosable) so operators can see how often the extractor slot needed the
+    shell wrapper without this function's own preference-for-direct-executables
+    behaviour changing at all.
     """
     cmd = [npx, "-y", "mcp-proxy", "--port", str(port),
            "--server", "stream", "--stateless"]
     if sys.platform == "win32" and inner_cmd and inner_cmd[0].lower().endswith((".cmd", ".bat")):
         cmd.append("--shell")
+        _note_shell_fallback(f"extractor:{Path(inner_cmd[0]).name}")
     cmd += ["--", *inner_cmd]
     return cmd
 
@@ -4506,23 +4851,30 @@ def _build_proxy_for_inner(
     mitigation above never triggers, so mcp-proxy's direct (no-shell) spawn of
     it raises ``ENOENT`` (the same failure class :func:`_find_npx` exists to
     avoid for the *outer* npx — that resolution was never applied to *inner*
-    commands). Resolve a literal ``"npx"`` inner token through :func:`_find_npx`
-    here, once, at the single choke point every inner command passes through —
-    this then also makes the ``--shell`` check above trigger correctly, since
-    the resolved path ends in ``.cmd`` on Windows.
+    commands). Resolve a literal ``"npx"`` inner token through :func:`_cached_npx`
+    (a memoized wrapper around :func:`_find_npx`, 36e46957) here, once per call,
+    at the single choke point every inner command passes through — this then
+    also makes the ``--shell`` check above trigger correctly, since the
+    resolved path ends in ``.cmd`` on Windows.
 
     *stateless* (4ea1b9d5) — when False, ``--stateless`` is omitted so the inner
     server keeps state across requests. Used for ``session_mode: "persistent"``
     slots like Desktop Commander, whose terminal sessions must survive between
     calls; ``--stateless`` would reset them on every POST.
+
+    36e46957 — every time the ``--shell`` branch fires below, the occurrence is
+    recorded via :func:`_note_shell_fallback` (explicit/counted/rate-limited/
+    diagnosable); the direct-executable preference and required-shim fallback
+    behaviour themselves are unchanged.
     """
     if inner_cmd and inner_cmd[0] == "npx":
-        inner_cmd = [_win_shell_safe_path(_find_npx()), *inner_cmd[1:]]
+        inner_cmd = [_win_shell_safe_path(_cached_npx()), *inner_cmd[1:]]
     cmd = [npx, "-y", "mcp-proxy", "--port", str(port), "--server", "stream"]
     if stateless:
         cmd.append("--stateless")
     if sys.platform == "win32" and inner_cmd and inner_cmd[0].lower().endswith((".cmd", ".bat")):
         cmd.append("--shell")
+        _note_shell_fallback(f"proxy_for_inner:{Path(inner_cmd[0]).name}")
     cmd += ["--", *inner_cmd]
     return cmd
 
@@ -5747,6 +6099,17 @@ async def _proc_watchdog(
     spam the terminal, but the slot keeps a standing chance to self-heal without
     a manual tunnel restart. A relaunch that comes back healthy resets the
     counter and the normal fast-retry cadence. Runs until cancelled.
+
+    36e46957 — a relaunch of a shell-wrapped command (``holder["cmd"]``
+    contains ``--shell``, i.e. mcp-proxy hands the inner launcher to
+    cmd.exe) is exactly the "repeated short-lived cmd.exe process creation"
+    pattern the kernel-pool investigation flagged: a slot that flaps through
+    this path spawns a fresh cmd.exe every retry. Each such relaunch is
+    recorded via :func:`_note_shell_fallback` (explicit/counted/rate-limited/
+    diagnosable) so the count is visible without this function itself trying
+    to avoid or suppress the retry — the existing backoff/cooldown logic
+    above already bounds the retry *rate*; this only makes the shell-wrapped
+    ones countable.
     """
     label = holder.get("label", "?")
     failures = 0
@@ -5781,6 +6144,9 @@ async def _proc_watchdog(
             )
             backoff = min(max(backoff, poll_interval) * 2, _MAX_BACKOFF)
         try:
+            _relaunch_cmd = holder.get("cmd") or []
+            if "--shell" in _relaunch_cmd:
+                _note_shell_fallback(f"proc_watchdog_relaunch:{label}")
             relaunched = subprocess.Popen(
                 holder["cmd"], env=holder.get("env"), **_spawn_kwargs()
             )
@@ -6376,7 +6742,10 @@ async def run_tunnel(
     # 2. Build commands for all enabled slots. Processes are NOT spawned here —
     #    lazy spawning (3649a61a) defers each proxy until its first incoming
     #    request, then auto-kills after _IDLE_KILL_SECONDS of idle time.
-    npx = _find_npx()
+    # 36e46957 — resolved via _cached_npx so every slot builder below (and any
+    # literal "npx" inner token _build_proxy_for_inner resolves later) reuses
+    # this single PATH probe instead of each re-resolving it independently.
+    npx = _cached_npx()
     # aaddb273 — per-run identity: a UUID that identifies THIS tunnel invocation.
     # Threaded through every SlotProxy so claim files can be attributed to this
     # run vs. a prior-generation tunnel that left orphans.

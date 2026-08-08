@@ -56,6 +56,17 @@ async def planner_handoff_endpoint(
     docx_integrity = await handoff_module.build_docx_integrity_gate_for_handoff(
         db, project_id, proposal_evidence=proposal_evidence,
     )
+    # 9154aa9a — machine-readable pointer to the latest durable executor
+    # report, mirroring the capability_contract/proposal_evidence pattern
+    # above; best-effort, never breaks the planner handoff. The prose
+    # rendering of this same data already lives in `content` (see
+    # handoff_module._generate_planner_handoff's "Latest executor report"
+    # section) — this is the structured projection for a machine reader.
+    try:
+        _reports = await db_module.list_executor_reports(db, project_id, limit=1)
+        latest_executor_report = _reports[0] if _reports else None
+    except Exception:  # noqa: BLE001
+        latest_executor_report = None
     return {
         # a5e8aa74 — route through the same shared helper the MCP handler/stdio
         # transports use so all transports share one raw-text contract (this
@@ -66,6 +77,7 @@ async def planner_handoff_endpoint(
         "capability_contract": capability_contract,
         "proposal_evidence": proposal_evidence,
         "docx_integrity": docx_integrity,
+        "latest_executor_report": latest_executor_report,
     }
 
 
@@ -103,6 +115,13 @@ async def generate_handoff_endpoint(
     _raw_fii = body.get("force_include_ids")
     if isinstance(_raw_fii, list):
         _force_include_ids = [str(x) for x in _raw_fii if x]
+    # 94f48e4d — same transport-parity gap: thread selected_item_ids through
+    # the REST body too. See handoff_module.generate_handoff's own docstring
+    # for the fail-closed contract (differs from force_include_ids above).
+    _selected_item_ids: list[str] | None = None
+    _raw_sel = body.get("selected_item_ids")
+    if isinstance(_raw_sel, list):
+        _selected_item_ids = [str(x) for x in _raw_sel if x]
     _strict_evidence = bool(body.get("strict_evidence"))
     _strict_pointer_evidence = bool(body.get("strict_pointer_evidence"))
     # 3cab355a — mirror handler.py's out-param: one entry per requested
@@ -128,6 +147,7 @@ async def generate_handoff_endpoint(
                 session_id=session_id if isinstance(session_id, str) else None,
                 version=_version if isinstance(_version, str) else None,
                 force_include_ids=_force_include_ids,
+                selected_item_ids=_selected_item_ids,
                 strict_evidence=_strict_evidence,
                 strict_pointer_evidence=_strict_pointer_evidence,
                 force_include_rejected=_force_include_rejected,
@@ -155,6 +175,19 @@ async def generate_handoff_endpoint(
                 "project_id": project_id,
                 "evidence_status": exc.evidence_status,
                 "evidence_errors": exc.errors,
+                "message": str(exc),
+            },
+        ) from exc
+    except handoff_module.HandoffSelectionError as exc:
+        # 94f48e4d — selected_item_ids given and at least one requested id
+        # failed validation: fail CLOSED, mirroring the MCP HTTP dispatch's
+        # structured refusal instead of a generic 500.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "HANDOFF_SELECTION_BLOCKED",
+                "project_id": project_id,
+                "selection_rejected": exc.rejected,
                 "message": str(exc),
             },
         ) from exc

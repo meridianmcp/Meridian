@@ -179,6 +179,31 @@ _DEFAULT_ROUTING_CATEGORIES: tuple[dict[str, Any], ...] = (
         "purpose": "DOCX work — claim a document region before writing",
         "fallback": ["meridian-outputs: record_provenance"],
     },
+    {
+        # 92ac025c — the ONE deterministic signal for "this item is clearly
+        # about an external library/framework's own published docs", per the
+        # RESEARCH ROUTING PROTOCOL's own ordering (agent_defaults.py):
+        # exact pointers and local structure always come first; this only
+        # ever fires as a PREFERRED hint (never required_or_preferred=
+        # "required" — see infer_default_routing_category's own docstring),
+        # and the item's own local-code work is never skipped in favor of it.
+        # Deliberately narrow, specific-phrase keywords (not generic words
+        # like "docs" or "api") to avoid false-positiving against an ordinary
+        # code-investigation or docx item that happens to mention "library".
+        "category": "documentation",
+        "keywords": frozenset({
+            "framework docs", "library docs", "third-party library",
+            "external library", "package documentation", "context7",
+            "framework documentation", "library documentation",
+        }),
+        "server_or_namespace": "context7",
+        "name": "resolve-library-id",
+        "purpose": (
+            "external library/framework docs — resolve-library-id then "
+            "query-docs for version-pinned upstream documentation"
+        ),
+        "fallback": ["meridian: github_search", "meridian: paper_search"],
+    },
 )
 
 
@@ -923,6 +948,32 @@ async def build_executor_contract_for_item_id(
     if item is None or item.get("project_id") != project_id:
         return None
     return await build_executor_contract(db, project_id, item, **kwargs)
+
+
+async def summarize_contract_for_report(
+    db: Any, project_id: str, item_id: str, **kwargs: Any,
+) -> "dict[str, Any] | None":
+    """9154aa9a -- compact per-item contract summary for embedding into an
+    executor_report item_outcome entry (see
+    ``meridian.handoff.record_executor_report``'s ``enrich_contract_hashes``
+    kwarg) -- durable provenance tying a reported outcome to the EXACT
+    executor_contract (by hash) the executor was working against, without
+    needing to persist the full contract object into every report row.
+
+    Returns ``None`` when the item does not exist or belongs to a different
+    project (mirrors :func:`build_executor_contract_for_item_id`) -- never
+    raises."""
+    contract = await build_executor_contract_for_item_id(
+        db, project_id, item_id, **kwargs,
+    )
+    if contract is None:
+        return None
+    return {
+        "item_id": contract.get("item_id"),
+        "contract_hash": contract.get("contract_hash"),
+        "executable": contract.get("executable"),
+        "generated_at": contract.get("generated_at"),
+    }
 
 
 # ---------------------------------------------------------------------------

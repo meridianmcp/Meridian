@@ -41,6 +41,7 @@ from .. import artifact_declaration as _artifact_declaration  # 2f9cb288 (665 fo
 from .. import executor_config as _executor_config  # 99c0c1be — parallelism diagnostics
 from .. import continuation_gate as _continuation_gate  # ecc8b280
 from .. import blocker_policy as _blocker_policy  # b108f2e0 (typed blocker triage)
+from .. import dependency_graph as _dependency_graph  # 05553946 (cycle detection)
 
 
 # ---------------------------------------------------------------------------
@@ -3224,8 +3225,18 @@ async def patch_sprint_item(
     independently claimable again), or another sprint item's id to set/fix
     dependency ordering retroactively — previously ``depends_on`` could only
     be set at creation time via ``add_sprint_item``, with no way to fix
-    ordering on an already-filed item. Raises ``ValueError`` if the id equals
-    ``item_id`` itself (a self-dependency would deadlock the item).
+    ordering on an already-filed item. Raises ``meridian.dependency_graph.
+    DependencyCycleError`` (a ``ValueError`` subclass, reason='cycle') if the
+    edit would create a dependency cycle — this covers both a plain
+    self-dependency (``depends_on == item_id``, a cycle of length one) and a
+    longer cycle introduced by retroactively rewiring an existing chain (e.g.
+    A depends_on B, then patching B to depend_on A); the exception carries
+    the full ``cycle_path`` for diagnostics (05553946). Missing / cross-
+    project / merged-away dependency targets are deliberately NOT rejected
+    here — that stale-reference check is intentionally deferred to handoff-
+    render time (see ``meridian.db.board_snapshot.find_stale_reference_ids``,
+    ee8a6af1), so a dependency on a not-yet-created or not-yet-synced item id
+    keeps working exactly as before.
     ``deferred_until`` / ``track`` (dec69708) also use the ``_UNSET`` sentinel:
     omit to leave unchanged, pass an empty string / ``None`` to CLEAR the
     deferral (making the item immediately claimable again), or an ISO timestamp
@@ -3410,8 +3421,19 @@ async def patch_sprint_item(
         # Previously depends_on could only be fixed at creation time — this
         # closes the gap that forced ordering into prose notes instead.
         _dep = depends_on or None
-        if _dep is not None and _dep == item_id:
-            raise ValueError("depends_on cannot be the item's own id (self-dependency)")
+        if _dep is not None:
+            # 05553946 — reject a self-dependency OR any longer cycle the edit
+            # would close. A self-dependency is just a cycle of length one, so
+            # this single cycle-detection call replaces the previous ad hoc
+            # ``_dep == item_id`` check with one consistent, fully-diagnosed
+            # code path (both raise DependencyCycleError, a ValueError
+            # subclass, with the full cycle_path attached).
+            _all_project_items = await get_sprint_items(db, project_id)
+            _cycle = _dependency_graph.find_dependency_cycle(
+                _all_project_items, proposed_edge=(item_id, _dep)
+            )
+            if _cycle:
+                raise _dependency_graph.DependencyCycleError(_cycle)
         ns_fields.append("depends_on = ?")
         ns_values.append(_dep)
     if require_verification is not _UNSET:
@@ -5911,18 +5933,40 @@ async def assign_sprint_waves(
     highest-priority-first sort still gives it an edge within its layer.
 
     Returns ``{version, wave_count, assigned, waves: {'wave-1': [ids...], ...},
-    blocked_count, undeclared_count, urgent_wave_count, urgent_assigned}``.
+    blocked_count, undeclared_count, urgent_wave_count, urgent_assigned,
+    cycles, graph_digest}``.
     ``blocked_count`` now counts items whose dependency is not yet DONE (they
     are still projected into a future wave, not truly dropped). ``waves``
     includes both the ``wave-N`` sequential labels and any ``wave-urgent*``
     labels — the two families are merged in the returned mapping but remain
     distinguishable by their key prefix.
+
+    ``cycles`` (05553946) — every distinct ``depends_on`` cycle found among
+    the eligible item set (see ``meridian.dependency_graph.
+    find_all_dependency_cycles``), each a full closed path
+    (``["a", "b", "a"]``). ``_topo_depth_map`` below silently treats a
+    revisited id as a root (depth 0) purely so wave labelling always
+    terminates — it never raises and never drops the involved items from the
+    plan — so a cyclic item still gets SOME wave label, but ``cycles`` is
+    the explicit, machine-readable signal that the label is a best-effort
+    fallback rather than a real topological position; a planner should treat
+    a non-empty ``cycles`` list as needing a ``depends_on`` fix (via
+    ``patch_sprint_item``, which fails closed on new cycles) before trusting
+    the plan. ``graph_digest`` (see ``meridian.dependency_graph.
+    compute_dependency_graph_digest``) is a deterministic digest of the same
+    eligible item set's ``(id, depends_on)`` edges, for cheap "did the
+    dependency graph change since I last called this" comparisons.
     """
     # ── Collect all eligible pending/todo non-manual items ─────────────────────
     items = await get_sprint_items(db, project_id, include_manual_blocker=False)
     items = [it for it in items if not _is_manual_sprint_item(it)]
     if version is not None:
         items = [it for it in items if it.get("version") == version]
+    # 05553946 — explicit, full-path cycle diagnostics over the same eligible
+    # set _topo_depth_map is about to walk; see the docstring above for why
+    # this is informational (wave assignment itself stays lenient/terminating).
+    cycles = _dependency_graph.find_all_dependency_cycles(items)
+    graph_digest = _dependency_graph.compute_dependency_graph_digest(items)
     claimable_statuses = {"pending", "todo"}
     # Only label pending/todo items that are not already in-flight or done.
     # In-progress items are mid-execution and must not be relabelled mid-run.
@@ -6008,6 +6052,8 @@ async def assign_sprint_waves(
             "undeclared_count": urgent_undeclared_count,
             "urgent_wave_count": len(urgent_waves),
             "urgent_assigned": urgent_assigned,
+            "cycles": cycles,
+            "graph_digest": graph_digest,
         }
 
     max_topo = max(depth_map.values())
@@ -6100,6 +6146,8 @@ async def assign_sprint_waves(
         "undeclared_count": undeclared_count + urgent_undeclared_count,
         "urgent_wave_count": len(urgent_waves),
         "urgent_assigned": urgent_assigned,
+        "cycles": cycles,
+        "graph_digest": graph_digest,
     }
 
 

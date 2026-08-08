@@ -1043,7 +1043,18 @@ _CUSTOM_PORT_START = 8822
 # plugin's name must not collide with a built-in slot name (task rule) nor with a
 # built-in plugin's display name (filesystem/code-intel/… — see builtin_names),
 # since either is a slot override rather than a genuine custom plugin.
-_RESERVED_CUSTOM_NAMES = frozenset(SLOTS)
+#
+# 45049071 — also reserve the OPTIONAL OpenAI Secure MCP Tunnel transport
+# adapter's own identity (meridian.openai_tunnel_adapter). That adapter is
+# NOT one of the three-slot model's built-in slots (it never appears in
+# SLOTS/builtin_names — it is a separate, parallel transport, not a plugin
+# behind a Meridian tunnel slot), so without this explicit reservation a
+# same-named LOCAL custom plugin would silently pass
+# validate_custom_plugin/resolve_custom_plugins and shadow the adapter's
+# identity in any future dashboard/plugin listing.
+_RESERVED_CUSTOM_NAMES = frozenset(SLOTS) | {
+    "openai", "openai-tunnel", "openai_secure_mcp_tunnel",
+}
 
 # Safe custom-plugin name charset: letters, digits, dash, underscore, dot. The
 # name becomes an ``.mcp.json`` key (``meridian-custom-<name>``) and part of a
@@ -1058,7 +1069,9 @@ def is_reserved_custom_name(name: Any) -> bool:
     A custom plugin may not be named like a built-in slot (fs/code/extract/ppt/
     word/dc) or a built-in plugin (filesystem/code-intel/…): such a name is a slot
     override, never a stand-alone custom plugin, and ``resolve_custom_plugins``
-    would silently drop it. Case-insensitive on the stripped value.
+    would silently drop it. Case-insensitive on the stripped value. Also
+    reserves the separate OpenAI Secure MCP Tunnel adapter's own identity
+    (45049071 — see :data:`_RESERVED_CUSTOM_NAMES`'s own comment).
     """
     n = str(name or "").strip().lower()
     if not n:

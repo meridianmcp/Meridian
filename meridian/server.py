@@ -836,6 +836,10 @@ async def lifespan(app: FastAPI):
             await keepalive_task
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
+        try:
+            await version_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
         # 57f7f7ba — stop the autonomous dispatcher if it was enabled.
         _disp = getattr(app.state, "dispatcher", None)
         if _disp is not None:
@@ -5055,6 +5059,26 @@ async def _build_continue_payload(
         }
         for it in pending
     ]
+    # 9154aa9a — best-effort informational pointer to the latest durable
+    # executor report (meridian.handoff.record_executor_report), scoped to
+    # this session's own version bucket, so a resuming executor can see
+    # whether a prior report is still awaiting planner review — never blocks
+    # or alters continuation itself; a lookup failure (or a pre-migration
+    # DB) degrades to None.
+    try:
+        _reports = await db_module.list_executor_reports(
+            db, project_id, version=scoped_version, limit=1,
+        )
+        latest_executor_report = (
+            {
+                "id": _reports[0].get("id"),
+                "status": _reports[0].get("status"),
+                "accepted_handoff_id": _reports[0].get("accepted_handoff_id"),
+            }
+            if _reports else None
+        )
+    except Exception:  # noqa: BLE001
+        latest_executor_report = None
     return {
         "continuation": True,
         "mode": "continue",
@@ -5066,6 +5090,7 @@ async def _build_continue_payload(
         "pending_count": len(pending_slim),
         "goal_string": goal_string,
         "recent_tasks": recent,
+        "latest_executor_report": latest_executor_report,
         "note": (
             "Continue mode — resumed without re-reading L0/L1/L2 context. Claim "
             "the first pending item and keep going; call "
@@ -6473,6 +6498,15 @@ async def _resolve_hook_project_id(
     return None
 
 
+# b4f4627f — same-session in-flight guard for /hooks/stop: this route is
+# explicitly SECONDARY cleanup (run-owned lifecycle teardown, e.g.
+# process_lifecycle.py, is the primary/authoritative teardown path and must
+# stay safe/recoverable on its own even if this route never fires, is
+# skipped, or fires twice for the same session). Prevents two concurrent
+# generate_handoff(mode="delta") calls from racing for one session_id.
+_STOP_HOOK_INFLIGHT: set[str] = set()
+
+
 @app.post("/hooks/stop")
 async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     """Claude Code / Codex Stop hook.
@@ -6495,7 +6529,26 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     Hosted callers can authenticate with Authorization: Bearer sk_meridian_...
     to route directly to their tenant DB. Local/browser-session behavior is
     unchanged when no Bearer token is supplied.
+
+    b4f4627f — two guards layered on top of the existing best-effort contract:
+
+    * ``stop_hook_active`` (Claude Code sets this true when the CURRENT Stop
+      event was itself caused by a PREVIOUS Stop hook's exit-2 block) short-
+      circuits immediately, before any DB/background work — the same
+      infinite-retrigger guard already baked into every rendered Stop-hook
+      script (sprint_guard.{sh,ps1}, and now every custom Stop hook — see
+      ``handoff._render_custom_hook_files``), applied at this route's own
+      entry point too, in case a caller ever forwards the real hook payload
+      here (the shipped hooks.sh/.ps1 STOP_CMD is a fixed curl call that
+      never does today, but this route accepts arbitrary POST bodies and
+      must not assume that stays true forever).
+    * a same-session in-flight guard (``_STOP_HOOK_INFLIGHT``) skips a
+      SECOND concurrent call for a session already being processed rather
+      than racing two concurrent ``generate_handoff(mode="delta")`` calls
+      for the same ``session_id``.
     """
+    if bool(body.get("stop_hook_active")):
+        return {"ok": True, "handoff": None, "reason": "stop_hook_active"}
     project_id = (body.get("project_id") or "").strip()
     session_id = (body.get("session_id") or "").strip() or None
     hook_cwd = (body.get("cwd") or "").strip()
@@ -6523,51 +6576,57 @@ async def hooks_stop(body: dict[str, Any], request: Request) -> dict[str, Any]:
     if not session_id:
         # Best-effort: no session to summarise — never an error.
         return {"ok": True, "handoff": None, "reason": "no session"}
-    # Bucket done tasks + finalize any session markdown (both guarded).
+    if session_id in _STOP_HOOK_INFLIGHT:
+        return {"ok": True, "handoff": None, "reason": "already_in_progress"}
+    _STOP_HOOK_INFLIGHT.add(session_id)
     try:
-        await db_module.auto_capture_session(db, project_id, session_id)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        await _finalize_session_md(db, project_id, session_id)
-    except Exception:  # noqa: BLE001
-        pass
-    # Produce the delta handoff inline but fully guarded — any failure (and the
-    # timeout) returns cleanly with handoff null so the hook never blocks/errors.
-    try:
-        from . import handoff as handoff_module_local
-        # 571b8b60 — bounded transcript read (local file, capped) → work
-        # narrative folded into the delta body. Guarded: any failure yields ""
-        # and the handoff falls back to the plain delta.
-        _narrative = ""
-        if transcript_path:
-            try:
-                _narrative = handoff_module_local.extract_transcript_narrative(
-                    transcript_path
-                )
-            except Exception:  # noqa: BLE001
-                _narrative = ""
-        path, _content, _amended = await asyncio.wait_for(
-            handoff_module_local.generate_handoff(
-                db, project_id, _data_dir(request), mode="delta",
-                session_id=session_id, extra_narrative=_narrative or None,
-            ),
-            timeout=20.0,
-        )
-        return {
-            "ok": True,
-            "handoff": {
-                "mode": "delta", "path": path,
-                "transcript_narrative": bool(_narrative),
-            },
-        }
-    except Exception as exc:  # noqa: BLE001
-        import logging as _hook_logging
-        _hook_logging.getLogger("meridian.hooks").info(
-            "hooks/stop delta handoff failed for project=%s session=%s: %r",
-            project_id, session_id, exc,
-        )
-        return {"ok": True, "handoff": None, "error": str(exc)}
+        # Bucket done tasks + finalize any session markdown (both guarded).
+        try:
+            await db_module.auto_capture_session(db, project_id, session_id)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await _finalize_session_md(db, project_id, session_id)
+        except Exception:  # noqa: BLE001
+            pass
+        # Produce the delta handoff inline but fully guarded — any failure (and the
+        # timeout) returns cleanly with handoff null so the hook never blocks/errors.
+        try:
+            from . import handoff as handoff_module_local
+            # 571b8b60 — bounded transcript read (local file, capped) → work
+            # narrative folded into the delta body. Guarded: any failure yields ""
+            # and the handoff falls back to the plain delta.
+            _narrative = ""
+            if transcript_path:
+                try:
+                    _narrative = handoff_module_local.extract_transcript_narrative(
+                        transcript_path
+                    )
+                except Exception:  # noqa: BLE001
+                    _narrative = ""
+            path, _content, _amended = await asyncio.wait_for(
+                handoff_module_local.generate_handoff(
+                    db, project_id, _data_dir(request), mode="delta",
+                    session_id=session_id, extra_narrative=_narrative or None,
+                ),
+                timeout=20.0,
+            )
+            return {
+                "ok": True,
+                "handoff": {
+                    "mode": "delta", "path": path,
+                    "transcript_narrative": bool(_narrative),
+                },
+            }
+        except Exception as exc:  # noqa: BLE001
+            import logging as _hook_logging
+            _hook_logging.getLogger("meridian.hooks").info(
+                "hooks/stop delta handoff failed for project=%s session=%s: %r",
+                project_id, session_id, exc,
+            )
+            return {"ok": True, "handoff": None, "error": str(exc)}
+    finally:
+        _STOP_HOOK_INFLIGHT.discard(session_id)
 
 
 # ---------------------------------------------------------------------------

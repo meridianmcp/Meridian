@@ -6270,6 +6270,7 @@ def _render_custom_hook_files(hook: dict[str, Any]) -> dict[str, str]:
     event = hook["event"]
     matcher = hook.get("matcher") or ""
     blocking = bool(hook.get("blocking", 1))
+    is_stop = event == "Stop"
     header_bits = [f"event={event}"]
     if matcher:
         header_bits.append(f"matcher={matcher}")
@@ -6281,13 +6282,41 @@ def _render_custom_hook_files(hook: dict[str, Any]) -> dict[str, str]:
     )
     out: dict[str, str] = {}
 
+    # b4f4627f — every Stop-event custom hook (not just sprint_guard, and not
+    # just the hardcoded orphan_reaper one) gets the same infinite-retrigger
+    # guard sprint_guard.{sh,ps1} already use: Claude Code sets
+    # stop_hook_active=true on a Stop event that was itself caused by a
+    # PREVIOUS Stop hook's own exit-2 block, so any Stop hook that doesn't
+    # check it can retrigger forever. PreToolUse/PostToolUse hooks are
+    # unaffected (that field is Stop-specific) and keep the exact prior
+    # rendering. The original stdin payload is consumed to check the flag, so
+    # it's re-exposed to the user's script via $MERIDIAN_HOOK_STDIN /
+    # $env:MERIDIAN_HOOK_STDIN — a documented, explicit substitute for the raw
+    # re-read the script would otherwise lose.
+    stop_guard_sh = (
+        'payload="$(cat 2>/dev/null || true)"\n'
+        'if printf \'%s\' "$payload" | grep -Eq '
+        '\'"stop_hook_active"[[:space:]]*:[[:space:]]*true\'; then\n'
+        '  exit 0\n'
+        'fi\n'
+        'export MERIDIAN_HOOK_STDIN="$payload"\n'
+    ) if is_stop else ""
+    stop_guard_ps1 = (
+        "$_meridianRawStdin = [Console]::In.ReadToEnd()\n"
+        "try { $_meridianPayload = $_meridianRawStdin | ConvertFrom-Json } "
+        "catch { $_meridianPayload = $null }\n"
+        "if ($_meridianPayload -and $_meridianPayload.stop_hook_active -eq $true) { exit 0 }\n"
+        "$env:MERIDIAN_HOOK_STDIN = $_meridianRawStdin\n"
+    ) if is_stop else ""
+
     script_sh = (hook.get("script_sh") or "").strip("\n")
     if script_sh:
         if blocking:
-            out[f"{slug}.sh"] = header + script_sh + "\n"
+            out[f"{slug}.sh"] = header + stop_guard_sh + script_sh + "\n"
         else:
             out[f"{slug}.sh"] = (
                 header
+                + stop_guard_sh
                 + "set -uo pipefail\n"
                 + "(\n"
                 + script_sh + "\n"
@@ -6304,12 +6333,13 @@ def _render_custom_hook_files(hook: dict[str, Any]) -> dict[str, str]:
     script_ps1 = (hook.get("script_ps1") or "").strip("\n")
     if script_ps1:
         if blocking:
-            out[f"{slug}.ps1"] = header + script_ps1 + "\n"
+            out[f"{slug}.ps1"] = header + stop_guard_ps1 + script_ps1 + "\n"
         else:
             body_name = f"{slug}_body.ps1"
             out[body_name] = header + script_ps1 + "\n"
             out[f"{slug}.ps1"] = (
                 header
+                + stop_guard_ps1
                 + "$ErrorActionPreference = 'SilentlyContinue'\n"
                 + f'& powershell -NoProfile -NonInteractive -File "$PSScriptRoot\\{body_name}"\n'
                 + "$_meridianHookRc = $LASTEXITCODE\n"
@@ -6323,6 +6353,47 @@ def _render_custom_hook_files(hook: dict[str, Any]) -> dict[str, str]:
     return out
 
 
+def custom_hook_artifact_filenames(slug: str) -> tuple[str, str, str]:
+    """b4f4627f — the (up to) 3 filenames ``_render_custom_hook_files`` can
+    produce for one hook's ``slug``, regardless of its CURRENT blocking /
+    script_ps1 configuration: ``{slug}.sh``, ``{slug}.ps1``, and the
+    advisory-mode ``.ps1`` wrapper's companion ``{slug}_body.ps1``. Returned
+    as a fixed superset (rather than re-derived from the hook's current row)
+    so a config change (e.g. blocking True -> False, or removing script_ps1)
+    can never leave an orphaned file behind from the PREVIOUS configuration —
+    mirrors ``orphan_reaper.ORPHAN_REAPER_HOOK_FILENAMES``'s same
+    fixed-superset approach for its one hardcoded slug.
+    """
+    return (f"{slug}.sh", f"{slug}.ps1", f"{slug}_body.ps1")
+
+
+def remove_custom_hook_artifacts(hooks_dir: "Path | str", slug: str) -> list[str]:
+    """b4f4627f — delete any already-written files for one custom hook's
+    ``slug`` from *hooks_dir* (a repo's ``.claude/hooks`` dir) immediately,
+    generalizing ``orphan_reaper.remove_orphan_reaper_artifacts`` to any
+    user-defined hook rather than just the one hardcoded orphan_reaper slug.
+    Best-effort, pure filesystem cleanup: never raises, never touches the DB,
+    never touches anything outside *hooks_dir* itself. Returns the filenames
+    actually removed (empty list if none were present or *slug* is falsy).
+    """
+    removed: list[str] = []
+    if not slug:
+        return removed
+    try:
+        base = Path(hooks_dir)
+    except Exception:  # noqa: BLE001 — malformed path input
+        return removed
+    for filename in custom_hook_artifact_filenames(slug):
+        try:
+            path = base / filename
+            if path.exists():
+                path.unlink()
+                removed.append(filename)
+        except Exception:  # noqa: BLE001 — one bad file must not abort the rest
+            continue
+    return removed
+
+
 async def _write_custom_hooks(db: aiosqlite.Connection, project_id: str, hooks_dir: Path) -> None:
     """273287cb — (re)write every enabled ``custom_hooks`` row for ``project_id``
     into ``hooks_dir``. Called from ``_write_sprint_guard_hooks`` under the same
@@ -6330,13 +6401,28 @@ async def _write_custom_hooks(db: aiosqlite.Connection, project_id: str, hooks_d
     Never touches ``sprint_guard.{sh,ps1}`` — ``add_custom_hook`` already
     rejects the reserved ``sprint_guard`` slug, and this is a second,
     defense-in-depth skip in case a row somehow bypassed that check.
+
+    b4f4627f — ALSO reconciles disabled hooks: a hook that currently exists
+    with ``enabled=0`` has any stale files from a PRIOR enabled write removed
+    (``remove_custom_hook_artifacts``) instead of being silently skipped
+    forever, which was the only prior behavior (see
+    ``db.hooks.delete_custom_hook``'s docstring for the still-unchanged
+    delete-path gap this does not touch — a deleted row isn't visited here at
+    all). This is a backstop convergence pass on every ``generate_handoff``;
+    ``update_custom_hook`` (mcp/handlers/project_tools.py) additionally does
+    the same removal immediately when it flips a hook's ``enabled`` flag off,
+    rather than waiting for the next handoff.
     """
-    hooks = await db_module.get_custom_hooks(db, project_id, enabled_only=True)
-    for hook in hooks:
-        if hook.get("slug") in db_module._RESERVED_HOOK_SLUGS:  # noqa: SLF001
+    all_hooks = await db_module.get_custom_hooks(db, project_id)
+    for hook in all_hooks:
+        slug = hook.get("slug")
+        if slug in db_module._RESERVED_HOOK_SLUGS:  # noqa: SLF001
             continue
-        for filename, content in _render_custom_hook_files(hook).items():
-            (hooks_dir / filename).write_text(content, encoding="utf-8")
+        if hook.get("enabled"):
+            for filename, content in _render_custom_hook_files(hook).items():
+                (hooks_dir / filename).write_text(content, encoding="utf-8")
+        else:
+            remove_custom_hook_artifacts(hooks_dir, slug)
 
 
 async def _write_sprint_guard_hooks(

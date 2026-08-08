@@ -983,7 +983,25 @@ async def handle_claim_sprint_item(
                 _verdict = None
             if _verdict is not None and _verdict.get("classification") in ("active", "ambiguous"):
                 _signals = _verdict.get("signals") or {}
+                _next_item = None
+                try:
+                    _grp = await db_module.get_parallelizable_groups(
+                        db, args["project_id"], version=_stale_item.get("version")
+                    )
+                    for _group in _grp.get("groups", []):
+                        for _cand in _group:
+                            if _cand.get("id") != args["item_id"]:
+                                _next_item = _cand
+                                break
+                        if _next_item is not None:
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
                 return {
+                    # Keep the stable claim-result contract for callers that
+                    # only branch on status, while exposing the richer
+                    # classifier diagnostics added by stale-claim recovery.
+                    "status": "already_claimed",
                     "error": "ACTIVE_CLAIM" if _verdict["classification"] == "active" else "AMBIGUOUS_CLAIM",
                     "message": (
                         f"Item is in_progress; autonomous stale-claim reconciliation classified "
@@ -995,6 +1013,9 @@ async def handle_claim_sprint_item(
                     "signals": _signals,
                     "stale_age_hours": _signals.get("age_hours"),
                     "claimed_at": _stale_item.get("claimed_at"),
+                    "current_status": _stale_item.get("status"),
+                    "next_available_id": (_next_item or {}).get("id"),
+                    "next_available_title": (_next_item or {}).get("title"),
                     "item": _stale_item,
                 }
         # df573218 — claim race: another session grabbed this item between

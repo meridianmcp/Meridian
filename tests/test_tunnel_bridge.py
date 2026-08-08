@@ -258,6 +258,73 @@ def test_tunnel_status_includes_slot_health():
         tn._tunnel_sockets.pop("th3", None)
 
 
+# ---------------------------------------------------------------------------
+# 45049071 — POST /tunnel/openai/diagnostics/{tenant_id}: OPTIONAL OpenAI
+# Secure MCP Tunnel adapter diagnostics, explicitly namespaced apart from
+# tunnel_status()'s Meridian-tunnel state above.
+# ---------------------------------------------------------------------------
+
+class _FakeJsonReq:
+    """Minimal Starlette-Request stand-in — only `.json()` is needed."""
+
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
+def test_openai_tunnel_diagnostics_defaults_to_not_configured():
+    result = asyncio.run(tn.openai_tunnel_diagnostics("t-oai-1", _FakeJsonReq({})))
+    payload = json.loads(result.body)
+    assert payload["tenant_id"] == "t-oai-1"
+    assert payload["openai_tunnel"]["state"] == "not_configured"
+    assert payload["meridian_tunnel"] == {"active": False}
+
+
+def test_openai_tunnel_diagnostics_distinguishes_from_meridian_tunnel_state():
+    tn._tunnel_sockets["t-oai-2"] = object()
+    try:
+        result = asyncio.run(tn.openai_tunnel_diagnostics("t-oai-2", _FakeJsonReq({})))
+        payload = json.loads(result.body)
+        # Meridian tunnel is active but the OpenAI adapter is unconfigured --
+        # these must never be conflated into a single flag.
+        assert payload["meridian_tunnel"]["active"] is True
+        assert payload["openai_tunnel"]["state"] == "not_configured"
+    finally:
+        tn._tunnel_sockets.pop("t-oai-2", None)
+
+
+def test_openai_tunnel_diagnostics_reports_configured_from_supplied_config():
+    body = {
+        "openai_tunnel_config": {
+            "enabled": True, "transport": "stdio", "command": ["echo", "hi"],
+        },
+    }
+    result = asyncio.run(tn.openai_tunnel_diagnostics("t-oai-3", _FakeJsonReq(body)))
+    payload = json.loads(result.body)
+    assert payload["openai_tunnel"]["state"] == "configured"
+    assert payload["openai_tunnel"]["transport"] == "stdio"
+
+
+def test_openai_tunnel_diagnostics_rejects_invalid_config_with_400():
+    body = {"openai_tunnel_config": {"enabled": True, "transport": "carrier-pigeon"}}
+    result = asyncio.run(tn.openai_tunnel_diagnostics("t-oai-4", _FakeJsonReq(body)))
+    assert result.status_code == 400
+    payload = json.loads(result.body)
+    assert "error" in payload
+
+
+def test_openai_tunnel_diagnostics_tolerates_missing_body():
+    class _NoBodyReq:
+        async def json(self):
+            raise ValueError("no body")
+
+    result = asyncio.run(tn.openai_tunnel_diagnostics("t-oai-5", _NoBodyReq()))
+    payload = json.loads(result.body)
+    assert payload["openai_tunnel"]["state"] == "not_configured"
+
+
 def test_slot_status_detail_record_clear():
     """9a8645c1 — unhealthy reports stash a reason/detail; healthy clears it."""
     try:

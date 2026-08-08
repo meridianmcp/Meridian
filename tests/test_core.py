@@ -7889,12 +7889,13 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_handoff_corrections_table",
         "_migrate_pg_vector_index_state",
         "_migrate_pg_pixi_env_roots",
+        "_migrate_pg_executor_reports",
         "_migrate_pg_wave_run_summaries",
         "_migrate_pg_decision_evidence",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 145
+    assert len(allnames) == len(set(allnames)) == 146
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -12534,41 +12535,58 @@ async def test_ingest_document_file_path_upserts_by_path(db, tmp_path):
 async def test_ingest_document_mcp_tool_round_trip(db, tmp_path):
     """e3f150d0 — the ingest_document MCP tool extracts a .docx server-side and
     stores a kind='document' note; the PDF path returns a clear error payload.
-    Also asserts the tool is declared in the canonical tool list."""
+    Also asserts the tool is declared in the canonical tool list.
+
+    ``ingest_document`` opens (and module-cache-registers) a doc_store
+    connection via ``open_doc_store_for``, keyed on ``{data_dir}/doc_structure.db``.
+    A hardcoded ``"/tmp"`` data_dir doesn't resolve to a writable directory on
+    Windows, so the doc_store's own ``init_db`` schema setup raised — an
+    exception ``_resolve_ingest_doc_store`` (mcp/handler.py) swallows
+    unconditionally ("never let store resolution break ingest"), orphaning the
+    already-opened connection before it reached the cache. That connection's
+    non-daemon aiosqlite worker thread then hung interpreter shutdown for
+    hours. Real fix: use the actual ``tmp_path`` fixture (a writable temp dir)
+    instead of the bogus literal, so doc_store setup succeeds, gets cached,
+    and the ``finally`` below (matching every dedicated doc_store test file's
+    convention) can actually close it."""
     import meridian.server as srv
+    from meridian import doc_store as doc_store_module
     from meridian.mcp_tools import _MCP_TOOLS_LIST
 
-    p = await db_module.create_project(db, "e3f150d0-mcp")
-    pid = p["id"]
+    try:
+        p = await db_module.create_project(db, "e3f150d0-mcp")
+        pid = p["id"]
 
-    docx = tmp_path / "chapter.docx"
-    docx.write_bytes(_build_docx(["Intro.", "Method."]))
-    note = await srv._dispatch_mcp_tool(
-        "ingest_document",
-        {"project_id": pid, "file_path": str(docx), "tags": "thesis"},
-        db, "/tmp",
-    )
-    assert note["note_kind"] == "document"
-    assert note["body"] == "Intro.\nMethod."
-    assert note["title"] == "chapter.docx"
-    assert note["source"] == str(docx)
+        docx = tmp_path / "chapter.docx"
+        docx.write_bytes(_build_docx(["Intro.", "Method."]))
+        note = await srv._dispatch_mcp_tool(
+            "ingest_document",
+            {"project_id": pid, "file_path": str(docx), "tags": "thesis"},
+            db, str(tmp_path),
+        )
+        assert note["note_kind"] == "document"
+        assert note["body"] == "Intro.\nMethod."
+        assert note["title"] == "chapter.docx"
+        assert note["source"] == str(docx)
 
-    # A .pdf file_path is rejected server-side with guidance to pass content.
-    pdf = tmp_path / "scan.pdf"
-    pdf.write_bytes(b"%PDF-1.7 ...")
-    err = await srv._dispatch_mcp_tool(
-        "ingest_document", {"project_id": pid, "file_path": str(pdf)}, db, "/tmp"
-    )
-    assert "error" in err and "content" in err["error"].lower()
+        # A .pdf file_path is rejected server-side with guidance to pass content.
+        pdf = tmp_path / "scan.pdf"
+        pdf.write_bytes(b"%PDF-1.7 ...")
+        err = await srv._dispatch_mcp_tool(
+            "ingest_document", {"project_id": pid, "file_path": str(pdf)}, db, str(tmp_path)
+        )
+        assert "error" in err and "content" in err["error"].lower()
 
-    by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
-    assert "ingest_document" in by_name
-    # 8a449ec0 — project_id resolvable via project_name, so required is now empty
-    # (the resolver/handler enforce a real project); project_name is advertised.
-    assert by_name["ingest_document"]["inputSchema"]["required"] == []
-    assert "project_name" in by_name["ingest_document"]["inputSchema"]["properties"]
-    # It writes, so it must not be flagged read-only.
-    assert by_name["ingest_document"]["annotations"]["readOnlyHint"] is False
+        by_name = {t["name"]: t for t in _MCP_TOOLS_LIST}
+        assert "ingest_document" in by_name
+        # 8a449ec0 — project_id resolvable via project_name, so required is now empty
+        # (the resolver/handler enforce a real project); project_name is advertised.
+        assert by_name["ingest_document"]["inputSchema"]["required"] == []
+        assert "project_name" in by_name["ingest_document"]["inputSchema"]["properties"]
+        # It writes, so it must not be flagged read-only.
+        assert by_name["ingest_document"]["annotations"]["readOnlyHint"] is False
+    finally:
+        await doc_store_module.close_all_doc_stores()
 
 
 def test_upload_document_txt_ingests_and_lists(client):
@@ -12692,20 +12710,28 @@ async def test_add_note_mcp_tool_stores_source_and_document_kind(db):
 
 async def test_auto_capture_writes_session_note_not_project_note():
     """9d44998b — auto_capture_session writes the bucketed summary to the
-    ephemeral session scratch-pad, NOT a permanent project note."""
+    ephemeral session scratch-pad, NOT a permanent project note.
+
+    The connection is closed in ``finally`` — an aiosqlite connection left
+    open leaks a non-daemon worker thread that hangs interpreter shutdown
+    for hours (the same class of bug documented on
+    ``test_create_tables_survives_pre_tenant_id_blog_posts`` above)."""
     import meridian.db as dbm
     conn = await dbm.init_db(":memory:")
-    project = await dbm.create_project(conn, "auto-cap")
-    pid = project["id"]
-    sess = await dbm.register_session(conn, pid, "s1")
-    sid = sess["id"]
-    await dbm.log_task(conn, sid, pid, "fix the broken thing", status="done")
-    await dbm.log_task(conn, sid, pid, "add a new feature", status="done")
-    await dbm.auto_capture_session(conn, pid, sid)
-    project_titles = [n["title"] for n in await dbm.get_project_notes(conn, pid)]
-    session_titles = [n["title"] for n in await dbm.get_session_notes(conn, sid)]
-    assert not any("Session summary" in t for t in project_titles), project_titles
-    assert any("Session summary" in t for t in session_titles), session_titles
+    try:
+        project = await dbm.create_project(conn, "auto-cap")
+        pid = project["id"]
+        sess = await dbm.register_session(conn, pid, "s1")
+        sid = sess["id"]
+        await dbm.log_task(conn, sid, pid, "fix the broken thing", status="done")
+        await dbm.log_task(conn, sid, pid, "add a new feature", status="done")
+        await dbm.auto_capture_session(conn, pid, sid)
+        project_titles = [n["title"] for n in await dbm.get_project_notes(conn, pid)]
+        session_titles = [n["title"] for n in await dbm.get_session_notes(conn, sid)]
+        assert not any("Session summary" in t for t in project_titles), project_titles
+        assert any("Session summary" in t for t in session_titles), session_titles
+    finally:
+        await conn.close()
 
 
 def test_favicon_ico_redirects_to_logo(client):

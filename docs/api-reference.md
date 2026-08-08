@@ -940,6 +940,13 @@ No auth required.
 | `POST` | `/outputs/mcp/{tenant_id}/{rest:path}` | Same as outputs_mcp_proxy but for sub-paths |
 
 
+### `/pkg-guard`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/pkg-guard/check` | 23f21820 -- package-install verification gate |
+
+
 ### `/ppt`
 
 | Method | Path | Description |
@@ -991,6 +998,7 @@ No auth required.
 | `PATCH` | `/projects/{project_id}/decisions-pinned/{decision_id}` | Patch fields, or supersede (pass new_title + new_body to atomically retire+create) |
 | `POST` | `/projects/{project_id}/decisions/consolidate` | Call an external LLM to deduplicate and consolidate pinned decisions |
 | `POST` | `/projects/{project_id}/devlog` | Append a user-written line to DEVLOG.md via the devlog anchor |
+| `GET` | `/projects/{project_id}/document-review` | b67ec6b5 — non-mutating DOCX review for the dashboard review panel |
 | `GET` | `/projects/{project_id}/document-structure` | 3f596f81 — heading-tree structure of an ingested .docx for the Documents |
 | `POST` | `/projects/{project_id}/documents/upload` | f1c7e7d1 — tunnel-free document upload (plain .txt/.md only, v1) |
 | `POST` | `/projects/{project_id}/events` | Normalize a framework event into Meridian's task_log |
@@ -1162,6 +1170,7 @@ No auth required.
 | `GET` | `/tunnel/filesystem-roots` | Return the directories the tunnel's filesystem connector may read |
 | `POST` | `/tunnel/filesystem-roots` | live-fs-roots — add a served filesystem root and push it live |
 | `GET` | `/tunnel/manifest` | Read-only tools/list manifest snapshot for this tenant (49d8244d) |
+| `POST` | `/tunnel/openai/diagnostics/{tenant_id}` | Compose OpenAI Secure MCP Tunnel adapter diagnostics for *tenant_id*, |
 | `GET` | `/tunnel/plugins` | Return the current tenant's resolved tunnel plugins + raw override config |
 | `PUT` | `/tunnel/plugins` | Persist the tenant's tunnel plugin overrides (Settings → Tunnel Plugins) |
 | `GET` | `/tunnel/plugins/check` | Check whether a plugin binary is available on the server's PATH |
