@@ -638,6 +638,127 @@ def insert_figure_block(
 
 
 @mcp.tool()
+def insert_media_part(
+    docx_path: str,
+    image_path: str,
+    anchor_para_id: str | None = None,
+    position: str = "after",
+    width_inches: float | None = None,
+    height_inches: float | None = None,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """d371b00b -- safe insertion of a brand-new image/media package member.
+
+    Lower-level, caption-less sibling of insert_figure_block (pair with
+    insert_caption / insert_figure_block for a captioned figure, same
+    two-step composition insert_image already documents). Adds beyond
+    insert_image: collision-free relationship id + media part name
+    generation that is explicitly RE-VERIFIED (not just trusted) before use;
+    matching [Content_Types].xml Default/Override entries (a Default is
+    reused when it already declares the right content type, added when the
+    extension is new to the package, or a part-specific Override is added
+    instead of mutating a pre-existing, disagreeing Default other parts may
+    rely on); the same drawing/frame-extent construction insert_figure_block
+    uses; and an explicit post-write relationship<->media BIJECTION check
+    (the new relationship id and new media part must be a clean 1:1 pairing)
+    before the write is ever reported as successful.
+
+    Routed through the same transactional backup/CAS-safe write envelope,
+    _docx_promotion_lock discipline, and tri-state real-render canary as
+    insert_figure_block. allow_degraded_render/degraded_render_reason: same
+    audited opt-in contract as insert_figure_block's own.
+
+    Anchor resolution, supported image formats, and dimension inference all
+    match insert_image.
+
+    Returns {status, image_para_id, image_name, relationship_id,
+    content_type_action, width_emu, height_emu, docx_path, render_status,
+    render_verified, ...}, or {error: message} without mutating the document
+    on validation failure, structural/bijection verification failure, or a
+    render-verification failure that could not be cleanly restored.
+
+    session_id: 273df573 — identifies the calling Meridian session to the
+      tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+      meridian/routes/tunnel.py). Not forwarded to docs_intel; has no effect
+      when this tool is invoked outside Meridian's tunnel (e.g. standalone
+      `uvx meridian-docs`).
+    """
+    return docs_intel.insert_docx_media_part(
+        docx_path=docx_path,
+        image_path=image_path,
+        anchor_para_id=anchor_para_id,
+        position=position,
+        width_inches=width_inches,
+        height_inches=height_inches,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
+def remove_package_part(
+    docx_path: str,
+    part_name: str,
+    dry_run: bool = True,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """d371b00b -- reference-counted, dry-run-capable removal of an
+    unreferenced word/media/* package part and its relationship(s).
+
+    part_name (e.g. "word/media/image3.png") must name a word/media/* ZIP
+    member — removal of any other package part is refused outright; this
+    tool's scope is deliberately narrow, not arbitrary-part removal.
+
+    Every relationship in word/_rels/document.xml.rels that targets
+    part_name is found, then word/document.xml is scanned for any attribute
+    referencing one of those relationship ids — a real reference count, not
+    a heuristic restricted to just inline images. A part with a NONZERO
+    reference count is REFUSED (a real error, status="refused_still_
+    referenced", never a silent skip) whether dry_run is True or False.
+
+    dry_run=True (the default — fail-safe): for a genuinely zero-reference
+    part, reports exactly what WOULD be removed (relationship ids, and which
+    [Content_Types].xml Default/Override entries would be cleaned up)
+    WITHOUT touching the zip.
+
+    dry_run=False: performs the removal for real through the same
+    transactional backup/CAS-safe write envelope, _docx_promotion_lock
+    discipline, and tri-state real-render canary insert_figure_block uses.
+    allow_degraded_render/degraded_render_reason: same audited opt-in
+    contract as insert_figure_block's own.
+
+    Returns, on success: {status: "dry_run"|"removed", part_name,
+    relationship_ids / relationship_ids_removed,
+    content_type_overrides_removed, content_type_defaults_removed,
+    reference_count: 0, docx_path, ...render fields on a real removal...}.
+    On refusal: {error, status: "refused_still_referenced", reference_count,
+    part_name, referencing_relationship_ids}. On any other failure: {error}
+    without mutating the document.
+
+    session_id: 273df573 — identifies the calling Meridian session to the
+      tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+      meridian/routes/tunnel.py). Not forwarded to docs_intel; has no effect
+      when this tool is invoked outside Meridian's tunnel (e.g. standalone
+      `uvx meridian-docs`).
+    """
+    return docs_intel.remove_docx_package_part(
+        docx_path=docx_path,
+        part_name=part_name,
+        dry_run=dry_run,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
 def find_image_paragraph(
     docx_path: str,
     figure_index: int | None = None,
