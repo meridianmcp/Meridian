@@ -7890,10 +7890,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_vector_index_state",
         "_migrate_pg_pixi_env_roots",
         "_migrate_pg_executor_reports",
+        "_migrate_pg_wave_run_summaries",
+        "_migrate_pg_decision_evidence",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 144
+    assert len(allnames) == len(set(allnames)) == 145
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
