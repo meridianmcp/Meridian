@@ -40,6 +40,7 @@ from . import db as db_module
 from . import docx_integrity_gate as docx_integrity_gate_module
 from . import executor_contract as executor_contract_module
 from . import pointers as pointers_module
+from . import test_run_receipt as test_run_receipt_module
 from . import tool_discovery as tool_discovery_module
 from . import tool_requirements as tool_requirements_module
 from .db.sprint_items import (
@@ -7443,6 +7444,32 @@ class HandoffContinuationRequired(ValueError):
         )
 
 
+class HandoffTestEvidenceRequired(ValueError):
+    """Raised by generate_handoff when ``strict_test_evidence=True`` and the
+    current local test-run receipt (:mod:`meridian.test_run_receipt`) does
+    not classify as ``passed`` — e24f2daa.
+
+    Mirrors :class:`HandoffContinuationRequired`'s opt-in, fail-closed
+    contract exactly: never engages for a caller that didn't pass
+    ``strict_test_evidence=True``, and when it does engage, NOTHING is
+    rendered, written to disk, or persisted for this call. A missing record,
+    a non-terminal run, a crash/timeout/cancellation, or a self-reported
+    "passed" state whose evidence doesn't independently hold up (see
+    ``test_run_receipt.classify_test_run_record``) all refuse the handoff
+    identically — the point is a caller can never walk away with a handoff
+    claiming "tests passed" on the strength of an empty, ambiguous, or
+    stale receipt.
+    """
+
+    def __init__(self, evidence: dict[str, Any]):
+        self.evidence = evidence
+        super().__init__(
+            "generate_handoff refused (strict_test_evidence=True): latest "
+            f"test-run receipt classifies as {evidence.get('classification')!r} "
+            f"({evidence.get('reason')})"
+        )
+
+
 class HandoffStaleReferenceError(ValueError):
     """Raised by generate_handoff BEFORE any mode (starter/compact, goal,
     full, delta) renders, persists, or mints a goal_token, when the live
@@ -7915,6 +7942,9 @@ async def generate_handoff(
     continuation_status: dict[str, Any] | None = None,
     selected_item_ids: list[str] | None = None,
     promotion_readiness: dict[str, Any] | None = None,
+    strict_test_evidence: bool = False,
+    test_run_evidence: dict[str, Any] | None = None,
+    test_run_repo_root: "str | None" = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -8116,6 +8146,37 @@ async def generate_handoff(
     regardless of ``strict_continuation``/``checkpoint``, so a caller can
     always read the machine-readable continuation/terminal-ready state
     without opting into the hard refusal.
+
+    ``test_run_evidence`` (e24f2daa) — optional output dict, populated in
+    place (same purely-additive shape as ``evidence_status``/
+    ``continuation_status`` above) with
+    ``test_run_receipt.get_test_run_evidence``'s result for the checkout
+    this handoff is being generated for: ``classification`` (one of
+    ``passed``/``failed``/``infra_crash``/``timeout``/``cancelled``/
+    ``missing_or_ambiguous``), ``run_id``, ``state``, ``exit_code``,
+    ``signal``, ``phase``, ``last_progress_at``, ``timeout_kind``,
+    ``cleanup_status``, and ``duplicate_active_run`` (non-``None`` when
+    another test run currently owns this checkout's lock). Computed
+    whenever EITHER ``test_run_evidence`` is not ``None`` OR
+    ``strict_test_evidence=True``; a caller that passes neither sees zero
+    functional change (no receipt lookup even attempted).
+
+    ``strict_test_evidence`` (e24f2daa) — optional, ``False`` by default,
+    mirrors ``strict_continuation``'s opt-in/fail-closed shape and placement
+    (computed at the exact same point, before anything below is rendered or
+    persisted). When ``True`` and the resolved evidence's ``classification``
+    is not ``"passed"``, raises ``HandoffTestEvidenceRequired`` — a missing
+    receipt, a non-terminal run, a crash/timeout/cancellation, or a
+    self-reported "passed" state whose evidence doesn't independently hold
+    up (see ``test_run_receipt.classify_test_run_record``) all refuse the
+    handoff identically. A caller that never opts in is completely
+    unaffected.
+
+    ``test_run_repo_root`` (e24f2daa) — optional explicit checkout path used
+    to locate the test-run receipt in place of the default resolution
+    (``session_id``'s own registered worktree when resolvable, else the
+    server's main checkout — see
+    ``test_run_receipt.resolve_repo_root_for_session``).
 
     ``selected_item_ids`` (cffb9323) — optional explicit INCLUDE-ONLY item
     scope, ``None`` by default (every pre-existing call site is completely
@@ -8709,6 +8770,34 @@ async def generate_handoff(
         continuation_status.update(_continuation_state)
     if strict_continuation and not checkpoint and _continuation_state["continuation_required"]:
         raise HandoffContinuationRequired(_continuation_state)
+    # e24f2daa — fail-closed test-run-receipt gate. Same placement/contract as
+    # strict_continuation directly above: computed here, before anything
+    # below has rendered or persisted, so a strict_test_evidence=True refusal
+    # never leaves a half-written handoff behind. Only attempts the receipt
+    # lookup at all when a caller actually asked for it (test_run_evidence
+    # out-param supplied, or strict_test_evidence=True) — otherwise this is a
+    # complete no-op, zero functional change.
+    if test_run_evidence is not None or strict_test_evidence:
+        try:
+            _test_repo_root = await test_run_receipt_module.resolve_repo_root_for_session(
+                db, test_run_repo_root, session_id,
+            )
+            _test_run_evidence_result = test_run_receipt_module.get_test_run_evidence(
+                _test_repo_root
+            )
+        except Exception as _tr_exc:  # noqa: BLE001 — evidence surfacing must never crash a handoff
+            _test_run_evidence_result = {
+                "classification": test_run_receipt_module.CLASS_MISSING_OR_AMBIGUOUS,
+                "reason": f"test-run receipt lookup failed: {_tr_exc}",
+            }
+        if test_run_evidence is not None:
+            test_run_evidence.clear()
+            test_run_evidence.update(_test_run_evidence_result)
+        if strict_test_evidence and (
+            _test_run_evidence_result.get("classification")
+            != test_run_receipt_module.CLASS_PASSED
+        ):
+            raise HandoffTestEvidenceRequired(_test_run_evidence_result)
     # d5849a67 — batch-resolve durable pointer evidence for the pending batch so
     # the excluded_unprospected list below uses the SAME evidence signal
     # claim_sprint_item checks per-item (sprint_item_pointers rows), not the
