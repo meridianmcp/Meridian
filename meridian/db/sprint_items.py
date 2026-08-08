@@ -7027,3 +7027,170 @@ async def evaluate_board_blockers(
     )
     decision["policy_source"] = policy_row.get("source")
     return decision
+
+
+# ---------------------------------------------------------------------------
+# 0d95003f — explicit, audited cross-project sprint-item reclassification +
+# a read-only dependency-mismatch audit scanner.
+#
+# The item's full ask spans sessions, tasks, notes, proposals, proposal
+# evidence, pointers, handoff bodies/pending goals, generated files, Redis
+# keys, and index shards. This section covers SPRINT ITEMS specifically —
+# the record type most directly tied to executor handoffs and completion
+# ("quarantine ambiguous or foreign records so they cannot enter an executor
+# handoff or be marked complete"). The other record types are explicit,
+# documented follow-up, not attempted here.
+#
+# Mirrors two already-proven patterns in this codebase rather than inventing
+# new ones: move_workspace_note_to_project's verify-then-write shape (this
+# module's sibling in workspace.py) for the move itself, and
+# set_project_blocker_policy's lazy-imported record_action_audit_event call
+# (same file, above) for the audit trail.
+# ---------------------------------------------------------------------------
+
+CROSS_PROJECT_MOVE_EVENT_TYPE = "sprint_item_cross_project_move"
+
+
+async def move_sprint_item_to_project(
+    db: aiosqlite.Connection,
+    item_id: str,
+    source_project_id: str,
+    destination_project_id: str,
+    *,
+    actor: "str | None",
+    reason: "str | None",
+) -> dict[str, Any]:
+    """Explicit, audited, idempotent reclassification of ONE sprint item from
+    ``source_project_id`` to ``destination_project_id`` (0d95003f).
+
+    Never infers a destination from title/path — both project ids are
+    caller-supplied and both are verified against real rows before anything
+    is written. Returns a structured result, never raises for an expected
+    condition::
+
+        {"moved": bool, "item": dict | None, "error": str | None}
+
+    Failure modes (all ``moved=False``, ``item=None``):
+
+    * empty ``reason``/``actor`` — mirrors every other audited-override
+      pattern in this codebase (code_intel_receipt, tool_discovery): an
+      unattributed, unexplained move is refused.
+    * ``"item not found"`` — no such sprint item.
+    * item's actual ``project_id`` does not match the supplied
+      ``source_project_id`` — refusing here (rather than moving anyway)
+      prevents a stale-caller-state race from silently reassigning the
+      wrong item.
+    * ``"destination project not found"`` — never creates a destination.
+
+    Idempotent: if the item is ALREADY on ``destination_project_id``, returns
+    ``{"moved": False, "item": <the item, unchanged>, "error": None}`` — a
+    repeat call is a safe no-op, not an error.
+
+    Audit: on an actual move, records a ``sprint_item_cross_project_move``
+    action_audit_log event with item_id/source/destination/actor/reason —
+    best-effort (a dropped audit row must never undo an otherwise-successful,
+    already-committed move; mirrors set_project_blocker_policy's identical
+    guard above).
+
+    Scope: moves the sprint_items row itself only. A ``depends_on`` pointing
+    at an item that stays behind in the source project becomes a genuine
+    cross-project dependency — surfaced by
+    :func:`find_cross_project_dependency_mismatches`, not silently repaired
+    here (auto-repairing a dependency graph risks reordering work the human
+    never asked to reorder; that is deliberately a human/audited decision,
+    not an automatic side effect of a move).
+    """
+    _reason = (reason or "").strip()
+    if not _reason:
+        return {"moved": False, "item": None, "error": "reason is required and must be non-empty."}
+    _actor = (actor or "").strip()
+    if not _actor:
+        return {"moved": False, "item": None, "error": "actor is required and must be non-empty."}
+
+    item = await get_sprint_item(db, item_id)
+    if item is None:
+        return {"moved": False, "item": None, "error": "item not found"}
+    if item.get("project_id") != source_project_id:
+        return {
+            "moved": False, "item": None,
+            "error": (
+                f"item's actual project_id ({item.get('project_id')!r}) does not match "
+                f"the supplied source_project_id ({source_project_id!r}) — refusing to "
+                "move based on stale/incorrect caller state."
+            ),
+        }
+    if item.get("project_id") == destination_project_id:
+        return {"moved": False, "item": item, "error": None}
+    if await get_project(db, destination_project_id) is None:
+        return {"moved": False, "item": None, "error": "destination project not found"}
+
+    await db.execute(
+        "UPDATE sprint_items SET project_id = ? WHERE id = ?",
+        (destination_project_id, item_id),
+    )
+    await db.commit()
+    moved_item = await get_sprint_item(db, item_id)
+
+    try:
+        # Lazy import: same circularity reason as set_project_blocker_policy's
+        # identical pattern above (workspace.py imports names FROM this module).
+        from . import workspace as _workspace_module  # noqa: PLC0415
+
+        await _workspace_module.record_action_audit_event(
+            db, CROSS_PROJECT_MOVE_EVENT_TYPE,
+            project_id=destination_project_id,
+            actor=_actor,
+            detail=json.dumps({
+                "item_id": item_id,
+                "source_project_id": source_project_id,
+                "destination_project_id": destination_project_id,
+                "reason": _reason,
+            }),
+        )
+    except Exception:  # noqa: BLE001 — a dropped audit entry must never undo the move
+        pass
+
+    return {"moved": True, "item": moved_item, "error": None}
+
+
+async def find_cross_project_dependency_mismatches(
+    db: aiosqlite.Connection, project_id: str,
+) -> list[dict[str, Any]]:
+    """Read-only, non-destructive audit (0d95003f): sprint items in
+    ``project_id`` whose ``depends_on`` points at an item belonging to a
+    DIFFERENT project. Never mutates anything.
+
+    A cross-project dependency is a genuine structural mismatch: the
+    dependent item's own wave/claim ordering assumes the depended-on item's
+    lifecycle is visible in the SAME project's board, which it is not once
+    the two diverge. Returns one entry per mismatch::
+
+        {"item_id", "item_project_id", "depends_on_id", "depends_on_project_id"}
+
+    An empty list means no mismatches found — not "not checked"; the scan
+    always covers every item currently in ``project_id`` with a non-null
+    ``depends_on``.
+    """
+    mismatches: list[dict[str, Any]] = []
+    async with db.execute(
+        "SELECT id, depends_on FROM sprint_items WHERE project_id = ? AND depends_on IS NOT NULL",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    for row in rows:
+        row_d = _row_to_dict(row)
+        dep_id = row_d.get("depends_on")
+        if not dep_id:
+            continue
+        dep_item = await get_sprint_item(db, dep_id)
+        if dep_item is None:
+            continue  # dangling depends_on is a different, pre-existing concern
+        dep_project_id = dep_item.get("project_id")
+        if dep_project_id != project_id:
+            mismatches.append({
+                "item_id": row_d.get("id"),
+                "item_project_id": project_id,
+                "depends_on_id": dep_id,
+                "depends_on_project_id": dep_project_id,
+            })
+    return mismatches
