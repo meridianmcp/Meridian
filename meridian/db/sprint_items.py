@@ -7261,3 +7261,52 @@ async def find_cross_project_dependency_mismatches(
                 "depends_on_project_id": dep_project_id,
             })
     return mismatches
+
+
+async def audit_and_quarantine_sprint_item_dependency_mismatches(
+    db: aiosqlite.Connection, project_id: str, *, actor: str,
+) -> dict[str, Any]:
+    """Run find_cross_project_dependency_mismatches and flag each mismatch
+    found via the generic cross-project quarantine mechanism in
+    meridian/db/workspace.py (0d95003f).
+
+    The ONLY mutation this performs is an audited quarantine event per
+    mismatch — it never moves, deletes, or otherwise repairs anything
+    (repairing the dependency graph is deliberately left a human/audited
+    decision, same reasoning find_cross_project_dependency_mismatches'
+    docstring already gives for not auto-repairing). Safe to call
+    repeatedly: quarantine_cross_project_record is idempotent, so re-running
+    this against an unchanged board produces the same open entries rather
+    than duplicating them.
+
+    Returns::
+
+        {"mismatches": [...], "quarantined": [...]}
+
+    ``mismatches`` is find_cross_project_dependency_mismatches' full,
+    unfiltered result for this run. ``quarantined`` holds only the entries
+    NEWLY flagged this call (an already-open entry from a prior run is
+    still present in ``mismatches`` but omitted from ``quarantined``, since
+    nothing changed for it).
+    """
+    from . import workspace as _workspace_module  # noqa: PLC0415
+
+    mismatches = await find_cross_project_dependency_mismatches(db, project_id)
+    quarantined: list[dict[str, Any]] = []
+    for mismatch in mismatches:
+        result = await _workspace_module.quarantine_cross_project_record(
+            db,
+            "sprint_item",
+            mismatch["item_id"],
+            mismatch["item_project_id"],
+            reason=(
+                f"depends_on {mismatch['depends_on_id']} which belongs to "
+                f"project {mismatch['depends_on_project_id']}, not this "
+                f"item's own project {mismatch['item_project_id']}."
+            ),
+            actor=actor,
+            suspected_project_id=mismatch["depends_on_project_id"],
+        )
+        if result.get("quarantined"):
+            quarantined.append(result["entry"])
+    return {"mismatches": mismatches, "quarantined": quarantined}

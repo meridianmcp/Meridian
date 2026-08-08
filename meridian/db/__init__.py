@@ -12090,6 +12090,7 @@ from .sprint_items import (  # noqa: F401
     add_subtask,
     analyze_sprint,
     assign_sprint_waves,
+    audit_and_quarantine_sprint_item_dependency_mismatches,
     build_github_completion_comment,
     build_sprint_items_xml,
     claim_parallel_batch,
@@ -12395,6 +12396,15 @@ from .workspace import (  # noqa: F401
     set_manual_issue_screening_enabled,
     record_action_audit_event,
     get_action_audit_log,
+    # 0d95003f — generic cross-project quarantine mechanism
+    CROSS_PROJECT_QUARANTINE_EVENT_TYPE,
+    CROSS_PROJECT_QUARANTINE_RESOLVED_EVENT_TYPE,
+    _VALID_QUARANTINE_RESOLUTIONS,
+    quarantine_cross_project_record,
+    resolve_cross_project_quarantine,
+    get_cross_project_quarantine_status,
+    is_cross_project_quarantined,
+    list_quarantined_cross_project_records,
     # Public workspace-member / invite functions
     create_workspace_invite,
     get_workspace_invite_by_token_hash,
