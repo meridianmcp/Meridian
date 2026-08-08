@@ -12572,9 +12572,13 @@ from .decision_evidence import (  # noqa: F401
 # everything above), a single-table, no-state-machine shape mirroring the
 # decision_evidence import immediately above. Nothing in this codebase calls
 # append_event yet — no capture/ingestion pipeline is wired to this table.
+# ea972129 additionally adds AiLogStore + purge_events_before (retention) —
+# see meridian.db.ai_log's module docstring's "ea972129 ... RETENTION" note.
 from .ai_log import (  # noqa: F401
+    AiLogStore,
     _migrate_ai_log_events_table,
     append_event,
     get_event,
     list_events,
+    purge_events_before,
 )
