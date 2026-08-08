@@ -12532,6 +12532,8 @@ from .executor_reports import (  # noqa: F401
     list_executor_reports,
     update_executor_report_status,
     mark_executor_report_accepted,
+)
+
 # 9149e132 — typed, code-linked decision evidence + deterministic planning
 # retrieval. Imported last (after everything above) — a single-table,
 # no-state-machine shape, mirroring the vector_index_state import above.
