@@ -367,6 +367,17 @@ class TestRunLock:
                 self.path.unlink()
             except FileNotFoundError:
                 pass
+            except OSError as exc:
+                # A transient unlink failure (e.g. Windows
+                # ERROR_SHARING_VIOLATION / PermissionError from an
+                # antivirus scan or another process briefly holding the
+                # lock file open) must not crash acquisition outright --
+                # fall through to the retry below the same way a clean
+                # FileNotFoundError does. Worst case the retry's O_EXCL
+                # open fails again and this recurses a bounded number of
+                # times rather than raising an unhandled exception before
+                # any test has even run.
+                print(f"warning: could not remove stale test-run lock {self.path}: {exc}", file=sys.stderr)
             return self.acquire()
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(f"{os.getpid()}\t{time.time()}\t{Path.cwd()}\n")
@@ -393,12 +404,31 @@ class TestRunLock:
         return self.acquire()
 
     def release(self) -> None:
+        """Release this run's lock file.
+
+        9e7b01cd -- must never raise. This is called from ``main()``'s
+        cleanup ``finally`` block AFTER a truthful pass/fail/crashed exit
+        code has already been computed by ``_run_pytest_observed``. A
+        ``finally`` block that raises DISCARDS the ``try`` block's own
+        ``return`` value and propagates the new exception instead (plain
+        Python semantics) -- so an unlink failure here (e.g. Windows
+        ERROR_SHARING_VIOLATION / PermissionError from an antivirus scan or
+        another process briefly holding the lock file open, or any other
+        OSError) would silently replace a correct "N passed" / "N failed"
+        result with an unrelated crash and the wrong exit code. That is
+        exactly the "lost final exit code" failure mode this item exists to
+        close. Swallow (with a logged warning) rather than raise; the lock
+        also auto-expires via ``_pid_is_running``-based stale reclaim on the
+        next run even if this leaves the file behind.
+        """
         if not self.acquired:
             return
         try:
             self.path.unlink()
         except FileNotFoundError:
             pass
+        except OSError as exc:
+            print(f"warning: could not remove test-run lock {self.path}: {exc}", file=sys.stderr)
         self.acquired = False
 
 
@@ -1293,9 +1323,23 @@ def main(argv: list[str] | None = None) -> int:
             post_results_grace=post_results_grace, max_workers=max_workers,
         )
     finally:
-        tracker.save()
+        # 9e7b01cd -- truthful exit-code propagation: a Python `finally`
+        # block that raises discards whatever the `try` block above already
+        # `return`-ed and propagates the new exception instead. tracker.save()
+        # and lock.release() are best-effort observability/cleanup, never
+        # load-bearing for the already-computed result -- each is individually
+        # guarded so neither can ever clobber a truthful pass/fail/crashed
+        # exit code with an unrelated cleanup crash (see TestRunLock.release's
+        # own docstring for the concrete Windows scenario this closes).
+        try:
+            tracker.save()
+        except Exception as exc:  # noqa: BLE001 -- must never mask the real result
+            print(f"warning: failed to persist final test-run record: {exc}", file=sys.stderr)
         if lock_owned_by_us:
-            lock.release()
+            try:
+                lock.release()
+            except Exception as exc:  # noqa: BLE001 -- must never mask the real result
+                print(f"warning: failed to release test-run lock: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
