@@ -1135,6 +1135,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_executor_reports_table(db)
     await _migrate_wave_run_summaries(db)
     await _migrate_decision_evidence(db)
+    await _migrate_ai_log_events_table(db)
     return db
 
 
@@ -12553,4 +12554,17 @@ from .decision_evidence import (  # noqa: F401
     list_decision_evidence,
     supersede_decision_evidence,
     reverse_decision_evidence,
+)
+
+# 9e83be4a (Round 1 proposal e143949d) — canonical, versioned, append-only
+# ExecutionEvent storage scaffold (meridian.db.ai_log). Schema/contract only
+# — see meridian.ai_log's module docstring for scope. Imported last (after
+# everything above), a single-table, no-state-machine shape mirroring the
+# decision_evidence import immediately above. Nothing in this codebase calls
+# append_event yet — no capture/ingestion pipeline is wired to this table.
+from .ai_log import (  # noqa: F401
+    _migrate_ai_log_events_table,
+    append_event,
+    get_event,
+    list_events,
 )

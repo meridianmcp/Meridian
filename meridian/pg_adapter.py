@@ -3139,6 +3139,60 @@ async def _migrate_pg_decision_evidence(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_ai_log_events(conn: PostgresConnection) -> None:
+    """9e83be4a (Round 1 proposal e143949d) — ai_log_events: canonical,
+    versioned, append-only ExecutionEvent storage (mirrors
+    db.ai_log._migrate_ai_log_events_table — see meridian.ai_log's module
+    docstring for the full envelope/versioning rationale).
+
+    Schema/contract scaffold only — nothing in this codebase calls
+    append_event yet (no capture/ingestion pipeline wired to this table).
+    ``recorded_at`` defaults via ``_TS`` (clock_timestamp()-based), not
+    ``now()`` — this repo's now()-vs-clock_timestamp() note (AGENTS.md /
+    project memory) applies to any multi-row-per-transaction insert
+    sequence, and this table is written one row per append_event call, so
+    using the already-fixed ``_TS`` expression here is simply staying
+    consistent with the newer tables (executor_reports, wave_run_summaries)
+    rather than the older ``now()``-based ones.
+
+    CREATE TABLE / INDEX IF NOT EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS ai_log_events ("
+        "    id TEXT PRIMARY KEY,"
+        "    schema_version INTEGER NOT NULL,"
+        "    event_type TEXT NOT NULL,"
+        "    project_id TEXT NOT NULL,"
+        "    session_id TEXT,"
+        "    tenant_id TEXT,"
+        "    actor_kind TEXT NOT NULL,"
+        "    actor_id TEXT,"
+        "    correlation_id TEXT,"
+        "    parent_event_id TEXT,"
+        "    source TEXT,"
+        "    payload TEXT NOT NULL DEFAULT '{}',"
+        "    payload_schema TEXT,"
+        "    occurred_at TEXT NOT NULL,"
+        "    idempotency_key TEXT,"
+        "    event_hash TEXT,"
+        f"    recorded_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_ai_log_events_project "
+        "ON ai_log_events(project_id, recorded_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_ai_log_events_session "
+        "ON ai_log_events(session_id, recorded_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_ai_log_events_type "
+        "ON ai_log_events(project_id, event_type, recorded_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_ai_log_events_correlation "
+        "ON ai_log_events(correlation_id);"
+        "CREATE INDEX IF NOT EXISTS idx_ai_log_events_parent "
+        "ON ai_log_events(parent_event_id);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_log_events_idempotency "
+        "ON ai_log_events(project_id, idempotency_key) "
+        "WHERE idempotency_key IS NOT NULL;"
+    )
+
+
 async def _migrate_pg_session_goal_compliance(conn: PostgresConnection) -> None:
     """5abf3e12 — sessions.goal_compliance: stored per-session goal-compliance
     metric (JSON: listed N vs completed M vs fully_completed).
@@ -4421,4 +4475,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_executor_reports,
     _migrate_pg_wave_run_summaries,
     _migrate_pg_decision_evidence,
+    _migrate_pg_ai_log_events,
 )
