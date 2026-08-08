@@ -3383,9 +3383,23 @@ async def test_start_session_unknown_project_name_clean_error(db):
 
 
 def test_stdio_start_session_resolves_project_name_in_source():
-    """stdio parity (ce3693e4): the stdio call_tool start_session branch must
-    resolve project_name and NOT index arguments['project_id'] directly (which
-    raised KeyError). Parsed from source so the test sees the real dispatch."""
+    """stdio parity (ce3693e4, superseded by 325276f8): the stdio call_tool
+    start_session branch must never index arguments['project_id'] directly
+    (which raised a bare KeyError) and must resolve project_name to a real
+    project_id somewhere in its reachable call graph.
+
+    325276f8 replaced the branch's own hand-duplicated project_name
+    resolution with a delegation to ``_dispatch_mcp_tool`` (the same
+    function the HTTP/streamable-HTTP transport uses for start_session and
+    ~30 other tools) — see the module docstring of
+    tests/test_325276f8_start_session_schema_parity.py for the full
+    rationale. The resolution logic itself didn't disappear, it moved:
+    _dispatch_mcp_tool's own central project_name resolver (meridian/mcp/
+    handler.py) runs first, and handle_start_session (meridian/mcp/handlers/
+    project_tools.py) applies the exact same ce3693e4 fallback as a safety
+    net for the case where a non-UUID project_id slips through ungrouped.
+    This test now checks the call graph rather than requiring the
+    resolution call to be textually inlined in the branch."""
     import ast
 
     src = (
@@ -3411,16 +3425,35 @@ def test_stdio_start_session_resolves_project_name_in_source():
             break
     assert found_block is not None, "start_session branch not found in stdio_handler"
 
-    # The whole stdio source must reference get_project_by_name from within the
-    # start_session handling (resolution present) and must never subscript
-    # arguments['project_id'] blind inside that branch.
     seg = src[src.index('name == "start_session"'):]
     # cut at the next elif to bound the branch
     end = seg.find("\n            elif name ==", 5)
     branch_src = seg[:end] if end != -1 else seg[:2000]
-    assert "get_project_by_name" in branch_src, "stdio start_session missing resolver"
     assert 'arguments["project_id"]' not in branch_src, (
         "stdio start_session still indexes arguments['project_id'] blind"
+    )
+    # 325276f8 — the branch now delegates to the shared dispatcher instead of
+    # resolving project_name inline.
+    assert "_dispatch_mcp_tool(" in branch_src, (
+        "stdio start_session no longer routes through _dispatch_mcp_tool — "
+        "if this legitimately changed, confirm project_name resolution is "
+        "still reachable some other way before updating this assertion"
+    )
+
+    # The resolution itself must still exist somewhere reachable from
+    # start_session: either _dispatch_mcp_tool's own central resolver
+    # (meridian/mcp/handler.py) or handle_start_session's ce3693e4 fallback
+    # (meridian/mcp/handlers/project_tools.py).
+    handler_src = (
+        Path(__file__).resolve().parents[1] / "meridian" / "mcp" / "handler.py"
+    ).read_text(encoding="utf-8")
+    project_tools_src = (
+        Path(__file__).resolve().parents[1]
+        / "meridian" / "mcp" / "handlers" / "project_tools.py"
+    ).read_text(encoding="utf-8")
+    assert "get_project_by_name" in handler_src or "get_project_by_name" in project_tools_src, (
+        "project_name -> project_id resolution missing from both "
+        "_dispatch_mcp_tool and handle_start_session"
     )
 
 

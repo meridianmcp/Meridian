@@ -34,7 +34,7 @@ Register a session and get the full project context (goal, sprint, recent tasks,
 | `session_name` | string | optional | Optional (599d0097): omit or leave blank to auto-generate a meaningful name from the first pending sprint item title + a timestamp, instead of inventing a string. |
 | `human_id` | string | optional |  |
 | `client` | string | optional |  |
-| `role` | string | optional | Pass 'executor' to inject executor_config and credentials guidance. |
+| `role` | string | optional | 325276f8 — 'executor' injects executor_config and credentials guidance and narrows active_tool_set to executor-oriented tools; 'planner' narrows active_tool_set to planner-oriented tools (no executor_config injection). Previously this enum only allowed 'executor', which made every connector/client-generated schema reject role='planner' with an enum validation error before the call ever reached the server, even though the server itself (_select_active_tool_set) has always supported both roles. |
 | `compact` | boolean | optional | Default true — slim orientation. Set false for the full goal/instructions payload. |
 | `version` | string | optional | Optional sprint-version bucket (e.g. 'v0.1.x') to scope this session to. Sprint progress/items in the orientation and /goal filter to it. Omit to auto-infer the bucket with the most pending items. |
 | `mode` | string | optional | Pass 'continue' to resume an already-active same-name session WITHOUT re-reading the full L0/L1/L2 orientation: returns just session_id + live pending items + the ready-to-paste /goal string. Auto-detected anyway within a 5-min heartbeat window; 'continue' widens that so a known-yours session resumes cleanly even after a longer gap. |

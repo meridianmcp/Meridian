@@ -1052,6 +1052,7 @@ No auth required.
 | `POST` | `/projects/{project_id}/rewind-token` | v1.3.0 — mint (or return) the project's shareable rewind token |
 | `GET` | `/projects/{project_id}/runs` | List executor_runs for a project, newest first |
 | `GET` | `/projects/{project_id}/runs/{run_id}` | Return a single executor_run with full transcript |
+| `GET` | `/projects/{project_id}/runtime_diagnostics` | 60a96ece — dashboard-visible, opt-in diagnostic snapshot of |
 | `GET` | `/projects/{project_id}/search` | Universal search across tasks, notes, decisions, and sprint items |
 | `GET` | `/projects/{project_id}/session-timeline` | 1e1bd6b0 — per-executor-session timeline: each session's start/end + the |
 | `GET` | `/projects/{project_id}/sessions` | List sessions attached to the project |
