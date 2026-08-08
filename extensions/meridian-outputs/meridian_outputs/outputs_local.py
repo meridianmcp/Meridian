@@ -4704,6 +4704,52 @@ def _cache_key(outputs_dir: str) -> str:
     return _normalize_output_path(outputs_dir) or os.path.abspath(str(outputs_dir))
 
 
+def _on_disk_cache_db_path(outputs_dir: str) -> str:
+    """Path this ``outputs_dir`` WOULD use for its index db, without
+    creating anything. Pure path arithmetic -- see
+    :func:`_resolve_index_db_path` for the create-if-missing counterpart."""
+    return os.path.join(outputs_dir, ".meridian-outputs-cache", "index.duckdb")
+
+
+#: 39bf34d8 -- bound on how many parent directories _find_ancestor_disk_cache
+#: will walk. The reported bug (Outputs vs Outputs/defense_plots) is one
+#: level; this leaves headroom for a couple more without ever walking to a
+#: filesystem root and risking an unrelated project's cache.
+_ANCESTOR_CACHE_SEARCH_MAX_LEVELS = 5
+
+
+def _find_ancestor_disk_cache(outputs_dir: str) -> "str | None":
+    """39bf34d8 -- best-effort ON-DISK lookup of the nearest ANCESTOR
+    directory that already has a real ``.meridian-outputs-cache/index.duckdb``
+    file, walking up from ``outputs_dir`` (bounded by
+    :data:`_ANCESTOR_CACHE_SEARCH_MAX_LEVELS`). Returns ``None`` if
+    ``outputs_dir`` itself already has its own on-disk cache (nothing to
+    redirect to), or if no ancestor within the bound has one.
+
+    This is the disk-aware counterpart of :func:`_find_ancestor_cached_index`
+    (which only sees indexes already loaded into THIS process's in-memory
+    ``_index_cache``) -- root-caused fix for the confirmed bug where
+    ``get_provenance_status``/``register_output_paths``/etc. called with an
+    outer (parent) ``outputs_dir`` and with an inner (child) ``outputs_dir``
+    resolved to two entirely separate on-disk databases for the SAME real
+    files, so a path registered under one reported "exact" provenance and
+    "unknown" under the other. Two directories on the SAME path chain
+    should never silently diverge into unrelated index roots.
+    """
+    start = os.path.normpath(os.path.abspath(str(outputs_dir)))
+    if os.path.isfile(_on_disk_cache_db_path(start)):
+        return None  # outputs_dir already has its own real cache -- keep it
+    current = start
+    for _ in range(_ANCESTOR_CACHE_SEARCH_MAX_LEVELS):
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            return None  # reached a filesystem root
+        if os.path.isfile(_on_disk_cache_db_path(parent)):
+            return parent
+        current = parent
+    return None
+
+
 def _resolve_index_db_path(outputs_dir: str) -> str:
     """Return the on-disk DuckDB path for ``outputs_dir``'s index cache.
 
@@ -4731,7 +4777,15 @@ def _resolve_index_db_path(outputs_dir: str) -> str:
 def _get_cached_index(
     outputs_dir: str, *, session_id: str | None = None,
 ) -> OutputsFtsIndex:
-    """Look up (or create) the cached OutputsFtsIndex for a directory.
+    """Look up (or create) the cached OutputsFtsIndex for a directory,
+    scoped EXACTLY to ``outputs_dir`` -- no ancestor redirection. This is
+    the primitive :func:`get_subtree_index` (and therefore ``search_outputs``
+    /``get_convergence_state``) builds its own, narrower subtree-scoping
+    contract on top of; redirecting here too would make a "subtree" query
+    silently return the whole ancestor's unscoped index instead (see
+    :func:`_get_cached_index_for_lookup` for the ancestor-aware sibling used
+    by the point-lookup/registration functions below, which have no such
+    scoping contract to preserve).
 
     ``session_id`` (a52216e2, optional): attributed to the index's write-lock
     lease for diagnostics (see ``lock_diagnostics()``/``read_index_lock_
@@ -4753,6 +4807,34 @@ def _get_cached_index(
             _, evicted = _index_cache.popitem(last=False)
             evicted.close()
         return idx
+
+
+def _get_cached_index_for_lookup(
+    outputs_dir: str, *, session_id: str | None = None,
+) -> OutputsFtsIndex:
+    """39bf34d8 -- ancestor-aware sibling of :func:`_get_cached_index`, used
+    ONLY by the point-lookup/registration functions below (``get_indexed_
+    output``, ``get_indexed_output_status``, ``get_path_annotations``,
+    ``register_output_paths``, ``register_priority_path``) -- never by
+    ``search_outputs``/``get_convergence_state``/``get_subtree_index``, which
+    have their own subtree-scoping contract this would silently break (a
+    "subtree" query returning the whole ancestor's unscoped rows).
+
+    Before creating a brand-new index for ``outputs_dir``, checks whether an
+    ANCESTOR directory already has a real on-disk index (see
+    :func:`_find_ancestor_disk_cache`). When one exists, this call is
+    transparently redirected to that ancestor's already-cached index instead
+    of creating an independent, empty one -- so a path registered under a
+    parent directory and later queried under a child subdirectory (or vice
+    versa) consistently resolves against the SAME index rather than
+    silently diverging into two unrelated databases. Only engages when
+    ``outputs_dir`` has no established index of its own; an outputs_dir that
+    already has its own real on-disk cache is never redirected away from it.
+    """
+    ancestor = _find_ancestor_disk_cache(outputs_dir)
+    if ancestor is not None:
+        outputs_dir = ancestor
+    return _get_cached_index(outputs_dir, session_id=session_id)
 
 
 def get_convergence_state(
@@ -4795,7 +4877,7 @@ def register_priority_path(outputs_dir: str, path: str) -> dict[str, Any]:
         return {"registered": False, "reason": "outputs_dir does not exist"}
     if not path or not str(path).strip():
         return {"registered": False, "reason": "path is required"}
-    index = _get_cached_index(outputs_dir)
+    index = _get_cached_index_for_lookup(outputs_dir)
     result = index.register_priority_path(path)
     result["registered"] = True
     return result
@@ -4835,7 +4917,7 @@ def register_output_paths(outputs_dir: str, paths: list[str]) -> dict[str, Any]:
         return {"registered": False, "reason": "outputs_dir does not exist"}
     if not paths:
         return {"registered": False, "reason": "paths is required"}
-    index = _get_cached_index(outputs_dir)
+    index = _get_cached_index_for_lookup(outputs_dir)
     for p in paths:
         if p and str(p).strip():
             index._priority_registered.add(os.path.normpath(p))
@@ -5230,7 +5312,7 @@ def annotate_outputs(
         return {"error": "path is required"}
     if not note or not str(note).strip():
         return {"error": "note is required"}
-    index = _get_cached_index(outputs_dir)
+    index = _get_cached_index_for_lookup(outputs_dir)
     return index.add_annotation(path, note, run_params=run_params, source="tool")
 
 
@@ -5270,7 +5352,7 @@ def resolve_figure_output(
         return None
     if not os.path.isdir(outputs_dir):
         return None
-    index = _get_cached_index(outputs_dir)
+    index = _get_cached_index_for_lookup(outputs_dir)
     index.rebuild()
     return index.resolve_output(file_path)
 
@@ -5302,7 +5384,7 @@ def get_indexed_output(outputs_dir: str, file_path: str) -> dict[str, Any] | Non
         return None
     if not outputs_dir or not os.path.isdir(outputs_dir):
         return None
-    index = _get_cached_index(outputs_dir)
+    index = _get_cached_index_for_lookup(outputs_dir)
     return index.resolve_output(file_path)
 
 
@@ -5336,7 +5418,7 @@ def get_indexed_output_status(outputs_dir: str, file_path: str) -> dict[str, Any
         return {"row": None, "degraded": True, "convergence": None}
     if not outputs_dir or not os.path.isdir(outputs_dir):
         return {"row": None, "degraded": True, "convergence": None}
-    index = _get_cached_index(outputs_dir)
+    index = _get_cached_index_for_lookup(outputs_dir)
     row = index.resolve_output(file_path)
     convergence = index.get_convergence_state().to_dict()
     return {
@@ -5363,7 +5445,7 @@ def get_path_annotations(outputs_dir: str, path: str) -> list[dict[str, Any]]:
         return []
     if not outputs_dir or not os.path.isdir(outputs_dir):
         return []
-    index = _get_cached_index(outputs_dir)
+    index = _get_cached_index_for_lookup(outputs_dir)
     return index.get_annotations_for_path(path)
 
 

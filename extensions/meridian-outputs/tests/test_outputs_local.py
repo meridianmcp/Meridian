@@ -5475,3 +5475,136 @@ class TestHierarchicalSubtreeIndexing:
         assert result["convergence"]["converged"] is False
         assert result["convergence"]["subtree"] is None  # scoped index itself
         assert "zero_hits_warning" in result
+
+
+class TestAncestorDiskCacheRedirect:
+    """39bf34d8 -- _get_cached_index must consult an ancestor's on-disk index
+    before creating an independent one, so a parent outputs_dir and a child
+    subdirectory never silently diverge into two unrelated databases for the
+    SAME real files (the confirmed incident: register/query under one
+    reports exact provenance, "unknown" under the other)."""
+
+    def test_find_ancestor_disk_cache_none_when_no_cache_anywhere(self, tmp_path: Path) -> None:
+        sub = tmp_path / "child"
+        sub.mkdir()
+        assert OL._find_ancestor_disk_cache(str(sub)) is None
+
+    def test_find_ancestor_disk_cache_none_when_own_cache_exists(self, tmp_path: Path) -> None:
+        cache_dir = tmp_path / ".meridian-outputs-cache"
+        cache_dir.mkdir()
+        (cache_dir / "index.duckdb").write_bytes(b"")
+        assert OL._find_ancestor_disk_cache(str(tmp_path)) is None
+
+    def test_find_ancestor_disk_cache_finds_immediate_parent(self, tmp_path: Path) -> None:
+        cache_dir = tmp_path / ".meridian-outputs-cache"
+        cache_dir.mkdir()
+        (cache_dir / "index.duckdb").write_bytes(b"")
+        child = tmp_path / "defense_plots"
+        child.mkdir()
+        found = OL._find_ancestor_disk_cache(str(child))
+        assert found is not None
+        assert os.path.normpath(found) == os.path.normpath(str(tmp_path))
+
+    def test_find_ancestor_disk_cache_prefers_nearest_ancestor(self, tmp_path: Path) -> None:
+        root_cache = tmp_path / ".meridian-outputs-cache"
+        root_cache.mkdir()
+        (root_cache / "index.duckdb").write_bytes(b"")
+        mid = tmp_path / "mid"
+        mid.mkdir()
+        mid_cache = mid / ".meridian-outputs-cache"
+        mid_cache.mkdir()
+        (mid_cache / "index.duckdb").write_bytes(b"")
+        child = mid / "leaf"
+        child.mkdir()
+        found = OL._find_ancestor_disk_cache(str(child))
+        assert found is not None
+        assert os.path.normpath(found) == os.path.normpath(str(mid))
+
+    def test_find_ancestor_disk_cache_respects_search_bound(self, tmp_path: Path) -> None:
+        cache_dir = tmp_path / ".meridian-outputs-cache"
+        cache_dir.mkdir()
+        (cache_dir / "index.duckdb").write_bytes(b"")
+        deep = tmp_path
+        for i in range(OL._ANCESTOR_CACHE_SEARCH_MAX_LEVELS + 1):
+            deep = deep / f"level{i}"
+        deep.mkdir(parents=True)
+        assert OL._find_ancestor_disk_cache(str(deep)) is None
+
+    def test_existing_own_cache_is_never_redirected_away_from(self, tmp_path: Path) -> None:
+        """An outputs_dir with ITS OWN established on-disk cache must keep
+        using it, even when an unrelated ancestor also has one."""
+        outer_cache = tmp_path / ".meridian-outputs-cache"
+        outer_cache.mkdir()
+        (outer_cache / "index.duckdb").write_bytes(b"")
+
+        own = tmp_path / "own_project"
+        own.mkdir()
+        own_cache = own / ".meridian-outputs-cache"
+        own_cache.mkdir()
+        (own_cache / "index.duckdb").write_bytes(b"")
+
+        assert OL._find_ancestor_disk_cache(str(own)) is None
+
+    @duckdb_required
+    def test_get_cached_index_redirects_child_to_parent_ancestor(self, tmp_path: Path) -> None:
+        parent = tmp_path
+        child = parent / "defense_plots"
+        child.mkdir()
+        (child / "a.csv").write_text("col\nvalue=1\n", encoding="utf-8")
+
+        # Converge under the PARENT so it gets a real on-disk cache.
+        OL.search_outputs(str(parent), "value")
+
+        # Evict the parent's index from the IN-MEMORY cache so this
+        # exercises the ON-DISK discovery path, not the in-memory one
+        # _find_ancestor_cached_index already covered.
+        with OL._index_cache_lock:
+            key = OL._cache_key(str(parent))
+            OL._index_cache.pop(key, None)
+
+        child_idx = OL._get_cached_index_for_lookup(str(child))
+        assert os.path.normpath(child_idx.outputs_dir) == os.path.normpath(str(parent))
+
+    @duckdb_required
+    def test_provenance_registered_under_parent_visible_under_child(self, tmp_path: Path) -> None:
+        """Direct regression test for the reported incident: a path
+        registered through the PARENT outputs_dir must resolve consistently
+        when the SAME path is later queried through a CHILD outputs_dir,
+        instead of reporting exact under one and unknown under the other."""
+        parent = tmp_path
+        child = parent / "defense_plots"
+        child.mkdir()
+        f = child / "figure_c11.csv"
+        f.write_text("col\nvalue=1\n", encoding="utf-8")
+
+        result = OL.register_output_paths(str(parent), [str(f)])
+        assert result["registered"] is True
+        assert result["indexed"] == 1
+
+        status_via_child = OL.get_indexed_output_status(str(child), str(f))
+        assert status_via_child["row"] is not None, (
+            "path registered under the parent outputs_dir was not visible "
+            f"when queried under the child outputs_dir: {status_via_child}"
+        )
+
+    @duckdb_required
+    def test_provenance_registered_under_child_visible_under_parent(self, tmp_path: Path) -> None:
+        """The reverse direction: once the parent has an established index,
+        a write through the CHILD outputs_dir must land in the SAME index
+        so a subsequent query under the PARENT sees it too."""
+        parent = tmp_path
+        child = parent / "defense_plots"
+        child.mkdir()
+
+        # Establish the parent's on-disk index first (matches the real
+        # incident's ordering -- an ambient walk/search converges the root
+        # before the scoped child-directory registration ever happens).
+        OL.search_outputs(str(parent), "irrelevant_seed_query")
+
+        f = child / "figure_c12.csv"
+        f.write_text("col\nvalue=2\n", encoding="utf-8")
+        result = OL.register_output_paths(str(child), [str(f)])
+        assert result["registered"] is True
+
+        status_via_parent = OL.get_indexed_output_status(str(parent), str(f))
+        assert status_via_parent["row"] is not None
