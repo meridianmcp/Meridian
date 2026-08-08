@@ -2694,6 +2694,58 @@ def _build_scheduler_lease_clause(parallel_groups: "dict[str, Any] | None") -> s
     return out
 
 
+def _build_self_start_bootstrap_clause(
+    project_id: "str | None",
+    project_name: "str | None" = None,
+    identity: "str | None" = None,
+) -> str:
+    """c1ec3517 — render the exact ``start_session(...)`` call a receiving
+    session must make FIRST when a /goal block is its only context (handed to
+    a fresh sub-agent with zero framing, or copy-pasted directly into a cold
+    chat with no prior Meridian tool calls).
+
+    Returns ``""`` when ``project_id`` is falsy — every existing call site
+    that has not been updated to pass it gets byte-for-byte unchanged output
+    from :func:`_build_quick_start_goal` (see that function's own
+    project_id/project_name/identity docstring for exactly which two call
+    sites opt in and why).
+
+    Deliberately phrased as a CONDITIONAL first action ("if you do not
+    already have an active session_id") rather than an unconditional one:
+    this same rendered text is also reachable via ``start_session``'s own
+    ``pending_goal`` field / ``load_handoff()`` — contexts where a session
+    already exists — and an unconditional re-invocation would register a
+    second, redundant session under a new session_name instead of resuming
+    the caller's real one.
+
+    ``project_name``/``identity`` are user-authored strings (project display
+    name / caller identity) and are therefore run through ``_xml_escape``
+    before interpolation, unlike ``project_id`` (a server-generated uuid4 —
+    see ``db._new_id`` — that never contains XML-special characters).
+    """
+    if not project_id:
+        return ""
+    _pid = _xml_escape(str(project_id))
+    _name_clause = (
+        f', project_name="{_xml_escape(str(project_name))}"' if project_name else ""
+    )
+    _human_clause = (
+        f', human_id="{_xml_escape(str(identity))}"' if identity else ""
+    )
+    _call = (
+        f'start_session(project_id="{_pid}"{_name_clause}{_human_clause}, '
+        'session_name="describe-what-youre-doing", role="executor")'
+    )
+    return (
+        "If you do not already have an active Meridian session_id in this "
+        f"conversation, your REQUIRED FIRST CALL is {_call} -- this registers "
+        "you as an executor and is what makes this /goal block self-starting "
+        "from a cold context with zero other framing. If a session_id already "
+        "exists (e.g. this block arrived via start_session's own pending_goal "
+        "field, or load_handoff()), skip straight to the next call. "
+    )
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -2719,6 +2771,9 @@ def _build_quick_start_goal(
     strict_pointer_evidence: bool = False,
     selected_scope: "dict[str, Any] | None" = None,
     full_contract_max_items: "int | None" = None,
+    project_id: "str | None" = None,
+    project_name: "str | None" = None,
+    identity: "str | None" = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -2869,6 +2924,27 @@ def _build_quick_start_goal(
     ``_render_test_floor_clause``. This is the fix for the reported bug: a
     receiving repo used to be told its floor was Meridian's own historical
     "2150+" pass count regardless of how many tests it actually had.
+
+    ``project_id``/``project_name``/``identity`` (c1ec3517) — OPT-IN, ``None``
+    by default for every pre-existing call site, which keeps this function's
+    output byte-for-byte unchanged unless a caller has been updated to pass
+    them. When ``project_id`` IS given, ``<first_step>`` (in both the normal
+    and empty-board branches) is prefixed with an explicit, copy-pasteable
+    ``start_session(project_id=..., ...)`` bootstrap call — see
+    :func:`_build_self_start_bootstrap_clause`. This closes the confirmed
+    CRITICAL gap (c1ec3517): ``mode="goal"`` is documented as "for a caller
+    that wants nothing but the executor-facing directive itself, e.g. to hand
+    straight to a fresh sub-agent with zero framing" — but a fresh sub-agent
+    with zero framing has no session_id and no project identity unless the
+    /goal block itself carries a bootstrap call. Every other handoff mode
+    (full/delta's Jinja "## Start a New Session" section, starter's
+    ``_render_starter_handoff`` header line) already carries its own separate
+    start_session mention outside this function, which is why only the
+    goal-only call site (:func:`_generate_goal_only_handoff`) and the
+    ``executor-goal`` MCP prompt (:func:`_build_executor_goal_messages` in
+    ``meridian/mcp/handler.py``) pass these params today — the two surfaces
+    where the /goal body can plausibly be copied/forwarded on its own,
+    stripped of any surrounding wrapper prose.
     """
     _completion_override = (
         completion_criteria_override.strip()
@@ -3065,6 +3141,10 @@ def _build_quick_start_goal(
     _pointer_lines_block = (
         _build_goal_pointer_lines(pending_sprint_items) if include_pointer_lines else ""
     )
+    # c1ec3517 — computed once, reused by both the empty-board and normal
+    # return branches below; "" (no-op) unless a caller opted in via
+    # project_id — see _build_self_start_bootstrap_clause's own docstring.
+    _self_start = _build_self_start_bootstrap_clause(project_id, project_name, identity)
     if not item_ids:
         _empty_completion = _completion_override or (
             "Done when remaining work is verified against its stated scope "
@@ -3074,11 +3154,21 @@ def _build_quick_start_goal(
         # test floor, generate_handoff, turn/HITL stop) re-expressed as XML tags.
         # This branch has no items and therefore no anti-stop completion clause,
         # exactly as the prior prose form did.
+        # c1ec3517 — <first_step> only appears here when a bootstrap was
+        # actually rendered (project_id was given): an empty board otherwise
+        # had NO <first_step> tag at all before this fix, and every existing
+        # non-project_id caller must keep rendering byte-for-byte the same.
+        _empty_first_step = (
+            f"<first_step>{_self_start}Then verify remaining work is complete."
+            "</first_step>\n"
+            if _self_start else ""
+        )
         return (
             f"{_loop_prefix}/goal\n"
             "<executor_directive>Verify remaining work is complete.</executor_directive>"
             f"{_policy_clause}"
             f"{_build_selected_scope_clause(selected_scope)}\n"
+            f"{_empty_first_step}"
             # 0d5453bc — explicit single-run wording: full suite runs once,
             # at the end of the megasprint, not per item.
             f"<completion_criteria>{_xml_escape(_empty_completion)}"
@@ -3296,7 +3386,15 @@ def _build_quick_start_goal(
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
         # board query keeps a resumed session honest about mid-run injections
         # and already-claimed items instead of trusting a stale list.
-        '<first_step>First call get_sprint_items(status="pending") to load the '
+        # c1ec3517 — when _self_start is "" (every pre-existing caller that
+        # has not opted into project_id), this renders BYTE-FOR-BYTE the same
+        # "First call get_sprint_items(...)" text as before this fix; when a
+        # caller opted in, the bootstrap call is prepended and the wording
+        # shifts to "Then call" so it still reads correctly as a sequence.
+        "<first_step>"
+        + _self_start
+        + ("First call " if not _self_start else "Then call ")
+        + 'get_sprint_items(status="pending") to load the '
         "live board (the ids below are a snapshot and may have shifted)."
         "</first_step>\n"
         f"{_build_executor_item_ids_clause(pending_sprint_items)}\n"
@@ -9619,6 +9717,15 @@ async def _generate_goal_only_handoff(
         # even on a large board: same cap as starter/compact — see
         # _build_quick_start_goal's own full_contract_max_items docstring.
         full_contract_max_items=_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+        # c1ec3517 — mode="goal" is the ONE surface documented as "hand
+        # straight to a fresh sub-agent with zero framing": no readiness
+        # header, no L0/L1/L2 context carries a start_session mention
+        # elsewhere the way full/delta/starter do. Passing project identity
+        # here is what makes _build_quick_start_goal render the self-start
+        # bootstrap in <first_step> — see that function's own
+        # project_id/project_name/identity docstring.
+        project_id=project_id,
+        project_name=project.get("name"),
     )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.

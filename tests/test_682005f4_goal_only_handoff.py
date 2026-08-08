@@ -110,6 +110,112 @@ async def test_generate_handoff_goal_mode_returns_bare_goal_block(db, tmp_path):
     assert "ship it" not in content
 
 
+# ---------------------------------------------------------------------------
+# c1ec3517 — CRITICAL: goal-mode is documented as "for a caller that wants
+# nothing but the executor-facing directive itself, e.g. to hand straight to
+# a fresh sub-agent with zero framing" -- but a fresh sub-agent with zero
+# framing has no session_id and no project identity unless the bare /goal
+# block carries an explicit self-start bootstrap. These tests prove the fix.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_is_self_starting(db, tmp_path):
+    """The real project id is threaded all the way from generate_handoff into
+    an explicit, copy-pasteable start_session(...) call inside <first_step>,
+    so a cold receiving session can bootstrap itself without any other
+    context (the whole point of mode="goal")."""
+    p = await db_module.create_project(db, "goal-mode-self-start")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Ship self-starting goal")
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+    assert f'start_session(project_id="{p["id"]}"' in content
+    assert 'project_name="goal-mode-self-start"' in content
+    assert "REQUIRED FIRST CALL" in content
+    _assert_starts_with_goal(content)
+
+    start = content.index("<first_step>") + len("<first_step>")
+    end = content.index("</first_step>", start)
+    first_step = content[start:end]
+    assert "start_session" in first_step
+    assert 'get_sprint_items(status="pending")' in first_step
+
+    # Still bare -- this fix must not leak readiness header/L0/L1/L2 context
+    # back in; that "no framing" contract is the whole reason the bootstrap
+    # has to live INSIDE the goal block itself in the first place.
+    assert "HANDOFF READINESS" not in content
+    assert "MERIDIAN_CONTEXT" not in content
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_empty_board_still_self_starts(db, tmp_path):
+    """Before this fix, an empty pending board rendered NO <first_step> tag at
+    all -- a fresh session landing on an empty board via mode="goal" had
+    nothing telling it to bootstrap a session either. Must still self-start
+    even with nothing pending."""
+    p = await db_module.create_project(db, "goal-mode-empty-self-start")
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal"
+    )
+    assert "<first_step>" in content
+    assert f'start_session(project_id="{p["id"]}"' in content
+
+
+def test_build_quick_start_goal_self_start_bootstrap_opt_in():
+    """Unit-level: passing project_id/project_name/identity renders the
+    bootstrap; every value is present and the tag stays valid XML text."""
+    items = [{"id": "id1", "title": "First"}]
+    out = handoff_module._build_quick_start_goal(
+        items, project_id="proj-abc", project_name="Acme Widgets", identity="adam",
+    )
+    assert 'start_session(project_id="proj-abc"' in out
+    assert 'project_name="Acme Widgets"' in out
+    assert 'human_id="adam"' in out
+    assert "REQUIRED FIRST CALL" in out
+
+    import xml.etree.ElementTree as ET
+
+    body = out.split("/goal", 1)[1].lstrip("\n")
+    ET.fromstring(f"<goal_root>{body}</goal_root>")  # raises if malformed
+
+
+def test_build_quick_start_goal_self_start_bootstrap_escapes_xml_specials():
+    """A user-authored project_name can contain XML-special characters; the
+    rendered /goal must still parse as well-formed XML."""
+    import xml.etree.ElementTree as ET
+
+    items = [{"id": "id1", "title": "First"}]
+    out = handoff_module._build_quick_start_goal(
+        items, project_id="proj-xyz", project_name="R&D <alpha> team",
+    )
+    body = out.split("/goal", 1)[1].lstrip("\n")
+    ET.fromstring(f"<goal_root>{body}</goal_root>")  # raises if malformed
+    assert "R&D <alpha> team" not in out  # raw unescaped form must not appear
+    assert "R&amp;D &lt;alpha&gt; team" in out
+
+
+def test_build_quick_start_goal_no_project_id_is_byte_identical_to_legacy():
+    """Every pre-existing caller that has not opted into project_id must see
+    NO change: the opt-in design must not regress the well-tested full/
+    delta/starter surfaces, which already carry their own separate
+    start_session mention outside this function (the Jinja "## Start a New
+    Session" section and _render_starter_handoff's header line, respectively)."""
+    items = [{"id": "id1", "title": "First"}]
+    default_call = handoff_module._build_quick_start_goal(items)
+    explicit_none = handoff_module._build_quick_start_goal(items, project_id=None)
+    assert default_call == explicit_none
+    assert "start_session" not in default_call
+    assert "REQUIRED FIRST CALL" not in default_call
+
+    # Same guarantee on the empty-board branch.
+    empty_default = handoff_module._build_quick_start_goal([])
+    empty_explicit_none = handoff_module._build_quick_start_goal([], project_id=None)
+    assert empty_default == empty_explicit_none
+    assert "<first_step>" not in empty_default
+
+
 @pytest.mark.asyncio
 async def test_generate_handoff_goal_mode_empty_board(db, tmp_path):
     """No pending items: still a clean /goal block, no crash, no headers."""

@@ -213,6 +213,16 @@ async def _build_executor_goal_messages(
         ),
         max_turns=_max_turns_from_settings(_goal_settings),
         pointer_evidence_ids=_tpl_pointer_evidence_ids,
+        # c1ec3517 — this prompt already prepends its own numbered
+        # start_session-first protocol above (see the returned message body
+        # below), but the embedded quick_start_goal itself is exactly the
+        # substring most likely to be copy-pasted on its own (it's the
+        # literal /goal block) — so it needs to carry the same self-start
+        # bootstrap in its own <first_step> as the goal-only handoff mode.
+        # See _build_quick_start_goal's project_id/project_name/identity
+        # docstring.
+        project_id=pid,
+        project_name=pname,
     )
     if pending:
         item_lines = "\n".join(
