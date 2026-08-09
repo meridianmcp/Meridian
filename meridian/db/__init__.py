@@ -1126,6 +1126,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_proposal_evidence_links(db)
     await _migrate_wave_base_manifests(db)
     await _migrate_sprint_batch_claims(db)
+    await _migrate_sprint_batch_claims_reservation_fields(db)
     await _migrate_verification_runs(db)
     await _migrate_sprint_item_require_strict_evidence(db)
     await _migrate_handoffs_invalidation(db)
@@ -12209,6 +12210,12 @@ from .sprint_items import (  # noqa: F401
     # also called directly by tests.
     _predict_resource_granularity,
     _is_legacy_file_symbol_shorthand,
+    # 704edefe — reservation/integration-queue manifest helpers, also called
+    # directly by tests.
+    _classify_verifier_class,
+    _expected_output_of,
+    _dependency_frontier_snapshot,
+    _compute_integration_order,
 )
 
 
@@ -12505,6 +12512,7 @@ from .worktree_manifest import (  # noqa: F401
 # immediately above.
 from .batch_claim import (  # noqa: F401
     _migrate_sprint_batch_claims,
+    _migrate_sprint_batch_claims_reservation_fields,
     compute_batch_key,
     persist_batch_claim_manifest,
     get_batch_claim_manifest,

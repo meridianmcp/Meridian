@@ -2810,6 +2810,24 @@ async def _migrate_pg_sprint_batch_claims(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_sprint_batch_claims_reservation_fields(conn: PostgresConnection) -> None:
+    """704edefe — extend sprint_batch_claims (Postgres) with the
+    reservation/integration-queue columns. Mirrors meridian.db.batch_claim.
+    _migrate_sprint_batch_claims_reservation_fields exactly; see that
+    docstring for the full per-column contract (resolved_symbols,
+    dependency_frontier, expected_outputs, verifier_class,
+    integration_order). Postgres supports ADD COLUMN IF NOT EXISTS
+    natively, so this is a single idempotent statement per column — no
+    catalog probe needed, unlike the SQLite PRAGMA table_info approach."""
+    await conn.executescript(
+        "ALTER TABLE sprint_batch_claims ADD COLUMN IF NOT EXISTS resolved_symbols TEXT;"
+        "ALTER TABLE sprint_batch_claims ADD COLUMN IF NOT EXISTS dependency_frontier TEXT;"
+        "ALTER TABLE sprint_batch_claims ADD COLUMN IF NOT EXISTS expected_outputs TEXT;"
+        "ALTER TABLE sprint_batch_claims ADD COLUMN IF NOT EXISTS verifier_class TEXT;"
+        "ALTER TABLE sprint_batch_claims ADD COLUMN IF NOT EXISTS integration_order TEXT;"
+    )
+
+
 async def _migrate_pg_verification_runs(conn: PostgresConnection) -> None:
     """525d86bb — verification_runs: durable synchronous run_verification
     lifecycle records (mirrors SQLite).
@@ -4543,6 +4561,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_proposal_evidence_links,
     _migrate_pg_wave_base_manifests,
     _migrate_pg_sprint_batch_claims,
+    _migrate_pg_sprint_batch_claims_reservation_fields,
     _migrate_pg_verification_runs,
     _migrate_pg_sprint_item_require_strict_evidence,
     _migrate_pg_handoffs_invalidation,
