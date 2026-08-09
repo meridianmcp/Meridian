@@ -1977,8 +1977,23 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Bulk-insert sprint items from a single orchestrator call — decompose a goal into "
         "parallel work items without N sequential add_sprint_item calls. Pass a list of "
         "{title, description?, group?, version?} dicts; returns the list of new item_ids "
-        "in insertion order. No duplicate guard is applied (the caller is assumed to have "
-        "deduped). Items with empty titles are silently skipped.",
+        "in insertion order. By DEFAULT (strict omitted/false) no duplicate guard is applied "
+        "(the caller is assumed to have deduped) and titles that resolve to an empty string "
+        "are silently skipped — unchanged, original behavior, kept for compatibility.\n"
+        "468ab67d — pass strict=true to opt into the SAME shared engine execute_batch uses "
+        "(meridian.db.batch_management, add_sprint_item-backed): the 60%-word-overlap "
+        "duplicate guard applies (per-item force:true still overrides it), idempotency_key "
+        "makes a retried call with the same key replay the first call's result instead of "
+        "re-inserting, and mode picks all_or_nothing (validate-then-insert with compensating "
+        "rollback on failure, default) or best_effort (each item processed independently). "
+        "In strict mode the response is the execute_batch response shape "
+        "({status, mode, entry_kind, project_id, idempotency_key, idempotent_replay, "
+        "created_count, error_count, results:[{index, correlation_key, status, id, outcome, "
+        "error_code, error_message, retryable}]}) PLUS the usual item_ids/count keys — a "
+        "different, richer shape than the legacy bare item_ids/count, by design (a new "
+        "opt-in contract, not a silent change to the old one). Each item may carry its own "
+        "correlation_key (echoed back on its strict-mode result) and force (per-item "
+        "duplicate-guard override, strict mode only).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
@@ -1993,10 +2008,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                      "group": {"type": "string", "description": "Optional objective group name."},
                      "version": {"type": "string", "description": "Optional sprint-version bucket; defaults to empty string."},
                      "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Optional typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:) for parallel conflict detection. For SYMBOL-LEVEL granularity append ':symbol_name' to a file id ('file:path.py:func') so items editing different symbols in the same file co-batch in parallel."},
+                     "force": {"type": "boolean", "description": "strict mode only — override the duplicate-title guard for this item (same meaning as add_sprint_item's own force). Ignored in legacy (non-strict) mode, which never applies the guard at all."},
+                     "correlation_key": {"type": "string", "description": "strict mode only — an arbitrary caller-chosen id echoed back on this item's result for reconciliation. Ignored in legacy mode."},
                  },
                  "required": ["title"],
              },
-         }},
+         },
+         "strict": {"type": "boolean", "description": "468ab67d — default false (legacy: no duplicate guard, bare item_ids/count response). Pass true to opt into the shared batch_management engine's duplicate guard + idempotency-key replay + mode semantics — see the tool description."},
+         "mode": {"type": "string", "enum": ["all_or_nothing", "best_effort"], "description": "strict mode only — default 'all_or_nothing'. Ignored unless strict=true."},
+         "idempotency_key": {"type": "string", "description": "strict mode only — a retried call with the same (project_id, idempotency_key) replays the first call's stored result instead of re-inserting. Ignored unless strict=true."},
+         },
          "required": ["items"]}},
     {"name": "update_sprint_item", "description":
         "Edit fields on an existing sprint item: title, version, notes, human_id (assignee), "

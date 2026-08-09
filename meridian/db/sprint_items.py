@@ -995,33 +995,116 @@ async def add_sprint_item(
     return item
 
 
+def _fan_out_spec_to_batch_entry(spec: Any, index: int) -> dict[str, Any]:
+    """Map one ``fan_out_sprint_items`` item-spec onto a
+    ``batch_management.execute_batch`` ``sprint_item`` create-entry (468ab67d).
+
+    Only translates fan_out's own historical field synonyms (``sprint`` ->
+    ``version``, ``item_group`` -> ``group``, ``description`` -> ``notes`` —
+    the exact same mapping the legacy insert loop below already performs);
+    everything else (``touches_resources``, ``force``, ``correlation_key``)
+    passes through by name unchanged, since it already matches
+    :func:`add_sprint_item`'s own kwarg names / ``execute_batch``'s own
+    entry shape. A non-dict ``spec`` is passed through as-is so it hits the
+    engine's own "entry must be an object" validation error (a real,
+    reportable per-entry outcome) instead of crashing this mapper with an
+    ``AttributeError`` the way the legacy loop would.
+    """
+    if not isinstance(spec, dict):
+        return spec
+    entry: dict[str, Any] = {"action": "create", "title": spec.get("title")}
+    version = spec.get("version") or spec.get("sprint")
+    if version:
+        entry["version"] = version
+    group = spec.get("group") or spec.get("item_group")
+    if group:
+        entry["group"] = group
+    description = spec.get("description")
+    if description:
+        entry["notes"] = description
+    if spec.get("touches_resources") is not None:
+        entry["touches_resources"] = spec.get("touches_resources")
+    if spec.get("force"):
+        entry["force"] = True
+    ck = spec.get("correlation_key")
+    if isinstance(ck, str) and ck.strip():
+        entry["correlation_key"] = ck
+    return entry
+
+
 async def fan_out_sprint_items(
     db: aiosqlite.Connection,
     project_id: str,
     items: list[dict[str, Any]],
-) -> list[str]:
+    *,
+    strict: bool = False,
+    mode: str = "all_or_nothing",
+    idempotency_key: str | None = None,
+    tenant_id: str | None = None,
+    actor: str | None = None,
+) -> list[str] | dict[str, Any]:
     """Bulk-insert sprint items for an orchestrator decomposing a goal.
 
     ``items`` is a list of dicts, each with at minimum ``title`` (required)
     and optionally ``description``, ``group``, and ``version``.  Missing
     ``version`` defaults to the empty string (same as the common add_sprint_item
-    convention).  Unlike add_sprint_item the duplicate guard is **not** applied
-    here — the orchestrator is assumed to have already deduped.
+    convention).
 
-    Returns the list of new item IDs in insertion order.
+    Legacy contract (``strict=False``, the default — UNCHANGED, 468ab67d):
+    the duplicate guard is **not** applied — the orchestrator is assumed to
+    have already deduped. Returns the bare ``list[str]`` of new item IDs in
+    insertion order, exactly as before. Every existing caller that never
+    passes ``strict=`` sees zero behavior change — this is the
+    compatibility-preserving half of 468ab67d's contract.
 
-    86e4ae44 — deliberately NOT rerouted through
-    :mod:`meridian.db.batch_management`'s shared batch engine. That engine's
-    ``sprint_item`` entry kind creates via :func:`add_sprint_item`, which DOES
-    enforce the 60%-word-overlap duplicate guard this function explicitly
-    skips (see the paragraph above) — rerouting would silently reject
-    near-duplicate titles that succeed today, a real behavior change for
-    every existing caller. See ``batch_management``'s module docstring
-    ("Compatibility: why fan_out_sprint_items / add_sprint_item_pointer are
-    NOT rerouted through this engine") for the full reasoning. The new
-    engine is the additive, atomic/idempotent/duplicate-guarded alternative
-    for callers who want that stricter contract instead of this one.
+    Strict, opt-in contract (``strict=True``, 468ab67d): reroutes through
+    :func:`meridian.db.batch_management.execute_batch`'s ``sprint_item``
+    create path (the SAME :func:`add_sprint_item`-backed engine
+    ``execute_batch``/``add_sprint_item`` already use — no second
+    duplicate/idempotency heuristic implemented here) instead of the raw
+    insert loop below, which gives a caller who explicitly opts in:
+
+    * the 60%-word-overlap duplicate guard (per-item ``force=True`` still
+      overrides it, same as :func:`add_sprint_item`);
+    * ``idempotency_key`` replay — a retried call with the same
+      ``(project_id, "sprint_item", idempotency_key)`` returns the FIRST
+      call's stored result verbatim instead of re-inserting;
+    * ``mode="all_or_nothing"`` (default) or ``"best_effort"`` batch
+      semantics, with compensating rollback on an ``all_or_nothing`` failure;
+    * a per-entry outcome (``ok``/``error``/``rolled_back``/``not_attempted``,
+      with ``error_code``/``error_message``/``retryable``) referencing the
+      created item's own id, instead of a bare id list that gives no
+      visibility into what happened to each entry;
+    * stable per-entry ``correlation_key`` echoing (an item spec's own
+      ``correlation_key``, when supplied) plus the always-present
+      deterministic ``index``.
+
+    Returns :class:`meridian.db.batch_management.BatchResult`'s
+    ``to_dict()`` when ``strict=True`` — a DIFFERENT shape from the legacy
+    ``list[str]`` return, by design: this is a new, explicitly-opted-into
+    contract, not a silent change to the existing one. Raises
+    :class:`meridian.db.batch_management.BatchEngineError` for a call-level
+    contract violation (e.g. every entry in ``items`` failed to map to a
+    dict with a title), matching ``execute_batch``'s own raise contract.
+
+    See ``batch_management``'s module docstring ("Compatibility: why
+    fan_out_sprint_items / add_sprint_item_pointer are NOT rerouted through
+    this engine [by default]") for the full history of why the DEFAULT stays
+    the legacy, unguarded loop.
     """
+    if strict:
+        from meridian.db import batch_management  # noqa: PLC0415 — lazy: db/__init__.py never imports batch_management itself, and this avoids any import-order dependence on where in db/__init__.py's load sequence sprint_items.py is reached.
+
+        entries = [
+            _fan_out_spec_to_batch_entry(spec, i) for i, spec in enumerate(items)
+        ]
+        result = await batch_management.execute_batch(
+            db, project_id=project_id, entry_kind="sprint_item", entries=entries,
+            mode=mode, idempotency_key=idempotency_key, tenant_id=tenant_id,
+            actor=actor,
+        )
+        return result.to_dict()
+
     ids: list[str] = []
     for spec in items:
         title = (spec.get("title") or "").strip()

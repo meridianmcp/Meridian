@@ -150,24 +150,39 @@ single-entry calls.
 
 -------------------------------------------------------------------------
 Compatibility: why fan_out_sprint_items / add_sprint_item_pointer are NOT
-rerouted through this engine
+rerouted through this engine BY DEFAULT
 -------------------------------------------------------------------------
 
 :func:`meridian.db.sprint_items.fan_out_sprint_items` has a DELIBERATELY
-different contract from this engine's ``sprint_item`` entry kind: its own
-docstring says "the duplicate guard is **not** applied here -- the
+different DEFAULT contract from this engine's ``sprint_item`` entry kind:
+its own docstring says "the duplicate guard is **not** applied here -- the
 orchestrator is assumed to have already deduped". This engine's
 ``sprint_item`` create path calls ``add_sprint_item``, which DOES enforce
-the 60%-word-overlap duplicate guard. Rerouting ``fan_out_sprint_items``
-through this engine would silently reject near-duplicate titles that
-succeed today -- a real behavior change for every existing caller (the
-orchestrator fan-out flow, tested in ``tests/test_ba4f879b_sprint_tools_dispatch.py``
-and others). Per this item's own acceptance criteria ("if full rerouting
-risks behavior changes for existing callers, it's fine to keep the new
-engine as an ADDITIVE new code path"), ``fan_out_sprint_items`` is left
-untouched; this module is the new, additive, atomic/idempotent path for
-callers who explicitly want validated + duplicate-guarded + rollback-safe
-bulk sprint-item writes.
+the 60%-word-overlap duplicate guard. Unconditionally rerouting
+``fan_out_sprint_items`` through this engine would silently reject
+near-duplicate titles that succeed today -- a real behavior change for
+every existing caller (the orchestrator fan-out flow, tested in
+``tests/test_ba4f879b_sprint_tools_dispatch.py`` and others). Per this
+item's own acceptance criteria ("if full rerouting risks behavior changes
+for existing callers, it's fine to keep the new engine as an ADDITIVE new
+code path"), ``fan_out_sprint_items``'s DEFAULT (``strict=False``) is left
+untouched.
+
+468ab67d (a later, focused follow-up) added an explicit, OPT-IN
+``strict=True`` parameter to ``fan_out_sprint_items`` itself that DOES
+reroute through this exact engine (``execute_batch`` with
+``entry_kind="sprint_item"``) -- giving a caller who explicitly asks for it
+the duplicate guard, idempotency-key replay, and best_effort/all_or_nothing
+semantics documented above, reusing this module's implementation rather
+than a second title-overlap heuristic. This is still "additive" in the
+sense the acceptance criteria above intended: nothing about the DEFAULT
+call shape (no ``strict=`` kwarg passed) changed at all; the new behavior
+is reached only through a parameter that did not previously exist. See
+``fan_out_sprint_items``'s own docstring for the strict-mode contract.
+Separately, this module remains the new, additive, atomic/idempotent path
+for callers who want validated + duplicate-guarded + rollback-safe bulk
+sprint-item writes without going through ``fan_out_sprint_items`` at all
+(e.g. via ``execute_batch``/``batch_ops.execute_batch_operation`` directly).
 
 :func:`meridian.db.sprint_items.add_sprint_item_pointer` needed no changes
 at all in the other direction: it is already a clean validate-then-insert

@@ -237,17 +237,23 @@ async def handle_fan_out_sprint_items(
 ) -> Any:
     """MCP tool: fan_out_sprint_items.
 
-    86e4ae44 — this handler's call to ``db_module.fan_out_sprint_items`` below
-    is deliberately UNCHANGED: that function's docstring documents a contract
-    (no duplicate-title guard -- "the orchestrator is assumed to have already
-    deduped") that the new ``meridian.db.batch_management`` shared batch
-    engine's ``sprint_item`` entry kind does NOT share (it creates via
+    86e4ae44 — the DEFAULT call shape below (no ``strict``) is deliberately
+    UNCHANGED: ``db_module.fan_out_sprint_items``'s legacy contract (no
+    duplicate-title guard -- "the orchestrator is assumed to have already
+    deduped") does NOT share the new ``meridian.db.batch_management`` shared
+    batch engine's ``sprint_item`` entry kind's contract (it creates via
     ``add_sprint_item``, which DOES enforce the duplicate guard). Rerouting
-    this handler through the new engine would silently reject near-duplicate
-    titles this tool accepts today -- a real behavior change for every
-    existing caller. See ``batch_management``'s module docstring for the
-    full reasoning; exposing the new engine as an atomic/idempotent
-    alternative tool is sprint item 627187b8's job, not this one's.
+    this handler through the new engine BY DEFAULT would silently reject
+    near-duplicate titles this tool accepts today -- a real behavior change
+    for every existing caller.
+
+    468ab67d — added an explicit, OPT-IN ``args["strict"]`` flag: when true,
+    this handler forwards ``mode``/``idempotency_key`` to
+    ``db_module.fan_out_sprint_items(..., strict=True, ...)``, which reroutes
+    through that exact shared engine (see its own docstring for the full
+    strict-mode contract: duplicate guard, idempotency replay, best_effort/
+    all_or_nothing semantics, per-entry outcomes). A caller who never passes
+    ``strict`` sees byte-identical behavior to before this item.
     """
     from ..handler import (  # noqa: PLC0415
         _infer_touches_resources,
@@ -271,10 +277,39 @@ async def handle_fan_out_sprint_items(
             if _inf:
                 spec = {**spec, "touches_resources": _inf}
         _enriched.append(spec)
-    ids = await db_module.fan_out_sprint_items(
-        db, args["project_id"], _enriched
-    )
-    _result: dict[str, Any] = {"item_ids": ids, "count": len(ids)}
+    # 468ab67d — opt-in strict mode: explicit duplicate safety + replay
+    # idempotency via the shared batch_management engine. Absent/false
+    # `strict` takes the exact same code path as before this item.
+    _strict = bool(args.get("strict"))
+    if _strict:
+        from meridian.db import batch_management  # noqa: PLC0415 — lazy, see fan_out_sprint_items' own import for why.
+
+        _mode = args.get("mode") or "all_or_nothing"
+        if _mode not in batch_management.BATCH_MODES:
+            return {
+                "error": f"mode must be one of {batch_management.BATCH_MODES}, got {_mode!r}"
+            }
+        try:
+            _batch_result = await db_module.fan_out_sprint_items(
+                db, args["project_id"], _enriched,
+                strict=True, mode=_mode,
+                idempotency_key=args.get("idempotency_key") or None,
+                tenant_id=_mcp_tenant_id, actor=args.get("session_id"),
+            )
+        except batch_management.BatchEngineError as exc:
+            return {"error": str(exc)}
+        ids = [
+            r["id"] for r in _batch_result.get("results", [])
+            if r.get("status") == "ok" and r.get("id")
+        ]
+        _result: dict[str, Any] = dict(_batch_result)
+        _result["item_ids"] = ids
+        _result["count"] = len(ids)
+    else:
+        ids = await db_module.fan_out_sprint_items(
+            db, args["project_id"], _enriched
+        )
+        _result = {"item_ids": ids, "count": len(ids)}
     # 02a52bf6 — mirror add_sprint_item's inline prospecting/pointer-persist for
     # each bulk-filed item. Without this, an item fanned out with real (declared
     # or inferred) touches_resources ends up with zero rows in

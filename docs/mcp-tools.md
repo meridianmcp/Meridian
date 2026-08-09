@@ -507,6 +507,9 @@ Bulk-insert sprint items in one call — lets an orchestrator LLM decompose a go
 | `project_id` | string | optional |  |
 | `project_name` | string | optional | Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given. |
 | `items` | array | required | List of sprint item specs. Each must have at least a 'title'. |
+| `strict` | boolean | optional | 468ab67d — default false (legacy: no duplicate guard, bare item_ids/count response). Pass true to opt into the shared batch_management engine's duplicate guard + idempotency-key replay + mode semantics — see the tool description. |
+| `mode` | string | optional | strict mode only — default 'all_or_nothing'. Ignored unless strict=true. |
+| `idempotency_key` | string | optional | strict mode only — a retried call with the same (project_id, idempotency_key) replays the first call's stored result instead of re-inserting. Ignored unless strict=true. |
 
 **Example:**
 ```
