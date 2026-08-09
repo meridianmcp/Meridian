@@ -127,10 +127,12 @@ jobs:
       - run: pixi install
       # Postgres-backed run. No coverage gate here — test-core already enforces
       # the coverage floor on the identical suite; this job's job is backend
-      # correctness. -n 3 shards across workers; each xdist worker gets its own
-      # database (meridian_test_gw0, _gw1, … — created on demand by conftest) and
-      # drops/recreates the public schema per test, so workers stay fully isolated
-      # even though every test rebuilds the schema.
+      # correctness. scripts/run_tests.py (not a literal -n flag here) shards
+      # across up to MERIDIAN_TEST_MAX_WORKERS (default 8, -n auto/worksteal)
+      # once collection exceeds its serial threshold; each xdist worker gets
+      # its own database (meridian_test_gw0, _gw1, … — created on demand by
+      # conftest) and drops/recreates the public schema per test, so workers
+      # stay fully isolated even though every test rebuilds the schema.
       #
       # e71ecf27 — real CI timing data collected 2026-07-14:
       #   PRE-change (7 runs): 445 445 466 485 502 510 690s  median=485s  avg=506s
@@ -164,7 +166,7 @@ jobs:
       - name: Install Playwright Chromium
         if: steps.playwright-cache.outputs.cache-hit != 'true'
         run: pixi run python -m playwright install chromium --with-deps
-      - run: pixi run python -m pytest tests/test_demo_ux.py -n 3 -q --tb=short
+      - run: pixi run python -m pytest tests/test_demo_ux.py -n auto -q --tb=short
 
   # 0ab8139f -- fail-closed dependency-contract gate for the local tunnel
   # extension servers (meridian-docs, meridian-outputs), run BEFORE the
