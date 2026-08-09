@@ -33,6 +33,14 @@ Covers:
    this surface (unknown ``kind``, or ``action="create"`` on a
    ``sprint_item_update`` entry); request-shape validation mirrors
    ``batch_ops``'s established wording.
+3. Release/manifest parity (7ac7f633): ``batch_read``/``batch_mutate`` are
+   registered in ``meridian.mcp_tools._MCP_TOOLS_LIST`` with stable schemas,
+   correctly categorised/annotated, advertise the IDENTICAL schema over the
+   stdio transport (``_shared_tool``), are picked up by the connector/
+   tool-manifest generator (``meridian.tool_manifest.build_tool_manifest``),
+   and are wired into ``meridian.mcp.handler``'s per-tool dispatch table --
+   mirroring ``tests/test_batch_management_schemas.py``'s coverage of the
+   sibling ``execute_batch`` tool (627187b8).
 """
 from __future__ import annotations
 
@@ -42,10 +50,14 @@ import time
 import pytest
 import pytest_asyncio
 
+import meridian.server as server_module  # noqa: F401 -- load before mcp.handler (import-cycle guard)
 from meridian import batch_mutate as bmut_module
 from meridian import batch_read as br_module
 from meridian import db as db_module
+from meridian import mcp_tools
+from meridian import tool_manifest as tool_manifest_module
 from meridian.db import batch_management as bm
+from meridian.mcp import handler as handler_module
 
 
 # ---------------------------------------------------------------------------
@@ -503,9 +515,11 @@ def test_validate_batch_mutate_request_shape_rejects_bad_mode():
 
 
 # ---------------------------------------------------------------------------
-# MCP handler-level: arg validation (handler.py dispatch-table wiring is
-# deferred -- see this item's code note -- so these call the handler
-# functions directly, same as the underlying engines above).
+# MCP handler-level: arg validation. These call the handler functions
+# directly (same as the underlying engines above) to isolate handler-level
+# argument validation from the dispatch-table wiring itself, which is
+# covered separately below (7ac7f633) now that _standard_dispatch in
+# meridian/mcp/handler.py routes both tool names.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -559,5 +573,165 @@ async def test_handle_batch_mutate_end_to_end(db, project):
         "idempotency_key": "handler-e2e-1",
     }
     result = await st_mod.handle_batch_mutate(args, db, "/tmp", None, None)
+    assert result["status"] == "ok"
+    assert result["committed_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Release / manifest parity (7ac7f633) -- mirrors
+# tests/test_batch_management_schemas.py's coverage of the sibling
+# execute_batch tool (627187b8): schema registration, annotations,
+# category/role/tier, stdio-transport schema identity, connector/tool
+# manifest generation, and (new here) the mcp.handler per-tool dispatch
+# table itself.
+# ---------------------------------------------------------------------------
+
+def _find_tool(name: str) -> dict:
+    return next(t for t in mcp_tools._MCP_TOOLS_LIST if t["name"] == name)
+
+
+@pytest.mark.parametrize("tool_name", ["batch_read", "batch_mutate"])
+def test_registered_in_mcp_tools_list_exactly_once(tool_name):
+    names = [t["name"] for t in mcp_tools._MCP_TOOLS_LIST]
+    assert names.count(tool_name) == 1
+
+
+def test_batch_read_schema_required_fields():
+    tool = _find_tool("batch_read")
+    schema = tool["inputSchema"]
+    assert schema["required"] == ["requests"]
+    props = schema["properties"]
+    assert "project_id" in props
+    assert "project_name" in props
+    assert "alternative to project_id" in props["project_name"]["description"]
+    request_item_schema = props["requests"]["items"]
+    assert set(request_item_schema["required"]) == {"request_id", "adapter", "operation"}
+
+
+def test_batch_mutate_schema_required_fields():
+    tool = _find_tool("batch_mutate")
+    schema = tool["inputSchema"]
+    assert set(schema["required"]) == {"entries", "mode", "idempotency_key"}
+    props = schema["properties"]
+    assert "project_id" in props
+    assert "project_name" in props
+    assert "alternative to project_id" in props["project_name"]["description"]
+    assert set(props["mode"]["enum"]) == set(bm.BATCH_MODES)
+
+
+def test_batch_read_annotations_read_only_not_destructive():
+    tool = _find_tool("batch_read")
+    assert tool["annotations"]["readOnlyHint"] is True
+    assert tool["annotations"]["destructiveHint"] is False
+    assert tool["annotations"]["idempotentHint"] is True
+
+
+def test_batch_mutate_annotations_not_readonly_not_destructive():
+    tool = _find_tool("batch_mutate")
+    assert tool["annotations"]["readOnlyHint"] is False
+    assert tool["annotations"]["destructiveHint"] is False
+
+
+@pytest.mark.parametrize("tool_name", ["batch_read", "batch_mutate"])
+def test_category_role_tier(tool_name):
+    assert mcp_tools._TOOL_CATEGORY.get(tool_name) == "sprint-management"
+    assert mcp_tools._TOOL_ROLE_RELEVANCE.get(tool_name) in ("both", "executor", "planner")
+    assert mcp_tools._TOOL_WORKFLOW_TIER.get(tool_name) == "common-support"
+
+
+@pytest.mark.parametrize("tool_name", ["batch_read", "batch_mutate"])
+def test_has_example(tool_name):
+    assert tool_name in mcp_tools._TOOL_EXAMPLES
+
+
+# ---------------------------------------------------------------------------
+# stdio transport advertises the IDENTICAL schema object (via _shared_tool),
+# not a hand-copied duplicate that can drift.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["batch_read", "batch_mutate"])
+async def test_stdio_tool_schema_is_the_shared_schema(db, monkeypatch, tool_name):
+    import mcp.types as mcp_types
+
+    async def _return_db(*_a, **_k):
+        return db
+
+    monkeypatch.setattr(db_module, "init_db", _return_db)
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.delenv("MERIDIAN_DB_URL", raising=False)
+
+    server, _run_stdio = server_module.build_mcp_server()
+    list_handler = server.request_handlers[mcp_types.ListToolsRequest]
+    listed = await list_handler(mcp_types.ListToolsRequest())
+    stdio_tool = next(t for t in listed.root.tools if t.name == tool_name)
+
+    canonical = _find_tool(tool_name)
+    assert stdio_tool.description == canonical["description"]
+    assert stdio_tool.inputSchema == canonical["inputSchema"]
+
+
+# ---------------------------------------------------------------------------
+# Connector / tool manifest generation picks both tools up automatically.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("tool_name", ["batch_read", "batch_mutate"])
+def test_connector_manifest_includes_tool(tool_name):
+    manifest = tool_manifest_module.build_tool_manifest(mcp_tools._MCP_TOOLS_LIST)
+    names = [t["name"] for t in manifest["tools"]]
+    assert tool_name in names
+    entry = next(t for t in manifest["tools"] if t["name"] == tool_name)
+    assert entry["summary"]  # non-empty first-sentence summary
+    assert manifest["count"] == len(mcp_tools._MCP_TOOLS_LIST)
+
+
+@pytest.mark.parametrize("tool_name", ["batch_read", "batch_mutate"])
+def test_tool_manifest_revision_changes_if_tool_removed(tool_name):
+    rev_full = tool_manifest_module.tool_manifest_revision(mcp_tools._MCP_TOOLS_LIST)
+    without_tool = [t for t in mcp_tools._MCP_TOOLS_LIST if t["name"] != tool_name]
+    rev_without = tool_manifest_module.tool_manifest_revision(without_tool)
+    assert rev_full != rev_without
+
+
+# ---------------------------------------------------------------------------
+# meridian.mcp.handler per-tool dispatch table -- proves _standard_dispatch
+# inside _handle_sprint_tools actually routes these two tool names end to
+# end. The handler-level tests above call handle_batch_read/
+# handle_batch_mutate directly and so do NOT exercise this wiring; a
+# regression here (e.g. a typo'd dict key removing the entry) would still
+# pass those tests while silently breaking the real MCP call path.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_dispatch_table_routes_batch_read(db, project):
+    await db_module.add_sprint_item(db, project["id"], "v1", "Dispatch-table read target")
+    args = {
+        "project_id": project["id"],
+        "requests": [
+            {"request_id": "r1", "adapter": "sprint_board", "operation": "get_sprint_items"},
+        ],
+    }
+    result = await handler_module._handle_sprint_tools(
+        "batch_read", args, db, "/tmp", None, None,
+    )
+    assert result is not handler_module._MISS
+    assert result["results"][0]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_table_routes_batch_mutate(db, project):
+    item = await db_module.add_sprint_item(db, project["id"], "v1", "Dispatch-table mutate target")
+    args = {
+        "project_id": project["id"],
+        "entries": [
+            {"kind": "sprint_item_update", "item_id": item["id"], "priority": "low"},
+        ],
+        "mode": "all_or_nothing",
+        "idempotency_key": "dispatch-table-mutate-1",
+    }
+    result = await handler_module._handle_sprint_tools(
+        "batch_mutate", args, db, "/tmp", None, None,
+    )
+    assert result is not handler_module._MISS
     assert result["status"] == "ok"
     assert result["committed_count"] == 1
