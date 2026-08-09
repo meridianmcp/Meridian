@@ -42,6 +42,7 @@ from .db import ai_log as ai_log_module
 from . import executor_contract as executor_contract_module
 from . import hook_paths as hook_paths_module
 from . import pointers as pointers_module
+from . import profile_contract as profile_contract_module
 from . import test_run_receipt as test_run_receipt_module
 from . import tool_discovery as tool_discovery_module
 from . import tool_requirements as tool_requirements_module
@@ -2860,6 +2861,8 @@ def _build_quick_start_goal(
     project_id: "str | None" = None,
     project_name: "str | None" = None,
     identity: "str | None" = None,
+    profile_generation_key: "str | None" = None,
+    profile_restart_required: bool = False,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -3047,6 +3050,24 @@ def _build_quick_start_goal(
     ``meridian/mcp/handler.py``) pass these params today — the two surfaces
     where the /goal body can plausibly be copied/forwarded on its own,
     stripped of any surrounding wrapper prose.
+
+    ``profile_generation_key``/``profile_restart_required`` (89a06e40,
+    PROFILE-6) — OPT-IN, ``None``/``False`` by default for every
+    pre-existing call site, which keeps this function's output byte-for-byte
+    unchanged unless a caller has been updated to pass them. This function
+    is SYNCHRONOUS (no DB access — see module-level note), so it cannot
+    resolve the effective profile itself; the caller resolves it once via
+    :func:`build_effective_profile_binding` and threads the two scalars
+    through. When ``profile_generation_key`` is given (not ``None``), one
+    additional terse tag — ``<profile_generation key="..."
+    restart_required="true|false"/>`` — is rendered, in both the normal and
+    empty-board branches, giving a goal-mode-only consumer (``mode="goal"``
+    returns ONLY this rendered text, per that mode's own docstring — no
+    sibling ``profile_binding`` field to fall back on) visibility into
+    profile identity/generation without a second call. Kept to exactly ONE
+    line by construction — this function has a documented history
+    (248c0bb9/b6510123) of fighting goal-mode size bloat; do not expand this
+    into a verbose block.
     """
     _completion_override = (
         completion_criteria_override.strip()
@@ -3065,6 +3086,17 @@ def _build_quick_start_goal(
         else build_execution_policy({}, execution_mode=execution_mode)
     )
     _policy_clause = _build_execution_policy_clause(_policy)
+    # 89a06e40 — optional inline profile-identity/generation marker (PROFILE-6,
+    # pinned decision ee7bccc9). "" (no-op) unless a caller passes
+    # profile_generation_key — every pre-existing call site keeps rendering
+    # byte-for-byte the same text. Kept to ONE line by construction — see this
+    # function's own documented history (248c0bb9/b6510123) of goal-mode size
+    # bloat; do not expand this into a verbose block.
+    _profile_generation_clause = (
+        f'\n<profile_generation key="{_xml_escape(profile_generation_key, {chr(34): "&quot;"})}" '
+        f'restart_required="{"true" if profile_restart_required else "false"}"/>'
+        if profile_generation_key is not None else ""
+    )
     try:
         _turns = int(max_turns)
         if _turns <= 0:
@@ -3317,6 +3349,7 @@ def _build_quick_start_goal(
             f"{_loop_prefix}/goal\n"
             "<executor_directive>Verify remaining work is complete.</executor_directive>"
             f"{_policy_clause}"
+            f"{_profile_generation_clause}"
             f"{_build_selected_scope_clause(selected_scope)}\n"
             f"{_empty_first_step}"
             # 0d5453bc — explicit single-run wording: full suite runs once,
@@ -3556,6 +3589,7 @@ def _build_quick_start_goal(
         f"{_loop_prefix}/goal\n"
         f"<executor_directive>{_xml_escape(directive)}</executor_directive>"
         f"{_policy_clause}"
+        f"{_profile_generation_clause}"
         f"{_build_selected_scope_clause(selected_scope)}\n"
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
         # board query keeps a resumed session honest about mid-run injections
@@ -7449,6 +7483,48 @@ async def build_effective_capability_contract(
         return None
 
 
+async def build_effective_profile_binding(
+    db: Any, project_id: str, *, session_id: "str | None" = None,
+) -> "dict[str, Any] | None":
+    """89a06e40 — thin, fully-guarded wrapper over
+    ``db.get_effective_profile`` for the two trusted channels that emit it:
+    ``start_session``'s orientation response
+    (``mcp/handlers/project_tools.py::handle_start_session``) and every
+    ``generate_handoff`` mode (``mcp/handler.py``'s ``generate_handoff``
+    dispatch, plus ``routes/handoff.py``'s two REST call sites). Mirrors
+    :func:`build_effective_capability_contract`'s wrapper style exactly:
+    returns ``None`` on any failure so a caller can simply skip attaching
+    the field rather than needing its own try/except around this call too.
+
+    See pinned decision ee7bccc9 (project 5787cc92-ba7d-4788-b17c-28ab7938b839,
+    "PROFILE-6 (89a06e40): tunnel/connector profile binding is
+    workspace+hosted_default only, no project/session layers") for why this
+    wrapper is NEVER called from ``meridian/routes/tunnel.py``: that surface
+    is scoped by ``tenant_id`` only (no ``project_id`` anywhere in its
+    runtime-config-generation machinery), so calling ``get_effective_profile``
+    there would require an arbitrary/wrong ``project_id`` choice for a tenant
+    that may have multiple projects. The tunnel/connector routes instead call
+    ``db.get_workspace_effective_profile`` (hosted_default + workspace layers
+    only) directly and project the SAME compact shape this function returns
+    — see ``meridian/routes/tunnel.py``'s own profile-binding helper.
+
+    Returns the SAME compact projection at every call site
+    (:func:`meridian.profile_contract.project_profile_binding`):
+    ``{"generation_key", "executable", "degraded", "restart_required",
+    "restart_report"}`` — deliberately not the full merged ``fields`` dict.
+    ``session_id`` is passed straight through to ``get_effective_profile``
+    (``None`` — the default — resolves the project/workspace/hosted_default
+    layers only, no session-layer override).
+    """
+    try:
+        effective = await db_module.get_effective_profile(
+            db, project_id, session_id=session_id,
+        )
+        return profile_contract_module.project_profile_binding(effective)
+    except Exception:  # noqa: BLE001 — profile binding is best-effort
+        return None
+
+
 async def build_blocker_policy_for_handoff(
     db: Any, project_id: str, *,
     version: "str | None" = None,
@@ -9304,6 +9380,15 @@ async def generate_handoff(
     _effective_execution_mode = db_module.normalize_execution_mode(
         project.get("execution_mode")
     )
+    # 89a06e40 — resolved ONCE per generate_handoff call, then threaded into
+    # both quick_start_goal's inline <profile_generation> tag below AND the
+    # sibling `profile_binding` field this function's caller (mcp/handler.py /
+    # routes/handoff.py) attaches alongside `content`. Best-effort: None on
+    # any failure (see build_effective_profile_binding's own docstring) —
+    # falls through to no tag / no field rather than breaking the handoff.
+    _profile_binding = await build_effective_profile_binding(
+        db, project_id, session_id=session_id,
+    )
     # 60eed526 — deliberately NOT passing full_contract_max_items here even
     # when checkpoint=True: capping construction would also shrink what gets
     # WRITTEN to disk / the handoffs table / pending_goal (this same
@@ -9360,6 +9445,14 @@ async def generate_handoff(
         strict_pointer_evidence=strict_pointer_evidence,
         selected_scope=_selected_scope,
         selected_scope_outcome=_selected_scope_outcome,
+        # 89a06e40 — inline <profile_generation> tag; None/False (never crash)
+        # when the best-effort resolution above failed.
+        profile_generation_key=(
+            _profile_binding.get("generation_key") if _profile_binding else None
+        ),
+        profile_restart_required=bool(
+            _profile_binding.get("restart_required")
+        ) if _profile_binding else False,
     )
     # fb82e51f — a selected_item_ids scope that validated cleanly (every id
     # genuinely pending) can still collapse to zero executable items once the
@@ -10091,6 +10184,12 @@ async def _generate_starter_handoff(
     # that validated cleanly can still collapse to zero executable items once
     # the exclusion filters below run.
     _s_selected_scope_outcome: dict[str, Any] = {}
+    # 89a06e40 — resolved ONCE per starter/compact render, threaded into
+    # quick_start_goal's inline <profile_generation> tag below. No session_id
+    # in scope for this mode (see this function's own signature) — resolves
+    # the project/workspace/hosted_default layers only. Best-effort: None on
+    # any failure, per build_effective_profile_binding's own docstring.
+    _s_profile_binding = await build_effective_profile_binding(db, project_id)
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=_s_execution_mode,
@@ -10126,6 +10225,14 @@ async def _generate_starter_handoff(
         # pending inventory. See _build_quick_start_goal's own
         # full_contract_max_items docstring for the fetch-on-demand fallback.
         full_contract_max_items=_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+        # 89a06e40 — inline <profile_generation> tag; None/False (never crash)
+        # when the best-effort resolution above failed.
+        profile_generation_key=(
+            _s_profile_binding.get("generation_key") if _s_profile_binding else None
+        ),
+        profile_restart_required=bool(
+            _s_profile_binding.get("restart_required")
+        ) if _s_profile_binding else False,
     )
     # fb82e51f — fail CLOSED before the token is minted or anything is
     # written/persisted. See HandoffScopeNonExecutable's own docstring.
@@ -10401,6 +10508,14 @@ async def _generate_goal_only_handoff(
     # that validated cleanly can still collapse to zero executable items once
     # the exclusion filters below run.
     _g_selected_scope_outcome: dict[str, Any] = {}
+    # 89a06e40 — resolved ONCE per goal-only render, threaded into
+    # quick_start_goal's inline <profile_generation> tag below. mode="goal"
+    # is the ONE handoff mode that returns ONLY this rendered text (no
+    # sibling `profile_binding` field for a caller to fall back on — see
+    # generate_handoff's own docstring), so this tag is this mode's sole
+    # profile-identity signal. No session_id in scope for this mode (see
+    # this function's own signature). Best-effort: None on any failure.
+    _g_profile_binding = await build_effective_profile_binding(db, project_id)
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=_g_execution_mode,
@@ -10446,6 +10561,14 @@ async def _generate_goal_only_handoff(
         # project_id/project_name/identity docstring.
         project_id=project_id,
         project_name=project.get("name"),
+        # 89a06e40 — inline <profile_generation> tag; None/False (never crash)
+        # when the best-effort resolution above failed.
+        profile_generation_key=(
+            _g_profile_binding.get("generation_key") if _g_profile_binding else None
+        ),
+        profile_restart_required=bool(
+            _g_profile_binding.get("restart_required")
+        ) if _g_profile_binding else False,
     )
     # fb82e51f — fail CLOSED before the token is minted or anything is
     # written/persisted. See HandoffScopeNonExecutable's own docstring.

@@ -12,25 +12,25 @@ Layered on top of 649e095f's schema/validation module
 (``db.get_project_capability_manifest`` / ``set_project_capability_manifest``).
 This module adds NO new DB table -- it reads the existing
 ``project_capabilities`` row and assembles a contract from it plus two
-OPTIONAL richer integration points that are being built in parallel, separate
-worktrees and are not assumed to exist yet:
+richer integration points:
 
 * **02038afe** (profile inheritance: workspace/user -> project ->
-  sprint/version -> item override). Until it lands, ``effective`` degrades to
-  the raw project manifest returned by 649e095f -- see
-  :func:`_resolve_effective_capabilities`.
-* **ac80aaaf** (live availability probing against the tunnel/tool inventory).
-  Until it lands, the ``availability`` section degrades to
+  sprint/version -> item override) has LANDED -- ``effective`` resolves via
+  ``db.get_effective_capability_profile`` (the real, DB-backed layered
+  merge) by default; see :func:`_resolve_effective_capabilities`. 137b88a3
+  fixed this call site, which previously auto-discovered a guessed function
+  name on ``meridian.capability_profile`` that was never actually defined
+  there, leaving ``effective_source`` permanently stuck at ``"raw_manifest"``.
+* **ac80aaaf** (live availability probing against the tunnel/tool inventory)
+  has NOT landed yet. Until it does, the ``availability`` section degrades to
   ``status="unknown"`` with ``available``/``missing``/``degraded`` all the
   string ``"unknown"`` -- see :func:`_resolve_availability`.
 
 Both integration points accept an explicit callable override
-(``effective_resolver`` / ``availability_checker``) so this module is fully
-testable TODAY using only what 649e095f provides, and upgrades automatically
-once a sibling module of a guessed, documented name appears -- a human or a
-follow-up item is expected to wire the real integration in either case (see
-the TODO comments below); this module must never hard-crash or hard-import
-in the meantime.
+(``effective_resolver`` / ``availability_checker``) so a caller (or a test)
+can inject an alternate resolution/check without depending on either
+integration's real shape; this module must never hard-crash or hard-import
+over either being absent or misbehaving.
 
 Never binds credentials: the underlying manifest already screens
 secret-shaped values and machine-local absolute paths at write time
@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from . import capability_manifest as _cm
+from . import capability_profile as _capability_profile
 from . import db as db_module
 from . import pointers as _pointers
 from . import tool_requirements as _tool_requirements
@@ -350,7 +351,7 @@ async def extract_artifact_pointer_findings(
     return sorted(entries, key=lambda e: e.get("item_id") or "")
 
 
-def _resolve_effective_capabilities(
+async def _resolve_effective_capabilities(
     db: Any,
     project_id: str,
     requested: list[dict[str, Any]],
@@ -360,26 +361,58 @@ def _resolve_effective_capabilities(
     """Resolve the EFFECTIVE capability list for a project.
 
     Returns ``(effective_capabilities, source)`` where ``source`` is
-    ``"resolver"`` / ``"profile_inheritance"`` (a richer integration ran) or
-    ``"raw_manifest"`` (degraded fallback -- no richer integration available).
+    ``"resolver"`` (an injected override ran) / ``"profile_inheritance"``
+    (02038afe's real layered-profile resolution ran) or ``"raw_manifest"``
+    (degraded fallback -- neither is available).
 
-    ``resolver`` lets a caller (or a test) inject the real 02038afe
-    resolution directly without this module needing to know its final
-    name/shape -- call as ``resolver(db, project_id, requested)``.
+    ``resolver`` lets a caller (or a test) inject an alternate resolution
+    directly, taking priority over the default below -- call as
+    ``resolver(db, project_id, requested)`` (a plain SYNCHRONOUS callable,
+    matching the existing ``EffectiveResolver`` type -- it is invoked
+    without ``await`` on purpose so hand-written test doubles never need to
+    be coroutines).
 
-    TODO(02038afe): once profile inheritance merges, prefer calling its real
-    resolution function directly from the two call sites in
-    ``mcp/handlers/project_tools.py``/``mcp/handler.py`` via the
-    ``effective_resolver`` kwarg on :func:`build_capability_contract`, rather
-    than relying on the guessed auto-discovery below. The auto-discovery
-    (a plausibly-named ``meridian.capability_profile`` module, looked up by
-    dotted string via ``importlib`` rather than a static ``from``/``import``
-    statement -- see the module docstring's note on ``scripts/check_orphaned_refs.py``)
-    is a best-effort bridge only -- it is not a contract with the sibling
-    item and may need updating to match whatever name/shape 02038afe
-    actually ships. Guarded broadly (ModuleNotFoundError + AttributeError +
-    any resolver exception) so an absent, differently-shaped, or still-half-
-    built sibling module can never break start_session/generate_handoff.
+    137b88a3 (fixes 98aaccf4's original TODO): 02038afe has landed --
+    ``db.get_effective_capability_profile`` is the real, DB-backed,
+    already-tested implementation (workspace -> user -> project ->
+    sprint_version -> item merge via ``capability_profile.merge_layers``).
+    This calls it DIRECTLY as the default resolution, replacing the earlier
+    guessed auto-discovery that looked for a ``resolve_effective_capabilities``
+    / ``resolve_effective_manifest`` function on ``meridian.capability_profile``
+    -- that module never defined (and was never going to define) either name,
+    which left ``effective_source`` permanently stuck at ``"raw_manifest"`` in
+    production even after profile inheritance shipped.
+
+    IMPORTANT: ``db.get_effective_capability_profile`` resolves ONLY the
+    ``capability_profiles`` table's layers (workspace/user/project/
+    sprint_version/item, set via ``set_capability_profile``) -- it has no
+    knowledge of ``requested`` (the older 649e095f ``project_capabilities``
+    raw-manifest row, set via ``set_project_capability_manifest``/
+    ``set_capability_manifest``). The two are independent stores, and most
+    projects populate only the raw manifest and have never called
+    ``set_capability_profile`` at all. Blindly returning the profile
+    resolver's output AS "effective" would silently DROP every raw-manifest
+    capability id that no profile layer happens to also declare -- including
+    ``availability_policy: "required"`` ids the ``executable``/
+    ``missing_required`` check below reads straight out of
+    ``effective_capabilities`` (see :func:`build_capability_contract`), so a
+    real "required" capability could silently stop being enforced. So:
+
+    * No profile layer has contributed anything for this project (the
+      common case today) -> degrade to ``requested`` unchanged, source
+      ``"raw_manifest"`` -- byte-identical to the pre-fix degraded output
+      when nothing from 02038afe applies.
+    * A profile layer DID contribute something -> merge it on top of
+      ``requested`` via :func:`capability_profile.merge_layers` (the SAME
+      pure merge primitive ``get_effective_capability_profile`` itself
+      uses), with the raw manifest as the least-specific layer and the
+      resolved profile as the most-specific override -- so a profile can
+      refine/override individual ids, but an id only the raw manifest
+      declares is never silently lost. Source ``"profile_inheritance"``.
+
+    Guarded broadly so a DB error (unknown project, pre-migration schema,
+    etc.) degrades to ``"raw_manifest"`` rather than breaking the mandatory
+    start_session/generate_handoff contract build.
     """
     if resolver is not None:
         try:
@@ -388,22 +421,25 @@ def _resolve_effective_capabilities(
                 return resolved, "resolver"
         except Exception:  # noqa: BLE001 — an injected resolver must never crash the contract
             pass
-    _capability_profile = _import_optional_sibling("meridian.capability_profile")
-    if _capability_profile is None:
+    try:
+        profile = await db_module.get_effective_capability_profile(db, project_id)
+    except Exception:  # noqa: BLE001 — DB error must never crash the contract
         return requested, "raw_manifest"
-    _fn = (
-        getattr(_capability_profile, "resolve_effective_capabilities", None)
-        or getattr(_capability_profile, "resolve_effective_manifest", None)
-    )
-    if _fn is None:
+    profile_capabilities = profile.get("capabilities") if isinstance(profile, dict) else None
+    if not isinstance(profile_capabilities, list) or not profile_capabilities:
+        # No workspace/user/project/sprint_version/item profile layer has
+        # anything to contribute -- nothing to layer on top of the raw
+        # manifest, so degrade to it directly rather than claiming a
+        # "profile_inheritance" source that did not actually change anything.
         return requested, "raw_manifest"
     try:
-        resolved = _fn(project_id, requested)
-        if isinstance(resolved, list):
-            return resolved, "profile_inheritance"
-    except Exception:  # noqa: BLE001 — sibling module may still be half-built
-        pass
-    return requested, "raw_manifest"
+        merged, *_rest = _capability_profile.merge_layers([
+            {"layer": "raw_manifest", "capabilities": requested, "disabled_capability_ids": []},
+            {"layer": "capability_profile", "capabilities": profile_capabilities, "disabled_capability_ids": []},
+        ])
+    except Exception:  # noqa: BLE001 — malformed profile data must never crash the contract
+        return requested, "raw_manifest"
+    return merged, "profile_inheritance"
 
 
 def _resolve_availability(
@@ -822,7 +858,7 @@ async def build_capability_contract(
         item_routing_summary = []
         item_routing_summary_hash = None
 
-    effective_capabilities, effective_source = _resolve_effective_capabilities(
+    effective_capabilities, effective_source = await _resolve_effective_capabilities(
         db, project_id, requested_capabilities, resolver=effective_resolver,
     )
     availability_result, availability_status = _resolve_availability(

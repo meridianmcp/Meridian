@@ -973,6 +973,19 @@ No auth required.
 | `GET` | `/privacy` | Static Privacy Policy page |
 
 
+### `/profile-layers`
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/profile-layers` | List every persisted profile_layers row, optionally filtered by |
+| `POST` | `/profile-layers/{scope_id}/activate` | Advance a hosted_default layer's lifecycle to 'active'. hosted_default |
+| `GET` | `/profile-layers/{scope_id}/revisions` | Return the hosted_default revision/audit history for one scope_id, |
+| `DELETE` | `/profile-layers/{scope_type}/{scope_id}` | Delete a scope's entire profile-layer row. Returns 200 with the |
+| `GET` | `/profile-layers/{scope_type}/{scope_id}` | Return the raw, single-layer profile for one (scope_type, scope_id) |
+| `PUT` | `/profile-layers/{scope_type}/{scope_id}` | Validate and persist one layer's profile — wholesale-replaces this |
+| `POST` | `/profile-layers/{scope_type}/{scope_id}/clone` | Copy one layer's fields/reset_fields/provenance onto another scope |
+
+
 ### `/projects`
 
 | Method | Path | Description |
@@ -1001,6 +1014,7 @@ No auth required.
 | `GET` | `/projects/{project_id}/document-review` | b67ec6b5 — non-mutating DOCX review for the dashboard review panel |
 | `GET` | `/projects/{project_id}/document-structure` | 3f596f81 — heading-tree structure of an ingested .docx for the Documents |
 | `POST` | `/projects/{project_id}/documents/upload` | f1c7e7d1 — tunnel-free document upload (plain .txt/.md only, v1) |
+| `GET` | `/projects/{project_id}/effective-profile` | Resolve and return the merged profile for a project across every |
 | `POST` | `/projects/{project_id}/events` | Normalize a framework event into Meridian's task_log |
 | `GET` | `/projects/{project_id}/export/pdf` | Generate a tamper-evident IP attribution PDF for the project |
 | `GET` | `/projects/{project_id}/files` | Return the list of editable markdown files for a project |

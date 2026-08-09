@@ -970,6 +970,9 @@ def test_tunnel_status_reports_active_sockets():
         "config_generation": {},
         "inflight": {},
         "safe_to_restart": True,
+        # 89a06e40 — None when called directly with no Request (see
+        # tunnel_status's own docstring) — this test's calling style.
+        "profile_binding": None,
     }
 
 

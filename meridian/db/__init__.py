@@ -1137,6 +1137,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_decision_evidence(db)
     await _migrate_ai_log_events_table(db)
     await _migrate_proposal_intake_drafts(db)
+    await _migrate_profile_layers(db)
     return db
 
 
@@ -12606,4 +12607,30 @@ from .ai_log import (  # noqa: F401
     get_event,
     list_events,
     purge_events_before,
+)
+
+
+# d8481276 — versioned hosted-default/scoped-profile persistence (PROFILE-1
+# contract, meridian.profile_contract). Imported after get_project/
+# get_project_settings are already bound onto this module's namespace (both
+# defined earlier in this file) — profile_layers.get_effective_profile reads
+# them at call time via `from meridian.db import ...`, not at import time, so
+# strict ordering isn't load-bearing here, but this placement matches the
+# other db/*.py submodules' "imported after its dependencies" convention.
+from .profile_layers import (  # noqa: F401
+    get_profile_layer,
+    list_profile_layers,
+    set_profile_layer,
+    reset_profile_layer,
+    transition_hosted_default_lifecycle,
+    get_profile_layer_revisions,
+    get_effective_profile,
+    clone_profile_layer,
+    # 89a06e40 — tenant/workspace-only resolution for the tunnel/connector
+    # surface (no project_id available there); see profile_layers.py's
+    # docstring and pinned decision ee7bccc9.
+    get_workspace_effective_profile,
+    # 77369699 — exact-revision rollback restore for batch_mutate's
+    # profile_layer compensation path (db/batch_management.py).
+    _restore_profile_layer_row,
 )
