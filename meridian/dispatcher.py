@@ -380,10 +380,53 @@ class Dispatcher:
     async def dispatch_once(self) -> list[dict[str, Any]]:
         """Run a single dispatch pass; return the task rows enqueued this pass.
 
-        Dispatches the first parallelizable group, skipping any item already
-        dispatched in this process, and stops once the pass's deterministic
-        ``effective_parallelism`` (see ``executor_config.resolve_parallelism``)
-        is reached so the number of live workers stays bounded.
+        272d8f2c — DYNAMIC FRONTIER ADMISSION: this pass walks every
+        dependency-satisfied, server-colored group returned by
+        ``get_parallelizable_groups`` (``groups[0]``, ``groups[1]``, ...),
+        not only ``groups[0]``, so a pass never idles leftover capacity just
+        because the first group happened to be smaller than
+        ``effective_parallelism`` or lost members to quarantine, a
+        merger-lock skip, or a failed enqueue.
+
+        Two DIFFERENT groups returned by ``get_parallelizable_groups`` are
+        NOT guaranteed to be mutually conflict-free — the server's greedy
+        first-fit coloring only guarantees each group is conflict-free
+        WITHIN itself; an item lands in ``groups[i]`` precisely BECAUSE it
+        conflicted with something already placed in every earlier group's
+        used-resource set at the time it was colored. So this method never
+        trusts cross-group disjointness: it walks every group's items in the
+        server's own order (``groups[0]`` first, preserving both the
+        across- and within-group priority-first ordering the coloring
+        already encodes) and independently re-verifies — via the SAME
+        file:/symbol:-hierarchy-aware conflict test the server's own
+        coloring uses (:func:`meridian.db._resource_sets_conflict`) — that a
+        candidate does not conflict with anything THIS pass has actually
+        admitted so far. An item with NO declared resources (undeclared —
+        de730a25) can never be proven disjoint from anything, so it is only
+        admitted when nothing else has been admitted yet this pass, and
+        nothing else may join it afterward — the server's own "each
+        undeclared item is its own sequential group" invariant, re-applied
+        dynamically here instead of only at group-construction time.
+
+        FAILURE RE-FRONTIERING: an item is skipped this pass (never folded
+        into the admitted-resources set) whenever it's already dispatched,
+        quarantined, conflicts with what's already been admitted, loses a
+        merger-lock race, or its enqueue call raises. Because the
+        admitted-resources set only ever reflects what ACTUALLY got
+        enqueued — never the server's precomputed group membership — any one
+        of those skips genuinely reopens the frontier: a later candidate,
+        from ANY subsequent group, that only conflicted with the SKIPPED
+        item is free to be admitted instead, up to
+        ``effective_parallelism``. This is what turns "one quarantined item
+        (or one bad enqueue) stalls this pass's whole batch" into "the pass
+        fills capacity with whatever else is safe."
+
+        ``effective_parallelism`` itself (see
+        ``executor_config.resolve_parallelism``) is computed exactly as
+        before this feature — from ``groups[0]``'s size as
+        ``resource_safe_capacity`` — so existing capacity diagnostics
+        (``self.last_parallelism``) are unchanged; only how that capacity is
+        SPENT changed.
 
         b108f2e0 — typed blocker triage runs BEFORE any enqueue this pass:
 
@@ -394,9 +437,10 @@ class Dispatcher:
           spec's "preserve explicit fail-closed stops" requirement.
         * Otherwise, any item in ``quarantined_item_ids`` is SKIPPED (never
           enqueued) but does NOT stop the pass — other, disjoint items in
-          the same group still dispatch normally. This is the actual fix
-          for the incident this module exists for: one under-scoped item
-          no longer halts an otherwise-executable autonomous run.
+          this OR any later group still dispatch normally (frontier
+          admission above). This is the actual fix for the incident this
+          module exists for: one under-scoped item no longer halts an
+          otherwise-executable autonomous run.
 
         Best-effort: a failure evaluating blockers degrades to "no
         quarantine this pass" (dispatch proceeds unfiltered) rather than
@@ -473,6 +517,13 @@ class Dispatcher:
         # OTHER input (e.g. an unreported host_limit) happens to be unknown —
         # an unknown host_limit is simply excluded from the min(), never
         # treated as 1.
+        #
+        # 272d8f2c — this stays anchored to groups[0]'s size, unchanged from
+        # before dynamic frontier admission: effective_parallelism is a
+        # CEILING on how much this pass may enqueue, not a claim about how
+        # much of that ceiling groups[0] alone can fill. The frontier
+        # admission loop below spends leftover capacity out of later
+        # groups; it never raises the ceiling itself.
         requested = (
             self.requested_parallelism
             if self.requested_parallelism is not None
@@ -496,58 +547,105 @@ class Dispatcher:
         # promotion for; a second item in the same pass sharing that target
         # is deferred to a later pass rather than raced against the first.
         claimed_targets_this_pass: set[str] = set()
-        # Only the first group is safe to fan out simultaneously; later groups
-        # depend on it draining. Run one group per pass.
-        for item in first_group:
-            item_id = item.get("id")
-            if not item_id or item_id in self._dispatched:
-                continue
-            if item_id in quarantined:
-                # Quarantined — skip THIS item only; other disjoint items in
-                # the group keep dispatching normally (quarantine_continue).
-                continue
+        # 272d8f2c — resources THIS pass has actually admitted so far (never
+        # the server's precomputed group membership — see the docstring's
+        # "dynamic frontier admission" section). Grown only on a SUCCESSFUL
+        # enqueue, so a skip (quarantine, merger-lock, conflict, or a raised
+        # enqueue) never blocks a later candidate that only conflicted with
+        # whatever got skipped — that reopening is "failure re-frontiering."
+        admitted_resources: set[str] = set()
+        # True once an item with NO declared resources has been admitted.
+        # Its footprint can't be proven disjoint from anything, so nothing
+        # else may join it this pass (de730a25's "own sequential group"
+        # invariant, enforced dynamically here instead of only at
+        # group-construction time).
+        undeclared_admitted = False
+        # Walk every group in the server's own order — groups[0] first — so
+        # the coloring's priority-first construction keeps being honored: a
+        # later group's item is only ever considered once every
+        # dependency-satisfied, non-conflicting candidate ahead of it
+        # (across ALL groups scanned so far this pass) has already had its
+        # shot at admission.
+        for group in groups:
             if in_flight >= cap:
                 break
-            promotion_target = _promotion_target_for_item(item)
-            if promotion_target is not None:
-                try:
-                    lock_status = await artifact_declaration_module.get_promotion_merger_lock(
-                        self.db, promotion_target, self.project_id,
-                    )
-                except Exception:  # noqa: BLE001 — a lock-status read failure never blocks dispatch
-                    logger.exception(
-                        "merger-lock status check failed for target %s", promotion_target,
-                    )
-                    lock_status = None
-                held_by_other = bool((lock_status or {}).get("file_lock"))
-                if held_by_other or promotion_target in claimed_targets_this_pass:
-                    self.last_merger_lock_skips.append({
-                        "item_id": item_id,
-                        "target": promotion_target,
-                        "reason": (
-                            "merger lock held by another live session"
-                            if held_by_other
-                            else "another item in this same pass already claims this target"
-                        ),
-                    })
+            for item in group:
+                item_id = item.get("id")
+                if not item_id or item_id in self._dispatched:
                     continue
-                claimed_targets_this_pass.add(promotion_target)
-            session_id = await self._ensure_session()
-            prompt = _worker_prompt(item, self.project_id)
-            try:
-                task = await self._enqueue(
-                    self.db,
-                    session_id,
-                    self.project_id,
-                    prompt,
-                )
-            except Exception:  # noqa: BLE001 — one bad enqueue must not abort the pass
-                logger.exception("failed to enqueue worker for item %s", item_id)
-                continue
-            # Mark dispatched only after a successful enqueue so a failure is retried.
-            self._dispatched.add(item_id)
-            in_flight += 1
-            enqueued.append(task)
+                if item_id in quarantined:
+                    # Quarantined — skip THIS item only; other disjoint
+                    # items (in this or a later group) keep dispatching
+                    # normally (quarantine_continue).
+                    continue
+                if in_flight >= cap:
+                    break
+                item_resources = set(item.get("resources") or [])
+                if item_resources:
+                    if undeclared_admitted or db_module._resource_sets_conflict(
+                        item_resources, admitted_resources,
+                    ):
+                        # Conflicts with something THIS pass already
+                        # admitted (from an earlier group, or an earlier
+                        # item in this same group) — leave it for a future
+                        # pass rather than racing a worker whose own
+                        # claim_sprint_item resource lock would just fail.
+                        continue
+                elif enqueued:
+                    # Undeclared item, but something (declared or
+                    # undeclared) already admitted this pass — an
+                    # undeclared item can't prove it's disjoint from that,
+                    # so it waits for an uncontested pass.
+                    continue
+                promotion_target = _promotion_target_for_item(item)
+                if promotion_target is not None:
+                    try:
+                        lock_status = await artifact_declaration_module.get_promotion_merger_lock(
+                            self.db, promotion_target, self.project_id,
+                        )
+                    except Exception:  # noqa: BLE001 — a lock-status read failure never blocks dispatch
+                        logger.exception(
+                            "merger-lock status check failed for target %s", promotion_target,
+                        )
+                        lock_status = None
+                    held_by_other = bool((lock_status or {}).get("file_lock"))
+                    if held_by_other or promotion_target in claimed_targets_this_pass:
+                        self.last_merger_lock_skips.append({
+                            "item_id": item_id,
+                            "target": promotion_target,
+                            "reason": (
+                                "merger lock held by another live session"
+                                if held_by_other
+                                else "another item in this same pass already claims this target"
+                            ),
+                        })
+                        continue
+                    claimed_targets_this_pass.add(promotion_target)
+                session_id = await self._ensure_session()
+                prompt = _worker_prompt(item, self.project_id)
+                try:
+                    task = await self._enqueue(
+                        self.db,
+                        session_id,
+                        self.project_id,
+                        prompt,
+                    )
+                except Exception:  # noqa: BLE001 — one bad enqueue must not abort the pass
+                    logger.exception("failed to enqueue worker for item %s", item_id)
+                    # 272d8f2c — failure re-frontiering: do NOT mark
+                    # dispatched and do NOT fold this item's resources into
+                    # admitted_resources/undeclared_admitted, so a later
+                    # candidate that only conflicted with THIS item still
+                    # gets a fair shot at the freed capacity this pass.
+                    continue
+                # Mark dispatched only after a successful enqueue so a failure is retried.
+                self._dispatched.add(item_id)
+                if item_resources:
+                    admitted_resources.update(item_resources)
+                else:
+                    undeclared_admitted = True
+                in_flight += 1
+                enqueued.append(task)
         return enqueued
 
 
