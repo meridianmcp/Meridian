@@ -4929,16 +4929,45 @@ async def _annotate_code_pointers(
     if not registry:
         return pending_items
     _priority = priority_ids or frozenset()
-    # 3cab355a — the cap is computed over NON-priority items only: split first,
-    # then take the tail of that ordinary-item subsequence as the capped-out
-    # set. A priority item is never in this set no matter where it sits in
-    # ``pending_items``. When ``priority_ids`` is empty (every pre-existing
-    # call site), ``_ordinary`` is exactly ``pending_items`` and this reduces
-    # to the original ``pending_items[_MAX_ENRICHED_ITEMS:]`` slice — zero
-    # behavior change for callers that don't pass it.
-    _ordinary = [it for it in pending_items if it.get("id") not in _priority]
+
+    def _needs_prospect_capacity(it: dict[str, Any]) -> bool:
+        """23a7c721 — an item only consumes enrichment-cap capacity when this
+        pass would actually issue a fresh prospector search for it. A manual
+        item is never searched (always ``skipped_manual``) and, absent
+        ``reprospect=True``, an item that already carries a pointer from a
+        prior run is left alone (``cached``) rather than re-searched — see
+        the two branches below. The confirmed bug (23a7c721): the OLD cap was
+        purely POSITIONAL over every non-priority item, so on a live board
+        where most earlier items are long since manual/cached (and therefore
+        free — no search call either way), a handful of newly created items
+        with durable ``touches_resources`` landed past the cap and came back
+        ``skipped_cap`` purely because >= ``_MAX_ENRICHED_ITEMS`` earlier
+        items preceded them in list order, not because prospecting capacity
+        was genuinely exhausted. Scoping the cap to items that actually need
+        a fresh search this pass gives new/uncached items their fair share of
+        capacity instead of losing slots to no-op manual/cached items.
+        """
+        if _is_manual_sprint_item(it):
+            return False
+        if not reprospect and (it.get("code_pointers") or it.get("pointers")):
+            return False
+        return True
+
+    # 3cab355a / 23a7c721 — the cap is computed over NON-priority items that
+    # actually need prospecting capacity this pass: split first, then take
+    # the tail of that subsequence as the capped-out set. A priority item is
+    # never in this set no matter where it sits in ``pending_items``. On a
+    # fresh board where every item still needs prospecting (no manual items,
+    # no cached pointers yet — the original ``pending_items[_MAX_ENRICHED_ITEMS:]``
+    # scenario), this is identical to the pre-23a7c721 purely-positional cap.
+    _ordinary_needing_capacity = [
+        it for it in pending_items
+        if it.get("id") not in _priority and _needs_prospect_capacity(it)
+    ]
     _capped_ids = {
-        it.get("id") for it in _ordinary[_MAX_ENRICHED_ITEMS:] if it.get("id")
+        it.get("id")
+        for it in _ordinary_needing_capacity[_MAX_ENRICHED_ITEMS:]
+        if it.get("id")
     }
     # 182468a6 — surface the cap instead of silently dropping items past it: any
     # non-manual item beyond the enrichment cap is marked skipped_cap so the caller

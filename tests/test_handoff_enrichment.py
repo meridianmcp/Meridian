@@ -857,6 +857,123 @@ async def test_annotate_priority_ids_none_is_backward_compatible():
 
 
 # ---------------------------------------------------------------------------
+# 23a7c721 — confirmed bad-handoff regression: the enrichment cap used to be
+# purely POSITIONAL over every non-priority item, so on a live board where
+# most EARLIER items already had cached pointers (or were manual — never
+# searched either way), a handful of newly created items with durable
+# touches_resources landed past the cap and came back skipped_cap even though
+# no real prospecting capacity had actually been spent on them. The cap must
+# be scoped to items that genuinely need a fresh search this pass.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_annotate_cached_items_do_not_consume_cap_capacity():
+    """A large run of items with cached pointers preceding a small tail of
+    genuinely new items must NOT push the new items past the cap — caching
+    frees capacity, it doesn't spend it."""
+    cap = handoff_module._MAX_ENRICHED_ITEMS
+    cached = [
+        {
+            "id": f"cached{n}", "title": f"already pointed item {n}", "status": "pending",
+            "code_pointers": [{"file": "old.py", "function": "f", "qualified_name": "f"}],
+        }
+        for n in range(cap + 10)
+    ]
+    new_items = [
+        {"id": f"new{n}", "title": f"newly created item {n}", "status": "pending"}
+        for n in range(3)
+    ]
+    items = cached + new_items
+
+    def searcher(query):
+        return [{"file": "fresh.py", "function": "g", "qualified_name": "g"}]
+
+    out = await handoff_module._annotate_code_pointers(items, searcher)
+    by_id = {it["id"]: it for it in out}
+    # Every cached item stays cached (no capacity spent, no re-search).
+    assert all(by_id[f"cached{n}"]["prospect_status"] == "cached" for n in range(cap + 10))
+    # None of the new items were pushed into skipped_cap despite sitting
+    # after cap+10 cached items positionally.
+    for n in range(3):
+        assert by_id[f"new{n}"]["prospect_status"] == "prospected"
+        assert by_id[f"new{n}"]["code_pointers"][0]["file"] == "fresh.py"
+
+
+@pytest.mark.asyncio
+async def test_annotate_manual_items_do_not_consume_cap_capacity():
+    """MANUAL items are never searched regardless of cap position, so a run
+    of manual items ahead of real items must not eat into the cap."""
+    cap = handoff_module._MAX_ENRICHED_ITEMS
+    manual = [
+        {"id": f"manual{n}", "title": f"MANUAL: publish blog post {n}", "status": "pending"}
+        for n in range(cap + 5)
+    ]
+    new_items = [
+        {"id": f"new{n}", "title": f"newly created item {n}", "status": "pending"}
+        for n in range(2)
+    ]
+    items = manual + new_items
+
+    def searcher(query):
+        return [{"file": "fresh.py", "function": "g", "qualified_name": "g"}]
+
+    out = await handoff_module._annotate_code_pointers(items, searcher)
+    by_id = {it["id"]: it for it in out}
+    assert all(by_id[f"manual{n}"]["prospect_status"] == "skipped_manual" for n in range(cap + 5))
+    for n in range(2):
+        assert by_id[f"new{n}"]["prospect_status"] == "prospected"
+
+
+@pytest.mark.asyncio
+async def test_annotate_cap_still_applies_to_genuinely_new_items():
+    """The cap remains a real, fail-closed limit: when the number of items
+    that ACTUALLY need a fresh search this pass exceeds the cap, the overflow
+    is still marked skipped_cap — capacity accounting changed, not the cap
+    being effectively removed."""
+    cap = handoff_module._MAX_ENRICHED_ITEMS
+    items = [
+        {"id": f"i{n}", "title": f"pending item {n}", "status": "pending"}
+        for n in range(cap + 4)
+    ]
+
+    def searcher(query):
+        return [{"file": "f.py", "function": "g", "qualified_name": "g"}]
+
+    out = await handoff_module._annotate_code_pointers(items, searcher)
+    capped = [it for it in out if it.get("prospect_status") == "skipped_cap"]
+    prospected = [it for it in out if it.get("prospect_status") == "prospected"]
+    assert len(capped) == 4
+    assert len(prospected) == cap
+
+
+@pytest.mark.asyncio
+async def test_annotate_reprospect_true_counts_cached_items_toward_cap():
+    """With reprospect=True every non-manual item DOES need a fresh search
+    (the cache is deliberately bypassed), so cached items go back to
+    consuming cap capacity exactly like the pre-23a7c721 positional cap."""
+    cap = handoff_module._MAX_ENRICHED_ITEMS
+    items = [
+        {
+            "id": f"i{n}", "title": f"pending item {n}", "status": "pending",
+            "code_pointers": [{"file": "old.py", "function": "f", "qualified_name": "f"}],
+        }
+        for n in range(cap + 3)
+    ]
+
+    def searcher(query):
+        return [{"file": "fresh.py", "function": "g", "qualified_name": "g"}]
+
+    out = await handoff_module._annotate_code_pointers(items, searcher, reprospect=True)
+    capped = [it for it in out if it.get("prospect_status") == "skipped_cap"]
+    reprospected = [it for it in out if it.get("prospect_status") == "prospected"]
+    assert len(capped) == 3
+    assert len(reprospected) == cap
+    # A capped item's cache is untouched (never reached the re-search path).
+    assert all(it["code_pointers"][0]["file"] == "old.py" for it in capped)
+
+
+# ---------------------------------------------------------------------------
 # 3cab355a — _resolve_force_included_items: validation + rejection
 # reporting for force_include_ids (project/version/status scope).
 # ---------------------------------------------------------------------------
