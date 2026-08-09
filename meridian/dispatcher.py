@@ -336,6 +336,16 @@ class Dispatcher:
         # caller/dashboard can see the last completed/failed child worker
         # this dispatcher accounted for without polling _active_leases.
         self.last_released_lease: "dict[str, Any] | None" = None
+        # 769e24a7 — diagnostics: every time ``release_worker_lease`` is
+        # called with an ``expected_seq`` that no longer matches the CURRENT
+        # active lease for that item_id (a late/stale completion signal for
+        # an attempt that has since been superseded by a newer one), the
+        # attempted release is recorded here instead of being applied. []
+        # until the first such collision — most dispatchers will never see
+        # one, since a single Dispatcher instance never re-dispatches an
+        # item_id already in ``self._dispatched``. Exists to make attempt-id
+        # safety auditable/testable, not just asserted in prose.
+        self.last_stale_release_attempts: list[dict[str, Any]] = []
 
         def _record_worker_lease(
             item_id: str, task: "dict[str, Any] | None" = None,
@@ -349,16 +359,35 @@ class Dispatcher:
             ``item_id``: re-registers (refreshes ``task``/``seq``) rather
             than raising, since a retried enqueue path must never be able
             to corrupt lease state.
+
+            769e24a7 — ``self._lease_seq`` (post-increment, stored as
+            ``seq`` below) doubles as the unique attempt/lease id required
+            to tell "this attempt's completion signal" apart from "a LATER
+            attempt for the same item_id's completion signal": it strictly
+            increases across the whole dispatcher instance, so two
+            registrations for the same ``item_id`` can never collide on the
+            same ``seq``. ``task_id`` is pulled out of ``task`` (when it is
+            a dict shaped like an ``enqueue_claude_task``/``task_log`` row)
+            purely as a convenience for :meth:`reconcile_active_leases`,
+            which needs a DB row to poll — it carries no attempt-identity
+            meaning of its own (``seq`` does).
             """
             self._lease_seq += 1
+            task_id = task.get("id") if isinstance(task, dict) else None
             self._active_leases[item_id] = {
                 "item_id": item_id,
                 "task": task,
+                "task_id": task_id,
                 "seq": self._lease_seq,
                 "status": "active",
             }
 
-        def _release_worker_lease(item_id: str, status: str = "completed") -> None:
+        def _release_worker_lease(
+            item_id: str,
+            status: str = "completed",
+            *,
+            expected_seq: "int | None" = None,
+        ) -> None:
             """Remove ``item_id`` from ACTIVE accounting — capacity release.
 
             This is the release half of the lease lifecycle: a completed or
@@ -372,7 +401,34 @@ class Dispatcher:
             ``item_id`` with no active lease (already released, released
             twice, or never registered) — that is a normal race in an async
             dispatch loop, never an error condition.
+
+            769e24a7 — ``expected_seq`` (keyword-only, default ``None``) is
+            the attempt-id safety valve: when the CALLER knows which attempt
+            it observed complete (e.g. :meth:`reconcile_active_leases`
+            snapshots a lease's ``seq`` before awaiting a DB read), passing
+            that ``seq`` here guarantees a late/stale completion signal for
+            an OLDER attempt can never release a NEWER attempt's lease — if
+            the currently-active lease's ``seq`` no longer matches
+            ``expected_seq``, this call is a no-op (recorded in
+            ``self.last_stale_release_attempts`` for diagnostics) rather
+            than releasing the wrong attempt. Omitting ``expected_seq``
+            (the default) preserves this method's exact pre-769e24a7
+            behavior byte-for-byte — every existing caller/test that never
+            passes it sees zero change.
             """
+            current = self._active_leases.get(item_id)
+            if (
+                expected_seq is not None
+                and current is not None
+                and current.get("seq") != expected_seq
+            ):
+                self.last_stale_release_attempts.append({
+                    "item_id": item_id,
+                    "attempted_status": status,
+                    "expected_seq": expected_seq,
+                    "active_seq": current.get("seq"),
+                })
+                return
             released = self._active_leases.pop(item_id, None)
             self.last_released_lease = {
                 "item_id": item_id,
@@ -447,6 +503,81 @@ class Dispatcher:
             )
             self._session_id = session["id"]
         return self._session_id
+
+    async def reconcile_active_leases(self) -> list[dict[str, Any]]:
+        """769e24a7 — pull-based completion reconciliation for ACTIVE leases.
+
+        This is the actual RELEASE half of the worker-lifecycle fix: for
+        every ``item_id`` currently in ``self._active_leases``, look up its
+        lease's ``task_id`` (recorded by ``record_worker_lease`` from the
+        task row the enqueue call returned) and read that task's CURRENT
+        persisted ``task_log`` status. A lease whose task has reached a
+        terminal status (``done`` or ``failed`` — covering normal
+        completion, explicit failure, a worker timeout, AND a process-death
+        detection, since :func:`meridian.enqueue._run_worker` and the
+        server's PID watchdog (``_auto_summary_loop``) both funnel every one
+        of those outcomes through the exact same ``update_task(status=...)``
+        call) is released via ``self.release_worker_lease``.
+
+        Why reconciliation instead of (or in addition to) a push callback:
+        this dispatcher's ``_active_leases`` already holds everything needed
+        to poll — the item_id -> task_id association — so no new coupling
+        between ``enqueue.py``/``server.py`` and lease internals is required;
+        those modules stay entirely unaware that leases exist. It is also
+        naturally RESTART-SAFE: a freshly constructed ``Dispatcher`` (e.g.
+        after a process restart) starts with an empty ``_active_leases``, so
+        there is nothing stale to reconcile and capacity begins at zero
+        (never leaked, never phantom) — no separate "recover after restart"
+        code path is needed.
+
+        Attempt-id safety: the ``seq`` compared against is SNAPSHOTTED from
+        each lease before the (yielding) ``await db_module.get_task(...)``
+        call, then passed as ``expected_seq`` to ``release_worker_lease`` —
+        so if some other path re-registered a NEWER attempt for the same
+        item_id while this call was awaiting the DB, the stale read can
+        never release the newer attempt's lease (see
+        ``release_worker_lease``'s own docstring).
+
+        Best-effort per item: a DB read failure for one task_id is logged
+        and skipped, never allowed to abort reconciliation for the other
+        active leases (same "must not break dispatch" contract as blocker
+        evaluation / the lease sweep above). Returns the list of
+        ``{"item_id", "task_id", "status", "seq"}`` entries this call
+        actually released (empty when nothing was terminal yet — the normal
+        case on most passes).
+        """
+        released: list[dict[str, Any]] = []
+        for item_id, lease in list(self._active_leases.items()):
+            task_id = lease.get("task_id")
+            if not task_id:
+                # No task row to poll (e.g. a test-injected lease, or a
+                # fake enqueue_fn that doesn't return a real task_log row)
+                # — nothing this method can safely decide, so leave it
+                # alone rather than guessing.
+                continue
+            expected_seq = lease.get("seq")
+            try:
+                row = await db_module.get_task(self.db, task_id)
+            except Exception:  # noqa: BLE001 — one bad read must not break reconciliation
+                logger.exception(
+                    "lease reconciliation: failed to read task %s for item %s",
+                    task_id, item_id,
+                )
+                continue
+            if row is None:
+                continue
+            status = row.get("status")
+            if status not in ("done", "failed"):
+                continue
+            self.release_worker_lease(item_id, status=status, expected_seq=expected_seq)
+            if item_id not in self._active_leases:
+                released.append({
+                    "item_id": item_id,
+                    "task_id": task_id,
+                    "status": status,
+                    "seq": expected_seq,
+                })
+        return released
 
     async def dispatch_once(self) -> list[dict[str, Any]]:
         """Run a single dispatch pass; return the task rows enqueued this pass.
@@ -534,8 +665,44 @@ class Dispatcher:
         check plus the lock itself, enforced wherever a promotion is
         actually applied. See ``self.last_merger_lock_skips`` for
         diagnostics.
+
+        769e24a7 — ACTIVE LEASE ACCOUNTING replaces ``len(self._dispatched)``
+        with ``len(self._active_leases)`` as the capacity denominator.
+        ``self._dispatched`` only ever grows (permanent per-process
+        dedup/history — an item is never re-dispatched once it lands there,
+        regardless of lease status); using it for capacity meant a
+        long-running dispatcher's effective concurrency silently throttled
+        toward zero as workers finished, since nothing ever shrank it. This
+        pass's very first action is ``await self.reconcile_active_leases()``
+        — a best-effort, idempotent, attempt-id-safe pull that releases any
+        active lease whose task has reached a terminal ``task_log`` status
+        (``done``/``failed``, which covers normal completion, explicit
+        failure, worker timeout, AND process-death detection — see that
+        method's docstring) — so capacity genuinely frees up, and a release
+        earlier in THIS SAME pass is immediately visible to the admission
+        loop below (both "capacity actually releases" and "re-frontier
+        after a release" from this item's own notes fall out of that
+        ordering for free, no separate wake-up needed for a same-pass
+        release). Each successful enqueue below also registers a NEW active
+        lease (``self.record_worker_lease``) and passes an ``on_complete``
+        hook that wakes this dispatcher's own run loop
+        (``self.trigger()``) the moment that worker's task reaches a
+        terminal status, rather than waiting up to ``self.interval``
+        seconds for the next scheduled pass to notice via reconciliation —
+        pure responsiveness; the ACTUAL release still only ever happens
+        through the attempt-id-safe reconciliation path.
         """
         self.last_merger_lock_skips = []
+        try:
+            reconciled = await self.reconcile_active_leases()
+            if reconciled:
+                logger.info(
+                    "dispatcher: reconciled %d completed worker lease(s): %s",
+                    len(reconciled),
+                    [r.get("item_id") for r in reconciled],
+                )
+        except Exception:  # noqa: BLE001 — reconciliation must never break dispatch
+            logger.exception("active-lease reconciliation failed")
         try:
             decision = await self._evaluate_blockers(
                 self.db, self.project_id, version=self.version,
@@ -609,7 +776,11 @@ class Dispatcher:
         self.last_parallelism = parallelism
         cap = parallelism["effective_parallelism"]
 
-        in_flight = len(self._dispatched)
+        # 769e24a7 — ACTIVE lease count, not the permanent _dispatched
+        # ledger: see this method's docstring. reconcile_active_leases()
+        # already ran above, so this reflects capacity genuinely freed by
+        # any worker that has completed as of this pass.
+        in_flight = len(self._active_leases)
         if in_flight >= cap:
             return []
 
@@ -700,6 +871,18 @@ class Dispatcher:
                         session_id,
                         self.project_id,
                         prompt,
+                        # 769e24a7 — best-effort responsiveness hook: wakes
+                        # this dispatcher's own loop the instant this
+                        # worker's task reaches a terminal status, instead
+                        # of waiting up to `interval` seconds for the next
+                        # scheduled pass to discover it via reconciliation.
+                        # Carries no item/lease identity of its own (a
+                        # generic "something finished, go look" signal) —
+                        # the real, attempt-id-safe release always happens
+                        # in reconcile_active_leases, never here. A fake
+                        # enqueue_fn (tests) that doesn't accept/forward
+                        # this kwarg simply never triggers it; harmless.
+                        on_complete=lambda _row: self.trigger(),
                     )
                 except Exception:  # noqa: BLE001 — one bad enqueue must not abort the pass
                     logger.exception("failed to enqueue worker for item %s", item_id)
@@ -711,6 +894,13 @@ class Dispatcher:
                     continue
                 # Mark dispatched only after a successful enqueue so a failure is retried.
                 self._dispatched.add(item_id)
+                # 769e24a7 — register the ACTIVE lease this successful
+                # enqueue opened. Additive to (never a replacement for) the
+                # _dispatched dedup marker above; see record_worker_lease's
+                # own docstring for why this refresh-not-raise on a repeat
+                # item_id is safe and what "seq" means for attempt-id
+                # safety.
+                self.record_worker_lease(item_id, task=task)
                 if item_resources:
                     admitted_resources.update(item_resources)
                 else:

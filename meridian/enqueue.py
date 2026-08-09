@@ -27,6 +27,19 @@ import aiosqlite
 
 from . import db as db_module
 
+# 769e24a7 — optional completion-notification hook, called with the FINAL
+# task_log row (or a minimal {"id", "status"} fallback if the DB update
+# itself returned None) once a worker reaches ANY terminal outcome — done,
+# failed, timeout, spawn error, or cancellation. May be sync or async.
+# Never required: every existing caller that doesn't pass one gets
+# byte-identical behavior to before this hook existed. See
+# meridian.dispatcher.Dispatcher.dispatch_once for the production consumer
+# (a lightweight "wake the loop" signal — the actual capacity-release
+# accounting lives in Dispatcher.reconcile_active_leases, deliberately kept
+# out of this lower-level module, which has no concept of sprint items or
+# leases).
+OnCompleteFn = "Callable[[dict[str, Any]], Any] | None"
+
 # Marker prefix so other sessions reading the task log can spot enqueued
 # Claude tasks at a glance.
 PROMPT_PREFIX = "[enqueued-claude-task] "
@@ -147,12 +160,16 @@ async def _run_worker(
     prompt: str,
     argv: list[str],
     timeout: float | None,
+    *,
+    on_complete: OnCompleteFn = None,
 ) -> None:
     """Background coroutine: run the subprocess and update the task row.
 
-    Never raises — failures are recorded on the task row as ``failed``.
-    Each result branch returns; the caller awaits this coroutine only in
-    tests (production fires it via :func:`asyncio.create_task`).
+    Never raises on a NORMAL (non-cancelled) exit — failures are recorded on
+    the task row as ``failed``. Each result branch reaches the single
+    ``_finish`` exit point below and returns; the caller awaits this
+    coroutine only in tests (production fires it via
+    :func:`asyncio.create_task`).
 
     49e06bcb — routes to one of two lightweight worker execution classes
     (module-level ``SESSION_WORKER`` / ``DETERMINISTIC_WORKER``) based on
@@ -164,86 +181,126 @@ async def _run_worker(
     policy are identical across classes. A prompt with no marker (every
     pre-49e06bcb caller) is ``SESSION_WORKER``, i.e. byte-identical to
     this function's prior behavior.
+
+    769e24a7 — two additions, both purely additive over the pre-existing
+    branches above:
+
+    * ``on_complete`` (see module-level ``OnCompleteFn``): invoked exactly
+      once, from the single ``_finish`` helper below, for EVERY terminal
+      branch (spawn-not-found, spawn-error, timeout, done, failed, AND
+      cancellation) with the final task row. A raising/broken callback is
+      swallowed (best-effort — a caller's notification hook must never be
+      able to corrupt this worker's own DB bookkeeping). ``None`` (the
+      default, every pre-769e24a7 caller) skips the call entirely — zero
+      behavior change.
+    * Cancellation handling: if this coroutine's own asyncio Task is
+      cancelled (e.g. the process is shutting down and something explicitly
+      cancels a still-in-flight worker task) at ANY await point — subprocess
+      creation, ``proc.communicate()``, or even the final DB update — the
+      outer ``except asyncio.CancelledError`` kills the subprocess if one
+      was started, marks the task row ``failed`` with a clear "worker
+      cancelled" message (so it can never linger stuck at ``in_progress``
+      forever), best-effort notifies ``on_complete``, and then RE-RAISES —
+      preserving normal `asyncio` cancellation propagation instead of
+      silently swallowing it.
     """
     worker_class, effective_prompt = _route_worker_execution(prompt)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            effective_prompt,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError as exc:
-        await db_module.update_task(
-            db,
-            task_id,
-            status="failed",
-            description=(
-                f"{worker_class.error_prefix}{effective_prompt}\n\n"
-                f"worker command not found: {argv[0]} ({exc})"
-            ),
-        )
-        return
-    except Exception as exc:  # noqa: BLE001 — surface arbitrary spawn errors
-        await db_module.update_task(
-            db,
-            task_id,
-            status="failed",
-            description=(
-                f"{worker_class.error_prefix}{effective_prompt}\n\n"
-                f"failed to spawn worker: {type(exc).__name__}: {exc}"
-            ),
-        )
-        return
+    proc: "asyncio.subprocess.Process | None" = None
 
-    # v1.0.1 — mark in_progress and record PID immediately on spawn
-    await db_module.update_task(
-        db, task_id,
-        status="in_progress",
-        description=f"{worker_class.prompt_prefix}{effective_prompt}\n\n[worker PID: {proc.pid}]",
-    )
-    await db_module.update_task_worker_pid(db, task_id, proc.pid)
+    async def _finish(status: str, description: str) -> None:
+        updated = await db_module.update_task(
+            db, task_id, status=status, description=description,
+        )
+        if on_complete is None:
+            return
+        try:
+            result = on_complete(updated or {"id": task_id, "status": status})
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:  # noqa: BLE001 — a bad callback must never corrupt the task row
+            pass
 
     try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
-        )
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
-        await db_module.update_task(
-            db,
-            task_id,
-            status="failed",
-            description=(
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                effective_prompt,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            await _finish(
+                "failed",
                 f"{worker_class.error_prefix}{effective_prompt}\n\n"
-                f"worker timed out after {timeout}s"
-            ),
-        )
-        return
-
-    stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
-    stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
-
-    if proc.returncode == 0:
-        body = _truncate(stdout) if stdout else "(no output)"
-        await db_module.update_task(
-            db,
-            task_id,
-            status="done",
-            description=f"{worker_class.result_prefix}{effective_prompt}\n\n{body}",
-        )
-    else:
-        body = stderr or stdout or "(no output)"
-        await db_module.update_task(
-            db,
-            task_id,
-            status="failed",
-            description=(
+                f"worker command not found: {argv[0]} ({exc})",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 — surface arbitrary spawn errors
+            await _finish(
+                "failed",
                 f"{worker_class.error_prefix}{effective_prompt}\n\n"
-                f"exit code {proc.returncode}\n{_truncate(body)}"
-            ),
+                f"failed to spawn worker: {type(exc).__name__}: {exc}",
+            )
+            return
+
+        # v1.0.1 — mark in_progress and record PID immediately on spawn
+        await db_module.update_task(
+            db, task_id,
+            status="in_progress",
+            description=f"{worker_class.prompt_prefix}{effective_prompt}\n\n[worker PID: {proc.pid}]",
         )
+        await db_module.update_task_worker_pid(db, task_id, proc.pid)
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            await _finish(
+                "failed",
+                f"{worker_class.error_prefix}{effective_prompt}\n\n"
+                f"worker timed out after {timeout}s",
+            )
+            return
+
+        stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
+        stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+        if proc.returncode == 0:
+            body = _truncate(stdout) if stdout else "(no output)"
+            await _finish(
+                "done",
+                f"{worker_class.result_prefix}{effective_prompt}\n\n{body}",
+            )
+        else:
+            body = stderr or stdout or "(no output)"
+            await _finish(
+                "failed",
+                f"{worker_class.error_prefix}{effective_prompt}\n\n"
+                f"exit code {proc.returncode}\n{_truncate(body)}",
+            )
+    except asyncio.CancelledError:
+        # 769e24a7 — this worker's own asyncio Task was cancelled. Kill a
+        # still-running subprocess (best-effort — it may already be dead or
+        # never started) and leave the task row in a real terminal state
+        # instead of stuck at pending/in_progress forever, then re-raise so
+        # normal cancellation propagation is preserved.
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:  # noqa: BLE001 — best-effort cleanup only
+                pass
+        try:
+            await _finish(
+                "failed",
+                f"{worker_class.error_prefix}{effective_prompt}\n\nworker cancelled",
+            )
+        except Exception:  # noqa: BLE001 — cleanup on the way out must not mask the cancellation
+            pass
+        raise
 
 
 async def enqueue_claude_task(
@@ -256,6 +313,7 @@ async def enqueue_claude_task(
     timeout: float | None = 900.0,
     wait: bool = False,
     parent_session_id: str | None = None,
+    on_complete: OnCompleteFn = None,
 ) -> dict[str, Any]:
     """Queue a Claude subprocess for async execution; return the pending task.
 
@@ -270,6 +328,14 @@ async def enqueue_claude_task(
         timeout: seconds before the worker is killed. ``None`` for no limit.
         wait: if True, block until the worker finishes before returning.
             Used by tests; production callers leave it False.
+        on_complete: 769e24a7 — optional hook invoked (with the final task
+            row) the moment the worker reaches ANY terminal outcome. See
+            :func:`_run_worker` and module-level ``OnCompleteFn``. ``None``
+            (default) is a no-op — every pre-769e24a7 caller is unaffected.
+            Meaningless when ``wait=True`` since the caller already awaits
+            the terminal state directly, but still honored for consistency
+            (and exercised the same way — the callback still fires from
+            inside ``_run_worker`` before this function returns).
 
     Returns:
         Dict with the task row as it stands when this function returns. If
@@ -296,7 +362,7 @@ async def enqueue_claude_task(
         parent_session_id=effective_parent,
     )
 
-    coro = _run_worker(db, task["id"], prompt, argv, timeout)
+    coro = _run_worker(db, task["id"], prompt, argv, timeout, on_complete=on_complete)
     if wait:
         await coro
         updated = await db_module.get_task(db, task["id"])
