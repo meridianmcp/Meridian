@@ -1823,6 +1823,16 @@ class ConvergenceState:
     # whether that owner looks active or stale. None only for an in-memory
     # (":memory:") index, which has no persistent lock to report on.
     index_lock: dict[str, Any] | None = None
+    # 3f758063 -- explicit, separate signal for "this index has never once
+    # been examined" (no scan progress, no indexed rows, no pending
+    # backlog, no confirmed expected count -- see get_convergence_state's
+    # `never_walked` computation for the exact definition). Additive: never
+    # changes `converged` for any state this dataclass already distinguished
+    # (a real completed pass, an in-progress walk, a durably-persisted
+    # interrupted walk) -- only makes explicit the one state that used to be
+    # silently folded into `converged=True` alongside a genuine confirmed
+    # convergence. False for every branch except the genuinely-untouched one.
+    never_walked: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -4221,6 +4231,29 @@ class OutputsFtsIndex:
         would otherwise report. Still read-only and safe to poll: once
         connected (a one-time cost per instance), this is a pure in-memory
         read, and never triggers a filesystem walk or any indexing.
+
+        3f758063 -- fail-closed on ZERO evidence. ``_walk_pass_confirmed_
+        complete`` optimistically defaults to ``True`` for a pristine
+        instance (see its own docstring) -- correct for the durability
+        contract it exists for (a restarted process must not lose a prior
+        CONFIRMED-complete state), but wrong when read as "this outputs_dir
+        has been examined" while literally nothing has ever been recorded
+        about it: no scan progress (``_scan_boundary``), no indexed rows
+        (``_row_cache``), no pending backlog, and no confirmed expected
+        count (``_expected_count`` -- ``None`` ONLY until a walk pass has
+        actually completed at least once; a real completed pass over a
+        genuinely empty directory sets it to ``0``, never leaves it
+        ``None``). Before this fix, that all-four-empty state was
+        indistinguishable from genuine convergence and reported
+        ``converged=True`` with ``indexed_count=0``/``expected_count=None``
+        -- exactly the "convergence reports true with zero indexed/unknown
+        expected state" defect this item exists to close (a caller trusting
+        that as "confirmed nothing here" when the index had simply never
+        been asked to walk yet). ``never_walked`` below is additive and
+        narrowly scoped to precisely that state -- it never fires for an
+        in-progress walk, a durably-rehydrated interrupted walk (those
+        already report ``converged=False`` on their own terms), or a real
+        completed pass (even over an empty tree).
         """
         with self._read_lock:
             try:
@@ -4244,10 +4277,25 @@ class OutputsFtsIndex:
                 self.last_db_write_error or self._last_walk_error
                 or self.last_lock_error
             )
+            # 3f758063 -- see docstring above: zero evidence a walk has
+            # EVER touched this outputs_dir, in-process or in a prior
+            # rehydrated incarnation. Deliberately NOT keyed off
+            # `walk_in_progress` (which is already False for this exact
+            # state, by design of the optimistic default) -- keyed instead
+            # off the underlying facts that default is supposed to be a
+            # proxy for, so a genuinely brand-new index can never satisfy
+            # this condition alongside real recorded state.
+            never_walked = (
+                self._scan_boundary is None
+                and self._expected_count is None
+                and not self._row_cache
+                and not self._pending_stale
+            )
             if subtree is None:
                 pending = len(self._pending_stale)
                 converged = (
-                    not walk_in_progress and pending == 0
+                    not never_walked
+                    and not walk_in_progress and pending == 0
                     and not self._fts_pending and last_error is None
                 )
                 scope_desc = None
@@ -4255,8 +4303,11 @@ class OutputsFtsIndex:
                 sub_norm = _normalize_output_path(subtree) or str(subtree).replace("\\", "/")
                 scope_desc = subtree
                 subtree_scanned = (
-                    not walk_in_progress
-                    or _subtree_scanned_past(self._scan_boundary, sub_norm)
+                    not never_walked
+                    and (
+                        not walk_in_progress
+                        or _subtree_scanned_past(self._scan_boundary, sub_norm)
+                    )
                 )
                 pending = sum(
                     1 for p in self._pending_stale
@@ -4282,6 +4333,7 @@ class OutputsFtsIndex:
                 fts_pending=bool(self._fts_pending),
                 partial=bool(self.last_rebuild_partial),
                 index_lock=self.lock_diagnostics(),
+                never_walked=never_walked,
             )
 
     def lock_diagnostics(self) -> dict[str, Any] | None:

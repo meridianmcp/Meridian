@@ -243,7 +243,8 @@ def get_convergence_state(
     Returns:
       {outputs_dir, subtree, converged, walk_complete, scan_boundary,
       pending_count, indexed_count, expected_count, last_error, fts_pending,
-      partial, index_lock}, or {error: ...} if ``outputs_dir`` doesn't exist.
+      partial, index_lock, never_walked}, or {error: ...} if ``outputs_dir``
+      doesn't exist.
       ``index_lock`` (a52216e2): a read-only snapshot of this index's
       single-writer lock/lease -- {held, pid, hostname, session_id,
       started_at, heartbeat_at, age_seconds, lock_mode, pid_alive, is_stale,
@@ -252,6 +253,15 @@ def get_convergence_state(
       never touched) from a STALE one (a leftover lock file from a crashed
       owner, safe to reclaim on the next acquire). This call never acquires
       the lock itself and never disturbs whatever process currently holds it.
+      ``never_walked`` (3f758063): ``True`` only when this index has ZERO
+      recorded evidence a walk has ever touched ``outputs_dir`` -- no scan
+      boundary, no indexed rows, no pending backlog, no confirmed expected
+      count. ``converged`` is always ``False`` whenever this is ``True``:
+      fail closed rather than reporting a genuinely never-examined tree as
+      "confirmed converged, nothing here" (the exact hosted/local mismatch
+      this item exists to close). Never ``True`` for an in-progress walk, a
+      durably-persisted interrupted walk, or a real completed pass -- even
+      one that confirmed a genuinely empty directory.
     """
     return outputs_local.get_convergence_state(outputs_dir, subtree=subtree)
 

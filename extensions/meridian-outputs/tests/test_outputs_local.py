@@ -1433,18 +1433,35 @@ class TestWalkStateDurability:
     def test_fresh_never_touched_differs_from_restarted_interrupted(
         self, tmp_path: Path,
     ) -> None:
-        """The pre-existing contract (a genuinely brand-new index that has
-        never indexed anything reports converged=True -- see
-        TestConvergenceState::test_no_walk_in_progress_means_any_subtree_
-        converged) must NOT become indistinguishable from a restarted
-        process whose PRIOR incarnation persisted an interrupted walk, even
-        though both have _walk_state is None right now. Conflating the two
-        is exactly the "silently claim completion it hasn't verified" bug."""
+        """3f758063 -- a genuinely brand-new index that has never indexed
+        anything must report converged=False (never_walked=True): zero
+        evidence (no scan boundary, no rows, no pending backlog, no
+        confirmed expected count) is not the same claim as "confirmed
+        converged", and reporting it as such is exactly the "convergence
+        reports true with zero indexed/unknown expected state" defect this
+        item closes (see get_convergence_state's own docstring). Prior to
+        this fix, a genuinely brand-new index reported converged=True by
+        design -- see git history for that superseded contract and its own
+        regression test, TestConvergenceState::test_no_walk_in_progress_
+        means_any_subtree_converged, updated alongside this one.
+
+        Both the never-touched case AND a restarted process whose PRIOR
+        incarnation persisted an interrupted walk must report
+        converged=False, walk_complete=False -- but for genuinely different
+        reasons (never_walked vs. a confirmed-incomplete prior pass), which
+        this test asserts separately so a future change can't silently
+        collapse the distinction back into "conflate the two", the exact
+        "silently claim completion it hasn't verified" bug this feature
+        exists to close."""
         never_touched_dir = tmp_path / "never_touched"
         never_touched_dir.mkdir()
         never_touched = OL.OutputsFtsIndex(str(never_touched_dir))
         try:
-            assert never_touched.get_convergence_state().converged is True
+            state = never_touched.get_convergence_state()
+            assert state.converged is False
+            assert state.never_walked is True
+            assert state.indexed_count == 0
+            assert state.expected_count is None
         finally:
             never_touched.close()
 
@@ -1455,6 +1472,12 @@ class TestWalkStateDurability:
         try:
             con = prior._connect()
             prior._walk_pass_confirmed_complete = False
+            # A REAL interrupted walk always leaves some concrete footprint
+            # (drain() had handed back at least one path) -- a scan boundary
+            # here, unlike the bare unconfirmed-complete flag alone, is what
+            # makes this genuinely distinguishable from never_touched's zero
+            # evidence above rather than an ambiguous corner case.
+            prior._scan_boundary = str(restarted_dir / "partial_progress.csv")
             prior._persist_walk_state_locked(con)
         finally:
             prior.close()
@@ -1465,6 +1488,11 @@ class TestWalkStateDurability:
             state = resumed.get_convergence_state()
             assert state.converged is False
             assert state.walk_complete is False
+            # Distinct from never_touched above: this IS durably-confirmed
+            # interrupted-walk evidence (a persisted scan boundary), not a
+            # genuinely untouched index -- never_walked must stay False here
+            # so a caller can tell the two apart.
+            assert state.never_walked is False
         finally:
             resumed.close()
 
@@ -5062,14 +5090,51 @@ class TestSubtreeConvergenceHeuristic:
             idx._walk_state = None
             idx.close()
 
-    def test_no_walk_in_progress_means_any_subtree_converged(self, tmp_path: Path) -> None:
+    def test_never_walked_means_no_subtree_can_be_confirmed_converged(
+        self, tmp_path: Path,
+    ) -> None:
+        """3f758063 -- `_walk_state is None` (walk_complete=True) alone is
+        no longer sufficient to call a subtree converged: a genuinely
+        never-rebuilt index has zero real evidence (no scan boundary, no
+        rows, no confirmed expected count) that ANY subtree -- however
+        small -- was ever actually looked at. See test_no_walk_in_progress_
+        after_a_real_pass_means_any_subtree_converged below for the case
+        this test used to (and, correctly, still does) cover: a subtree
+        query issued after a real pass has genuinely completed."""
         sub = tmp_path / "sub"
         sub.mkdir()
         idx = OL.OutputsFtsIndex(str(tmp_path))
         try:
-            # _walk_state is None by default -- no pass currently running.
+            # _walk_state is None by default -- no pass currently running --
+            # but that alone no longer implies converged=True.
             state = idx.get_convergence_state(subtree=str(sub))
             assert state.walk_complete is True
+            assert state.never_walked is True
+            assert state.converged is False
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_no_walk_in_progress_after_a_real_pass_means_any_subtree_converged(
+        self, tmp_path: Path,
+    ) -> None:
+        """Once a real pass has genuinely completed at least once (a
+        confirmed expected_count, even over a part of the tree unrelated to
+        `sub` itself), a subtree query with no walk currently in progress
+        correctly reports converged=True -- the original pre-3f758063
+        intent of this test, preserved for the case it actually protects."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (tmp_path / "root_file.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.get_convergence_state().never_walked is False  # sanity
+            # _walk_state is None (the pass completed) -- no pass currently
+            # running.
+            state = idx.get_convergence_state(subtree=str(sub))
+            assert state.walk_complete is True
+            assert state.never_walked is False
             assert state.converged is True
         finally:
             idx.close()

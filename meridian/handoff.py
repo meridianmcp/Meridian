@@ -39,6 +39,7 @@ from . import continuation_gate as continuation_gate_module
 from . import db as db_module
 from . import docx_integrity_gate as docx_integrity_gate_module
 from . import executor_contract as executor_contract_module
+from . import hook_paths as hook_paths_module
 from . import pointers as pointers_module
 from . import test_run_receipt as test_run_receipt_module
 from . import tool_discovery as tool_discovery_module
@@ -6631,6 +6632,13 @@ async def _write_sprint_guard_hooks(
     a real checkout with a ``.claude`` dir), the write is skipped entirely — a
     project with no repo of its own has no business getting a foreign repo's
     hook files.
+
+    e5eec33b — the stored ``repo_path`` is validated through
+    ``hook_paths.resolve_repo_root_for_handoff`` rather than a bare
+    ``Path(repo_path)`` check, so a path recorded from a WSL/Linux session
+    (``/mnt/c/Users/...``) still resolves correctly when this handoff runs
+    on native Windows, instead of silently and permanently skipping the
+    write for that project.
     """
     if root is None and "PYTEST_CURRENT_TEST" in os.environ:
         return
@@ -6640,9 +6648,10 @@ async def _write_sprint_guard_hooks(
         else:
             executor_config = await db_module.get_executor_config(db, project_id)
             repo_path = (executor_config.get("repo_path") or "").strip()
-            if not repo_path or not (Path(repo_path) / ".claude").exists():
+            resolved_repo_root = hook_paths_module.resolve_repo_root_for_handoff(repo_path)
+            if resolved_repo_root is None:
                 return  # no configured repo for this project — nothing to do
-            repo_root = Path(repo_path)
+            repo_root = resolved_repo_root
         hooks_dir = repo_root / ".claude" / "hooks"
         url = os.environ.get("MERIDIAN_URL") or "http://localhost:7878"
         hooks_dir.mkdir(parents=True, exist_ok=True)

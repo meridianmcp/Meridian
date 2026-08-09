@@ -4559,7 +4559,32 @@ _CODE_SNIPPET_SOURCE_FIELDS = ("source", "code", "snippet", "content", "text")
 # Slack for trailing-newline edge cases.  A snippet that is only 1 line short
 # may simply lack a terminal newline; we only warn when genuinely short by more
 # than this many lines.
+#
+# 8c6d88c9 — this is an ABSOLUTE cap only. Used alone (as originally
+# implemented) it silently swallows severe/total truncation on SHORT
+# functions: a 2-line function returned with 0 actual lines (100% missing —
+# the source field came back completely empty) has expected-actual == 2,
+# which is NOT > 2, so no warning ever fired. The long-function case this
+# constant was designed for (e.g. a 114-line function truncated to 70) still
+# works correctly because 2 lines is a negligible fraction of 114 — the bug
+# only manifests when the declared range itself is small enough that the
+# fixed slack approaches or exceeds it. See _effective_truncation_slack.
 _TRUNCATION_SLACK = 2
+
+
+def _effective_truncation_slack(expected_lines: int) -> int:
+    """Slack for a snippet with a declared range of ``expected_lines``.
+
+    8c6d88c9 — caps the absolute :data:`_TRUNCATION_SLACK` at roughly half of
+    ``expected_lines`` (rounded down, minus the one line already given up for
+    the trailing-newline case) so a short declared range can no longer absorb
+    a proportionally huge — up to and including total — loss of source text
+    without ever surfacing a warning. For any function long enough that
+    ``_TRUNCATION_SLACK`` is already small relative to its size (roughly
+    expected_lines >= 5), this returns the unchanged flat constant, so every
+    existing long-function boundary case keeps its original behavior.
+    """
+    return min(_TRUNCATION_SLACK, (expected_lines - 1) // 2)
 
 
 def _check_code_snippet_truncation(result: Any) -> Any:
@@ -4614,7 +4639,8 @@ def _check_code_snippet_truncation(result: Any) -> Any:
         # Count lines in the source text.  splitlines() handles \r\n and \r
         # correctly.  An empty string → 0 lines.
         actual_lines = len(source_text.splitlines())
-        if (expected_lines - actual_lines) > _TRUNCATION_SLACK:
+        effective_slack = _effective_truncation_slack(expected_lines)
+        if (expected_lines - actual_lines) > effective_slack:
             result = dict(result)  # shallow copy — don't mutate the original
             result["truncation_warning"] = (
                 f"get_code_snippet returned a truncated snippet: expected "
@@ -4623,7 +4649,7 @@ def _check_code_snippet_truncation(result: Any) -> Any:
                 f"{actual_lines} lines. The tail of the function/block is "
                 f"missing. Re-fetch the missing portion via a direct file read "
                 f"(e.g. filesystem__read_file with offset={start_line + actual_lines - 1} "
-                f"limit={expected_lines - actual_lines + _TRUNCATION_SLACK}) to "
+                f"limit={expected_lines - actual_lines + effective_slack}) to "
                 f"get the complete source."
             )
     except Exception:  # noqa: BLE001 — enrichment must never mask the real result

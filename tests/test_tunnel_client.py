@@ -3612,6 +3612,91 @@ def test_extract_pool_set_active_repo_blank_is_noop():
 
 
 # ---------------------------------------------------------------------------
+# 8c6d88c9 — active-project identity survives project-switch drift, and a
+# spawn timeout/failure never corrupts the activation-state "receipt"
+# (pool.default_repo_path). Replicates the exact per-request resolution and
+# failure-branch logic inside _run_extract_pool_connection, matching the
+# existing set_active_repo tests' style above rather than standing up a full
+# websockets.connect + httpx.AsyncClient harness.
+# ---------------------------------------------------------------------------
+
+def test_extract_pool_request_header_wins_over_drifted_default():
+    """A request carrying an explicit X-Meridian-Repo-Path must resolve to
+    ITS OWN repo, not whatever the tunnel's active/default repo has since
+    drifted to via a later set_active_repo (e.g. a request queued for repo A
+    that is still being processed after the user switched the active project
+    to repo B in another window)."""
+    from meridian.serena_pool import SerenaDaemonPool, resolve_repo_path
+    pool = SerenaDaemonPool(default_repo_path="/repo/a")
+
+    # Project switch: set_active_repo(B) lands, mutating the shared default —
+    # exactly _run_extract_pool_connection's "set_active_repo" branch.
+    switch_msg = {"type": "set_active_repo", "repo_path": "/repo/b"}
+    new_path = str(switch_msg.get("repo_path") or "").strip()
+    if new_path:
+        pool.default_repo_path = pool._normalize(new_path)
+    assert pool.default_repo_path == pool._normalize("/repo/b")
+
+    # A request explicitly pinned to repo A must still resolve to A — the
+    # exact call _run_extract_pool_connection makes per "request" message.
+    req_msg = {"type": "request", "headers": {"x-meridian-repo-path": "/repo/a"}}
+    resolved = resolve_repo_path(
+        req_msg.get("headers") or {}, pool.default_repo_path
+    )
+    assert resolved == "/repo/a"
+
+
+def test_extract_pool_headerless_request_follows_current_default():
+    """A request with NO explicit header (the common case) must pick up the
+    CURRENT active repo, not whatever was active when the connection was
+    first established — confirms activation-state actually propagates
+    forward, not just that per-request headers can override it."""
+    from meridian.serena_pool import SerenaDaemonPool, resolve_repo_path
+    pool = SerenaDaemonPool(default_repo_path="/repo/a")
+
+    switch_msg = {"type": "set_active_repo", "repo_path": "/repo/b"}
+    new_path = str(switch_msg.get("repo_path") or "").strip()
+    if new_path:
+        pool.default_repo_path = pool._normalize(new_path)
+
+    req_msg = {"type": "request", "headers": {}}
+    resolved = resolve_repo_path(
+        req_msg.get("headers") or {}, pool.default_repo_path
+    )
+    assert resolved == pool._normalize("/repo/b")
+
+
+def test_extract_pool_spawn_failure_leaves_active_repo_receipt_untouched(tmp_path):
+    """A get_or_spawn failure (timeout / crash on launch) for the resolved
+    repo_path must be reported as a 503 without mutating pool.default_repo_path
+    — the activation-state receipt for the tenant's active project must
+    survive a transient spawn failure unchanged, so the NEXT request (for
+    either repo) still resolves against the correct, un-corrupted default."""
+    from meridian.serena_pool import SerenaDaemonPool
+
+    def failing_spawn(cmd):
+        raise TimeoutError("Serena daemon did not become ready in time")
+
+    pool = SerenaDaemonPool(spawn=failing_spawn, default_repo_path=str(tmp_path))
+    before = pool.default_repo_path
+
+    # Replicates _run_extract_pool_connection's try/except around get_or_spawn.
+    daemon = None
+    spawn_exc = None
+    try:
+        daemon = pool.get_or_spawn(pool.default_repo_path)
+    except Exception as exc:  # noqa: BLE001 — mirrors the production handler
+        spawn_exc = exc
+
+    assert daemon is None
+    assert isinstance(spawn_exc, TimeoutError)
+    # The receipt (active-repo bookkeeping) must be exactly what it was
+    # before the failed spawn attempt — a timeout must never silently switch
+    # or blank out the tenant's active-project identity.
+    assert pool.default_repo_path == before
+
+
+# ---------------------------------------------------------------------------
 # Script-mode entrypoint — `python meridian/__main__.py` (regression for 9ec44f0)
 # ---------------------------------------------------------------------------
 

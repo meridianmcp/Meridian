@@ -499,6 +499,42 @@ def _bind_one_artifact(
             ),
         }
 
+    # 3f758063 -- fail-closed on incomplete evidence. `status_row` already
+    # carries `inconclusive` (provenance_status.get_provenance_status's own
+    # signal that its outputs index has not finished walking this tree, so
+    # a bare absence here is "not found YET", never "confirmed absent" --
+    # see that function's own docstring). Before this fix, that signal was
+    # computed but never consulted here: an artifact whose canonical output
+    # genuinely exists but simply hasn't been reached yet by a still-
+    # converging walk (a large/cold outputs_dir; resolve_figure_output's own
+    # forced rebuild() above can legitimately run out of budget mid-pass,
+    # same as any other rebuild() call -- see its own docstring) fell
+    # straight through to the same confident ORPHANED verdict as a genuinely
+    # absent one. A caller gating a write on `all_clear`/`status` would then
+    # reject or quarantine a perfectly valid, not-yet-indexed artifact based
+    # on a false "orphaned from any known provenance" claim -- exactly the
+    # "provenance attachment reported unavailable when it's actually just
+    # not confirmed yet" failure mode this item exists to close. Routed to
+    # UNRESOLVED (not a new status): its existing contract already covers
+    # "some evidence exists but is not strong enough to confirm", which is
+    # precisely this case.
+    if status_row.get("inconclusive"):
+        return {
+            **base,
+            "status": UNRESOLVED,
+            "match_type": None,
+            "evidence": "index_not_converged",
+            "resolved_sha256": None,
+            "reason": (
+                f"canonical_path {canonical_path!r} was not found by "
+                "meridian-outputs, but its outputs index has not finished "
+                "walking this outputs_dir yet (convergence incomplete) -- "
+                "absence cannot be confirmed from incomplete evidence; "
+                "re-check once the index has converged before treating "
+                "this artifact as orphaned"
+            ),
+        }
+
     return {
         **base,
         "status": ORPHANED,
@@ -555,7 +591,9 @@ def bind_artifact_provenance(
           ``canonical_path`` and DOES have a hash on file, but it does not
           match ``expected_sha256``.
         - ``"orphaned"``      -- no meridian-outputs record at all (exact,
-          basename, or directory-level) covers ``canonical_path``.
+          basename, or directory-level) covers ``canonical_path``, AND the
+          outputs index that failed to find it has fully converged (its
+          absence is confirmed, not just "not found so far").
         - ``"unresolved"``    -- some evidence exists but is not strong
           enough to confirm: no ``canonical_path`` recorded on the artifact,
           an exact match whose record has no hash on file when
@@ -564,8 +602,13 @@ def bind_artifact_provenance(
           file -- "no hash to compare" is never silently treated as "hash
           matches"), an ambiguous multi-candidate basename match, a basename
           match that cannot confirm a requested hash (that tier never
-          carries one at all), or ONLY non-authoritative directory-level
-          fallback evidence.
+          carries one at all), ONLY non-authoritative directory-level
+          fallback evidence, OR (``evidence="index_not_converged"``, item
+          3f758063) no record found AND the outputs index has not finished
+          walking ``outputs_dir`` yet -- fail-closed: incomplete evidence is
+          never promoted to the confident ``"orphaned"`` verdict, since the
+          artifact's real output may simply not have been indexed yet on a
+          large/cold tree.
 
       ``counts`` tallies each status across ``bindings`` (always all four
       keys, zero-filled). ``all_clear`` is ``True`` only when every artifact
