@@ -3278,6 +3278,14 @@ async def _handle_task_tools(
         _blocker_policy_decision = await handoff_module_local.build_blocker_policy_for_handoff(
             db, args["project_id"], version=_effective_version,
         )
+        # 79491e26 — deterministic run timeline reconstructed from durable
+        # ai_log_events state, emitted on every generate_handoff mode
+        # alongside the fields above. Fully guarded — a failure degrades to
+        # no field rather than breaking the mandatory handoff (see
+        # build_run_timeline_for_handoff's own docstring).
+        _run_timeline = await handoff_module_local.build_run_timeline_for_handoff(
+            db, args["project_id"], session_id=session_id,
+        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -3326,6 +3334,15 @@ async def _handle_task_tools(
             # whether the whole run must fail closed (see
             # meridian.blocker_policy / db.evaluate_board_blockers).
             "blocker_policy": _blocker_policy_decision,
+            # 79491e26 — durable, deterministic run-timeline reconstruction
+            # (compact projection of ai_log_events — event_type/occurred_at/
+            # actor/source/correlation, no raw payload) — includes any
+            # planner/executor corrective handoff recorded against this
+            # project's handoffs (see
+            # routes.handoff.record_handoff_correction_endpoint). None when
+            # this project has no durable execution events for this scope
+            # (see build_run_timeline_for_handoff's own docstring).
+            "run_timeline": _run_timeline,
             # b8f89491 — machine-readable scope: which sprint-version bucket
             # this handoff actually resolved to, and why (explicit argument vs.
             # session-derived vs. unscoped). effective_version is None when the

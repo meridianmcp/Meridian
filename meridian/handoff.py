@@ -38,6 +38,7 @@ from . import capability_contract as capability_contract_module
 from . import continuation_gate as continuation_gate_module
 from . import db as db_module
 from . import docx_integrity_gate as docx_integrity_gate_module
+from .db import ai_log as ai_log_module
 from . import executor_contract as executor_contract_module
 from . import hook_paths as hook_paths_module
 from . import pointers as pointers_module
@@ -5885,6 +5886,7 @@ def _render_delta_handoff(
     identity: str | None = None,
     diagnostic_tasks: list[dict[str, Any]] | None = None,
     continuation_manifest: dict[str, Any] | None = None,
+    run_timeline: dict[str, Any] | None = None,
 ) -> str:
     """Return a compact handoff for back-to-back goal runs in one session.
 
@@ -5896,6 +5898,12 @@ def _render_delta_handoff(
     :func:`build_continuation_manifest`. ``None`` (e.g. the manifest build
     failed and the caller degraded gracefully) omits the tag entirely, so this
     stays byte-for-byte the pre-836ca1d5 output for that call.
+    ``run_timeline`` (79491e26), when given, is embedded the same way as a
+    compact JSON block inside a ``<run_timeline>`` tag — see
+    :func:`build_run_timeline_for_handoff`. ``None`` (no durable ai_log
+    events for this scope, or the best-effort build degraded) omits the tag
+    entirely, so this stays byte-for-byte the pre-79491e26 output for that
+    call.
     """
     # bc834237 — cap the pending list so a large backlog never bloats the delta
     # payload. Delta is richer than starter (session-continuity context), so the
@@ -6006,6 +6014,21 @@ def _render_delta_handoff(
                 continuation_manifest, sort_keys=True, separators=(",", ":"),
             ),
             "</continuation_manifest>",
+        ]
+    if run_timeline is not None:
+        # 79491e26 — durable, deterministic run-timeline reconstruction (see
+        # build_run_timeline_for_handoff's docstring) embedded the same way
+        # continuation_manifest is just above: compact/sorted-keys JSON so
+        # the tag's content is byte-deterministic for a given timeline, and
+        # a resuming session (or load_handoff, which returns this body
+        # verbatim) can see exactly what durable execution events —
+        # including any planner/executor corrective handoff — happened, in
+        # order, without a separate round trip.
+        lines += [
+            "",
+            "<run_timeline>",
+            json.dumps(run_timeline, sort_keys=True, separators=(",", ":")),
+            "</run_timeline>",
         ]
     return "\n".join(lines) + "\n"
 
@@ -7205,6 +7228,107 @@ async def build_continuation_manifest(
         "item_count": snapshot["item_count"],
         "pending_count": len(pending_ids),
         "pending_item_ids": pending_ids[:_CONTINUATION_MANIFEST_ID_CAP],
+    }
+
+
+# 79491e26 — schema version for the compact run-timeline projection embedded
+# in a delta handoff / returned from the generate_handoff MCP tool. Bump only
+# for a breaking shape change to the dict build_run_timeline_for_handoff
+# returns (mirrors _CONTINUATION_MANIFEST_SCHEMA_VERSION's own convention).
+_RUN_TIMELINE_SCHEMA_VERSION = 1
+
+# Max events embedded in a rendered handoff body / MCP response. Mirrors the
+# _DELTA_PENDING_CAP/_DELTA_COMPLETED_CAP magnitude in _render_delta_handoff
+# — bounded so a chatty project's ai_log never bloats a handoff payload; a
+# caller needing the full window has meridian.db.ai_log.build_run_timeline
+# directly (no cap applied there beyond its own `limit` argument).
+_RUN_TIMELINE_EVENT_CAP = 25
+
+
+async def build_run_timeline_for_handoff(
+    db: Any,
+    project_id: str,
+    *,
+    session_id: str | None = None,
+    correlation_id: str | None = None,
+    since_occurred_at: str | None = None,
+    limit: int = _RUN_TIMELINE_EVENT_CAP,
+) -> "dict[str, Any] | None":
+    """79491e26 — the shared, deterministic run-timeline serializer.
+
+    Thin wrapper over :func:`meridian.db.ai_log.build_run_timeline` (mirrors
+    :func:`build_continuation_manifest`'s own "shared serializer" role for
+    continuation state, directly above): reconstructs the ordered sequence
+    of durable :class:`meridian.ai_log.ExecutionEvent` rows for this project
+    — optionally narrowed to one session's or one correlation group's
+    events — in the SAME deterministic ``occurred_at`` order every time it
+    is read (see that function's own docstring for why this differs from
+    :func:`meridian.db.ai_log.list_events`'s arrival-order listing).
+
+    A planner/executor corrective handoff recorded through
+    ``routes.handoff.record_handoff_correction_endpoint`` durably appends a
+    ``handoff.correction_recorded``/``handoff.correction_regenerated`` event
+    (best-effort — see that endpoint) — so a correction shows up HERE, on
+    this same timeline, alongside whatever other execution events this
+    project has captured, instead of only being reachable via a separate
+    ``handoff_corrections`` lookup (:func:`load_handoff_correction`). This
+    function does not special-case that event type: it is just one more row
+    in the same durable, project-scoped log.
+
+    Best-effort by construction (unlike ``build_continuation_manifest``,
+    which pushes the try/except onto its callers — see that function's own
+    docstring — this one guards itself, matching
+    ``build_effective_capability_contract``/``build_proposal_evidence_for_handoff``'s
+    "fully guarded, call directly" convention): returns ``None`` when the
+    ai_log table can't be read (e.g. a project on a pre-9e83be4a DB missing
+    ``ai_log_events``, or any other read error) or when the resolved event
+    list is empty — an empty timeline carries no information worth
+    embedding, matching ``build_continuation_manifest``'s own
+    None-on-nothing-to-report convention for optional enrichment sections.
+
+    Each embedded event is a COMPACT projection — ``event_type``,
+    ``occurred_at``, ``actor_kind``, ``actor_id``, ``source``,
+    ``correlation_id``, ``parent_event_id``, ``event_hash`` — deliberately
+    OMITTING ``payload`` (event-type-specific, may be arbitrarily large) so
+    a handoff body embedding this stays bounded regardless of what a given
+    event type's payload happens to contain; a reader that needs one
+    event's full payload can fetch it directly via
+    ``meridian.db.ai_log.get_event(event_id)``. This projection carries
+    enough to know WHAT happened and WHEN, and to correlate/causally-chain
+    events, without re-embedding arbitrary content.
+    """
+    try:
+        events = await ai_log_module.build_run_timeline(
+            db, project_id,
+            session_id=session_id,
+            correlation_id=correlation_id,
+            since_occurred_at=since_occurred_at,
+            limit=limit,
+        )
+    except Exception:  # noqa: BLE001 — best-effort, never breaks handoff generation
+        return None
+    if not events:
+        return None
+    compact = [
+        {
+            "event_type": e.get("event_type"),
+            "occurred_at": e.get("occurred_at"),
+            "actor_kind": e.get("actor_kind"),
+            "actor_id": e.get("actor_id"),
+            "source": e.get("source"),
+            "correlation_id": e.get("correlation_id"),
+            "parent_event_id": e.get("parent_event_id"),
+            "event_hash": e.get("event_hash"),
+        }
+        for e in events
+    ]
+    return {
+        "schema_version": _RUN_TIMELINE_SCHEMA_VERSION,
+        "project_id": project_id,
+        "session_id": session_id,
+        "correlation_id": correlation_id,
+        "event_count": len(compact),
+        "events": compact,
     }
 
 
@@ -9314,6 +9438,16 @@ async def generate_handoff(
             )
         except Exception:  # noqa: BLE001 — manifest is best-effort, never fatal
             _continuation_manifest = None
+        # 79491e26 — durable, deterministic run-timeline reconstruction;
+        # build_run_timeline_for_handoff is already fully self-guarded (see
+        # its own docstring), so no try/except is needed at this call site —
+        # matches the build_effective_capability_contract/
+        # build_proposal_evidence_for_handoff "fully guarded, call directly"
+        # convention rather than build_continuation_manifest's "caller must
+        # guard" one.
+        _run_timeline = await build_run_timeline_for_handoff(
+            db, project_id, session_id=session_id,
+        )
         content = _render_delta_handoff(
             project,
             generated_at=generated_at,
@@ -9324,6 +9458,7 @@ async def generate_handoff(
             identity=identity,
             diagnostic_tasks=delta_diagnostic,
             continuation_manifest=_continuation_manifest,
+            run_timeline=_run_timeline,
         )
     else:
         # v1.1 — per-user handoff template. When workspace_settings.handoff_template

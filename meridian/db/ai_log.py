@@ -314,6 +314,86 @@ async def list_events(
 
 
 # ---------------------------------------------------------------------------
+# 79491e26 — deterministic run-timeline reconstruction
+# ---------------------------------------------------------------------------
+
+async def build_run_timeline(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    session_id: "str | None" = None,
+    correlation_id: "str | None" = None,
+    since_occurred_at: "str | None" = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """79491e26 — reconstruct a DETERMINISTIC run timeline from durable
+    ``ai_log_events`` state.
+
+    Distinct from :func:`list_events` above: that function's ordering
+    (``recorded_at DESC`` — newest-STORED first) is arrival/insertion order,
+    the right shape for "what showed up most recently" browsing, but it is
+    NOT a deterministic replay order — two events appended out of causal
+    order by a retried/batched writer, or two rows landing in the same
+    DB-clock instant, have no guaranteed stable relationship there beyond
+    insertion sequence, which is itself a storage artifact, not a fact about
+    the run. A "run timeline" needs the opposite: the SAME, reproducible
+    sequence every time it is read, ordered by WHEN the event actually
+    happened at its source (``occurred_at`` — see
+    :mod:`meridian.ai_log`'s envelope docs for why this differs from
+    ``recorded_at``), with a fully deterministic tiebreak (``id``) for two
+    events sharing one ``occurred_at`` timestamp (same-millisecond bursts
+    are common — a ``tool.invoked``/``tool.completed`` pair, or two events
+    emitted within one request). ``occurred_at`` is an ISO-8601 ``...Z``
+    string (see :class:`meridian.ai_log.ExecutionEvent`), lexicographically
+    comparable exactly like ``recorded_at`` (see
+    :func:`purge_events_before`'s own note on this column below).
+
+    Always project-scoped. ``session_id``/``correlation_id`` optionally
+    narrow to one session's or one logical operation's events;
+    ``since_occurred_at`` optionally bounds to events at or after a given
+    ISO-8601 timestamp (inclusive) — e.g. "since this session started" or
+    "since the last handoff". ``limit`` (default 200, clamped 1..1000) bounds
+    the window: when more than ``limit`` events match, the OLDEST are
+    dropped first (a timeline that must truncate should keep what happened
+    most recently, not what happened first) — the returned list itself is
+    always in ascending ``occurred_at`` order regardless of truncation.
+
+    Read-only. Adds no new storage behavior — see :class:`AiLogStore`'s own
+    docstring ("Adds NO new storage behavior").
+    """
+    limit = max(1, min(int(limit or 200), 1000))
+    clauses = ["project_id = ?"]
+    params: list[Any] = [project_id]
+    if session_id is not None:
+        clauses.append("session_id = ?")
+        params.append(session_id)
+    if correlation_id is not None:
+        clauses.append("correlation_id = ?")
+        params.append(correlation_id)
+    if since_occurred_at is not None:
+        clauses.append("occurred_at >= ?")
+        params.append(since_occurred_at)
+    params.append(limit)
+    # Select the newest `limit` rows first (DESC) so a truncation drops the
+    # OLDEST events, not the newest, then reverse in Python to hand back the
+    # ascending, deterministic-replay order this function's docstring
+    # promises.
+    sql = (
+        f"SELECT * FROM ai_log_events WHERE {' AND '.join(clauses)} "
+        "ORDER BY occurred_at DESC, id DESC LIMIT ?"
+    )
+    async with db.execute(sql, tuple(params)) as cur:
+        rows = await cur.fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = _deserialize_event_row(_row_to_dict(r))
+        if d is not None:
+            out.append(d)
+    out.reverse()
+    return out
+
+
+# ---------------------------------------------------------------------------
 # ea972129 (Round 1 proposal e143949d) — retention
 # ---------------------------------------------------------------------------
 
@@ -439,12 +519,13 @@ class AiLogStore:
 
     Adds NO new storage behavior beyond what
     :func:`append_event`/:func:`get_event`/:func:`list_events`/
-    :func:`purge_events_before`/:func:`export_events` (c0168425) already
-    provide — this class exists purely so a caller doing several operations
-    against ONE project (e.g. a retention sweep, an export job) does not
-    have to repeat ``project_id`` on every call. The module-level free
-    functions remain the primary API and are unaffected by this class's
-    existence.
+    :func:`purge_events_before`/:func:`export_events` (c0168425)/
+    :func:`build_run_timeline` (79491e26) already provide — this class
+    exists purely so a caller doing several operations against ONE project
+    (e.g. a retention sweep, an export job, a run-timeline reconstruction)
+    does not have to repeat ``project_id`` on every call. The module-level
+    free functions remain the primary API and are unaffected by this
+    class's existence.
     """
 
     def __init__(self, db: aiosqlite.Connection, project_id: str) -> None:
@@ -474,3 +555,7 @@ class AiLogStore:
     async def export(self, **kwargs: Any) -> dict[str, Any]:
         """See :func:`export_events` (``project_id`` is already bound)."""
         return await export_events(self._db, self.project_id, **kwargs)
+
+    async def timeline(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """See :func:`build_run_timeline` (``project_id`` is already bound)."""
+        return await build_run_timeline(self._db, self.project_id, **kwargs)
