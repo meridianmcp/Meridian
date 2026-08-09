@@ -543,3 +543,114 @@ def test_mcp_start_session_includes_profile_binding_with_configured_layers(clien
     binding = result["profile_binding"]
     assert binding is not None
     assert binding["generation_key"].startswith("sha256:")
+
+
+# ---------------------------------------------------------------------------
+# 89a06e40 fix-up (independent-verification follow-up) — two more
+# _build_quick_start_goal call sites that the original PROFILE-6 commit
+# (3afe59ae) missed the profile_generation_key/profile_restart_required
+# wiring for:
+#   Gap 1 — meridian/mcp/handler.py::_build_executor_goal_messages (the
+#     executor-goal MCP prompt), one of exactly two call sites
+#     _build_quick_start_goal's own docstring names as forwarding the
+#     rendered /goal text standalone with no sibling profile_binding field.
+#   Gap 2 — meridian/server.py::_build_continue_payload's goal_string (the
+#     "just continue" resume payload), plus the REST
+#     POST /projects/{id}/start-session endpoint's missing profile_binding
+#     sibling field (it bypasses handle_start_session's own enrichment
+#     block entirely by calling _start_session_composite directly).
+# ---------------------------------------------------------------------------
+
+
+async def test_executor_goal_prompt_includes_profile_generation_tag(db):
+    """Gap 1 — the executor-goal prompt's embedded /goal text now carries
+    the same <profile_generation> tag a goal-only handoff render does."""
+    from meridian.mcp.handler import _build_executor_goal_messages
+
+    p = await db_module.create_project(db, "89a06e40-fixup-executor-goal-tag")
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "solo item", prospect_bypass=True,
+    )
+
+    messages = await _build_executor_goal_messages({"project_id": p["id"]}, db)
+    text = messages[0]["content"]["text"]
+    assert "<profile_generation key=" in text
+    assert 'restart_required="false"' in text
+
+
+async def test_executor_goal_prompt_no_project_omits_profile_generation_tag(db):
+    """No project resolved → the instructional-template branch, which never
+    reaches _build_quick_start_goal with a resolved project_id — no tag,
+    and no crash from the profile-binding resolution being skipped."""
+    from meridian.mcp.handler import _build_executor_goal_messages
+
+    messages = await _build_executor_goal_messages({}, db)
+    text = messages[0]["content"]["text"]
+    assert "<profile_generation" not in text
+
+
+async def test_build_continue_payload_goal_string_includes_profile_generation_tag(db):
+    """Gap 2 (half A) — _build_continue_payload's goal_string (the 'just
+    continue' resume payload's /goal-equivalent field) now also carries the
+    inline tag, threaded the same way generate_handoff's own call sites are
+    in meridian/handoff.py."""
+    from meridian.server import _start_session_composite
+
+    p = await db_module.create_project(db, "89a06e40-fixup-continue-tag")
+    item = await db_module.add_sprint_item(
+        db, p["id"], "v9", "Wire the widget", prospect_bypass=True,
+    )
+    first = await _start_session_composite(
+        db, p["id"], "resume-me-89a06e40", "/tmp", version="v9",
+    )
+    assert "continuation" not in first
+    # Immediate re-call within the heartbeat window → continue payload.
+    second = await _start_session_composite(
+        db, p["id"], "resume-me-89a06e40", "/tmp", source="resume",
+    )
+    assert second.get("continuation") is True
+    assert "<profile_generation key=" in second["goal_string"]
+    assert 'restart_required="false"' in second["goal_string"]
+    assert item["id"] in second["goal_string"]
+
+
+# --- Gap 2 (half B) — REST /start-session profile_binding sibling field --
+
+
+def test_rest_start_session_endpoint_includes_profile_binding(client):
+    """The REST /projects/{id}/start-session route returns
+    _start_session_composite's payload directly, bypassing the MCP
+    start_session tool's handle_start_session enrichment entirely — this
+    endpoint needs its own profile_binding attachment (89a06e40 fix-up)."""
+    pid = client.post(
+        "/projects", json={"name": "rest-89a06e40-start-binding"}
+    ).json()["id"]
+    r = client.post(
+        f"/projects/{pid}/start-session", json={"session_name": "rest-fresh"}
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert "profile_binding" in body
+    assert body["profile_binding"] is not None
+    assert set(body["profile_binding"].keys()) == _PROFILE_BINDING_KEYS
+
+
+def test_rest_start_session_endpoint_continue_mode_includes_profile_binding(client):
+    """Both the fresh-session AND continue-mode REST payload shapes get the
+    sibling field — Gap 2 explicitly calls out both as affected."""
+    pid = client.post(
+        "/projects", json={"name": "rest-89a06e40-continue-binding"}
+    ).json()["id"]
+    first = client.post(
+        f"/projects/{pid}/start-session", json={"session_name": "rest-resume"}
+    )
+    assert first.status_code == 200
+    second = client.post(
+        f"/projects/{pid}/start-session", json={"session_name": "rest-resume"}
+    )
+    assert second.status_code == 200
+    body = second.json()
+    assert body.get("continuation") is True
+    assert "profile_binding" in body
+    assert body["profile_binding"] is not None
+    assert set(body["profile_binding"].keys()) == _PROFILE_BINDING_KEYS

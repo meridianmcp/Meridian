@@ -126,7 +126,11 @@ async def _build_executor_goal_messages(
     returns a clear fill-in template rather than an error, so the slash command
     is always useful even on a cold/empty project.
     """
-    from ..handoff import _build_quick_start_goal, _prepare_pending_sprint_items
+    from ..handoff import (
+        _build_quick_start_goal,
+        _prepare_pending_sprint_items,
+        build_effective_profile_binding,
+    )
 
     project: dict[str, Any] | None = None
     project_id = (args.get("project_id") or "").strip()
@@ -205,6 +209,21 @@ async def _build_executor_goal_messages(
         )
     except Exception:  # noqa: BLE001
         _tpl_pointer_evidence_ids = None
+    # 89a06e40 — best-effort profile identity/generation resolution, threaded
+    # into quick_start_goal's inline <profile_generation> tag below. Per
+    # _build_quick_start_goal's own docstring (see profile_generation_key),
+    # this prompt handler (_build_executor_goal_messages) is one of exactly
+    # two call sites where the rendered /goal text is copied/forwarded
+    # standalone with no sibling profile_binding field to fall back on — the
+    # other is _generate_goal_only_handoff (meridian/handoff.py), which
+    # already threads this. No session_id in scope here (this prompt only
+    # takes project_id/project_name — see _MCP_PROMPTS' "executor-goal"
+    # argument list), so this resolves the project/workspace/hosted_default
+    # layers only, matching _generate_starter_handoff's /
+    # _generate_goal_only_handoff's own session_id-less calls.
+    # build_effective_profile_binding is already fully guarded internally
+    # (returns None on any failure) — no extra try/except needed here.
+    _profile_binding = await build_effective_profile_binding(db, pid)
     quick_start_goal = _build_quick_start_goal(
         pending,
         version=scoped_version,
@@ -224,6 +243,14 @@ async def _build_executor_goal_messages(
         # docstring.
         project_id=pid,
         project_name=pname,
+        # 89a06e40 — inline <profile_generation> tag; None/False (never crash)
+        # when the best-effort resolution above failed.
+        profile_generation_key=(
+            _profile_binding.get("generation_key") if _profile_binding else None
+        ),
+        profile_restart_required=bool(
+            _profile_binding.get("restart_required")
+        ) if _profile_binding else False,
     )
     if pending:
         item_lines = "\n".join(
