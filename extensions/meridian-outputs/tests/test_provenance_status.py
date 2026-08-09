@@ -427,11 +427,11 @@ class TestConvergenceAwareness:
         enough files that one drain() can't finish the walk in a single
         pass, leaves the walk genuinely IN PROGRESS (not converged) -- an
         "unknown" answer read against that state must say so, never be
-        read as confirmed absence. (A brand-new, NEVER-rebuilt index is
-        trivially "converged" by this system's own design -- no walk has
-        started, so none can be "in progress" -- so that scenario alone
-        does not exercise this path; see test_converged_index_makes_
-        unknown_confident for that baseline instead.)
+        read as confirmed absence. (Since item 3f758063, a brand-new,
+        NEVER-rebuilt index is ALSO never confidently "converged" -- see
+        test_never_walked_index_makes_unknown_inconclusive below for that
+        distinct, zero-evidence scenario; see test_converged_index_makes_
+        unknown_confident for the genuine-convergence baseline instead.)
         """
         for i in range(25):
             (tmp_path / f"file_{i:03d}.csv").write_text(f"{i}\n", encoding="utf-8")
@@ -446,6 +446,34 @@ class TestConvergenceAwareness:
         assert status["convergence"] is not None
         assert status["convergence"]["converged"] is False
         assert status["inconclusive"] is True
+
+    @duckdb_required
+    def test_never_walked_index_makes_unknown_inconclusive(
+        self, tmp_path: Path,
+    ) -> None:
+        """3f758063 -- a genuinely brand-new index that has never once been
+        asked to walk `outputs_dir` at all (no rebuild()/search_outputs()
+        call preceded this lookup) must answer "unknown" as inconclusive,
+        never as confirmed absence -- the real hosted/local mismatch this
+        item was opened to close: a caller trusting `get_provenance_status`
+        as authoritative on its very first call against a real, non-empty
+        outputs tree that simply hadn't been walked yet."""
+        real_output = tmp_path / "already_here.csv"
+        real_output.write_text("a,b\n1,2\n", encoding="utf-8")
+        never = tmp_path / "genuinely_absent.csv"  # never created on disk
+
+        # No rebuild()/search_outputs() call at all before this lookup.
+        status = PS.get_provenance_status(str(tmp_path), str(never))
+        assert status["provenance_type"] == PS.UNKNOWN
+        assert status["convergence"]["converged"] is False
+        assert status["convergence"]["never_walked"] is True
+        assert status["inconclusive"] is True
+
+        # The REAL, already-on-disk file must be equally inconclusive, not
+        # silently reported as a confirmed miss either.
+        status_real = PS.get_provenance_status(str(tmp_path), str(real_output))
+        assert status_real["provenance_type"] == PS.UNKNOWN
+        assert status_real["inconclusive"] is True
 
     @duckdb_required
     def test_converged_index_makes_unknown_confident(

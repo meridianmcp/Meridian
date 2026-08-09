@@ -303,6 +303,82 @@ class TestNoAuthoritativeRecord:
 
 
 # ---------------------------------------------------------------------------
+# Fail-closed on incomplete evidence (item 3f758063)
+#
+# Prior state (confirmed by direct reproduction before this fix): the
+# "nothing in meridian-outputs' authoritative index at all" fallback branch
+# in _bind_one_artifact called provenance_status.get_provenance_status and
+# read its `provenance_type`, but never consulted the `inconclusive` field
+# that same call already computes. An artifact whose canonical output
+# genuinely exists but simply had not been reached yet by a still-
+# converging walk (a real possibility any time resolve_figure_output's own
+# forced rebuild() runs out of budget on a large/cold outputs_dir -- see
+# that function's own docstring) was classified ORPHANED -- a confident
+# "this artifact is orphaned from any known provenance" verdict -- with
+# nothing distinguishing it from a genuinely, confirmedly absent artifact.
+# A caller gating a write on `status`/`all_clear` would then reject or
+# quarantine a perfectly valid, not-yet-indexed artifact.
+# ---------------------------------------------------------------------------
+
+class TestIncompleteEvidenceFailsClosed:
+    @duckdb_required
+    def test_unconverged_index_reports_unresolved_not_orphaned(
+        self, tmp_path: Path,
+    ) -> None:
+        """Simulates a still-mid-walk index (real completed pass, then a
+        confirmed-stale backlog entry injected and rebuild() frozen so the
+        simulated backlog survives resolve_figure_output's own forced
+        rebuild() calls -- same deterministic technique
+        test_degraded_labeling.py already uses for this exact reason,
+        rather than racing a tiny time budget against a slow hasher)."""
+        real_output = tmp_path / "already_here.csv"
+        real_output.write_text("a,b\n1,2\n", encoding="utf-8")
+
+        idx = OL._get_cached_index(str(tmp_path))
+        idx.rebuild()
+        idx.rebuild = lambda max_seconds=None: len(idx._row_cache)
+        idx._pending_stale["/still/not/discovered/output.csv"] = (None, None)
+        idx.last_rebuild_partial = True
+
+        never_written = str(tmp_path / "not_yet_produced.csv")
+        result = PV.bind_artifact_provenance(
+            str(tmp_path),
+            [{
+                "artifact_id": "fig-7", "kind": "figure",
+                "canonical_path": never_written,
+            }],
+        )
+        assert result["all_clear"] is False
+        binding = result["bindings"][0]
+        assert binding["status"] == PV.UNRESOLVED
+        assert binding["evidence"] == "index_not_converged"
+        assert binding["status"] != PV.ORPHANED
+        assert binding["reason"]
+
+    @duckdb_required
+    def test_converged_index_still_reports_orphaned(self, tmp_path: Path) -> None:
+        """Fail-closed cuts both ways: once the index HAS genuinely
+        converged, a real absence must still come back ORPHANED, not get
+        swept into UNRESOLVED just because this item added a new check."""
+        (tmp_path / "unrelated.csv").write_text("x\n", encoding="utf-8")
+        idx = OL._get_cached_index(str(tmp_path))
+        idx.rebuild()
+        assert idx.get_convergence_state().converged is True  # sanity
+
+        result = PV.bind_artifact_provenance(
+            str(tmp_path),
+            [{
+                "artifact_id": "fig-8", "kind": "figure",
+                "canonical_path": str(tmp_path / "truly_missing.csv"),
+            }],
+        )
+        assert result["all_clear"] is False
+        binding = result["bindings"][0]
+        assert binding["status"] == PV.ORPHANED
+        assert binding["evidence"] == "none"
+
+
+# ---------------------------------------------------------------------------
 # Aggregate counts / all_clear across a mixed manifest
 # ---------------------------------------------------------------------------
 
