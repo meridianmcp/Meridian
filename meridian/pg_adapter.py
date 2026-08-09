@@ -4221,6 +4221,46 @@ async def _migrate_pg_capability_profiles(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_profile_layers(conn: PostgresConnection) -> None:
+    """d8481276 — profile_layers / profile_layer_revisions (mirrors SQLite).
+
+    One row per (scope_type, scope_id): a JSON field dict, an explicit
+    reset-field list, schema version, content hash, a hosted_default-only
+    lifecycle state, non-secret provenance, and updated_at. The revisions
+    table is an append-only audit ledger for hosted_default only, mirroring
+    board_snapshot_revisions. Mirrors db.migrations._migrate_profile_layers.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS profile_layers ("
+        "    scope_type TEXT NOT NULL,"
+        "    scope_id TEXT NOT NULL,"
+        "    schema_version INTEGER NOT NULL DEFAULT 1,"
+        "    revision INTEGER NOT NULL DEFAULT 0,"
+        "    fields TEXT NOT NULL DEFAULT '{}',"
+        "    reset_fields TEXT NOT NULL DEFAULT '[]',"
+        "    lifecycle_state TEXT,"
+        "    content_hash TEXT,"
+        "    provenance TEXT,"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    PRIMARY KEY (scope_type, scope_id)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS profile_layer_revisions ("
+        "    id TEXT PRIMARY KEY,"
+        "    scope_type TEXT NOT NULL,"
+        "    scope_id TEXT NOT NULL,"
+        "    revision INTEGER NOT NULL,"
+        "    content_hash TEXT NOT NULL,"
+        "    lifecycle_state TEXT,"
+        "    fields TEXT NOT NULL DEFAULT '{}',"
+        "    reset_fields TEXT NOT NULL DEFAULT '[]',"
+        "    actor TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_profile_layer_revisions_scope "
+        "ON profile_layer_revisions(scope_type, scope_id, revision DESC);"
+    )
+
+
 async def _migrate_pg_sprint_item_tool_requirements(conn: PostgresConnection) -> None:
     """76dde31f (665 follow-up) — sprint_items.tool_requirements: typed,
     per-item MCP tool-requirement contract (mirrors SQLite).
@@ -4573,4 +4613,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_ai_log_events,
     _migrate_pg_proposal_intake_drafts,
     _migrate_pg_sprint_batch_claims_reservation_fields,
+    _migrate_pg_profile_layers,
 )

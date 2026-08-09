@@ -88,6 +88,13 @@ async def planner_handoff_endpoint(
     capability_contract = await handoff_module.build_effective_capability_contract(
         db, project_id,
     )
+    # 89a06e40 — machine-readable effective profile identity/generation;
+    # best-effort, never breaks the planner handoff. See pinned decision
+    # ee7bccc9 for why the tunnel/connector routes deliberately do NOT call
+    # this same helper.
+    profile_binding = await handoff_module.build_effective_profile_binding(
+        db, project_id,
+    )
     # 6cdc5df3 — machine-readable proposal-to-evidence linkage; best-effort,
     # never breaks the planner handoff.
     proposal_evidence = await handoff_module.build_proposal_evidence_for_handoff(
@@ -118,6 +125,7 @@ async def planner_handoff_endpoint(
         "path": path, "content": handoff_module.format_handoff_mcp_content(content),
         "mode": "planner",
         "capability_contract": capability_contract,
+        "profile_binding": profile_binding,
         "proposal_evidence": proposal_evidence,
         "docx_integrity": docx_integrity,
         "latest_executor_report": latest_executor_report,
@@ -283,6 +291,14 @@ async def generate_handoff_endpoint(
     capability_contract = await handoff_module.build_effective_capability_contract(
         db, project_id, board_stale=_board_stale,
     )
+    # 89a06e40 — machine-readable effective profile identity/generation;
+    # best-effort, never breaks the mandatory handoff. See pinned decision
+    # ee7bccc9 for why the tunnel/connector routes deliberately do NOT call
+    # this same helper. session_id is threaded through the same way it is
+    # into generate_handoff() above.
+    profile_binding = await handoff_module.build_effective_profile_binding(
+        db, project_id, session_id=session_id if isinstance(session_id, str) else None,
+    )
     # 6cdc5df3 — machine-readable proposal-to-evidence linkage; best-effort,
     # never breaks the mandatory handoff.
     proposal_evidence = await handoff_module.build_proposal_evidence_for_handoff(
@@ -300,6 +316,7 @@ async def generate_handoff_endpoint(
         "path": path, "content": handoff_module.format_handoff_mcp_content(content),
         "mode": mode,
         "capability_contract": capability_contract,
+        "profile_binding": profile_binding,
         "proposal_evidence": proposal_evidence,
         "docx_integrity": docx_integrity,
         "force_include_rejected": _force_include_rejected,

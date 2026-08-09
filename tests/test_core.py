@@ -1074,9 +1074,20 @@ def test_websocket_receives_task_event(client):
 def test_tunnel_status_returns_inactive_for_unknown_tenant(client):
     r = client.get("/tunnel/status/no-such-tenant")
     assert r.status_code == 200
+    body = r.json()
+    # 89a06e40 — profile_binding is a NEW additive field (workspace-only
+    # compact profile identity/generation); popped before the strict
+    # equality check below since its generation_key is a content hash that
+    # would make this assertion brittle to unrelated profile_contract
+    # changes — shape-checked separately instead.
+    binding = body.pop("profile_binding")
+    assert binding is not None
+    assert set(binding.keys()) == {
+        "generation_key", "executable", "degraded", "restart_required", "restart_report",
+    }
     # 02dbd8b4 — config_generation/inflight/safe_to_restart are always present
     # (empty/True for a tenant with no recorded runtime config generation yet).
-    assert r.json() == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "docs_active": False, "zotero_active": False, "outputs_active": False, "debug_active": False, "slot_health": {}, "slot_status": {}, "config_generation": {}, "inflight": {}, "safe_to_restart": True}
+    assert body == {"tenant_id": "no-such-tenant", "active": False, "code_active": False, "extract_active": False, "ppt_active": False, "word_active": False, "dc_active": False, "docs_active": False, "zotero_active": False, "outputs_active": False, "debug_active": False, "slot_health": {}, "slot_status": {}, "config_generation": {}, "inflight": {}, "safe_to_restart": True}
 
 
 def test_fs_mcp_proxy_returns_503_when_not_hosted(client):
@@ -7928,10 +7939,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_ai_log_events",
         "_migrate_pg_proposal_intake_drafts",
         "_migrate_pg_sprint_batch_claims_reservation_fields",
+        "_migrate_pg_profile_layers",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 149
+    assert len(allnames) == len(set(allnames)) == 150
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

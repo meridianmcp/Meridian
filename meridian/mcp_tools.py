@@ -105,6 +105,14 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "set_capability_profile": 'set_capability_profile(scope_type="project", scope_id="abc-123", capabilities=[{"id": "code-search", "purpose": "find symbols/functions/classes", "required_tools": ["Serena: find_symbol"], "availability_policy": "required"}], disabled_capability_ids=["legacy-grep-search"])',
     "clear_capability_profile": 'clear_capability_profile(scope_type="item", scope_id="item-uuid")',
     "get_effective_capability_profile": 'get_effective_capability_profile(project_id="abc-123", sprint_item_id="item-uuid")',
+    "list_profile_layers": 'list_profile_layers(scope_type="workspace")',
+    "get_profile_layer": 'get_profile_layer(scope_type="hosted_default", scope_id="global")',
+    "save_profile_layer": 'save_profile_layer(scope_type="workspace", scope_id="singleton", fields={"tool_priority_map": {"docs": "meridian-docs"}})',
+    "clone_profile_layer": 'clone_profile_layer(source_scope_type="hosted_default", source_scope_id="global", target_scope_type="hosted_default", target_scope_id="global-v2")',
+    "activate_profile_layer": 'activate_profile_layer(scope_id="global")',
+    "reset_profile_layer": 'reset_profile_layer(scope_type="session", scope_id="session-uuid")',
+    "get_profile_layer_revisions": 'get_profile_layer_revisions(scope_id="global", limit=10)',
+    "get_effective_profile": 'get_effective_profile(project_id="abc-123", session_id="session-uuid")',
     "claim_file": 'claim_file(session_id="session-uuid", file_path="meridian/server.py")',
     "release_file": 'release_file(session_id="session-uuid", file_path="meridian/server.py")',
     "idle_until_session_done": 'idle_until_session_done(watching_session_id="session-uuid")',
@@ -1570,7 +1578,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "'get_sprint_items' (args: status, show_blocked, include_human, version, "
         "include_manual_blocker, include_deferred — same meaning as the get_sprint_items tool) "
         "and 'get_sprint_item_pointers' (args: sprint_item_id — 404s if that item belongs to a "
-        "different project). Returns {results: [{request_id, status, adapter, operation, result, "
+        "different project); and 'profile' (PROFILE-7) with operations 'get_profile_layer' (args: "
+        "scope_type, scope_id), 'list_profile_layers' (args: optional scope_type filter), "
+        "'get_effective_profile' (args: optional session_id, user_scope_id, workspace_scope_id — "
+        "returns the merged, generation-keyed effective profile across all 5 layers), and "
+        "'get_profile_layer_revisions' (args: scope_id, optional limit). Returns {results: [{request_id, status, adapter, operation, result, "
         "error_code, error_message, elapsed_ms, cache_hit, coalesced_with}], elapsed_ms} — "
         "results is ALWAYS in input order. error_code is one of VALIDATION_ERROR, "
         "ADAPTER_NOT_FOUND, OPERATION_NOT_FOUND, DEPENDENCY_NOT_FOUND, DEPENDENCY_CYCLE, "
@@ -1591,12 +1603,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "max_requests": {"type": "integer", "description": "Optional cap on len(requests) for this call (default 100)."}},
          "required": ["requests"]}},
     {"name": "batch_mutate", "description":
-        "133bfff6 — run a batch of TRANSACTIONAL mutation entries in ONE call, mixing TWO entry "
+        "133bfff6 — run a batch of TRANSACTIONAL mutation entries in ONE call, mixing entry "
         "kinds selected per-entry via 'kind': 'sprint_item_pointer' (attach a pointer — same "
-        "shape as add_sprint_item_pointer: sprint_item_id, source_type, targets, optional label) "
-        "and 'sprint_item_update' (patch an EXISTING sprint item — same shape as update_sprint_item: "
+        "shape as add_sprint_item_pointer: sprint_item_id, source_type, targets, optional label), "
+        "'sprint_item_update' (patch an EXISTING sprint item — same shape as update_sprint_item: "
         "item_id + at least one patchable field; sprint-item CREATION is not supported here, use "
-        "execute_batch(operation='sprint_items', ...) or add_sprint_item for that). Reuses the exact "
+        "execute_batch(operation='sprint_items', ...) or add_sprint_item for that), and (PROFILE-7) "
+        "'profile_layer' (upsert one scope_type+scope_id profile layer — same shape as "
+        "set_profile_layer: scope_type, scope_id, optional fields/reset_fields/provenance/"
+        "expected_revision; a stale expected_revision surfaces error_code='CONFLICT' with "
+        "expected_revision/actual_revision in the outcome payload). Reuses the exact "
         "same validated apply/compensate logic execute_batch and the single-item tools already use — "
         "no separate/duplicated mutation path. mode is REQUIRED: 'all_or_nothing' validates every "
         "entry BEFORE mutating anything — any validation failure writes NOTHING (status 'rejected'); "
@@ -1615,7 +1631,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "entries": {"type": "array", "description": "Non-empty list of entries, each carrying its own 'kind' ('sprint_item_pointer' or 'sprint_item_update'). Each entry may carry an optional 'correlation_key' string echoed back on its result.", "items": {"type": "object"}},
+         "entries": {"type": "array", "description": "Non-empty list of entries, each carrying its own 'kind' ('sprint_item_pointer', 'sprint_item_update', or 'profile_layer'). Each entry may carry an optional 'correlation_key' string echoed back on its result.", "items": {"type": "object"}},
          "mode": {"type": "string", "enum": ["all_or_nothing", "best_effort"], "description": "REQUIRED — no default."},
          "idempotency_key": {"type": "string", "description": "REQUIRED key (value may be null or \"\" to explicitly opt out)."},
          "session_id": {"type": "string", "description": "Optional attribution for the idempotency receipt."},
@@ -2705,6 +2721,159 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "user_scope_id": {"type": "string", "description": "Optional — a user/human id whose 'user' layer should be included in the merge."},
          "workspace_scope_id": {"type": "string", "description": "Optional — defaults to 'singleton' (the self-host default workspace key)."}},
          "required": []}},
+    {"name": "list_profile_layers", "description":
+        "0bec79a7 (PROFILE-5) — Read-only: enumerate every persisted "
+        "profile_layers row across the 5-layer hosted_default -> workspace "
+        "-> user -> project -> session contract (see "
+        "meridian.profile_contract / meridian.db.profile_layers for the "
+        "full design), optionally narrowed to one scope_type. Each entry is "
+        "shaped exactly like get_profile_layer's return value: scope_type, "
+        "scope_id, schema_version, revision, fields, reset_fields, "
+        "lifecycle_state (hosted_default only), content_hash, provenance, "
+        "updated_at. Ordered by (scope_type, scope_id) for deterministic "
+        "output — this is a raw listing, not a resolved/merged view; use "
+        "get_effective_profile for the merged per-project result. An empty "
+        "table returns [], never an error.",
+     "inputSchema": {"type": "object", "properties": {
+         "scope_type": {"type": "string", "enum": ["hosted_default", "workspace", "user", "project", "session"],
+             "description": "Optional — narrow the listing to one layer. Omit to list every layer of every scope_type."}},
+         "required": []}},
+    {"name": "get_profile_layer", "description":
+        "0bec79a7 (PROFILE-5) — Read-only: return the raw, single-layer "
+        "profile for one (scope_type, scope_id) — one row of the "
+        "hosted_default -> workspace -> user -> project -> session "
+        "contract, with no merging against any other layer. A scope with "
+        "no persisted row gets an empty profile back (revision=0, "
+        "fields={}), never an error — mirrors get_capability_manifest's "
+        "'never a read error' contract. Use get_effective_profile instead "
+        "when you want the MERGED, multi-layer view for a project.",
+     "inputSchema": {"type": "object", "properties": {
+         "scope_type": {"type": "string", "enum": ["hosted_default", "workspace", "user", "project", "session"]},
+         "scope_id": {"type": "string", "description": "The key for this layer — a hosted_default policy id (typically 'global'), a tenant/workspace id, a user/human id, the project_id, or the session_id, depending on scope_type."}},
+         "required": ["scope_type", "scope_id"]}},
+    {"name": "save_profile_layer", "description":
+        "0bec79a7 (PROFILE-5) — Validate and persist ONE layer of the "
+        "hosted_default -> workspace -> user -> project -> session profile "
+        "contract (see meridian.profile_contract.FIELD_REGISTRY for the "
+        "full field list and per-field allowed_layers/merge_strategy/"
+        "narrow_only rules). REPLACES this scope's stored fields/"
+        "reset_fields wholesale (not a merge) — to add one field to an "
+        "existing layer, pass the full desired field set, not a delta. "
+        "Rejects deterministically with {error} on an unknown field, a "
+        "field not allowed at this scope_type, a secret-shaped value, a "
+        "machine-local absolute path (outside the field's "
+        "path_allowed_from_layer), an unsafe/destructive shell command "
+        "(executor_config.test_cmd/deploy_cmd), or a malformed "
+        "capability_manifest_ref. expected_revision enables optimistic "
+        "concurrency: omit it for last-write-wins, or pass the revision "
+        "you last read from get_profile_layer to fail with a structured "
+        "{error, code: 'STALE_REVISION', current_revision} instead of "
+        "silently clobbering a concurrent write. override_reason is "
+        "accepted for forward symmetry with the narrow_only-widen override "
+        "knob used at resolve time (get_effective_profile) but this tool "
+        "itself never blocks a write on it — narrow_only/safe_direction "
+        "enforcement happens at MERGE time, not write time, since a layer "
+        "may legitimately declare any value for a field it owns. An "
+        "idempotent no-op resave (identical fields/reset_fields) returns "
+        "the current row unchanged with no revision bump.",
+     "inputSchema": {"type": "object", "properties": {
+         "scope_type": {"type": "string", "enum": ["hosted_default", "workspace", "user", "project", "session"]},
+         "scope_id": {"type": "string"},
+         "fields": {"type": "object", "description": "This layer's field declarations — replaces whatever is currently stored at this scope. See meridian.profile_contract.FIELD_REGISTRY for the valid field names."},
+         "reset_fields": {"type": "array", "items": {"type": "string"}, "description": "Field names this layer explicitly resets back to inheriting from a less-specific layer. Replaces this scope's previous reset_fields list."},
+         "provenance": {"type": "object", "description": "Non-secret provenance for this layer's declaration (config source, hashes, observed_at, client/server identity). No secrets or machine-local absolute paths."},
+         "expected_revision": {"type": "integer", "description": "Optimistic-concurrency guard — must match the scope's current revision or the write is rejected with STALE_REVISION. Omit for last-write-wins."},
+         "override_reason": {"type": "string", "description": "Accepted for symmetry with resolve-time override_reason; this tool does not itself gate on it."},
+         "actor": {"type": "string", "description": "Optional human/session identity recorded on the hosted_default audit ledger (ignored for non-hosted_default scopes, which are not ledgered)."}},
+         "required": ["scope_type", "scope_id"]}},
+    {"name": "clone_profile_layer", "description":
+        "0bec79a7 (PROFILE-5) — Copy one layer's fields/reset_fields/"
+        "provenance onto another scope, going through the exact same "
+        "validation/hashing path as save_profile_layer (not a raw copy) — "
+        "the target scope's allowed_layers may differ from the source's, "
+        "so a field the source layer legally carries can still be rejected "
+        "at the target. Rejects with {error} when the source layer does "
+        "not exist (revision=0 — cloning nothing is a caller error, not a "
+        "silent no-op). Cloning INTO a hosted_default target never carries "
+        "over the source's lifecycle_state — a fresh clone always lands in "
+        "'draft', exactly like any other first-ever write on a "
+        "hosted_default scope; use activate_profile_layer afterward to "
+        "publish it.",
+     "inputSchema": {"type": "object", "properties": {
+         "source_scope_type": {"type": "string", "enum": ["hosted_default", "workspace", "user", "project", "session"]},
+         "source_scope_id": {"type": "string"},
+         "target_scope_type": {"type": "string", "enum": ["hosted_default", "workspace", "user", "project", "session"]},
+         "target_scope_id": {"type": "string"},
+         "actor": {"type": "string", "description": "Optional human/session identity recorded on the target's hosted_default audit ledger, if the target is hosted_default."}},
+         "required": ["source_scope_type", "source_scope_id", "target_scope_type", "target_scope_id"]}},
+    {"name": "activate_profile_layer", "description":
+        "0bec79a7 (PROFILE-5) — Advance a hosted_default layer's lifecycle "
+        "to 'active' — the single 'publish' operation for the "
+        "hosted_default floor (fae6e882 pinned decision collapsed "
+        "'publish' and 'activate' into this one tool: a hosted_default "
+        "layer becomes authoritative the moment it reaches 'active', so "
+        "there is no separate publish step to expose). Only a "
+        "draft -> active or deprecated -> active transition is valid; any "
+        "other current state (e.g. retired, which is terminal) rejects "
+        "with {error}. Idempotent: calling on an already-active scope is a "
+        "no-op success (same revision, no new audit row). See "
+        "reset_profile_layer for the non-audited 'clear the row entirely' "
+        "path, or save_profile_layer followed by this tool for the "
+        "audited draft-then-publish flow.",
+     "inputSchema": {"type": "object", "properties": {
+         "scope_id": {"type": "string", "description": "The hosted_default scope id to activate (typically 'global')."},
+         "actor": {"type": "string", "description": "Optional human/session identity recorded on the audit ledger for this transition."}},
+         "required": ["scope_id"]}},
+    {"name": "reset_profile_layer", "description":
+        "0bec79a7 (PROFILE-5) — Delete a scope's ENTIRE profile-layer row "
+        "so it reverts to purely inheriting from less-specific layers — "
+        "mirrors clear_capability_profile's semantics for the "
+        "profile-layers contract. Idempotent: resetting an already-empty "
+        "or never-set scope is a no-op, not an error. For hosted_default "
+        "this clears the row (back to no-row / implicit draft) but is NOT "
+        "an audited lifecycle transition — prefer activate_profile_layer's "
+        "lifecycle machinery when you need an audited retire/reactivate "
+        "path instead of an unaudited wipe.",
+     "inputSchema": {"type": "object", "properties": {
+         "scope_type": {"type": "string", "enum": ["hosted_default", "workspace", "user", "project", "session"]},
+         "scope_id": {"type": "string"}},
+         "required": ["scope_type", "scope_id"]}},
+    {"name": "get_profile_layer_revisions", "description":
+        "0bec79a7 (PROFILE-5) — Read-only: the hosted_default revision/"
+        "audit history for one scope_id, newest first — the rollback/audit "
+        "trail the profile contract requires for the one layer that is "
+        "'immutable once published'. Only hosted_default writes are "
+        "ledgered; a non-hosted_default scope_id always returns []. Each "
+        "entry carries revision, content_hash, lifecycle_state, fields, "
+        "reset_fields, actor, and created_at.",
+     "inputSchema": {"type": "object", "properties": {
+         "scope_id": {"type": "string"},
+         "limit": {"type": "integer", "description": "Maximum rows to return, newest first. Defaults to 50."}},
+         "required": ["scope_id"]}},
+    {"name": "get_effective_profile", "description":
+        "0bec79a7 (PROFILE-5) — Read-only: resolve and return the MERGED "
+        "profile for a project across every applicable layer — "
+        "hosted_default -> workspace -> user -> project -> session, least "
+        "to most specific (see meridian.db.profile_layers."
+        "get_effective_profile). The 'project' layer is synthetic: its 7 "
+        "legacy ProjectSettings/executor_config fields come from the "
+        "existing get_project_settings authority (zero duplication), and "
+        "its 3 new fields (tool_priority_map, capability_manifest_ref, "
+        "claim_verification_mode) come from the real profile_layers row. A "
+        "hosted_default layer only applies when its lifecycle_state is "
+        "'active' or 'deprecated' — 'draft' and 'retired' never contribute "
+        "fields but still mark the result degraded/not-executable via the "
+        "returned executable/degraded/*_reasons fields. Pass "
+        "session_id/user_scope_id to also fold in those layers; "
+        "workspace_scope_id/hosted_default_scope_id default to "
+        "'singleton'/'global'. Returns {error} for an unknown project_id.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string", "description": "Optional — also resolve this session's session-scoped layer."},
+         "user_scope_id": {"type": "string", "description": "Optional — a user/human id whose 'user' layer should be included in the merge."},
+         "workspace_scope_id": {"type": "string", "description": "Optional — defaults to 'singleton' (the self-host default workspace key)."},
+         "hosted_default_scope_id": {"type": "string", "description": "Optional — defaults to 'global' (the self-host default hosted_default key)."}},
+         "required": []}},
     {"name": "claim_file", "description":
         "Claim edit rights on a file for this session. Whole-file by default "
         "(auto-expires after 2 hours). For symbol-level claims — so two sessions "
@@ -3130,6 +3299,8 @@ _READ_ONLY_TOOLS = {
     "analyze_model_efficiency",
     "get_custom_hooks",
     "batch_read",
+    "list_profile_layers", "get_profile_layer", "get_profile_layer_revisions",
+    "get_effective_profile",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
 
@@ -3337,6 +3508,14 @@ _TOOL_CATEGORY: dict[str, str] = {
     "set_capability_profile": "config",
     "clear_capability_profile": "config",
     "get_effective_capability_profile": "config",
+    "list_profile_layers": "config",
+    "get_profile_layer": "config",
+    "save_profile_layer": "config",
+    "clone_profile_layer": "config",
+    "activate_profile_layer": "config",
+    "reset_profile_layer": "config",
+    "get_profile_layer_revisions": "config",
+    "get_effective_profile": "config",
     "set_active_repo":     "config",
     "run_verification":    "config",
     "add_custom_hook":     "config",
@@ -3467,6 +3646,14 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "set_capability_profile":    "both",
     "clear_capability_profile":  "both",
     "get_effective_capability_profile": "both",
+    "list_profile_layers":       "both",
+    "get_profile_layer":         "both",
+    "save_profile_layer":        "both",
+    "clone_profile_layer":       "both",
+    "activate_profile_layer":    "both",
+    "reset_profile_layer":       "both",
+    "get_profile_layer_revisions": "both",
+    "get_effective_profile":     "both",
     "add_custom_hook":           "both",
     "get_custom_hooks":          "both",
     "delete_custom_hook":        "both",
