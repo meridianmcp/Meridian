@@ -442,12 +442,20 @@ _CLAIM_VERIFICATION_MODE_ORDER: dict[str, int] = {"off": 0, "advisory": 1, "stri
 
 
 def validate_layer_fields(
-    scope_type: str, fields: dict[str, Any] | None, *, field_registry: dict[str, ProfileFieldSpec] | None = None
+    scope_type: str,
+    fields: dict[str, Any] | None,
+    *,
+    reset_fields: list[str] | None = None,
+    field_registry: dict[str, ProfileFieldSpec] | None = None,
 ) -> None:
     """Validate a layer write BEFORE persistence — raise, never silent drop.
 
-    Checks: scope_type is valid, every field name exists in the registry,
-    the layer's scope_type is in that field's ``allowed_layers``, the value
+    Checks: scope_type is valid, every ``reset_fields`` name exists in the
+    registry (folded in from profile_resolution.py's validate_profile_layer
+    during the second PROFILE-RECON re-verification pass, 732c113e --
+    previously a reset_fields entry naming an unknown field silently no-opped
+    instead of raising), every ``fields`` name exists in the registry, the
+    layer's scope_type is in that field's ``allowed_layers``, the value
     is not ``None`` (use ``reset_fields`` instead), the value's Python type
     matches the field's registry ``type``, the value carries no
     secret-shaped string or (outside ``path_allowed_from_layer``)
@@ -462,6 +470,9 @@ def validate_layer_fields(
     """
     registry = field_registry or FIELD_REGISTRY
     scope_type = normalize_scope_type(scope_type)
+    for reset_field in reset_fields or []:
+        if reset_field not in registry:
+            raise ProfileContractError(f"reset_fields: unknown profile field: {reset_field!r}")
     for field_name, value in (fields or {}).items():
         spec = registry.get(field_name)
         if spec is None:
@@ -572,6 +583,26 @@ class EffectiveProfile(BaseModel):
     #: own "nothing to diff without a baseline" contract.
     restart_report: dict[str, str] = Field(default_factory=dict)
     restart_required: bool = False
+    #: Whether this resolution is safe to act on at all -- False only when a
+    #: hosted_default floor is "retired" (terminal, no longer authoritative).
+    #: Folded in from profile_resolution.py's EffectiveProfile.executable
+    #: (ac95d206) during the PROFILE-RECON re-verification pass (732c113e,
+    #: second verification round) -- the one piece the first re-verification
+    #: pass (which restored changed_fields) still missed. See
+    #: resolve_effective_profile's docstring for why this field only ever
+    #: reflects the ``blocked_widens``-driven half of the original signal;
+    #: the hosted_default-lifecycle half is computed by
+    #: ``db.profile_layers.get_effective_profile`` instead (this module is
+    #: pure/storage-free and, by design, never receives a non-live
+    #: hosted_default layer to begin with -- see that module's docstring).
+    executable: bool = True
+    executable_reasons: list[str] = Field(default_factory=list)
+    #: True when the resolution is usable but running under a caveat (a
+    #: draft/deprecated hosted_default floor, or a narrow_only widen that got
+    #: rejected into blocked_widens). Unlike ``executable``, a degraded
+    #: resolution is still safe to act on.
+    degraded: bool = False
+    degraded_reasons: list[str] = Field(default_factory=list)
 
 
 def _direction_is_safe(old: Any, new: Any, safe_direction: str, field_name: str) -> bool:
@@ -684,6 +715,34 @@ def resolve_effective_profile(
     actually set is diffed against its FIELD_REGISTRY default instead. See
     the field's own docstring on :class:`EffectiveProfile` for the exact
     contract.
+
+    ``executable``/``executable_reasons``/``degraded``/``degraded_reasons``
+    (folded in from profile_resolution.py's EffectiveProfile.executable/
+    degraded during the second PROFILE-RECON re-verification pass,
+    732c113e) report only the HALF of the original signal this function can
+    actually see: a ``narrow_only`` widen rejected into ``blocked_widens``
+    always marks the resolution ``degraded`` (``"narrow_only_widen_blocked"``).
+    The other half of the original signal -- a hosted_default floor whose
+    ``lifecycle_state`` is ``"retired"`` (not ``executable`` at all) or
+    ``"draft"``/``"deprecated"`` (``degraded`` but still ``executable``) --
+    is deliberately NOT computed here, because this module is pure and
+    storage-free: it only ever sees the layers its caller hands it, and
+    ``db.profile_layers.get_effective_profile`` already OMITS a non-live
+    (draft/retired) hosted_default layer from ``layers`` entirely before
+    calling this function (see that module's docstring and
+    ``LIVE_HOSTED_DEFAULT_STATES``) -- a design predating this fix, already
+    relied upon by ``test_get_effective_profile_hosted_default_draft_does_not_apply``,
+    and deliberately NOT changed here (passing every layer through
+    regardless of lifecycle_state so this function could compute the whole
+    signal uniformly was considered and rejected: it would mean a
+    retired/draft hosted_default's field VALUES start flowing into
+    ``fields`` again, which is exactly the outcome the pre-filter exists to
+    prevent -- narrowing the safety property to "caller must remember to
+    check ``executable``" instead of "the merge never sees the row at all").
+    ``db.profile_layers.get_effective_profile`` therefore computes the
+    hosted_default-lifecycle half itself, from the raw row it already reads
+    before filtering, and folds it into this function's ``executable``/
+    ``degraded``/``*_reasons`` on the returned dict -- see that function.
     """
     registry = field_registry or FIELD_REGISTRY
     ordered_layers = sorted(layers, key=lambda layer: SCOPE_TYPES.index(layer.scope_type))
@@ -698,10 +757,33 @@ def resolve_effective_profile(
     for layer in ordered_layers:
         if not layer.fields and not layer.reset_fields:
             continue
+        # Envelope/structural checks -- same tier as the "unknown profile
+        # field"/"not allowed at layer" checks a few lines down (both
+        # pre-date this pass and already run at resolve time regardless of
+        # the "no content revalidation" divergence documented above; that
+        # divergence is about secrets/paths/unsafe-commands/types, not
+        # envelope shape). Folded in from profile_resolution.py's
+        # validate_profile_layer during the second PROFILE-RECON
+        # re-verification pass (732c113e) -- previously ZERO equivalent
+        # existed anywhere in this module for either check.
+        if layer.schema_version != SCHEMA_VERSION:
+            raise ProfileContractError(
+                f"unsupported profile schema_version {layer.schema_version!r} for layer "
+                f"({layer.scope_type!r}, {layer.scope_id!r}) -- this module understands "
+                f"schema_version {SCHEMA_VERSION} only"
+            )
+        if layer.lifecycle_state is not None and layer.scope_type != "hosted_default":
+            raise ProfileContractError(
+                f"lifecycle_state is only valid for scope_type='hosted_default', got "
+                f"scope_type={layer.scope_type!r} for layer "
+                f"({layer.scope_type!r}, {layer.scope_id!r})"
+            )
         layers_applied.append(layer.scope_type)
         contributing.append((layer.scope_type, layer.scope_id, layer.revision))
 
         for reset_field in layer.reset_fields:
+            if reset_field not in registry:
+                raise ProfileContractError(f"reset_fields: unknown profile field: {reset_field!r}")
             if reset_field in effective:
                 reset_log.append({
                     "field": reset_field,
@@ -823,6 +905,18 @@ def resolve_effective_profile(
 
     restart_report, restart_required = _compute_restart_report(changed_field_names, registry)
 
+    # executable/degraded: only the blocked_widens-driven half of the
+    # original signal is computable here -- see the docstring above for why
+    # the hosted_default-lifecycle half is NOT computed in this pure module
+    # and instead lives in db.profile_layers.get_effective_profile.
+    executable = True
+    executable_reasons: list[str] = []
+    degraded = False
+    degraded_reasons: list[str] = []
+    if blocked_widens:
+        degraded = True
+        degraded_reasons.append("narrow_only_widen_blocked")
+
     return EffectiveProfile(
         fields=effective,
         field_sources=sources,
@@ -835,6 +929,10 @@ def resolve_effective_profile(
         changed_fields=changed_fields,
         restart_report=restart_report,
         restart_required=restart_required,
+        executable=executable,
+        executable_reasons=executable_reasons,
+        degraded=degraded,
+        degraded_reasons=degraded_reasons,
     )
 
 

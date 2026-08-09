@@ -14,6 +14,18 @@ were then deleted. See profile_contract.py's inline "Folded in from
 profile_resolution.py ... PROFILE-RECON (732c113e)" comments for exactly
 what moved.
 
+This reconciliation went through TWO independent verification passes before
+everything actually landed. The first pass restored ``changed_fields``
+(silently dropped by the initial merge). The second pass (this revision)
+found ``executable``/``degraded``/``executable_reasons``/``degraded_reasons``
+had ZERO equivalent anywhere, fixed that, fixed a related ``reset_fields``
+validation gap found in the same audit, and cross-checked literally every
+one of the 51 test functions (57 collected test IDs, once the two
+parametrized lifecycle tests are counted per-case) in the deleted
+tests/test_profile_resolution.py against this file and
+tests/test_profile_layers.py -- see both files' new sections below for what
+that audit found and fixed vs. documented as a deliberate divergence.
+
 What moved in (see the corresponding sections below):
   * ProfileFieldSpec.component (tunnel/connector/capability/general) +
     EffectiveProfile.restart_report/restart_required.
@@ -29,6 +41,23 @@ What moved in (see the corresponding sections below):
     capability_profile.merge_layers instead of last-write-wins -- closing a
     gap the module's own pre-existing comment already claimed was handled
     "elsewhere" but wasn't.
+  * (second pass) EffectiveProfile.executable/executable_reasons/degraded/
+    degraded_reasons -- but SPLIT across two functions rather than ported
+    verbatim into one: resolve_effective_profile computes the
+    blocked_widens-driven half (see the "executable / degraded" section
+    below); db.profile_layers.get_effective_profile computes the
+    hosted_default-lifecycle half, since resolve_effective_profile is pure
+    and, by design, never sees a non-live hosted_default layer (see both
+    functions' docstrings and tests/test_profile_layers.py's
+    test_get_effective_profile_*_hosted_default_* tests).
+  * (second pass) reset_fields entries are now validated against
+    FIELD_REGISTRY, both at write time (validate_layer_fields) and at
+    resolve time (resolve_effective_profile) -- previously an unknown
+    reset_fields name silently no-opped instead of raising.
+  * (second pass) ProfileLayer envelope checks: an unsupported
+    schema_version, or a lifecycle_state set on a non-hosted_default layer,
+    now raise ProfileContractError at resolve time -- previously neither
+    was checked anywhere.
 
 What did NOT move in (deliberate, documented divergences -- see the
 "documented divergences" section at the bottom of this file for tests that
@@ -45,7 +74,11 @@ auditable rather than silently lost):
     break every single effective-profile resolution for every project.
     profile_resolution.py's "validate every layer inside
     resolve_effective_profile" design is incompatible with that synthetic
-    layer and was not ported.
+    layer and was not ported. (The envelope checks added in the second pass
+    -- schema_version, lifecycle_state scoping -- are structural, not
+    content-safety checks, so they don't run into this problem: the
+    synthetic project layer always carries a real, already-valid
+    schema_version/no lifecycle_state.)
   * A no-layers resolve returning the FULL FIELD_REGISTRY pre-populated with
     defaults. profile_contract.py returns only fields some layer actually
     set (fields={} for zero layers) -- already relied upon by
@@ -65,18 +98,44 @@ auditable rather than silently lost):
     profile_contract.py's own naming/mechanism here, since
     db.profile_layers.set_profile_layer already depends on the call-level
     shape.
-  * executable/degraded profile status computed from hosted_default
-    lifecycle state. profile_contract.py / get_effective_profile instead
-    just OMIT a non-live (draft/retired) hosted_default layer from
-    resolution entirely (see test_profile_layers.py's
-    test_get_effective_profile_hosted_default_draft_does_not_apply) -- a
-    different but not incompatible design; porting an explicit
-    executable/degraded field was judged out of this reconciliation's scope
-    (the item notes called out only #1 restart/refresh component
-    classification and #2 unsafe-command validation explicitly).
-  * reset_fields entries are not validated against FIELD_REGISTRY (neither
-    module closes this fully in profile_contract.py's write path today --
-    flagged as a minor followup, not fixed here).
+  * ``layers_applied`` is a plain list of scope_type strings (e.g.
+    ``["hosted_default", "project"]``), not a list of
+    ``{"scope_type", "scope_id", "revision"}`` dicts. Loses per-layer
+    scope_id/revision detail from the report but the load-bearing property
+    (which scopes contributed, in order) is unchanged and extensively
+    tested (e.g. test_layers_out_of_order_five_deep_still_resolves_to_most_specific).
+    Not something either reconciliation pass touched -- profile_contract.py
+    had this shape from PROFILE-2 (d8481276), independently of
+    profile_resolution.py.
+  * claim_verification_mode is writable at scope_type="hosted_default".
+    profile_resolution.py's registry deliberately excluded hosted_default
+    from this field's allowed_layers ("not something a hosted floor should
+    be asserting for every tenant"); profile_contract.py's own registry
+    (PROFILE-2, d8481276, predating either reconciliation pass) allows it,
+    and HOSTED_DEFAULT_FIXTURE actively exercises this. Pre-existing
+    canonical-module design, not something lost during reconciliation --
+    see test_divergence_claim_verification_mode_allowed_at_hosted_default.
+  * A handful of fields' restart_class classification differs between the
+    two registries (each independently assigned per-field judgment calls
+    neither module's source item fully specified): hitl_auto_answer and
+    require_merge_approval are "hot_reload" here vs.
+    "explicit_refresh_required" in profile_resolution.py;
+    capability_manifest_ref is "explicit_refresh_required" here vs.
+    "restart_required" there. profile_contract.py's own values (assigned at
+    PROFILE-2 time) are treated as canonical -- narrow_only/safe_direction
+    widen-blocking (the actual safety mechanism for these fields) is
+    identical in both registries and unaffected by this classification
+    difference.
+  * refresh_required is computed ONLY from explicit_refresh_required-class
+    field changes here, matching resolve_effective_profile's own docstring
+    quote of the PROFILE-1 (62c41508) definition verbatim ("refresh_required
+    = generation_key changed AND diff touches an explicit_refresh_required
+    field"). profile_resolution.py's independent implementation also set
+    refresh_required=True for a restart_required-class-only change
+    (test_connector_restart_required_for_shell_type_change asserted both
+    restart_required AND refresh_required True) -- profile_contract.py does
+    not mirror that extra inclusion. See
+    test_divergence_restart_required_field_change_does_not_imply_refresh_required.
 """
 from __future__ import annotations
 
@@ -364,6 +423,84 @@ def test_no_change_yields_empty_changed_fields():
 
 
 # ---------------------------------------------------------------------------
+# executable / degraded (folded in from profile_resolution.py's
+# EffectiveProfile.executable/degraded during the second PROFILE-RECON
+# re-verification pass, 732c113e -- this is the pure/blocked_widens-driven
+# half of the signal; the hosted_default-lifecycle half is computed by
+# db.profile_layers.get_effective_profile and covered by
+# tests/test_profile_layers.py's test_get_effective_profile_*_hosted_default_*
+# tests instead, since resolve_effective_profile never sees a non-live
+# hosted_default layer -- see resolve_effective_profile's own docstring.)
+# ---------------------------------------------------------------------------
+
+def test_no_layers_is_executable_and_not_degraded():
+    result = pc.resolve_effective_profile([])
+    assert result.executable is True
+    assert result.executable_reasons == []
+    assert result.degraded is False
+    assert result.degraded_reasons == []
+
+
+def test_ordinary_resolution_without_blocked_widens_is_not_degraded():
+    result = pc.resolve_effective_profile([_layer("project", {"auto_worktrees": 0}, scope_id="p1")])
+    assert result.executable is True
+    assert result.degraded is False
+
+
+def test_blocked_widen_marks_degraded_but_still_executable():
+    result = pc.resolve_effective_profile([
+        _layer("hosted_default", {"hitl_auto_answer": 0}, scope_id="global"),
+        _layer("session", {"hitl_auto_answer": 2}, scope_id="s1"),
+    ])
+    assert result.executable is True
+    assert result.degraded is True
+    assert result.degraded_reasons == ["narrow_only_widen_blocked"]
+
+
+def test_overridden_widen_still_marks_degraded():
+    """override_reason lets the widen through, but blocked_widens (with
+    overridden=True) still gets recorded -- degraded still reflects that a
+    narrow_only field needed an override, same as an unoverridden block."""
+    result = pc.resolve_effective_profile(
+        [
+            _layer("hosted_default", {"hitl_auto_answer": 0}, scope_id="global"),
+            _layer("session", {"hitl_auto_answer": 2}, scope_id="s1"),
+        ],
+        override_reason="incident response",
+    )
+    assert result.fields["hitl_auto_answer"] == 2
+    assert result.degraded is True
+    assert result.degraded_reasons == ["narrow_only_widen_blocked"]
+
+
+# ---------------------------------------------------------------------------
+# reset_fields validated against FIELD_REGISTRY (folded in from
+# profile_resolution.py's validate_profile_layer during the second
+# PROFILE-RECON re-verification pass, 732c113e -- previously an unknown
+# reset_fields name silently no-opped instead of raising, at both the
+# write-time (validate_layer_fields) and resolve-time (resolve_effective_
+# profile) checkpoints. DB-level ported tests live in
+# tests/test_profile_layers.py alongside the rest of the reset_fields
+# coverage.)
+# ---------------------------------------------------------------------------
+
+def test_validate_layer_fields_accepts_known_reset_field():
+    pc.validate_layer_fields("project", {}, reset_fields=["auto_worktrees"])
+
+
+# ---------------------------------------------------------------------------
+# schema_version / lifecycle_state envelope checks (folded in from
+# profile_resolution.py's validate_profile_layer during the second
+# PROFILE-RECON re-verification pass, 732c113e.)
+# ---------------------------------------------------------------------------
+
+def test_resolve_effective_profile_accepts_matching_schema_version():
+    pc.resolve_effective_profile([
+        _layer("project", {"auto_worktrees": 0}, scope_id="p1"),  # default schema_version == SCHEMA_VERSION
+    ])  # must not raise
+
+
+# ---------------------------------------------------------------------------
 # Documented divergences from profile_resolution.py -- these pin
 # profile_contract.py's ACTUAL (deliberately different) behavior so a future
 # reader can see exactly what changed rather than re-discovering it.
@@ -429,3 +566,43 @@ def test_divergence_override_reason_stays_call_level_not_per_layer():
     assert result.blocked_widens[-1]["overridden"] is True
     assert result.blocked_widens[-1]["override_reason"] == "ops emergency \u2014 approved by human"
     assert not hasattr(result, "acknowledged_widens")
+
+
+def test_divergence_claim_verification_mode_allowed_at_hosted_default():
+    """profile_resolution.py's registry deliberately excluded hosted_default
+    from claim_verification_mode's allowed_layers. profile_contract.py's own
+    registry (PROFILE-2, predating either reconciliation pass) allows it --
+    HOSTED_DEFAULT_FIXTURE actively relies on this."""
+    assert "hosted_default" in pc.FIELD_REGISTRY["claim_verification_mode"].allowed_layers
+    pc.validate_layer_fields("hosted_default", {"claim_verification_mode": "strict"})  # must not raise
+    result = pc.resolve_effective_profile([_layer("hosted_default", {"claim_verification_mode": "strict"}, scope_id="global")])
+    assert result.fields["claim_verification_mode"] == "strict"
+
+
+def test_divergence_restart_class_differs_for_some_fields_between_registries():
+    """profile_resolution.py classified hitl_auto_answer/require_merge_approval
+    as explicit_refresh_required and capability_manifest_ref as
+    restart_required; profile_contract.py's own registry (predating either
+    reconciliation pass) classifies them hot_reload/hot_reload/
+    explicit_refresh_required respectively. The safety-relevant mechanism
+    (narrow_only/safe_direction widen-blocking) is identical in both
+    registries -- only the restart/refresh bucketing differs."""
+    assert pc.FIELD_REGISTRY["hitl_auto_answer"].restart_class == "hot_reload"
+    assert pc.FIELD_REGISTRY["require_merge_approval"].restart_class == "hot_reload"
+    assert pc.FIELD_REGISTRY["capability_manifest_ref"].restart_class == "explicit_refresh_required"
+
+
+def test_divergence_restart_required_field_change_does_not_imply_refresh_required():
+    """profile_resolution.py's refresh_required was True for EITHER an
+    explicit_refresh_required OR a restart_required field change.
+    profile_contract.py's resolve_effective_profile docstring quotes
+    PROFILE-1's own definition verbatim ("refresh_required = ... diff
+    touches an explicit_refresh_required field") -- a restart_required-only
+    change does not set it."""
+    result = pc.resolve_effective_profile(
+        [_layer("project", {"executor_config.repo_path": "C:/repo"}, scope_id="p1")],
+        previous_fields={},
+    )
+    assert result.restart_report["connector"] == "restart_required"
+    assert result.restart_required is True
+    assert result.refresh_required is False
