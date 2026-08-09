@@ -1900,6 +1900,7 @@ async def complete_sprint_item(
     verification_notes: str | None = None,
     force_foreign_claim: bool = False,
     correlation_id: str | None = None,
+    exit_code: int | None = None,
 ) -> dict[str, Any] | None:
     """Mark a sprint item ``done`` and optionally link the task that shipped it.
 
@@ -2035,6 +2036,19 @@ async def complete_sprint_item(
       starts) — the response carries ``advisory_work_deferred: true``
       instead of hanging. The continuation-state gather (also advisory) is
       bounded the same way.
+
+    7d71d6bc — ``exit_code`` (optional): when this item is a live child of
+    an ACTIVE (non-terminal) wave run, a genuine, freshly-committed
+    completion (``completion_outcome == "committed"``, never the idempotent
+    ``"already_committed"`` replay) records the wave-run child's terminal
+    outcome (``status="succeeded"``) onto its ``wave_run_children`` row via
+    :func:`meridian.db.wave_runs.record_wave_run_child_outcome` —
+    ``exit_code`` is threaded straight through so the REAL subprocess exit
+    code of whatever ran this item's work is preserved, not just a
+    pass/fail boolean. Best-effort and fail-open, same as every other
+    wave-run bookkeeping hook in this module: never lets wave-run
+    bookkeeping block or fail a completion that has already committed. A
+    project that never calls ``start_wave_run`` sees zero behavior change.
     """
     _t_start = time.monotonic()
     _phase_ms: dict[str, float] = {}
@@ -2222,6 +2236,26 @@ async def complete_sprint_item(
         # so it runs under a bounded budget and can never turn an
         # already-successful commit into a hung or misleading response.
         _completion_outcome = "committed"
+        # 7d71d6bc — RESCUE-R2: best-effort wave-run child terminal-outcome
+        # bookkeeping, INCLUDING the real subprocess exit code (see the
+        # docstring's exit_code paragraph). Only on a genuine fresh commit —
+        # never on the idempotent already_committed replay above, matching
+        # this function's own "no duplicate side effects on retry"
+        # discipline. Lazy import + fully swallowed: must never turn an
+        # already-successful completion into a failure.
+        try:
+            from meridian.db import wave_runs as _wave_runs_module  # noqa: PLC0415
+            _wr_child = await _wave_runs_module.find_active_wave_run_child_for_item(
+                db, project_id, item_id,
+            )
+            if _wr_child is not None:
+                await _wave_runs_module.record_wave_run_child_outcome(
+                    db, _wr_child["wave_run_id"], item_id,
+                    status="succeeded", exit_code=exit_code,
+                    actor=actor, agent_id=actor,
+                )
+        except Exception:  # noqa: BLE001 — wave-run bookkeeping must never wedge completion
+            pass
         _advisory_deferred = False
         try:
             await asyncio.wait_for(
@@ -2727,6 +2761,31 @@ async def claim_sprint_item(
         raise ValueError(
             f"cannot claim item with status '{_raced.get('status')}'"
         )
+    # 7d71d6bc — RESCUE-R2: best-effort wave-run child-lease bookkeeping.
+    # If this item is a live child of an ACTIVE (non-terminal) wave run,
+    # stamp the claim-before-work timestamp + agent identity onto its
+    # wave_run_children row (claim_wave_run_child itself decides
+    # first_claim/reclaim/retry — see meridian.db.wave_runs). Lazy import to
+    # avoid any module-load-order coupling between sprint_items.py and
+    # wave_runs.py (both are imported at the bottom of db/__init__.py).
+    # Never lets wave-run bookkeeping block or fail a claim that has ALREADY
+    # committed above — a ForeignWaveRunChildLeaseError from a still-live
+    # sibling agent, a missing wave_run_children table on an old mid-
+    # migration DB, etc. are all swallowed here. A project that never calls
+    # start_wave_run sees zero behavior change:
+    # find_active_wave_run_child_for_item returns None immediately.
+    if actor:
+        try:
+            from meridian.db import wave_runs as _wave_runs_module  # noqa: PLC0415
+            _wr_child = await _wave_runs_module.find_active_wave_run_child_for_item(
+                db, project_id, item_id,
+            )
+            if _wr_child is not None:
+                await _wave_runs_module.claim_wave_run_child(
+                    db, _wr_child["wave_run_id"], item_id, agent_id=actor, actor=actor,
+                )
+        except Exception:  # noqa: BLE001 — wave-run bookkeeping must never wedge a claim
+            pass
     return result
 
 

@@ -297,6 +297,68 @@ def _hydrate_event(row: Any) -> dict[str, Any] | None:
     return event
 
 
+def _hydrate_child(row: Any) -> dict[str, Any] | None:
+    """Row -> dict with a wave_run_children row's JSON columns parsed.
+
+    7d71d6bc — shared by every reader of ``wave_run_children`` (the
+    pre-existing :func:`record_wave_run_child` / :func:`get_wave_run_children`
+    as well as the child-lease functions below) so ``evidence`` and
+    ``dispatch_provenance`` are parsed identically everywhere instead of each
+    call site re-implementing the same two ``_loads_or_default`` calls.
+    """
+    if row is None:
+        return None
+    child = _row_to_dict(row)
+    if child is None:
+        return None
+    child["evidence"] = _loads_or_default(child.get("evidence"), None)
+    child["dispatch_provenance"] = _loads_or_default(child.get("dispatch_provenance"), None)
+    return child
+
+
+def _parse_ts(value: Any) -> "Any | None":
+    """Small, self-contained timestamp parser for lease-age comparisons.
+
+    Deliberately NOT imported from
+    :func:`meridian.db.sprint_items._parse_deferral_ts` (which does the same
+    job) — that is a private helper of a sibling module, and reaching into it
+    would create the exact cross-module coupling this file's own module
+    docstring already avoids elsewhere (see the lazy-import notes on
+    ``record_board_snapshot_revision`` / ``artifact_declaration`` above).
+    Accepts the DB's space-separated ``YYYY-MM-DD HH:MM:SS`` form or
+    ISO-8601 (``T`` separator, optional trailing ``Z``/offset/fractional
+    seconds). Returns ``None`` on anything empty/unparseable — callers MUST
+    treat that as "unknown", never coerce it into "definitely stale" or
+    "definitely live" (see :func:`classify_wave_run_child_lease`).
+    """
+    from datetime import datetime as _dt_cls, timezone as _tz_cls
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, _dt_cls):
+        dt = value
+    else:
+        s = str(value).strip()
+        if not s:
+            return None
+        s = s.replace("Z", "+00:00")
+        dt = None
+        try:
+            dt = _dt_cls.fromisoformat(s)
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    dt = _dt_cls.strptime(s, fmt)
+                    break
+                except ValueError:
+                    continue
+        if dt is None:
+            return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(_tz_cls.utc).replace(tzinfo=None)
+    return dt
+
+
 async def _next_event_seq(db: aiosqlite.Connection, wave_run_id: str) -> int:
     """Next monotonic per-run event sequence number (1-based).
 
@@ -1109,9 +1171,8 @@ async def record_wave_run_child(
         (wave_run_id, sprint_item_id),
     ) as cur:
         row = await cur.fetchone()
-    child = _row_to_dict(row)
+    child = _hydrate_child(row)
     assert child is not None
-    child["evidence"] = _loads_or_default(child.get("evidence"), None)
     return child
 
 
@@ -1125,14 +1186,7 @@ async def get_wave_run_children(
         (wave_run_id,),
     ) as cur:
         rows = await cur.fetchall()
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        child = _row_to_dict(row)
-        if child is None:
-            continue
-        child["evidence"] = _loads_or_default(child.get("evidence"), None)
-        out.append(child)
-    return out
+    return [c for c in (_hydrate_child(r) for r in rows) if c is not None]
 
 
 def _blocking_children(children: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1438,4 +1492,614 @@ async def finalize_wave_run(
         "pinned_promotion_targets": pinned_promotion_targets,
         "children_summary": _children_summary(children),
         "event_count": len(events),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7d71d6bc — RESCUE-R2: child leases, dispatch provenance, no-op resume
+# protection.
+#
+# Why this exists (rescue-sweep gap): 2a654cb0 gave a wave run's CHILDREN
+# (one row per sprint item) a status/failure_mode/evidence — enough to block
+# finalization on a stop-mode failure, but nothing that answers "which agent
+# is doing this work, when did it start, is it still alive, and did its
+# subprocess actually succeed." A wave run that crashes mid-flight (the
+# orchestrating session dies, a worktree agent is killed) had no durable way
+# to tell an EXISTING LIVE child (another agent is still working it — do not
+# steal it) apart from a STALE ORPHAN (the claiming agent is gone — safe to
+# re-dispatch), a COMPLETED child (already done — re-running it would
+# silently duplicate work), or an EMPTY/INVALID dispatch (registered by
+# start_wave_run but never actually claimed by anyone).
+#
+# The four functions below close that gap:
+#   * claim_wave_run_child   — claim-before-work timestamp + agent identity
+#                              + retry provenance (first_claim/reclaim/retry).
+#   * heartbeat_wave_run_child — proves a claimed child's agent is still
+#                              alive without re-claiming it.
+#   * record_wave_run_child_outcome — terminal outcome INCLUDING the real
+#                              subprocess exit code (never just a status
+#                              string), a thin guarded wrapper over
+#                              record_wave_run_child.
+#   * get_wave_run_recovery_plan — the read-only classifier a crash-
+#                              recovering orchestrator calls INSTEAD of
+#                              blindly re-dispatching every item_ids entry.
+#                              Never mutates state and never touches an OS
+#                              process — it only ever answers "safe to
+#                              re-dispatch: yes/no", never "go kill X".
+#
+# meridian.db.sprint_items.claim_sprint_item / complete_sprint_item call
+# claim_wave_run_child / record_wave_run_child_outcome via a lazy,
+# best-effort hook (never lets wave-run bookkeeping block or fail a claim or
+# completion) whenever the item being claimed/completed is a live child of
+# an ACTIVE (non-terminal) wave run — see find_active_wave_run_child_for_item
+# below. A project that never calls start_wave_run sees zero behavior
+# change: find_active_wave_run_child_for_item returns None immediately.
+# ---------------------------------------------------------------------------
+
+#: Default lease TTL for a wave-run child with no per-child override —
+#: deliberately a different order of magnitude than
+#: process_registry.DEFAULT_TTL_SECONDS (90s, tuned for a subprocess poll
+#: loop): a wave-run child represents a whole sprint item's worth of agent
+#: work, not a subprocess heartbeat cadence, so the default TTL is minutes.
+WAVE_RUN_CHILD_DEFAULT_LEASE_TTL_SECONDS = 1800  # 30 minutes
+
+#: The four resume classifications :func:`classify_wave_run_child_lease`
+#: assigns to every child — see that function's docstring for the full
+#: decision tree, and :func:`get_wave_run_recovery_plan` for how a
+#: recovering orchestrator is meant to act on each one.
+WAVE_RUN_CHILD_LEASE_LIVE = "live"
+WAVE_RUN_CHILD_LEASE_STALE_ORPHAN = "stale_orphan"
+WAVE_RUN_CHILD_LEASE_COMPLETED = "completed"
+WAVE_RUN_CHILD_LEASE_EMPTY_INVALID = "empty_invalid"
+
+WAVE_RUN_CHILD_LEASE_STATES: frozenset[str] = frozenset({
+    WAVE_RUN_CHILD_LEASE_LIVE,
+    WAVE_RUN_CHILD_LEASE_STALE_ORPHAN,
+    WAVE_RUN_CHILD_LEASE_COMPLETED,
+    WAVE_RUN_CHILD_LEASE_EMPTY_INVALID,
+})
+
+#: Terminal wave-run-child outcomes — mirrors WAVE_RUN_CHILD_STATUSES minus
+#: 'running'. record_wave_run_child_outcome requires one of these; the
+#: in-flight state is claim_wave_run_child/heartbeat_wave_run_child's job.
+_WAVE_RUN_CHILD_TERMINAL_STATUSES: frozenset[str] = frozenset({
+    "succeeded", "failed", "skipped",
+})
+
+
+class ForeignWaveRunChildLeaseError(RuntimeError):
+    """Raised when :func:`claim_wave_run_child` / :func:`heartbeat_wave_run_child`
+    is called with an ``agent_id`` that does not match the CURRENT, LIVE
+    lease holder for that child.
+
+    This is the "test-run lock contention" guardrail named in the sprint
+    item: two agents may not both believe they own the same wave-run child
+    at once. The child-lease analogue of
+    :class:`meridian.process_registry.ForeignLeaseError` — same philosophy
+    (never auto-resolved, never silently taken over), different layer (a DB
+    row, not an OS process). A genuinely dead peer is reaped by re-deriving
+    from :func:`get_wave_run_recovery_plan`'s ``stale_orphan`` classification
+    and re-claiming (which itself takes the "retry" branch once the lease
+    is confirmed non-live), never by catching and ignoring this exception.
+    """
+
+    def __init__(
+        self, wave_run_id: str, sprint_item_id: str, holder: "str | None", requester: str,
+    ):
+        self.wave_run_id = wave_run_id
+        self.sprint_item_id = sprint_item_id
+        self.holder = holder
+        self.requester = requester
+        super().__init__(
+            f"Wave run {wave_run_id!r} child {sprint_item_id!r} is already "
+            f"leased to agent_id {holder!r} (still live) — refusing to hand "
+            f"it to {requester!r}. If {holder!r} genuinely crashed, call "
+            "get_wave_run_recovery_plan to confirm a 'stale_orphan' "
+            "classification before re-claiming."
+        )
+
+
+def classify_wave_run_child_lease(
+    child: dict[str, Any],
+    *,
+    now: "Any | None" = None,
+    default_ttl_seconds: int | None = None,
+) -> str:
+    """Classify ONE ``wave_run_children`` row's resume-safety state.
+
+    The core "no-op resume protection" primitive (7d71d6bc). Pure and
+    synchronous — no DB access, never raises; an unparseable/missing
+    timestamp degrades toward the SAFER-for-review classification
+    (``stale_orphan``, eligible for recovery review) rather than silently
+    trusting a child as live forever.
+
+    Returns one of:
+
+    * :data:`WAVE_RUN_CHILD_LEASE_COMPLETED` — ``status`` is a terminal
+      outcome (succeeded/failed/skipped), regardless of how old or fresh the
+      row is. A recovering orchestrator must NEVER re-dispatch this child —
+      that is exactly the "silently re-run completed work" failure this
+      item exists to prevent.
+    * :data:`WAVE_RUN_CHILD_LEASE_EMPTY_INVALID` — ``status='running'`` but
+      the child was never actually dispatched: ``claimed_at`` is NULL (e.g.
+      ``start_wave_run`` pre-registered it via ``record_wave_run_child`` and
+      nothing has called :func:`claim_wave_run_child` yet), or ``agent_id``
+      is missing/blank despite a ``claimed_at`` (a malformed/partial
+      dispatch record). Safe to dispatch fresh — there is no live or
+      completed work to protect.
+    * :data:`WAVE_RUN_CHILD_LEASE_LIVE` — ``status='running'``, properly
+      dispatched (``claimed_at`` AND ``agent_id`` both present), and the
+      heartbeat signal (``last_heartbeat_at``, falling back to
+      ``claimed_at`` when no explicit heartbeat was ever recorded) is
+      within the lease TTL. An orchestrator must NOT re-dispatch this child
+      — an agent may still be actively working it.
+    * :data:`WAVE_RUN_CHILD_LEASE_STALE_ORPHAN` — properly dispatched, but
+      the heartbeat signal has lapsed past the TTL (or is unparseable). The
+      ONE state :func:`get_wave_run_recovery_plan` marks safe to
+      re-dispatch — the claiming agent is presumed crashed.
+
+    ``default_ttl_seconds`` is used only when the child itself carries no
+    ``lease_ttl_seconds`` (the per-child value set at claim time always
+    wins); both fall back to :data:`WAVE_RUN_CHILD_DEFAULT_LEASE_TTL_SECONDS`.
+    """
+    status = child.get("status")
+    if status in WAVE_RUN_CHILD_STATUSES and status != "running":
+        return WAVE_RUN_CHILD_LEASE_COMPLETED
+
+    claimed_at = child.get("claimed_at")
+    agent_id = str(child.get("agent_id") or "").strip()
+    if not claimed_at or not agent_id:
+        return WAVE_RUN_CHILD_LEASE_EMPTY_INVALID
+
+    from datetime import datetime as _dt_cls
+
+    now_dt = now or _dt_cls.utcnow()
+    ttl = child.get("lease_ttl_seconds") or default_ttl_seconds \
+        or WAVE_RUN_CHILD_DEFAULT_LEASE_TTL_SECONDS
+    try:
+        ttl = int(ttl)
+    except (TypeError, ValueError):
+        ttl = WAVE_RUN_CHILD_DEFAULT_LEASE_TTL_SECONDS
+
+    heartbeat_dt = _parse_ts(child.get("last_heartbeat_at") or claimed_at)
+    if heartbeat_dt is None:
+        # Dispatched, but the heartbeat/claimed_at signal itself is garbage —
+        # fail toward the reviewable classification, not toward "trust it".
+        return WAVE_RUN_CHILD_LEASE_STALE_ORPHAN
+
+    age_seconds = (now_dt - heartbeat_dt).total_seconds()
+    if age_seconds > ttl:
+        return WAVE_RUN_CHILD_LEASE_STALE_ORPHAN
+    return WAVE_RUN_CHILD_LEASE_LIVE
+
+
+async def find_active_wave_run_child_for_item(
+    db: aiosqlite.Connection, project_id: str, sprint_item_id: str,
+) -> dict[str, Any] | None:
+    """Look up the most recent child row for ``sprint_item_id`` belonging to
+    a NON-TERMINAL (not merged/aborted) wave run in ``project_id``.
+
+    This is the lookup :func:`meridian.db.sprint_items.claim_sprint_item` /
+    :func:`meridian.db.sprint_items.complete_sprint_item` use, best-effort
+    and fail-open, to decide whether to touch child-lease bookkeeping at
+    all. Returns ``None`` when the item isn't a child of any active wave run
+    — the overwhelming majority of claims/completions in a project that
+    never calls ``start_wave_run`` — so those callers see zero behavior
+    change.
+    """
+    statuses = sorted(WAVE_RUN_TERMINAL_STATUSES)
+    placeholders = ", ".join("?" for _ in statuses)
+    async with db.execute(
+        "SELECT wrc.* FROM wave_run_children wrc "
+        "JOIN wave_runs wr ON wr.id = wrc.wave_run_id "
+        f"WHERE wrc.sprint_item_id = ? AND wr.project_id = ? "
+        f"AND wr.status NOT IN ({placeholders}) "
+        "ORDER BY wrc.created_at DESC LIMIT 1",
+        (sprint_item_id, project_id, *statuses),
+    ) as cur:
+        row = await cur.fetchone()
+    return _hydrate_child(row)
+
+
+async def claim_wave_run_child(
+    db: aiosqlite.Connection,
+    wave_run_id: str,
+    sprint_item_id: str,
+    *,
+    agent_id: str,
+    actor: str | None = None,
+    lease_ttl_seconds: int | None = None,
+    dispatch_provenance: Any = None,
+    now: "Any | None" = None,
+) -> dict[str, Any]:
+    """Record that ``agent_id`` began (or resumed) work on this wave-run
+    child NOW — the claim-before-work timestamp + agent/session identity
+    half of the rescue-sweep gap (7d71d6bc).
+
+    Three distinct outcomes, each returned with a ``claim_kind`` marker:
+
+    * ``"first_claim"`` — the child was never actually dispatched: either
+      the row didn't exist at all, or it was pre-registered with no
+      dispatch info (``start_wave_run`` / ``record_wave_run_child`` — the
+      :data:`WAVE_RUN_CHILD_LEASE_EMPTY_INVALID` classification). Sets
+      ``claimed_at``/``last_heartbeat_at`` to now and records ``agent_id``;
+      ``attempt`` is left at whatever it already was (normally 1) — nothing
+      was ever live or completed, so there is no prior attempt to count.
+    * ``"reclaim"`` — the SAME ``agent_id`` already holds this child's LIVE
+      lease (see :func:`classify_wave_run_child_lease`). Idempotent —
+      refreshes ``last_heartbeat_at`` only; ``attempt`` is NOT bumped. Lets
+      a caller re-assert its own claim without corrupting retry provenance.
+    * ``"retry"`` — the child's last recorded outcome was TERMINAL, or its
+      lease had gone STALE under a different (or the same) ``agent_id``.
+      ``attempt`` is incremented, ``exit_code`` is cleared, status resets to
+      ``'running'``, and a ``child_retried`` event is appended to the wave
+      run's append-only history recording the PRIOR agent_id/status/
+      exit_code — the prior attempt's values are never silently discarded,
+      only superseded going forward (mirrors this module's append-only
+      correction philosophy elsewhere).
+
+    Raises :class:`ForeignWaveRunChildLeaseError` when a DIFFERENT
+    ``agent_id`` holds this child's CURRENTLY-LIVE lease — the "test-run
+    lock contention" guardrail: two agents may not both believe they own the
+    same child at once. Raises ``ValueError`` if the wave run itself does
+    not exist, or if ``agent_id`` is blank.
+    """
+    from datetime import datetime as _dt_cls
+
+    run = await get_wave_run(db, wave_run_id)
+    if run is None:
+        raise ValueError(f"Wave run {wave_run_id!r} not found.")
+    agent_id = str(agent_id or "").strip()
+    if not agent_id:
+        raise ValueError("agent_id is required to claim a wave-run child.")
+
+    now_dt = now or _dt_cls.utcnow()
+    now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+    ttl = int(lease_ttl_seconds) if lease_ttl_seconds else WAVE_RUN_CHILD_DEFAULT_LEASE_TTL_SECONDS
+
+    async with db.execute(
+        "SELECT * FROM wave_run_children WHERE wave_run_id = ? AND sprint_item_id = ?",
+        (wave_run_id, sprint_item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    existing = _hydrate_child(row)
+
+    if existing is None:
+        await db.execute(
+            "INSERT INTO wave_run_children "
+            "(id, wave_run_id, sprint_item_id, failure_mode, status, actor, "
+            " agent_id, claimed_at, last_heartbeat_at, lease_ttl_seconds, "
+            " attempt, dispatch_provenance) "
+            "VALUES (?, ?, ?, 'continue', 'running', ?, ?, ?, ?, ?, 1, ?)",
+            (
+                _new_id(), wave_run_id, sprint_item_id, actor, agent_id,
+                now_str, now_str, ttl, _json_or_none(dispatch_provenance),
+            ),
+        )
+        await db.commit()
+        await append_wave_run_event(
+            db, wave_run_id, "child_claimed",
+            detail=f"{sprint_item_id} claimed by {agent_id} (first_claim)",
+            payload={
+                "sprint_item_id": sprint_item_id, "agent_id": agent_id,
+                "claim_kind": "first_claim", "attempt": 1,
+            },
+            actor=actor or agent_id,
+        )
+        claim_kind = "first_claim"
+    else:
+        lease_state = classify_wave_run_child_lease(existing, now=now_dt, default_ttl_seconds=ttl)
+        existing_agent = existing.get("agent_id")
+        existing_status = existing.get("status")
+
+        if lease_state == WAVE_RUN_CHILD_LEASE_LIVE and existing_agent and existing_agent != agent_id:
+            raise ForeignWaveRunChildLeaseError(
+                wave_run_id, sprint_item_id, existing_agent, agent_id,
+            )
+
+        if lease_state == WAVE_RUN_CHILD_LEASE_LIVE and existing_agent == agent_id:
+            # Same agent re-asserting its own still-live claim — treat as a
+            # heartbeat refresh, not a retry. No attempt bump, no event spam.
+            await db.execute(
+                "UPDATE wave_run_children SET last_heartbeat_at = ?, "
+                "lease_ttl_seconds = COALESCE(?, lease_ttl_seconds), "
+                "dispatch_provenance = COALESCE(?, dispatch_provenance), "
+                "updated_at = datetime('now') "
+                "WHERE wave_run_id = ? AND sprint_item_id = ?",
+                (
+                    now_str, ttl, _json_or_none(dispatch_provenance),
+                    wave_run_id, sprint_item_id,
+                ),
+            )
+            await db.commit()
+            claim_kind = "reclaim"
+        elif lease_state == WAVE_RUN_CHILD_LEASE_EMPTY_INVALID:
+            # The row was pre-registered (e.g. start_wave_run's own
+            # item_ids loop via record_wave_run_child) but never actually
+            # dispatched — no claimed_at, no agent_id. This IS a first
+            # claim in every sense that matters (nothing was live, nothing
+            # completed, there is no prior attempt to preserve provenance
+            # for) even though the row already existed. attempt is left
+            # untouched — bumping it here would fabricate retry history
+            # for work that never actually started.
+            await db.execute(
+                "UPDATE wave_run_children SET status = 'running', agent_id = ?, "
+                "claimed_at = ?, last_heartbeat_at = ?, lease_ttl_seconds = ?, "
+                "dispatch_provenance = ?, actor = COALESCE(?, actor), "
+                "updated_at = datetime('now') "
+                "WHERE wave_run_id = ? AND sprint_item_id = ?",
+                (
+                    agent_id, now_str, now_str, ttl,
+                    _json_or_none(dispatch_provenance), actor,
+                    wave_run_id, sprint_item_id,
+                ),
+            )
+            await db.commit()
+            await append_wave_run_event(
+                db, wave_run_id, "child_claimed",
+                detail=f"{sprint_item_id} claimed by {agent_id} (first_claim)",
+                payload={
+                    "sprint_item_id": sprint_item_id, "agent_id": agent_id,
+                    "claim_kind": "first_claim",
+                    "attempt": int(existing.get("attempt") or 1),
+                },
+                actor=actor or agent_id,
+            )
+            claim_kind = "first_claim"
+        else:
+            # Terminal outcome, or a genuinely stale (non-live) lease under
+            # any agent — both are legitimately re-claimable. Bump retry
+            # provenance and preserve the PRIOR attempt's identity/outcome
+            # in the append-only history.
+            new_attempt = int(existing.get("attempt") or 1) + 1
+            await db.execute(
+                "UPDATE wave_run_children SET status = 'running', agent_id = ?, "
+                "claimed_at = ?, last_heartbeat_at = ?, lease_ttl_seconds = ?, "
+                "exit_code = NULL, attempt = ?, dispatch_provenance = ?, "
+                "actor = COALESCE(?, actor), updated_at = datetime('now') "
+                "WHERE wave_run_id = ? AND sprint_item_id = ?",
+                (
+                    agent_id, now_str, now_str, ttl, new_attempt,
+                    _json_or_none(dispatch_provenance), actor,
+                    wave_run_id, sprint_item_id,
+                ),
+            )
+            await db.commit()
+            await append_wave_run_event(
+                db, wave_run_id, "child_retried",
+                detail=(
+                    f"{sprint_item_id} retried by {agent_id} (attempt "
+                    f"{new_attempt}); prior: agent={existing_agent!r} "
+                    f"status={existing_status!r} "
+                    f"exit_code={existing.get('exit_code')!r} "
+                    f"lease_state={lease_state!r}"
+                ),
+                payload={
+                    "sprint_item_id": sprint_item_id, "agent_id": agent_id,
+                    "claim_kind": "retry", "attempt": new_attempt,
+                    "prior_agent_id": existing_agent,
+                    "prior_status": existing_status,
+                    "prior_exit_code": existing.get("exit_code"),
+                    "lease_state_before_retry": lease_state,
+                },
+                actor=actor or agent_id,
+            )
+            claim_kind = "retry"
+
+    async with db.execute(
+        "SELECT * FROM wave_run_children WHERE wave_run_id = ? AND sprint_item_id = ?",
+        (wave_run_id, sprint_item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    child = _hydrate_child(row)
+    assert child is not None
+    child["claim_kind"] = claim_kind
+    return child
+
+
+async def heartbeat_wave_run_child(
+    db: aiosqlite.Connection,
+    wave_run_id: str,
+    sprint_item_id: str,
+    *,
+    agent_id: str,
+    now: "Any | None" = None,
+) -> dict[str, Any]:
+    """Refresh a live child's ``last_heartbeat_at`` — proves ``agent_id`` is
+    still working it, without going through the claim/retry decision tree.
+
+    Raises ``ValueError`` if the child does not exist, or if its status is
+    not ``'running'`` (a terminal child has nothing left to heartbeat — that
+    would silently resurrect completed/failed work). Raises
+    :class:`ForeignWaveRunChildLeaseError` if a DIFFERENT ``agent_id``
+    currently holds the recorded lease — a dead agent's identity can never
+    be hijacked by a heartbeat call; re-claim via :func:`claim_wave_run_child`
+    instead (which itself decides retry-vs-refusal via the SAME lease
+    classification this function's own guard reuses).
+    """
+    from datetime import datetime as _dt_cls
+
+    async with db.execute(
+        "SELECT * FROM wave_run_children WHERE wave_run_id = ? AND sprint_item_id = ?",
+        (wave_run_id, sprint_item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    existing = _hydrate_child(row)
+    if existing is None:
+        raise ValueError(
+            f"No child recorded for wave run {wave_run_id!r} / sprint item "
+            f"{sprint_item_id!r} — claim it first via claim_wave_run_child."
+        )
+    if existing.get("status") != "running":
+        raise ValueError(
+            f"Cannot heartbeat wave-run child {sprint_item_id!r}: status is "
+            f"{existing.get('status')!r}, not 'running' — a terminal child "
+            "has nothing left to heartbeat."
+        )
+    existing_agent = existing.get("agent_id")
+    agent_id = str(agent_id or "").strip()
+    if existing_agent and existing_agent != agent_id:
+        raise ForeignWaveRunChildLeaseError(
+            wave_run_id, sprint_item_id, existing_agent, agent_id,
+        )
+
+    now_str = (now or _dt_cls.utcnow()).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE wave_run_children SET last_heartbeat_at = ?, "
+        "updated_at = datetime('now') "
+        "WHERE wave_run_id = ? AND sprint_item_id = ?",
+        (now_str, wave_run_id, sprint_item_id),
+    )
+    await db.commit()
+
+    async with db.execute(
+        "SELECT * FROM wave_run_children WHERE wave_run_id = ? AND sprint_item_id = ?",
+        (wave_run_id, sprint_item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    child = _hydrate_child(row)
+    assert child is not None
+    return child
+
+
+async def record_wave_run_child_outcome(
+    db: aiosqlite.Connection,
+    wave_run_id: str,
+    sprint_item_id: str,
+    *,
+    status: str,
+    exit_code: int | None = None,
+    evidence: Any = None,
+    actor: str | None = None,
+    agent_id: str | None = None,
+) -> dict[str, Any]:
+    """Record a wave-run child's TERMINAL outcome, preserving the real
+    subprocess exit code when the dispatching agent ran the item's work as a
+    subprocess — "preserve real subprocess exit codes" from the sprint-item
+    spec, verbatim.
+
+    A thin, guarded wrapper over :func:`record_wave_run_child`: ``status``
+    must be one of :data:`_WAVE_RUN_CHILD_TERMINAL_STATUSES`
+    (succeeded/failed/skipped) — raises ``ValueError`` for ``'running'``
+    (use :func:`claim_wave_run_child` for the in-flight state instead; this
+    function exists specifically for the "this child is DONE" half of the
+    contract, so it is not a generic status setter). ``exit_code`` must be
+    an ``int`` or ``None`` — never a string/bool, so "did the subprocess
+    actually succeed" is never ambiguous between "no exit code captured"
+    and "exit code was falsy".
+    """
+    if status not in _WAVE_RUN_CHILD_TERMINAL_STATUSES:
+        raise ValueError(
+            "record_wave_run_child_outcome requires a terminal status "
+            f"({sorted(_WAVE_RUN_CHILD_TERMINAL_STATUSES)}), got {status!r}. "
+            "Use claim_wave_run_child for the in-flight 'running' state."
+        )
+    if exit_code is not None and (not isinstance(exit_code, int) or isinstance(exit_code, bool)):
+        raise ValueError(f"exit_code must be an int or None, got {exit_code!r}")
+
+    run = await get_wave_run(db, wave_run_id)
+    if run is None:
+        raise ValueError(f"Wave run {wave_run_id!r} not found.")
+
+    async with db.execute(
+        "SELECT * FROM wave_run_children WHERE wave_run_id = ? AND sprint_item_id = ?",
+        (wave_run_id, sprint_item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    existing = _row_to_dict(row)
+    existing_failure_mode = (existing or {}).get("failure_mode") or "continue"
+
+    await record_wave_run_child(
+        db, wave_run_id, sprint_item_id,
+        failure_mode=existing_failure_mode, status=status,
+        evidence=evidence, actor=actor,
+    )
+    await db.execute(
+        "UPDATE wave_run_children SET exit_code = ?, "
+        "agent_id = COALESCE(?, agent_id), updated_at = datetime('now') "
+        "WHERE wave_run_id = ? AND sprint_item_id = ?",
+        (exit_code, agent_id, wave_run_id, sprint_item_id),
+    )
+    await db.commit()
+
+    async with db.execute(
+        "SELECT * FROM wave_run_children WHERE wave_run_id = ? AND sprint_item_id = ?",
+        (wave_run_id, sprint_item_id),
+    ) as cur:
+        row = await cur.fetchone()
+    result = _hydrate_child(row)
+    assert result is not None
+    return result
+
+
+async def get_wave_run_recovery_plan(
+    db: aiosqlite.Connection,
+    wave_run_id: str,
+    *,
+    default_ttl_seconds: int | None = None,
+    now: "Any | None" = None,
+) -> dict[str, Any]:
+    """The "no-op resume protection" entry point: classify EVERY child of
+    ``wave_run_id`` via :func:`classify_wave_run_child_lease` and split them
+    into actionable buckets for a crash-recovering orchestrator.
+
+    Read-only — never mutates state, and never touches or kills any OS
+    process. That guarantee is structural, not just a convention: this
+    function has no access to process handles at all (it only reads DB
+    rows), so "do not kill unrelated processes" holds by construction. If a
+    caller decides a ``stale_orphan`` child's underlying OS process somehow
+    survived its agent's crash, reconciling THAT is entirely the caller's
+    responsibility via whatever process-management primitive fits its own
+    context (e.g. :mod:`meridian.process_registry` for an externally
+    registered lease) — this function only ever answers "safe to
+    re-dispatch: yes/no", never "go kill X".
+
+    Returns::
+
+        {
+          "wave_run_id": ...,
+          "children": [ {...child fields..., "lease_state": <state>}, ... ],
+          "live": [sprint_item_id, ...],
+          "stale_orphan": [sprint_item_id, ...],
+          "completed": [sprint_item_id, ...],
+          "empty_invalid": [sprint_item_id, ...],
+          "resumable_item_ids": [...],  # stale_orphan + empty_invalid —
+                                         # safe to (re-)dispatch
+          "protected_item_ids": [...],  # live + completed — must NOT be
+                                         # (re-)dispatched
+        }
+
+    Raises ``ValueError`` if the wave run does not exist.
+    """
+    run = await get_wave_run(db, wave_run_id)
+    if run is None:
+        raise ValueError(f"Wave run {wave_run_id!r} not found.")
+
+    children = await get_wave_run_children(db, wave_run_id)
+    buckets: dict[str, list[Any]] = {state: [] for state in WAVE_RUN_CHILD_LEASE_STATES}
+    annotated: list[dict[str, Any]] = []
+    for child in children:
+        state = classify_wave_run_child_lease(
+            child, now=now, default_ttl_seconds=default_ttl_seconds,
+        )
+        buckets[state].append(child.get("sprint_item_id"))
+        annotated_child = dict(child)
+        annotated_child["lease_state"] = state
+        annotated.append(annotated_child)
+
+    return {
+        "wave_run_id": wave_run_id,
+        "children": annotated,
+        "live": buckets[WAVE_RUN_CHILD_LEASE_LIVE],
+        "stale_orphan": buckets[WAVE_RUN_CHILD_LEASE_STALE_ORPHAN],
+        "completed": buckets[WAVE_RUN_CHILD_LEASE_COMPLETED],
+        "empty_invalid": buckets[WAVE_RUN_CHILD_LEASE_EMPTY_INVALID],
+        "resumable_item_ids": [
+            *buckets[WAVE_RUN_CHILD_LEASE_STALE_ORPHAN],
+            *buckets[WAVE_RUN_CHILD_LEASE_EMPTY_INVALID],
+        ],
+        "protected_item_ids": [
+            *buckets[WAVE_RUN_CHILD_LEASE_LIVE],
+            *buckets[WAVE_RUN_CHILD_LEASE_COMPLETED],
+        ],
     }

@@ -3223,7 +3223,21 @@ async def _migrate_wave_runs(db: aiosqlite.Connection) -> None:
       wave_run_children  — one row per sprint item in the wave, carrying its
                            ``failure_mode`` ('stop'|'continue') and outcome.
                            A failed stop-mode child structurally blocks
-                           finalization.
+                           finalization. 7d71d6bc (RESCUE-R2) added child-lease/
+                           dispatch-provenance columns: ``agent_id`` (who is
+                           actually doing the work, distinct from ``actor``,
+                           which records who last WROTE the row),
+                           ``claimed_at`` (claim-before-work timestamp),
+                           ``last_heartbeat_at`` + ``lease_ttl_seconds`` (crash
+                           detection), ``exit_code`` (the real subprocess exit
+                           code of a terminal outcome, when the dispatcher ran
+                           the work as a subprocess), ``attempt`` (retry
+                           provenance), and ``dispatch_provenance`` (freeform
+                           JSON — e.g. correlation_id/worktree/session_id).
+                           See meridian.db.wave_runs.claim_wave_run_child /
+                           heartbeat_wave_run_child /
+                           record_wave_run_child_outcome /
+                           get_wave_run_recovery_plan.
 
     CREATE_TABLES covers fresh DBs; this is the upgrade path for existing ones.
     Every index lives INSIDE this guarded migration (CREATE INDEX IF NOT
@@ -3285,6 +3299,13 @@ async def _migrate_wave_runs(db: aiosqlite.Connection) -> None:
             status TEXT NOT NULL DEFAULT 'running',
             evidence TEXT,
             actor TEXT,
+            agent_id TEXT,
+            claimed_at TEXT,
+            last_heartbeat_at TEXT,
+            lease_ttl_seconds INTEGER,
+            exit_code INTEGER,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            dispatch_provenance TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE(wave_run_id, sprint_item_id)
@@ -3293,6 +3314,35 @@ async def _migrate_wave_runs(db: aiosqlite.Connection) -> None:
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_wave_run_children_run "
         "ON wave_run_children(wave_run_id, status)"
+    )
+    # 7d71d6bc — RESCUE-R2: child leases, dispatch provenance, no-op resume
+    # protection. Additive columns for a table that may already exist from
+    # before this fix (the CREATE TABLE above only applies to a fresh DB) —
+    # same ed8e4524 pattern as wave_gate_results.version. Every column is
+    # nullable/defaulted so an existing row (and every pre-existing caller of
+    # record_wave_run_child) is completely unaffected until the new
+    # claim_wave_run_child/heartbeat_wave_run_child/record_wave_run_child_outcome
+    # helpers in meridian.db.wave_runs actually populate them. Index lives
+    # HERE (inside this guarded migration), never inline in the CREATE TABLE
+    # literal — the 2026-07-04 unguarded-index outage rule.
+    await _migrate_add_column_if_missing(db, "wave_run_children", "agent_id", "TEXT")
+    await _migrate_add_column_if_missing(db, "wave_run_children", "claimed_at", "TEXT")
+    await _migrate_add_column_if_missing(
+        db, "wave_run_children", "last_heartbeat_at", "TEXT"
+    )
+    await _migrate_add_column_if_missing(
+        db, "wave_run_children", "lease_ttl_seconds", "INTEGER"
+    )
+    await _migrate_add_column_if_missing(db, "wave_run_children", "exit_code", "INTEGER")
+    await _migrate_add_column_if_missing(
+        db, "wave_run_children", "attempt", "INTEGER NOT NULL DEFAULT 1"
+    )
+    await _migrate_add_column_if_missing(
+        db, "wave_run_children", "dispatch_provenance", "TEXT"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_children_lease "
+        "ON wave_run_children(wave_run_id, status, last_heartbeat_at)"
     )
     await db.commit()
 
