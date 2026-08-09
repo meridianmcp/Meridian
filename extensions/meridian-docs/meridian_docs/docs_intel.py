@@ -17309,10 +17309,31 @@ def audit_document(
     # Defensive round-trip: every paragraph/heading node id must resolve
     # back through the SAME lookup callers (locate_anchor, get_paragraph,
     # insert_caption, ...) already use.
+    #
+    # d092d2a4 gap fix: _find_para_by_id raises AmbiguousParagraphIdError
+    # (e21b2ca7) instead of returning a value when a node's id is a native
+    # w14:paraId shared by more than one paragraph. That fail-closed
+    # behavior is correct and load-bearing for _find_para_by_id's MUTATING
+    # callers (insert_caption, move_section, edit_equation_local, ...), which
+    # must never silently guess which of two identically-id'd paragraphs to
+    # write to -- it must stay exactly as-is. audit_document is a read-only
+    # INSPECTION pass, not a mutation, so that exception is not an audit
+    # failure here: the id DID resolve, just to more than one paragraph, and
+    # that exact condition is already reported deterministically above as a
+    # `duplicate_para_id` finding (sourced independently from
+    # document_content_tree's own collision detection). Letting the
+    # exception escape would crash the whole audit over a condition the
+    # audit already has a dedicated, diagnostic finding type for -- so it is
+    # caught here and treated as "resolved (ambiguously)", not as the
+    # id-scheme-drift bug unresolvable_structural_id exists to catch.
     for node in nodes:
         if node["kind"] not in ("paragraph", "heading"):
             continue
-        if _find_para_by_id(root, node["id"]) is None:
+        try:
+            located = _find_para_by_id(root, node["id"])
+        except AmbiguousParagraphIdError:
+            continue
+        if located is None:
             findings.append({
                 "type": "unresolvable_structural_id",
                 "severity": "error",
