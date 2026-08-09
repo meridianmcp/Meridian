@@ -79,15 +79,22 @@ Adapters implemented vs deferred
   ``get_effective_profile`` -> :func:`meridian.db.get_effective_profile`
   (the flagship op -- returns the fully merged, generation-keyed effective
   profile), ``get_profile_layer_revisions`` ->
-  :func:`meridian.db.get_profile_layer_revisions`. Unlike ``sprint_board``,
-  ``get_profile_layer``/``list_profile_layers``/``get_profile_layer_revisions``
-  deliberately do NOT add a project-ownership check on top of the raw DB
-  functions: ``(scope_type, scope_id)`` is not inherently project-scoped for
-  ``hosted_default``/``workspace``/``user`` scopes (only ``project``/
-  ``session`` scope types are actually tied to one project), and PROFILE-5's
-  own ``get_profile_layer`` MCP tool has no such gate either -- this adapter
-  exposes the identical read surface through a different transport, not new
-  authorization semantics.
+  :func:`meridian.db.get_profile_layer_revisions`. ``get_profile_layer``/
+  ``get_profile_layer_revisions`` deliberately do NOT add a project-ownership
+  check on top of the raw DB functions -- both require the CALLER to already
+  know the exact target ``scope_id``, so ``(scope_type, scope_id)`` not being
+  inherently project-scoped for ``hosted_default``/``workspace``/``user``
+  scopes is not a new exposure (PROFILE-5's own ``get_profile_layer`` MCP
+  tool has no such gate either; this adapter exposes the identical read
+  surface through a different transport, not new authorization semantics).
+  ``list_profile_layers`` is different: it is a bulk-enumeration primitive
+  that needs no prior knowledge of any other project's identifiers, so
+  ``project``/``session`` scope_type rows (the two scope types that ARE
+  tied to one project each) ARE filtered to the calling ``project_id`` --
+  see :func:`_op_list_profile_layers` -- mirroring ``sprint_board``'s own
+  project-ownership gate on ``get_sprint_item_pointers``.
+  ``hosted_default``/``workspace``/``user`` rows are not project-scoped and
+  are never filtered.
 * **code / codebase-memory / Serena-style reads** (explicitly DEFERRED, per
   this item's own scoping note: "or document that this adapter proxies to
   an external MCP call"). No local, in-process code-search/graph capability
@@ -210,7 +217,32 @@ async def _op_list_profile_layers(db: Any, project_id: str, args: "dict[str, Any
     scope_type = args.get("scope_type")
     if scope_type is not None and (not isinstance(scope_type, str) or not scope_type.strip()):
         raise ValueError("list_profile_layers 'scope_type', when given, must be a non-empty string")
-    return await db_module.list_profile_layers(db, scope_type)
+    rows = await db_module.list_profile_layers(db, scope_type)
+    # Project isolation (security fix, PROFILE-7 77369699 review): unlike
+    # get_profile_layer/get_profile_layer_revisions (which require already
+    # knowing the exact target scope_id -- see this module's docstring),
+    # list_profile_layers is a bulk-enumeration primitive that needs no
+    # prior knowledge of any other project's identifiers. 'project' and
+    # 'session' scope_type rows ARE tied to one project each, so left
+    # unfiltered this op would let any caller enumerate every OTHER
+    # project's project-scoped/session-scoped profile-layer rows just by
+    # passing scope_type='project' (or nothing at all). hosted_default/
+    # workspace/user rows are NOT project-scoped and pass through
+    # unfiltered -- mirrors _op_get_sprint_item_pointers's own
+    # project-ownership gate above.
+    session_ids: "set[str] | None" = None
+    if any(row.get("scope_type") == "session" for row in rows):
+        sessions = await db_module.get_sessions(db, project_id, active_only=False)
+        session_ids = {s["id"] for s in sessions if s.get("id")}
+    filtered: "list[dict[str, Any]]" = []
+    for row in rows:
+        row_scope_type = row.get("scope_type")
+        if row_scope_type == "project" and row.get("scope_id") != project_id:
+            continue
+        if row_scope_type == "session" and row.get("scope_id") not in (session_ids or set()):
+            continue
+        filtered.append(row)
+    return filtered
 
 
 async def _op_get_effective_profile(db: Any, project_id: str, args: "dict[str, Any]") -> Any:

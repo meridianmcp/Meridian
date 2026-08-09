@@ -362,6 +362,53 @@ async def test_profile_adapter_get_profile_layer_list_and_revisions_happy_paths(
 
 
 @pytest.mark.asyncio
+async def test_profile_adapter_list_profile_layers_is_project_isolated(db, project, other_project):
+    """PROFILE-7 review fix (security): list_profile_layers is a
+    bulk-enumeration primitive requiring no prior knowledge of any other
+    project's identifiers -- unlike get_profile_layer/get_profile_layer_revisions,
+    which need the caller to already know the exact scope_id. 'project' and
+    'session' scope_type rows are each tied to ONE project, so this must
+    filter to the CALLING project_id rather than exposing every project's
+    rows. hosted_default/workspace/user rows are not project-scoped and
+    must still pass through unfiltered."""
+    await db_module.set_profile_layer(db, "project", project["id"], fields={"claim_verification_mode": "strict"})
+    await db_module.set_profile_layer(db, "project", other_project["id"], fields={"claim_verification_mode": "loose"})
+    await db_module.set_profile_layer(db, "workspace", "singleton", fields={"max_pinned_decisions": 9})
+
+    own_session = await db_module.register_session(db, project["id"], "own-sess")
+    other_session = await db_module.register_session(db, other_project["id"], "other-sess")
+    await db_module.set_profile_layer(db, "session", own_session["id"], fields={"max_pinned_decisions": 3})
+    await db_module.set_profile_layer(db, "session", other_session["id"], fields={"max_pinned_decisions": 7})
+
+    requests = [
+        {"request_id": "by_project", "adapter": "profile", "operation": "list_profile_layers",
+         "args": {"scope_type": "project"}},
+        {"request_id": "by_session", "adapter": "profile", "operation": "list_profile_layers",
+         "args": {"scope_type": "session"}},
+        {"request_id": "unfiltered", "adapter": "profile", "operation": "list_profile_layers", "args": {}},
+    ]
+    resp = await br_module.batch_read(db, project_id=project["id"], requests=requests)
+    by_id = {r["request_id"]: r for r in resp["results"]}
+
+    assert by_id["by_project"]["status"] == "ok"
+    project_scope_ids = {layer["scope_id"] for layer in by_id["by_project"]["result"]}
+    assert project_scope_ids == {project["id"]}  # never the other project's row
+
+    assert by_id["by_session"]["status"] == "ok"
+    session_scope_ids = {layer["scope_id"] for layer in by_id["by_session"]["result"]}
+    assert session_scope_ids == {own_session["id"]}  # never the other project's session
+
+    assert by_id["unfiltered"]["status"] == "ok"
+    unfiltered_rows = by_id["unfiltered"]["result"]
+    unfiltered_project_ids = {r["scope_id"] for r in unfiltered_rows if r["scope_type"] == "project"}
+    unfiltered_session_ids = {r["scope_id"] for r in unfiltered_rows if r["scope_type"] == "session"}
+    assert unfiltered_project_ids == {project["id"]}
+    assert unfiltered_session_ids == {own_session["id"]}
+    # non-project-scoped rows still pass through unfiltered
+    assert any(r["scope_type"] == "workspace" and r["scope_id"] == "singleton" for r in unfiltered_rows)
+
+
+@pytest.mark.asyncio
 async def test_profile_adapter_bad_args_is_validation_error(db, project):
     requests = [
         {"request_id": "bad", "adapter": "profile", "operation": "get_profile_layer",
@@ -601,7 +648,9 @@ async def test_batch_mutate_profile_layer_rollback_restores_prior_and_deletes_ne
     triggering compensation of every already-applied entry), but exercises
     BOTH profile_layer compensation branches in one batch: entry 0 UPDATES an
     existing layer (prior revision > 0) -- compensation must restore its
-    exact prior fields, not just delete it; entry 1 CREATES a brand-new layer
+    exact prior fields AND prior revision (restoring fields via
+    set_profile_layer alone would bump revision a SECOND time -- PROFILE-7
+    review fix), not just delete it; entry 1 CREATES a brand-new layer
     (prior revision 0) -- compensation must delete it back to the
     never-configured state."""
     existing = await db_module.set_profile_layer(
@@ -637,6 +686,12 @@ async def test_batch_mutate_profile_layer_rollback_restores_prior_and_deletes_ne
 
     reverted_existing = await db_module.get_profile_layer(db, "workspace", "singleton")
     assert reverted_existing["fields"] == existing["fields"]  # exact prior content restored
+    # PROFILE-7 review fix: the apply already bumped revision once (existing
+    # -> existing+1); a compensate that restores content via
+    # set_profile_layer would bump it AGAIN, leaving the row's revision two
+    # higher than before the batch ran even though its content matches --
+    # must land back on the exact prior revision instead.
+    assert reverted_existing["revision"] == existing["revision"]
 
     reverted_new = await db_module.get_profile_layer(db, "user", "brand-new-user")
     assert reverted_new["revision"] == 0  # deleted back to never-configured

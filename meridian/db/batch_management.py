@@ -762,6 +762,7 @@ async def _apply_profile_layer_entry(
     comp_state = (
         "profile_layer", scope_type, scope_id, prior.get("revision", 0),
         prior.get("fields") or {}, prior.get("reset_fields") or [], prior.get("provenance"),
+        prior.get("lifecycle_state"),
     )
     return entry_id, {"profile_layer": result}, comp_state
 
@@ -770,7 +771,10 @@ async def _compensate_profile_layer_entry(
     db: Any, project_id: str, comp_state: tuple[Any, ...], ctx: _EntryContext,
 ) -> None:
     try:
-        _, scope_type, scope_id, prior_revision, prior_fields, prior_reset_fields, prior_provenance = comp_state
+        (
+            _, scope_type, scope_id, prior_revision, prior_fields, prior_reset_fields,
+            prior_provenance, prior_lifecycle_state,
+        ) = comp_state
         if prior_revision == 0:
             # This batch call CREATED the row -- revert to the
             # never-configured state, exactly like sprint_item's own
@@ -778,13 +782,21 @@ async def _compensate_profile_layer_entry(
             await db_module.reset_profile_layer(db, scope_type, scope_id)
         else:
             # An existing row was UPDATED -- restore its exact prior
-            # content. No expected_revision here: compensation must succeed
-            # regardless of what revision the failed/aborted batch left
-            # behind, mirroring sprint_item's own compensate, which does not
-            # re-check the item's current state before restoring.
-            await db_module.set_profile_layer(
+            # content AND revision. No expected_revision check here:
+            # compensation must succeed regardless of what revision the
+            # failed/aborted batch left behind, mirroring sprint_item's own
+            # compensate, which does not re-check the item's current state
+            # before restoring. Restoring via set_profile_layer would BUMP
+            # revision again (apply already bumped it once), leaving the
+            # row two revisions higher than before the batch ran even
+            # though its content matches -- use the exact-restore helper
+            # instead so a caller's pre-batch expected_revision still
+            # matches after a rollback (see _restore_profile_layer_row's
+            # own docstring for the full rationale).
+            await db_module._restore_profile_layer_row(
                 db, scope_type, scope_id,
-                fields=prior_fields, reset_fields=prior_reset_fields, provenance=prior_provenance,
+                revision=prior_revision, fields=prior_fields, reset_fields=prior_reset_fields,
+                lifecycle_state=prior_lifecycle_state, provenance=prior_provenance,
             )
     except Exception:  # noqa: BLE001 -- compensation must never mask the original abort
         pass

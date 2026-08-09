@@ -291,6 +291,69 @@ async def set_profile_layer(
     return await get_profile_layer(db, scope_type, scope_id)
 
 
+async def _restore_profile_layer_row(
+    db: aiosqlite.Connection,
+    scope_type: str,
+    scope_id: str,
+    *,
+    revision: int,
+    fields: dict[str, Any],
+    reset_fields: list[str],
+    lifecycle_state: str | None,
+    provenance: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Raw restore to an EXACT prior row state -- revision included.
+
+    Used ONLY by ``batch_management``'s ``profile_layer`` entry-kind
+    rollback compensation (PROFILE-7 77369699 rollback fix, follows the
+    ``db_module._invalidate_sprint_items_cache`` precedent for a
+    leading-underscore helper called cross-module via the ``db`` package
+    namespace). :func:`set_profile_layer` ALWAYS bumps ``revision`` by 1 on
+    any real content change -- correct for a normal write, but wrong for
+    compensation: an apply that bumped revision N -> N+1 followed by a
+    compensating call THROUGH ``set_profile_layer`` would bump it again to
+    N+2, leaving the row's revision two higher than before the batch ran
+    even though its content is back to exactly what it was. This writes the
+    given ``revision`` verbatim (no auto-increment), so a rolled-back batch
+    restores the row to a state indistinguishable from "the batch never
+    ran" -- content AND revision -- which is what callers holding a
+    pre-batch ``expected_revision`` need for optimistic concurrency to keep
+    working after a rollback.
+
+    Not a general-purpose API: no validation of ``fields``/``reset_fields``
+    against the field registry (the caller is always restoring a snapshot
+    that already passed that validation once, at the original write it is
+    reverting), no revision-history row (mirrors ``set_profile_layer``,
+    which only records history for ``hosted_default``, and a rollback isn't
+    a new hosted_default lifecycle event), and no idempotent-no-op-hash
+    short-circuit (a restore must always land exactly on ``revision``,
+    never silently skip because content happens to already match).
+    """
+    scope_type = _pc.normalize_scope_type(scope_type)
+    scope_id = _pc.normalize_scope_id(scope_id)
+    fields = dict(fields or {})
+    reset_fields = _pc.normalize_reset_fields(reset_fields)
+    content_hash = _content_hash(fields, reset_fields)
+    await db.execute(
+        "INSERT INTO profile_layers "
+        "(scope_type, scope_id, schema_version, revision, fields, reset_fields, "
+        "lifecycle_state, content_hash, provenance, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(scope_type, scope_id) DO UPDATE SET "
+        "revision = excluded.revision, fields = excluded.fields, "
+        "reset_fields = excluded.reset_fields, lifecycle_state = excluded.lifecycle_state, "
+        "content_hash = excluded.content_hash, provenance = excluded.provenance, "
+        "updated_at = excluded.updated_at",
+        (
+            scope_type, scope_id, _pc.SCHEMA_VERSION, revision,
+            json.dumps(fields), json.dumps(reset_fields), lifecycle_state, content_hash,
+            json.dumps(provenance) if provenance is not None else None,
+        ),
+    )
+    await db.commit()
+    return await get_profile_layer(db, scope_type, scope_id)
+
+
 async def reset_profile_layer(db: aiosqlite.Connection, scope_type: str, scope_id: str) -> dict[str, Any]:
     """Delete a scope's entire profile-layer row (d8481276).
 
