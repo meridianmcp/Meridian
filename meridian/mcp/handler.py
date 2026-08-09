@@ -3889,7 +3889,8 @@ async def _handle_notes_decisions(
     save_blog_post, get_blog_posts, add_workspace_sprint_item,
     get_workspace_sprint_items, update_workspace_sprint_item,
     complete_workspace_sprint_item, add_workspace_proposal,
-    get_workspace_proposals, advance_proposal_status, promote_proposal.
+    get_workspace_proposals, advance_proposal_status, promote_proposal,
+    preview_proposal_promotion, commit_proposal_promotion.
 
     ac4df52f — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -3949,6 +3950,8 @@ async def _handle_notes_decisions(
         handle_get_workspace_proposals,
         handle_advance_proposal_status,
         handle_promote_proposal,
+        handle_preview_proposal_promotion,
+        handle_commit_proposal_promotion,
     )
 
     # All 47 tools map directly to handler functions with the standard five
@@ -4005,6 +4008,8 @@ async def _handle_notes_decisions(
         "get_workspace_proposals": handle_get_workspace_proposals,
         "advance_proposal_status": handle_advance_proposal_status,
         "promote_proposal": handle_promote_proposal,
+        "preview_proposal_promotion": handle_preview_proposal_promotion,
+        "commit_proposal_promotion": handle_commit_proposal_promotion,
     }
 
     if name in _standard_dispatch:
