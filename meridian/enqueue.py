@@ -203,6 +203,28 @@ async def _run_worker(
       forever), best-effort notifies ``on_complete``, and then RE-RAISES —
       preserving normal `asyncio` cancellation propagation instead of
       silently swallowing it.
+
+    Fail-closed guarantee (post-769e24a7 follow-up): the region between
+    spawning the subprocess and the final ``done``/``failed`` write —
+    the ``in_progress`` status write, ``update_task_worker_pid``, decoding
+    output, and the terminal ``_finish`` calls themselves — used to be
+    completely unguarded. Since production always invokes this coroutine
+    via ``asyncio.create_task`` (fire-and-forget, see
+    :func:`enqueue_claude_task`'s ``wait=False`` default path), any
+    unexpected exception there (e.g. a transient DB error) had no caller to
+    propagate to: the task row was left stuck at a non-terminal status
+    forever, and ``Dispatcher.reconcile_active_leases`` — which only
+    releases a lease once status is ``done``/``failed`` — could never
+    observe or free it, permanently occupying that lease's capacity. The
+    outer ``except Exception`` below closes that gap: it reuses the same
+    ``_finish`` write path as every other terminal branch to mark the row
+    ``failed`` with the exception recorded, best-effort kills a still-live
+    subprocess, and then — unlike ``CancelledError`` — does NOT re-raise,
+    matching this function's documented "never raises on a normal
+    (non-cancelled) exit" contract. ``asyncio.CancelledError`` is a
+    ``BaseException`` subclass (not ``Exception``) since Python 3.8, so
+    this broad clause can never intercept cancellation; the two branches
+    stay mutually exclusive and cancellation semantics are unchanged.
     """
     worker_class, effective_prompt = _route_worker_execution(prompt)
     proc: "asyncio.subprocess.Process | None" = None
@@ -301,6 +323,28 @@ async def _run_worker(
         except Exception:  # noqa: BLE001 — cleanup on the way out must not mask the cancellation
             pass
         raise
+    except Exception as exc:  # noqa: BLE001 — fail closed: see docstring. Any unexpected
+        # exception anywhere in the try block above (the in_progress write,
+        # update_task_worker_pid, output decoding, or even a terminal
+        # _finish call itself) must still land the task row in a real
+        # terminal state instead of leaving it stuck — production only ever
+        # runs this coroutine fire-and-forget, so nothing else ever will.
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:  # noqa: BLE001 — best-effort cleanup only
+                pass
+        try:
+            await _finish(
+                "failed",
+                f"{worker_class.error_prefix}{effective_prompt}\n\n"
+                f"unhandled worker error: {type(exc).__name__}: {exc}",
+            )
+        except Exception:  # noqa: BLE001 — must not raise out of a fail-closed handler;
+            # the row may already be unwritable for the same underlying
+            # reason, but this coroutine still must not propagate.
+            pass
 
 
 async def enqueue_claude_task(

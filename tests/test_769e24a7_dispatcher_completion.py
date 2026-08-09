@@ -822,33 +822,35 @@ async def test_stop_then_restart_orphaned_worker_completion_does_not_corrupt_new
 
 
 # ---------------------------------------------------------------------------
-# Fail-closed guarantee VIOLATION: an unexpected exception inside
-# meridian/enqueue.py::_run_worker's UNGUARDED body (everything outside the
-# narrow subprocess-spawn try/except and the outer
-# `except asyncio.CancelledError`) escapes the coroutine entirely, leaving
-# the task_log row stuck at a non-terminal status forever. Since
-# Dispatcher.reconcile_active_leases only ever releases a lease whose task
-# has reached status in ("done", "failed"), that lease can then NEVER be
-# released — a real, currently-unguarded violation of this item's own hard
-# requirement: "fail closed if any completion path can leave active_leases
-# permanently occupied." These tests document the CURRENT (unfixed)
-# behavior against real, unmocked production code, per the item's
-# directive to prove the failure mode rather than paper over it.
+# Fail-closed guarantee: an unexpected exception inside
+# meridian/enqueue.py::_run_worker's body (the in_progress write,
+# update_task_worker_pid, output decoding, or a terminal _finish call
+# itself) is now caught by the outer `except Exception` clause (alongside
+# the pre-existing `except asyncio.CancelledError`, which stays disjoint —
+# CancelledError is a BaseException subclass, not Exception, since Python
+# 3.8). The task_log row lands on `failed` via the same `_finish` write
+# path every other terminal branch uses, so
+# Dispatcher.reconcile_active_leases can observe it and free the lease —
+# satisfying this item's own hard requirement: "fail closed if any
+# completion path can leave active_leases permanently occupied." These
+# tests inject the exact same fault as before (a transient DB error from
+# `update_task_worker_pid`) against real, unmocked production code, and now
+# assert the CORRECTED (self-healing) outcome instead of the bug.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_run_worker_unhandled_exception_leaves_task_stuck_and_lease_unreconcilable(
+async def test_run_worker_unhandled_exception_marks_task_failed_and_lease_reconcilable(
     db, project, session, monkeypatch,
 ):
     """Unit-level proof: a real (unmocked) `_run_worker` call, with one of
-    its unguarded DB writes (`update_task_worker_pid`, the call
-    immediately after the in_progress write) raising an unexpected
-    exception. The exception is NOT `asyncio.CancelledError`, so it is not
-    caught by _run_worker's only except clause — it propagates straight
-    out. The task row is left at 'in_progress' forever, and a real
-    Dispatcher.reconcile_active_leases call can never observe a terminal
-    status for it."""
+    its DB writes (`update_task_worker_pid`, the call immediately after the
+    in_progress write) raising an unexpected exception. The exception is
+    NOT `asyncio.CancelledError`, so it is caught by _run_worker's broad
+    `except Exception` clause rather than propagating out — the coroutine
+    returns normally, the task row lands on 'failed' with the error
+    recorded, and a real Dispatcher.reconcile_active_leases call can
+    observe that terminal status and free the lease."""
     task = await db_module.log_task(db, session, project, "t", "pending")
 
     async def _boom(db_, task_id, pid):
@@ -856,33 +858,39 @@ async def test_run_worker_unhandled_exception_leaves_task_stuck_and_lease_unreco
 
     monkeypatch.setattr(db_module, "update_task_worker_pid", _boom)
 
-    with pytest.raises(RuntimeError, match="simulated transient DB error"):
-        await _run_worker(db, task["id"], "hello", _OK_WORKER, timeout=10)
+    # No longer raises — the broad except swallows the injected fault and
+    # writes a terminal status instead.
+    await _run_worker(db, task["id"], "hello", _OK_WORKER, timeout=10)
 
-    stuck = await db_module.get_task(db, task["id"])
-    assert stuck["status"] == "in_progress"  # never reached a terminal status
+    healed = await db_module.get_task(db, task["id"])
+    assert healed["status"] == "failed"  # reached a real terminal status
+    assert "simulated transient DB error" in healed["description"]
 
     disp = Dispatcher(db, project)
-    disp.record_worker_lease("item-stuck", task=stuck)
+    disp.record_worker_lease("item-healed", task=healed)
 
     released = await disp.reconcile_active_leases()
-    assert released == []
-    assert "item-stuck" in disp._active_leases  # PERMANENTLY occupied — the violation
+    assert released == [
+        {"item_id": "item-healed", "task_id": task["id"], "status": "failed", "seq": 1}
+    ]
+    assert "item-healed" not in disp._active_leases  # released, not permanently occupied
 
 
 @pytest.mark.asyncio
-async def test_dispatch_once_unhandled_run_worker_exception_permanently_occupies_active_lease(
+async def test_dispatch_once_unhandled_run_worker_exception_releases_active_lease(
     db, project, monkeypatch,
 ):
-    """Same violation, exercised through the REAL production entry point:
-    Dispatcher.dispatch_once() -> the real enqueue_claude_task(wait=False)
-    -> a real, fire-and-forget asyncio.create_task(_run_worker(...)) —
-    exactly how dispatch_once always invokes it in production (it never
-    passes wait=True). The unhandled exception inside that background task
-    has no caller to propagate to at all (a genuine 'Task exception was
-    never retrieved'), proving this failure mode survives the ACTUAL
-    fire-and-forget shape production uses, not just a directly-awaited
-    call."""
+    """Same fault injection, exercised through the REAL production entry
+    point: Dispatcher.dispatch_once() -> the real
+    enqueue_claude_task(wait=False) -> a real, fire-and-forget
+    asyncio.create_task(_run_worker(...)) — exactly how dispatch_once
+    always invokes it in production (it never passes wait=True). Because
+    _run_worker's broad `except Exception` now catches the injected fault
+    instead of letting it escape the background task unhandled, the task
+    row reaches 'failed' on its own, reconcile_active_leases can free the
+    lease, and dispatch_once can then reuse that freed capacity — proving
+    this failure mode is now self-healing under the ACTUAL fire-and-forget
+    shape production uses, not just a directly-awaited call."""
     async def _boom(db_, task_id, pid):
         raise RuntimeError("simulated transient DB error")
 
@@ -900,23 +908,31 @@ async def test_dispatch_once_unhandled_run_worker_exception_permanently_occupies
     for _ in range(50):
         await asyncio.sleep(0.05)
         row = await db_module.get_task(db, task_id)
-        if row and row["status"] == "in_progress":
+        if row and row["status"] == "failed":
             break
     else:
-        pytest.fail("worker never reached in_progress before the injected failure")
+        pytest.fail("worker never reached failed status after the injected fault")
 
-    # Give the background task's raise (the very next await after the
-    # in_progress write) a moment to actually happen.
-    await asyncio.sleep(0.2)
+    healed = await db_module.get_task(db, task_id)
+    assert healed["status"] == "failed"  # self-healed, not stuck at in_progress
+    assert "simulated transient DB error" in healed["description"]
 
-    stuck = await db_module.get_task(db, task_id)
-    assert stuck["status"] == "in_progress"  # never reached done/failed
-
-    # The dispatcher's own reconciliation is the ONLY mechanism that frees
-    # capacity in production — and it can never see this lease as terminal.
+    # The dispatcher's own reconciliation is the mechanism that frees
+    # capacity in production — it now observes the terminal status.
     released = await disp.reconcile_active_leases()
-    assert released == []
-    assert "i1" in disp._active_leases  # PERMANENTLY occupied
+    assert len(released) == 1
+    assert released[0]["item_id"] == "i1"
+    assert released[0]["status"] == "failed"
+    assert "i1" not in disp._active_leases  # released, not permanently occupied
 
+    # i1 itself is never re-dispatched (permanent dedup ledger — see
+    # test_item_never_redispatched_after_its_lease_is_released), so prove
+    # capacity was genuinely freed, not just that i1 was skipped, the same
+    # way test_capacity_reuse_after_real_worker_completes does: swap in a
+    # DIFFERENT item and confirm it now fits in the freed slot.
+    groups_round2 = [[{"id": "i2", "title": "I2", "resources": ["file:b"]}]]
+    disp._get_groups = _groups_fn(groups_round2)
     second = await disp.dispatch_once()
-    assert second == []  # capacity is truly gone: nothing else can ever fill this slot
+    assert len(second) == 1  # capacity was freed: a new dispatch can fill this slot
+    assert "i2" in disp._active_leases
+    assert "i1" not in disp._active_leases
