@@ -253,8 +253,17 @@ async def handle_start_session(
         # fails the orientation.
         try:
             if isinstance(result, dict) and "continuation" not in result:
+                # 99e0bb6a — use the already-resolved _pid, not the raw
+                # args["project_id"]. When start_session is called with
+                # neither project_id nor project_name (the AGENTS.md
+                # auto-scoping pattern: project_id resolved from
+                # MERIDIAN_PROJECT_ID / meridian.toml [project]), the
+                # "project_id" key is absent from args entirely — blind
+                # indexing here silently KeyErrored (swallowed by the except
+                # below) and dropped codebase_context for every call using
+                # that documented, recommended pattern.
                 _cc = await _server._build_codebase_context(
-                    tenant.get("id", ""), args["project_id"],
+                    tenant.get("id", ""), _pid,
                     compact=args.get("compact", True),
                 )
                 if _cc:
@@ -273,8 +282,15 @@ async def handle_start_session(
     # Guarded so a pre-migration DB never breaks the orientation.
     try:
         if isinstance(result, dict):
+            # 99e0bb6a — resolved _pid, not raw args["project_id"] (see the
+            # codebase_context comment above for why the raw key can be
+            # absent). This one matters most: silently dropping pending_goal
+            # here means the handoff /goal a prior generate_handoff minted
+            # for THIS project never reaches the session that resolved via
+            # the default-project fallback, even though the session itself
+            # was correctly created under that project.
             _pg_meta = await db_module.pop_pending_goal_with_meta(
-                db, args["project_id"]
+                db, _pid
             )
             if _pg_meta:
                 result["pending_goal"] = _pg_meta["goal"]
@@ -292,7 +308,8 @@ async def handle_start_session(
         if isinstance(result, dict) and "continuation" not in result:
             _goal_text: str | None = None
             try:
-                _goal_row = await db_module.get_goal(db, args["project_id"])
+                # 99e0bb6a — resolved _pid, not raw args["project_id"].
+                _goal_row = await db_module.get_goal(db, _pid)
                 if _goal_row:
                     _goal_text = " ".join(
                         str(_goal_row.get(f) or "")

@@ -18704,6 +18704,84 @@ async def test_start_session_no_project_id_returns_error(db, monkeypatch):
     assert "project_id" in result["error"].lower() or "project" in result["error"].lower()
 
 
+@pytest.mark.asyncio
+async def test_99e0bb6a_repro_default_project_id_pending_goal_delivery(db, monkeypatch):
+    """REPRO (99e0bb6a): when start_session relies purely on the
+    MERIDIAN_PROJECT_ID/toml default fallback (no project_id, no project_name
+    in args -- exactly the AGENTS.md-recommended auto-scoping call pattern),
+    the resolved project id (_pid) must be used consistently for every
+    project-scoped enrichment in the same response, including pending_goal
+    delivery. Before the fix, downstream code read the RAW args["project_id"]
+    (absent in this call pattern) instead of the resolved _pid, raising a
+    silently-swallowed KeyError and dropping pending_goal delivery entirely.
+    """
+    import meridian.toml_config as tc
+    from meridian.mcp.handlers.project_tools import handle_start_session
+
+    p = await db_module.create_project(db, "default-project-pending-goal-test")
+    monkeypatch.setenv("MERIDIAN_PROJECT_ID", p["id"])
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+
+    await db_module.set_pending_goal(db, p["id"], "<goal>do the thing</goal>")
+
+    result = await handle_start_session(
+        {"session_name": "test-default-scope-pending-goal"},
+        db=db,
+        data_dir="/tmp",
+        tenant=None,
+        _mcp_tenant_id=None,
+        executor_sessions=set(),
+    )
+    assert "error" not in result
+    assert result.get("pending_goal") == "<goal>do the thing</goal>", (
+        "pending_goal must be delivered when start_session resolves project_id "
+        "via the env/toml default fallback, not silently dropped"
+    )
+
+
+@pytest.mark.asyncio
+async def test_99e0bb6a_start_session_project_name_only_scopes_pending_goal_correctly(
+    db, monkeypatch,
+):
+    """99e0bb6a two-project regression: handle_start_session resolves
+    project_name -> project_id itself (ce3693e4, for callers that bypass the
+    central _dispatch_mcp_tool resolver and invoke the handler directly).
+    That resolved id must be the SAME one used for every project-scoped
+    enrichment in the response -- a session started by name for project A
+    must never surface project B's pending_goal, even when neither
+    project_id nor the env/toml default happens to point at B.
+    """
+    import meridian.toml_config as tc
+    from meridian.mcp.handlers.project_tools import handle_start_session
+
+    monkeypatch.delenv("MERIDIAN_PROJECT_ID", raising=False)
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+
+    proj_a = await db_module.create_project(db, "99e0bb6a-project-a")
+    proj_b = await db_module.create_project(db, "99e0bb6a-project-b")
+    await db_module.set_pending_goal(db, proj_a["id"], "<goal>project A work</goal>")
+    await db_module.set_pending_goal(db, proj_b["id"], "<goal>project B work</goal>")
+
+    result = await handle_start_session(
+        {"project_name": "99e0bb6a-project-a", "session_name": "name-only-scope"},
+        db=db,
+        data_dir="/tmp",
+        tenant=None,
+        _mcp_tenant_id=None,
+        executor_sessions=set(),
+    )
+    assert "error" not in result
+    assert result.get("pending_goal") == "<goal>project A work</goal>", (
+        "start_session resolved by project_name must deliver THAT project's "
+        "pending_goal, not silently drop it or leak a different project's"
+    )
+    # Project B's goal must remain untouched (still pending, read-once not
+    # consumed) -- proves no cross-project pop occurred either.
+    assert await db_module.get_pending_goal(db, proj_b["id"]) == (
+        "<goal>project B work</goal>"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 9dad83fd — recovery for answered blocking HITLs whose session died
 # ---------------------------------------------------------------------------
