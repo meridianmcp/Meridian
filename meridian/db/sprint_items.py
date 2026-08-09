@@ -474,6 +474,13 @@ async def get_sprint_items_cached(
     note above _SPRINT_ITEMS_CACHE for why that residual, TTL-bounded gap is
     the accepted tradeoff. Callers that need read-your-own-writes-anywhere
     guarantees (not just same-process) must call get_sprint_items() directly.
+
+    f291bb24 — do NOT call this from complete_sprint_item's own continuation-
+    state gather. This project's cache entry was just invalidated by THIS
+    SAME completion's status write moments earlier (_transition_status calls
+    _invalidate_sprint_items_cache before this would run), so that caller is
+    a guaranteed miss every time — see get_sprint_items_continuation_scoped
+    below, which is what complete_sprint_item actually uses instead.
     """
     now = time.monotonic()
     hit = _SPRINT_ITEMS_CACHE.get(project_id)
@@ -482,6 +489,89 @@ async def get_sprint_items_cached(
     items = await get_sprint_items(db, project_id)
     _SPRINT_ITEMS_CACHE[project_id] = (now, items)
     return items
+
+
+async def get_sprint_items_continuation_scoped(
+    db: aiosqlite.Connection, project_id: str, version: str | None,
+) -> list[dict[str, Any]]:
+    """f291bb24 — minimal-column, version-scoped item list for
+    continuation_gate.compute_continuation_state, which reads only
+    ``id``/``status``/``blocker_kind`` per item.
+
+    Replaces the previous get_sprint_items_cached(project_id) call inside
+    complete_sprint_item's _gather_continuation_inputs, which (a) was a
+    guaranteed cache miss for the completing call itself — this item's own
+    status write invalidates the project's cache entry moments earlier — and
+    (b) even on a hit would have returned every column (including the wide
+    notes/tool_requirements/touches_resources TEXT columns) for every item in
+    the project, then discarded everything outside one version bucket in
+    Python. On a large board (thousands of items, multi-KB JSON blobs per
+    row) that full-board fetch dominated the completion call's latency. This
+    pushes both the version filter and the column narrowing into SQL.
+    """
+    clauses = ["project_id = ?"]
+    params: list = [project_id]
+    if version is not None:
+        clauses.append("version = ?")
+        params.append(version)
+    query = f"SELECT id, status, blocker_kind FROM sprint_items WHERE {' AND '.join(clauses)}"
+    async with db.execute(query, tuple(params)) as cur:
+        rows = await cur.fetchall()
+    return [_row_to_dict(r) for r in rows]  # type: ignore[misc]
+
+
+async def count_new_sprint_items_since(
+    db: aiosqlite.Connection, project_id: str, since: str,
+) -> tuple[int, int]:
+    """f291bb24 — ``(new_count, urgent_count)`` of items added after ``since``.
+
+    Replaces _board_change_for_session's previous pattern (used by
+    complete_sprint_item, claim_sprint_item, get_sprint_progress) of fetching
+    EVERY item in the project via the uncached get_sprint_items(project_id) —
+    every column, every row — then filtering/counting in Python. This is a
+    single aggregate query scoped to the project (using the project_id
+    prefix of idx_sprint_items_project) that returns just the two counts the
+    caller actually needs, with no wide TEXT columns and no per-item Python
+    iteration.
+    """
+    query = (
+        "SELECT COUNT(*) AS total, "
+        "SUM(CASE WHEN priority = 'urgent' THEN 1 ELSE 0 END) AS urgent "
+        "FROM sprint_items WHERE project_id = ? AND added_at > ?"
+    )
+    async with db.execute(query, (project_id, since)) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return 0, 0
+    _row = _row_to_dict(row) or {}
+    return int(_row.get("total") or 0), int(_row.get("urgent") or 0)
+
+
+async def has_active_sprint_items(
+    db: aiosqlite.Connection, project_id: str, statuses: "set[str] | tuple[str, ...]",
+) -> bool:
+    """f291bb24 — indexed existence check: does this project have any item
+    whose status is in ``statuses``?
+
+    Replaces an unfiltered, untimed ``SELECT * FROM sprint_items WHERE
+    project_id=?`` that complete_sprint_item's MCP handler used to run on
+    every single completion (unlike every other advisory query in that
+    codepath, it had no asyncio.wait_for budget at all) purely to decide
+    whether to fire a "sprint done" notification. Uses
+    idx_sprint_items_project(project_id, status), ``LIMIT 1``, no wide TEXT
+    columns — cost independent of board size.
+    """
+    _statuses = tuple(statuses)
+    if not _statuses:
+        return False
+    placeholders = ", ".join("?" for _ in _statuses)
+    query = (
+        f"SELECT 1 FROM sprint_items WHERE project_id = ? "
+        f"AND status IN ({placeholders}) LIMIT 1"
+    )
+    async with db.execute(query, (project_id, *_statuses)) as cur:
+        row = await cur.fetchone()
+    return row is not None
 
 
 def _sprint_item_slug_base(text: str) -> str:
@@ -2281,15 +2371,11 @@ async def complete_sprint_item(
         # blocks completion, fails open on any error (INCLUDING a timeout),
         # same shape as the two warning fields above.
         try:
+            _cg_version = result.get("version")
             _cg_sibling_items, _cg_project = await asyncio.wait_for(
-                _gather_continuation_inputs(db, project_id),
+                _gather_continuation_inputs(db, project_id, version=_cg_version),
                 timeout=_ADVISORY_PHASE_TIMEOUT_S,
             )
-            _cg_version = result.get("version")
-            if _cg_version:
-                _cg_sibling_items = [
-                    it for it in _cg_sibling_items if it.get("version") == _cg_version
-                ]
             result = dict(result)
             result["continuation"] = _continuation_gate.compute_continuation_state(
                 _cg_sibling_items,
@@ -2346,12 +2432,19 @@ async def _run_post_commit_side_effects(
 
 
 async def _gather_continuation_inputs(
-    db: aiosqlite.Connection, project_id: str,
+    db: aiosqlite.Connection, project_id: str, version: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     """a2a027cf — the two async fetches continuation-state computation needs,
     split out so they can be awaited under a single bounded
-    ``asyncio.wait_for`` call in :func:`complete_sprint_item`."""
-    _sibling_items = await get_sprint_items_cached(db, project_id)
+    ``asyncio.wait_for`` call in :func:`complete_sprint_item`.
+
+    f291bb24 — ``version`` (the just-completed item's own version bucket) is
+    now pushed into the sibling-item query itself via
+    get_sprint_items_continuation_scoped, instead of fetching every item in
+    the project (through a cache that's a guaranteed miss for this caller)
+    and filtering to one version bucket in Python afterward.
+    """
+    _sibling_items = await get_sprint_items_continuation_scoped(db, project_id, version)
     _project = await get_project(db, project_id)
     return _sibling_items, _project
 
