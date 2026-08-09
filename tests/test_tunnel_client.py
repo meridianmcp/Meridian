@@ -6164,6 +6164,18 @@ def test_serena_pool_spawn_omits_new_session_on_windows(monkeypatch):
     monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(tc.sys, "platform", "win32")
     monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    # 64b67781 — must not hit the real shutil.which("uvx") here: CPython's own
+    # shutil.which() checks sys.platform == "win32" internally and, when true,
+    # calls _winapi.NeedCurrentDirectoryForExePath — but _winapi is bound to
+    # None at import time on a REAL non-Windows host (e.g. Linux CI), so the
+    # monkeypatched sys.platform above makes stdlib's own win32 branch run for
+    # real and crash with AttributeError: 'NoneType' object has no attribute
+    # 'NeedCurrentDirectoryForExePath'. Mock the launcher resolution instead of
+    # letting it hit the real filesystem/PATH probe, and reset the memoization
+    # cache first so a value cached by an earlier test in this worker process
+    # can't mask the mock.
+    monkeypatch.setattr(tc, "_find_uvx", lambda: None)
+    tc._reset_launcher_resolution_cache()
 
     tc._serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
     assert "start_new_session" not in captured
