@@ -17,10 +17,12 @@ from __future__ import annotations
 import pytest
 
 from meridian.mcp_tools import (
+    _KEYWORD_CATEGORY_AFFINITY,
     _MCP_TOOLS_LIST,
     _TOOL_CATEGORY,
     _TOOL_ROLE_RELEVANCE,
     _select_active_tool_set,
+    match_categories_by_keywords,
 )
 
 
@@ -370,3 +372,72 @@ def test_select_active_tool_set_active_tools_follow_declared_list_order() -> Non
     active_set = set(result["active_tools"])
     expected_order = [n for n in all_names_in_order if n in active_set]
     assert result["active_tools"] == expected_order
+
+
+# ---------------------------------------------------------------------------
+# e5a7ce7f (decision 2a3a3882, finding 5569beca) — match_categories_by_keywords:
+# the SAME keyword -> category-affinity primitive _select_active_tool_set uses
+# inline above, generalized as a standalone function so a caller outside
+# Meridian's own tool set (meridian.tool_routing) can reuse it with an
+# arbitrary affinity mapping. See that function's own docstring for why it is
+# additive (does not replace _select_active_tool_set's inline loop).
+# ---------------------------------------------------------------------------
+
+
+def test_match_categories_by_keywords_empty_text_returns_empty() -> None:
+    matched, signals = match_categories_by_keywords(None, _KEYWORD_CATEGORY_AFFINITY)
+    assert matched == set()
+    assert signals == []
+    matched, signals = match_categories_by_keywords("", _KEYWORD_CATEGORY_AFFINITY)
+    assert matched == set()
+    assert signals == []
+
+
+def test_match_categories_by_keywords_matches_meridians_own_affinity() -> None:
+    matched, signals = match_categories_by_keywords(
+        "refactor the codebase search index", _KEYWORD_CATEGORY_AFFINITY
+    )
+    assert "code-intel" in matched
+    assert signals, "expected at least one matched keyword"
+    assert set(signals) <= {"refactor", "codebase", "search"}
+
+
+def test_match_categories_by_keywords_no_match_returns_empty() -> None:
+    matched, signals = match_categories_by_keywords(
+        "the weather today is sunny", _KEYWORD_CATEGORY_AFFINITY
+    )
+    assert matched == set()
+    assert signals == []
+
+
+def test_match_categories_by_keywords_works_beyond_merdians_own_tools() -> None:
+    """The generalization gap this function closes: an arbitrary caller-
+    supplied affinity mapping (not _KEYWORD_CATEGORY_AFFINITY / _TOOL_CATEGORY)
+    works identically."""
+    custom_affinity = {"deploy": "infra", "kubernetes": "infra", "invoice": "billing"}
+    matched, signals = match_categories_by_keywords(
+        "deploy the new kubernetes manifest", custom_affinity
+    )
+    assert matched == {"infra"}
+    assert set(signals) == {"deploy", "kubernetes"}
+
+
+def test_match_categories_by_keywords_deterministic_across_repeated_calls() -> None:
+    text = "refactor the codebase search index and update the thesis docx"
+    first = match_categories_by_keywords(text, _KEYWORD_CATEGORY_AFFINITY)
+    second = match_categories_by_keywords(text, _KEYWORD_CATEGORY_AFFINITY)
+    assert first == second
+
+
+def test_match_categories_by_keywords_superset_of_select_active_tool_set_expansion() -> None:
+    """Every category _select_active_tool_set added via keyword expansion for
+    an executor is also found by the generalized matcher over the same text
+    and the same affinity mapping — the generalization is a strict
+    superset/consistent view of the original inline loop's matching
+    decisions (it just doesn't do the original's per-category dedup)."""
+    text = "refactor the codebase search index and update the thesis docx"
+    result = _select_active_tool_set("executor", text)
+    from meridian.mcp_tools import _EXECUTOR_DEFAULT_CATEGORIES
+    expanded_by_original = set(result["active_categories"]) - _EXECUTOR_DEFAULT_CATEGORIES
+    matched, _ = match_categories_by_keywords(text, _KEYWORD_CATEGORY_AFFINITY)
+    assert expanded_by_original <= matched

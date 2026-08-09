@@ -3896,6 +3896,53 @@ def _extract_kws(text: str) -> set[str]:
     return {w for w in words if w not in _KW_STOP}
 
 
+def match_categories_by_keywords(
+    text: "str | None",
+    keyword_affinity: "dict[str, str]",
+) -> "tuple[set[str], list[str]]":
+    """Generalized keyword -> category-affinity matcher (e5a7ce7f, decision 2a3a3882).
+
+    Extracted as a standalone, reusable primitive from the SAME keyword ->
+    category lookup ``_select_active_tool_set`` performs inline below, so the
+    identical deterministic matching logic is available to callers that are
+    NOT selecting among Meridian's own MCP tools — e.g.
+    ``meridian.tool_routing``'s "exact category matching" routing layer,
+    which matches an arbitrary caller-supplied ``keyword_affinity`` mapping
+    (its own categories/tool names, not ``_TOOL_CATEGORY``). This closes the
+    "generalizing ``_select_active_tool_set`` beyond Meridian's own tools"
+    gap recorded in finding 5569beca / pinned decision 2a3a3882 for item
+    78127d55, per decision 2a3a3882: "generalize ... don't build new
+    matching/ranking logic."
+
+    Deliberately does NOT replace ``_select_active_tool_set``'s own inline
+    loop (below) — that loop's "only record the keyword that FIRST newly
+    adds a given category" dedup behavior is specific, already covered by
+    passing regression tests, and out of scope to touch here. This function
+    instead returns ALL matching keywords (no base-set-aware dedup), which
+    is the correct, simpler contract for a generic "does this text match any
+    of these categories" caller that has no pre-existing base set to dedup
+    against.
+
+    Pure, DB-free, no I/O, same determinism guarantees as ``_extract_kws``.
+
+    Returns ``(matched_categories, keyword_signals)`` — ``keyword_signals``
+    lists every keyword (in ``_extract_kws``'s own iteration order) whose
+    affinity mapping produced a match, so a caller can surface which
+    specific words drove a match even when several keywords map to the same
+    category.
+    """
+    matched: set[str] = set()
+    signals: list[str] = []
+    if not text:
+        return matched, signals
+    for kw in _extract_kws(text):
+        cat = keyword_affinity.get(kw)
+        if cat:
+            matched.add(cat)
+            signals.append(kw)
+    return matched, signals
+
+
 def _select_active_tool_set(
     role: "str | None",
     goal_text: "str | None" = None,
