@@ -456,3 +456,138 @@ async def test_unversioned_legacy_wave_gate_still_project_wide(db):
 
     claimed = await db_module.claim_sprint_item(db, pid, item["id"])
     assert claimed.get("status") == "in_progress"
+
+
+# ---------------------------------------------------------------------------
+# 12. Residual-constraint gap on a table that predates ed8e4524 (live bug)
+# ---------------------------------------------------------------------------
+#
+# Confirmed live on a hosted project: a version-scoped complete_wave_gate()
+# call for a wave_label that already has an UNSCOPED (version IS NULL)
+# result row fails with a raw
+#   duplicate key value violates unique constraint
+#   "wave_gate_results_project_id_wave_label_key"
+# The test fixture's `db` always gets a FRESH wave_gate_results table (the
+# CREATE TABLE branch already has the correct 3-column constraint), so the
+# tests above never exercise the actual bug: a table that existed BEFORE
+# ed8e4524 shipped, where only the additive `ADD COLUMN version` half of
+# that migration ran and the OLD 2-column UNIQUE(project_id, wave_label)
+# stuck around. This rebuilds the fixture's table down to that pre-fix
+# shape, then proves _migrate_wave_gate_results_version_unique /
+# _migrate_wave_gate_configs_version_unique repair it in place.
+
+async def _downgrade_wave_gate_tables_to_pre_ed8e4524(db):
+    """Rebuild wave_gate_results/wave_gate_configs with the OLD 2-column
+    UNIQUE constraint, simulating a table that predates ed8e4524's version
+    column (that migration only ever ADD COLUMN'd version onto tables in
+    this shape — it never widened the constraint)."""
+    await db.executescript(
+        """
+        DROP TABLE IF EXISTS wave_gate_results;
+        CREATE TABLE wave_gate_results (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            wave_label TEXT NOT NULL,
+            version TEXT,
+            gate_passed INTEGER NOT NULL DEFAULT 1,
+            exit_code INTEGER,
+            passed_count INTEGER,
+            failed_count INTEGER,
+            verification_status TEXT,
+            evidence_snapshot TEXT,
+            actor TEXT,
+            completed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, wave_label)
+        );
+        DROP TABLE IF EXISTS wave_gate_configs;
+        CREATE TABLE wave_gate_configs (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            wave_start TEXT NOT NULL,
+            wave_end TEXT NOT NULL,
+            version TEXT,
+            actions TEXT NOT NULL,
+            actor TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(project_id, wave_end)
+        );
+        """
+    )
+
+
+@pytest.mark.asyncio
+async def test_pre_existing_table_blocks_multi_version_gate_before_migration(db):
+    """Reproduces the live bug directly: on the OLD 2-column-constraint
+    schema, a second version's legitimate complete_wave_gate() for the
+    SAME wave_label raises — proving the failure mode is real, not just
+    theoretical, before asserting the repair migration fixes it below."""
+    import sqlite3
+
+    pid = (await db_module.create_project(db, name="pre-ed8e4524-wave-gate"))["id"]
+    await _downgrade_wave_gate_tables_to_pre_ed8e4524(db)
+
+    result_a = await db_module.complete_wave_gate(
+        db, pid, "wave-1", _GOOD_PAYLOAD, version="vA",
+    )
+    assert result_a["gate_completed"] is True
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await db_module.complete_wave_gate(
+            db, pid, "wave-1", _GOOD_PAYLOAD, version="vB",
+        )
+
+
+@pytest.mark.asyncio
+async def test_version_unique_migration_repairs_pre_existing_table(db):
+    """The actual fix: _migrate_wave_gate_results_version_unique /
+    _migrate_wave_gate_configs_version_unique rebuild a pre-ed8e4524 table
+    in place, preserving existing rows, so a second version's gate for the
+    same wave_label can complete afterward without error."""
+    from meridian.db.migrations import (
+        _migrate_wave_gate_configs_version_unique,
+        _migrate_wave_gate_results_version_unique,
+    )
+
+    pid = (await db_module.create_project(db, name="repaired-wave-gate"))["id"]
+    await _downgrade_wave_gate_tables_to_pre_ed8e4524(db)
+
+    # Existing (pre-migration) data that must survive the rebuild.
+    result_a = await db_module.complete_wave_gate(
+        db, pid, "wave-1", _GOOD_PAYLOAD, version="vA",
+    )
+    assert result_a["gate_completed"] is True
+    cfg = await db_module.configure_wave_gate(
+        db, pid, "wave-2", [{"type": "run_verification"}], version="vA",
+    )
+    assert cfg["configured"] is True
+
+    # Run the repair migrations (idempotent — safe to call on any shape).
+    await _migrate_wave_gate_results_version_unique(db)
+    await _migrate_wave_gate_configs_version_unique(db)
+    # Calling twice must be a true no-op (already-correct schema).
+    await _migrate_wave_gate_results_version_unique(db)
+    await _migrate_wave_gate_configs_version_unique(db)
+
+    # Pre-existing row survived the rebuild.
+    async with db.execute(
+        "SELECT version FROM wave_gate_results WHERE project_id = ? AND wave_label = ?",
+        (pid, "wave-1"),
+    ) as cur:
+        row = await cur.fetchone()
+    assert (row["version"] if isinstance(row, dict) else row[0]) == "vA"
+
+    # The actual repro: version B can now complete its OWN gate for the
+    # SAME wave_label — no more duplicate-key error.
+    result_b = await db_module.complete_wave_gate(
+        db, pid, "wave-1", _GOOD_PAYLOAD, version="vB",
+    )
+    assert result_b["gate_completed"] is True
+    assert result_b["version"] == "vB"
+
+    # Config side too: a second version's config for the same wave_end.
+    cfg_b = await db_module.configure_wave_gate(
+        db, pid, "wave-2", [{"type": "run_verification"}], version="vB",
+    )
+    assert cfg_b["configured"] is True
+    assert cfg_b["gate_config_id"] != cfg["gate_config_id"]

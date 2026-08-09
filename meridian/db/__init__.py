@@ -1139,6 +1139,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_ai_log_events_table(db)
     await _migrate_proposal_intake_drafts(db)
     await _migrate_profile_layers(db)
+    await _migrate_wave_gate_results_version_unique(db)
+    await _migrate_wave_gate_configs_version_unique(db)
     return db
 
 

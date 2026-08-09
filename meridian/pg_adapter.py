@@ -3691,6 +3691,65 @@ async def _migrate_pg_wave_gate_configs(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_wave_gate_version_unique_constraints(
+    conn: PostgresConnection,
+) -> None:
+    """Closes the residual-constraint gap flagged in ed8e4524's own docstrings
+    on ``_migrate_pg_wave_gate_results`` / ``_migrate_pg_wave_gate_configs``.
+
+    Both tables predate ed8e4524 on any long-running (non-fresh) database:
+    their ``CREATE TABLE IF NOT EXISTS`` is a no-op there, so only the
+    ``ADD COLUMN IF NOT EXISTS version`` half of that migration ever ran —
+    the UNIQUE constraint stayed the OLD 2-column
+    ``(project_id, wave_label)`` / ``(project_id, wave_end)`` shape instead
+    of widening to include ``version``. Confirmed live: a genuinely
+    version-scoped ``complete_wave_gate(version=...)`` call for a wave_label
+    that already has an UNSCOPED (``version IS NULL``) result row fails with
+    a raw ``duplicate key value violates unique constraint
+    "wave_gate_results_project_id_wave_label_key"`` — the exact cross-version
+    leak ed8e4524 was meant to close, reopened by the stale constraint on
+    already-existing installs (this hosted project's table among them).
+
+    Postgres has no ``ADD CONSTRAINT IF NOT EXISTS``, so the old auto-named
+    constraint is looked up via ``pg_constraint`` (mirroring
+    ``_migrate_pg_workspace_members_rbac``'s existing DROP-CONSTRAINT idiom)
+    and dropped only if found; the new 3-column constraint add is wrapped in
+    its own best-effort try/except so a second run (or a database that
+    already has it) is a no-op either way. Online-safe on Postgres 11+ — no
+    table rewrite, no long lock — matching the same idiom's own note.
+    """
+    for _table, _cols in (
+        ("wave_gate_results", "project_id, wave_label, version"),
+        ("wave_gate_configs", "project_id, wave_end, version"),
+    ):
+        try:
+            await conn.execute(
+                "DO $$ "
+                "DECLARE c text; "
+                "BEGIN "
+                f"  SELECT conname INTO c FROM pg_constraint "
+                f"   WHERE conrelid = '{_table}'::regclass "
+                "     AND contype = 'u' "
+                "     AND pg_get_constraintdef(oid) NOT LIKE '%version%' "
+                "   LIMIT 1; "
+                "  IF c IS NOT NULL THEN "
+                f"    EXECUTE 'ALTER TABLE {_table} DROP CONSTRAINT ' || quote_ident(c); "
+                "  END IF; "
+                "END $$",
+                None,
+            )
+        except Exception:  # noqa: BLE001 — best-effort; new installs already lack it
+            pass
+        try:
+            await conn.execute(
+                f"ALTER TABLE {_table} ADD CONSTRAINT "
+                f"{_table}_version_unique_key UNIQUE ({_cols})",
+                None,
+            )
+        except Exception:  # noqa: BLE001 — already exists (fresh install / prior run)
+            pass
+
+
 async def _migrate_pg_server_logs(conn: PostgresConnection) -> None:
     """f0a48685 — server_logs: application-wide WARNING/ERROR/EXCEPTION log capture.
 
@@ -4614,4 +4673,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_proposal_intake_drafts,
     _migrate_pg_sprint_batch_claims_reservation_fields,
     _migrate_pg_profile_layers,
+    _migrate_pg_wave_gate_version_unique_constraints,
 )
