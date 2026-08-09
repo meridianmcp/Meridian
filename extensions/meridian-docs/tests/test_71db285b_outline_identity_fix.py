@@ -28,6 +28,8 @@ from __future__ import annotations
 import io
 import zipfile
 
+import pytest
+
 from meridian_docs import docs_intel, server
 from meridian_docs._vendored_content_tree import _build_synth_id_map
 
@@ -406,3 +408,108 @@ def test_document_outline_server_wrapper_supports_pagination(tmp_path):
 
     assert page1["has_more"] is True
     assert len(page1["headings"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# e21b2ca7 -- durable document-bound synth-id addressing, end-to-end through
+# this package's real MCP-facing surface (document_outline / _find_para_by_id),
+# not just the unit-level _build_synth_id_map covered directly in
+# tests/test_docs_intel.py against the docparse package's own copy.
+# ---------------------------------------------------------------------------
+
+
+def test_document_outline_ids_stable_across_ancestor_heading_retitle(tmp_path):
+    """A body paragraph's id discovered via document_outline must be the SAME
+    before and after an ANCESTOR heading (not the paragraph itself) is
+    retitled -- the exact "ancestry" mutability e21b2ca7 fixes."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+
+    def _xml(heading_text: str) -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>{heading_text}</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>Body paragraph under the heading.</w:t></w:r></w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+    path_before = _write_docx(tmp_path, _xml("Setup"), name="before_retitle.docx")
+    path_after = _write_docx(tmp_path, _xml("Setup (renamed)"), name="after_retitle.docx")
+
+    before_paras = docs_intel.parse_docx(path_before)
+    after_paras = docs_intel.parse_docx(path_after)
+
+    before_body = next(
+        p for p in before_paras if p["text"] == "Body paragraph under the heading."
+    )
+    after_body = next(
+        p for p in after_paras if p["text"] == "Body paragraph under the heading."
+    )
+
+    assert before_body["para_id"].startswith("sp")
+    assert before_body["para_id"] == after_body["para_id"], (
+        "retitling the enclosing heading must not change the body "
+        f"paragraph's id: {before_body['para_id']!r} -> {after_body['para_id']!r}"
+    )
+
+
+def test_find_para_by_id_raises_on_duplicate_native_paraid():
+    """e21b2ca7: _find_para_by_id must fail closed (raise, not silently
+    return the first match in document order) when the queried native
+    w14:paraId is assigned to more than one paragraph -- a Word-invalid but
+    real-world-possible (hand-edited or third-party-tool-generated) document
+    state that would otherwise risk silently mutating the wrong paragraph."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p w14:paraId="6BDC5378"><w:r><w:t>First copy.</w:t></w:r></w:p>
+    <w:p w14:paraId="6BDC5378"><w:r><w:t>Second copy.</w:t></w:r></w:p>
+  </w:body>
+</w:document>
+"""
+    docx_bytes = _make_docx_bytes(xml)
+    root = docs_intel.ET.fromstring(
+        zipfile.ZipFile(io.BytesIO(docx_bytes)).read("word/document.xml")
+    )
+
+    with pytest.raises(docs_intel.AmbiguousParagraphIdError):
+        docs_intel._find_para_by_id(root, "6BDC5378")
+
+
+def test_find_para_by_id_still_resolves_unique_native_paraid():
+    """Sanity check alongside the ambiguity test above: a native paraId that
+    is NOT duplicated still resolves normally (the new check must not
+    false-positive on ordinary, valid documents)."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p w14:paraId="11111111"><w:r><w:t>Only copy.</w:t></w:r></w:p>
+  </w:body>
+</w:document>
+"""
+    docx_bytes = _make_docx_bytes(xml)
+    root = docs_intel.ET.fromstring(
+        zipfile.ZipFile(io.BytesIO(docx_bytes)).read("word/document.xml")
+    )
+
+    located = docs_intel._find_para_by_id(root, "11111111")
+
+    assert located is not None
+    _body, para, _idx = located
+    assert docs_intel._q(_W, "p") == para.tag

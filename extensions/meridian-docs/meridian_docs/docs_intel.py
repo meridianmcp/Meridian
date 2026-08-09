@@ -337,17 +337,27 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     the same three-tier scheme every mutation primitive in this module already
     uses (``_find_para_by_id``, ``_locate_section_bounds``,
     ``_vendored_content_tree._paragraph_node``): the native ``w14:paraId`` when
-    Word wrote one (stable across edits), else the synthesized ``sp<hash>`` id
-    from :func:`_vendored_content_tree._build_synth_id_map` (a content-derived
-    id that is ALSO stable across edits -- unlike a raw position counter), else
-    a positional ``p{index}`` fallback. Returns an empty list for a document
-    with no body.
+    Word wrote one (stable across edits -- prefer this whenever present), else
+    the synthesized ``sp<hash>`` id from
+    :func:`_vendored_content_tree._build_synth_id_map` (a content-derived id,
+    stable across insertions elsewhere in the document and, as of e21b2ca7, no
+    longer perturbed by an ancestor heading being retitled -- see that
+    function's docstring for exactly what is and is not stable about it),
+    else a positional ``p{index}`` fallback kept only for explicit legacy
+    compatibility. Returns an empty list for a document with no body.
 
     71db285b -- previously this used a bare ``p{index}`` position counter,
     unaware of the synth_id scheme that ``move_section``/``copy_section``/
     ``_locate_section_bounds`` actually resolve against, so ``document_outline``
     handed back ids that those functions could not reliably locate on any real
     (non-synthetic) docx lacking ``w14:paraId`` on every paragraph.
+
+    e21b2ca7 -- the synth-id fallback's hash inputs changed (ancestor heading
+    TEXT dropped); see :func:`_vendored_content_tree._build_synth_id_map` for
+    the exact stability guarantees this gives, and what remains a known,
+    accepted limitation (own-text edits and duplicate-order shifts still
+    change a synth id -- both require real persisted identity to fully fix,
+    which this stateless, single-parse function does not implement).
     """
     if isinstance(source, (bytes, bytearray)):
         zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
@@ -3195,6 +3205,32 @@ def _verify_image_ownership(
     return None
 
 
+class AmbiguousParagraphIdError(ValueError):
+    """e21b2ca7 -- ``para_id`` matches MORE THAN ONE paragraph in the current
+    document, so :func:`_find_para_by_id` refuses to silently guess which
+    one the caller means (previously it returned whichever match it hit
+    first in document order, i.e. a silent, non-deterministic-feeling
+    choice from the caller's perspective).
+
+    This can only happen for the native ``w14:paraId`` tier: a real Word
+    document should never assign the same ``w14:paraId`` to two paragraphs,
+    but a hand-edited or generated-by-another-tool ``.docx`` sometimes does
+    (see :func:`_vendored_content_tree._find_duplicate_native_para_ids`,
+    already surfaced read-only via ``document_content_tree``'s
+    ``duplicate_para_ids``). The synthesized ``sp<hash>`` and legacy
+    ``p{N}`` tiers are unique by construction within one parse, so neither
+    can trigger this.
+
+    Every one of this function's write-path callers (insert_caption,
+    move_section, copy_section, edit_equation_local, etc.) would otherwise
+    risk silently mutating the WRONG one of two identically-id'd paragraphs
+    -- failing closed here instead of guessing matches the fail-closed
+    convention already used elsewhere in this module for OOXML writes
+    (b6a9ec99, ambiguity/nesting rejection in equation and bibliography
+    rewriting).
+    """
+
+
 def _find_para_by_id(
     root: ET.Element, para_id: str
 ) -> tuple[ET.Element, ET.Element, int] | None:
@@ -3224,8 +3260,13 @@ def _find_para_by_id(
 
     Only schemes 1 and 3 apply to paragraphs inside tables -- like
     ``document_content_tree``, the synth-id map is built over direct body
-    children only (table-cell paragraphs are not part of the
-    heading-path/synth-id scheme).
+    children only (table-cell paragraphs are not part of the synth-id
+    scheme).
+
+    e21b2ca7 -- raises :class:`AmbiguousParagraphIdError` (fail closed,
+    instead of silently resolving to the first match in document order)
+    when ``para_id`` is a native ``w14:paraId`` that more than one
+    paragraph in the document carries. See that exception's docstring.
 
     Returns ``None`` when ``para_id`` matches none of the three schemes.
     The ``body_child_index`` is the index of the direct body child that contains
@@ -3237,9 +3278,23 @@ def _find_para_by_id(
     w_p = _q(_W, "p")
     w14_para_id = _q(_W14, "paraId")
 
-    from ._vendored_content_tree import _build_synth_id_map  # noqa: PLC0415
+    from ._vendored_content_tree import (  # noqa: PLC0415
+        _build_synth_id_map,
+        _find_duplicate_native_para_ids,
+    )
 
     synth_map = _build_synth_id_map(body)
+    duplicate_native_ids = {
+        entry["para_id"] for entry in _find_duplicate_native_para_ids(body)
+    }
+    if para_id in duplicate_native_ids:
+        raise AmbiguousParagraphIdError(
+            f"paraId {para_id!r} is assigned to more than one paragraph in "
+            "this document (Word-invalid duplicate w14:paraId) -- refusing "
+            "to guess which one the caller means. See "
+            "document_content_tree's duplicate_para_ids report to locate "
+            "and disambiguate the affected paragraphs."
+        )
 
     global_p_idx = 0
     for child_idx, child in enumerate(list(body)):

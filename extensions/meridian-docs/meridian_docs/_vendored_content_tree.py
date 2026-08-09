@@ -17,6 +17,15 @@ not a silent duplication.
 827b6bdc -- also vendors _find_duplicate_native_para_ids (native w14:paraId
 duplicate detection) for the same reason: document_content_tree here calls
 it, so it has to exist here too.
+
+e21b2ca7 -- _build_synth_id_map's hash input changed (ancestor heading TEXT
+dropped, see that function's own docstring). This vendored copy and
+packages/docparse/docparse/docs_intel.py's own local _build_synth_id_map
+have now DIVERGED -- the sync note above was already an accepted,
+documented tradeoff before this change, but flagging explicitly here since
+this specific divergence is fresh: packages/docparse's copy was out of this
+sprint item's declared scope and was intentionally left untouched. A
+follow-up item should port the same algorithm change there.
 """
 from __future__ import annotations
 
@@ -118,30 +127,60 @@ def _paragraph_text(p: ET.Element) -> str:
 
 def _build_synth_id_map(body: ET.Element) -> dict[int, str]:
     """Stable synthesized-id map for direct <w:p> children of *body* without a
-    native w14:paraId.  See docparse.docs_intel._build_synth_id_map for the
-    full docstring; this is the vendored copy kept in sync manually."""
+    native w14:paraId.
+
+    e21b2ca7 -- previously hashed ``(heading_path, normalized_text,
+    occurrence)``, where ``heading_path`` was the literal TEXT of every
+    enclosing heading. That made a paragraph's own id drift whenever an
+    ANCESTOR heading was retitled, even though the paragraph itself was
+    never touched -- "ancestry" mutability flagged as a residual gap on top
+    of caf5ee34's original stable-on-insertion fix. Ancestor text is no
+    longer part of the hash input at all: only the paragraph's own
+    normalized text plus a document-order occurrence counter (scoped to
+    that exact normalized text, across the whole document -- not per
+    section) feed the hash, so retitling a heading no longer perturbs any
+    descendant's id. This does not weaken duplicate-disambiguation safety:
+    the occurrence counter still assigns a strictly increasing, unique index
+    to every successive paragraph sharing the same normalized text, so no
+    two paragraphs can ever collide onto the same id regardless of which
+    section they fall in.
+
+    Residual, explicitly accepted limitations (inherent to any id derived
+    purely by re-parsing content on every call, with no persisted state --
+    see :func:`docs_intel._find_para_by_id`'s docstring for the
+    resolution-side half of this):
+
+    - Editing a paragraph's OWN text still changes ITS OWN id (the id is
+      content-derived; there is nothing else here to hash it from).
+    - Inserting or removing an EARLIER paragraph that shares this
+      paragraph's exact normalized text still shifts this paragraph's
+      occurrence index, and therefore its id.
+
+    Both require a real persisted, document-bound identity (minted once and
+    remembered, not recomputed fresh from content on every parse) to fully
+    close -- native ``w14:paraId`` already gives real Word-authored
+    paragraphs that guarantee; this fallback does not yet, and closing the
+    gap needs a persistence layer (sidecar-backed or embedded in the
+    document itself) beyond this function's current stateless,
+    single-parse contract. Preferring native ``w14:paraId`` whenever present
+    (see call sites) already gets real documents the strongest guarantee
+    available; this is the deliberately-scoped-down fallback for paragraphs
+    Word never assigned one to.
+    """
     p_tag = _q(_W, "p")
     w14_paraId = _q(_W14, "paraId")
-    heading_path: list[str] = []
-    seen: dict[tuple[str, str], int] = {}
+    seen: dict[str, int] = {}
     result: dict[int, str] = {}
     for child in body:
         if child.tag != p_tag:
             continue
         native_id = child.get(w14_paraId)
-        style = _paragraph_style(child)
-        if _is_heading(style):
-            level = _heading_level(style)
-            text = _paragraph_text(child)
-            heading_path = heading_path[: level - 1] + [text]
         if native_id:
             continue
-        path_str = " > ".join(heading_path) if heading_path else "<root>"
         norm_text = re.sub(r"\s+", " ", _paragraph_text(child).lower()).strip()
-        slot_key = (path_str, norm_text)
-        occ = seen.get(slot_key, 0)
-        seen[slot_key] = occ + 1
-        raw = f"{path_str}\x00{norm_text}\x00{occ}"
+        occ = seen.get(norm_text, 0)
+        seen[norm_text] = occ + 1
+        raw = f"{norm_text}\x00{occ}"
         digest = hashlib.sha1(raw.encode()).hexdigest()[:16]
         result[id(child)] = f"sp{digest}"
     return result
