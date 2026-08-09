@@ -55,7 +55,9 @@ content-addressed design (and the Redis-read-acceleration design note).
 """
 from __future__ import annotations
 
+import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 import aiosqlite
@@ -346,6 +348,83 @@ async def purge_events_before(
 
 
 # ---------------------------------------------------------------------------
+# c0168425 — export (implementation follow-up to ea972129's design)
+# ---------------------------------------------------------------------------
+
+def _utc_now_iso() -> str:
+    """Millisecond-precision UTC ISO-8601 with a literal 'Z' suffix — same
+    shape as meridian.ai_log._utc_now_iso / meridian.artifact_store._utc_now_iso
+    (each module keeps its own private copy by convention — see
+    artifact_store's module docstring)."""
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+async def export_events(
+    db: aiosqlite.Connection,
+    project_id: str,
+    *,
+    session_id: "str | None" = None,
+    event_type: "str | None" = None,
+    correlation_id: "str | None" = None,
+    parent_event_id: "str | None" = None,
+    limit: int = 5000,
+) -> dict[str, Any]:
+    """Project-scoped, receipted bulk export of ``ai_log_events`` — for a
+    local-first backup or as a retention sweep's pre-purge archive.
+    Read-only: never deletes or mutates a row (that remains
+    :func:`purge_events_before`'s job).
+
+    Reuses :func:`list_events`'s exact filter semantics (``session_id``/
+    ``event_type``/``correlation_id``/``parent_event_id``) but with a much
+    higher default/max cap (5000 vs. ``list_events``'s UI-oriented default
+    of 50 / hard ceiling of 500) since an export is meant to be
+    as-complete-as-practical rather than a paginated read. Still explicitly
+    bounded — never truly unlimited — so one export call can't attempt to
+    materialize an unbounded result set in memory.
+
+    Returns a receipted bundle: ``{project_id, exported_at, filters,
+    event_count, truncated, events, export_hash}``. ``truncated`` is True
+    when ``event_count`` hit the bound, signalling more rows exist than
+    were returned. ``export_hash`` is a ``sha256:<hex>`` over the exported
+    events list (sorted-key, separator-compact JSON) — mirrors
+    ``meridian.ai_log.canonical_event_hash`` /
+    ``meridian.capability_manifest.manifest_hash``'s "hash the content so a
+    caller can independently verify nothing was altered in transit" pattern
+    already used elsewhere in this codebase.
+    """
+    if not project_id:
+        raise ValueError("project_id is required")
+    bounded_limit = max(1, min(int(limit or 5000), 5000))
+    events = await list_events(
+        db, project_id,
+        session_id=session_id, event_type=event_type,
+        correlation_id=correlation_id, parent_event_id=parent_event_id,
+        limit=bounded_limit,
+    )
+    canonical = json.dumps(events, sort_keys=True, separators=(",", ":"), default=str)
+    export_hash = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return {
+        "project_id": project_id,
+        "exported_at": _utc_now_iso(),
+        "filters": {
+            "session_id": session_id,
+            "event_type": event_type,
+            "correlation_id": correlation_id,
+            "parent_event_id": parent_event_id,
+            "limit": bounded_limit,
+        },
+        "event_count": len(events),
+        "truncated": len(events) >= bounded_limit,
+        "events": events,
+        "export_hash": export_hash,
+    }
+
+
+# ---------------------------------------------------------------------------
 # ea972129 (Round 1 proposal e143949d) — AiLogStore facade
 # ---------------------------------------------------------------------------
 
@@ -360,11 +439,12 @@ class AiLogStore:
 
     Adds NO new storage behavior beyond what
     :func:`append_event`/:func:`get_event`/:func:`list_events`/
-    :func:`purge_events_before` already provide — this class exists purely
-    so a caller doing several operations against ONE project (e.g. a
-    retention sweep, a future export job) does not have to repeat
-    ``project_id`` on every call. The module-level free functions remain
-    the primary API and are unaffected by this class's existence.
+    :func:`purge_events_before`/:func:`export_events` (c0168425) already
+    provide — this class exists purely so a caller doing several operations
+    against ONE project (e.g. a retention sweep, an export job) does not
+    have to repeat ``project_id`` on every call. The module-level free
+    functions remain the primary API and are unaffected by this class's
+    existence.
     """
 
     def __init__(self, db: aiosqlite.Connection, project_id: str) -> None:
@@ -390,3 +470,7 @@ class AiLogStore:
     async def purge_older_than(self, cutoff_recorded_at: str) -> int:
         """See :func:`purge_events_before` (``project_id`` is already bound)."""
         return await purge_events_before(self._db, self.project_id, cutoff_recorded_at)
+
+    async def export(self, **kwargs: Any) -> dict[str, Any]:
+        """See :func:`export_events` (``project_id`` is already bound)."""
+        return await export_events(self._db, self.project_id, **kwargs)

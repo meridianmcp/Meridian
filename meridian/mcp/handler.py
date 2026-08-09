@@ -2925,7 +2925,7 @@ async def _handle_task_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token."""
+    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token, export_ai_log, export_ai_log_artifacts, purge_ai_log."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         _log_sid = args.get("session_id", "")
@@ -3477,6 +3477,83 @@ async def _handle_task_tools(
         return await handoff_module_local.verify_handoff_token(
             db, _token, _pid, body=_body_for_check
         )
+    if name == "export_ai_log":
+        # c0168425 — implementation follow-up to ea972129's design: read-only,
+        # receipted export of ai_log_events. See db.ai_log.export_events for
+        # the full contract (filter semantics, bounded limit, export_hash).
+        _limit_raw = args.get("limit")
+        return await db_module.export_events(
+            db, args["project_id"],
+            session_id=args.get("session_id"),
+            event_type=args.get("event_type"),
+            correlation_id=args.get("correlation_id"),
+            parent_event_id=args.get("parent_event_id"),
+            limit=int(_limit_raw) if _limit_raw is not None else 5000,
+        )
+    if name == "export_ai_log_artifacts":
+        # c0168425 — read-only, receipted export of stored ai_log artifacts
+        # (meridian.artifact_store — filesystem-only, no DB dependency by
+        # design; see that module's docstring). Pass content_hashes for an
+        # explicit subset, or omit to export every artifact stored for the
+        # project.
+        from .. import artifact_store as artifact_store_module  # noqa: PLC0415
+        _hashes = args.get("content_hashes")
+        if _hashes is not None and not isinstance(_hashes, list):
+            raise ValueError("content_hashes must be a list of 'sha256:...' strings")
+        try:
+            return artifact_store_module.export_artifacts(
+                data_dir, args["project_id"],
+                content_hashes=[str(h) for h in _hashes] if _hashes else None,
+            )
+        except artifact_store_module.ArtifactStoreError as exc:
+            return {"error": "ARTIFACT_EXPORT_INVALID", "message": str(exc)}
+    if name == "purge_ai_log":
+        # c0168425 — project-scoped, cutoff-based retention sweep spanning
+        # BOTH ai_log_events (db.ai_log.purge_events_before) and their
+        # stored artifacts (artifact_store.purge_artifacts_before) in one
+        # call, with a single structured receipt. Assembled HERE, at the
+        # integration layer, rather than inside either module:
+        # artifact_store is intentionally DB-free (see its module
+        # docstring) and db.ai_log is intentionally filesystem-free, so a
+        # combined sweep belongs to neither module individually.
+        from .. import artifact_store as artifact_store_module  # noqa: PLC0415
+        from datetime import datetime as _dt_cls, timezone as _tz  # noqa: PLC0415
+        _cutoff_raw = str(args.get("cutoff") or "").strip()
+        if not _cutoff_raw:
+            raise ValueError(
+                "cutoff is required (an ISO-8601 UTC datetime, e.g. "
+                "'2025-01-01T00:00:00Z')"
+            )
+        try:
+            _parsed_cutoff = _dt_cls.fromisoformat(_cutoff_raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(
+                f"cutoff {_cutoff_raw!r} must be an ISO-8601 UTC datetime, "
+                "e.g. '2025-01-01T00:00:00Z'"
+            ) from exc
+        # ai_log_events.recorded_at is written in the space-separated
+        # "YYYY-MM-DD HH:MM:SS[.ffffff]" shape on BOTH backends (SQLite's
+        # datetime('now') / Postgres's _TS — see meridian/pg_adapter.py's
+        # _TS constant), distinct from the artifact store's ISO-8601-with-
+        # 'Z' created_at shape (meridian.artifact_store._utc_now_iso) —
+        # convert once here rather than inside purge_events_before, which
+        # already has its own tested cutoff contract (see
+        # tests/test_ai_log_retention.py) that this call must not disturb.
+        _events_cutoff = _parsed_cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        _pid = args["project_id"]
+        _events_deleted = await db_module.purge_events_before(db, _pid, _events_cutoff)
+        _artifacts_deleted = artifact_store_module.purge_artifacts_before(
+            data_dir, _pid, _cutoff_raw,
+        )
+        return {
+            "project_id": _pid,
+            "cutoff": _cutoff_raw,
+            "events_deleted": _events_deleted,
+            "artifacts_deleted": _artifacts_deleted,
+            "purged_at": (
+                _dt_cls.now(_tz.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            ),
+        }
     return _MISS
 
 

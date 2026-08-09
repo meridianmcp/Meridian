@@ -87,6 +87,9 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "finalize_wave_run": 'finalize_wave_run(wave_run_id="run-uuid", evidence={"status": "ok", "exit_code": 0, "passed": 1780, "failed": 0}, expected_revision_hash="sha256:...")',
     "resume_wave": 'resume_wave(wave_run_id="run-uuid", goal_token="a1b2c3d4e5f6a7b8", presented_body="/goal\\n<sprint_items>...</sprint_items>")',
     "record_handoff_correction": 'record_handoff_correction(project_id="abc-123", source_handoff_id="handoff-uuid", blocker_classification="pointer_unresolved", investigation_evidence={"finding": "the file was renamed since the handoff was rendered"}, regenerate=True)',
+    "export_ai_log": 'export_ai_log(project_id="abc-123", event_type="tool.invoked", limit=500)',
+    "export_ai_log_artifacts": 'export_ai_log_artifacts(project_id="abc-123", content_hashes=["sha256:..."])',
+    "purge_ai_log": 'purge_ai_log(project_id="abc-123", cutoff="2025-01-01T00:00:00Z")',
     "complete_wave_gate": 'complete_wave_gate(project_id="abc-123", wave_label="wave-1", verification_payload={"status": "ok", "exit_code": 0, "passed": 42, "failed": 0, "stdout_tail": "42 passed in 5.3s", "stderr_tail": ""})',
     "configure_wave_gate": 'configure_wave_gate(project_id="abc-123", wave_end="wave-3", actions=[{"type": "push_dev"}, {"type": "run_verification"}, {"type": "push_main"}, {"type": "deploy"}])',
     "get_planning_brief": 'get_planning_brief(project_id="abc-123")',
@@ -504,6 +507,54 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"], "description": "Only used when regenerate=true — forwarded to generate_handoff."},
          "output_dir": {"type": "string", "description": "Only used when regenerate=true; defaults to the server's data directory."}},
          "required": ["source_handoff_id", "blocker_classification"]}},
+    {"name": "export_ai_log", "description":
+        "c0168425 — Read-only: project-scoped, receipted export of ai_log_events "
+        "(meridian.db.ai_log — the append-only ExecutionEvent log). Nothing "
+        "captures events into this table automatically yet (see meridian.ai_log's "
+        "module docstring); this exports whatever has been recorded via "
+        "append_event so far. Filter with session_id/event_type/correlation_id/"
+        "parent_event_id exactly like list_events. limit defaults to 5000 and is "
+        "capped at 5000 — the response's truncated field is true when more "
+        "matching rows exist than were returned. Returns {project_id, "
+        "exported_at, filters, event_count, truncated, events, export_hash} — "
+        "export_hash is a sha256 over the exported events so a caller can "
+        "independently verify nothing was altered in transit.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "session_id": {"type": "string"}, "event_type": {"type": "string"},
+         "correlation_id": {"type": "string"}, "parent_event_id": {"type": "string"},
+         "limit": {"type": "integer", "description": "Default/max 5000."}},
+         "required": []}},
+    {"name": "export_ai_log_artifacts", "description":
+        "c0168425 — Read-only: project-scoped, receipted export of stored ai_log "
+        "artifacts (meridian.artifact_store — the local-first, content-addressed "
+        "blob store an ExecutionEvent payload can point to via artifact_ref "
+        "instead of inlining large content). Pass content_hashes to export an "
+        "explicit subset (sha256:... values) — every requested hash must exist "
+        "for this project, or the call errors rather than silently returning a "
+        "shorter list; omit it to export every artifact currently stored for the "
+        "project. Returns {project_id, exported_at, artifact_count, total_size, "
+        "artifacts, export_hash} — each artifact entry includes its metadata plus "
+        "base64-encoded content. export_hash covers the metadata only (not the "
+        "base64 payloads) so it stays cheap to verify.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "content_hashes": {"type": "array", "items": {"type": "string"}, "description": "Explicit subset of 'sha256:...' hashes to export. Omit to export every artifact stored for the project."}},
+         "required": []}},
+    {"name": "purge_ai_log", "description":
+        "c0168425 — Project-scoped, cutoff-based retention sweep spanning BOTH "
+        "ai_log_events (meridian.db.ai_log.purge_events_before) and their stored "
+        "artifacts (meridian.artifact_store.purge_artifacts_before) in one call, "
+        "with a single receipt. Deletes every event/artifact strictly older than "
+        "cutoff (an ISO-8601 UTC datetime, e.g. '2025-01-01T00:00:00Z') for the "
+        "given project. Irreversible — this is a hard bulk delete, not a soft "
+        "archive (call export_ai_log / export_ai_log_artifacts first if the data "
+        "needs to survive the sweep). Returns {project_id, cutoff, "
+        "events_deleted, artifacts_deleted, purged_at}.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "cutoff": {"type": "string", "description": "ISO-8601 UTC datetime, e.g. '2025-01-01T00:00:00Z'. Events/artifacts recorded strictly before this are deleted."}},
+         "required": ["cutoff"]}},
     {"name": "get_context_block", "description":
         "Read-only: Return a compact project context block (north star, sprint, "
         "pending sprint items, recent tasks, recent decisions, active sessions) "
@@ -3056,6 +3107,7 @@ _READ_ONLY_TOOLS = {
     "search_server_logs", "get_server_log_checkpoint",
     "idle_until_session_done", "generate_handoff", "load_handoff",
     "verify_handoff_token",
+    "export_ai_log", "export_ai_log_artifacts",
     "get_insights",
     "get_workspace_notes", "get_workspace_decisions", "get_workspace_settings",
     "get_blog_posts",
@@ -3079,7 +3131,7 @@ _READ_ONLY_TOOLS = {
     "get_custom_hooks",
     "batch_read",
 }
-_DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook"}
+_DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
 
 # ---------------------------------------------------------------------------
 # a749f87c — Deterministic tool pre-selection metadata.
@@ -3125,6 +3177,9 @@ _TOOL_CATEGORY: dict[str, str] = {
     "load_handoff":            "session",
     "record_handoff_correction": "session",
     "verify_handoff_token":    "session",
+    "export_ai_log":           "notes",
+    "export_ai_log_artifacts": "notes",
+    "purge_ai_log":            "notes",
     "checkpoint":              "session",
     "get_session_brief":       "session",
     "get_context_block":       "session",
@@ -3381,6 +3436,9 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "register_session":          "both",
     "load_handoff":              "both",
     "verify_handoff_token":      "both",
+    "export_ai_log":             "both",
+    "export_ai_log_artifacts":   "both",
+    "purge_ai_log":              "executor",
     "refresh_context":           "both",
     "get_context_block":         "both",
     "get_session_brief":         "both",
@@ -3642,6 +3700,9 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "load_handoff":               "maintenance-only",
     "record_handoff_correction":  "maintenance-only",
     "verify_handoff_token":       "maintenance-only",
+    "export_ai_log":              "maintenance-only",
+    "export_ai_log_artifacts":    "maintenance-only",
+    "purge_ai_log":               "maintenance-only",
     # sprint item pointer cleanup
     "delete_sprint_item_pointer": "maintenance-only",
     # note cleanup
@@ -3745,6 +3806,9 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "finalize_wave_run": "Finalize Wave Run",
     "resume_wave": "Resume Wave",
     "record_handoff_correction": "Record Handoff Correction",
+    "export_ai_log": "Export AI Log",
+    "export_ai_log_artifacts": "Export AI Log Artifacts",
+    "purge_ai_log": "Purge AI Log",
     "get_planning_brief": "Get Planning Brief",
     "get_file_claims": "Get File Claims",
     "list_plugins": "List Plugins",

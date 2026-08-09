@@ -16,9 +16,16 @@ covers that scaffold itself and is NOT duplicated here):
       dedup-by-content, redaction-on-write for text content, binary content
       stored unchanged, cutoff-based retention purge, and path-safety
       validation (malformed project_id / content_hash).
+  5.  c0168425 (implementation follow-up to ea972129) —
+      db.ai_log.export_events / AiLogStore.export: receipted event export,
+      filter parity with list_events, bounded/truncated reporting, and
+      export_hash determinism.
 
-It deliberately does NOT cover capture-boundary enumeration, export format,
-or search/indexing — those are sibling items 4d113dcb / 14009d86's job.
+It deliberately does NOT cover capture-boundary enumeration or
+search/indexing — those are sibling items 4d113dcb / 14009d86's job.
+meridian.artifact_store.export_artifacts and the export_ai_log /
+export_ai_log_artifacts / purge_ai_log MCP dispatch surface are covered in
+tests/test_ai_log_artifacts.py (c0168425), not duplicated here.
 """
 from __future__ import annotations
 
@@ -349,3 +356,114 @@ def test_store_artifact_rejects_unsafe_project_id(tmp_path, bad_project_id):
 def test_get_artifact_rejects_malformed_hash(tmp_path, bad_hash):
     with pytest.raises(artifact_store.ArtifactStoreError):
         artifact_store.get_artifact(str(tmp_path), "proj-1", bad_hash)
+
+
+# ---------------------------------------------------------------------------
+# 5. c0168425 (implementation follow-up to ea972129) — db.ai_log.export_events
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_export_events_returns_receipted_bundle(db):
+    pid = await _project(db, "ai-log-export-basic")
+    created = await db_module.append_event(db, pid, "session.started", "session")
+
+    bundle = await db_module.export_events(db, pid)
+
+    assert bundle["project_id"] == pid
+    assert bundle["event_count"] == 1
+    assert bundle["truncated"] is False
+    assert bundle["events"][0]["id"] == created["id"]
+    assert bundle["export_hash"].startswith("sha256:")
+    assert bundle["exported_at"]
+
+
+@pytest.mark.asyncio
+async def test_export_events_is_project_scoped(db):
+    pid_a = await _project(db, "ai-log-export-a")
+    pid_b = await _project(db, "ai-log-export-b")
+    await db_module.append_event(db, pid_a, "session.started", "session")
+    await db_module.append_event(db, pid_b, "session.started", "session")
+    await db_module.append_event(db, pid_b, "tool.invoked", "tool")
+
+    bundle_a = await db_module.export_events(db, pid_a)
+    bundle_b = await db_module.export_events(db, pid_b)
+
+    assert bundle_a["event_count"] == 1
+    assert bundle_b["event_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_export_events_applies_same_filters_as_list_events(db):
+    pid = await _project(db, "ai-log-export-filters")
+    await db_module.append_event(db, pid, "tool.invoked", "tool")
+    match = await db_module.append_event(db, pid, "llm.response", "model")
+
+    bundle = await db_module.export_events(db, pid, event_type="llm.response")
+
+    assert bundle["event_count"] == 1
+    assert bundle["events"][0]["id"] == match["id"]
+    assert bundle["filters"]["event_type"] == "llm.response"
+
+
+@pytest.mark.asyncio
+async def test_export_events_requires_project_id(db):
+    with pytest.raises(ValueError):
+        await db_module.export_events(db, "")
+
+
+@pytest.mark.asyncio
+async def test_export_events_reports_truncated_when_limit_hit(db):
+    pid = await _project(db, "ai-log-export-truncated")
+    for _ in range(3):
+        await db_module.append_event(db, pid, "session.started", "session")
+
+    bundle = await db_module.export_events(db, pid, limit=2)
+
+    assert bundle["event_count"] == 2
+    assert bundle["truncated"] is True
+    assert bundle["filters"]["limit"] == 2
+
+
+@pytest.mark.asyncio
+async def test_export_events_limit_is_bounded_to_5000(db):
+    pid = await _project(db, "ai-log-export-bound")
+    bundle = await db_module.export_events(db, pid, limit=999_999)
+    assert bundle["filters"]["limit"] == 5000
+
+
+@pytest.mark.asyncio
+async def test_export_events_hash_is_deterministic_for_same_content(db):
+    pid = await _project(db, "ai-log-export-hash")
+    await db_module.append_event(
+        db, pid, "session.started", "session", idempotency_key="fixed-key",
+    )
+
+    first = await db_module.export_events(db, pid)
+    second = await db_module.export_events(db, pid)
+
+    assert first["export_hash"] == second["export_hash"]
+
+
+@pytest.mark.asyncio
+async def test_export_events_hash_changes_when_content_changes(db):
+    pid = await _project(db, "ai-log-export-hash-diff")
+    await db_module.append_event(db, pid, "session.started", "session")
+    before = await db_module.export_events(db, pid)
+
+    await db_module.append_event(db, pid, "tool.invoked", "tool")
+    after = await db_module.export_events(db, pid)
+
+    assert before["export_hash"] != after["export_hash"]
+
+
+@pytest.mark.asyncio
+async def test_ai_log_store_export_delegates_to_export_events(db):
+    pid = await _project(db, "ai-log-store-export")
+    store = db_module.AiLogStore(db, pid)
+    created = await store.append("session.started", "session")
+
+    bundle = await store.export()
+
+    assert bundle["project_id"] == pid
+    assert bundle["event_count"] == 1
+    assert bundle["events"][0]["id"] == created["id"]
