@@ -1607,6 +1607,59 @@ _DEFAULT_HANDOFF_MAX_BYTES = 300_000
 _DEFAULT_STARTER_MAX_BYTES = 16_000
 _DEFAULT_GOAL_MAX_BYTES = 12_000
 
+# 60eed526 — mode-aware backstop for checkpoint()'s own mid-run progress
+# ping. ``checkpoint()`` (meridian/mcp/handlers/session_tools.py::
+# handle_checkpoint) calls generate_handoff(mode="delta", checkpoint=True)
+# on EVERY call — often many times per session — so its RETURNED content
+# needs the same "small by default" treatment starter/goal already get via
+# the two constants above, even though delta's own item-listing sections
+# (bc834237/7732e096) are independently capped at 20 items each with
+# truncated titles. Confirmed root cause, distinct from the 248c0bb9
+# starter/goal fix: the SHARED quick_start_goal build at the full/delta call
+# site never passed full_contract_max_items (still doesn't, for a plain
+# checkpoint=False call — see the comment at that call site), so a session
+# working a large pending backlog produced an observed ~139KB checkpoint()
+# response — the <tool_requirements>/<sprint_item_pointers>/
+# <artifact_pointer_findings> clauses embedded inside quick_start_goal
+# serialize the FULL pending inventory exactly like the 248c0bb9 goal-mode
+# regression did, just reached through checkpoint()'s own delta call instead
+# of a direct mode='goal' call.
+#
+# Deliberately a byte-budget backstop only (mirrors the pre-248c0bb9
+# relationship between _DEFAULT_HANDOFF_MAX_BYTES and full/delta): a
+# checkpoint=True call keeps full_contract_max_items=None (unbounded
+# construction, same as any other full/delta call — see the full/delta
+# quick_start_goal call site below), so what gets PERSISTED (disk file,
+# handoffs table, pending_goal) is always the complete, untruncated render —
+# only the value RETURNED over MCP is bounded, via format_handoff_mcp_content
+# (the exact same integrity-first, non-silent, goal-token-preserving
+# mechanism starter/goal already use). A plain generate_handoff(mode='delta')
+# call (checkpoint=False, the default — every pre-existing caller) is
+# completely unaffected: "full/delta mode may include full detail as today"
+# still holds byte-for-byte. Only a call that explicitly opts into
+# checkpoint=True (today: handle_checkpoint's own internal call, and any
+# direct MCP caller of the generate_handoff tool that passes checkpoint=true)
+# gets this bound.
+_DEFAULT_CHECKPOINT_MAX_BYTES = 40_000
+
+# 60eed526 — same size-class backstop as _DEFAULT_CHECKPOINT_MAX_BYTES above,
+# for meridian/server.py::_build_continue_payload's own "just continue"
+# resume goal_string. That path builds its /goal via _build_quick_start_goal
+# directly (not through generate_handoff), so it has no mode dial to key off
+# of and previously had NO byte-level backstop at all — only
+# full_contract_max_items's ITEM-COUNT cap (bounds how many pending items'
+# tool_requirements get inlined, not how large each inlined entry is).
+# Confirmed regression: a board with a handful of items carrying large
+# per-item tool_requirements payloads still produced a ~59KB goal_string
+# even after the item-count cap, because a single item's own
+# tool_requirements JSON can already be large. format_handoff_mcp_content is
+# applied on top (same integrity-first, non-silent, goal-token-preserving
+# mechanism every other mode uses) as the actual byte-level guarantee; the
+# item-count cap stays in place too since it keeps the UNCUT prefix
+# (directives, stop conditions, item list) smaller to begin with, so less of
+# it needs trimming by the byte budget below.
+_DEFAULT_CONTINUE_GOAL_MAX_BYTES = 40_000
+
 # Sentinel distinguishing "caller did not pass max_content_bytes" (use the
 # mode-aware default above) from an explicit `None` (which has always meant
 # "opt out of budgeting entirely" — see format_handoff_mcp_content's
@@ -1698,6 +1751,14 @@ def format_handoff_mcp_content(
     ``<goal_token>`` value itself remains valid for plain provenance
     verification (``verify_handoff_token(project_id, token)`` with no
     ``body``) regardless.
+
+    ``max_bytes`` is a budget on the RETURNED string, marker included
+    (60eed526) — the appended truncation marker itself is not free bytes
+    outside the budget it is reporting against. The cut point below reserves
+    room for the marker before slicing, then runs one exact correction pass,
+    so ``len(result.encode("utf-8")) <= max_bytes`` whenever the protected
+    banner floor allows it (confirmed regression: a naive cut-then-append
+    let a ~460-byte marker push a 40000-byte budget to 40464 bytes).
     """
     if not isinstance(content, str):
         return content
@@ -1710,23 +1771,44 @@ def format_handoff_mcp_content(
     _banner_match = _GOAL_TOKEN_BANNER_RE.search(content)
     if _banner_match:
         _protected_end = len(content[: _banner_match.end()].encode("utf-8"))
-    _cut = max(max_bytes, _protected_end)
+    _total_bytes = len(_raw)
+
+    def _marker_bytes_for(omitted: int) -> bytes:
+        return (
+            "\n\n<!-- TRUNCATED (cb00889c bounded handoff profile): "
+            f"{omitted} of {_total_bytes} total bytes omitted to satisfy the "
+            f"handoff response-size budget (limit={max_bytes} bytes). Everything "
+            "up to and including any <goal_token>/SECURITY banner above is "
+            "complete and byte-identical to the original render. "
+            "Narrative/context beyond this point was trimmed to fit the budget "
+            "-- request mode='goal' for the minimal bounded executable profile, "
+            "or a narrower version scope, to see it in full. -->"
+        ).encode("utf-8")
+
+    # 60eed526 — iterate to a fixed point: the marker's own length depends
+    # on the omitted-byte count it names, which depends on the cut point.
+    # Converges in 1-2 tries in practice (the marker only grows/shrinks when
+    # `_omitted`'s digit count crosses a power-of-ten boundary); the exact
+    # correction pass right after this loop makes the final result precise
+    # regardless of how many tries it takes.
+    _cut = max_bytes
+    for _ in range(5):
+        _marker_len = len(_marker_bytes_for(_total_bytes - _cut))
+        _next_cut = max(_protected_end, min(_cut, max_bytes - _marker_len))
+        if _next_cut == _cut:
+            break
+        _cut = _next_cut
     _kept_raw = _raw[:_cut]
+    _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw))
+    _overshoot = (len(_kept_raw) + len(_marker_bytes)) - max_bytes
+    if _overshoot > 0 and _cut > _protected_end:
+        _cut = max(_protected_end, _cut - _overshoot)
+        _kept_raw = _raw[:_cut]
+        _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw))
     # errors="ignore" — never split a multi-byte UTF-8 sequence into an
     # invalid trailing fragment; at most drops the final incomplete char.
     _kept_text = _kept_raw.decode("utf-8", errors="ignore")
-    _omitted = len(_raw) - len(_kept_raw)
-    _marker = (
-        "\n\n<!-- TRUNCATED (cb00889c bounded handoff profile): "
-        f"{_omitted} of {len(_raw)} total bytes omitted to satisfy the "
-        f"handoff response-size budget (limit={max_bytes} bytes). Everything "
-        "up to and including any <goal_token>/SECURITY banner above is "
-        "complete and byte-identical to the original render. "
-        "Narrative/context beyond this point was trimmed to fit the budget "
-        "-- request mode='goal' for the minimal bounded executable profile, "
-        "or a narrower version scope, to see it in full. -->"
-    )
-    return _kept_text + _marker
+    return _kept_text + _marker_bytes.decode("utf-8")
 
 
 # 08c355c2 — staleness threshold for the legacy goal_states.sprint free-text
@@ -8149,12 +8231,27 @@ async def generate_handoff(
     degrades to the pre-836ca1d5 delta output (no tag), never a broken
     handoff.
 
-    ``checkpoint`` (ecc8b280) — optional, ``False`` by default. Marks this
-    call as a mid-run progress report rather than a final, session-ending
-    handoff. Applies to the ``full``/``delta`` modes only (``goal`` is
-    already bare-batch and ``starter``/``compact`` are already explicitly
-    non-final). Purely a signal to the ``strict_continuation`` gate below —
-    it changes nothing about what gets rendered.
+    ``checkpoint`` (ecc8b280, size behaviour added 60eed526) — optional,
+    ``False`` by default. Marks this call as a mid-run progress report rather
+    than a final, session-ending handoff. Applies to the ``full``/``delta``
+    modes only (``goal`` is already bare-batch and ``starter``/``compact``
+    are already explicitly non-final). Two effects, both purely additive for
+    a caller that never opts in:
+
+    1. (ecc8b280) A signal to the ``strict_continuation`` gate below — see
+       its own docstring.
+    2. (60eed526) When ``max_content_bytes`` is left at its default (the
+       ``_MODE_DEFAULT_MAX_BYTES`` sentinel), the RETURNED content's byte
+       budget resolves to ``_DEFAULT_CHECKPOINT_MAX_BYTES`` instead of the
+       generous full/delta ``_DEFAULT_HANDOFF_MAX_BYTES`` — see that
+       constant's own module-level comment for the confirmed ~139KB
+       ``checkpoint()`` regression this closes. This never changes what gets
+       rendered or persisted (disk file / ``handoffs`` table / pending_goal
+       always keep the complete render, exactly like every other mode); only
+       the value handed back over MCP is bounded, via the same
+       integrity-first ``format_handoff_mcp_content`` truncation starter/goal
+       already rely on. An explicit ``max_content_bytes`` argument still
+       always wins over this default, exactly as for every other mode.
 
     ``strict_continuation`` (ecc8b280) — optional, ``False`` by default,
     mirrors ``strict_evidence``'s opt-in/fail-closed shape. When ``True``
@@ -8271,6 +8368,12 @@ async def generate_handoff(
             _resolved_max_bytes: "int | None" = _DEFAULT_STARTER_MAX_BYTES
         elif mode == "goal":
             _resolved_max_bytes = _DEFAULT_GOAL_MAX_BYTES
+        elif checkpoint:
+            # 60eed526 — a mid-run progress ping never needs full/delta's
+            # generous 300_000-byte ceiling; see _DEFAULT_CHECKPOINT_MAX_BYTES's
+            # own module-level comment. Checked before the full/delta
+            # fallback below so checkpoint=True wins regardless of mode.
+            _resolved_max_bytes = _DEFAULT_CHECKPOINT_MAX_BYTES
         else:
             _resolved_max_bytes = _DEFAULT_HANDOFF_MAX_BYTES
     else:
@@ -8838,6 +8941,14 @@ async def generate_handoff(
     _effective_execution_mode = db_module.normalize_execution_mode(
         project.get("execution_mode")
     )
+    # 60eed526 — deliberately NOT passing full_contract_max_items here even
+    # when checkpoint=True: capping construction would also shrink what gets
+    # WRITTEN to disk / the handoffs table / pending_goal (this same
+    # quick_start_goal is embedded in `content` below and persisted
+    # unconditionally), which the cb00889c contract promises stays complete
+    # for every mode. checkpoint=True instead bounds only the RETURNED value,
+    # via the mode-aware max_content_bytes resolved above — see
+    # _DEFAULT_CHECKPOINT_MAX_BYTES's own comment.
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=_effective_execution_mode,

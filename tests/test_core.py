@@ -8876,6 +8876,161 @@ async def test_checkpoint_unscoped_session_sees_all_versions(db, tmp_path):
     assert result["pending_count"] == 2
 
 
+def _bulky_tool_requirements(idx: int) -> list[dict[str, str]]:
+    """Realistic-shaped, deliberately verbose tool_requirements entries —
+    used by the 60eed526 checkpoint-bloat regression tests below to build a
+    board whose per-item <tool_requirements> JSON is large enough to
+    reproduce the confirmed ~139KB oversized checkpoint() payload."""
+    _purpose = (
+        "Prospect the touched symbols with search_graph/find_symbol before "
+        "editing so the change stays scoped to what this item actually "
+        "declared, then confirm callers via find_referencing_symbols. "
+    ) * 4  # ~640 chars
+    return [
+        {
+            "name": "find_symbol",
+            "server_or_namespace": "Serena",
+            "required_or_preferred": "required",
+            "purpose": _purpose,
+            "call_template": f"find_symbol(name_path='bulk_item_{idx}')",
+            "fallback": ["meridian-code: search_graph", "Grep"],
+            "availability_check": "confirm 'Serena: find_symbol' appears in tools/list",
+            "verification": "re-read the edited symbol body and diff against intent",
+        },
+        {
+            "name": "search_graph",
+            "server_or_namespace": "meridian-code",
+            "required_or_preferred": "preferred",
+            "purpose": _purpose,
+            "call_template": f"search_graph(query='bulk item {idx}', project='meridian-repo')",
+        },
+        {
+            "name": "find_referencing_symbols",
+            "server_or_namespace": "Serena",
+            "required_or_preferred": "required",
+            "purpose": _purpose,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_bounds_oversized_delta_summary(db, tmp_path):
+    """60eed526 — checkpoint() must not return an oversized delta summary.
+
+    Confirmed regression: handle_checkpoint's internal
+    generate_handoff(mode="delta") call never passed checkpoint=True, so a
+    project with a sizeable pending backlog (each item carrying a realistic
+    tool_requirements contract) made checkpoint() embed the FULL, unbounded
+    <tool_requirements> JSON for every pending item into its own "summary"
+    field — observed ~139KB on a real board, distinct from the already-fixed
+    248c0bb9 starter/goal bloat (which never touched full/delta).
+
+    This first proves the fixture reproduces a large, unbounded render (the
+    pre-fix effective shape — a plain checkpoint=False delta call still gets
+    "full detail" by design), then proves the actual checkpoint() MCP tool
+    call is now bounded via an explicit, non-silent truncation marker.
+    """
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "ckpt-bloat-test")
+    pid = p["id"]
+    s = await db_module.register_session(db, pid, "ckpt-bloat-session")
+    for i in range(45):
+        await db_module.add_sprint_item(
+            db, pid, "v1", f"Bulk item {i}",
+            tool_requirements=_bulky_tool_requirements(i),
+            # b0d42ef6 — these titles deliberately share most of their words
+            # ("Bulk item N"), which would otherwise trip the >=60%
+            # word-overlap duplicate guard after the first one.
+            force=True,
+        )
+
+    # Regression fixture: an ordinary delta call (checkpoint=False, what
+    # handle_checkpoint used before this fix) is UNCHANGED by this fix —
+    # "full/delta mode may include full detail as today" still holds.
+    _, unbounded_content, _ = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="delta",
+        session_id=s["id"], checkpoint=False,
+    )
+    unbounded_bytes = len(unbounded_content.encode("utf-8"))
+    assert unbounded_bytes > 60_000, (
+        "fixture did not reproduce a large enough delta render to prove the "
+        f"regression; got {unbounded_bytes} bytes"
+    )
+
+    # The actual checkpoint() MCP tool — must now be bounded regardless of
+    # backlog size.
+    result = await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": pid}, db, str(tmp_path)
+    )
+    summary = result["summary"]
+    summary_bytes = len(summary.encode("utf-8"))
+    assert summary_bytes <= handoff_module._DEFAULT_CHECKPOINT_MAX_BYTES, (
+        f"checkpoint() summary not bounded: {summary_bytes} bytes "
+        f"(budget={handoff_module._DEFAULT_CHECKPOINT_MAX_BYTES})"
+    )
+    assert summary_bytes < unbounded_bytes, (
+        "checkpoint() summary should be materially smaller than the "
+        "unbounded delta render for the same board"
+    )
+    assert "TRUNCATED" in summary, (
+        "oversized summary must carry an explicit, non-silent truncation "
+        "marker — never a silent drop"
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_persists_full_delta_despite_bounded_response(db, tmp_path):
+    """60eed526 — bounding checkpoint()'s RETURNED summary must not lose
+    structured evidence: the complete, untruncated delta render stays
+    durable in the handoffs table (and therefore load_handoff /
+    generate_handoff(mode='full')) exactly like every other mode's
+    persistence contract (cb00889c) — checkpoint=True only bounds what is
+    handed back over MCP, never what is written to disk/DB."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "ckpt-bloat-persist-test")
+    pid = p["id"]
+    s = await db_module.register_session(db, pid, "ckpt-bloat-persist-session")
+    for i in range(45):
+        await db_module.add_sprint_item(
+            db, pid, "v1", f"Bulk item {i}",
+            tool_requirements=_bulky_tool_requirements(i),
+            # b0d42ef6 — these titles deliberately share most of their words
+            # ("Bulk item N"), which would otherwise trip the >=60%
+            # word-overlap duplicate guard after the first one.
+            force=True,
+        )
+
+    result = await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": pid}, db, str(tmp_path)
+    )
+    summary_bytes = len(result["summary"].encode("utf-8"))
+    assert "TRUNCATED" in result["summary"]
+
+    rows = await db_module.get_handoffs(db, pid, limit=1, session_id=s["id"])
+    assert rows, "checkpoint() must still persist a handoffs row"
+    persisted_body = rows[0]["body"]
+    persisted_bytes = len(persisted_body.encode("utf-8"))
+    assert persisted_bytes > summary_bytes, (
+        "the persisted handoff body must retain the COMPLETE render even "
+        "when the returned summary was bounded/truncated"
+    )
+    assert "TRUNCATED" not in persisted_body, (
+        "durable state must never itself be truncated — only the RETURNED "
+        "MCP value is bounded (cb00889c contract)"
+    )
+    # The full per-item tool_requirements detail for every one of the 45
+    # items is genuinely retrievable from durable state (not just claimed to
+    # be) — the delta's own "Pending:" list caps at 20 items (bc834237,
+    # unrelated to this fix), but the <tool_requirements> JSON this fix is
+    # about is embedded unbounded regardless of that separate cap.
+    assert persisted_body.count('"name":"find_symbol"') >= 45, (
+        "persisted body should retain the full per-item tool_requirements "
+        "JSON — not just the bounded delta-list titles"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Goal history filter — AUTO BLOCKS-only versions collapsed
 # ---------------------------------------------------------------------------
@@ -10419,6 +10574,61 @@ async def test_start_session_continue_mode_resumes_past_heartbeat_window():
         assert cont.get("continuation") is True
         assert cont.get("mode") == "continue"
         assert cont["session_id"] == first_sid
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_continue_goal_string_bounds_large_tool_requirements():
+    """60eed526 — _build_continue_payload's goal_string must stay compact BY
+    CONSTRUCTION, matching its own "compact 'just continue' resume block"
+    docstring, even when the live pending backlog carries large per-item
+    tool_requirements contracts. Before this fix, the goal_string build never
+    passed full_contract_max_items NOR any byte-level budget, so this code
+    path could reproduce the same class of unbounded <tool_requirements>
+    bloat the checkpoint() fix (same sprint item, 60eed526) addresses — the
+    item-count cap alone is not sufficient when a single item's own
+    tool_requirements entry is already large; format_handoff_mcp_content
+    (_DEFAULT_CONTINUE_GOAL_MAX_BYTES) is the actual byte-level guarantee."""
+    from meridian.server import _start_session_composite
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "continue-bloat")
+        for i in range(45):
+            await db_module.add_sprint_item(
+                db, p["id"], "v9", f"Bulk item {i}",
+                tool_requirements=_bulky_tool_requirements(i),
+                # b0d42ef6 — see the identical force=True note above.
+                force=True,
+            )
+        await _start_session_composite(
+            db, p["id"], "resume-me-bulk", "/tmp", version="v9",
+        )
+        second = await _start_session_composite(
+            db, p["id"], "resume-me-bulk", "/tmp", source="resume",
+        )
+        assert second.get("continuation") is True
+        goal_string = second["goal_string"]
+        goal_bytes = len(goal_string.encode("utf-8"))
+        assert goal_bytes <= handoff_module._DEFAULT_CONTINUE_GOAL_MAX_BYTES, (
+            f"goal_string not bounded: {goal_bytes} bytes"
+        )
+        # Two independent, non-silent truncation signals can fire here: the
+        # item-count cap's own sibling tag (248c0bb9 pattern) IF the byte
+        # cut lands after it, and format_handoff_mcp_content's own marker
+        # (60eed526) whenever the byte budget itself is what bites — as it
+        # does on this fixture, where a single item's tool_requirements
+        # entry is already large enough that the byte cut lands INSIDE the
+        # <tool_requirements> JSON blob, before ever reaching the sibling
+        # <tool_requirements_truncated> tag. Either way this must never be a
+        # silent drop, so assert on the byte-budget marker that is always
+        # guaranteed present whenever goal_bytes exceeded the budget (as
+        # proven above) rather than the item-count marker's tag name, which
+        # is only guaranteed when the cut happens to land after it.
+        assert "TRUNCATED" in goal_string, (
+            "an oversized contract must carry an explicit, non-silent "
+            "truncation marker — never a silent drop"
+        )
     finally:
         await db.close()
 

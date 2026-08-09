@@ -1447,6 +1447,63 @@ async def test_generate_handoff_with_ai_summary_stub(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_generate_handoff_checkpoint_true_bounds_delta_content(db, tmp_path):
+    """60eed526 — checkpoint=True resolves the RETURNED content's byte
+    budget to _DEFAULT_CHECKPOINT_MAX_BYTES for full/delta modes (the
+    mode-aware sentinel default, alongside starter=16000/goal=12000 from
+    248c0bb9), closing the confirmed ~139KB checkpoint() regression. A plain
+    checkpoint=False call to the SAME mode (every pre-existing caller) is
+    completely unaffected — full/delta keeps the generous, unbounded-by-
+    default budget. An explicit max_content_bytes argument still always wins
+    over the checkpoint-aware default, exactly as for every other mode."""
+    p = await db_module.create_project(db, "ckpt-flag-test")
+    await db_module.set_goal(db, p["id"], "ship", sprint="s")
+    # ~64,000 chars from one field alone — comfortably over
+    # _DEFAULT_CHECKPOINT_MAX_BYTES, well under the unbounded full/delta cap.
+    # .strip()'d up front (not just at assertion time) because
+    # tool_requirements.py's own validation strips the stored `purpose`
+    # field — comparing against the un-stripped literal would spuriously
+    # fail even on genuinely unbounded/untruncated content.
+    huge_purpose = ("context " * 8000).strip()
+    await db_module.add_sprint_item(
+        db, p["id"], "v1", "solo item",
+        tool_requirements=[{
+            "name": "find_symbol", "server_or_namespace": "Serena",
+            "required_or_preferred": "required", "purpose": huge_purpose,
+        }],
+    )
+
+    _, checkpoint_content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
+        session_id="sess-ckpt-flag", checkpoint=True,
+    )
+    assert (
+        len(checkpoint_content.encode("utf-8"))
+        <= handoff_module._DEFAULT_CHECKPOINT_MAX_BYTES
+    )
+    assert "TRUNCATED" in checkpoint_content
+    assert huge_purpose not in checkpoint_content
+
+    _, plain_delta_content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
+        session_id="sess-ckpt-flag-plain", checkpoint=False,
+    )
+    # checkpoint=False (the default) keeps the unbounded, byte-for-byte
+    # unchanged full/delta contract: the huge field survives untruncated.
+    assert huge_purpose in plain_delta_content
+    assert "TRUNCATED" not in plain_delta_content
+
+    # An explicit max_content_bytes always wins over the checkpoint-aware default.
+    _, explicit_content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="delta",
+        session_id="sess-ckpt-flag-explicit", checkpoint=True,
+        max_content_bytes=None,
+    )
+    assert huge_purpose in explicit_content
+    assert "TRUNCATED" not in explicit_content
+
+
+@pytest.mark.asyncio
 async def test_generate_handoff_delta_with_in_progress(db, tmp_path):
     """Delta mode surfaces 'Currently running' for in_progress items."""
     p = await db_module.create_project(db, "alpha-delta-ip")

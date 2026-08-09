@@ -5067,6 +5067,21 @@ async def _build_continue_payload(
     # `goal_string` (not `goal`) deliberately — consumers like hooks_session_start
     # treat a result `goal` key as the goal *dict* (north_star/sprint); this is the
     # ready-to-paste /goal *command* string, a distinct shape.
+    # 60eed526 — this payload's own docstring promises a "compact" resume
+    # block, but _build_quick_start_goal's <tool_requirements>/
+    # <sprint_item_pointers>/<artifact_pointer_findings> clauses default to
+    # UNBOUNDED (the same full/delta contract generate_handoff's full/delta
+    # modes deliberately keep) — with no generate_handoff-style
+    # max_content_bytes backstop wired for this code path at all, an
+    # un-capped call here could silently reproduce the same class of
+    # oversized payload the checkpoint() fix addresses. This resume block is
+    # never persisted anywhere (unlike generate_handoff's full/delta
+    # content), so capping construction here loses nothing durable — the
+    # omitted items' full contracts remain available via this SAME
+    # response's capability_contract field (get_capability_manifest /
+    # get_effective_capability_profile) or a follow-up
+    # generate_handoff(mode='full') call, exactly like the 248c0bb9
+    # starter/goal fix's own fallback story.
     goal_string = handoff_module._build_quick_start_goal(
         pending,
         version=scoped_version,
@@ -5075,6 +5090,19 @@ async def _build_continue_payload(
         hitl_auto_answer_mode=_hitl_mode,
         pointer_evidence_ids=_continue_pointer_evidence_ids,
         execution_policy=_exec_policy,
+        full_contract_max_items=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+    )
+    # 60eed526 — full_contract_max_items above only caps how many pending
+    # items' tool_requirements get inlined; it does not bound how large a
+    # SINGLE item's own entry is. Apply the same byte-budget backstop every
+    # generate_handoff mode already gets via format_handoff_mcp_content so
+    # this resume block can't reproduce the same class of oversized payload
+    # regardless of per-item contract size. No <goal_token> banner is ever
+    # embedded in this resume goal_string (this path never calls
+    # _mint_and_embed_goal_token), so there is no protected-content floor to
+    # honor here.
+    goal_string = handoff_module.format_handoff_mcp_content(
+        goal_string, max_bytes=handoff_module._DEFAULT_CONTINUE_GOAL_MAX_BYTES,
     )
     recent = await db_module.get_tasks(db, project_id, limit=5)
     pending_slim = [
