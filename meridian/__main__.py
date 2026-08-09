@@ -80,9 +80,45 @@ def _kill_port(port: int) -> None:
                 except OSError:
                     pass
 
+
+def _argv_wants_tunnel_mode(argv: list[str]) -> bool:
+    """True when this invocation will end up in --tunnel mode.
+
+    Mirrors main()'s own dispatch (explicit ``--tunnel``, or the frozen-binary
+    implicit default from ``_frozen_default_to_tunnel``) using only argv/env —
+    this runs at import time, before argparse exists. Duplicated rather than
+    shared because the real dispatch logic needs parsed ``args``, which don't
+    exist yet this early.
+    """
+    if "--tunnel" in argv:
+        return True
+    if "--mcp" in argv:
+        return False
+    if not bool(getattr(sys, "frozen", False)):
+        return False
+    if os.environ.get("MERIDIAN_FROZEN_MODE", "").strip().lower() == "server":
+        return False
+    if any(
+        tok == "--host" or tok == "--port"
+        or tok.startswith("--host=") or tok.startswith("--port=")
+        for tok in argv
+    ):
+        return False
+    return True
+
+
 # psycopg3 requires SelectorEventLoop on Windows (ProactorEventLoop not supported).
-# Must be set before any asyncio.run() or uvicorn.run() call.
-if sys.platform == "win32":
+# Must be set before any asyncio.run() or uvicorn.run() call. Skipped for
+# --tunnel mode: the tunnel client never touches psycopg3/db (it's a pure
+# WebSocket relay + subprocess manager), but its run_cmd handling (used by
+# run_verification) DOES need real subprocess support
+# (asyncio.create_subprocess_shell/_exec), which SelectorEventLoop does not
+# implement on Windows — forcing it here made every run_cmd fail with a bare,
+# message-less NotImplementedError, surfaced to callers as a blank
+# `status: "error", message: ""`. Leaving tunnel mode on the Windows-default
+# ProactorEventLoop (via _ensure_event_loop's fallback) fixes that while
+# server/--mcp modes keep the SelectorEventLoop psycopg3 needs.
+if sys.platform == "win32" and not _argv_wants_tunnel_mode(sys.argv[1:]):
     import selectors
     # psycopg3 requires SelectorEventLoop — override Windows default ProactorEventLoop
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

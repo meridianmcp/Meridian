@@ -25,7 +25,9 @@ and the tunnel path's event loop is driven only over a fast fake coroutine.
 """
 from __future__ import annotations
 
+import subprocess
 import sys
+import textwrap
 import types
 
 import pytest
@@ -277,3 +279,151 @@ def test_frozen_default_respects_equals_form_port(monkeypatch):
     ns = types.SimpleNamespace(tunnel=False, mcp=False)
     m._frozen_default_to_tunnel(ns, ["--port=7700"])
     assert ns.tunnel is False
+
+
+# ---------------------------------------------------------------------------
+# Event-loop-policy scoping (the run_verification / run_cmd bug)
+#
+# meridian/__main__.py forces WindowsSelectorEventLoopPolicy at module scope
+# because psycopg3 needs it (ProactorEventLoop is unsupported). But Windows
+# asyncio does not support subprocess spawning under SelectorEventLoop, so
+# forcing it onto --tunnel mode broke run_verification's run_cmd: every
+# asyncio.create_subprocess_shell/_exec call raised a bare, message-less
+# NotImplementedError, surfaced to callers as `status: "error", message: ""`.
+# --tunnel mode never touches psycopg3/db (see meridian/tunnel_client.py's
+# module-scope imports), so it must be exempt from the override and keep
+# Windows' default ProactorEventLoop, which supports subprocesses.
+# ---------------------------------------------------------------------------
+
+def test_argv_wants_tunnel_mode_explicit_tunnel_flag():
+    assert m._argv_wants_tunnel_mode(["--tunnel"]) is True
+    assert m._argv_wants_tunnel_mode(["--tunnel", "--repo", "."]) is True
+
+
+def test_argv_wants_tunnel_mode_explicit_mcp_flag_wins_over_absence_of_tunnel():
+    assert m._argv_wants_tunnel_mode(["--mcp"]) is False
+
+
+def test_argv_wants_tunnel_mode_default_not_frozen(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert m._argv_wants_tunnel_mode([]) is False
+
+
+def test_argv_wants_tunnel_mode_frozen_no_flags_defaults_true(monkeypatch):
+    """Mirrors _frozen_default_to_tunnel: a frozen binary with no mode flag IS tunnel mode."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.delenv("MERIDIAN_FROZEN_MODE", raising=False)
+    assert m._argv_wants_tunnel_mode([]) is True
+
+
+def test_argv_wants_tunnel_mode_frozen_explicit_host_opts_out(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.delenv("MERIDIAN_FROZEN_MODE", raising=False)
+    assert m._argv_wants_tunnel_mode(["--host", "0.0.0.0"]) is False
+    assert m._argv_wants_tunnel_mode(["--host=0.0.0.0"]) is False
+
+
+def test_argv_wants_tunnel_mode_frozen_explicit_port_opts_out(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.delenv("MERIDIAN_FROZEN_MODE", raising=False)
+    assert m._argv_wants_tunnel_mode(["--port", "7700"]) is False
+    assert m._argv_wants_tunnel_mode(["--port=7700"]) is False
+
+
+def test_argv_wants_tunnel_mode_frozen_server_env_opts_out(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setenv("MERIDIAN_FROZEN_MODE", "server")
+    assert m._argv_wants_tunnel_mode([]) is False
+
+
+def test_argv_wants_tunnel_mode_agrees_with_frozen_default_to_tunnel(monkeypatch):
+    """The duplicated frozen heuristic must never drift from the real dispatch logic."""
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.delenv("MERIDIAN_FROZEN_MODE", raising=False)
+    for argv in ([], ["--host", "x"], ["--port=1"], ["--repo", "."]):
+        ns = types.SimpleNamespace(tunnel=False, mcp=False)
+        m._frozen_default_to_tunnel(ns, argv)
+        assert m._argv_wants_tunnel_mode(argv) is ns.tunnel, argv
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="event-loop override is Windows-only")
+def test_tunnel_argv_skips_selector_event_loop_policy_at_import(tmp_path):
+    """Regression (import-time behaviour): --tunnel argv must NOT get SelectorEventLoop.
+
+    The override is applied once, at module import, from raw sys.argv — so this
+    has to run in a fresh subprocess to observe it honestly.
+    """
+    script = textwrap.dedent(
+        """
+        import sys
+        sys.argv = ["meridian", "--tunnel", "--repo", "."]
+        import meridian.__main__  # noqa: F401
+        import asyncio
+        policy = type(asyncio.get_event_loop_policy()).__name__
+        assert policy == "WindowsProactorEventLoopPolicy", policy
+        print("OK:" + policy)
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK:WindowsProactorEventLoopPolicy" in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="event-loop override is Windows-only")
+def test_mcp_argv_still_gets_selector_event_loop_policy_at_import():
+    """--mcp (and the default server mode) must keep the psycopg3-required SelectorEventLoop."""
+    script = textwrap.dedent(
+        """
+        import sys
+        sys.argv = ["meridian", "--mcp"]
+        import meridian.__main__  # noqa: F401
+        import asyncio
+        policy = type(asyncio.get_event_loop_policy()).__name__
+        assert policy == "WindowsSelectorEventLoopPolicy", policy
+        print("OK:" + policy)
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK:WindowsSelectorEventLoopPolicy" in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="subprocess spawn regression is Windows-only")
+def test_tunnel_mode_can_actually_spawn_a_subprocess(tmp_path):
+    """End-to-end proof: under --tunnel argv, asyncio subprocess spawn (run_cmd) works.
+
+    This is the exact operation run_verification's run_cmd performs via
+    tunnel_client._handle_run_cmd. Before the fix this raised a bare
+    NotImplementedError under the forced SelectorEventLoop.
+    """
+    script = textwrap.dedent(
+        """
+        import sys
+        sys.argv = ["meridian", "--tunnel", "--repo", "."]
+        import meridian.__main__ as m
+        import asyncio
+        loop = m._ensure_event_loop()
+
+        async def run():
+            proc = await asyncio.create_subprocess_shell(
+                "echo hello-from-subprocess",
+                stdout=asyncio.subprocess.PIPE,
+            )
+            out, _ = await proc.communicate()
+            return out.decode().strip(), proc.returncode
+
+        text, code = loop.run_until_complete(run())
+        assert code == 0, code
+        assert "hello-from-subprocess" in text, text
+        print("OK")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stderr
+    assert "OK" in result.stdout

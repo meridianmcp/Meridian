@@ -83,11 +83,70 @@ def is_enabled() -> bool:
     return os.environ.get(ENABLE_ENV_VAR) == "1"
 
 
+# 49e06bcb — lightweight worker execution classes + deterministic routing.
+#
+# Historically every dispatched item got the identical prompt: "you are an
+# autonomous Claude Code session, do whatever it takes." That is the right
+# call for genuinely ambiguous implementation work, but wasteful and
+# needlessly nondeterministic for an item that is really just "run the
+# verification/evidence/bookkeeping this item already declares" — no
+# judgment call required. This routes the latter to a distinct,
+# deterministic worker class while a full Claude session stays the
+# default for everything else — the classifier below recognizes only a
+# small, explicit title-prefix allowlist, so no existing, untagged item
+# can ever be reclassified out from under it.
+#
+# The routing decision travels to meridian.enqueue._run_worker as a
+# single, optional leading marker line on the returned prompt string —
+# the only channel available without widening this item's locked-symbol
+# scope (Dispatcher.__init__ / dispatch_once belong to sibling items
+# 869d6198 / 272d8f2c in this same wave) or introducing a
+# dispatcher<->enqueue import cycle (enqueue.py is the lower-level
+# module and must not import this one). enqueue.py owns its own copy of
+# the exact marker text; keep the two in sync by hand if either changes.
+SESSION_WORKER_CLASS = "session"
+DETERMINISTIC_WORKER_CLASS = "deterministic"
+
+# Wire-format contract with meridian/enqueue.py::_run_worker — must match
+# enqueue._DETERMINISTIC_WORKER_MARKER_LINE exactly.
+_WORKER_CLASS_MARKER_LINE = "[worker-class: deterministic]"
+
+# Deterministic (no LLM judgment involved) signal only: an explicit title
+# tag. milestone_type is NOT used here — it is a strictly validated enum
+# of only "task" / "milestone" / "human" (see db/sprint_items.py), none of
+# which distinguish "targeted verification/evidence/bookkeeping" from
+# ordinary implementation work, so it would be dead weight in this check.
+_DETERMINISTIC_TITLE_PREFIXES = ("VERIFY:", "EVIDENCE:", "BOOKKEEPING:", "AUDIT:", "CHECK:")
+
+
+def _classify_worker_execution(item: dict[str, Any]) -> str:
+    """Pure, deterministic execution-class routing for one sprint item.
+
+    Returns ``SESSION_WORKER_CLASS`` (default) unless the item's own
+    ``title`` opts in with one of ``_DETERMINISTIC_TITLE_PREFIXES``, in
+    which case it returns ``DETERMINISTIC_WORKER_CLASS``. A pure function
+    of ``item["title"]`` only — no network/LLM call — so calling it twice
+    for the same item always returns the same answer, and an item that
+    predates this feature (no such prefix) is always ``SESSION_WORKER_CLASS``.
+    """
+    title = (item.get("title") or "").strip().upper()
+    if title.startswith(_DETERMINISTIC_TITLE_PREFIXES):
+        return DETERMINISTIC_WORKER_CLASS
+    return SESSION_WORKER_CLASS
+
+
 def _worker_prompt(item: dict[str, Any], project_id: str) -> str:
     """Build the worker prompt for one sprint item.
 
     Kept small and deterministic so tests can assert on it. The worker is a
-    full Claude Code session pointed at a single sprint item.
+    full Claude Code session pointed at a single sprint item — UNLESS
+    :func:`_classify_worker_execution` routes it to the lightweight
+    deterministic worker class instead (49e06bcb), in which case the
+    returned prompt carries a leading routing marker line
+    (``meridian.enqueue._run_worker`` strips it before use — it never
+    reaches the subprocess or the persisted task description) and asks
+    for a scoped verification/evidence/bookkeeping pass instead of
+    open-ended implementation.
     """
     item_id = item.get("id", "")
     title = (item.get("title") or "").strip()
@@ -97,6 +156,18 @@ def _worker_prompt(item: dict[str, Any], project_id: str) -> str:
         if resources
         else ""
     )
+    if _classify_worker_execution(item) == DETERMINISTIC_WORKER_CLASS:
+        return (
+            f"{_WORKER_CLASS_MARKER_LINE}\n"
+            f"You are a deterministic Meridian worker for project {project_id}.\n"
+            f"Work ONLY on sprint item {item_id}: {title}\n"
+            f"{res_line}"
+            f"This is targeted verification, evidence, or bookkeeping — not "
+            f"open-ended implementation: claim the item (claim_sprint_item), "
+            f"run the item's declared verification (its verification_command "
+            f"or the test suite), record the result, then call "
+            f"complete_sprint_item. Do not make unrelated code changes."
+        )
     return (
         f"You are an autonomous Meridian worker for project {project_id}.\n"
         f"Work ONLY on sprint item {item_id}: {title}\n"
@@ -226,6 +297,148 @@ class Dispatcher:
         # dispatch_once pass finds a promotion-declaring item at all.
         self.last_merger_lock_skips: list[dict[str, Any]] = []
 
+        # 869d6198 — ACTIVE worker lease accounting, deliberately decoupled
+        # from the dedup/frontier ledger above (``self._dispatched``).
+        # ``self._dispatched`` answers "has this item id EVER been handed to
+        # a worker in this process" — permanent membership, read by
+        # dispatch_once's frontier/dedup check ("never re-dispatch the same
+        # item"), and this item does NOT change that check or its meaning.
+        # ``self._active_leases`` answers a different question: "is a
+        # worker for this item id CURRENTLY still running" — transient
+        # membership, meant to back the actual capacity computation
+        # (``in_flight`` vs. ``cap``) instead of ``len(self._dispatched)``.
+        # Before this, capacity was derived from ``len(self._dispatched)``,
+        # which only ever grows: every completed or failed child worker
+        # permanently occupied a capacity slot for the rest of the process's
+        # life, so a long-running dispatcher would silently throttle itself
+        # toward zero new dispatches long after its earlier workers had
+        # already exited. Keyed by item_id -> lease record
+        # ({"item_id", "task", "seq", "status"}); empty until the first
+        # successful enqueue registers one via ``record_worker_lease``.
+        #
+        # Bound as plain instance attributes (closures over this __init__'s
+        # locals) rather than ordinary class methods — the same
+        # injectable-callable pattern this class already uses for
+        # self._enqueue / self._get_groups / self._evaluate_blockers /
+        # self._lease_sweep above. That keeps the entire lease lifecycle
+        # self-contained inside Dispatcher.__init__: dispatch_once (a
+        # DIFFERENT, separately-owned symbol in this same class) can call
+        # self.record_worker_lease(...) after a successful enqueue and
+        # self.release_worker_lease(...) once a child worker's completion is
+        # observed, without either symbol's body needing to know how the
+        # other implements its half of the contract.
+        self._active_leases: dict[str, dict[str, Any]] = {}
+        self._lease_seq: int = 0
+        # Most recent release this dispatcher observed ({"item_id",
+        # "status", "seq"} or None before the first release), mirroring the
+        # existing last_parallelism/last_blocker_decision/last_lease_sweep/
+        # last_merger_lock_skips introspection attributes above — a
+        # caller/dashboard can see the last completed/failed child worker
+        # this dispatcher accounted for without polling _active_leases.
+        self.last_released_lease: "dict[str, Any] | None" = None
+        # 769e24a7 — diagnostics: every time ``release_worker_lease`` is
+        # called with an ``expected_seq`` that no longer matches the CURRENT
+        # active lease for that item_id (a late/stale completion signal for
+        # an attempt that has since been superseded by a newer one), the
+        # attempted release is recorded here instead of being applied. []
+        # until the first such collision — most dispatchers will never see
+        # one, since a single Dispatcher instance never re-dispatches an
+        # item_id already in ``self._dispatched``. Exists to make attempt-id
+        # safety auditable/testable, not just asserted in prose.
+        self.last_stale_release_attempts: list[dict[str, Any]] = []
+
+        def _record_worker_lease(
+            item_id: str, task: "dict[str, Any] | None" = None,
+        ) -> None:
+            """Register ``item_id`` as an ACTIVE (in-flight) worker lease.
+
+            Intended call site: immediately after a successful enqueue,
+            alongside the existing ``self._dispatched.add(item_id)`` dedup
+            bookkeeping — this call is additive to that, never a
+            replacement for it. Safe to call more than once for the same
+            ``item_id``: re-registers (refreshes ``task``/``seq``) rather
+            than raising, since a retried enqueue path must never be able
+            to corrupt lease state.
+
+            769e24a7 — ``self._lease_seq`` (post-increment, stored as
+            ``seq`` below) doubles as the unique attempt/lease id required
+            to tell "this attempt's completion signal" apart from "a LATER
+            attempt for the same item_id's completion signal": it strictly
+            increases across the whole dispatcher instance, so two
+            registrations for the same ``item_id`` can never collide on the
+            same ``seq``. ``task_id`` is pulled out of ``task`` (when it is
+            a dict shaped like an ``enqueue_claude_task``/``task_log`` row)
+            purely as a convenience for :meth:`reconcile_active_leases`,
+            which needs a DB row to poll — it carries no attempt-identity
+            meaning of its own (``seq`` does).
+            """
+            self._lease_seq += 1
+            task_id = task.get("id") if isinstance(task, dict) else None
+            self._active_leases[item_id] = {
+                "item_id": item_id,
+                "task": task,
+                "task_id": task_id,
+                "seq": self._lease_seq,
+                "status": "active",
+            }
+
+        def _release_worker_lease(
+            item_id: str,
+            status: str = "completed",
+            *,
+            expected_seq: "int | None" = None,
+        ) -> None:
+            """Remove ``item_id`` from ACTIVE accounting — capacity release.
+
+            This is the release half of the lease lifecycle: a completed or
+            failed child worker must stop counting against
+            ``max_in_flight`` / ``configured_target`` capacity. Frontier
+            selection is explicitly UNCHANGED by this call — ``item_id``
+            correctly stays in ``self._dispatched`` forever (an item already
+            dispatched is never re-dispatched in this process, regardless of
+            lease status); this method only ever touches
+            ``self._active_leases``. Idempotent and side-effect-free for an
+            ``item_id`` with no active lease (already released, released
+            twice, or never registered) — that is a normal race in an async
+            dispatch loop, never an error condition.
+
+            769e24a7 — ``expected_seq`` (keyword-only, default ``None``) is
+            the attempt-id safety valve: when the CALLER knows which attempt
+            it observed complete (e.g. :meth:`reconcile_active_leases`
+            snapshots a lease's ``seq`` before awaiting a DB read), passing
+            that ``seq`` here guarantees a late/stale completion signal for
+            an OLDER attempt can never release a NEWER attempt's lease — if
+            the currently-active lease's ``seq`` no longer matches
+            ``expected_seq``, this call is a no-op (recorded in
+            ``self.last_stale_release_attempts`` for diagnostics) rather
+            than releasing the wrong attempt. Omitting ``expected_seq``
+            (the default) preserves this method's exact pre-769e24a7
+            behavior byte-for-byte — every existing caller/test that never
+            passes it sees zero change.
+            """
+            current = self._active_leases.get(item_id)
+            if (
+                expected_seq is not None
+                and current is not None
+                and current.get("seq") != expected_seq
+            ):
+                self.last_stale_release_attempts.append({
+                    "item_id": item_id,
+                    "attempted_status": status,
+                    "expected_seq": expected_seq,
+                    "active_seq": current.get("seq"),
+                })
+                return
+            released = self._active_leases.pop(item_id, None)
+            self.last_released_lease = {
+                "item_id": item_id,
+                "status": status,
+                "seq": (released or {}).get("seq"),
+            }
+
+        self.record_worker_lease = _record_worker_lease
+        self.release_worker_lease = _release_worker_lease
+
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> asyncio.Task[None]:
@@ -291,13 +504,131 @@ class Dispatcher:
             self._session_id = session["id"]
         return self._session_id
 
+    async def reconcile_active_leases(self) -> list[dict[str, Any]]:
+        """769e24a7 — pull-based completion reconciliation for ACTIVE leases.
+
+        This is the actual RELEASE half of the worker-lifecycle fix: for
+        every ``item_id`` currently in ``self._active_leases``, look up its
+        lease's ``task_id`` (recorded by ``record_worker_lease`` from the
+        task row the enqueue call returned) and read that task's CURRENT
+        persisted ``task_log`` status. A lease whose task has reached a
+        terminal status (``done`` or ``failed`` — covering normal
+        completion, explicit failure, a worker timeout, AND a process-death
+        detection, since :func:`meridian.enqueue._run_worker` and the
+        server's PID watchdog (``_auto_summary_loop``) both funnel every one
+        of those outcomes through the exact same ``update_task(status=...)``
+        call) is released via ``self.release_worker_lease``.
+
+        Why reconciliation instead of (or in addition to) a push callback:
+        this dispatcher's ``_active_leases`` already holds everything needed
+        to poll — the item_id -> task_id association — so no new coupling
+        between ``enqueue.py``/``server.py`` and lease internals is required;
+        those modules stay entirely unaware that leases exist. It is also
+        naturally RESTART-SAFE: a freshly constructed ``Dispatcher`` (e.g.
+        after a process restart) starts with an empty ``_active_leases``, so
+        there is nothing stale to reconcile and capacity begins at zero
+        (never leaked, never phantom) — no separate "recover after restart"
+        code path is needed.
+
+        Attempt-id safety: the ``seq`` compared against is SNAPSHOTTED from
+        each lease before the (yielding) ``await db_module.get_task(...)``
+        call, then passed as ``expected_seq`` to ``release_worker_lease`` —
+        so if some other path re-registered a NEWER attempt for the same
+        item_id while this call was awaiting the DB, the stale read can
+        never release the newer attempt's lease (see
+        ``release_worker_lease``'s own docstring).
+
+        Best-effort per item: a DB read failure for one task_id is logged
+        and skipped, never allowed to abort reconciliation for the other
+        active leases (same "must not break dispatch" contract as blocker
+        evaluation / the lease sweep above). Returns the list of
+        ``{"item_id", "task_id", "status", "seq"}`` entries this call
+        actually released (empty when nothing was terminal yet — the normal
+        case on most passes).
+        """
+        released: list[dict[str, Any]] = []
+        for item_id, lease in list(self._active_leases.items()):
+            task_id = lease.get("task_id")
+            if not task_id:
+                # No task row to poll (e.g. a test-injected lease, or a
+                # fake enqueue_fn that doesn't return a real task_log row)
+                # — nothing this method can safely decide, so leave it
+                # alone rather than guessing.
+                continue
+            expected_seq = lease.get("seq")
+            try:
+                row = await db_module.get_task(self.db, task_id)
+            except Exception:  # noqa: BLE001 — one bad read must not break reconciliation
+                logger.exception(
+                    "lease reconciliation: failed to read task %s for item %s",
+                    task_id, item_id,
+                )
+                continue
+            if row is None:
+                continue
+            status = row.get("status")
+            if status not in ("done", "failed"):
+                continue
+            self.release_worker_lease(item_id, status=status, expected_seq=expected_seq)
+            if item_id not in self._active_leases:
+                released.append({
+                    "item_id": item_id,
+                    "task_id": task_id,
+                    "status": status,
+                    "seq": expected_seq,
+                })
+        return released
+
     async def dispatch_once(self) -> list[dict[str, Any]]:
         """Run a single dispatch pass; return the task rows enqueued this pass.
 
-        Dispatches the first parallelizable group, skipping any item already
-        dispatched in this process, and stops once the pass's deterministic
-        ``effective_parallelism`` (see ``executor_config.resolve_parallelism``)
-        is reached so the number of live workers stays bounded.
+        272d8f2c — DYNAMIC FRONTIER ADMISSION: this pass walks every
+        dependency-satisfied, server-colored group returned by
+        ``get_parallelizable_groups`` (``groups[0]``, ``groups[1]``, ...),
+        not only ``groups[0]``, so a pass never idles leftover capacity just
+        because the first group happened to be smaller than
+        ``effective_parallelism`` or lost members to quarantine, a
+        merger-lock skip, or a failed enqueue.
+
+        Two DIFFERENT groups returned by ``get_parallelizable_groups`` are
+        NOT guaranteed to be mutually conflict-free — the server's greedy
+        first-fit coloring only guarantees each group is conflict-free
+        WITHIN itself; an item lands in ``groups[i]`` precisely BECAUSE it
+        conflicted with something already placed in every earlier group's
+        used-resource set at the time it was colored. So this method never
+        trusts cross-group disjointness: it walks every group's items in the
+        server's own order (``groups[0]`` first, preserving both the
+        across- and within-group priority-first ordering the coloring
+        already encodes) and independently re-verifies — via the SAME
+        file:/symbol:-hierarchy-aware conflict test the server's own
+        coloring uses (:func:`meridian.db._resource_sets_conflict`) — that a
+        candidate does not conflict with anything THIS pass has actually
+        admitted so far. An item with NO declared resources (undeclared —
+        de730a25) can never be proven disjoint from anything, so it is only
+        admitted when nothing else has been admitted yet this pass, and
+        nothing else may join it afterward — the server's own "each
+        undeclared item is its own sequential group" invariant, re-applied
+        dynamically here instead of only at group-construction time.
+
+        FAILURE RE-FRONTIERING: an item is skipped this pass (never folded
+        into the admitted-resources set) whenever it's already dispatched,
+        quarantined, conflicts with what's already been admitted, loses a
+        merger-lock race, or its enqueue call raises. Because the
+        admitted-resources set only ever reflects what ACTUALLY got
+        enqueued — never the server's precomputed group membership — any one
+        of those skips genuinely reopens the frontier: a later candidate,
+        from ANY subsequent group, that only conflicted with the SKIPPED
+        item is free to be admitted instead, up to
+        ``effective_parallelism``. This is what turns "one quarantined item
+        (or one bad enqueue) stalls this pass's whole batch" into "the pass
+        fills capacity with whatever else is safe."
+
+        ``effective_parallelism`` itself (see
+        ``executor_config.resolve_parallelism``) is computed exactly as
+        before this feature — from ``groups[0]``'s size as
+        ``resource_safe_capacity`` — so existing capacity diagnostics
+        (``self.last_parallelism``) are unchanged; only how that capacity is
+        SPENT changed.
 
         b108f2e0 — typed blocker triage runs BEFORE any enqueue this pass:
 
@@ -308,9 +639,10 @@ class Dispatcher:
           spec's "preserve explicit fail-closed stops" requirement.
         * Otherwise, any item in ``quarantined_item_ids`` is SKIPPED (never
           enqueued) but does NOT stop the pass — other, disjoint items in
-          the same group still dispatch normally. This is the actual fix
-          for the incident this module exists for: one under-scoped item
-          no longer halts an otherwise-executable autonomous run.
+          this OR any later group still dispatch normally (frontier
+          admission above). This is the actual fix for the incident this
+          module exists for: one under-scoped item no longer halts an
+          otherwise-executable autonomous run.
 
         Best-effort: a failure evaluating blockers degrades to "no
         quarantine this pass" (dispatch proceeds unfiltered) rather than
@@ -333,8 +665,44 @@ class Dispatcher:
         check plus the lock itself, enforced wherever a promotion is
         actually applied. See ``self.last_merger_lock_skips`` for
         diagnostics.
+
+        769e24a7 — ACTIVE LEASE ACCOUNTING replaces ``len(self._dispatched)``
+        with ``len(self._active_leases)`` as the capacity denominator.
+        ``self._dispatched`` only ever grows (permanent per-process
+        dedup/history — an item is never re-dispatched once it lands there,
+        regardless of lease status); using it for capacity meant a
+        long-running dispatcher's effective concurrency silently throttled
+        toward zero as workers finished, since nothing ever shrank it. This
+        pass's very first action is ``await self.reconcile_active_leases()``
+        — a best-effort, idempotent, attempt-id-safe pull that releases any
+        active lease whose task has reached a terminal ``task_log`` status
+        (``done``/``failed``, which covers normal completion, explicit
+        failure, worker timeout, AND process-death detection — see that
+        method's docstring) — so capacity genuinely frees up, and a release
+        earlier in THIS SAME pass is immediately visible to the admission
+        loop below (both "capacity actually releases" and "re-frontier
+        after a release" from this item's own notes fall out of that
+        ordering for free, no separate wake-up needed for a same-pass
+        release). Each successful enqueue below also registers a NEW active
+        lease (``self.record_worker_lease``) and passes an ``on_complete``
+        hook that wakes this dispatcher's own run loop
+        (``self.trigger()``) the moment that worker's task reaches a
+        terminal status, rather than waiting up to ``self.interval``
+        seconds for the next scheduled pass to notice via reconciliation —
+        pure responsiveness; the ACTUAL release still only ever happens
+        through the attempt-id-safe reconciliation path.
         """
         self.last_merger_lock_skips = []
+        try:
+            reconciled = await self.reconcile_active_leases()
+            if reconciled:
+                logger.info(
+                    "dispatcher: reconciled %d completed worker lease(s): %s",
+                    len(reconciled),
+                    [r.get("item_id") for r in reconciled],
+                )
+        except Exception:  # noqa: BLE001 — reconciliation must never break dispatch
+            logger.exception("active-lease reconciliation failed")
         try:
             decision = await self._evaluate_blockers(
                 self.db, self.project_id, version=self.version,
@@ -387,6 +755,13 @@ class Dispatcher:
         # OTHER input (e.g. an unreported host_limit) happens to be unknown —
         # an unknown host_limit is simply excluded from the min(), never
         # treated as 1.
+        #
+        # 272d8f2c — this stays anchored to groups[0]'s size, unchanged from
+        # before dynamic frontier admission: effective_parallelism is a
+        # CEILING on how much this pass may enqueue, not a claim about how
+        # much of that ceiling groups[0] alone can fill. The frontier
+        # admission loop below spends leftover capacity out of later
+        # groups; it never raises the ceiling itself.
         requested = (
             self.requested_parallelism
             if self.requested_parallelism is not None
@@ -401,7 +776,11 @@ class Dispatcher:
         self.last_parallelism = parallelism
         cap = parallelism["effective_parallelism"]
 
-        in_flight = len(self._dispatched)
+        # 769e24a7 — ACTIVE lease count, not the permanent _dispatched
+        # ledger: see this method's docstring. reconcile_active_leases()
+        # already ran above, so this reflects capacity genuinely freed by
+        # any worker that has completed as of this pass.
+        in_flight = len(self._active_leases)
         if in_flight >= cap:
             return []
 
@@ -410,58 +789,124 @@ class Dispatcher:
         # promotion for; a second item in the same pass sharing that target
         # is deferred to a later pass rather than raced against the first.
         claimed_targets_this_pass: set[str] = set()
-        # Only the first group is safe to fan out simultaneously; later groups
-        # depend on it draining. Run one group per pass.
-        for item in first_group:
-            item_id = item.get("id")
-            if not item_id or item_id in self._dispatched:
-                continue
-            if item_id in quarantined:
-                # Quarantined — skip THIS item only; other disjoint items in
-                # the group keep dispatching normally (quarantine_continue).
-                continue
+        # 272d8f2c — resources THIS pass has actually admitted so far (never
+        # the server's precomputed group membership — see the docstring's
+        # "dynamic frontier admission" section). Grown only on a SUCCESSFUL
+        # enqueue, so a skip (quarantine, merger-lock, conflict, or a raised
+        # enqueue) never blocks a later candidate that only conflicted with
+        # whatever got skipped — that reopening is "failure re-frontiering."
+        admitted_resources: set[str] = set()
+        # True once an item with NO declared resources has been admitted.
+        # Its footprint can't be proven disjoint from anything, so nothing
+        # else may join it this pass (de730a25's "own sequential group"
+        # invariant, enforced dynamically here instead of only at
+        # group-construction time).
+        undeclared_admitted = False
+        # Walk every group in the server's own order — groups[0] first — so
+        # the coloring's priority-first construction keeps being honored: a
+        # later group's item is only ever considered once every
+        # dependency-satisfied, non-conflicting candidate ahead of it
+        # (across ALL groups scanned so far this pass) has already had its
+        # shot at admission.
+        for group in groups:
             if in_flight >= cap:
                 break
-            promotion_target = _promotion_target_for_item(item)
-            if promotion_target is not None:
-                try:
-                    lock_status = await artifact_declaration_module.get_promotion_merger_lock(
-                        self.db, promotion_target, self.project_id,
-                    )
-                except Exception:  # noqa: BLE001 — a lock-status read failure never blocks dispatch
-                    logger.exception(
-                        "merger-lock status check failed for target %s", promotion_target,
-                    )
-                    lock_status = None
-                held_by_other = bool((lock_status or {}).get("file_lock"))
-                if held_by_other or promotion_target in claimed_targets_this_pass:
-                    self.last_merger_lock_skips.append({
-                        "item_id": item_id,
-                        "target": promotion_target,
-                        "reason": (
-                            "merger lock held by another live session"
-                            if held_by_other
-                            else "another item in this same pass already claims this target"
-                        ),
-                    })
+            for item in group:
+                item_id = item.get("id")
+                if not item_id or item_id in self._dispatched:
                     continue
-                claimed_targets_this_pass.add(promotion_target)
-            session_id = await self._ensure_session()
-            prompt = _worker_prompt(item, self.project_id)
-            try:
-                task = await self._enqueue(
-                    self.db,
-                    session_id,
-                    self.project_id,
-                    prompt,
-                )
-            except Exception:  # noqa: BLE001 — one bad enqueue must not abort the pass
-                logger.exception("failed to enqueue worker for item %s", item_id)
-                continue
-            # Mark dispatched only after a successful enqueue so a failure is retried.
-            self._dispatched.add(item_id)
-            in_flight += 1
-            enqueued.append(task)
+                if item_id in quarantined:
+                    # Quarantined — skip THIS item only; other disjoint
+                    # items (in this or a later group) keep dispatching
+                    # normally (quarantine_continue).
+                    continue
+                if in_flight >= cap:
+                    break
+                item_resources = set(item.get("resources") or [])
+                if item_resources:
+                    if undeclared_admitted or db_module._resource_sets_conflict(
+                        item_resources, admitted_resources,
+                    ):
+                        # Conflicts with something THIS pass already
+                        # admitted (from an earlier group, or an earlier
+                        # item in this same group) — leave it for a future
+                        # pass rather than racing a worker whose own
+                        # claim_sprint_item resource lock would just fail.
+                        continue
+                elif enqueued:
+                    # Undeclared item, but something (declared or
+                    # undeclared) already admitted this pass — an
+                    # undeclared item can't prove it's disjoint from that,
+                    # so it waits for an uncontested pass.
+                    continue
+                promotion_target = _promotion_target_for_item(item)
+                if promotion_target is not None:
+                    try:
+                        lock_status = await artifact_declaration_module.get_promotion_merger_lock(
+                            self.db, promotion_target, self.project_id,
+                        )
+                    except Exception:  # noqa: BLE001 — a lock-status read failure never blocks dispatch
+                        logger.exception(
+                            "merger-lock status check failed for target %s", promotion_target,
+                        )
+                        lock_status = None
+                    held_by_other = bool((lock_status or {}).get("file_lock"))
+                    if held_by_other or promotion_target in claimed_targets_this_pass:
+                        self.last_merger_lock_skips.append({
+                            "item_id": item_id,
+                            "target": promotion_target,
+                            "reason": (
+                                "merger lock held by another live session"
+                                if held_by_other
+                                else "another item in this same pass already claims this target"
+                            ),
+                        })
+                        continue
+                    claimed_targets_this_pass.add(promotion_target)
+                session_id = await self._ensure_session()
+                prompt = _worker_prompt(item, self.project_id)
+                try:
+                    task = await self._enqueue(
+                        self.db,
+                        session_id,
+                        self.project_id,
+                        prompt,
+                        # 769e24a7 — best-effort responsiveness hook: wakes
+                        # this dispatcher's own loop the instant this
+                        # worker's task reaches a terminal status, instead
+                        # of waiting up to `interval` seconds for the next
+                        # scheduled pass to discover it via reconciliation.
+                        # Carries no item/lease identity of its own (a
+                        # generic "something finished, go look" signal) —
+                        # the real, attempt-id-safe release always happens
+                        # in reconcile_active_leases, never here. A fake
+                        # enqueue_fn (tests) that doesn't accept/forward
+                        # this kwarg simply never triggers it; harmless.
+                        on_complete=lambda _row: self.trigger(),
+                    )
+                except Exception:  # noqa: BLE001 — one bad enqueue must not abort the pass
+                    logger.exception("failed to enqueue worker for item %s", item_id)
+                    # 272d8f2c — failure re-frontiering: do NOT mark
+                    # dispatched and do NOT fold this item's resources into
+                    # admitted_resources/undeclared_admitted, so a later
+                    # candidate that only conflicted with THIS item still
+                    # gets a fair shot at the freed capacity this pass.
+                    continue
+                # Mark dispatched only after a successful enqueue so a failure is retried.
+                self._dispatched.add(item_id)
+                # 769e24a7 — register the ACTIVE lease this successful
+                # enqueue opened. Additive to (never a replacement for) the
+                # _dispatched dedup marker above; see record_worker_lease's
+                # own docstring for why this refresh-not-raise on a repeat
+                # item_id is safe and what "seq" means for attempt-id
+                # safety.
+                self.record_worker_lease(item_id, task=task)
+                if item_resources:
+                    admitted_resources.update(item_resources)
+                else:
+                    undeclared_admitted = True
+                in_flight += 1
+                enqueued.append(task)
         return enqueued
 
 

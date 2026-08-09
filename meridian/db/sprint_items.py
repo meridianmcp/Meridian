@@ -5757,6 +5757,168 @@ async def _revert_batch_item_claim(
     _invalidate_sprint_items_cache(project_id)
 
 
+# ---------------------------------------------------------------------------
+# 704edefe — reservation / integration-queue manifest fields.
+#
+# claim_parallel_batch already persists an immutable "what batch was
+# decided" manifest (batch_claim.py, 22cad9b8) and already rejects a
+# duplicate reservation (BATCH_MANIFEST_EXISTS, unless force_manifest=True)
+# and a stale one (STALE_PLAN_GENERATION, via plan_generation vs. the live
+# board digest) — those two "reject duplicate/stale reservations" behaviors
+# are pre-existing and are NOT touched here. What was missing from the
+# manifest itself: which symbols/files each resource actually resolved to
+# and at what granularity, the dependency edges this batch was validated
+# against, each item's own declared expected output, a derived verifier
+# class, and a dependency-respecting integration order — the fields this
+# item's notes ask the manifest to record. All four helpers below read ONLY
+# already-existing sprint-item fields/resource-parsing behavior (depends_on,
+# artifact_kind/planned_output/artifact_policy, require_verification/
+# require_strict_evidence, and the existing symbol:<path>::<name> /
+# file:<path> resource shapes _claim_batch_resource already parses) — no
+# new sprint_items schema, and no dependency on c2d41e96's in-flight
+# canonical symbol-resource parsing work, which touches a DIFFERENT
+# function (get_parallelizable_groups) in this same file. Because every one
+# of these fields is recomputed from the LIVE board on every
+# claim_parallel_batch call (nothing here is cached from a previous call),
+# a board revision between two calls is automatically reflected — this is
+# the "recompute on board revision changes" property for these fields,
+# parallel to (but independent of) plan_generation's explicit staleness
+# check for status/resource state.
+# ---------------------------------------------------------------------------
+
+
+def _classify_verifier_class(item: dict[str, Any]) -> str:
+    """704edefe — deterministic verifier-class classification for the
+    reservation manifest, derived purely from an item's own already-existing
+    verification-related fields (no new sprint_items schema). Escalating
+    strictness, most demanding first:
+
+      * ``"strict_evidence"``       — ``require_strict_evidence`` is set
+        (the override_strict_evidence gate; see SprintItemEvidenceRequired).
+      * ``"verification_required"`` — ``require_verification`` is set (the
+        run_verification gate; see SprintItemVerificationRequired).
+      * ``"artifact_check"``        — neither flag is set, but the item
+        declares an ``artifact_kind`` (figure/table/document_only), so its
+        completion is still subject to an artifact-pointer check
+        (``artifact_policy``) even though it isn't gated by either flag
+        above.
+      * ``"standard"``              — none of the above; ordinary
+        completion, no special verification contract.
+    """
+    if item.get("require_strict_evidence"):
+        return "strict_evidence"
+    if item.get("require_verification"):
+        return "verification_required"
+    if item.get("artifact_kind"):
+        return "artifact_check"
+    return "standard"
+
+
+def _expected_output_of(item: dict[str, Any]) -> dict[str, Any]:
+    """704edefe — an item's own declared "what this produces" trio, exactly
+    as recorded by 2f9cb288's artifact-declaration fields. A read-only
+    snapshot for the reservation manifest; never mutates the item.
+
+    Reads through ``artifact_declaration``'s ``effective_*`` accessors
+    (the SAME canonical decode path every other caller in this codebase
+    uses — see ``meridian.artifact_declaration``'s own module docstring),
+    not the raw ``item.get(...)`` fields directly: ``planned_output`` and
+    ``artifact_policy`` are stored as serialized JSON TEXT columns
+    (``_artifact_declaration.serialize_planned_output`` /
+    ``serialize_artifact_policy`` at write time), so reading the raw field
+    off a fetched row returns a JSON string, not a dict, unless decoded via
+    these accessors first. ``artifact_policy`` uses
+    ``effective_artifact_policy`` specifically (not a bare parse) so an item
+    that declares no policy at all still reports the real project-default
+    policy it will actually be checked against, matching what
+    ``effective_artifact_policy`` documents ("absent is unknown, never
+    strict and never off" refers to the STORED value; the EFFECTIVE one
+    always resolves to a concrete policy)."""
+    return {
+        "artifact_kind": _artifact_declaration.effective_artifact_kind(item),
+        "planned_output": _artifact_declaration.effective_planned_output(item),
+        "artifact_policy": _artifact_declaration.effective_artifact_policy(item),
+    }
+
+
+async def _dependency_frontier_snapshot(
+    db: aiosqlite.Connection, items_by_id: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """704edefe — durable snapshot of each batch item's ``depends_on`` edge
+    and whether that dependency was satisfied AT RESERVATION TIME, for the
+    integration-queue manifest's audit trail.
+
+    claim_sprint_item's own dependency gate already refuses to claim an item
+    whose depends_on parent isn't done, so by the time claim_parallel_batch
+    reaches this point every item in the batch necessarily has a satisfied
+    (or absent) dependency — this function does not itself enforce
+    anything; it records the fact for later audit/integration-order use.
+    One extra lookup per DISTINCT out-of-batch dependency id (an in-batch
+    dependency is resolved from ``items_by_id`` with no extra query;
+    repeated out-of-batch ids are cached so a shared parent is only fetched
+    once).
+    """
+    frontier: dict[str, dict[str, Any]] = {}
+    dep_cache: dict[str, "dict[str, Any] | None"] = {}
+    for iid, item in items_by_id.items():
+        dep_id = item.get("depends_on")
+        if not dep_id:
+            frontier[iid] = {"depends_on": None, "dependency_satisfied": True}
+            continue
+        dep_item = items_by_id.get(dep_id)
+        if dep_item is None:
+            if dep_id not in dep_cache:
+                dep_cache[dep_id] = await get_sprint_item(db, dep_id)
+            dep_item = dep_cache[dep_id]
+        frontier[iid] = {
+            "depends_on": dep_id,
+            "dependency_satisfied": bool(dep_item) and dep_item.get("status") == "done",
+            "dependency_in_batch": dep_id in items_by_id,
+        }
+    return frontier
+
+
+def _compute_integration_order(
+    ordered_ids: list[str], items_by_id: dict[str, dict[str, Any]],
+) -> list[str]:
+    """704edefe — dependency-respecting integration order for this batch's
+    "integration queue": an item whose ``depends_on`` parent is ALSO in this
+    batch must integrate strictly after that parent. Items with no in-batch
+    dependency keep their original ``ordered_ids`` relative order (stable).
+
+    Only IN-BATCH dependency edges affect ordering — an out-of-batch
+    dependency is, by the depends_on claim gate's own contract, already
+    'done' before this item could ever be claimed (see
+    _dependency_frontier_snapshot), so it imposes no additional integration
+    sequencing within this batch.
+
+    Cycle-safe: a depends_on cycle is already rejected at write time
+    (update_sprint_item's cycle guard), but if one somehow reached this far
+    the loop below still terminates — any item that can never become
+    "ready" is appended, unordered, at the end rather than hanging.
+    """
+    dep_of = {iid: items_by_id[iid].get("depends_on") for iid in ordered_ids}
+    result: list[str] = []
+    placed: set[str] = set()
+    remaining = list(ordered_ids)
+    while remaining:
+        progressed = False
+        next_remaining: list[str] = []
+        for iid in remaining:
+            dep = dep_of[iid]
+            if dep is None or dep not in items_by_id or dep in placed:
+                result.append(iid)
+                placed.add(iid)
+                progressed = True
+            else:
+                next_remaining.append(iid)
+        remaining = next_remaining
+        if not progressed:
+            result.extend(remaining)  # cycle guard — never hang
+            break
+    return result
+
+
 async def claim_parallel_batch(
     db: aiosqlite.Connection,
     project_id: str,
@@ -5794,15 +5956,35 @@ async def claim_parallel_batch(
 
     Returns ``{"ok": True, "manifest_id", "batch_key", "claimed_item_ids",
     "items", "resources", "manifest", "plan_generation",
-    "lease_local_warning"}`` on success, or ``{"ok": False, "error": <code>,
-    "message": ...}`` (plus error-specific fields) on any rejection — never
-    raises for an expected validation/conflict outcome, only for a genuine
-    caller bug (empty item_ids / missing session_id). See the module-level
-    comment above for the full step-by-step contract; error codes are:
-    ITEM_NOT_FOUND, STALE_PLAN_GENERATION, UNDECLARED_RESOURCE_IN_BATCH,
+    "lease_local_warning", "integration_order"}`` on success, or
+    ``{"ok": False, "error": <code>, "message": ...}`` (plus error-specific
+    fields) on any rejection — never raises for an expected
+    validation/conflict outcome, only for a genuine caller bug (empty
+    item_ids / missing session_id). See the module-level comment above for
+    the full step-by-step contract; error codes are: ITEM_NOT_FOUND,
+    STALE_PLAN_GENERATION, UNDECLARED_RESOURCE_IN_BATCH,
     BATCH_COMPOSITION_CONFLICT, BATCH_MANIFEST_EXISTS, ITEM_CLAIM_CONFLICT,
     <claim_sprint_item's own blocked "error" values e.g. DEFERRED/SUPERSEDED/
     WAVE_GATE_PENDING/UNPROSPECTED>, BATCH_RESOURCE_CONFLICT.
+
+    704edefe — the persisted ``manifest`` is now a genuine reservation +
+    integration-queue record, not just "which items/resources were
+    decided": it also carries ``resolved_symbols`` (per-resource
+    file/symbol/granularity — a static prediction at persist time,
+    overwritten with the actual claim outcome once the attempt resolves),
+    ``dependency_frontier`` (each item's depends_on edge and whether it was
+    satisfied at reservation time), ``expected_outputs`` (each item's own
+    declared artifact_kind/planned_output/artifact_policy), and
+    ``verifier_class`` (a derived strict_evidence/verification_required/
+    artifact_check/standard classification per item). ``integration_order``
+    — the dependency-respecting sequence this batch's items should be
+    integrated/merged in — is both on the manifest and promoted to the
+    top-level success result for convenience. All five are computed fresh
+    from the live board on every call (never cached), so a board revision
+    between calls is always reflected; see the module comment above this
+    function for the full rationale. The pre-existing "reject duplicate/
+    stale reservations" behaviors (BATCH_MANIFEST_EXISTS,
+    STALE_PLAN_GENERATION) are unchanged by this.
     """
     if not session_id:
         raise ValueError("session_id is required to claim a batch")
@@ -5925,6 +6107,18 @@ async def claim_parallel_batch(
 
     resources_union = sorted({r for lst in item_resources.values() for r in lst})
 
+    # ── 2b. 704edefe — compute the reservation/integration-queue fields
+    # BEFORE persisting, from the live board (items_by_id was just loaded
+    # above), so the durable manifest below records them from the start. ──
+    _predicted_resolved_symbols = [
+        {"resource": r, "predicted_granularity": _predict_resource_granularity(r)}
+        for r in resources_union
+    ]
+    _dependency_frontier = await _dependency_frontier_snapshot(db, items_by_id)
+    _expected_outputs = {iid: _expected_output_of(items_by_id[iid]) for iid in ordered_ids}
+    _verifier_class = {iid: _classify_verifier_class(items_by_id[iid]) for iid in ordered_ids}
+    _integration_order = _compute_integration_order(ordered_ids, items_by_id)
+
     # ── 3. Persist the immutable manifest BEFORE attempting any lock — a
     # durable audit record of what was decided, independent of whether the
     # attempt below actually succeeds. ──
@@ -5932,6 +6126,11 @@ async def claim_parallel_batch(
         manifest = await persist_batch_claim_manifest(
             db, project_id, session_id, ordered_ids, item_resources, resources_union,
             force=force_manifest, reason=manifest_reason,
+            resolved_symbols=_predicted_resolved_symbols,
+            dependency_frontier=_dependency_frontier,
+            expected_outputs=_expected_outputs,
+            verifier_class=_verifier_class,
+            integration_order=_integration_order,
         )
     except ValueError as exc:
         return {
@@ -5956,7 +6155,14 @@ async def claim_parallel_batch(
         for iid, orig_status, orig_actor in reversed(claimed_items):
             await _revert_batch_item_claim(db, project_id, iid, orig_status, orig_actor)
         detail = {"error": error_code, "message": message, **extra}
-        await mark_batch_claim_outcome(db, manifest["id"], "failed", failure_detail=detail)
+        # 704edefe — record however far the resource resolution actually got
+        # before the failure (empty list if the failure happened before the
+        # resource loop ever ran, e.g. an ITEM_CLAIM_CONFLICT on the first
+        # item) rather than leaving the pre-attempt prediction unrefined.
+        await mark_batch_claim_outcome(
+            db, manifest["id"], "failed", failure_detail=detail,
+            resolved_symbols=resource_claims,
+        )
         return {"ok": False, "manifest_id": manifest["id"], **detail}
 
     for iid in ordered_ids:
@@ -6057,7 +6263,11 @@ async def claim_parallel_batch(
                 outcome["_session_id"] = claim_session
                 acquired_resources.append(outcome)
 
-    final_manifest = await mark_batch_claim_outcome(db, manifest["id"], "claimed")
+    # 704edefe — overwrite the pre-attempt PREDICTED resolved_symbols with
+    # the ACTUAL per-resource outcome the loop above just built.
+    final_manifest = await mark_batch_claim_outcome(
+        db, manifest["id"], "claimed", resolved_symbols=resource_claims,
+    )
     result_items = [await get_sprint_item(db, iid) for iid in ordered_ids]
 
     # 0d0cada7 — lease-local nudge: a multi-item batch where the SAME session
@@ -6095,6 +6305,10 @@ async def claim_parallel_batch(
         # 0d0cada7 — lease-local scheduler diagnostics (additive).
         "plan_generation": _current_generation,
         "lease_local_warning": lease_local_warning,
+        # 704edefe — the integration-queue's dependency-respecting merge
+        # order, promoted to the top level for convenience (also on
+        # final_manifest["integration_order"]).
+        "integration_order": _integration_order,
     }
 
 

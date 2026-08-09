@@ -85,6 +85,60 @@ async def _migrate_sprint_batch_claims(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
+async def _migrate_sprint_batch_claims_reservation_fields(db: aiosqlite.Connection) -> None:
+    """704edefe — extend sprint_batch_claims into a genuine reservation +
+    integration-queue manifest, additive to 22cad9b8's original columns.
+
+    Five new nullable TEXT (JSON) columns, guarded ADD COLUMN so this is a
+    no-op on a DB that already has them (mirrors
+    meridian.db.migrations._migrate_add_column_if_missing's pattern,
+    reimplemented locally since this table's whole lifecycle lives in this
+    module rather than meridian/db/migrations.py's registered list — see
+    _migrate_sprint_batch_claims above, which this always runs after):
+
+      * ``resolved_symbols``    — list[{resource, file_path, symbol, scope,
+        claim_granularity, fallback_reason, ...}]. Persisted TWICE: a
+        STATIC, planning-time prediction (via _predict_resource_granularity,
+        before any lock is attempted) at manifest-creation time, then
+        overwritten with the ACTUAL per-resource outcome (the same
+        resource_claims claim_parallel_batch already builds during its
+        attempt loop) once the attempt resolves — see
+        mark_batch_claim_outcome's ``resolved_symbols`` kwarg below.
+      * ``dependency_frontier`` — {item_id: {depends_on, dependency_
+        satisfied, dependency_in_batch}}, a durable snapshot of each batch
+        item's depends_on edge and whether it was satisfied at reservation
+        time.
+      * ``expected_outputs``    — {item_id: {artifact_kind, planned_output,
+        artifact_policy}}, each item's own already-declared "what this
+        produces" trio (2f9cb288), unchanged by this manifest — just copied
+        onto the reservation record for a downstream integration step to
+        read without re-fetching every item.
+      * ``verifier_class``      — {item_id: "strict_evidence" |
+        "verification_required" | "artifact_check" | "standard"}, a
+        deterministic classification (see
+        sprint_items._classify_verifier_class) of what kind of verification
+        each item needs before its output can be integrated.
+      * ``integration_order``   — [item_id, ...], the dependency-respecting
+        order this batch's items should be integrated/merged in (an item
+        with an in-batch depends_on parent always sorts after it — see
+        sprint_items._compute_integration_order).
+
+    All five are optional/nullable — a manifest persisted before this
+    migration ran (or by a hypothetical future caller that omits them)
+    decodes to an empty list/dict via _decode_manifest_row, never a
+    KeyError for an existing reader.
+    """
+    async with db.execute("PRAGMA table_info(sprint_batch_claims)") as cur:
+        existing_cols = {row[1] async for row in cur}
+    for column in (
+        "resolved_symbols", "dependency_frontier", "expected_outputs",
+        "verifier_class", "integration_order",
+    ):
+        if column not in existing_cols:
+            await db.execute(f"ALTER TABLE sprint_batch_claims ADD COLUMN {column} TEXT")
+    await db.commit()
+
+
 def compute_batch_key(item_ids: list[str]) -> str:
     """Deterministic identity for a batch: sorted, deduped, comma-joined ids.
 
@@ -101,6 +155,8 @@ def _decode_manifest_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
     out = dict(row)
     for field, default in (
         ("item_ids", []), ("item_resource_map", {}), ("resources", []),
+        ("resolved_symbols", []), ("dependency_frontier", {}),
+        ("expected_outputs", {}), ("verifier_class", {}), ("integration_order", []),
     ):
         raw = out.get(field)
         if isinstance(raw, str):
@@ -131,6 +187,11 @@ async def persist_batch_claim_manifest(
     *,
     force: bool = False,
     reason: str | None = None,
+    resolved_symbols: list[dict[str, Any]] | None = None,
+    dependency_frontier: dict[str, Any] | None = None,
+    expected_outputs: dict[str, Any] | None = None,
+    verifier_class: dict[str, Any] | None = None,
+    integration_order: list[str] | None = None,
 ) -> dict[str, Any]:
     """Persist the immutable "what batch was decided" manifest.
 
@@ -148,6 +209,16 @@ async def persist_batch_claim_manifest(
     manifest is a durable record of what was DECIDED even when the
     subsequent attempt fails — the audit trail this item's acceptance
     criteria calls for.
+
+    704edefe — five additional, all-optional reservation/integration-queue
+    fields (default to an empty list/dict when omitted, never ``None`` on
+    the decoded row — see :func:`_decode_manifest_row`): ``resolved_symbols``,
+    ``dependency_frontier``, ``expected_outputs``, ``verifier_class``,
+    ``integration_order``. See
+    :func:`_migrate_sprint_batch_claims_reservation_fields` for the full
+    per-field contract. ``resolved_symbols`` recorded here is the STATIC
+    planning-time prediction; :func:`mark_batch_claim_outcome` overwrites it
+    with the actual post-attempt resolution once the claim resolves.
     """
     batch_key = compute_batch_key(item_ids)
     existing = await get_batch_claim_manifest(db, project_id, batch_key)
@@ -168,12 +239,19 @@ async def persist_batch_claim_manifest(
     await db.execute(
         "INSERT INTO sprint_batch_claims "
         "(id, project_id, session_id, batch_key, item_ids, item_resource_map, "
-        "resources, status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
+        "resources, status, resolved_symbols, dependency_frontier, "
+        "expected_outputs, verifier_class, integration_order) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
         (
             mid, project_id, session_id, batch_key,
             json.dumps(list(item_ids)),
             json.dumps({k: list(v) for k, v in item_resource_map.items()}),
             json.dumps(list(resources)),
+            json.dumps(resolved_symbols if resolved_symbols is not None else []),
+            json.dumps(dependency_frontier if dependency_frontier is not None else {}),
+            json.dumps(expected_outputs if expected_outputs is not None else {}),
+            json.dumps(verifier_class if verifier_class is not None else {}),
+            json.dumps(list(integration_order) if integration_order is not None else []),
         ),
     )
     await db.commit()
@@ -232,6 +310,7 @@ async def mark_batch_claim_outcome(
     status: str,
     *,
     failure_detail: dict[str, Any] | None = None,
+    resolved_symbols: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Stamp the resolved outcome (``'claimed'`` or ``'failed'``) on a manifest
     this SAME call's :func:`persist_batch_claim_manifest` just created.
@@ -239,15 +318,33 @@ async def mark_batch_claim_outcome(
     This is NOT a supersede — it completes the record of the same attempt
     (the manifest's identity, item set, and resource set are unchanged), so
     it updates the existing row in place rather than creating a new one.
+
+    ``resolved_symbols`` (704edefe, optional) — when supplied, OVERWRITES the
+    manifest's ``resolved_symbols`` column with the ACTUAL per-resource
+    outcome of the claim attempt (whatever ``claim_parallel_batch``'s
+    resource loop actually built — scope/claim_granularity/fallback_reason
+    per resource, however far the attempt got before succeeding or failing),
+    refining the STATIC prediction ``persist_batch_claim_manifest`` recorded
+    up front. Omitted (the default) leaves the existing predicted value
+    untouched — e.g. a failure that never reached the resource loop at all
+    (an ``ITEM_CLAIM_CONFLICT`` on the very first item's status transition)
+    has nothing real to report yet.
     """
     if status not in ("claimed", "failed"):
         raise ValueError(f"status must be 'claimed' or 'failed', got {status!r}")
     detail_json = json.dumps(failure_detail) if failure_detail is not None else None
-    await db.execute(
-        "UPDATE sprint_batch_claims SET status = ?, failure_detail = ?, "
-        "resolved_at = datetime('now') WHERE id = ?",
-        (status, detail_json, manifest_id),
-    )
+    if resolved_symbols is not None:
+        await db.execute(
+            "UPDATE sprint_batch_claims SET status = ?, failure_detail = ?, "
+            "resolved_at = datetime('now'), resolved_symbols = ? WHERE id = ?",
+            (status, detail_json, json.dumps(resolved_symbols), manifest_id),
+        )
+    else:
+        await db.execute(
+            "UPDATE sprint_batch_claims SET status = ?, failure_detail = ?, "
+            "resolved_at = datetime('now') WHERE id = ?",
+            (status, detail_json, manifest_id),
+        )
     await db.commit()
     result = await get_batch_claim_manifest_by_id(db, manifest_id)
     assert result is not None

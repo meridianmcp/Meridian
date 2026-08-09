@@ -665,6 +665,24 @@ async def lifespan(app: FastAPI):
                                     f"unexpectedly (PID {pid})"
                                 ),
                             )
+                            # 769e24a7 — process death is one of the
+                            # terminal signals Dispatcher.
+                            # reconcile_active_leases watches for via
+                            # task_log status (this update_task call is
+                            # exactly what makes it observable). Wake the
+                            # dispatcher immediately, best-effort, instead
+                            # of leaving the freed capacity undiscovered
+                            # until its own next scheduled pass (up to
+                            # `interval` seconds later). No-op when the
+                            # dispatcher feature is disabled (the default)
+                            # or hasn't started yet — app.state.dispatcher
+                            # is only ever set by start_dispatcher_if_enabled.
+                            try:
+                                _dispatcher = getattr(app.state, "dispatcher", None)
+                                if _dispatcher is not None:
+                                    _dispatcher.trigger()
+                            except Exception:  # noqa: BLE001
+                                pass
                 except Exception:  # noqa: BLE001
                     pass
                 # v1.0 — hourly storage overage check (hosted only)
