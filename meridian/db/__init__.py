@@ -12619,15 +12619,18 @@ from .ai_log import (  # noqa: F401
 # other db/*.py submodules' "imported after its dependencies" convention.
 from .profile_layers import (  # noqa: F401
     get_profile_layer,
+    list_profile_layers,
     set_profile_layer,
     reset_profile_layer,
     transition_hosted_default_lifecycle,
     get_profile_layer_revisions,
     get_effective_profile,
-    list_profile_layers,
     clone_profile_layer,
     # 89a06e40 — tenant/workspace-only resolution for the tunnel/connector
     # surface (no project_id available there); see profile_layers.py's
     # docstring and pinned decision ee7bccc9.
     get_workspace_effective_profile,
+    # 77369699 — exact-revision rollback restore for batch_mutate's
+    # profile_layer compensation path (db/batch_management.py).
+    _restore_profile_layer_row,
 )

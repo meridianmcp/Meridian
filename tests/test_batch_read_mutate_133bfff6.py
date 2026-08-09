@@ -308,6 +308,135 @@ async def test_sprint_board_adapter_real_reads_and_cross_project_isolation(db, p
 
 
 # ---------------------------------------------------------------------------
+# batch_read: profile adapter (PROFILE-7 77369699)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_profile_adapter_get_effective_profile_happy_path(db, project):
+    # claim_verification_mode is one of the 3 genuinely-new PROFILE-1 fields
+    # (legacy_source="profile_layers") -- unlike a legacy ProjectSettings
+    # field (e.g. auto_worktrees), it is never silently re-populated by the
+    # synthetic project layer's legacy-settings seed, so the workspace
+    # override set here is guaranteed to survive to the merged result.
+    await db_module.set_profile_layer(db, "workspace", "singleton", fields={"claim_verification_mode": "strict"})
+    requests = [
+        {"request_id": "eff", "adapter": "profile", "operation": "get_effective_profile"},
+    ]
+    resp = await br_module.batch_read(db, project_id=project["id"], requests=requests)
+    by_id = {r["request_id"]: r for r in resp["results"]}
+    assert by_id["eff"]["status"] == "ok"
+    result = by_id["eff"]["result"]
+    assert result["project_id"] == project["id"]
+    assert result["generation_key"]  # the flagship op returns effective profile metadata
+    assert result["fields"]["claim_verification_mode"] == "strict"
+
+
+@pytest.mark.asyncio
+async def test_profile_adapter_get_profile_layer_list_and_revisions_happy_paths(db, project):
+    await db_module.set_profile_layer(db, "workspace", "singleton", fields={"max_pinned_decisions": 15})
+    await db_module.transition_hosted_default_lifecycle(db, "global", "active")
+
+    requests = [
+        {"request_id": "one", "adapter": "profile", "operation": "get_profile_layer",
+         "args": {"scope_type": "workspace", "scope_id": "singleton"}},
+        {"request_id": "listed", "adapter": "profile", "operation": "list_profile_layers",
+         "args": {"scope_type": "workspace"}},
+        {"request_id": "rev", "adapter": "profile", "operation": "get_profile_layer_revisions",
+         "args": {"scope_id": "global"}},
+    ]
+    resp = await br_module.batch_read(db, project_id=project["id"], requests=requests)
+    by_id = {r["request_id"]: r for r in resp["results"]}
+
+    assert by_id["one"]["status"] == "ok"
+    assert by_id["one"]["result"]["fields"] == {"max_pinned_decisions": 15}
+
+    assert by_id["listed"]["status"] == "ok"
+    assert any(
+        layer["scope_type"] == "workspace" and layer["scope_id"] == "singleton"
+        for layer in by_id["listed"]["result"]
+    )
+
+    assert by_id["rev"]["status"] == "ok"
+    assert isinstance(by_id["rev"]["result"], list)
+    assert by_id["rev"]["result"][0]["scope_id"] == "global"
+
+
+@pytest.mark.asyncio
+async def test_profile_adapter_list_profile_layers_is_project_isolated(db, project, other_project):
+    """PROFILE-7 review fix (security): list_profile_layers is a
+    bulk-enumeration primitive requiring no prior knowledge of any other
+    project's identifiers -- unlike get_profile_layer/get_profile_layer_revisions,
+    which need the caller to already know the exact scope_id. 'project' and
+    'session' scope_type rows are each tied to ONE project, so this must
+    filter to the CALLING project_id rather than exposing every project's
+    rows. hosted_default/workspace/user rows are not project-scoped and
+    must still pass through unfiltered."""
+    await db_module.set_profile_layer(db, "project", project["id"], fields={"claim_verification_mode": "strict"})
+    await db_module.set_profile_layer(db, "project", other_project["id"], fields={"claim_verification_mode": "loose"})
+    await db_module.set_profile_layer(db, "workspace", "singleton", fields={"max_pinned_decisions": 9})
+
+    own_session = await db_module.register_session(db, project["id"], "own-sess")
+    other_session = await db_module.register_session(db, other_project["id"], "other-sess")
+    await db_module.set_profile_layer(db, "session", own_session["id"], fields={"max_pinned_decisions": 3})
+    await db_module.set_profile_layer(db, "session", other_session["id"], fields={"max_pinned_decisions": 7})
+
+    requests = [
+        {"request_id": "by_project", "adapter": "profile", "operation": "list_profile_layers",
+         "args": {"scope_type": "project"}},
+        {"request_id": "by_session", "adapter": "profile", "operation": "list_profile_layers",
+         "args": {"scope_type": "session"}},
+        {"request_id": "unfiltered", "adapter": "profile", "operation": "list_profile_layers", "args": {}},
+    ]
+    resp = await br_module.batch_read(db, project_id=project["id"], requests=requests)
+    by_id = {r["request_id"]: r for r in resp["results"]}
+
+    assert by_id["by_project"]["status"] == "ok"
+    project_scope_ids = {layer["scope_id"] for layer in by_id["by_project"]["result"]}
+    assert project_scope_ids == {project["id"]}  # never the other project's row
+
+    assert by_id["by_session"]["status"] == "ok"
+    session_scope_ids = {layer["scope_id"] for layer in by_id["by_session"]["result"]}
+    assert session_scope_ids == {own_session["id"]}  # never the other project's session
+
+    assert by_id["unfiltered"]["status"] == "ok"
+    unfiltered_rows = by_id["unfiltered"]["result"]
+    unfiltered_project_ids = {r["scope_id"] for r in unfiltered_rows if r["scope_type"] == "project"}
+    unfiltered_session_ids = {r["scope_id"] for r in unfiltered_rows if r["scope_type"] == "session"}
+    assert unfiltered_project_ids == {project["id"]}
+    assert unfiltered_session_ids == {own_session["id"]}
+    # non-project-scoped rows still pass through unfiltered
+    assert any(r["scope_type"] == "workspace" and r["scope_id"] == "singleton" for r in unfiltered_rows)
+
+
+@pytest.mark.asyncio
+async def test_profile_adapter_bad_args_is_validation_error(db, project):
+    requests = [
+        {"request_id": "bad", "adapter": "profile", "operation": "get_profile_layer",
+         "args": {"scope_type": "workspace"}},  # missing required scope_id
+    ]
+    resp = await br_module.batch_read(db, project_id=project["id"], requests=requests)
+    by_id = {r["request_id"]: r for r in resp["results"]}
+    assert by_id["bad"]["status"] == "error"
+    assert by_id["bad"]["error_code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_profile_adapter_requests_coalesce_like_any_other_adapter(db, project):
+    """Confirms the profile adapter isn't special-cased out of the generic
+    coalescing machinery already proven for sprint_board above."""
+    requests = [
+        {"request_id": "a", "adapter": "profile", "operation": "get_effective_profile"},
+        {"request_id": "b", "adapter": "profile", "operation": "get_effective_profile"},
+    ]
+    resp = await br_module.batch_read(db, project_id=project["id"], requests=requests)
+    by_id = {r["request_id"]: r for r in resp["results"]}
+    assert by_id["a"]["cache_hit"] is False
+    assert by_id["b"]["cache_hit"] is True
+    assert by_id["b"]["coalesced_with"] == "a"
+    assert by_id["b"]["result"] == by_id["a"]["result"]
+
+
+# ---------------------------------------------------------------------------
 # batch_mutate: mixed-kind success + mid-mutation rollback across kinds
 # ---------------------------------------------------------------------------
 
@@ -458,6 +587,155 @@ async def test_batch_mutate_update_cross_project_item_id_not_found(db, project, 
     )
     assert resp["status"] == "rejected"
     assert resp["results"][0]["error_code"] == "NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# batch_mutate: profile_layer kind (PROFILE-7 77369699)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_batch_mutate_profile_layer_all_or_nothing_success(db, project):
+    entries = [
+        {"kind": "profile_layer", "scope_type": "workspace", "scope_id": "singleton",
+         "fields": {"auto_worktrees": 0}, "correlation_key": "pl1"},
+    ]
+    resp = await bmut_module.batch_mutate(
+        db, project_id=project["id"], entries=entries, mode="all_or_nothing",
+        idempotency_key="profile-layer-success-1",
+    )
+    assert resp["status"] == "ok"
+    assert resp["committed_count"] == 1
+    assert resp["failures"] == []
+    assert resp["rollback_status"] == "none"
+
+    layer = await db_module.get_profile_layer(db, "workspace", "singleton")
+    assert layer["fields"] == {"auto_worktrees": 0}
+    assert layer["revision"] == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_mutate_profile_layer_stale_revision_surfaces_conflict(db, project):
+    saved = await db_module.set_profile_layer(db, "workspace", "singleton", fields={"auto_worktrees": 1})
+    entries = [
+        {"kind": "profile_layer", "scope_type": "workspace", "scope_id": "singleton",
+         "fields": {"auto_worktrees": 0}, "expected_revision": saved["revision"] + 5,
+         "correlation_key": "pl-conflict"},
+    ]
+    resp = await bmut_module.batch_mutate(
+        db, project_id=project["id"], entries=entries, mode="all_or_nothing",
+        idempotency_key="profile-layer-conflict-1",
+    )
+    # A stale-revision failure happens mid-APPLY (not pre-mutation validate),
+    # same reason the mixed cross-kind rollback test below ends up "failed",
+    # not "rejected" -- see execute_mixed_mutation_batch's phase split.
+    assert resp["status"] == "failed"
+    result = resp["results"][0]
+    assert result["error_code"] == bm.ERROR_CONFLICT
+    payload = result["outcome"]["payload"]
+    assert payload["expected_revision"] == saved["revision"] + 5
+    assert payload["actual_revision"] == saved["revision"]
+    assert payload["scope_type"] == "workspace"
+    assert payload["scope_id"] == "singleton"
+
+    unchanged = await db_module.get_profile_layer(db, "workspace", "singleton")
+    assert unchanged["fields"]["auto_worktrees"] == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_mutate_profile_layer_rollback_restores_prior_and_deletes_new(db, project, monkeypatch):
+    """Mirrors test_batch_mutate_mixed_mid_mutation_abort_rolls_back_across_kinds's
+    monkeypatch technique (a later, DIFFERENT-kind entry fails mid-mutation,
+    triggering compensation of every already-applied entry), but exercises
+    BOTH profile_layer compensation branches in one batch: entry 0 UPDATES an
+    existing layer (prior revision > 0) -- compensation must restore its
+    exact prior fields AND prior revision (restoring fields via
+    set_profile_layer alone would bump revision a SECOND time -- PROFILE-7
+    review fix), not just delete it; entry 1 CREATES a brand-new layer
+    (prior revision 0) -- compensation must delete it back to the
+    never-configured state."""
+    existing = await db_module.set_profile_layer(
+        db, "workspace", "singleton", fields={"auto_worktrees": 1, "max_pinned_decisions": 5},
+    )
+    item = await db_module.add_sprint_item(db, project["id"], "v1", "Profile rollback pointer target")
+
+    async def _flaky_add_pointer(*args, **kwargs):
+        raise RuntimeError("simulated transient DB failure")
+
+    monkeypatch.setattr(bm.db_module, "add_sprint_item_pointer", _flaky_add_pointer)
+
+    entries = [
+        {"kind": "profile_layer", "scope_type": "workspace", "scope_id": "singleton",
+         "fields": {"auto_worktrees": 0}, "correlation_key": "update-existing"},
+        {"kind": "profile_layer", "scope_type": "user", "scope_id": "brand-new-user",
+         "fields": {"max_pinned_decisions": 40}, "correlation_key": "create-new"},
+        {"kind": "sprint_item_pointer", "sprint_item_id": item["id"], "source_type": "file",
+         "targets": [{"uri": "meridian/db/batch_management.py",
+                     "selector": {"type": "range", "start_line": 1, "end_line": 5}}],
+         "correlation_key": "p1"},
+    ]
+    resp = await bmut_module.batch_mutate(
+        db, project_id=project["id"], entries=entries, mode="all_or_nothing",
+        idempotency_key="profile-layer-rollback-1",
+    )
+    assert resp["status"] == "failed"
+    assert resp["rollback_status"] == "rolled_back"
+    by_ck = {r["correlation_key"]: r for r in resp["results"]}
+    assert by_ck["update-existing"]["status"] == "rolled_back"
+    assert by_ck["create-new"]["status"] == "rolled_back"
+    assert by_ck["p1"]["status"] == "error"
+
+    reverted_existing = await db_module.get_profile_layer(db, "workspace", "singleton")
+    assert reverted_existing["fields"] == existing["fields"]  # exact prior content restored
+    # PROFILE-7 review fix: the apply already bumped revision once (existing
+    # -> existing+1); a compensate that restores content via
+    # set_profile_layer would bump it AGAIN, leaving the row's revision two
+    # higher than before the batch ran even though its content matches --
+    # must land back on the exact prior revision instead.
+    assert reverted_existing["revision"] == existing["revision"]
+
+    reverted_new = await db_module.get_profile_layer(db, "user", "brand-new-user")
+    assert reverted_new["revision"] == 0  # deleted back to never-configured
+    assert reverted_new["fields"] == {}
+
+
+@pytest.mark.asyncio
+async def test_batch_mutate_profile_layer_rejects_entry_with_conflicting_project_id(db, project, other_project):
+    entries = [
+        {"kind": "profile_layer", "scope_type": "workspace", "scope_id": "singleton",
+         "fields": {"auto_worktrees": 0}, "project_id": other_project["id"],
+         "correlation_key": "pl-cross"},
+    ]
+    resp = await bmut_module.batch_mutate(
+        db, project_id=project["id"], entries=entries, mode="all_or_nothing",
+        idempotency_key="profile-layer-cross-1",
+    )
+    assert resp["status"] == "rejected"
+    assert resp["results"][0]["error_code"] == bm.ERROR_VALIDATION
+
+    layer = await db_module.get_profile_layer(db, "workspace", "singleton")
+    assert layer["revision"] == 0, "a cross-project entry must never mutate anything"
+
+
+@pytest.mark.asyncio
+async def test_batch_mutate_profile_layer_idempotent_replay_does_not_double_apply(db, project):
+    entries = [
+        {"kind": "profile_layer", "scope_type": "workspace", "scope_id": "singleton",
+         "fields": {"auto_worktrees": 0}, "correlation_key": "pl1"},
+    ]
+    resp1 = await bmut_module.batch_mutate(
+        db, project_id=project["id"], entries=entries, mode="all_or_nothing",
+        idempotency_key="profile-layer-replay-1",
+    )
+    resp2 = await bmut_module.batch_mutate(
+        db, project_id=project["id"], entries=entries, mode="all_or_nothing",
+        idempotency_key="profile-layer-replay-1",
+    )
+    assert resp1["idempotent_replay"] is False
+    assert resp2["idempotent_replay"] is True
+    assert resp2["results"] == resp1["results"]
+
+    layer = await db_module.get_profile_layer(db, "workspace", "singleton")
+    assert layer["revision"] == 1, "a replayed call must NOT re-apply the mutation"
 
 
 # ---------------------------------------------------------------------------

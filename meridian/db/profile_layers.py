@@ -102,12 +102,11 @@ def _empty_layer_dict(scope_type: str, scope_id: str) -> dict[str, Any]:
     }
 
 
-def _decode_profile_layer_row(row: aiosqlite.Row) -> dict[str, Any]:
-    """Decode one ``profile_layers`` row into the dict shape
-    :func:`get_profile_layer` returns. Shared by :func:`get_profile_layer`
-    and :func:`list_profile_layers` (PROFILE-5, 0bec79a7) so the two never
-    drift on JSON-decode logic."""
-    data = _row_to_dict(row) or {}
+def _decode_layer_row(data: dict[str, Any], scope_type: str, scope_id: str) -> dict[str, Any]:
+    """Shared JSON-decode step for one ``profile_layers`` row -> the dict
+    shape every read in this module returns. Factored out of
+    :func:`get_profile_layer` (PROFILE-7 77369699) so :func:`list_profile_layers`
+    doesn't duplicate this decoding per row."""
     try:
         fields = json.loads(data.get("fields") or "{}")
     except (TypeError, ValueError):
@@ -122,8 +121,8 @@ def _decode_profile_layer_row(row: aiosqlite.Row) -> dict[str, Any]:
     except (TypeError, ValueError):
         provenance = None
     return {
-        "scope_type": data.get("scope_type"),
-        "scope_id": data.get("scope_id"),
+        "scope_type": scope_type,
+        "scope_id": scope_id,
         "schema_version": int(data.get("schema_version") or _pc.SCHEMA_VERSION),
         "revision": int(data.get("revision") or 0),
         "fields": fields,
@@ -154,37 +153,49 @@ async def get_profile_layer(db: aiosqlite.Connection, scope_type: str, scope_id:
         row = await cur.fetchone()
     if row is None:
         return _empty_layer_dict(scope_type, scope_id)
-    return _decode_profile_layer_row(row)
+    data = _row_to_dict(row) or {}
+    return _decode_layer_row(data, scope_type, scope_id)
 
 
 async def list_profile_layers(
     db: aiosqlite.Connection, scope_type: str | None = None
 ) -> list[dict[str, Any]]:
-    """Read-only enumeration of every persisted ``profile_layers`` row
-    (PROFILE-5, 0bec79a7), optionally narrowed to one ``scope_type`` —
-    validated via :func:`profile_contract.normalize_scope_type` the same way
-    every other scope_type-accepting function in this module validates it.
+    """List every persisted ``profile_layers`` row, optionally filtered to
+    one ``scope_type`` (added PROFILE-7 77369699).
 
-    Ordered by ``(scope_type, scope_id)`` for deterministic output — this is
-    a raw listing, not a resolved/merged view; see :func:`get_effective_profile`
-    for the merged per-project result. Each entry is shaped exactly like
-    :func:`get_profile_layer`'s return dict. An empty table (or an empty
-    scope_type filter) returns ``[]``, never an error.
+    ``batch_read``'s new ``"profile"`` adapter needs a listing operation
+    that, per that item's own design notes, was assumed to have already
+    landed via a sibling PROFILE-5 commit — it had not, in this worktree, so
+    this is added here rather than reimplemented at the batch_read call
+    site. Follows :func:`get_profile_layer`'s own row-shape/JSON-decode
+    convention exactly (via the shared :func:`_decode_layer_row` helper).
+
+    Read-only; never an error for "no rows" — an empty list, the same
+    "never a read error" contract as :func:`get_profile_layer`. Raises
+    ``profile_contract.ProfileContractError`` for an unrecognized
+    ``scope_type``, same as every other scope_type-accepting function in
+    this module. This is a single-layer listing, like
+    :func:`get_profile_layer` — it does NOT resolve/merge across layers;
+    see :func:`get_effective_profile` for that.
     """
     params: tuple[Any, ...] = ()
     where_clause = ""
     if scope_type is not None:
         scope_type = _pc.normalize_scope_type(scope_type)
-        where_clause = "WHERE scope_type = ?"
+        where_clause = "WHERE scope_type = ? "
         params = (scope_type,)
     async with db.execute(
         "SELECT scope_type, scope_id, schema_version, revision, fields, reset_fields, "
         "lifecycle_state, content_hash, provenance, updated_at FROM profile_layers "
-        f"{where_clause} ORDER BY scope_type, scope_id",
+        + where_clause + "ORDER BY scope_type, scope_id",
         params,
     ) as cur:
         rows = await cur.fetchall()
-    return [_decode_profile_layer_row(row) for row in rows]
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        data = _row_to_dict(row) or {}
+        out.append(_decode_layer_row(data, data.get("scope_type"), data.get("scope_id")))
+    return out
 
 
 async def set_profile_layer(
@@ -277,6 +288,69 @@ async def set_profile_layer(
             db, scope_type, scope_id, new_revision, new_hash, lifecycle_state, fields, reset_fields, actor,
         )
 
+    return await get_profile_layer(db, scope_type, scope_id)
+
+
+async def _restore_profile_layer_row(
+    db: aiosqlite.Connection,
+    scope_type: str,
+    scope_id: str,
+    *,
+    revision: int,
+    fields: dict[str, Any],
+    reset_fields: list[str],
+    lifecycle_state: str | None,
+    provenance: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Raw restore to an EXACT prior row state -- revision included.
+
+    Used ONLY by ``batch_management``'s ``profile_layer`` entry-kind
+    rollback compensation (PROFILE-7 77369699 rollback fix, follows the
+    ``db_module._invalidate_sprint_items_cache`` precedent for a
+    leading-underscore helper called cross-module via the ``db`` package
+    namespace). :func:`set_profile_layer` ALWAYS bumps ``revision`` by 1 on
+    any real content change -- correct for a normal write, but wrong for
+    compensation: an apply that bumped revision N -> N+1 followed by a
+    compensating call THROUGH ``set_profile_layer`` would bump it again to
+    N+2, leaving the row's revision two higher than before the batch ran
+    even though its content is back to exactly what it was. This writes the
+    given ``revision`` verbatim (no auto-increment), so a rolled-back batch
+    restores the row to a state indistinguishable from "the batch never
+    ran" -- content AND revision -- which is what callers holding a
+    pre-batch ``expected_revision`` need for optimistic concurrency to keep
+    working after a rollback.
+
+    Not a general-purpose API: no validation of ``fields``/``reset_fields``
+    against the field registry (the caller is always restoring a snapshot
+    that already passed that validation once, at the original write it is
+    reverting), no revision-history row (mirrors ``set_profile_layer``,
+    which only records history for ``hosted_default``, and a rollback isn't
+    a new hosted_default lifecycle event), and no idempotent-no-op-hash
+    short-circuit (a restore must always land exactly on ``revision``,
+    never silently skip because content happens to already match).
+    """
+    scope_type = _pc.normalize_scope_type(scope_type)
+    scope_id = _pc.normalize_scope_id(scope_id)
+    fields = dict(fields or {})
+    reset_fields = _pc.normalize_reset_fields(reset_fields)
+    content_hash = _content_hash(fields, reset_fields)
+    await db.execute(
+        "INSERT INTO profile_layers "
+        "(scope_type, scope_id, schema_version, revision, fields, reset_fields, "
+        "lifecycle_state, content_hash, provenance, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) "
+        "ON CONFLICT(scope_type, scope_id) DO UPDATE SET "
+        "revision = excluded.revision, fields = excluded.fields, "
+        "reset_fields = excluded.reset_fields, lifecycle_state = excluded.lifecycle_state, "
+        "content_hash = excluded.content_hash, provenance = excluded.provenance, "
+        "updated_at = excluded.updated_at",
+        (
+            scope_type, scope_id, _pc.SCHEMA_VERSION, revision,
+            json.dumps(fields), json.dumps(reset_fields), lifecycle_state, content_hash,
+            json.dumps(provenance) if provenance is not None else None,
+        ),
+    )
+    await db.commit()
     return await get_profile_layer(db, scope_type, scope_id)
 
 
