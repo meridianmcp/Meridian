@@ -71,6 +71,21 @@ Deliberately out of scope (per the sprint notes' final sentence): opaque
 vendor-internal subagents this module has no PID/lease visibility into at
 all. The broker only ever knows about a process because SOMETHING called
 :meth:`register` for it — it never guesses.
+
+c5c3fc5f — agent/subprocess execution-event capture
+------------------------------------------------------
+:func:`register_process` / :func:`release_process` are an ADDITIVE async
+layer on top of :meth:`ProcessLeaseBroker.register` / :meth:`.release`
+(both left completely unchanged, still synchronous, still with zero DB
+dependency) that ALSO best-effort records an ``agent.registered`` /
+``agent.released`` :class:`meridian.ai_log.ExecutionEvent` via an injected
+``capture`` callable — see :mod:`meridian.session_tools`'s
+``capture_process_registered``/``capture_process_released`` for the actual
+event shape. This module still never imports ``meridian.db`` or
+``meridian.ai_log`` directly (dependency injection keeps the lease broker's
+own dependency-free contract intact); a caller that has no DB/project
+context simply omits ``capture`` and gets the exact pre-existing
+synchronous behavior.
 """
 from __future__ import annotations
 
@@ -83,7 +98,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from . import process_lifecycle as _process_lifecycle
 
@@ -516,6 +531,106 @@ class ProcessLeaseBroker:
         whichever caller actually owns the shared runtime's lifecycle that
         it's now safe (no more peers depend on it) to tear it down."""
         return self.shared_runtime_refcount(name) == 0
+
+
+# ---------------------------------------------------------------------------
+# c5c3fc5f — capture-aware async wrappers (agent/subprocess execution-event
+# boundary)
+# ---------------------------------------------------------------------------
+#
+# ProcessLeaseBroker.register/release above stay exactly as they were:
+# synchronous, and with ZERO import of meridian.db/meridian.ai_log/
+# meridian.session_tools — this module's own docstring's "lightweight,
+# dependency-free, local-machine contract" is unchanged (the CLI wrapper at
+# the bottom of this file, and every existing in-process caller such as
+# tunnel_client.py, keep working unmodified against the sync methods).
+#
+# These two functions are an ADDITIVE, opt-in async layer on top: a caller
+# that DOES have DB/project context (meridian.session_tools's
+# capture_process_registered/capture_process_released, wired here via
+# dependency injection rather than a direct import — see meridian.
+# session_tools's own module docstring for the full boundary contract) can
+# register a lease AND get a best-effort execution-event recorded in one
+# call, without this module ever importing anything DB-shaped itself. A
+# capture callback that raises is swallowed here: a broken/degraded
+# execution-event sink must never undo, retry, or otherwise affect a lease
+# that already registered/released synchronously above it — this is the
+# "disabled/failed sinks do not lose the local event receipt" contract
+# applied to THIS boundary specifically (the "local event receipt" for a
+# lease IS the WorkerLease itself, already durably persisted by
+# ProcessLeaseBroker._save() before `capture` is ever invoked).
+ProcessCaptureFn = Callable[[WorkerLease], Awaitable[Any]]
+
+
+async def register_process(
+    broker: ProcessLeaseBroker,
+    client: str,
+    pid: int,
+    *,
+    run_id: "str | None" = None,
+    executable: str = "",
+    cwd: "str | None" = None,
+    cmdline: "list[str] | None" = None,
+    create_time: "float | None" = None,
+    group_id: "int | None" = None,
+    job_id: "int | None" = None,
+    ttl_seconds: float = DEFAULT_TTL_SECONDS,
+    shared_runtime: "str | None" = None,
+    owner_key: "str | None" = None,
+    capture: "ProcessCaptureFn | None" = None,
+) -> WorkerLease:
+    """Register a lease exactly like :meth:`ProcessLeaseBroker.register`
+    (synchronous call, unchanged), then — only if *capture* is supplied —
+    best-effort ``await capture(lease)`` so the caller can record an
+    ``agent.registered`` execution event. *capture* failing (or being
+    omitted entirely) never affects the returned, already-registered
+    ``WorkerLease``. Typical caller shape::
+
+        from meridian import session_tools
+        lease = await register_process(
+            broker, "codex", pid,
+            capture=lambda lease: session_tools.capture_process_registered(
+                db, project_id=project_id, run_id=lease.run_id,
+                client=lease.client, executable=lease.executable,
+                cwd=lease.cwd, owner_key=lease.owner_key,
+            ),
+        )
+    """
+    lease = broker.register(
+        client, pid,
+        run_id=run_id, executable=executable, cwd=cwd, cmdline=cmdline,
+        create_time=create_time, group_id=group_id, job_id=job_id,
+        ttl_seconds=ttl_seconds, shared_runtime=shared_runtime,
+        owner_key=owner_key,
+    )
+    if capture is not None:
+        try:
+            await capture(lease)
+        except Exception:  # noqa: BLE001 — capture must never affect an already-registered lease
+            pass
+    return lease
+
+
+async def release_process(
+    broker: ProcessLeaseBroker,
+    client: str,
+    run_id: str,
+    *,
+    capture: "ProcessCaptureFn | None" = None,
+) -> WorkerLease:
+    """Release a lease exactly like :meth:`ProcessLeaseBroker.release`
+    (synchronous call, unchanged, same ``LeaseNotFoundError``/
+    ``ForeignLeaseError`` guardrails), then — only if *capture* is supplied
+    — best-effort ``await capture(lease)`` so the caller can record an
+    ``agent.released`` execution event. See :func:`register_process` for the
+    full contract (identical shape, release half)."""
+    lease = broker.release(client, run_id)
+    if capture is not None:
+        try:
+            await capture(lease)
+        except Exception:  # noqa: BLE001 — capture must never affect an already-released lease
+            pass
+    return lease
 
 
 # ---------------------------------------------------------------------------

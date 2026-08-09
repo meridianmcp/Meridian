@@ -6086,6 +6086,14 @@ async def _dispatch_mcp_tool(
     # Tenant scope for the workspace layer (notes/decisions/settings). None for
     # self-host / unauthenticated; the db functions then skip isolation.
     _mcp_tenant_id = tenant.get("id") if tenant else None
+    # c5c3fc5f — tool-boundary execution-event capture: t0 + a per-dispatch
+    # correlation id, both unconditional (unlike _dispatch_t0/
+    # _dispatch_correlation_id below, which only exist for the
+    # complete_sprint_item special case). See the capture_tool_completed()
+    # call further down, right beside the pre-existing activity-heartbeat
+    # side channel it deliberately mirrors.
+    _capture_t0 = time.monotonic()
+    _capture_correlation_id = uuid.uuid4().hex
     # b6ab6e83 — project_name resolver: accept project_name as alternative to
     # project_id, and resolve non-UUID project_id values as human-readable names.
     _pid_raw = args.get("project_id", "")
@@ -6180,6 +6188,79 @@ async def _dispatch_mcp_tool(
                         db, _act_sid, name, _act_summary
                     )
             except Exception:  # noqa: BLE001 — activity recording must never fail a call
+                pass
+            # c5c3fc5f — session + tool boundary execution-event capture (the
+            # canonical ExecutionEvent contract defined in meridian.ai_log,
+            # wired for real via meridian.session_tools). Fully guarded,
+            # exactly like the activity-heartbeat block immediately above:
+            # a capture failure must never affect `_result`. Two boundaries:
+            #   * session.started — only for start_session/register_session,
+            #     the only explicit session-CREATION tool this codebase has
+            #     (see session_tools.py's docstring for why session.ended has
+            #     no symmetric wiring: no explicit end-session tool exists).
+            #   * tool.completed — for every OTHER executor-session tool
+            #     call, reusing the exact same _EXECUTOR_SESSIONS +
+            #     _ACTIVITY_SKIP_TOOLS gate as the activity heartbeat above
+            #     (established precedent for "which tool calls are signal,
+            #     not polling noise" — not a new policy invented here).
+            # Success-path only (mirrors the heartbeat/nudge side channels
+            # around it) — see session_tools.capture_tool_completed's own
+            # docstring for why the exception path is intentionally not
+            # covered by this dispatcher.
+            try:
+                from .. import session_tools as _session_tools  # noqa: PLC0415
+                _cap_pid = args.get("project_id")
+                if (
+                    name in ("start_session", "register_session")
+                    and isinstance(_result, dict)
+                    and not _result.get("error")
+                ):
+                    _cap_started_sid = (
+                        _result.get("session_id")
+                        or (_result.get("session") or {}).get("id")
+                        or _result.get("id")
+                    )
+                    if _cap_started_sid:
+                        await _session_tools.capture_session_started(
+                            db,
+                            # b6ab6e83's project_name resolver already folds a
+                            # resolved id back into `args` above; the one
+                            # remaining gap is start_session's OWN toml/env
+                            # default-project fallback (64b9907a), which
+                            # resolves inside handle_start_session without
+                            # echoing back into this outer `args` — capture_event
+                            # degrades that case to a soft skip (see its
+                            # docstring), never a broken start_session call.
+                            project_id=_cap_pid,
+                            session_id=_cap_started_sid,
+                            actor_id=name,
+                            human_id=args.get("human_id"),
+                            client=args.get("client"),
+                            role=args.get("role"),
+                            tenant_id=_mcp_tenant_id,
+                        )
+                elif (
+                    _act_sid
+                    and _act_sid in _EXECUTOR_SESSIONS
+                    and name not in _ACTIVITY_SKIP_TOOLS
+                ):
+                    _cap_error = (
+                        _result.get("error")
+                        if isinstance(_result, dict) and _result.get("error")
+                        else None
+                    )
+                    await _session_tools.capture_tool_completed(
+                        db,
+                        project_id=_cap_pid,
+                        tool_name=name,
+                        ok=_cap_error is None,
+                        duration_ms=(time.monotonic() - _capture_t0) * 1000.0,
+                        correlation_id=_capture_correlation_id,
+                        session_id=_act_sid,
+                        tenant_id=_mcp_tenant_id,
+                        error_type=(str(_cap_error)[:120] if _cap_error else None),
+                    )
+            except Exception:  # noqa: BLE001 — capture must never break a tool call
                 pass
             # bf51b12e — planner context-refresh nudge. Fully defensive: any error
             # falls through to the untouched _result. In-memory turn tracking +
