@@ -102,26 +102,11 @@ def _empty_layer_dict(scope_type: str, scope_id: str) -> dict[str, Any]:
     }
 
 
-async def get_profile_layer(db: aiosqlite.Connection, scope_type: str, scope_id: str) -> dict[str, Any]:
-    """Return the raw, single-layer profile for one scope (d8481276).
-
-    A scope with no persisted row gets an empty profile back, never an error
-    — mirrors get_capability_profile's "never a read error" contract. This
-    is one layer only; see :func:`get_effective_profile` for the merged,
-    multi-layer view.
-    """
-    scope_type = _pc.normalize_scope_type(scope_type)
-    scope_id = _pc.normalize_scope_id(scope_id)
-    async with db.execute(
-        "SELECT scope_type, scope_id, schema_version, revision, fields, reset_fields, "
-        "lifecycle_state, content_hash, provenance, updated_at FROM profile_layers "
-        "WHERE scope_type = ? AND scope_id = ?",
-        (scope_type, scope_id),
-    ) as cur:
-        row = await cur.fetchone()
-    if row is None:
-        return _empty_layer_dict(scope_type, scope_id)
-    data = _row_to_dict(row) or {}
+def _decode_layer_row(data: dict[str, Any], scope_type: str, scope_id: str) -> dict[str, Any]:
+    """Shared JSON-decode step for one ``profile_layers`` row -> the dict
+    shape every read in this module returns. Factored out of
+    :func:`get_profile_layer` (PROFILE-7 77369699) so :func:`list_profile_layers`
+    doesn't duplicate this decoding per row."""
     try:
         fields = json.loads(data.get("fields") or "{}")
     except (TypeError, ValueError):
@@ -147,6 +132,70 @@ async def get_profile_layer(db: aiosqlite.Connection, scope_type: str, scope_id:
         "provenance": provenance,
         "updated_at": data.get("updated_at"),
     }
+
+
+async def get_profile_layer(db: aiosqlite.Connection, scope_type: str, scope_id: str) -> dict[str, Any]:
+    """Return the raw, single-layer profile for one scope (d8481276).
+
+    A scope with no persisted row gets an empty profile back, never an error
+    — mirrors get_capability_profile's "never a read error" contract. This
+    is one layer only; see :func:`get_effective_profile` for the merged,
+    multi-layer view.
+    """
+    scope_type = _pc.normalize_scope_type(scope_type)
+    scope_id = _pc.normalize_scope_id(scope_id)
+    async with db.execute(
+        "SELECT scope_type, scope_id, schema_version, revision, fields, reset_fields, "
+        "lifecycle_state, content_hash, provenance, updated_at FROM profile_layers "
+        "WHERE scope_type = ? AND scope_id = ?",
+        (scope_type, scope_id),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return _empty_layer_dict(scope_type, scope_id)
+    data = _row_to_dict(row) or {}
+    return _decode_layer_row(data, scope_type, scope_id)
+
+
+async def list_profile_layers(
+    db: aiosqlite.Connection, scope_type: str | None = None
+) -> list[dict[str, Any]]:
+    """List every persisted ``profile_layers`` row, optionally filtered to
+    one ``scope_type`` (added PROFILE-7 77369699).
+
+    ``batch_read``'s new ``"profile"`` adapter needs a listing operation
+    that, per that item's own design notes, was assumed to have already
+    landed via a sibling PROFILE-5 commit — it had not, in this worktree, so
+    this is added here rather than reimplemented at the batch_read call
+    site. Follows :func:`get_profile_layer`'s own row-shape/JSON-decode
+    convention exactly (via the shared :func:`_decode_layer_row` helper).
+
+    Read-only; never an error for "no rows" — an empty list, the same
+    "never a read error" contract as :func:`get_profile_layer`. Raises
+    ``profile_contract.ProfileContractError`` for an unrecognized
+    ``scope_type``, same as every other scope_type-accepting function in
+    this module. This is a single-layer listing, like
+    :func:`get_profile_layer` — it does NOT resolve/merge across layers;
+    see :func:`get_effective_profile` for that.
+    """
+    params: tuple[Any, ...] = ()
+    where_clause = ""
+    if scope_type is not None:
+        scope_type = _pc.normalize_scope_type(scope_type)
+        where_clause = "WHERE scope_type = ? "
+        params = (scope_type,)
+    async with db.execute(
+        "SELECT scope_type, scope_id, schema_version, revision, fields, reset_fields, "
+        "lifecycle_state, content_hash, provenance, updated_at FROM profile_layers "
+        + where_clause + "ORDER BY scope_type, scope_id",
+        params,
+    ) as cur:
+        rows = await cur.fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        data = _row_to_dict(row) or {}
+        out.append(_decode_layer_row(data, data.get("scope_type"), data.get("scope_id")))
+    return out
 
 
 async def set_profile_layer(

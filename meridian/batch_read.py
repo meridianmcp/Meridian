@@ -71,6 +71,23 @@ Adapters implemented vs deferred
   ``sprint_item_id`` from a different project can never leak pointers
   through this read surface -- mirrors the isolation
   ``_validate_sprint_item_entry`` already enforces on the write side).
+* **profile** (implemented, PROFILE-7 77369699) -- read-only wraps of the
+  PROFILE-1/PROFILE-2 layered-profile persistence
+  (:mod:`meridian.db.profile_layers`), reusing every function AS-IS:
+  ``get_profile_layer`` -> :func:`meridian.db.get_profile_layer`,
+  ``list_profile_layers`` -> :func:`meridian.db.list_profile_layers`,
+  ``get_effective_profile`` -> :func:`meridian.db.get_effective_profile`
+  (the flagship op -- returns the fully merged, generation-keyed effective
+  profile), ``get_profile_layer_revisions`` ->
+  :func:`meridian.db.get_profile_layer_revisions`. Unlike ``sprint_board``,
+  ``get_profile_layer``/``list_profile_layers``/``get_profile_layer_revisions``
+  deliberately do NOT add a project-ownership check on top of the raw DB
+  functions: ``(scope_type, scope_id)`` is not inherently project-scoped for
+  ``hosted_default``/``workspace``/``user`` scopes (only ``project``/
+  ``session`` scope types are actually tied to one project), and PROFILE-5's
+  own ``get_profile_layer`` MCP tool has no such gate either -- this adapter
+  exposes the identical read surface through a different transport, not new
+  authorization semantics.
 * **code / codebase-memory / Serena-style reads** (explicitly DEFERRED, per
   this item's own scoping note: "or document that this adapter proxies to
   an external MCP call"). No local, in-process code-search/graph capability
@@ -173,12 +190,62 @@ async def _op_get_sprint_item_pointers(db: Any, project_id: str, args: "dict[str
     return await db_module.get_sprint_item_pointers(db, sprint_item_id)
 
 
+# ---------------------------------------------------------------------------
+# profile adapter -- thin, read-only wraps of meridian.db.profile_layers
+# (PROFILE-7 77369699). See the module docstring's "profile" bullet for the
+# deliberate absence of a project-ownership gate on the scope-keyed ops.
+# ---------------------------------------------------------------------------
+
+async def _op_get_profile_layer(db: Any, project_id: str, args: "dict[str, Any]") -> Any:
+    scope_type = args.get("scope_type")
+    scope_id = args.get("scope_id")
+    if not isinstance(scope_type, str) or not scope_type.strip():
+        raise ValueError("get_profile_layer requires a non-empty 'scope_type'")
+    if not isinstance(scope_id, str) or not scope_id.strip():
+        raise ValueError("get_profile_layer requires a non-empty 'scope_id'")
+    return await db_module.get_profile_layer(db, scope_type, scope_id)
+
+
+async def _op_list_profile_layers(db: Any, project_id: str, args: "dict[str, Any]") -> Any:
+    scope_type = args.get("scope_type")
+    if scope_type is not None and (not isinstance(scope_type, str) or not scope_type.strip()):
+        raise ValueError("list_profile_layers 'scope_type', when given, must be a non-empty string")
+    return await db_module.list_profile_layers(db, scope_type)
+
+
+async def _op_get_effective_profile(db: Any, project_id: str, args: "dict[str, Any]") -> Any:
+    # get_effective_profile raises ValueError for an unknown project_id --
+    # this engine's dispatch loop maps ValueError -> VALIDATION_ERROR
+    # generically, so no extra try/except is needed here (see batch_read's
+    # own docstring: "Raise ValueError for a bad/malformed args shape").
+    return await db_module.get_effective_profile(
+        db, project_id,
+        session_id=args.get("session_id"),
+        user_scope_id=args.get("user_scope_id"),
+        workspace_scope_id=args.get("workspace_scope_id", "singleton"),
+    )
+
+
+async def _op_get_profile_layer_revisions(db: Any, project_id: str, args: "dict[str, Any]") -> Any:
+    scope_id = args.get("scope_id")
+    if not isinstance(scope_id, str) or not scope_id.strip():
+        raise ValueError("get_profile_layer_revisions requires a non-empty 'scope_id'")
+    limit = args.get("limit", 50)
+    return await db_module.get_profile_layer_revisions(db, scope_id, limit=limit)
+
+
 #: Domain-aware adapter registry: adapter name -> {operation name -> callable}.
 #: See the module docstring's "Adapters implemented vs deferred" section.
 DEFAULT_ADAPTERS: "dict[str, dict[str, AdapterOperation]]" = {
     "sprint_board": {
         "get_sprint_items": _op_get_sprint_items,
         "get_sprint_item_pointers": _op_get_sprint_item_pointers,
+    },
+    "profile": {
+        "get_profile_layer": _op_get_profile_layer,
+        "list_profile_layers": _op_list_profile_layers,
+        "get_effective_profile": _op_get_effective_profile,
+        "get_profile_layer_revisions": _op_get_profile_layer_revisions,
     },
 }
 

@@ -1570,7 +1570,11 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "'get_sprint_items' (args: status, show_blocked, include_human, version, "
         "include_manual_blocker, include_deferred — same meaning as the get_sprint_items tool) "
         "and 'get_sprint_item_pointers' (args: sprint_item_id — 404s if that item belongs to a "
-        "different project). Returns {results: [{request_id, status, adapter, operation, result, "
+        "different project); and 'profile' (PROFILE-7) with operations 'get_profile_layer' (args: "
+        "scope_type, scope_id), 'list_profile_layers' (args: optional scope_type filter), "
+        "'get_effective_profile' (args: optional session_id, user_scope_id, workspace_scope_id — "
+        "returns the merged, generation-keyed effective profile across all 5 layers), and "
+        "'get_profile_layer_revisions' (args: scope_id, optional limit). Returns {results: [{request_id, status, adapter, operation, result, "
         "error_code, error_message, elapsed_ms, cache_hit, coalesced_with}], elapsed_ms} — "
         "results is ALWAYS in input order. error_code is one of VALIDATION_ERROR, "
         "ADAPTER_NOT_FOUND, OPERATION_NOT_FOUND, DEPENDENCY_NOT_FOUND, DEPENDENCY_CYCLE, "
@@ -1591,12 +1595,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "max_requests": {"type": "integer", "description": "Optional cap on len(requests) for this call (default 100)."}},
          "required": ["requests"]}},
     {"name": "batch_mutate", "description":
-        "133bfff6 — run a batch of TRANSACTIONAL mutation entries in ONE call, mixing TWO entry "
+        "133bfff6 — run a batch of TRANSACTIONAL mutation entries in ONE call, mixing entry "
         "kinds selected per-entry via 'kind': 'sprint_item_pointer' (attach a pointer — same "
-        "shape as add_sprint_item_pointer: sprint_item_id, source_type, targets, optional label) "
-        "and 'sprint_item_update' (patch an EXISTING sprint item — same shape as update_sprint_item: "
+        "shape as add_sprint_item_pointer: sprint_item_id, source_type, targets, optional label), "
+        "'sprint_item_update' (patch an EXISTING sprint item — same shape as update_sprint_item: "
         "item_id + at least one patchable field; sprint-item CREATION is not supported here, use "
-        "execute_batch(operation='sprint_items', ...) or add_sprint_item for that). Reuses the exact "
+        "execute_batch(operation='sprint_items', ...) or add_sprint_item for that), and (PROFILE-7) "
+        "'profile_layer' (upsert one scope_type+scope_id profile layer — same shape as "
+        "set_profile_layer: scope_type, scope_id, optional fields/reset_fields/provenance/"
+        "expected_revision; a stale expected_revision surfaces error_code='CONFLICT' with "
+        "expected_revision/actual_revision in the outcome payload). Reuses the exact "
         "same validated apply/compensate logic execute_batch and the single-item tools already use — "
         "no separate/duplicated mutation path. mode is REQUIRED: 'all_or_nothing' validates every "
         "entry BEFORE mutating anything — any validation failure writes NOTHING (status 'rejected'); "
@@ -1615,7 +1623,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "entries": {"type": "array", "description": "Non-empty list of entries, each carrying its own 'kind' ('sprint_item_pointer' or 'sprint_item_update'). Each entry may carry an optional 'correlation_key' string echoed back on its result.", "items": {"type": "object"}},
+         "entries": {"type": "array", "description": "Non-empty list of entries, each carrying its own 'kind' ('sprint_item_pointer', 'sprint_item_update', or 'profile_layer'). Each entry may carry an optional 'correlation_key' string echoed back on its result.", "items": {"type": "object"}},
          "mode": {"type": "string", "enum": ["all_or_nothing", "best_effort"], "description": "REQUIRED — no default."},
          "idempotency_key": {"type": "string", "description": "REQUIRED key (value may be null or \"\" to explicitly opt out)."},
          "session_id": {"type": "string", "description": "Optional attribution for the idempotency receipt."},
