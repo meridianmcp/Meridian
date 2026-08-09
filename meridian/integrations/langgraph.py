@@ -21,6 +21,7 @@ can answer and the graph can resume.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, AsyncIterator, Iterator
 
 import httpx
@@ -52,6 +53,13 @@ class MeridianCheckpointer:
         if api_token:
             self.headers["Authorization"] = f"Bearer {api_token}"
         self._session_id: str | None = None
+        # Same class of check-then-act race as _deps._tenant_db_cache /
+        # doc_store._doc_store_cache (instance-scoped here instead of a
+        # module-level dict): two graph nodes calling _log_task/_ensure_session
+        # concurrently before the first POST completes both see
+        # self._session_id as None and both register a session -- the
+        # loser's session_id is discarded, leaving an orphaned session row.
+        self._session_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -60,18 +68,23 @@ class MeridianCheckpointer:
     async def _ensure_session(self) -> str:
         if self._session_id:
             return self._session_id
-        async with httpx.AsyncClient(timeout=10) as http:
-            resp = await http.post(
-                f"{self.api_url}/sessions/register",
-                headers={**self.headers, "Content-Type": "application/json"},
-                json={
-                    "project_id": self.project_id,
-                    "name": "langgraph-worker",
-                    "agent_framework": "langgraph",
-                },
-            )
-            resp.raise_for_status()
-            self._session_id = resp.json()["id"]
+        async with self._session_lock:
+            # Double-checked: another concurrent caller may have already
+            # registered the session while we were blocked on the lock.
+            if self._session_id:
+                return self._session_id
+            async with httpx.AsyncClient(timeout=10) as http:
+                resp = await http.post(
+                    f"{self.api_url}/sessions/register",
+                    headers={**self.headers, "Content-Type": "application/json"},
+                    json={
+                        "project_id": self.project_id,
+                        "name": "langgraph-worker",
+                        "agent_framework": "langgraph",
+                    },
+                )
+                resp.raise_for_status()
+                self._session_id = resp.json()["id"]
         return self._session_id  # type: ignore[return-value]
 
     async def _log_task(self, description: str, status: str = "done") -> None:

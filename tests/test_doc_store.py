@@ -566,6 +566,58 @@ def test_open_doc_store_for_caches_by_target(tmp_path, monkeypatch):
     asyncio.run(_run())
 
 
+def test_open_doc_store_for_concurrent_same_target_opens_exactly_once(tmp_path, monkeypatch):
+    """Regression: two concurrent open_doc_store_for() calls for the SAME
+    not-yet-cached target must not each open their own connection.
+
+    Before the per-target lock fix, the check ("cached = _doc_store_cache.get
+    (target); if cached is not None: return") and the write
+    ("_doc_store_cache[target] = store") were separated by an `await
+    db_module.init_db(target)` with nothing serializing concurrent callers.
+    Two requests racing a cold cache both passed the check, both opened their
+    own connection, and whichever finished last silently overwrote the
+    cache -- orphaning the other connection with no reference left anywhere
+    to close it (confirmed live in production for the identical pattern in
+    _deps._open_tenant_db_by_id: leaked AsyncConnectionPool instances,
+    "Task was destroyed but it is pending!" in server logs).
+    """
+    async def _run():
+        doc_store._reset_doc_store_cache()
+        doc_store._doc_store_locks.clear()
+        try:
+            call_count = {"n": 0}
+            real_init_db = db_module.init_db
+
+            async def _slow_init_db(target):
+                call_count["n"] += 1
+                # A real await here is what lets a second concurrently-
+                # scheduled caller's coroutine actually run before this one
+                # finishes -- exactly the window the race needs.
+                await asyncio.sleep(0.02)
+                return await real_init_db(target)
+
+            monkeypatch.setattr(db_module, "init_db", _slow_init_db)
+
+            kwargs = dict(
+                plan="free", hosted=False, data_dir=str(tmp_path),
+                tenant_pg_url=None, override_url=None,
+            )
+            s1, s2 = await asyncio.gather(
+                doc_store.open_doc_store_for(**kwargs),
+                doc_store.open_doc_store_for(**kwargs),
+            )
+
+            assert call_count["n"] == 1, (
+                "two concurrent callers for the same target must open the "
+                "underlying connection exactly once, not race to open two"
+            )
+            assert s1 is s2
+        finally:
+            await doc_store.close_all_doc_stores()
+
+    asyncio.run(_run())
+
+
 # ---------------------------------------------------------------------------
 # Guarded wiring — ingest survives a store failure; lifespan tolerates open fail
 # ---------------------------------------------------------------------------

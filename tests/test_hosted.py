@@ -447,6 +447,68 @@ async def test_non_admin_tenant_with_null_db_gets_503(monkeypatch):
     assert deps_module._tenant_db_cache.get("free-tenant-1") is None
 
 
+@pytest.mark.asyncio
+async def test_open_tenant_db_concurrent_same_tenant_opens_pool_exactly_once(monkeypatch):
+    """Regression: two concurrent requests for the SAME not-yet-cached
+    tenant_id must not each provision their own AsyncConnectionPool.
+
+    Before the per-tenant_id lock fix, the check
+    ("if tenant_id in _tenant_db_cache: return ...") and the write
+    ("_tenant_db_cache[tenant_id] = conn") were separated by
+    `await init_pg_db(url)` with nothing serializing concurrent callers. Two
+    requests racing a cold cache for the same tenant both opened their own
+    pool; whichever finished last silently overwrote the cache, orphaning
+    the loser's pool with no reference anywhere to close it. Confirmed live
+    in production: server logs show "Task was destroyed but it is pending!"
+    for AsyncConnectionPool.worker, with the pool's internal instance
+    counter climbing (pool-2 through pool-5+) over days -- each leaked pool
+    holding up to 10 orphaned Postgres connections.
+    """
+    import meridian._deps as deps_module
+    import meridian.pg_adapter as pg_adapter
+    import meridian.tenant_crypto as tenant_crypto
+
+    deps_module._tenant_db_cache.clear()
+    deps_module._tenant_db_locks.clear()
+
+    async def fake_get_tenant_by_id(_db, tenant_id):
+        return {"id": tenant_id, "plan": "pro", "neon_db_url": "enc:valid"}
+
+    def fake_decrypt(_tenant_id, _value):
+        return "postgresql://tenant-db"
+
+    call_count = {"n": 0}
+
+    async def fake_init_pg_db(url):
+        call_count["n"] += 1
+        # A real await here is what lets a second concurrently-scheduled
+        # caller's coroutine actually run before this one finishes --
+        # exactly the window the race needs.
+        await asyncio.sleep(0.02)
+        return {"opened_url": url, "instance": call_count["n"]}
+
+    monkeypatch.setattr(db_module, "get_tenant_by_id", fake_get_tenant_by_id)
+    monkeypatch.setattr(tenant_crypto, "decrypt_tenant_db_url", fake_decrypt)
+    monkeypatch.setattr(pg_adapter, "init_pg_db", fake_init_pg_db)
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(db="auth-db")),
+        state=SimpleNamespace(),
+    )
+
+    conn1, conn2 = await asyncio.gather(
+        deps_module._open_tenant_db_by_id(request, "race-tenant-1"),
+        deps_module._open_tenant_db_by_id(request, "race-tenant-1"),
+    )
+
+    assert call_count["n"] == 1, (
+        "two concurrent callers for the same tenant must open the "
+        "connection pool exactly once, not race to open two"
+    )
+    assert conn1 is conn2
+    assert deps_module._tenant_db_cache["race-tenant-1"] is conn1
+
+
 def test_strip_unsupported_pg_query_params_preserves_sslmode():
     import meridian.pg_adapter as pg_adapter
 
