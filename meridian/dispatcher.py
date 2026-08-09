@@ -83,11 +83,70 @@ def is_enabled() -> bool:
     return os.environ.get(ENABLE_ENV_VAR) == "1"
 
 
+# 49e06bcb — lightweight worker execution classes + deterministic routing.
+#
+# Historically every dispatched item got the identical prompt: "you are an
+# autonomous Claude Code session, do whatever it takes." That is the right
+# call for genuinely ambiguous implementation work, but wasteful and
+# needlessly nondeterministic for an item that is really just "run the
+# verification/evidence/bookkeeping this item already declares" — no
+# judgment call required. This routes the latter to a distinct,
+# deterministic worker class while a full Claude session stays the
+# default for everything else — the classifier below recognizes only a
+# small, explicit title-prefix allowlist, so no existing, untagged item
+# can ever be reclassified out from under it.
+#
+# The routing decision travels to meridian.enqueue._run_worker as a
+# single, optional leading marker line on the returned prompt string —
+# the only channel available without widening this item's locked-symbol
+# scope (Dispatcher.__init__ / dispatch_once belong to sibling items
+# 869d6198 / 272d8f2c in this same wave) or introducing a
+# dispatcher<->enqueue import cycle (enqueue.py is the lower-level
+# module and must not import this one). enqueue.py owns its own copy of
+# the exact marker text; keep the two in sync by hand if either changes.
+SESSION_WORKER_CLASS = "session"
+DETERMINISTIC_WORKER_CLASS = "deterministic"
+
+# Wire-format contract with meridian/enqueue.py::_run_worker — must match
+# enqueue._DETERMINISTIC_WORKER_MARKER_LINE exactly.
+_WORKER_CLASS_MARKER_LINE = "[worker-class: deterministic]"
+
+# Deterministic (no LLM judgment involved) signal only: an explicit title
+# tag. milestone_type is NOT used here — it is a strictly validated enum
+# of only "task" / "milestone" / "human" (see db/sprint_items.py), none of
+# which distinguish "targeted verification/evidence/bookkeeping" from
+# ordinary implementation work, so it would be dead weight in this check.
+_DETERMINISTIC_TITLE_PREFIXES = ("VERIFY:", "EVIDENCE:", "BOOKKEEPING:", "AUDIT:", "CHECK:")
+
+
+def _classify_worker_execution(item: dict[str, Any]) -> str:
+    """Pure, deterministic execution-class routing for one sprint item.
+
+    Returns ``SESSION_WORKER_CLASS`` (default) unless the item's own
+    ``title`` opts in with one of ``_DETERMINISTIC_TITLE_PREFIXES``, in
+    which case it returns ``DETERMINISTIC_WORKER_CLASS``. A pure function
+    of ``item["title"]`` only — no network/LLM call — so calling it twice
+    for the same item always returns the same answer, and an item that
+    predates this feature (no such prefix) is always ``SESSION_WORKER_CLASS``.
+    """
+    title = (item.get("title") or "").strip().upper()
+    if title.startswith(_DETERMINISTIC_TITLE_PREFIXES):
+        return DETERMINISTIC_WORKER_CLASS
+    return SESSION_WORKER_CLASS
+
+
 def _worker_prompt(item: dict[str, Any], project_id: str) -> str:
     """Build the worker prompt for one sprint item.
 
     Kept small and deterministic so tests can assert on it. The worker is a
-    full Claude Code session pointed at a single sprint item.
+    full Claude Code session pointed at a single sprint item — UNLESS
+    :func:`_classify_worker_execution` routes it to the lightweight
+    deterministic worker class instead (49e06bcb), in which case the
+    returned prompt carries a leading routing marker line
+    (``meridian.enqueue._run_worker`` strips it before use — it never
+    reaches the subprocess or the persisted task description) and asks
+    for a scoped verification/evidence/bookkeeping pass instead of
+    open-ended implementation.
     """
     item_id = item.get("id", "")
     title = (item.get("title") or "").strip()
@@ -97,6 +156,18 @@ def _worker_prompt(item: dict[str, Any], project_id: str) -> str:
         if resources
         else ""
     )
+    if _classify_worker_execution(item) == DETERMINISTIC_WORKER_CLASS:
+        return (
+            f"{_WORKER_CLASS_MARKER_LINE}\n"
+            f"You are a deterministic Meridian worker for project {project_id}.\n"
+            f"Work ONLY on sprint item {item_id}: {title}\n"
+            f"{res_line}"
+            f"This is targeted verification, evidence, or bookkeeping — not "
+            f"open-ended implementation: claim the item (claim_sprint_item), "
+            f"run the item's declared verification (its verification_command "
+            f"or the test suite), record the result, then call "
+            f"complete_sprint_item. Do not make unrelated code changes."
+        )
     return (
         f"You are an autonomous Meridian worker for project {project_id}.\n"
         f"Work ONLY on sprint item {item_id}: {title}\n"

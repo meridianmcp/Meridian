@@ -62,6 +62,85 @@ def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
     return text[:limit] + f"\n... [truncated, {len(text) - limit} more chars]"
 
 
+# 49e06bcb — lightweight worker execution classes + deterministic routing.
+#
+# See meridian/dispatcher.py::_worker_prompt (and its module-level
+# _classify_worker_execution) for the actual routing DECISION — this
+# module only consumes the result. Wire format: an optional, exact
+# leading line on `prompt`. A prompt with no marker (every caller that
+# predates this feature, and every existing test that hands _run_worker
+# a plain prompt string directly) resolves to SESSION_WORKER — today's
+# exact, unchanged behavior.
+_DETERMINISTIC_WORKER_MARKER_LINE = "[worker-class: deterministic]"
+
+# Distinct log-prefixes for the deterministic class so a downstream reader
+# (e.g. a future worker-telemetry adapter — 28da27fd, out of scope here)
+# can tell a scripted verification/evidence/bookkeeping run apart from a
+# full, ambiguous Claude Code session from the task row's description
+# alone, without re-parsing prompt text. The marker line itself never
+# reaches the persisted description or the subprocess argv — see
+# _route_worker_execution below.
+DETERMINISTIC_PROMPT_PREFIX = "[enqueued-deterministic-task] "
+DETERMINISTIC_RESULT_PREFIX = "[deterministic-result] "
+DETERMINISTIC_ERROR_PREFIX = "[deterministic-error] "
+
+
+class WorkerExecutionClass:
+    """Lightweight descriptor for one worker execution class.
+
+    Both classes below still spawn ``argv`` as a real subprocess and
+    share IDENTICAL lease (PID recording via
+    :func:`meridian.db.update_task_worker_pid`), timeout, and
+    ``pending -> in_progress -> done/failed`` status-transition mechanics
+    in :func:`_run_worker` — 49e06bcb's "preserve leases, receipts,
+    project identity, and failure policy" requirement is met by NOT
+    forking that plumbing per class. All a class actually varies is the
+    three task-log prefixes used to label its run: enough for a
+    downstream consumer to distinguish "targeted, deterministic
+    verification/evidence/bookkeeping" from "full, ambiguous
+    implementation session" without any extra state.
+    """
+
+    __slots__ = ("name", "prompt_prefix", "result_prefix", "error_prefix")
+
+    def __init__(
+        self, name: str, prompt_prefix: str, result_prefix: str, error_prefix: str
+    ) -> None:
+        self.name = name
+        self.prompt_prefix = prompt_prefix
+        self.result_prefix = result_prefix
+        self.error_prefix = error_prefix
+
+
+# The only execution class prior to 49e06bcb, unchanged: the same three
+# module-level prefixes every existing caller/test already asserts on.
+SESSION_WORKER = WorkerExecutionClass("session", PROMPT_PREFIX, RESULT_PREFIX, ERROR_PREFIX)
+DETERMINISTIC_WORKER = WorkerExecutionClass(
+    "deterministic",
+    DETERMINISTIC_PROMPT_PREFIX,
+    DETERMINISTIC_RESULT_PREFIX,
+    DETERMINISTIC_ERROR_PREFIX,
+)
+
+
+def _route_worker_execution(prompt: str) -> "tuple[WorkerExecutionClass, str]":
+    """Split an optional leading routing marker off ``prompt``.
+
+    Returns ``(execution_class, effective_prompt)``. ``effective_prompt``
+    has the marker line (and the single newline after it) removed so
+    neither the subprocess argv nor the persisted task description ever
+    see the internal routing marker — both look byte-identical to
+    pre-49e06bcb output for the SESSION class. Any prompt without an
+    EXACT, recognized marker on its own first line — including every
+    prompt that predates this feature — resolves to ``SESSION_WORKER``,
+    so this can never change behavior for an existing caller.
+    """
+    first_line, sep, rest = prompt.partition("\n")
+    if sep and first_line == _DETERMINISTIC_WORKER_MARKER_LINE:
+        return DETERMINISTIC_WORKER, rest
+    return SESSION_WORKER, prompt
+
+
 async def _run_worker(
     db: aiosqlite.Connection,
     task_id: str,
@@ -74,11 +153,23 @@ async def _run_worker(
     Never raises — failures are recorded on the task row as ``failed``.
     Each result branch returns; the caller awaits this coroutine only in
     tests (production fires it via :func:`asyncio.create_task`).
+
+    49e06bcb — routes to one of two lightweight worker execution classes
+    (module-level ``SESSION_WORKER`` / ``DETERMINISTIC_WORKER``) based on
+    an optional leading marker line on ``prompt`` (see
+    :func:`_route_worker_execution`; ``meridian.dispatcher._worker_prompt``
+    is the only thing that ever emits the marker). Both classes share this
+    exact subprocess/PID/timeout/status machinery — only the task-log
+    prefixes differ — so leases, receipts, project identity, and failure
+    policy are identical across classes. A prompt with no marker (every
+    pre-49e06bcb caller) is ``SESSION_WORKER``, i.e. byte-identical to
+    this function's prior behavior.
     """
+    worker_class, effective_prompt = _route_worker_execution(prompt)
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
-            prompt,
+            effective_prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -88,7 +179,7 @@ async def _run_worker(
             task_id,
             status="failed",
             description=(
-                f"{ERROR_PREFIX}{prompt}\n\n"
+                f"{worker_class.error_prefix}{effective_prompt}\n\n"
                 f"worker command not found: {argv[0]} ({exc})"
             ),
         )
@@ -99,7 +190,7 @@ async def _run_worker(
             task_id,
             status="failed",
             description=(
-                f"{ERROR_PREFIX}{prompt}\n\n"
+                f"{worker_class.error_prefix}{effective_prompt}\n\n"
                 f"failed to spawn worker: {type(exc).__name__}: {exc}"
             ),
         )
@@ -109,7 +200,7 @@ async def _run_worker(
     await db_module.update_task(
         db, task_id,
         status="in_progress",
-        description=f"{PROMPT_PREFIX}{prompt}\n\n[worker PID: {proc.pid}]",
+        description=f"{worker_class.prompt_prefix}{effective_prompt}\n\n[worker PID: {proc.pid}]",
     )
     await db_module.update_task_worker_pid(db, task_id, proc.pid)
 
@@ -125,7 +216,7 @@ async def _run_worker(
             task_id,
             status="failed",
             description=(
-                f"{ERROR_PREFIX}{prompt}\n\n"
+                f"{worker_class.error_prefix}{effective_prompt}\n\n"
                 f"worker timed out after {timeout}s"
             ),
         )
@@ -140,7 +231,7 @@ async def _run_worker(
             db,
             task_id,
             status="done",
-            description=f"{RESULT_PREFIX}{prompt}\n\n{body}",
+            description=f"{worker_class.result_prefix}{effective_prompt}\n\n{body}",
         )
     else:
         body = stderr or stdout or "(no output)"
@@ -149,7 +240,7 @@ async def _run_worker(
             task_id,
             status="failed",
             description=(
-                f"{ERROR_PREFIX}{prompt}\n\n"
+                f"{worker_class.error_prefix}{effective_prompt}\n\n"
                 f"exit code {proc.returncode}\n{_truncate(body)}"
             ),
         )
