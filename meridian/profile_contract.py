@@ -539,6 +539,28 @@ class EffectiveProfile(BaseModel):
     layers_applied: list[str] = Field(default_factory=list)
     generation_key: str = ""
     refresh_required: bool = False
+    #: Per-field ``{"old": ..., "new": ...}`` diff report. Folded in from
+    #: profile_resolution.py's ``EffectiveProfile.changed_fields``
+    #: (ac95d206) during the PROFILE-RECON reconciliation (732c113e) --
+    #: this was the one piece dropped by the initial reconciliation pass
+    #: (caught on re-verification). See _compute_changed_fields.
+    #:
+    #: When ``previous_fields`` is supplied to resolve_effective_profile,
+    #: this piggybacks on the exact same touched-field-name comparison
+    #: already used for ``refresh_required``/``restart_report`` -- each
+    #: entry's "old"/"new" come straight from ``previous_fields``/
+    #: ``effective`` via the same ``.get()`` calls, so a field absent from
+    #: ``previous_fields`` reports ``old=None`` (matching this module's
+    #: sparse-``fields`` convention -- an untouched field is simply absent,
+    #: not defaulted -- unlike profile_resolution.py's registry-defaults
+    #: -pre-seeded ``effective``; see test_profile_contract.py's
+    #: "documented divergences" section). When ``previous_fields`` is
+    #: omitted, every field actually set by some layer is diffed against
+    #: its FIELD_REGISTRY default instead (mirrors profile_resolution.py's
+    #: "no baseline -> diff against defaults" behavior, including that a
+    #: layer re-declaring its own default value still counts as changed --
+    #: it was still explicitly set by a layer, not silently defaulted).
+    changed_fields: dict[str, dict[str, Any]] = Field(default_factory=dict)
     #: Per-component (tunnel/connector/capability/general) restart/refresh
     #: severity among CHANGED fields — "none" | "hot_reload" |
     #: "explicit_refresh_required" | "restart_required". Folded in from
@@ -653,6 +675,15 @@ def resolve_effective_profile(
     ``restart_required`` (see :func:`_compute_restart_report`) — folded in
     from profile_resolution.py during the PROFILE-RECON reconciliation
     (732c113e).
+
+    ``changed_fields`` (also folded in from profile_resolution.py during
+    the PROFILE-RECON reconciliation, 732c113e) is always populated, in one
+    of two modes: with ``previous_fields`` given, it reuses that same
+    touched-field-name diff verbatim (one ``{"old", "new"}`` entry per name
+    in ``changed_field_names``); without it, every field this resolution
+    actually set is diffed against its FIELD_REGISTRY default instead. See
+    the field's own docstring on :class:`EffectiveProfile` for the exact
+    contract.
     """
     registry = field_registry or FIELD_REGISTRY
     ordered_layers = sorted(layers, key=lambda layer: SCOPE_TYPES.index(layer.scope_type))
@@ -765,6 +796,30 @@ def resolve_effective_profile(
                 spec = registry.get(field_name)
                 if spec is not None and spec.restart_class == "explicit_refresh_required":
                     refresh_required = True
+        # Piggyback on the touched-field-name diff just computed above for
+        # refresh_required/restart_report -- same field names, same
+        # effective/previous_fields .get() calls, just packaged as
+        # {"old", "new"} pairs. Folded in from profile_resolution.py's
+        # EffectiveProfile.changed_fields (ac95d206) during the
+        # PROFILE-RECON reconciliation (732c113e).
+        changed_fields = {
+            field_name: {"old": previous_fields.get(field_name), "new": effective.get(field_name)}
+            for field_name in changed_field_names
+        }
+    else:
+        # No baseline to diff against -- fall back to each touched field's
+        # FIELD_REGISTRY default, mirroring profile_resolution.py's
+        # "previous_effective_fields is None" branch. Every field this
+        # resolution actually set (i.e. every key in `effective`) counts as
+        # changed, even if a layer happened to re-declare the default value
+        # verbatim -- it was still an explicit declaration, not silence.
+        changed_fields = {
+            field_name: {
+                "old": registry[field_name].default if field_name in registry else None,
+                "new": value,
+            }
+            for field_name, value in effective.items()
+        }
 
     restart_report, restart_required = _compute_restart_report(changed_field_names, registry)
 
@@ -777,6 +832,7 @@ def resolve_effective_profile(
         layers_applied=layers_applied,
         generation_key=generation_key,
         refresh_required=refresh_required,
+        changed_fields=changed_fields,
         restart_report=restart_report,
         restart_required=restart_required,
     )

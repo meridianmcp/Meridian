@@ -312,6 +312,58 @@ def test_restart_report_all_none_when_nothing_changed():
 
 
 # ---------------------------------------------------------------------------
+# changed_fields (folded in from profile_resolution.py's
+# EffectiveProfile.changed_fields, ac95d206 -- this was the one piece the
+# initial PROFILE-RECON reconciliation (732c113e) silently dropped; ported
+# here on re-verification from the deleted tests/test_profile_resolution.py's
+# test_changed_fields_against_defaults_when_no_previous_given,
+# test_changed_fields_against_explicit_previous, and (partially --
+# the restart/refresh half is already covered by
+# test_restart_report_all_none_when_nothing_changed above)
+# test_no_change_yields_no_restart_or_refresh_required. Adapted for
+# profile_contract.py's own sparse-``fields``/``previous_fields`` shape --
+# see the "documented divergences" section below: profile_resolution.py
+# pre-seeded `effective`/a full `previous_effective_fields` baseline with
+# every FIELD_REGISTRY default; profile_contract.py's `effective` and its
+# callers' `previous_fields` only ever carry fields some layer actually set.
+# ---------------------------------------------------------------------------
+
+def test_changed_fields_against_defaults_when_no_previous_given():
+    result = pc.resolve_effective_profile([
+        _layer("project", {"auto_worktrees": 0}, scope_id="p1"),
+    ])
+    assert result.changed_fields == {
+        "auto_worktrees": {"old": pc.FIELD_REGISTRY["auto_worktrees"].default, "new": 0},
+    }
+
+
+def test_changed_fields_against_explicit_previous():
+    layers = [_layer("project", {"auto_worktrees": 0, "code_intel_enabled": 1}, scope_id="p1")]
+    # A sparse previous baseline (profile_contract.py's own `fields` shape --
+    # only fields some prior layer actually set, not every registry
+    # default) with auto_worktrees already at 0 -- only code_intel_enabled
+    # should show up as changed. code_intel_enabled is absent from
+    # `previous`, so its reported "old" is None (piggybacking verbatim on
+    # the same previous_fields.get()/effective.get() calls already used for
+    # refresh_required/restart_report -- not re-derived from the registry).
+    previous = {"auto_worktrees": 0}
+    result = pc.resolve_effective_profile(layers, previous_fields=previous)
+    assert result.changed_fields == {"code_intel_enabled": {"old": None, "new": 1}}
+
+
+def test_no_change_yields_empty_changed_fields():
+    layers = [_layer("project", {"auto_worktrees": 0}, scope_id="p1")]
+    first = pc.resolve_effective_profile(layers)
+    second = pc.resolve_effective_profile(layers, previous_fields=first.fields)
+    assert second.changed_fields == {}
+    # Restart/refresh half of the original (deleted) test -- also covered by
+    # test_restart_report_all_none_when_nothing_changed above.
+    assert second.restart_required is False
+    assert second.refresh_required is False
+    assert all(v == "none" for v in second.restart_report.values())
+
+
+# ---------------------------------------------------------------------------
 # Documented divergences from profile_resolution.py -- these pin
 # profile_contract.py's ACTUAL (deliberately different) behavior so a future
 # reader can see exactly what changed rather than re-discovering it.
