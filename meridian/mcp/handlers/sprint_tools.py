@@ -21,6 +21,7 @@ and avoid circular imports with ``meridian.mcp.handler``.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -1511,6 +1512,65 @@ async def handle_complete_sprint_item(
         except Exception:  # noqa: BLE001
             pass
 
+    # 427b7902 / a8c0f3b7 / e24f2daa — three of this function's checks (GitHub
+    # CI state, the code-intel prospecting receipt, and test-run-receipt
+    # evidence) are each an independent read-only DB and/or network
+    # round-trip that used to run one after another, purely because they
+    # were written one after another. f291bb24 — none of the three depends
+    # on another's RESULT (only on `_pre_item`, fetched once below), so this
+    # runs all three CONCURRENTLY via asyncio.gather instead of serially.
+    # Every gate that consumes their results (immediately below, and the
+    # code-intel/test-run gates further down) keeps its EXACT pre-existing
+    # condition, message, and override contract, in the EXACT same
+    # evaluation order as before — only the wall-clock cost of fetching the
+    # underlying data changed, not what is computed or which gate wins when
+    # more than one would fail at once.
+    _ci_pre: dict[str, Any] | None = None
+    _ci_checked = False
+    _override_ci = bool(args.get("override_ci"))
+    _code_intel_check: dict[str, Any] | None = None
+    _code_intel_override: dict[str, Any] | None = None
+    _test_run_evidence: dict[str, Any] | None = None
+    _test_run_receipt_override: dict[str, Any] | None = None
+    try:
+        _pre_item = await db_module.get_sprint_item(db, args["item_id"])
+    except Exception:  # noqa: BLE001
+        _pre_item = None
+    _pre_item_matches = (
+        _pre_item is not None and _pre_item.get("project_id") == args["project_id"]
+    )
+
+    async def _run_ci_check() -> dict[str, Any] | None:
+        if not _pre_item_matches:
+            return None
+        _ci_text = f"{args.get('notes') or ''} {(_pre_item.get('notes') or '')}"
+        return await _verify_item_ci(db, args["project_id"], tenant, _ci_text)
+
+    async def _run_code_intel_check() -> dict[str, Any] | None:
+        if not _pre_item_matches:
+            return None
+        from meridian.code_intel_receipt import (  # noqa: PLC0415
+            verify_code_intel_prospecting,
+        )
+        return await verify_code_intel_prospecting(
+            db, tenant, args["project_id"], _pre_item,
+            session_id=_complete_session_id or None,
+        )
+
+    async def _run_test_run_evidence() -> dict[str, Any] | None:
+        try:
+            _root = await test_run_receipt_module.resolve_repo_root_for_session(
+                db, _server._REPO_ROOT, _complete_session_id or None,
+            )
+            return test_run_receipt_module.get_test_run_evidence(_root)
+        except Exception:  # noqa: BLE001 — evidence surfacing must never block completion
+            return None
+
+    _ci_pre, _code_intel_check, _test_run_evidence = await asyncio.gather(
+        _run_ci_check(), _run_code_intel_check(), _run_test_run_evidence(),
+    )
+    _ci_checked = _pre_item_matches
+
     # 427b7902 — HARD CI GATE: refuse to complete when GitHub Actions CI for the
     # commit named in the notes is GENUINELY FAILING. This upgrades the b121348e
     # advisory (which only WARNED post-completion) to a real gate, mirroring the
@@ -1524,35 +1584,24 @@ async def handle_complete_sprint_item(
     #     override_ci=true to complete anyway (records that the failing CI was
     #     acknowledged). The result is cached so the advisory block below reuses
     #     it without a second GitHub round-trip.
-    _ci_pre: dict[str, Any] | None = None
-    _ci_checked = False
-    _override_ci = bool(args.get("override_ci"))
-    try:
-        _pre_item = await db_module.get_sprint_item(db, args["item_id"])
-    except Exception:  # noqa: BLE001
-        _pre_item = None
-    if _pre_item is not None and _pre_item.get("project_id") == args["project_id"]:
-        _ci_text = f"{args.get('notes') or ''} {(_pre_item.get('notes') or '')}"
-        _ci_pre = await _verify_item_ci(db, args["project_id"], tenant, _ci_text)
-        _ci_checked = True
-        if (
-            not _override_ci
-            and _ci_pre is not None
-            and _ci_pre.get("state") == "failure"
-        ):
-            return {
-                "error": "CI_FAILING",
-                "item_id": args["item_id"],
-                "ci_verification": _ci_pre,
-                "message": (
-                    f"Refusing to complete {args['item_id']}: GitHub Actions CI "
-                    f"is FAILING for commit {_ci_pre.get('sha')} "
-                    f"({_ci_pre.get('failed')}/{_ci_pre.get('total')} checks failed). "
-                    "Fix CI and re-push, or pass override_ci=true to acknowledge "
-                    "and complete anyway. (Unknown/pending CI is never blocked — "
-                    "only a real failing status.)"
-                ),
-            }
+    if (
+        not _override_ci
+        and _ci_pre is not None
+        and _ci_pre.get("state") == "failure"
+    ):
+        return {
+            "error": "CI_FAILING",
+            "item_id": args["item_id"],
+            "ci_verification": _ci_pre,
+            "message": (
+                f"Refusing to complete {args['item_id']}: GitHub Actions CI "
+                f"is FAILING for commit {_ci_pre.get('sha')} "
+                f"({_ci_pre.get('failed')}/{_ci_pre.get('total')} checks failed). "
+                "Fix CI and re-push, or pass override_ci=true to acknowledge "
+                "and complete anyway. (Unknown/pending CI is never blocked — "
+                "only a real failing status.)"
+            ),
+        }
 
     # e7548587 — _complete_actor is now computed up top (alongside
     # _complete_session_id), before the merge-approval block that needs it
@@ -1634,16 +1683,12 @@ async def handle_complete_sprint_item(
     # self-report. Fails CLOSED only for availability_policy="required"
     # (mirrors verify_strict_completion_evidence's fail-closed contract);
     # "optional"/"degraded_ok" degrade with a warning instead of blocking.
-    _code_intel_check: dict[str, Any] | None = None
-    _code_intel_override: dict[str, Any] | None = None
-    if _pre_item is not None and _pre_item.get("project_id") == args["project_id"]:
+    # f291bb24 — _code_intel_check was already computed concurrently (with the
+    # CI and test-run-evidence checks) above; this block only evaluates the
+    # gate against that pre-computed result now, same condition as before.
+    if _code_intel_check is not None:
         from meridian.code_intel_receipt import (  # noqa: PLC0415
-            verify_code_intel_prospecting,
             record_prospect_receipt_override,
-        )
-        _code_intel_check = await verify_code_intel_prospecting(
-            db, tenant, args["project_id"], _pre_item,
-            session_id=_complete_session_id or None,
         )
         if _code_intel_check.get("applicable") and not _code_intel_check.get("ok"):
             _ci_override_requested = bool(args.get("override_code_intel_receipt"))
@@ -1692,15 +1737,11 @@ async def handle_complete_sprint_item(
     #      non-empty override_reason acknowledges and completes anyway
     #      (audited via record_test_run_receipt_override), same pattern as
     #      override_strict_evidence / override_code_intel_receipt.
-    _test_run_evidence: dict[str, Any] | None = None
-    _test_run_receipt_override: dict[str, Any] | None = None
-    try:
-        _test_run_repo_root = await test_run_receipt_module.resolve_repo_root_for_session(
-            db, _server._REPO_ROOT, _complete_session_id or None,
-        )
-        _test_run_evidence = test_run_receipt_module.get_test_run_evidence(_test_run_repo_root)
-    except Exception:  # noqa: BLE001 — evidence surfacing must never block completion
-        _test_run_evidence = None
+    # f291bb24 — _test_run_evidence (the always-best-effort surfacing half of
+    # this gate) was already computed concurrently above, alongside the CI
+    # and code-intel checks; only the opt-in strict gate below still runs its
+    # own dedicated verify_test_run_receipt_evidence call (rare, so left
+    # sequential rather than folded into the concurrent batch).
     _strict_test_evidence = bool(args.get("strict_test_evidence")) or bool(
         (_pre_item or {}).get("require_strict_test_evidence")
     )
