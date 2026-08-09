@@ -2968,14 +2968,24 @@ def test_serena_pool_spawn_records_pid(tmp_path, monkeypatch):
 
 def test_serena_daemon_pool_wired_via_serena_pool_spawn_in_run_tunnel():
     """6c29d144: run_tunnel must wire SerenaDaemonPool's spawn callable to
-    _serena_pool_spawn (not a bare subprocess.Popen lambda) so every Serena
-    daemon it spawns is recorded in the all-spawned PID registry. Guards
-    against a future regression silently reverting to the unrecorded lambda."""
+    a function that ultimately calls _serena_pool_spawn (not a bare
+    subprocess.Popen lambda) so every Serena daemon it spawns is recorded in
+    the all-spawned PID registry. Guards against a future regression
+    silently reverting to the unrecorded lambda.
+
+    42a320dd: the wired callable is now _owned_serena_pool_spawn (which
+    calls _serena_pool_spawn internally — see its docstring), additionally
+    tracking the daemon via the portable owned-process lifecycle backend so
+    SerenaDaemonPool's teardown tears down the whole owned tree instead of
+    leaving a Serena grandchild orphaned."""
     import inspect
 
     source = inspect.getsource(tc.run_tunnel)
-    assert "spawn=_serena_pool_spawn" in source
+    assert "spawn=_owned_serena_pool_spawn" in source
     assert "spawn=lambda cmd: subprocess.Popen(cmd" not in source
+
+    owned_source = inspect.getsource(tc._owned_serena_pool_spawn)
+    assert "_serena_pool_spawn(cmd)" in owned_source
 
 
 def test_serena_daemon_pool_wired_with_host_local_broker_in_run_tunnel():
@@ -3599,6 +3609,91 @@ def test_extract_pool_set_active_repo_blank_is_noop():
         pool.default_repo_path = pool._normalize(new_path)
 
     assert pool.default_repo_path == original
+
+
+# ---------------------------------------------------------------------------
+# 8c6d88c9 — active-project identity survives project-switch drift, and a
+# spawn timeout/failure never corrupts the activation-state "receipt"
+# (pool.default_repo_path). Replicates the exact per-request resolution and
+# failure-branch logic inside _run_extract_pool_connection, matching the
+# existing set_active_repo tests' style above rather than standing up a full
+# websockets.connect + httpx.AsyncClient harness.
+# ---------------------------------------------------------------------------
+
+def test_extract_pool_request_header_wins_over_drifted_default():
+    """A request carrying an explicit X-Meridian-Repo-Path must resolve to
+    ITS OWN repo, not whatever the tunnel's active/default repo has since
+    drifted to via a later set_active_repo (e.g. a request queued for repo A
+    that is still being processed after the user switched the active project
+    to repo B in another window)."""
+    from meridian.serena_pool import SerenaDaemonPool, resolve_repo_path
+    pool = SerenaDaemonPool(default_repo_path="/repo/a")
+
+    # Project switch: set_active_repo(B) lands, mutating the shared default —
+    # exactly _run_extract_pool_connection's "set_active_repo" branch.
+    switch_msg = {"type": "set_active_repo", "repo_path": "/repo/b"}
+    new_path = str(switch_msg.get("repo_path") or "").strip()
+    if new_path:
+        pool.default_repo_path = pool._normalize(new_path)
+    assert pool.default_repo_path == pool._normalize("/repo/b")
+
+    # A request explicitly pinned to repo A must still resolve to A — the
+    # exact call _run_extract_pool_connection makes per "request" message.
+    req_msg = {"type": "request", "headers": {"x-meridian-repo-path": "/repo/a"}}
+    resolved = resolve_repo_path(
+        req_msg.get("headers") or {}, pool.default_repo_path
+    )
+    assert resolved == "/repo/a"
+
+
+def test_extract_pool_headerless_request_follows_current_default():
+    """A request with NO explicit header (the common case) must pick up the
+    CURRENT active repo, not whatever was active when the connection was
+    first established — confirms activation-state actually propagates
+    forward, not just that per-request headers can override it."""
+    from meridian.serena_pool import SerenaDaemonPool, resolve_repo_path
+    pool = SerenaDaemonPool(default_repo_path="/repo/a")
+
+    switch_msg = {"type": "set_active_repo", "repo_path": "/repo/b"}
+    new_path = str(switch_msg.get("repo_path") or "").strip()
+    if new_path:
+        pool.default_repo_path = pool._normalize(new_path)
+
+    req_msg = {"type": "request", "headers": {}}
+    resolved = resolve_repo_path(
+        req_msg.get("headers") or {}, pool.default_repo_path
+    )
+    assert resolved == pool._normalize("/repo/b")
+
+
+def test_extract_pool_spawn_failure_leaves_active_repo_receipt_untouched(tmp_path):
+    """A get_or_spawn failure (timeout / crash on launch) for the resolved
+    repo_path must be reported as a 503 without mutating pool.default_repo_path
+    — the activation-state receipt for the tenant's active project must
+    survive a transient spawn failure unchanged, so the NEXT request (for
+    either repo) still resolves against the correct, un-corrupted default."""
+    from meridian.serena_pool import SerenaDaemonPool
+
+    def failing_spawn(cmd):
+        raise TimeoutError("Serena daemon did not become ready in time")
+
+    pool = SerenaDaemonPool(spawn=failing_spawn, default_repo_path=str(tmp_path))
+    before = pool.default_repo_path
+
+    # Replicates _run_extract_pool_connection's try/except around get_or_spawn.
+    daemon = None
+    spawn_exc = None
+    try:
+        daemon = pool.get_or_spawn(pool.default_repo_path)
+    except Exception as exc:  # noqa: BLE001 — mirrors the production handler
+        spawn_exc = exc
+
+    assert daemon is None
+    assert isinstance(spawn_exc, TimeoutError)
+    # The receipt (active-repo bookkeeping) must be exactly what it was
+    # before the failed spawn attempt — a timeout must never silently switch
+    # or blank out the tenant's active-project identity.
+    assert pool.default_repo_path == before
 
 
 # ---------------------------------------------------------------------------
@@ -4702,6 +4797,60 @@ def test_kill_reason_states_cover_every_reason_used_by_call_sites():
     assert tc._KILL_REASON_STATES["stopped"] is tc.SlotState.STOPPED
 
 
+# ---------------------------------------------------------------------------
+# dd46f899 — "automatic idle tunnel restart" end-to-end regression lock.
+#
+# Prior tests exercise _idle_killer's decision (idle_seconds() > threshold ->
+# kill(reason="idle_killed")) and ensure_running's cold-spawn path separately,
+# but nothing chains them: kill(reason="idle_killed") -> is_running goes
+# False -> a later ensure_running() call actually respawns and reaches
+# HEALTHY again. That full loop IS the "automatic restart" the investigation
+# item asked about, so lock it in explicitly rather than relying on the two
+# halves being independently green.
+# ---------------------------------------------------------------------------
+
+def test_idle_kill_then_ensure_running_respawns_automatically(monkeypatch):
+    """An idle-killed slot is not stuck down — the next ensure_running() call
+    (as would happen on the next incoming request) spawns a fresh proxy and
+    the slot reaches HEALTHY again, with a fresh PID."""
+    spawned = []
+
+    def fake_popen(cmd, env=None, **kw):
+        proc = _FakeProc()
+        proc.pid = 1000 + len(spawned)
+        spawned.append(cmd)
+        return proc
+
+    monkeypatch.setattr(tc, "_port_is_open", lambda port, **kw: False)
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc, "_write_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_clear_slot_claim", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_terminate_proc_tree", lambda *a, **kw: None)
+    monkeypatch.setattr(tc, "_probe_slot_health", AsyncMock(return_value=True))
+
+    proxy = tc.SlotProxy(["mcp-proxy", "--port", "9299"], 9299, "idle-restart", client_id="cl-idle")
+
+    # First spawn (e.g. the first real request ever routed to this slot).
+    _run_sync(_run_ensure(proxy))
+    assert len(spawned) == 1
+    assert proxy.is_running
+    assert proxy.diagnostics.state is tc.SlotState.HEALTHY
+    first_pid = proxy._proc.pid
+
+    # The idle-killer fires after the configured idle window.
+    proxy.kill(reason="idle_killed")
+    assert not proxy.is_running
+    assert proxy.diagnostics.state is tc.SlotState.IDLE_KILLED
+
+    # The next incoming request calls ensure_running() again — must respawn
+    # automatically, with no manual intervention.
+    _run_sync(_run_ensure(proxy))
+    assert len(spawned) == 2, "idle-killed slot must respawn on next ensure_running()"
+    assert proxy.is_running
+    assert proxy.diagnostics.state is tc.SlotState.HEALTHY
+    assert proxy._proc.pid != first_pid, "respawn should produce a fresh process, not reuse the dead one"
+
+
 def test_reconnect_loop_lazy_transient_startup_timeout_never_quarantines(monkeypatch):
     """Mirror image of the deterministic-quarantine test: a slot whose readiness
     probe repeatedly misses (STARTUP_TIMEOUT — a cold cache that just needs more
@@ -5692,6 +5841,78 @@ def test_owned_process_backend_selects_by_platform(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# 268d4e9b — real-backend integration through the tunnel_client wrapper.
+#
+# The existing coverage above (test_close_owned_process_delegates_to_backend)
+# monkeypatches `_owned_process_backend` itself with a `_FakeBackend` whose
+# `close()` is a trivial `return True` — it proves the wrapper CALLS the
+# backend, but never exercises the backend's own PID-reuse guard (see
+# process_lifecycle.verify_handle_live / tests/test_process_lifecycle.py's
+# test_posix_backend_close_skips_when_pid_reused +
+# test_windows_backend_close_skips_when_pid_reused, which cover that guard
+# at the BACKEND layer in isolation). Nothing exercises the two wired
+# together: tc._close_owned_process -> the REAL platform-selected backend
+# class (not a fake stand-in) -> its real close()'s PID-reuse skip. These
+# two tests close that gap, one per platform, using the same "patch
+# pl._killpg / pl.verify_handle_live / subprocess.run, never a real OS
+# signal" technique test_process_lifecycle.py already established as safe
+# to run on a Windows dev box.
+# ---------------------------------------------------------------------------
+
+
+def test_close_owned_process_real_posix_backend_skips_signal_on_pid_reuse(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    signal_calls = []
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(pl, "_killpg", lambda pgid, sig: signal_calls.append((pgid, sig)))
+    monkeypatch.setattr(pl, "verify_handle_live", lambda handle: False)
+
+    # _owned_process_backend() itself is NOT monkeypatched — it resolves the
+    # real PosixProcessGroupBackend via _process_lifecycle.get_default_backend().
+    backend = tc._owned_process_backend()
+    assert isinstance(backend, pl.PosixProcessGroupBackend)
+
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=4321, executable="node", cwd=None, cmdline=["node"],
+        create_time=123.0, group_id=4321,
+    )
+    ok = tc._close_owned_process(handle)
+    assert ok is True
+    assert handle.closed is True
+    assert signal_calls == []  # PID may have been reused -- never signalled
+
+
+def test_close_owned_process_real_windows_backend_skips_signal_on_pid_reuse(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    run_calls = []
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    monkeypatch.setattr(pl.subprocess, "run", lambda argv, **kw: run_calls.append(argv))
+    monkeypatch.setattr(pl, "verify_handle_live", lambda handle: False)
+
+    # Real WindowsJobObjectBackend class (not a _FakeBackend), with only the
+    # win32 kernel32 API loader faked out — the same pattern
+    # test_spawn_owned_with_cache_retry_windows_assigns_job already uses so
+    # this is runnable without a real ctypes.WinDLL.
+    monkeypatch.setattr(
+        tc._process_lifecycle, "get_default_backend",
+        lambda: pl.WindowsJobObjectBackend(api_loader=lambda: _FakeWin32JobAPIForTunnel()),
+    )
+    backend = tc._owned_process_backend()
+    assert isinstance(backend, pl.WindowsJobObjectBackend)
+
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=1234, executable="node.exe", cwd=None, cmdline=["node.exe"],
+        create_time=1.0,
+    )
+    ok = tc._close_owned_process(handle)
+    assert ok is True
+    assert handle.closed is True
+    assert run_calls == []  # taskkill skipped entirely -- PID may have been reused
+
+
+# ---------------------------------------------------------------------------
 # 315b0a63 — opt-in process_registry lease wiring for owned spawns. Gated
 # OFF by default (MERIDIAN_PROCESS_LEASES_ENABLED != "1") so every test
 # above this section runs with ZERO behavior change and zero disk I/O —
@@ -5699,10 +5920,21 @@ def test_owned_process_backend_selects_by_platform(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+class _FakeLease:
+    def __init__(self, run_id, pid):
+        self.run_id = run_id
+        self.pid = pid
+
+
 class _FakeLeaseBroker:
     def __init__(self):
         self.registered = []
         self.released = []
+        # 39c8cf2c — acquire_exclusive support for the wrapper-lease tests
+        # below. `raise_conflict`, when set, makes the NEXT acquire_exclusive
+        # call raise it (simulating a genuinely live prior wrapper).
+        self.acquire_exclusive_calls = []
+        self.raise_conflict: "Exception | None" = None
 
     def register(self, client, pid, **kwargs):
         self.registered.append((client, pid, kwargs))
@@ -5710,6 +5942,13 @@ class _FakeLeaseBroker:
 
     def release(self, client, run_id):
         self.released.append((client, run_id))
+
+    def acquire_exclusive(self, client, owner_key, pid, **kwargs):
+        self.acquire_exclusive_calls.append((client, owner_key, pid, kwargs))
+        if self.raise_conflict is not None:
+            exc, self.raise_conflict = self.raise_conflict, None
+            raise exc
+        return _FakeLease(run_id=f"run-{pid}", pid=pid)
 
 
 def test_process_leases_enabled_default_off(monkeypatch):
@@ -5871,3 +6110,550 @@ def test_close_owned_process_releases_lease_when_enabled(monkeypatch):
     ok = tc._close_owned_process(handle)
     assert ok is True
     assert fake_broker.released == [(tc._LEASE_CLIENT_NAME, "close-me")]
+
+
+# ---------------------------------------------------------------------------
+# 42a320dd — Serena pool daemons wired into the owned-process lifecycle
+# (_owned_serena_pool_spawn / _OwnedServiceProcess). Every test here follows
+# the same "monkeypatch tc._owned_process_backend, never let the real
+# backend touch a fake pid" discipline as the _spawn_owned_with_cache_retry
+# tests above — a real WindowsJobObjectBackend assigning an arbitrary test
+# pid (which may coincide with an unrelated real process) to a
+# KILL_ON_JOB_CLOSE job would be genuinely dangerous, not just wrong.
+# ---------------------------------------------------------------------------
+
+
+def test_serena_pool_spawn_requests_new_session_on_posix(monkeypatch):
+    """42a320dd — _serena_pool_spawn itself (unwrapped) must ask for its own
+    session on POSIX so a LATER adopt() into the owned-process lifecycle
+    backend builds a group_id that corresponds to a real process group."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tc.Path.cwd()))
+    captured = {}
+
+    class _FakeProc:
+        pid = 5151
+
+    def fake_popen(cmd, **kw):
+        captured.update(kw)
+        return _FakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+
+    result = tc._serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert result.pid == 5151
+    assert captured.get("start_new_session") is True
+
+
+def test_serena_pool_spawn_omits_new_session_on_windows(monkeypatch):
+    """The POSIX-only kwarg must never reach Popen on win32 (subprocess
+    rejects mixing start_new_session with creationflags in some Python
+    versions, and it is meaningless there anyway — CREATE_NEW_PROCESS_GROUP
+    already covers the Job Object adoption need)."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tc.Path.cwd()))
+    captured = {}
+
+    class _FakeProc:
+        pid = 5152
+
+    def fake_popen(cmd, **kw):
+        captured.update(kw)
+        return _FakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+    # 64b67781 — must not hit the real shutil.which("uvx") here: CPython's own
+    # shutil.which() checks sys.platform == "win32" internally and, when true,
+    # calls _winapi.NeedCurrentDirectoryForExePath — but _winapi is bound to
+    # None at import time on a REAL non-Windows host (e.g. Linux CI), so the
+    # monkeypatched sys.platform above makes stdlib's own win32 branch run for
+    # real and crash with AttributeError: 'NoneType' object has no attribute
+    # 'NeedCurrentDirectoryForExePath'. Mock the launcher resolution instead of
+    # letting it hit the real filesystem/PATH probe, and reset the memoization
+    # cache first so a value cached by an earlier test in this worker process
+    # can't mask the mock.
+    monkeypatch.setattr(tc, "_find_uvx", lambda: None)
+    tc._reset_launcher_resolution_cache()
+
+    tc._serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert "start_new_session" not in captured
+
+
+def test_owned_serena_pool_spawn_wraps_when_adopt_succeeds(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    monkeypatch.setattr(tc, "_serena_pool_spawn", lambda cmd: _OwnedFakeProc(pid=6001))
+    monkeypatch.delenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, raising=False)
+
+    class _FakeBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            return pl.OwnedProcessHandle(
+                run_id="serena-r1", pid=proc.pid, executable=cmd[0],
+                cwd=cwd, cmdline=list(cmd), group_id=proc.pid,
+            )
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+
+    result = tc._owned_serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert isinstance(result, tc._OwnedServiceProcess)
+    assert result.pid == 6001
+    assert result.poll() is None  # delegates to the wrapped FakeProc
+
+
+def test_owned_serena_pool_spawn_disabled_via_env_returns_plain_proc(monkeypatch):
+    monkeypatch.setattr(tc, "_serena_pool_spawn", lambda cmd: _OwnedFakeProc(pid=6002))
+    monkeypatch.setenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, "1")
+
+    class _ShouldNeverBeCalledBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            raise AssertionError("adopt() must not run when the opt-out is set")
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _ShouldNeverBeCalledBackend())
+
+    result = tc._owned_serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert result.pid == 6002
+    assert not isinstance(result, tc._OwnedServiceProcess)
+
+
+def test_owned_serena_pool_spawn_degrades_to_plain_proc_on_adopt_failure(monkeypatch):
+    monkeypatch.setattr(tc, "_serena_pool_spawn", lambda cmd: _OwnedFakeProc(pid=6003))
+    monkeypatch.delenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, raising=False)
+
+    class _BoomBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _BoomBackend())
+
+    result = tc._owned_serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert result.pid == 6003
+    assert not isinstance(result, tc._OwnedServiceProcess)
+
+
+def test_owned_serena_pool_spawn_degrades_when_adopt_returns_none(monkeypatch):
+    monkeypatch.setattr(tc, "_serena_pool_spawn", lambda cmd: _OwnedFakeProc(pid=6004))
+    monkeypatch.delenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, raising=False)
+
+    class _NoneBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            return None
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _NoneBackend())
+
+    result = tc._owned_serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert result.pid == 6004
+    assert not isinstance(result, tc._OwnedServiceProcess)
+
+
+def test_owned_service_process_terminate_closes_whole_tree(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    proc = _OwnedFakeProc(pid=6100)
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=6100, executable="uvx", cwd=None, cmdline=["uvx"], group_id=6100,
+    )
+    calls = []
+
+    class _FakeBackend:
+        def close(self, h, *, grace_seconds=5.0):
+            calls.append((h, grace_seconds))
+            h.closed = True  # mirrors the real backends' own close() contract
+            return True
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+    wrapper = tc._OwnedServiceProcess(proc, handle)
+
+    wrapper.terminate()
+    assert calls == [(handle, 5.0)]
+    assert handle.closed is True
+
+
+def test_owned_service_process_terminate_reports_survivor(monkeypatch, capsys):
+    from meridian import process_lifecycle as pl
+
+    proc = _OwnedFakeProc(pid=6101)
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=6101, executable="uvx", cwd=None, cmdline=["uvx"],
+        group_id=6101, create_time=12345.0,
+    )
+
+    class _SurvivorBackend:
+        def close(self, h, *, grace_seconds=5.0):
+            return False  # confirmed survivor
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _SurvivorBackend())
+    wrapper = tc._OwnedServiceProcess(proc, handle)
+
+    wrapper.terminate()
+    err = capsys.readouterr().err
+    assert "pid=6101" in err
+    assert "create_time=12345.0" in err
+    assert "survived" in err
+
+
+def test_owned_service_process_kill_is_idempotent_after_terminate(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    proc = _OwnedFakeProc(pid=6102)
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=6102, executable="uvx", cwd=None, cmdline=["uvx"], group_id=6102,
+    )
+    calls = []
+
+    class _FakeBackend:
+        def close(self, h, *, grace_seconds=5.0):
+            calls.append(h)
+            if not h.closed:
+                h.closed = True
+                return True
+            return True  # idempotent — a repeat close() is still a success no-op
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+    wrapper = tc._OwnedServiceProcess(proc, handle)
+
+    wrapper.terminate()
+    wrapper.kill()  # serena_pool._default_terminate's escalation path
+    assert len(calls) == 2  # both calls reach the backend; the SECOND is a confirmed no-op
+    assert handle.closed is True
+
+
+def test_owned_service_process_pid_and_poll_delegate_to_wrapped_proc():
+    from meridian import process_lifecycle as pl
+
+    proc = _OwnedFakeProc(pid=6103)
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=6103, executable="uvx", cwd=None, cmdline=["uvx"], group_id=6103,
+    )
+    wrapper = tc._OwnedServiceProcess(proc, handle)
+    assert wrapper.pid == 6103
+    assert wrapper.poll() is None  # _OwnedFakeProc.poll() always reports alive
+
+
+def test_owned_serena_lifecycle_disabled_reads_env(monkeypatch):
+    monkeypatch.delenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, raising=False)
+    assert tc._owned_serena_lifecycle_disabled() is False
+    monkeypatch.setenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, "1")
+    assert tc._owned_serena_lifecycle_disabled() is True
+    monkeypatch.setenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, "0")
+    assert tc._owned_serena_lifecycle_disabled() is False
+
+
+def test_serena_pool_wired_with_owned_serena_pool_spawn_end_to_end(monkeypatch, tmp_path):
+    """End-to-end: a SerenaDaemonPool constructed exactly like run_tunnel
+    constructs it (spawn=_owned_serena_pool_spawn) spawns a daemon whose
+    teardown goes through the tree-aware wrapper, not a bare Popen."""
+    from meridian import process_lifecycle as pl
+    from meridian.serena_pool import SerenaDaemonPool
+
+    class _FakeUvxProc:
+        """Popen stand-in exposing .pid/.poll()/.wait() — the full surface
+        serena_pool._default_terminate touches (unlike the module-level
+        _OwnedFakeProc, which other tests here never exercise .wait() on)."""
+
+        def __init__(self, pid):
+            self.pid = pid
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(tc, "_serena_pool_spawn", lambda cmd: _FakeUvxProc(pid=6200))
+    monkeypatch.delenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, raising=False)
+
+    closed = []
+
+    class _FakeBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            return pl.OwnedProcessHandle(
+                run_id="e2e", pid=proc.pid, executable=cmd[0],
+                cwd=cwd, cmdline=list(cmd), group_id=proc.pid,
+            )
+
+        def close(self, handle, *, grace_seconds=5.0):
+            closed.append(handle.pid)
+            return True
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+
+    pool = SerenaDaemonPool(
+        default_repo_path=str(tmp_path), spawn=tc._owned_serena_pool_spawn,
+    )
+    daemon = pool.get_or_spawn(str(tmp_path))
+    assert isinstance(daemon.proc, tc._OwnedServiceProcess)
+
+    pool.shutdown()
+    assert closed == [6200]
+
+
+# ---------------------------------------------------------------------------
+# 39c8cf2c — single-owner wrapper lease (_acquire_wrapper_lease /
+# _release_wrapper_lease). Opt-in via MERIDIAN_PROCESS_LEASES_ENABLED=1, same
+# gate as the child-spawn lease helpers above. Never touches a real process —
+# the broker is fully faked.
+# ---------------------------------------------------------------------------
+
+
+def test_wrapper_owner_key_is_keyed_by_repo_path():
+    assert tc._wrapper_owner_key("/repo/a") != tc._wrapper_owner_key("/repo/b")
+    assert tc._wrapper_owner_key("/repo/a") == tc._wrapper_owner_key("/repo/a")
+    assert "/repo/a" in tc._wrapper_owner_key("/repo/a")
+
+
+def test_acquire_wrapper_lease_noop_when_disabled(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    assert tc._acquire_wrapper_lease("/repo") is None
+    assert fake_broker.acquire_exclusive_calls == []
+
+
+def test_acquire_wrapper_lease_cold_start_returns_run_id(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    run_id = tc._acquire_wrapper_lease("/repo")
+    assert run_id is not None
+    assert len(fake_broker.acquire_exclusive_calls) == 1
+    client, owner_key, pid, kwargs = fake_broker.acquire_exclusive_calls[0]
+    assert client == tc._LEASE_CLIENT_NAME
+    assert owner_key == tc._wrapper_owner_key("/repo")
+    assert pid == os.getpid()
+
+
+def test_acquire_wrapper_lease_reports_conflict_and_does_not_raise(monkeypatch, capsys):
+    """A genuinely live prior wrapper must be reported (stderr warning), not
+    raised out of run_tunnel's startup and not silently swallowed either —
+    the caller gets None back (meaning "no lease acquired, but keep going")."""
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    conflict_lease = _FakeLease(run_id="old-run", pid=4242)
+    fake_broker.raise_conflict = tc._process_registry.OwnerConflictError(
+        tc._LEASE_CLIENT_NAME, tc._wrapper_owner_key("/repo"), conflict_lease
+    )
+
+    run_id = tc._acquire_wrapper_lease("/repo")
+    assert run_id is None
+    captured = capsys.readouterr()
+    assert "4242" in captured.err
+    assert "/repo" in captured.err
+    assert "warning" in captured.err.lower()
+
+
+def test_acquire_wrapper_lease_best_effort_on_generic_broker_error(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+
+    class _BoomBroker:
+        def acquire_exclusive(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: _BoomBroker())
+    assert tc._acquire_wrapper_lease("/repo") is None  # must not raise
+
+
+def test_release_wrapper_lease_noop_when_disabled_or_none(monkeypatch):
+    monkeypatch.delenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, raising=False)
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    tc._release_wrapper_lease("some-run-id")  # disabled → no-op
+    assert fake_broker.released == []
+
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    tc._release_wrapper_lease(None)  # None run_id → no-op even when enabled
+    assert fake_broker.released == []
+
+
+def test_release_wrapper_lease_releases_when_enabled(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+    fake_broker = _FakeLeaseBroker()
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: fake_broker)
+
+    tc._release_wrapper_lease("run-123")
+    assert fake_broker.released == [(tc._LEASE_CLIENT_NAME, "run-123")]
+
+
+def test_release_wrapper_lease_best_effort_on_broker_error(monkeypatch):
+    monkeypatch.setenv(tc._PROCESS_LEASES_ENABLED_ENV_VAR, "1")
+
+    class _BoomBroker:
+        def release(self, *a, **kw):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc._process_registry, "get_broker", lambda: _BoomBroker())
+    tc._release_wrapper_lease("run-123")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# 39c8cf2c — readiness gating (_run_connection / _run_connection_lazy).
+# Covers the deterministic lifecycle contract's core, incident-relevant fix:
+# READY is announced on first inbound frame OR a bounded grace window,
+# whichever is first; a connection that opens then closes before either
+# raises TunnelNeverReadyError. Every FakeWS below is entirely in-process —
+# no real socket, no real subprocess, no real ambient process touched.
+# ---------------------------------------------------------------------------
+
+
+class _QueueWS:
+    """Minimal fake WebSocket: yields queued messages, then ends the
+    iteration (StopAsyncIteration) — mirrors the FakeWS shape already used
+    throughout this file and test_cov_tunnel_client.py."""
+
+    def __init__(self, messages):
+        self._msgs = list(messages)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        pass
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._msgs:
+            raise StopAsyncIteration
+        return self._msgs.pop(0)
+
+    async def send(self, data):
+        pass
+
+
+class _FakeHttpClient:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        pass
+
+
+def _patch_ws_and_http(monkeypatch, ws):
+    import httpx as _httpx
+    import websockets as _ws
+
+    monkeypatch.setattr(_ws, "connect", lambda url, **kw: ws)
+    monkeypatch.setattr(_httpx, "AsyncClient", lambda *a, **k: _FakeHttpClient())
+
+
+def test_run_connection_reaches_ready_on_first_message(monkeypatch):
+    ws = _QueueWS([json.dumps({"type": "ping"})])
+    _patch_ws_and_http(monkeypatch, ws)
+    lifecycle = tc._tunnel_lifecycle.TunnelLifecycle(label="fs")
+
+    asyncio.run(tc._run_connection("wss://x/tunnel/t", 8808, "fs", lifecycle=lifecycle))
+
+    assert lifecycle.state is tc._tunnel_lifecycle.LifecycleState.READY
+    assert lifecycle.is_ready is True
+
+
+def test_run_connection_never_ready_raises_and_marks_lifecycle(monkeypatch):
+    ws = _QueueWS([])  # zero messages — closes immediately
+    _patch_ws_and_http(monkeypatch, ws)
+    lifecycle = tc._tunnel_lifecycle.TunnelLifecycle(label="fs")
+
+    with pytest.raises(tc._tunnel_lifecycle.TunnelNeverReadyError) as excinfo:
+        asyncio.run(tc._run_connection("wss://x/tunnel/t", 8808, "fs", lifecycle=lifecycle))
+
+    assert excinfo.value.label == "fs"
+    assert lifecycle.state is tc._tunnel_lifecycle.LifecycleState.NEVER_READY
+
+
+def test_run_connection_never_ready_without_lifecycle_still_raises(monkeypatch):
+    """lifecycle is optional — the readiness gate itself must not depend on
+    a lifecycle object being supplied."""
+    ws = _QueueWS([])
+    _patch_ws_and_http(monkeypatch, ws)
+    with pytest.raises(tc._tunnel_lifecycle.TunnelNeverReadyError):
+        asyncio.run(tc._run_connection("wss://x/tunnel/t", 8808, "fs"))
+
+
+def test_run_connection_lazy_reaches_ready_on_first_message(monkeypatch):
+    ws = _QueueWS([json.dumps({"type": "ping"})])
+    _patch_ws_and_http(monkeypatch, ws)
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+    lifecycle = tc._tunnel_lifecycle.TunnelLifecycle(label="fs")
+
+    asyncio.run(
+        tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs", lifecycle=lifecycle)
+    )
+
+    assert lifecycle.state is tc._tunnel_lifecycle.LifecycleState.READY
+
+
+def test_run_connection_lazy_never_ready_raises_and_marks_lifecycle(monkeypatch):
+    ws = _QueueWS([])
+    _patch_ws_and_http(monkeypatch, ws)
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+    lifecycle = tc._tunnel_lifecycle.TunnelLifecycle(label="fs")
+
+    with pytest.raises(tc._tunnel_lifecycle.TunnelNeverReadyError):
+        asyncio.run(
+            tc._run_connection_lazy("wss://x/tunnel/t", proxy, "fs", lifecycle=lifecycle)
+        )
+    assert lifecycle.state is tc._tunnel_lifecycle.LifecycleState.NEVER_READY
+
+
+def test_reconnect_loop_backs_off_on_repeated_never_ready_not_busy_loop(monkeypatch):
+    """39c8cf2c — the actual bug this item fixes: before this change, a
+    connection that opened and then closed with zero messages exchanged
+    (e.g. an immediate server-side auth/plan rejection right after accept)
+    made _run_connection return NORMALLY, which _reconnect_loop treated as a
+    SUCCESSFUL attempt — resetting backoff to 1.0 and looping again
+    immediately, with no sleep at all, forever. Driving the REAL
+    _run_connection (not a mock) through _reconnect_loop against a server
+    that keeps closing immediately must now back off and climb exactly like
+    any other repeated failure."""
+    ws = _QueueWS([])  # every (re)connect attempt gets zero messages
+    _patch_ws_and_http(monkeypatch, ws)
+
+    sleeps: list[float] = []
+    attempts = {"n": 0}
+
+    async def fake_sleep(n):
+        sleeps.append(n)
+        attempts["n"] += 1
+        if attempts["n"] >= 3:
+            raise asyncio.CancelledError  # stop the loop after 3 backoff sleeps
+
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tc._reconnect_loop("wss://x", 8808, "fs"))
+
+    # Backoff must have actually happened AND climbed each time — not reset
+    # to (and stayed at) 1.0 forever, which is what the pre-fix "return
+    # normally" behavior produced.
+    assert len(sleeps) == 3
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+def test_reconnect_loop_lazy_backs_off_on_repeated_never_ready_not_busy_loop(monkeypatch):
+    """Same fix, applied to the LIVE code path run_tunnel actually schedules."""
+    ws = _QueueWS([])
+    _patch_ws_and_http(monkeypatch, ws)
+    proxy = tc.SlotProxy(["x"], 8808, "fs")
+
+    sleeps: list[float] = []
+    attempts = {"n": 0}
+
+    async def fake_sleep(n):
+        sleeps.append(n)
+        attempts["n"] += 1
+        if attempts["n"] >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tc._reconnect_loop_lazy("wss://x/tunnel/t", proxy, "fs"))
+
+    assert len(sleeps) == 3
+    assert sleeps == [1.0, 2.0, 4.0]

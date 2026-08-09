@@ -1,13 +1,13 @@
-# b8fbb4cb — PreToolUse HITL guard (structural, not text).
+# b8fbb4cb -- PreToolUse HITL guard (structural, not text).
 #
 # Blocks the executor from using Claude Code's NATIVE ask-UI (AskUserQuestion) and
 # redirects to Meridian's request_hitl, so every human-in-the-loop question is logged
-# in the hitl_requests table (the native ask bypasses it entirely — confirmed absent 3x).
+# in the hitl_requests table (the native ask bypasses it entirely -- confirmed absent 3x).
 # Text guidance in agent_instructions failed three times (36edd005, d261ea2e); this is
 # the same structural-enforcement pattern as the file-claim guard.
 #
 # Wired in .claude/settings.json under PreToolUse with matcher "AskUserQuestion", so it
-# ONLY ever runs for that one tool — it can never affect any other tool call. Fails OPEN
+# ONLY ever runs for that one tool -- it can never affect any other tool call. Fails OPEN
 # on any parse error. This is NOT hooks.ps1 (the token-rotation installer).
 $ErrorActionPreference = 'SilentlyContinue'
 try { $payload = [Console]::In.ReadToEnd() } catch { exit 0 }

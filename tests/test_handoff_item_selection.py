@@ -418,3 +418,93 @@ async def test_empty_list_is_treated_as_no_selection(db, tmp_path):
     )
     assert _extract_scope_tag(content) is None
     assert item["id"] in content
+
+
+# ---------------------------------------------------------------------------
+# fb82e51f — a selected_item_ids scope that validates cleanly in
+# _resolve_selected_item_scope (genuinely todo/pending, right project/version)
+# can still collapse to zero executable items once _build_quick_start_goal's
+# OWN, separate exclusion filters (manual/backburner/unprospected/wave-gate)
+# run. That must fail visibly (HandoffScopeNonExecutable) rather than persist
+# and hand back a /goal whose declared scope has nothing claimable in it —
+# the exact 2026-07-27 incident recorded in this item's notes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["goal", "starter", "full", "delta"])
+async def test_scope_non_executable_when_sole_requested_item_is_manual(db, tmp_path, mode):
+    """The fail-closed exception fires uniformly across every mode, but the
+    reported ``reason`` legitimately differs: full/delta/goal-only fetch
+    pending items with ``include_human=False`` (which ALSO excludes
+    ``blocker_kind='manual'`` items — see get_sprint_items's own docstring),
+    so the item is already absent by the time _build_quick_start_goal's own
+    manual-item tracking runs, and the outcome falls back to
+    ``not_in_pending_batch``. starter mode's fetch has no such DB-level
+    filter, so its own in-function manual-item split catches it and reports
+    the more specific ``manual`` reason. Both are genuinely non-executable —
+    this test pins the (mode-dependent) reason so a future change to either
+    fetch path is caught rather than silently drifting."""
+    pid = await _project(db, f"selection-scope-non-executable-manual-{mode}")
+    manual_item = await db_module.add_sprint_item(
+        db, pid, "v1", "configure PyPI trusted publisher", blocker_kind="manual", force=True,
+    )
+
+    out_dir = tmp_path / mode
+    out_dir.mkdir()
+    tokens_before = await _count_handoff_tokens(db, pid)
+    with pytest.raises(handoff_module.HandoffScopeNonExecutable) as excinfo:
+        await handoff_module.generate_handoff(
+            db, pid, str(out_dir), skip_ai_summary=True, mode=mode,
+            selected_item_ids=[manual_item["id"]],
+        )
+    exc = excinfo.value
+    assert exc.project_id == pid
+    assert exc.requested_ids == [manual_item["id"]]
+    expected_reason = "manual" if mode == "starter" else "not_in_pending_batch"
+    assert exc.excluded == [{"id": manual_item["id"], "reason": expected_reason}]
+    assert list(out_dir.iterdir()) == [], "nothing must be written on refusal"
+    assert await _count_handoff_tokens(db, pid) == tokens_before, (
+        "no provenance token may be minted for a scope that collapses to "
+        "zero executable items"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scope_non_executable_when_sole_requested_item_is_backburner(db, tmp_path):
+    pid = await _project(db, "selection-scope-non-executable-backburner")
+    backburner_item = await db_module.add_sprint_item(
+        db, pid, "v1", "backburnered follow-up", track="backburner", force=True,
+    )
+
+    with pytest.raises(handoff_module.HandoffScopeNonExecutable) as excinfo:
+        await handoff_module.generate_handoff(
+            db, pid, str(tmp_path), skip_ai_summary=True, mode="goal",
+            selected_item_ids=[backburner_item["id"]],
+        )
+    exc = excinfo.value
+    assert exc.requested_ids == [backburner_item["id"]]
+    assert exc.excluded == [{"id": backburner_item["id"], "reason": "backburner"}]
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_scope_stays_executable_when_only_some_requested_ids_excluded(db, tmp_path):
+    """A selection that mixes a genuinely-claimable item with a manual one
+    must NOT fail closed — HandoffScopeNonExecutable only fires when EVERY
+    requested id is excluded. The claimable item still renders normally."""
+    pid = await _project(db, "selection-scope-partial-exclusion")
+    ordinary_item = await db_module.add_sprint_item(db, pid, "v1", "ordinary claimable item", force=True)
+    manual_item = await db_module.add_sprint_item(
+        db, pid, "v1", "configure PyPI trusted publisher", blocker_kind="manual", force=True,
+    )
+
+    _path, content, _amended = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="goal",
+        selected_item_ids=[ordinary_item["id"], manual_item["id"]],
+    )
+    assert ordinary_item["id"] in content
+    token = _extract_token(content)
+    assert token, "a partially-executable scope must still mint a genuine token"
+    verify = await handoff_module.verify_handoff_token(db, token, pid)
+    assert verify == {"valid": True, "reason": "ok"}

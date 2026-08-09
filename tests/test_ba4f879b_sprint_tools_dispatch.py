@@ -305,6 +305,120 @@ async def test_fan_out_sprint_items_not_a_list(db, project):
 
 
 # ---------------------------------------------------------------------------
+# fan_out_sprint_items — strict=True opt-in contract (468ab67d)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_dispatch_basic(db, project):
+    pid = project["id"]
+    result = await mh._handle_sprint_tools(
+        "fan_out_sprint_items",
+        {
+            "project_id": pid,
+            "items": [{"title": "Strict dispatch item", "version": "v1"}],
+            "strict": True,
+            "idempotency_key": "handler-strict-basic-1",
+        },
+        db, _DATA_DIR, None, None,
+    )
+    assert result is not mh._MISS
+    assert "error" not in result
+    assert result["status"] == "ok"
+    assert result["created_count"] == 1
+    assert result["count"] == 1
+    assert len(result["item_ids"]) == 1
+    assert "results" in result
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_invalid_mode_returns_error(db, project):
+    pid = project["id"]
+    result = await mh._handle_sprint_tools(
+        "fan_out_sprint_items",
+        {
+            "project_id": pid,
+            "items": [{"title": "Bad mode item"}],
+            "strict": True,
+            "mode": "sometimes",
+        },
+        db, _DATA_DIR, None, None,
+    )
+    assert "error" in result
+    assert "mode" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_duplicate_rejected_via_dispatch(db, project):
+    pid = project["id"]
+    await db_module.add_sprint_item(db, pid, "v1", "Handler dup guard title")
+    result = await mh._handle_sprint_tools(
+        "fan_out_sprint_items",
+        {
+            "project_id": pid,
+            "items": [{"title": "Handler dup guard title", "version": "v1"}],
+            "strict": True,
+            "mode": "all_or_nothing",
+            "idempotency_key": "handler-strict-dup-1",
+        },
+        db, _DATA_DIR, None, None,
+    )
+    assert result["status"] == "failed"
+    assert result["item_ids"] == []
+    assert result["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_idempotent_replay_via_dispatch(db, project):
+    pid = project["id"]
+    args = {
+        "project_id": pid,
+        "items": [{"title": "Handler replay item", "version": "v1"}],
+        "strict": True,
+        "idempotency_key": "handler-strict-replay-1",
+    }
+    first = await mh._handle_sprint_tools("fan_out_sprint_items", args, db, _DATA_DIR, None, None)
+    second = await mh._handle_sprint_tools("fan_out_sprint_items", args, db, _DATA_DIR, None, None)
+    assert first["idempotent_replay"] is False
+    assert second["idempotent_replay"] is True
+    assert second["item_ids"] == first["item_ids"]
+    items = await db_module.get_sprint_items(db, pid)
+    assert sum(1 for i in items if i["title"] == "Handler replay item") == 1
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_handler_direct_strict(db, project):
+    pid = project["id"]
+    result = await st_mod.handle_fan_out_sprint_items(
+        {
+            "project_id": pid,
+            "items": [{"title": "Direct strict fan item", "version": "v1"}],
+            "strict": True,
+            "idempotency_key": "handler-direct-strict-1",
+        },
+        db, _DATA_DIR, None, None,
+    )
+    assert result["status"] == "ok"
+    assert result["item_ids"]
+    assert result["count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_legacy_default_shape_unchanged_via_dispatch(db, project):
+    """Omitting strict entirely must return EXACTLY the pre-468ab67d response
+    shape — no batch_management keys (status/mode/entry_kind/results/...)
+    leaking into the legacy response."""
+    pid = project["id"]
+    result = await mh._handle_sprint_tools(
+        "fan_out_sprint_items",
+        {"project_id": pid, "items": [{"title": "Legacy dispatch item", "version": "v1"}]},
+        db, _DATA_DIR, None, None,
+    )
+    assert "item_ids" in result and "count" in result
+    for leaking_key in ("status", "mode", "entry_kind", "results", "idempotent_replay"):
+        assert leaking_key not in result
+
+
+# ---------------------------------------------------------------------------
 # update_sprint_item
 # ---------------------------------------------------------------------------
 

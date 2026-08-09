@@ -3383,9 +3383,23 @@ async def test_start_session_unknown_project_name_clean_error(db):
 
 
 def test_stdio_start_session_resolves_project_name_in_source():
-    """stdio parity (ce3693e4): the stdio call_tool start_session branch must
-    resolve project_name and NOT index arguments['project_id'] directly (which
-    raised KeyError). Parsed from source so the test sees the real dispatch."""
+    """stdio parity (ce3693e4, superseded by 325276f8): the stdio call_tool
+    start_session branch must never index arguments['project_id'] directly
+    (which raised a bare KeyError) and must resolve project_name to a real
+    project_id somewhere in its reachable call graph.
+
+    325276f8 replaced the branch's own hand-duplicated project_name
+    resolution with a delegation to ``_dispatch_mcp_tool`` (the same
+    function the HTTP/streamable-HTTP transport uses for start_session and
+    ~30 other tools) — see the module docstring of
+    tests/test_325276f8_start_session_schema_parity.py for the full
+    rationale. The resolution logic itself didn't disappear, it moved:
+    _dispatch_mcp_tool's own central project_name resolver (meridian/mcp/
+    handler.py) runs first, and handle_start_session (meridian/mcp/handlers/
+    project_tools.py) applies the exact same ce3693e4 fallback as a safety
+    net for the case where a non-UUID project_id slips through ungrouped.
+    This test now checks the call graph rather than requiring the
+    resolution call to be textually inlined in the branch."""
     import ast
 
     src = (
@@ -3411,16 +3425,35 @@ def test_stdio_start_session_resolves_project_name_in_source():
             break
     assert found_block is not None, "start_session branch not found in stdio_handler"
 
-    # The whole stdio source must reference get_project_by_name from within the
-    # start_session handling (resolution present) and must never subscript
-    # arguments['project_id'] blind inside that branch.
     seg = src[src.index('name == "start_session"'):]
     # cut at the next elif to bound the branch
     end = seg.find("\n            elif name ==", 5)
     branch_src = seg[:end] if end != -1 else seg[:2000]
-    assert "get_project_by_name" in branch_src, "stdio start_session missing resolver"
     assert 'arguments["project_id"]' not in branch_src, (
         "stdio start_session still indexes arguments['project_id'] blind"
+    )
+    # 325276f8 — the branch now delegates to the shared dispatcher instead of
+    # resolving project_name inline.
+    assert "_dispatch_mcp_tool(" in branch_src, (
+        "stdio start_session no longer routes through _dispatch_mcp_tool — "
+        "if this legitimately changed, confirm project_name resolution is "
+        "still reachable some other way before updating this assertion"
+    )
+
+    # The resolution itself must still exist somewhere reachable from
+    # start_session: either _dispatch_mcp_tool's own central resolver
+    # (meridian/mcp/handler.py) or handle_start_session's ce3693e4 fallback
+    # (meridian/mcp/handlers/project_tools.py).
+    handler_src = (
+        Path(__file__).resolve().parents[1] / "meridian" / "mcp" / "handler.py"
+    ).read_text(encoding="utf-8")
+    project_tools_src = (
+        Path(__file__).resolve().parents[1]
+        / "meridian" / "mcp" / "handlers" / "project_tools.py"
+    ).read_text(encoding="utf-8")
+    assert "get_project_by_name" in handler_src or "get_project_by_name" in project_tools_src, (
+        "project_name -> project_id resolution missing from both "
+        "_dispatch_mcp_tool and handle_start_session"
     )
 
 
@@ -6278,9 +6311,14 @@ async def test_start_worker_session_xml_is_slim(db):
     await db_module.set_decision(db, p["id"], "internal call")
     result = await db_module.start_worker_session(db, p["id"])
     xml = result["worker_context"]
-    # Under 700 chars per spec (matters because it lands in every
-    # worker's first prompt).
-    assert len(xml) < 700, f"worker_context too big: {len(xml)} chars"
+    # Bounded by the named prompt-budget contract (bfb18ea2), not a bare
+    # unexplained literal — matters because it lands in every worker's
+    # first prompt. See WORKER_CONTEXT_XML_BUDGET_CHARS's comment in
+    # meridian/db/__init__.py for the unit (chars, not tokens) rationale.
+    assert len(xml) <= db_module.WORKER_CONTEXT_XML_BUDGET_CHARS, (
+        f"worker_context too big: {len(xml)} chars "
+        f"(budget={db_module.WORKER_CONTEXT_XML_BUDGET_CHARS})"
+    )
     # Worker-relevant fields present.
     assert "<version_goal>" in xml
     assert "<task " in xml
@@ -6293,6 +6331,140 @@ async def test_start_worker_session_xml_is_slim(db):
     assert "decisions" not in xml
     assert "<sprint>" not in xml
     assert "<recent_tasks>" not in xml
+    # Small, typical content should never trigger the truncation path.
+    assert "[truncated]" not in xml
+
+
+@pytest.mark.asyncio
+async def test_worker_context_xml_budget_contract_is_named(db):
+    """The 700-char cap is a versioned, named constant — not a bare
+    literal duplicated between the implementation and the test."""
+    assert db_module.WORKER_CONTEXT_XML_BUDGET_CHARS == 700
+    assert db_module.WORKER_CONTEXT_XML_BUDGET_VERSION == 1
+
+
+def test_build_worker_context_xml_long_goal_and_task_are_bounded():
+    """A pathologically long version_goal/task_description must never
+    push the XML over budget — they get compacted at a word boundary
+    with a visible marker instead."""
+    long_goal = "This is a very long version goal statement. " * 40
+    long_task = "This is a very long task description that goes on. " * 40
+    xml = db_module.build_worker_context_xml(
+        version_goal=long_goal,
+        task_id="task-123",
+        task_description=long_task,
+        repo="/some/repo/path",
+    )
+    assert len(xml) <= db_module.WORKER_CONTEXT_XML_BUDGET_CHARS, (
+        f"worker_context exceeded budget: {len(xml)} chars"
+    )
+    # Truncation must be visible, not silent.
+    assert "[truncated]" in xml
+    # Operational fields are never truncated — only the two dynamic
+    # content fields (version_goal/task_description) are compacted.
+    assert "<repo>/some/repo/path</repo>" in xml
+    assert "<test_cmd>pixi run test</test_cmd>" in xml
+    assert "<commit_pattern>" in xml
+    assert "commit_pattern>[truncated]" not in xml
+    assert "<done_when>" in xml
+    assert "done_when>[truncated]" not in xml
+    # Truncation happens at a whole-word boundary, not mid-word. The
+    # last token retained right before the marker must be preceded by
+    # whitespace in the ORIGINAL source text — i.e. it's the start of a
+    # genuine word there, never a fragment sliced out of the middle of
+    # one (padding with a leading space lets this also match a source
+    # string's very first word).
+    before_marker = xml.split("…[truncated]")[0]
+    last_word = before_marker.rstrip().rsplit(None, 1)[-1]
+    padded_goal = " " + long_goal
+    padded_task = " " + long_task
+    assert (f" {last_word}" in padded_goal) or (f" {last_word}" in padded_task), (
+        f"{last_word!r} is not a whole-word boundary in the source text "
+        "(truncation likely split a word mid-way)"
+    )
+
+
+def test_build_worker_context_xml_special_characters_escaped():
+    """XML-special characters and unicode must be escaped correctly and
+    never split an entity in half, even under truncation.
+
+    The strongest check available is that the output actually parses as
+    well-formed XML — that alone rules out unescaped '<'/'&', a split
+    entity from mid-escape truncation, and a malformed id="..." attribute.
+    """
+    import xml.etree.ElementTree as ET
+
+    special_goal = (
+        "Goal with <tag> & \"quotes\" 'apostrophes' and ünïcödé 日本語 "
+        "emoji \U0001F600 more & more <nested> content " * 5
+    )
+    xml_short = db_module.build_worker_context_xml(
+        version_goal="Goal with <tag> & \"quotes\" 'apos' and ünïcödé 日本語",
+        task_id="task-<id>",
+        task_description="task & <desc> with \"quotes\"",
+        repo="/r",
+    )
+    xml_long = db_module.build_worker_context_xml(
+        version_goal=special_goal,
+        task_id="task-<id>",
+        task_description="task & <desc> with \"quotes\"",
+        repo="/r",
+    )
+    for xml in (xml_short, xml_long):
+        assert len(xml) <= db_module.WORKER_CONTEXT_XML_BUDGET_CHARS
+        root = ET.fromstring(xml)  # raises ParseError on malformed XML
+        assert root.tag == "worker_context"
+
+    # Short (untruncated) case: raw content round-trips exactly through
+    # escape/unescape, including unicode.
+    goal_el = ET.fromstring(xml_short).find("version_goal")
+    assert goal_el.text == (
+        "Goal with <tag> & \"quotes\" 'apos' and ünïcödé 日本語"
+    )
+    task_el = ET.fromstring(xml_short).find("task")
+    assert task_el.text == "task & <desc> with \"quotes\""
+    assert task_el.get("id") == "task-<id>"
+
+    # Long (truncated) case: still well-formed, and the visible marker
+    # made it into the parsed text rather than being cut off.
+    assert "…[truncated]" in ET.fromstring(xml_long).find("version_goal").text
+
+
+def test_build_worker_context_xml_exact_boundary():
+    """Content whose full, escaped XML lands exactly at the budget must
+    pass through untruncated; one character more must trigger visible
+    truncation while staying within budget."""
+    budget = db_module.WORKER_CONTEXT_XML_BUDGET_CHARS
+
+    def _xml_for_goal_len(n: int) -> str:
+        return db_module.build_worker_context_xml(
+            version_goal="g" * n,
+            task_id="t",
+            task_description="d",
+            repo="/r",
+            test_cmd="pixi run test",
+        )
+
+    # Find the exact raw length at which the untruncated candidate first
+    # exceeds the budget (i.e. the boundary edge).
+    boundary_n = None
+    for n in range(0, budget):
+        xml = _xml_for_goal_len(n)
+        if "[truncated]" in xml:
+            boundary_n = n
+            break
+    assert boundary_n is not None, "did not find a truncation boundary"
+
+    # Right at the edge (one char below the boundary): no truncation,
+    # content passes through verbatim.
+    at_edge = _xml_for_goal_len(boundary_n - 1)
+    assert "[truncated]" not in at_edge
+    assert len(at_edge) <= budget
+
+    # One character over: truncation kicks in, output still bounded.
+    over_edge = _xml_for_goal_len(boundary_n)
+    assert "[truncated]" in over_edge
+    assert len(over_edge) <= budget
 
 
 @pytest.mark.asyncio
@@ -7751,10 +7923,14 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_vector_index_state",
         "_migrate_pg_pixi_env_roots",
         "_migrate_pg_executor_reports",
+        "_migrate_pg_wave_run_summaries",
+        "_migrate_pg_decision_evidence",
+        "_migrate_pg_ai_log_events",
+        "_migrate_pg_proposal_intake_drafts",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 144
+    assert len(allnames) == len(set(allnames)) == 148
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
@@ -8698,6 +8874,161 @@ async def test_checkpoint_unscoped_session_sees_all_versions(db, tmp_path):
         "checkpoint", {"session_id": s["id"], "project_id": pid}, db, str(tmp_path)
     )
     assert result["pending_count"] == 2
+
+
+def _bulky_tool_requirements(idx: int) -> list[dict[str, str]]:
+    """Realistic-shaped, deliberately verbose tool_requirements entries —
+    used by the 60eed526 checkpoint-bloat regression tests below to build a
+    board whose per-item <tool_requirements> JSON is large enough to
+    reproduce the confirmed ~139KB oversized checkpoint() payload."""
+    _purpose = (
+        "Prospect the touched symbols with search_graph/find_symbol before "
+        "editing so the change stays scoped to what this item actually "
+        "declared, then confirm callers via find_referencing_symbols. "
+    ) * 4  # ~640 chars
+    return [
+        {
+            "name": "find_symbol",
+            "server_or_namespace": "Serena",
+            "required_or_preferred": "required",
+            "purpose": _purpose,
+            "call_template": f"find_symbol(name_path='bulk_item_{idx}')",
+            "fallback": ["meridian-code: search_graph", "Grep"],
+            "availability_check": "confirm 'Serena: find_symbol' appears in tools/list",
+            "verification": "re-read the edited symbol body and diff against intent",
+        },
+        {
+            "name": "search_graph",
+            "server_or_namespace": "meridian-code",
+            "required_or_preferred": "preferred",
+            "purpose": _purpose,
+            "call_template": f"search_graph(query='bulk item {idx}', project='meridian-repo')",
+        },
+        {
+            "name": "find_referencing_symbols",
+            "server_or_namespace": "Serena",
+            "required_or_preferred": "required",
+            "purpose": _purpose,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_bounds_oversized_delta_summary(db, tmp_path):
+    """60eed526 — checkpoint() must not return an oversized delta summary.
+
+    Confirmed regression: handle_checkpoint's internal
+    generate_handoff(mode="delta") call never passed checkpoint=True, so a
+    project with a sizeable pending backlog (each item carrying a realistic
+    tool_requirements contract) made checkpoint() embed the FULL, unbounded
+    <tool_requirements> JSON for every pending item into its own "summary"
+    field — observed ~139KB on a real board, distinct from the already-fixed
+    248c0bb9 starter/goal bloat (which never touched full/delta).
+
+    This first proves the fixture reproduces a large, unbounded render (the
+    pre-fix effective shape — a plain checkpoint=False delta call still gets
+    "full detail" by design), then proves the actual checkpoint() MCP tool
+    call is now bounded via an explicit, non-silent truncation marker.
+    """
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "ckpt-bloat-test")
+    pid = p["id"]
+    s = await db_module.register_session(db, pid, "ckpt-bloat-session")
+    for i in range(45):
+        await db_module.add_sprint_item(
+            db, pid, "v1", f"Bulk item {i}",
+            tool_requirements=_bulky_tool_requirements(i),
+            # b0d42ef6 — these titles deliberately share most of their words
+            # ("Bulk item N"), which would otherwise trip the >=60%
+            # word-overlap duplicate guard after the first one.
+            force=True,
+        )
+
+    # Regression fixture: an ordinary delta call (checkpoint=False, what
+    # handle_checkpoint used before this fix) is UNCHANGED by this fix —
+    # "full/delta mode may include full detail as today" still holds.
+    _, unbounded_content, _ = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="delta",
+        session_id=s["id"], checkpoint=False,
+    )
+    unbounded_bytes = len(unbounded_content.encode("utf-8"))
+    assert unbounded_bytes > 60_000, (
+        "fixture did not reproduce a large enough delta render to prove the "
+        f"regression; got {unbounded_bytes} bytes"
+    )
+
+    # The actual checkpoint() MCP tool — must now be bounded regardless of
+    # backlog size.
+    result = await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": pid}, db, str(tmp_path)
+    )
+    summary = result["summary"]
+    summary_bytes = len(summary.encode("utf-8"))
+    assert summary_bytes <= handoff_module._DEFAULT_CHECKPOINT_MAX_BYTES, (
+        f"checkpoint() summary not bounded: {summary_bytes} bytes "
+        f"(budget={handoff_module._DEFAULT_CHECKPOINT_MAX_BYTES})"
+    )
+    assert summary_bytes < unbounded_bytes, (
+        "checkpoint() summary should be materially smaller than the "
+        "unbounded delta render for the same board"
+    )
+    assert "TRUNCATED" in summary, (
+        "oversized summary must carry an explicit, non-silent truncation "
+        "marker — never a silent drop"
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_persists_full_delta_despite_bounded_response(db, tmp_path):
+    """60eed526 — bounding checkpoint()'s RETURNED summary must not lose
+    structured evidence: the complete, untruncated delta render stays
+    durable in the handoffs table (and therefore load_handoff /
+    generate_handoff(mode='full')) exactly like every other mode's
+    persistence contract (cb00889c) — checkpoint=True only bounds what is
+    handed back over MCP, never what is written to disk/DB."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "ckpt-bloat-persist-test")
+    pid = p["id"]
+    s = await db_module.register_session(db, pid, "ckpt-bloat-persist-session")
+    for i in range(45):
+        await db_module.add_sprint_item(
+            db, pid, "v1", f"Bulk item {i}",
+            tool_requirements=_bulky_tool_requirements(i),
+            # b0d42ef6 — these titles deliberately share most of their words
+            # ("Bulk item N"), which would otherwise trip the >=60%
+            # word-overlap duplicate guard after the first one.
+            force=True,
+        )
+
+    result = await srv._dispatch_mcp_tool(
+        "checkpoint", {"session_id": s["id"], "project_id": pid}, db, str(tmp_path)
+    )
+    summary_bytes = len(result["summary"].encode("utf-8"))
+    assert "TRUNCATED" in result["summary"]
+
+    rows = await db_module.get_handoffs(db, pid, limit=1, session_id=s["id"])
+    assert rows, "checkpoint() must still persist a handoffs row"
+    persisted_body = rows[0]["body"]
+    persisted_bytes = len(persisted_body.encode("utf-8"))
+    assert persisted_bytes > summary_bytes, (
+        "the persisted handoff body must retain the COMPLETE render even "
+        "when the returned summary was bounded/truncated"
+    )
+    assert "TRUNCATED" not in persisted_body, (
+        "durable state must never itself be truncated — only the RETURNED "
+        "MCP value is bounded (cb00889c contract)"
+    )
+    # The full per-item tool_requirements detail for every one of the 45
+    # items is genuinely retrievable from durable state (not just claimed to
+    # be) — the delta's own "Pending:" list caps at 20 items (bc834237,
+    # unrelated to this fix), but the <tool_requirements> JSON this fix is
+    # about is embedded unbounded regardless of that separate cap.
+    assert persisted_body.count('"name":"find_symbol"') >= 45, (
+        "persisted body should retain the full per-item tool_requirements "
+        "JSON — not just the bounded delta-list titles"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -10243,6 +10574,61 @@ async def test_start_session_continue_mode_resumes_past_heartbeat_window():
         assert cont.get("continuation") is True
         assert cont.get("mode") == "continue"
         assert cont["session_id"] == first_sid
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_start_session_continue_goal_string_bounds_large_tool_requirements():
+    """60eed526 — _build_continue_payload's goal_string must stay compact BY
+    CONSTRUCTION, matching its own "compact 'just continue' resume block"
+    docstring, even when the live pending backlog carries large per-item
+    tool_requirements contracts. Before this fix, the goal_string build never
+    passed full_contract_max_items NOR any byte-level budget, so this code
+    path could reproduce the same class of unbounded <tool_requirements>
+    bloat the checkpoint() fix (same sprint item, 60eed526) addresses — the
+    item-count cap alone is not sufficient when a single item's own
+    tool_requirements entry is already large; format_handoff_mcp_content
+    (_DEFAULT_CONTINUE_GOAL_MAX_BYTES) is the actual byte-level guarantee."""
+    from meridian.server import _start_session_composite
+    db = await db_module.init_db(":memory:")
+    try:
+        p = await db_module.create_project(db, "continue-bloat")
+        for i in range(45):
+            await db_module.add_sprint_item(
+                db, p["id"], "v9", f"Bulk item {i}",
+                tool_requirements=_bulky_tool_requirements(i),
+                # b0d42ef6 — see the identical force=True note above.
+                force=True,
+            )
+        await _start_session_composite(
+            db, p["id"], "resume-me-bulk", "/tmp", version="v9",
+        )
+        second = await _start_session_composite(
+            db, p["id"], "resume-me-bulk", "/tmp", source="resume",
+        )
+        assert second.get("continuation") is True
+        goal_string = second["goal_string"]
+        goal_bytes = len(goal_string.encode("utf-8"))
+        assert goal_bytes <= handoff_module._DEFAULT_CONTINUE_GOAL_MAX_BYTES, (
+            f"goal_string not bounded: {goal_bytes} bytes"
+        )
+        # Two independent, non-silent truncation signals can fire here: the
+        # item-count cap's own sibling tag (248c0bb9 pattern) IF the byte
+        # cut lands after it, and format_handoff_mcp_content's own marker
+        # (60eed526) whenever the byte budget itself is what bites — as it
+        # does on this fixture, where a single item's tool_requirements
+        # entry is already large enough that the byte cut lands INSIDE the
+        # <tool_requirements> JSON blob, before ever reaching the sibling
+        # <tool_requirements_truncated> tag. Either way this must never be a
+        # silent drop, so assert on the byte-budget marker that is always
+        # guaranteed present whenever goal_bytes exceeded the budget (as
+        # proven above) rather than the item-count marker's tag name, which
+        # is only guaranteed when the cut happens to land after it.
+        assert "TRUNCATED" in goal_string, (
+            "an oversized contract must carry an explicit, non-silent "
+            "truncation marker — never a silent drop"
+        )
     finally:
         await db.close()
 
@@ -18526,6 +18912,84 @@ async def test_start_session_no_project_id_returns_error(db, monkeypatch):
     )
     assert "error" in result
     assert "project_id" in result["error"].lower() or "project" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_99e0bb6a_repro_default_project_id_pending_goal_delivery(db, monkeypatch):
+    """REPRO (99e0bb6a): when start_session relies purely on the
+    MERIDIAN_PROJECT_ID/toml default fallback (no project_id, no project_name
+    in args -- exactly the AGENTS.md-recommended auto-scoping call pattern),
+    the resolved project id (_pid) must be used consistently for every
+    project-scoped enrichment in the same response, including pending_goal
+    delivery. Before the fix, downstream code read the RAW args["project_id"]
+    (absent in this call pattern) instead of the resolved _pid, raising a
+    silently-swallowed KeyError and dropping pending_goal delivery entirely.
+    """
+    import meridian.toml_config as tc
+    from meridian.mcp.handlers.project_tools import handle_start_session
+
+    p = await db_module.create_project(db, "default-project-pending-goal-test")
+    monkeypatch.setenv("MERIDIAN_PROJECT_ID", p["id"])
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+
+    await db_module.set_pending_goal(db, p["id"], "<goal>do the thing</goal>")
+
+    result = await handle_start_session(
+        {"session_name": "test-default-scope-pending-goal"},
+        db=db,
+        data_dir="/tmp",
+        tenant=None,
+        _mcp_tenant_id=None,
+        executor_sessions=set(),
+    )
+    assert "error" not in result
+    assert result.get("pending_goal") == "<goal>do the thing</goal>", (
+        "pending_goal must be delivered when start_session resolves project_id "
+        "via the env/toml default fallback, not silently dropped"
+    )
+
+
+@pytest.mark.asyncio
+async def test_99e0bb6a_start_session_project_name_only_scopes_pending_goal_correctly(
+    db, monkeypatch,
+):
+    """99e0bb6a two-project regression: handle_start_session resolves
+    project_name -> project_id itself (ce3693e4, for callers that bypass the
+    central _dispatch_mcp_tool resolver and invoke the handler directly).
+    That resolved id must be the SAME one used for every project-scoped
+    enrichment in the response -- a session started by name for project A
+    must never surface project B's pending_goal, even when neither
+    project_id nor the env/toml default happens to point at B.
+    """
+    import meridian.toml_config as tc
+    from meridian.mcp.handlers.project_tools import handle_start_session
+
+    monkeypatch.delenv("MERIDIAN_PROJECT_ID", raising=False)
+    monkeypatch.setattr(tc, "_toml_path", lambda: None)
+
+    proj_a = await db_module.create_project(db, "99e0bb6a-project-a")
+    proj_b = await db_module.create_project(db, "99e0bb6a-project-b")
+    await db_module.set_pending_goal(db, proj_a["id"], "<goal>project A work</goal>")
+    await db_module.set_pending_goal(db, proj_b["id"], "<goal>project B work</goal>")
+
+    result = await handle_start_session(
+        {"project_name": "99e0bb6a-project-a", "session_name": "name-only-scope"},
+        db=db,
+        data_dir="/tmp",
+        tenant=None,
+        _mcp_tenant_id=None,
+        executor_sessions=set(),
+    )
+    assert "error" not in result
+    assert result.get("pending_goal") == "<goal>project A work</goal>", (
+        "start_session resolved by project_name must deliver THAT project's "
+        "pending_goal, not silently drop it or leak a different project's"
+    )
+    # Project B's goal must remain untouched (still pending, read-once not
+    # consumed) -- proves no cross-project pop occurred either.
+    assert await db_module.get_pending_goal(db, proj_b["id"]) == (
+        "<goal>project B work</goal>"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1433,18 +1433,35 @@ class TestWalkStateDurability:
     def test_fresh_never_touched_differs_from_restarted_interrupted(
         self, tmp_path: Path,
     ) -> None:
-        """The pre-existing contract (a genuinely brand-new index that has
-        never indexed anything reports converged=True -- see
-        TestConvergenceState::test_no_walk_in_progress_means_any_subtree_
-        converged) must NOT become indistinguishable from a restarted
-        process whose PRIOR incarnation persisted an interrupted walk, even
-        though both have _walk_state is None right now. Conflating the two
-        is exactly the "silently claim completion it hasn't verified" bug."""
+        """3f758063 -- a genuinely brand-new index that has never indexed
+        anything must report converged=False (never_walked=True): zero
+        evidence (no scan boundary, no rows, no pending backlog, no
+        confirmed expected count) is not the same claim as "confirmed
+        converged", and reporting it as such is exactly the "convergence
+        reports true with zero indexed/unknown expected state" defect this
+        item closes (see get_convergence_state's own docstring). Prior to
+        this fix, a genuinely brand-new index reported converged=True by
+        design -- see git history for that superseded contract and its own
+        regression test, TestConvergenceState::test_no_walk_in_progress_
+        means_any_subtree_converged, updated alongside this one.
+
+        Both the never-touched case AND a restarted process whose PRIOR
+        incarnation persisted an interrupted walk must report
+        converged=False, walk_complete=False -- but for genuinely different
+        reasons (never_walked vs. a confirmed-incomplete prior pass), which
+        this test asserts separately so a future change can't silently
+        collapse the distinction back into "conflate the two", the exact
+        "silently claim completion it hasn't verified" bug this feature
+        exists to close."""
         never_touched_dir = tmp_path / "never_touched"
         never_touched_dir.mkdir()
         never_touched = OL.OutputsFtsIndex(str(never_touched_dir))
         try:
-            assert never_touched.get_convergence_state().converged is True
+            state = never_touched.get_convergence_state()
+            assert state.converged is False
+            assert state.never_walked is True
+            assert state.indexed_count == 0
+            assert state.expected_count is None
         finally:
             never_touched.close()
 
@@ -1455,6 +1472,12 @@ class TestWalkStateDurability:
         try:
             con = prior._connect()
             prior._walk_pass_confirmed_complete = False
+            # A REAL interrupted walk always leaves some concrete footprint
+            # (drain() had handed back at least one path) -- a scan boundary
+            # here, unlike the bare unconfirmed-complete flag alone, is what
+            # makes this genuinely distinguishable from never_touched's zero
+            # evidence above rather than an ambiguous corner case.
+            prior._scan_boundary = str(restarted_dir / "partial_progress.csv")
             prior._persist_walk_state_locked(con)
         finally:
             prior.close()
@@ -1465,6 +1488,11 @@ class TestWalkStateDurability:
             state = resumed.get_convergence_state()
             assert state.converged is False
             assert state.walk_complete is False
+            # Distinct from never_touched above: this IS durably-confirmed
+            # interrupted-walk evidence (a persisted scan boundary), not a
+            # genuinely untouched index -- never_walked must stay False here
+            # so a caller can tell the two apart.
+            assert state.never_walked is False
         finally:
             resumed.close()
 
@@ -5062,14 +5090,51 @@ class TestSubtreeConvergenceHeuristic:
             idx._walk_state = None
             idx.close()
 
-    def test_no_walk_in_progress_means_any_subtree_converged(self, tmp_path: Path) -> None:
+    def test_never_walked_means_no_subtree_can_be_confirmed_converged(
+        self, tmp_path: Path,
+    ) -> None:
+        """3f758063 -- `_walk_state is None` (walk_complete=True) alone is
+        no longer sufficient to call a subtree converged: a genuinely
+        never-rebuilt index has zero real evidence (no scan boundary, no
+        rows, no confirmed expected count) that ANY subtree -- however
+        small -- was ever actually looked at. See test_no_walk_in_progress_
+        after_a_real_pass_means_any_subtree_converged below for the case
+        this test used to (and, correctly, still does) cover: a subtree
+        query issued after a real pass has genuinely completed."""
         sub = tmp_path / "sub"
         sub.mkdir()
         idx = OL.OutputsFtsIndex(str(tmp_path))
         try:
-            # _walk_state is None by default -- no pass currently running.
+            # _walk_state is None by default -- no pass currently running --
+            # but that alone no longer implies converged=True.
             state = idx.get_convergence_state(subtree=str(sub))
             assert state.walk_complete is True
+            assert state.never_walked is True
+            assert state.converged is False
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_no_walk_in_progress_after_a_real_pass_means_any_subtree_converged(
+        self, tmp_path: Path,
+    ) -> None:
+        """Once a real pass has genuinely completed at least once (a
+        confirmed expected_count, even over a part of the tree unrelated to
+        `sub` itself), a subtree query with no walk currently in progress
+        correctly reports converged=True -- the original pre-3f758063
+        intent of this test, preserved for the case it actually protects."""
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (tmp_path / "root_file.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.get_convergence_state().never_walked is False  # sanity
+            # _walk_state is None (the pass completed) -- no pass currently
+            # running.
+            state = idx.get_convergence_state(subtree=str(sub))
+            assert state.walk_complete is True
+            assert state.never_walked is False
             assert state.converged is True
         finally:
             idx.close()
@@ -5475,3 +5540,136 @@ class TestHierarchicalSubtreeIndexing:
         assert result["convergence"]["converged"] is False
         assert result["convergence"]["subtree"] is None  # scoped index itself
         assert "zero_hits_warning" in result
+
+
+class TestAncestorDiskCacheRedirect:
+    """39bf34d8 -- _get_cached_index must consult an ancestor's on-disk index
+    before creating an independent one, so a parent outputs_dir and a child
+    subdirectory never silently diverge into two unrelated databases for the
+    SAME real files (the confirmed incident: register/query under one
+    reports exact provenance, "unknown" under the other)."""
+
+    def test_find_ancestor_disk_cache_none_when_no_cache_anywhere(self, tmp_path: Path) -> None:
+        sub = tmp_path / "child"
+        sub.mkdir()
+        assert OL._find_ancestor_disk_cache(str(sub)) is None
+
+    def test_find_ancestor_disk_cache_none_when_own_cache_exists(self, tmp_path: Path) -> None:
+        cache_dir = tmp_path / ".meridian-outputs-cache"
+        cache_dir.mkdir()
+        (cache_dir / "index.duckdb").write_bytes(b"")
+        assert OL._find_ancestor_disk_cache(str(tmp_path)) is None
+
+    def test_find_ancestor_disk_cache_finds_immediate_parent(self, tmp_path: Path) -> None:
+        cache_dir = tmp_path / ".meridian-outputs-cache"
+        cache_dir.mkdir()
+        (cache_dir / "index.duckdb").write_bytes(b"")
+        child = tmp_path / "defense_plots"
+        child.mkdir()
+        found = OL._find_ancestor_disk_cache(str(child))
+        assert found is not None
+        assert os.path.normpath(found) == os.path.normpath(str(tmp_path))
+
+    def test_find_ancestor_disk_cache_prefers_nearest_ancestor(self, tmp_path: Path) -> None:
+        root_cache = tmp_path / ".meridian-outputs-cache"
+        root_cache.mkdir()
+        (root_cache / "index.duckdb").write_bytes(b"")
+        mid = tmp_path / "mid"
+        mid.mkdir()
+        mid_cache = mid / ".meridian-outputs-cache"
+        mid_cache.mkdir()
+        (mid_cache / "index.duckdb").write_bytes(b"")
+        child = mid / "leaf"
+        child.mkdir()
+        found = OL._find_ancestor_disk_cache(str(child))
+        assert found is not None
+        assert os.path.normpath(found) == os.path.normpath(str(mid))
+
+    def test_find_ancestor_disk_cache_respects_search_bound(self, tmp_path: Path) -> None:
+        cache_dir = tmp_path / ".meridian-outputs-cache"
+        cache_dir.mkdir()
+        (cache_dir / "index.duckdb").write_bytes(b"")
+        deep = tmp_path
+        for i in range(OL._ANCESTOR_CACHE_SEARCH_MAX_LEVELS + 1):
+            deep = deep / f"level{i}"
+        deep.mkdir(parents=True)
+        assert OL._find_ancestor_disk_cache(str(deep)) is None
+
+    def test_existing_own_cache_is_never_redirected_away_from(self, tmp_path: Path) -> None:
+        """An outputs_dir with ITS OWN established on-disk cache must keep
+        using it, even when an unrelated ancestor also has one."""
+        outer_cache = tmp_path / ".meridian-outputs-cache"
+        outer_cache.mkdir()
+        (outer_cache / "index.duckdb").write_bytes(b"")
+
+        own = tmp_path / "own_project"
+        own.mkdir()
+        own_cache = own / ".meridian-outputs-cache"
+        own_cache.mkdir()
+        (own_cache / "index.duckdb").write_bytes(b"")
+
+        assert OL._find_ancestor_disk_cache(str(own)) is None
+
+    @duckdb_required
+    def test_get_cached_index_redirects_child_to_parent_ancestor(self, tmp_path: Path) -> None:
+        parent = tmp_path
+        child = parent / "defense_plots"
+        child.mkdir()
+        (child / "a.csv").write_text("col\nvalue=1\n", encoding="utf-8")
+
+        # Converge under the PARENT so it gets a real on-disk cache.
+        OL.search_outputs(str(parent), "value")
+
+        # Evict the parent's index from the IN-MEMORY cache so this
+        # exercises the ON-DISK discovery path, not the in-memory one
+        # _find_ancestor_cached_index already covered.
+        with OL._index_cache_lock:
+            key = OL._cache_key(str(parent))
+            OL._index_cache.pop(key, None)
+
+        child_idx = OL._get_cached_index_for_lookup(str(child))
+        assert os.path.normpath(child_idx.outputs_dir) == os.path.normpath(str(parent))
+
+    @duckdb_required
+    def test_provenance_registered_under_parent_visible_under_child(self, tmp_path: Path) -> None:
+        """Direct regression test for the reported incident: a path
+        registered through the PARENT outputs_dir must resolve consistently
+        when the SAME path is later queried through a CHILD outputs_dir,
+        instead of reporting exact under one and unknown under the other."""
+        parent = tmp_path
+        child = parent / "defense_plots"
+        child.mkdir()
+        f = child / "figure_c11.csv"
+        f.write_text("col\nvalue=1\n", encoding="utf-8")
+
+        result = OL.register_output_paths(str(parent), [str(f)])
+        assert result["registered"] is True
+        assert result["indexed"] == 1
+
+        status_via_child = OL.get_indexed_output_status(str(child), str(f))
+        assert status_via_child["row"] is not None, (
+            "path registered under the parent outputs_dir was not visible "
+            f"when queried under the child outputs_dir: {status_via_child}"
+        )
+
+    @duckdb_required
+    def test_provenance_registered_under_child_visible_under_parent(self, tmp_path: Path) -> None:
+        """The reverse direction: once the parent has an established index,
+        a write through the CHILD outputs_dir must land in the SAME index
+        so a subsequent query under the PARENT sees it too."""
+        parent = tmp_path
+        child = parent / "defense_plots"
+        child.mkdir()
+
+        # Establish the parent's on-disk index first (matches the real
+        # incident's ordering -- an ambient walk/search converges the root
+        # before the scoped child-directory registration ever happens).
+        OL.search_outputs(str(parent), "irrelevant_seed_query")
+
+        f = child / "figure_c12.csv"
+        f.write_text("col\nvalue=2\n", encoding="utf-8")
+        result = OL.register_output_paths(str(child), [str(f)])
+        assert result["registered"] is True
+
+        status_via_parent = OL.get_indexed_output_status(str(parent), str(f))
+        assert status_via_parent["row"] is not None

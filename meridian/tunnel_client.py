@@ -42,6 +42,7 @@ from . import process_budget as _process_budget
 from . import process_lifecycle as _process_lifecycle
 from . import process_registry as _process_registry
 from . import serena_pool as _serena_pool
+from . import tunnel_lifecycle as _tunnel_lifecycle
 from .serena_pool import SerenaDaemonPool, SERENA_POOL_BASE_PORT
 
 DEFAULT_BASE_URL = "https://usemeridian.us"
@@ -1176,6 +1177,98 @@ async def _idle_killer(proxy: "SlotProxy", idle_seconds: float = _IDLE_KILL_SECO
             proxy.kill(reason="idle_killed")
 
 
+# ---------------------------------------------------------------------------
+# INVESTIGATE dd46f899 (item_group: tunnel-control-plane)
+# "automatic idle tunnel restart, safe child recovery, and update policy"
+#
+# This item was added 2026-08-04 and sat unclaimed/orphaned for 4+ days
+# while a batch of adjacent, independently-tracked items shipped real,
+# tested code covering the exact same three concerns. Rather than restart
+# an investigation from a blank page (and risk re-deriving/duplicating
+# work already landed elsewhere), this write-up records what was found for
+# each of the item's three named concerns, with concrete pointers, so a
+# future reader does not have to re-run this same search.
+#
+# 1) AUTOMATIC IDLE TUNNEL RESTART -- already implemented, right here.
+#    ``_idle_killer`` (above) tears a slot down with reason="idle_killed"
+#    once it has been running-but-unused for longer than
+#    ``_IDLE_KILL_SECONDS`` (30min default). The restart half is NOT a
+#    separate proactive mechanism -- it falls out of ``SlotProxy.kill()``
+#    clearing ``self._proc`` (so ``is_running`` goes False) combined with
+#    ``SlotProxy.ensure_running()`` already being called, lazily, on every
+#    slot before it serves a request. The next request after an idle-kill
+#    is therefore what triggers the respawn -- this is intentional (a
+#    genuinely idle tunnel should not burn a background timer respawning
+#    itself with nothing to serve; see ``run_tunnel``'s
+#    "Proxies start on first use; idle for >Nmin -> auto-kill + restart"
+#    banner). ``ensure_running`` was already heavily tested in isolation
+#    (``tests/test_tunnel_client.py``'s ``test_ensure_running_*`` family),
+#    but nothing chained kill(reason="idle_killed") -> ensure_running()
+#    end-to-end, so that gap is closed by
+#    ``test_idle_kill_then_ensure_running_respawns_automatically`` (same
+#    test file), which locks in: idle-kill drops the slot to IDLE_KILLED
+#    with is_running False, and the very next ensure_running() call
+#    respawns a fresh process and reaches HEALTHY again.
+#
+# 2) SAFE CHILD RECOVERY -- already implemented, across three
+#    complementary, already-shipped layers (no single item owns all of it,
+#    which is likely why this looked like an open investigation):
+#      - a3410a9c (done) -- per-slot watchdog escalation: a dead core slot
+#        (fs/code/extract) gets bounded retries with cooldown instead of
+#        retrying forever or giving up silently; once retries are
+#        exhausted the slot is marked unhealthy so ``list_tunnel_tools``
+#        stops advertising tools that would just 503, and a background
+#        re-probe every 60s auto-recovers the slot if the underlying
+#        binary becomes available again. See
+#        ``test_proc_watchdog_relaunches_on_exit`` /
+#        ``test_proc_watchdog_cools_down_instead_of_giving_up`` /
+#        ``test_proc_watchdog_healthy_tick_resets_failure_streak``.
+#      - commit ed2a882c (feat(a898710a): DC persistent-slot recovery +
+#        unhealthy badge, client side) -- Desktop-Commander's persistent
+#        session slot gets the same recover-or-badge-unhealthy treatment
+#        surfaced in the dashboard.
+#      - ``meridian/process_lifecycle.py`` (3c4ed79d) -- the actual "safe"
+#        part: an OS-level container for every owned spawn (Windows Job
+#        Object / POSIX process-group+session) so a whole process TREE
+#        (including grandchildren a child spawns before Meridian can
+#        record them) is torn down atomically, plus a PID-reuse guard
+#        (``verify_handle_live`` -- a pid read back later is confirmed to
+#        still be the SAME process, by identity/create_time, before any
+#        recovery action touches it) and ``meridian/orphan_reaper.py``
+#        (e401221d/f7084ed0), which reaps orphaned pixi/python/node
+#        children left by dead worktree sessions using that identical
+#        create-time identity check (``_identity_matches``) so a recycled
+#        PID is never killed by mistake.
+#    Together these cover the item's "safe" qualifier concretely: bounded
+#    retry (not infinite respawn storms), tree-safe teardown (not
+#    root-PID-only), and identity-verified kills (not bare-PID kills) --
+#    the three failure modes an *unsafe* child-recovery implementation
+#    would actually hit.
+#
+# 3) UPDATE POLICY -- already implemented and shipped as 23ba76a2 (done):
+#    tiered ``MERIDIAN_TUNNEL_UPDATE_MODE`` (off/warn/ask/full-auto), SAFE
+#    DEFAULT is "ask" = notify-then-explicit-confirm (never silent
+#    full-auto), wired at the existing ``/me`` server_version nudge
+#    (4bde9437) in ``run_tunnel()``. Degrades to notify-only when stdin
+#    isn't a TTY (a backgrounded tunnel can never be prompted, so it must
+#    not block/hang), and never hot-swaps the running process mid-session
+#    -- it installs then instructs a restart. See
+#    ``tests/test_tunnel_update.py`` (15 tests, referenced in 23ba76a2's
+#    own completion notes) for the full off/warn/ask/full-auto x
+#    TTY/non-TTY decision matrix.
+#
+# CONCLUSION -- no further code is needed under THIS item id. All three
+# named concerns are covered by shipped, tested, production code that
+# landed under other item ids after dd46f899 was originally added; the
+# one concrete, previously-untested seam (the idle-kill -> respawn chain
+# in area 1) now has a dedicated regression test. This block is the
+# "finding/write-up" deliverable the RESCUE-A requeue note flagged as
+# missing, kept next to the code it describes rather than in a
+# standalone root-level markdown file, per the same rationale
+# f30bbd89/5bedd35e used in meridian/mcp_tools.py.
+# ---------------------------------------------------------------------------
+
+
 async def _budget_watchdog(
     proxy: "SlotProxy",
     budget: "_process_budget.ProcessBudget | None" = None,
@@ -1738,6 +1831,7 @@ async def _run_connection_lazy(
     label: str = "fs",
     tool_prefix: str | None = None,
     known_repo_paths: "list[str] | None" = None,
+    lifecycle: "_tunnel_lifecycle.TunnelLifecycle | None" = None,
 ) -> None:
     """Hold one WebSocket session open with lazy proxy spawning.
 
@@ -1752,6 +1846,16 @@ async def _run_connection_lazy(
     *known_repo_paths* are trusted root anchors: if a path-not-allowed error
     falls under one of these roots the proxy is automatically expanded and the
     request retried once (b9d1b606).
+
+    39c8cf2c — this is the LIVE code path ``run_tunnel`` actually schedules
+    for the fs/code/extract-default/office/custom-office slots (unlike
+    ``_run_connection``, which is no longer wired into ``run_tunnel``), so
+    the same readiness-gating fix as ``_run_connection`` is applied here too:
+    "connected (lazy mode)" is announced on first inbound frame OR after a
+    bounded grace window, whichever is first, and a connection that opens
+    and then ends without ever reaching either raises
+    :class:`_tunnel_lifecycle.TunnelNeverReadyError` — see
+    :func:`_run_connection`'s docstring for the full rationale.
     """
     import httpx
     import websockets
@@ -1880,15 +1984,27 @@ async def _run_connection_lazy(
         if _reprobe_task is None:
             _reprobe_task = asyncio.ensure_future(_reprobe())
 
+    gate = _tunnel_lifecycle.ReadinessGate()
+    timer_task: "asyncio.Task | None" = None
+
+    def _announce() -> None:
+        if gate.announce():
+            if lifecycle is not None:
+                lifecycle.mark_ready()
+            print(f"tunnel:{label}: connected (lazy mode)", flush=True)
+
     try:
         async with websockets.connect(
             ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
             open_timeout=_tunnel_connect_timeout(),
         ) as ws:
-            print(f"tunnel:{label}: connected (lazy mode)", flush=True)
+            if lifecycle is not None:
+                lifecycle.mark_ws_open()
+            timer_task = _tunnel_lifecycle.start_grace_timer(_announce)
             local_base = f"http://127.0.0.1:{proxy.port}"
             async with httpx.AsyncClient() as http_client:
                 async for raw in ws:
+                    _announce()
                     try:
                         msg = json.loads(raw)
                     except (ValueError, TypeError):
@@ -2030,6 +2146,13 @@ async def _run_connection_lazy(
         # outlive the WebSocket it reports on (a3410a9c).
         if _reprobe_task is not None:
             _reprobe_task.cancel()
+        # 39c8cf2c — stop the readiness grace timer the same way; a no-op if
+        # it already fired or the connection never got past connect().
+        await _tunnel_lifecycle.stop_grace_timer(timer_task)
+    if not gate.announced:
+        if lifecycle is not None:
+            lifecycle.mark_never_ready()
+        raise _tunnel_lifecycle.TunnelNeverReadyError(label)
 
 
 async def _reconnect_loop_lazy(
@@ -3214,6 +3337,77 @@ def _release_owned_process_lease(
         pass         # never-registered, etc. are all fine to silently ignore here)
 
 
+# 39c8cf2c — single-owner lease for the WHOLE tunnel wrapper process (as
+# opposed to _register_owned_process_lease above, which leases individual
+# spawned CHILDREN). This is the "old wrapper remained alive" guardrail: a
+# fresh `run_tunnel` invocation acquires this lease before spawning anything,
+# so a genuinely-still-running prior wrapper for the SAME repo_path is
+# detected (verified via PID + create_time, never a bare pid_exists) rather
+# than silently coexisting with a brand new one. Same opt-in gate
+# (MERIDIAN_PROCESS_LEASES_ENABLED=1) and client name as every other lease
+# integration in this module — disabled by default, zero behavior change for
+# anyone who hasn't opted in.
+def _wrapper_owner_key(repo_path: str) -> str:
+    """Logical single-owner identity for one repo's tunnel wrapper. Keyed by
+    repo_path so independent tunnels for DIFFERENT repos on one machine are
+    legitimate concurrent owners, never a conflict."""
+    return f"tunnel-wrapper:{repo_path}"
+
+
+def _acquire_wrapper_lease(repo_path: str) -> "str | None":
+    """Best-effort: acquire the single-owner lease for this whole tunnel
+    wrapper process. Returns the acquired lease's ``run_id`` (hand it to
+    :func:`_release_wrapper_lease` at shutdown), or ``None`` when leasing is
+    disabled/unavailable.
+
+    A STALE prior lease (its process verified no longer alive) is silently
+    replaced — see ``ProcessLeaseBroker.acquire_exclusive``. A genuinely LIVE
+    prior wrapper for this same repo_path is reported via a clear stderr
+    warning but does NOT block this process from starting: refusing to start
+    outright is a bigger, riskier behavior change than an opt-in, report-only
+    MVP should make in one pass — see this sprint item's follow-up notes for
+    a proposed strict/fail-closed mode. Never kills the other process.
+    """
+    if not _process_leases_enabled():
+        return None
+    try:
+        pid = os.getpid()
+        create_time: "float | None" = None
+        try:
+            import psutil  # type: ignore
+            create_time = psutil.Process(pid).create_time()
+        except Exception:  # noqa: BLE001 — psutil unavailable; degrade gracefully
+            create_time = None
+        lease = _process_registry.get_broker().acquire_exclusive(
+            _LEASE_CLIENT_NAME, _wrapper_owner_key(repo_path), pid,
+            executable=sys.executable, cwd=repo_path,
+            cmdline=list(sys.argv), create_time=create_time,
+        )
+        return lease.run_id
+    except _process_registry.OwnerConflictError as exc:
+        print(
+            f"tunnel: warning — another tunnel wrapper for {repo_path!r} appears "
+            f"to still be running (pid {exc.lease.pid}, verified alive) — "
+            "starting anyway, but two wrappers serving the same repo can race "
+            "for ports and produce duplicate slot processes. Stop the other one "
+            "first if this is unexpected.",
+            file=sys.stderr, flush=True,
+        )
+        return None
+    except Exception:  # noqa: BLE001 — best-effort, never block tunnel startup
+        return None
+
+
+def _release_wrapper_lease(run_id: "str | None") -> None:
+    """Best-effort counterpart to :func:`_acquire_wrapper_lease`. Never raises."""
+    if run_id is None or not _process_leases_enabled():
+        return
+    try:
+        _process_registry.get_broker().release(_LEASE_CLIENT_NAME, run_id)
+    except Exception:  # noqa: BLE001 — best-effort, never raise
+        pass
+
+
 def _spawn_owned_with_cache_retry(
     cmd: "list[str]",
     env: "dict | None",
@@ -3268,6 +3462,122 @@ def _close_owned_process(
     result = _owned_process_backend().close(handle, grace_seconds=grace_seconds)
     _release_owned_process_lease(handle)
     return result
+
+
+# ---------------------------------------------------------------------------
+# 42a320dd — Serena pool daemons wired into the SAME ownership-bound
+# lifecycle (job-object on Windows / process-group on POSIX) the tunnel
+# proxy slots already have via _spawn_owned_with_cache_retry /
+# _close_owned_process. Confirmed gap: SerenaDaemonPool's default teardown
+# (serena_pool._default_terminate) only ever signals the ONE pid it holds a
+# Popen for. Serena's own launch command is `uvx --from serena-agent serena
+# start-mcp-server ...`, so a plain proc.terminate()/kill() only reaches the
+# uvx wrapper — the actual Serena grandchild uvx execs into is left
+# orphaned once the wrapper dies.
+#
+# Wired in as a NEW function (_owned_serena_pool_spawn) rather than changing
+# _serena_pool_spawn itself, so that function's own existing tests (uvx
+# resolution, PID recording) keep exercising a bare, unwrapped Popen — zero
+# behaviour change for them, and zero real Win32/psutil syscalls sneak into
+# any test that monkeypatches subprocess.Popen without also monkeypatching
+# _owned_process_backend (the established pattern every existing
+# _spawn_owned_with_cache_retry test already follows — see
+# test_spawn_owned_with_cache_retry_* in tests/test_tunnel_client.py).
+#
+# serena_pool.py itself needs ZERO changes: SerenaDaemon / _default_terminate
+# only ever touch .pid / .poll() / .terminate() / .wait() / .kill() on
+# whatever `spawn` returns (see serena_pool.SerenaDaemon.is_alive and
+# serena_pool._default_terminate) — _OwnedServiceProcess below duck-types
+# exactly those five members, so this wrapper is the ENTIRE integration
+# surface.
+# ---------------------------------------------------------------------------
+
+_SERENA_OWNED_LIFECYCLE_DISABLE_ENV = "MERIDIAN_DISABLE_OWNED_SERENA_LIFECYCLE"
+
+
+def _owned_serena_lifecycle_disabled() -> bool:
+    """Opt-out escape hatch (42a320dd): set to ``"1"`` to restore the exact
+    pre-existing behaviour (bare Popen, single-pid teardown, no job-object/
+    process-group tracking) — e.g. a host where Job Object creation is
+    blocked by policy, or while ruling out a suspected regression in the new
+    path. Checked fresh on every spawn, never cached, so it can be flipped
+    between tunnel restarts without a code change."""
+    return os.environ.get(_SERENA_OWNED_LIFECYCLE_DISABLE_ENV, "").strip() == "1"
+
+
+class _OwnedServiceProcess:
+    """Popen-duck-typed wrapper (42a320dd) fronting a Serena daemon's real
+    ``Popen`` handle but tearing down the WHOLE owned process tree via
+    :func:`_close_owned_process` instead of signalling only the root pid.
+
+    Only ``.pid`` / ``.poll()`` / ``.terminate()`` / ``.wait()`` / ``.kill()``
+    are ever touched by :mod:`meridian.serena_pool` (see the module comment
+    above) — exactly what this class provides.
+    """
+
+    def __init__(
+        self, proc: "subprocess.Popen", handle: "_process_lifecycle.OwnedProcessHandle"
+    ) -> None:
+        self._proc = proc
+        self._handle = handle
+        self.pid = proc.pid
+
+    def poll(self) -> "int | None":
+        return self._proc.poll()
+
+    def wait(self, timeout: "float | None" = None) -> "int | None":
+        return self._proc.wait(timeout=timeout)
+
+    def terminate(self) -> None:
+        """Tree-aware close (job-object/process-group + grace-then-force
+        escalation, all handled inside :func:`_close_owned_process`).
+        Reports a confirmed survivor to stderr with PID/create_time evidence
+        — the sprint's "report survivors" acceptance criterion — instead of
+        silently swallowing a failed teardown."""
+        confirmed_gone = _close_owned_process(self._handle)
+        if not confirmed_gone:
+            _ct = self._handle.create_time
+            print(
+                f"tunnel:extract: Serena daemon pid={self._handle.pid}"
+                + (f" create_time={_ct}" if _ct is not None else "")
+                + " survived owned-tree teardown (job-object/process-group "
+                "close reported a possible survivor) — may need manual cleanup",
+                file=sys.stderr, flush=True,
+            )
+
+    def kill(self) -> None:
+        """``_default_terminate``'s escalation-after-timeout call. The owned
+        handle's close is idempotent (:func:`_close_owned_process` no-ops
+        once already closed), so this either performs the one real close
+        (if :meth:`terminate` was somehow never called first) or is a
+        confirmed no-op."""
+        _close_owned_process(self._handle)
+
+
+def _owned_serena_pool_spawn(cmd: "list[str]") -> "subprocess.Popen":
+    """Spawn one Serena daemon via :func:`_serena_pool_spawn`, additionally
+    tracked by the portable owned-process lifecycle backend (3c4ed79d) so
+    :class:`serena_pool.SerenaDaemonPool`'s teardown tears down the WHOLE
+    owned tree instead of leaving a Serena grandchild orphaned (42a320dd —
+    see the module comment above). This is what gets wired into
+    ``SerenaDaemonPool(spawn=...)`` in :func:`run_tunnel`; ``_serena_pool_spawn``
+    itself is unchanged and stays independently tested.
+
+    Best-effort at every step: an adopt failure (or the opt-out env var)
+    degrades to returning the plain ``proc`` — today's exact behaviour —
+    rather than failing the spawn.
+    """
+    proc = _serena_pool_spawn(cmd)
+    if _owned_serena_lifecycle_disabled():
+        return proc
+    try:
+        handle = _owned_process_backend().adopt(proc, cmd=cmd)
+    except Exception:  # noqa: BLE001 — best-effort; the spawn itself already succeeded
+        handle = None
+    if handle is None:
+        return proc
+    _register_owned_process_lease(handle)
+    return _OwnedServiceProcess(proc, handle)
 
 
 def _plugin_spawn_env(env: object) -> "dict[str, str] | None":
@@ -3536,12 +3846,31 @@ def _serena_pool_spawn(cmd: "list[str]") -> "subprocess.Popen":
     a busy tunnel with several projects open re-hits this path repeatedly —
     memoizing avoids re-probing PATH/the filesystem for the same answer
     every time.
+
+    42a320dd — on POSIX, also requests ``start_new_session=True`` (the same
+    flag :func:`_spawn_owned_with_cache_retry` already uses), so the spawned
+    ``uvx`` process becomes its own session/process-group leader from the
+    moment it starts. This is additive/inert on its own (nothing here reads
+    the resulting group) but is a PREREQUISITE for
+    :func:`_owned_serena_pool_spawn` to later adopt this process into the
+    portable owned-process lifecycle backend correctly: adopting a process
+    that was NOT actually spawned as its own session leader would build an
+    ``OwnedProcessHandle`` whose ``group_id`` does not correspond to any
+    real process group, and a later ``os.killpg`` on it would raise
+    ``ProcessLookupError`` — silently treated as "already gone" while the
+    process (and Serena's own grandchild it launches) is still running.
+    Windows is unaffected: ``_spawn_kwargs()`` already applies
+    ``CREATE_NEW_PROCESS_GROUP`` unconditionally, which is what Job Object
+    adoption needs.
     """
     if cmd and cmd[0] == "uvx":
         _resolved_uvx = _cached_uvx()
         if _resolved_uvx:
             cmd = [_resolved_uvx, *cmd[1:]]
-    proc = subprocess.Popen(cmd, **_spawn_kwargs())
+    kwargs = _spawn_kwargs()
+    if sys.platform != "win32":
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **kwargs)
     _record_spawned_pid(proc, "extract")
     return proc
 
@@ -6002,33 +6331,71 @@ async def _fetch_me_with_retry(
 
 
 async def _run_connection(
-    ws_url: str, port: int, label: str = "fs", tool_prefix: str | None = None
+    ws_url: str, port: int, label: str = "fs", tool_prefix: str | None = None,
+    lifecycle: "_tunnel_lifecycle.TunnelLifecycle | None" = None,
 ) -> None:
-    """Hold one WebSocket session open, relaying requests until it drops."""
+    """Hold one WebSocket session open, relaying requests until it drops.
+
+    39c8cf2c — readiness ("connected") is no longer declared the instant the
+    WS transport handshake completes: the server
+    (routes/tunnel.py:tunnel_ws) accepts the socket THEN authenticates, and
+    closes immediately on a bad token / disallowed plan, so declaring
+    "connected" right after ``connect()`` returns could report success for a
+    connection that was about to be torn down a moment later — the
+    "reported Connected... then disconnected" incident pattern this fix
+    addresses. READY is now announced the moment EITHER (a) the first
+    inbound frame arrives, or (b) the socket has stayed open for
+    ``_tunnel_lifecycle.DEFAULT_READY_GRACE_SECONDS`` without closing —
+    whichever happens first (see :func:`_tunnel_lifecycle.start_grace_timer`
+    for why a bounded grace window, not "wait for the first frame",  is used).
+    If the connection ends before either happens, this raises
+    :class:`_tunnel_lifecycle.TunnelNeverReadyError` instead of returning
+    normally, so :func:`_reconnect_loop` applies its normal backoff rather
+    than busy-looping with zero backoff against a server that keeps
+    rejecting the connection immediately.
+    """
     import httpx
     import websockets
 
     local_base = f"http://127.0.0.1:{port}"
+    gate = _tunnel_lifecycle.ReadinessGate()
+
+    def _announce() -> None:
+        if gate.announce():
+            if lifecycle is not None:
+                lifecycle.mark_ready()
+            print(f"tunnel:{label}: connected", flush=True)
+
     async with websockets.connect(
         ws_url, max_size=None, ping_interval=20, ping_timeout=_WS_PING_TIMEOUT,
         open_timeout=_tunnel_connect_timeout(),
     ) as ws:
-        print(f"tunnel:{label}: connected", flush=True)
-        async with httpx.AsyncClient() as http_client:
-            async for raw in ws:
-                try:
-                    msg = json.loads(raw)
-                except (ValueError, TypeError):
-                    continue
-                if not isinstance(msg, dict):
-                    continue
-                if msg.get("type") == "ping":
-                    continue
-                if msg.get("type") == "request":
-                    resp = await _relay_request(
-                        http_client, local_base, msg, tool_prefix=tool_prefix
-                    )
-                    await ws.send(json.dumps(resp))
+        if lifecycle is not None:
+            lifecycle.mark_ws_open()
+        timer_task = _tunnel_lifecycle.start_grace_timer(_announce)
+        try:
+            async with httpx.AsyncClient() as http_client:
+                async for raw in ws:
+                    _announce()
+                    try:
+                        msg = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("type") == "ping":
+                        continue
+                    if msg.get("type") == "request":
+                        resp = await _relay_request(
+                            http_client, local_base, msg, tool_prefix=tool_prefix
+                        )
+                        await ws.send(json.dumps(resp))
+        finally:
+            await _tunnel_lifecycle.stop_grace_timer(timer_task)
+    if not gate.announced:
+        if lifecycle is not None:
+            lifecycle.mark_never_ready()
+        raise _tunnel_lifecycle.TunnelNeverReadyError(label)
 
 
 # ---------------------------------------------------------------------------
@@ -6750,6 +7117,10 @@ async def run_tunnel(
     # Threaded through every SlotProxy so claim files can be attributed to this
     # run vs. a prior-generation tunnel that left orphans.
     _client_id: str = str(uuid.uuid4())
+    # 39c8cf2c — single-owner lease for this whole wrapper process (opt-in via
+    # MERIDIAN_PROCESS_LEASES_ENABLED=1; see _acquire_wrapper_lease). Released
+    # in the shutdown `finally` block below, alongside every other teardown step.
+    _wrapper_lease_run_id = _acquire_wrapper_lease(repo_path)
     # SlotProxy objects (one per enabled slot) replace the old proc_holders list.
     slot_proxies: list[SlotProxy] = []
     # Track which built-in slots have a registered SlotProxy (for URL printing).
@@ -6909,7 +7280,13 @@ async def run_tunnel(
                 # _record_spawned_pid so orphaned Serena daemons are covered
                 # by _kill_all_previously_spawned_pids on the next startup
                 # (see _serena_pool_spawn's docstring for the full gap).
-                spawn=_serena_pool_spawn,
+                # 42a320dd — _owned_serena_pool_spawn additionally tracks the
+                # spawned daemon via the portable owned-process lifecycle
+                # backend (job-object on Windows / process-group on POSIX),
+                # calling _serena_pool_spawn internally so the PID-recording
+                # behaviour above is unchanged (see _owned_serena_pool_spawn's
+                # docstring for the full gap this closes).
+                spawn=_owned_serena_pool_spawn,
                 # 92aaedb7 — host-local broker: share a repo's Serena daemon
                 # with sibling tunnel_client processes on this machine instead
                 # of each spawning its own duplicate. owner_id=_client_id ties
@@ -7251,4 +7628,7 @@ async def run_tunnel(
         # Kill custom (eager) plugin processes.
         for holder in proc_holders:
             _terminate_proc_tree(holder.get("proc"))
+        # 39c8cf2c — release the whole-wrapper single-owner lease acquired at
+        # startup (no-op when leasing is disabled or was never acquired).
+        _release_wrapper_lease(_wrapper_lease_run_id)
     return 0

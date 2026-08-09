@@ -212,6 +212,35 @@ def test_prompts_get_executor_goal_by_project_name():
     assert "Item via name lookup" in text
 
 
+def test_prompts_get_executor_goal_embeds_self_start_bootstrap_in_goal_body():
+    """c1ec3517 — the executor-goal prompt's own numbered wrapper already told
+    a receiving session to call start_session first (step 1 above the /goal
+    block), but the EMBEDDED quick_start_goal /goal body itself did not carry
+    that call. A session that copies only the /goal portion -- the literal
+    block most likely to be pasted on its own, since that's the part meant
+    for /goal-style consumption -- landed with no self-start bootstrap.
+    Prove the /goal body itself now also carries it, with the real project
+    id, not just the surrounding prose."""
+    db = _make_db()
+    import meridian.db as db_module
+
+    async def _seed():
+        proj = await db_module.create_project(db, "exec-goal-self-start")
+        await db_module.add_sprint_item(db, proj["id"], "v1", "Self-start prompt item")
+        return proj["id"]
+
+    pid = _run(_seed())
+    resp = _run(mh._handle_mcp_request(
+        _req("prompts/get", {"name": "executor-goal", "arguments": {"project_id": pid}}),
+        db=db, data_dir="/tmp",
+    ))
+    text = resp["result"]["messages"][0]["content"]["text"]
+    goal_start = text.index("/goal")
+    goal_body = text[goal_start:]
+    assert f'start_session(project_id="{pid}"' in goal_body
+    assert "REQUIRED FIRST CALL" in goal_body
+
+
 def test_prompts_get_start_executor():
     resp = _run(mh._handle_mcp_request(
         _req("prompts/get", {"name": "start-executor", "arguments": {"project_id": "pid42"}}),
@@ -627,6 +656,91 @@ def test_decision_without_assumption_has_null_status():
         brief = _run(mh._dispatch_mcp_tool(
             "get_planning_brief", {"project_id": proj["id"]}, db, "/tmp"))
         assert brief["unvalidated_assumptions"] == []
+    finally:
+        _run(db.close())
+
+
+# ---------------------------------------------------------------------------
+# 9149e132 — pin_decision's optional `evidence` param (typed, code-linked
+# decision_evidence). handle_pin_decision is the ONLY touched MCP handler
+# for this item; planning_search itself is exercised in test_new_v25.py.
+# ---------------------------------------------------------------------------
+
+
+def test_pin_decision_without_evidence_is_unchanged():
+    """Omitting `evidence` entirely is a complete no-op change from before
+    this item — same call, same return shape, no evidence key at all."""
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(db_module.create_project(db, "pd-no-evidence"))
+        res = _run(mh._dispatch_mcp_tool("pin_decision", {
+            "project_id": proj["id"], "title": "Use psycopg3", "body": "body text",
+        }, db, "/tmp"))
+        assert "evidence" not in res
+        assert "evidence_error" not in res
+        assert res["title"] == "Use psycopg3"
+    finally:
+        _run(db.close())
+
+
+def test_pin_decision_with_valid_evidence_creates_linked_row():
+    """A well-formed `evidence` param atomically attaches a typed,
+    code-linked decision_evidence row to the freshly pinned decision."""
+    import meridian.db as db_module
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "pd-evidence"))
+        res = _run(mh._dispatch_mcp_tool("pin_decision", {
+            "project_id": proj["id"], "title": "Use psycopg3",
+            "body": "asyncpg has DLL issues on Windows",
+            "evidence": {
+                "pointer": {
+                    "source_type": "code",
+                    "targets": [{
+                        "uri": "meridian/pg_adapter.py",
+                        "selector": {"type": "symbol", "qualified_name": "PostgresPool"},
+                    }],
+                },
+                "text": "PostgresPool wraps psycopg3's AsyncConnectionPool directly",
+                "assumptions": "pool handles our concurrency",
+                "confidence": 0.9,
+            },
+        }, db, "/tmp"))
+        assert "evidence_error" not in res
+        ev = res["evidence"]
+        assert ev["decision_id"] == res["id"]
+        assert ev["project_id"] == proj["id"]
+        assert ev["status"] == "active"
+        assert ev["confidence"] == 0.9
+        assert ev["pointer"]["targets"][0]["uri"] == "meridian/pg_adapter.py"
+        # Durably persisted — resolvable without relying on Serena memories.
+        fetched = _run(db_module.get_decision_evidence(db, ev["id"], project_id=proj["id"]))
+        assert fetched is not None and fetched["evidence"] == ev["evidence"]
+    finally:
+        _run(db.close())
+
+
+def test_pin_decision_with_malformed_pointer_reports_evidence_error_not_failure():
+    """A malformed pointer degrades to evidence_error on the result — the
+    decision itself is never lost because its evidence was malformed."""
+    db = _make_db()
+    try:
+        import meridian.db as db_module
+        proj = _run(db_module.create_project(db, "pd-bad-evidence"))
+        res = _run(mh._dispatch_mcp_tool("pin_decision", {
+            "project_id": proj["id"], "title": "Some decision", "body": "body",
+            "evidence": {
+                "pointer": {"source_type": "code", "targets": [{"uri": "x"}]},  # missing selector
+                "text": "some evidence text",
+            },
+        }, db, "/tmp"))
+        assert "evidence" not in res
+        assert "evidence_error" in res
+        # The decision itself still committed successfully.
+        assert res["title"] == "Some decision"
+        again = _run(db_module.get_pinned_decision(db, res["id"]))
+        assert again is not None
     finally:
         _run(db.close())
 
@@ -1096,6 +1210,95 @@ def test_generate_handoff_content_parity_across_transports(monkeypatch, tmp_path
             "generate_handoff content diverged between the handler.py and "
             "stdio_handler.py transports"
         )
+    finally:
+        _run(db.close())
+
+
+def test_generate_handoff_goal_mode_self_start_parity_across_transports(
+    monkeypatch, tmp_path, client
+):
+    """c1ec3517 — CRITICAL: mode="goal" is the one handoff surface documented
+    as safe to hand a fresh sub-agent with zero other framing, so its content
+    must (a) carry an explicit self-start start_session(...) bootstrap naming
+    the REAL project id and (b) be delivered byte-identical (modulo the
+    single-use <goal_token>, which legitimately differs per call) across all
+    three transports: the HTTP/MCP handler dispatch (meridian/mcp/handler.py),
+    the stdio MCP transport (meridian/mcp/stdio_handler.py), and the plain
+    HTTP REST route (meridian/routes/handoff.py). This is the delivery-side
+    half of the CRITICAL fix: proving there is no silent truncation,
+    re-encoding, or mutation anywhere in the chain from generate_handoff's own
+    mint through to each wire contract.
+    """
+    import re
+
+    import mcp.types as mcp_types
+    import meridian.db as db_module
+
+    db = _make_db()
+    try:
+        proj = _run(db_module.create_project(db, "goal-self-start-parity"))
+        _run(db_module.add_sprint_item(db, proj["id"], "v1", "Parity item"))
+
+        handler_out = _run(mh._dispatch_mcp_tool(
+            "generate_handoff",
+            {"project_id": proj["id"], "mode": "goal"},
+            db, str(tmp_path),
+        ))
+        handler_content = handler_out["content"]
+
+        server = _stdio_server(monkeypatch, db)
+        call_handler = server.request_handlers[mcp_types.CallToolRequest]
+        called = _run(call_handler(
+            mcp_types.CallToolRequest(
+                params=mcp_types.CallToolRequestParams(
+                    name="generate_handoff",
+                    arguments={"project_id": proj["id"], "mode": "goal"},
+                )
+            )
+        ))
+        stdio_content = json.loads(called.root.content[0].text)["content"]
+
+        def _normalize(text: str) -> str:
+            return re.sub(
+                r"<goal_token>[^<]*</goal_token>",
+                "<goal_token><tok></goal_token>",
+                text,
+            )
+
+        assert _normalize(handler_content) == _normalize(stdio_content), (
+            "mode='goal' content diverged between the handler.py and "
+            "stdio_handler.py transports"
+        )
+
+        # Both MCP transports carry the real self-start bootstrap intact —
+        # naming the true project_id, not a placeholder or truncated stub.
+        expected_bootstrap = f'start_session(project_id="{proj["id"]}"'
+        for _label, _content in (("handler", handler_content), ("stdio", stdio_content)):
+            assert expected_bootstrap in _content, (
+                f"{_label} transport dropped/mutated the self-start bootstrap"
+            )
+            assert "REQUIRED FIRST CALL" in _content
+
+        # Third transport: the plain HTTP REST route. Uses its own
+        # independent app/db via the `client` fixture (a5e8aa74's parity
+        # contract must hold across the REST surface too, not just the two
+        # MCP transports above).
+        http_proj = client.post(
+            "/projects", json={"name": "goal-self-start-http"}
+        ).json()
+        client.post(
+            f"/projects/{http_proj['id']}/sprint-items",
+            json={"version": "v1", "title": "HTTP parity item"},
+        )
+        r = client.post(f"/projects/{http_proj['id']}/handoff", json={"mode": "goal"})
+        assert r.status_code == 200
+        http_content = r.json()["content"]
+        assert f'start_session(project_id="{http_proj["id"]}"' in http_content
+        assert "REQUIRED FIRST CALL" in http_content
+        # Same a5e8aa74 raw-unwrapped contract as the other two transports —
+        # no fence, no header, no blockquote added on the way out.
+        assert not http_content.startswith("````")
+        assert not http_content.endswith("````")
     finally:
         _run(db.close())
 

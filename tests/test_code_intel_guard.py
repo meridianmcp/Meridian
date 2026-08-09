@@ -39,11 +39,28 @@ from meridian.mcp.handlers import sprint_tools as _st_mod
 
 _REPO = Path(__file__).resolve().parent.parent
 _HOOK_SH = _REPO / ".claude" / "hooks" / "code_intel_guard.sh"
+_HOOK_PS1 = _REPO / ".claude" / "hooks" / "code_intel_guard.ps1"
 _SETTINGS = _REPO / ".claude" / "settings.json"
 
 _needs_bash = pytest.mark.skipif(
     not _HOOK_SH.exists() or shutil.which("bash") is None,
     reason="code_intel_guard.sh or bash unavailable",
+)
+
+
+def _powershell_exe() -> str | None:
+    """883ce543 -- resolve a PowerShell interpreter (pwsh preferred, then
+    Windows PowerShell), mirroring test_w5_5fb084fe_ps1_components.py."""
+    for exe in ("pwsh", "powershell"):
+        found = shutil.which(exe)
+        if found:
+            return found
+    return None
+
+
+_needs_powershell = pytest.mark.skipif(
+    _powershell_exe() is None or not _HOOK_PS1.exists(),
+    reason="no PowerShell interpreter (pwsh/powershell) available, or code_intel_guard.ps1 missing",
 )
 
 # Windows NTSTATUS crash exit codes seen under heavy xdist (-n auto) contention.
@@ -252,6 +269,106 @@ def _start_stub_server(code_intel_enabled: int) -> tuple[str, _StubServer]:
     return stub.url, stub
 
 
+# ---------------------------------------------------------------------------
+# 883ce543 -- flexible slot-readiness stub: an arbitrary HTTP status + body on
+# the /slot-readiness route (settings always reports code_intel_enabled as
+# given). Used to reproduce the exact gap this item fixes -- the endpoint
+# unreachable/erroring (curl -sf fails -> empty slot_resp) or returning a
+# 200 body with no extractable ready/has_tunnel fields -- which previously
+# fell through to BLOCK instead of failing open. Mirrors _StubServer's
+# WSL2-awareness (same network-namespace problem applies here).
+# ---------------------------------------------------------------------------
+
+def _custom_slot_stub_script(code_intel_enabled: int, slot_status: int, slot_body: str) -> str:
+    return f"""\
+import http.server, sys
+
+SLOT_STATUS = {slot_status}
+SLOT_BODY = {slot_body!r}.encode('utf-8')
+SETTINGS_BODY = b'{{"code_intel_enabled": {code_intel_enabled}}}'
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if 'slot-readiness' in self.path:
+            body = SLOT_BODY
+            self.send_response(SLOT_STATUS)
+        else:
+            body = SETTINGS_BODY
+            self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a, **k): pass
+
+s = http.server.HTTPServer(('127.0.0.1', 0), H)
+sys.stdout.write(str(s.server_address[1]) + '\\n')
+sys.stdout.flush()
+s.serve_forever()
+"""
+
+
+def _start_custom_slot_stub(code_intel_enabled: int, slot_status: int, slot_body: str):
+    """Start a stub whose /slot-readiness route returns an arbitrary status +
+    body, in the correct network namespace for bash. Returns
+    (url, handle, tmpfile_or_None); pass both to _stop_custom_slot_stub."""
+    if _bash_is_wsl2():
+        script = _custom_slot_stub_script(code_intel_enabled, slot_status, slot_body)
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".py", mode="w", delete=False, encoding="utf-8"
+        )
+        tmp.write(script)
+        tmp.close()
+        wsl_path = _windows_path_to_wsl(tmp.name)
+        proc = subprocess.Popen(
+            ["bash", "-c", f"python3 '{wsl_path}'"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert proc.stdout is not None
+        port_line = proc.stdout.readline().decode("utf-8", "replace").strip()
+        if not port_line.isdigit():
+            proc.kill()
+            stderr = (proc.stderr.read() if proc.stderr else b"").decode("utf-8", "replace")
+            raise RuntimeError(
+                f"WSL2 stub server failed to start (got port={port_line!r}, stderr={stderr!r})"
+            )
+        return f"http://127.0.0.1:{port_line}", proc, tmp.name
+
+    slot_body_bytes = slot_body.encode("utf-8")
+    settings_bytes = json.dumps({"code_intel_enabled": code_intel_enabled}).encode()
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if "slot-readiness" in self.path:
+                body = slot_body_bytes
+                self.send_response(slot_status)
+            else:
+                body = settings_bytes
+                self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a, **kw):  # noqa: N802
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return f"http://127.0.0.1:{port}", t, None
+
+
+def _stop_custom_slot_stub(handle, tmpfile: str | None) -> None:
+    if isinstance(handle, subprocess.Popen):
+        handle.kill()
+    if tmpfile is not None:
+        try:
+            os.unlink(tmpfile)
+        except OSError:
+            pass
+
+
 def _free_url() -> str:
     """Return a URL on an unbound port in the same namespace as bash.
 
@@ -330,6 +447,7 @@ def _run_hook(
 # ---------------------------------------------------------------------------
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_fails_open_when_server_unreachable(tool):
     """MERIDIAN_URL on an unbound port -- connection refused, hook exits 0."""
@@ -343,6 +461,7 @@ def test_hook_fails_open_when_server_unreachable(tool):
 # ---------------------------------------------------------------------------
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_fails_open_when_code_intel_disabled(tool):
     """code_intel_enabled=0 -- no index, hook exits 0 (nothing to redirect to)."""
@@ -360,6 +479,7 @@ def test_hook_fails_open_when_code_intel_disabled(tool):
 # ---------------------------------------------------------------------------
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_blocks_grep_glob_when_code_intel_enabled(tool):
     """code_intel_enabled=1 -- hook exits 2 and stderr names code-intel tools."""
@@ -376,6 +496,7 @@ def test_hook_blocks_grep_glob_when_code_intel_enabled(tool):
 
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("tool", ["Grep", "Glob"])
 def test_hook_stderr_names_the_tool_that_was_blocked(tool):
     """The error message names the specific blocked tool (Grep or Glob)."""
@@ -394,6 +515,7 @@ def test_hook_stderr_names_the_tool_that_was_blocked(tool):
 # ---------------------------------------------------------------------------
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize(
     "tool",
     ["Bash", "Edit", "Write", "Read", "AskUserQuestion", "find_symbol",
@@ -415,6 +537,7 @@ def test_hook_allows_all_other_tools(tool):
 # ---------------------------------------------------------------------------
 
 @_needs_bash
+@pytest.mark.subprocess_isolated
 @pytest.mark.parametrize("payload", ["", "not json at all", "{}", '{"foo":"bar"}'])
 def test_hook_fails_open_on_unparseable(payload):
     """Malformed or missing stdin: hook must never trap the executor."""
@@ -424,6 +547,80 @@ def test_hook_fails_open_on_unparseable(payload):
         assert r.returncode == 0, "must fail open on unparseable payload"
     finally:
         stub.stop()
+
+
+# ---------------------------------------------------------------------------
+# 883ce543 -- Tests: slot-readiness itself unreachable or unparseable must
+# fail open, not fall through to BLOCK. This is the exact regression the
+# item fixes: code_intel_enabled=1 confirms an index exists, but slot
+# readiness could not be positively confirmed, so the hook must never
+# escalate to exit 2.
+# ---------------------------------------------------------------------------
+
+@_needs_bash
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+def test_hook_fails_open_when_slot_readiness_unreachable_but_settings_ok(tool):
+    """settings reports code_intel_enabled=1, but /slot-readiness errors
+    (HTTP 500 -> curl -sf fails -> empty slot_resp). Before 883ce543 this fell
+    through the `if [ -n "$slot_resp" ]` guard straight to the block path --
+    the opposite of the documented fail-open policy."""
+    url, handle, tmpfile = _start_custom_slot_stub(
+        code_intel_enabled=1, slot_status=500, slot_body="internal error"
+    )
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_hook(payload, meridian_url=url)
+        assert r.returncode == 0, (
+            f"{tool}: must fail open when the slot-readiness endpoint errors, "
+            f"not fall through to block (883ce543 regression). stderr={r.stderr!r}"
+        )
+    finally:
+        _stop_custom_slot_stub(handle, tmpfile)
+
+
+@_needs_bash
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+def test_hook_fails_open_when_slot_readiness_body_unparseable(tool):
+    """settings reports code_intel_enabled=1, /slot-readiness returns HTTP 200
+    but a body with no extractable ready/has_tunnel fields (neither jq nor the
+    regex fallback can populate them). Before 883ce543 this also fell through
+    to block instead of failing open."""
+    url, handle, tmpfile = _start_custom_slot_stub(
+        code_intel_enabled=1, slot_status=200, slot_body="not json at all"
+    )
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_hook(payload, meridian_url=url)
+        assert r.returncode == 0, (
+            f"{tool}: must fail open when the slot-readiness body is unparseable, "
+            f"not fall through to block (883ce543 regression). stderr={r.stderr!r}"
+        )
+    finally:
+        _stop_custom_slot_stub(handle, tmpfile)
+
+
+@_needs_bash
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+def test_hook_fails_open_when_slot_readiness_json_missing_fields(tool):
+    """/slot-readiness returns valid JSON (200) but omits ready/has_tunnel
+    entirely -- jq's `.ready | tostring` yields "null" (not true/false) and
+    the regex finds no match either way, so both stay unconfirmed. Must fail
+    open, never block on an unconfirmed value."""
+    url, handle, tmpfile = _start_custom_slot_stub(
+        code_intel_enabled=1, slot_status=200, slot_body="{}"
+    )
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_hook(payload, meridian_url=url)
+        assert r.returncode == 0, (
+            f"{tool}: must fail open when ready/has_tunnel are missing from an "
+            f"otherwise-valid slot-readiness body. stderr={r.stderr!r}"
+        )
+    finally:
+        _stop_custom_slot_stub(handle, tmpfile)
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +695,302 @@ def test_agent_defaults_version_bumped_for_structural_hook():
     assert "code_intel_guard" in DEFAULT_AGENT_INSTRUCTIONS, (
         "DEFAULT_AGENT_INSTRUCTIONS must mention the hook name"
     )
+
+
+# ===========================================================================
+# 883ce543 -- PowerShell path: .claude/settings.json wires code_intel_guard.ps1
+# for the real Claude Code client on Windows (see the "powershell" shell
+# entries in settings.json), while the tests above only ever exercise
+# code_intel_guard.sh. These tests run the ACTUAL .ps1 hook as a subprocess
+# (never source it in-process -- `exit` inside a dot-sourced/`&`-invoked
+# script would terminate the CURRENT PowerShell host, not just return), proving
+# the .ps1 and .sh variants share one fail-open/block decision table for the
+# same inputs. Stub server runs a plain (non-WSL2) HTTP listener in-process --
+# PowerShell on Windows talks to 127.0.0.1 directly, no WSL2 network-namespace
+# boundary applies here (that boundary is specific to bash resolving to WSL2).
+# ===========================================================================
+
+def _start_plain_stub(
+    *, code_intel_enabled: int, slot_status: int = 200, slot_body: str | None = None
+) -> tuple[str, http.server.HTTPServer, threading.Thread]:
+    """Start a plain in-process HTTP stub for the PS1 hook (native Invoke-RestMethod,
+    no WSL2 namespace concerns). Returns (url, server, thread)."""
+    if slot_body is None:
+        slot_body = json.dumps({"ready": True, "has_tunnel": True})
+    slot_bytes = slot_body.encode("utf-8")
+    settings_bytes = json.dumps({"code_intel_enabled": code_intel_enabled}).encode()
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if "slot-readiness" in self.path:
+                body = slot_bytes
+                self.send_response(slot_status)
+            else:
+                body = settings_bytes
+                self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a, **kw):  # noqa: N802
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return f"http://127.0.0.1:{port}", srv, t
+
+
+def _run_ps1_hook(payload: str, *, meridian_url: str) -> subprocess.CompletedProcess:
+    """Run code_intel_guard.ps1 as a real child process with *payload* on
+    stdin and MERIDIAN_URL set in its environment."""
+    ps = _powershell_exe()
+    env = dict(os.environ)
+    env["MERIDIAN_URL"] = meridian_url
+    r = subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(_HOOK_PS1)],
+        input=payload.encode("utf-8"),
+        cwd=str(_REPO),
+        capture_output=True,
+        timeout=30,
+        env=env,
+    )
+    return subprocess.CompletedProcess(
+        r.args,
+        r.returncode,
+        stdout=(r.stdout or b"").decode("utf-8", "replace"),
+        stderr=(r.stderr or b"").decode("utf-8", "replace"),
+    )
+
+
+@_needs_powershell
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+def test_ps1_hook_fails_open_when_code_intel_disabled(tool):
+    url, srv, _t = _start_plain_stub(code_intel_enabled=0)
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_ps1_hook(payload, meridian_url=url)
+        assert r.returncode == 0, f"{tool}: ps1 hook must fail open when disabled"
+    finally:
+        srv.shutdown()
+
+
+@_needs_powershell
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+def test_ps1_hook_fails_open_when_server_unreachable(tool):
+    payload = json.dumps({"tool_name": tool, "tool_input": {}})
+    r = _run_ps1_hook(payload, meridian_url=_free_url())
+    assert r.returncode == 0, f"{tool}: ps1 hook must fail open when server is unreachable"
+
+
+@_needs_powershell
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+def test_ps1_hook_fails_open_when_slot_readiness_unreachable(tool):
+    """883ce543 (PS1 side): code_intel_enabled=1 but /slot-readiness errors
+    (HTTP 500 -> Invoke-RestMethod throws, caught -> $slotResp stays $null).
+    Must fail open, not fall through to block."""
+    url, srv, _t = _start_plain_stub(code_intel_enabled=1, slot_status=500, slot_body="err")
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_ps1_hook(payload, meridian_url=url)
+        assert r.returncode == 0, (
+            f"{tool}: ps1 hook must fail open when slot-readiness errors "
+            f"(883ce543 regression). stderr={r.stderr!r}"
+        )
+    finally:
+        srv.shutdown()
+
+
+@_needs_powershell
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+def test_ps1_hook_fails_open_when_slot_readiness_malformed(tool):
+    """883ce543 (PS1 side): code_intel_enabled=1, /slot-readiness returns 200
+    with a non-JSON body (Invoke-RestMethod throws parsing it, caught). Must
+    fail open, not fall through to block."""
+    url, srv, _t = _start_plain_stub(
+        code_intel_enabled=1, slot_status=200, slot_body="not json at all"
+    )
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_ps1_hook(payload, meridian_url=url)
+        assert r.returncode == 0, (
+            f"{tool}: ps1 hook must fail open when slot-readiness body is "
+            f"malformed (883ce543 regression). stderr={r.stderr!r}"
+        )
+    finally:
+        srv.shutdown()
+
+
+@_needs_powershell
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+def test_ps1_hook_fails_open_when_slot_readiness_missing_fields(tool):
+    """883ce543 (PS1 side): valid JSON (200) but missing ready/has_tunnel
+    entirely -- $slotResp.ready and $slotResp.has_tunnel resolve to $null,
+    which is neither -eq $true nor -eq $false. Must fail open."""
+    url, srv, _t = _start_plain_stub(code_intel_enabled=1, slot_status=200, slot_body="{}")
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_ps1_hook(payload, meridian_url=url)
+        assert r.returncode == 0, (
+            f"{tool}: ps1 hook must fail open when ready/has_tunnel are "
+            f"missing. stderr={r.stderr!r}"
+        )
+    finally:
+        srv.shutdown()
+
+
+@_needs_powershell
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+def test_ps1_hook_fails_open_when_ready_false(tool):
+    url, srv, _t = _start_plain_stub(
+        code_intel_enabled=1,
+        slot_body=json.dumps({"ready": False, "has_tunnel": True}),
+    )
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_ps1_hook(payload, meridian_url=url)
+        assert r.returncode == 0, f"{tool}: ps1 hook must fail open when ready=false"
+        assert "NOT ready" in r.stderr, "stderr must explain the not-ready fail-open"
+    finally:
+        srv.shutdown()
+
+
+@_needs_powershell
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+def test_ps1_hook_fails_open_when_has_tunnel_false(tool):
+    url, srv, _t = _start_plain_stub(
+        code_intel_enabled=1,
+        slot_body=json.dumps({"ready": True, "has_tunnel": False}),
+    )
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_ps1_hook(payload, meridian_url=url)
+        assert r.returncode == 0, f"{tool}: ps1 hook must fail open when has_tunnel=false"
+        assert "no tunnel" in r.stderr.lower(), "stderr must explain the no-tunnel fail-open"
+    finally:
+        srv.shutdown()
+
+
+@_needs_powershell
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+def test_ps1_hook_blocks_when_validated_ready_and_tunnel(tool):
+    """The ONLY case that should block: positively confirmed ready=true AND
+    has_tunnel=true. Mirrors test_hook_blocks_grep_glob_when_code_intel_enabled
+    for the .sh hook -- same contract, same message content, different shell."""
+    url, srv, _t = _start_plain_stub(
+        code_intel_enabled=1,
+        slot_body=json.dumps({"ready": True, "has_tunnel": True}),
+    )
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_ps1_hook(payload, meridian_url=url)
+        assert r.returncode == 2, f"{tool}: ps1 hook must block when ready+tunnel are confirmed"
+        combined = r.stdout + r.stderr
+        assert "find_symbol" in combined, "must mention find_symbol as the alternative"
+        assert "search_graph" in combined, "must mention search_graph as the alternative"
+        assert "aeba8a80" in combined, "must cite the item id"
+        assert tool in combined, f"stderr must name the blocked tool ({tool})"
+    finally:
+        srv.shutdown()
+
+
+@_needs_powershell
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Grep", "Glob"])
+@pytest.mark.parametrize(
+    "slot_body",
+    [
+        json.dumps({"ready": 1, "has_tunnel": True}),
+        json.dumps({"ready": True, "has_tunnel": 1}),
+        json.dumps({"ready": "true", "has_tunnel": True}),
+        json.dumps({"ready": 1, "has_tunnel": 1}),
+    ],
+)
+def test_ps1_hook_fails_open_on_non_boolean_ready_or_tunnel(tool, slot_body):
+    """Verifier-found gap (post-883ce543 fix): PowerShell's -eq coerces its
+    RHS to the LHS's type, so a non-boolean truthy JSON value like ready=1
+    (int) or ready="true" (string) made "$slotReady -eq $true" coerce
+    $true -> 1 (or "True") and wrongly compare equal, BLOCKING when it
+    should fail open -- diverging from code_intel_guard.sh, whose jq/regex
+    path only ever matches the literal strings "true"/"false". Must fail
+    open (exit 0) for every one of these malformed-but-truthy shapes,
+    identically to the .sh hook."""
+    url, srv, _t = _start_plain_stub(code_intel_enabled=1, slot_body=slot_body)
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_ps1_hook(payload, meridian_url=url)
+        assert r.returncode == 0, (
+            f"{tool}: ps1 hook must fail open on non-boolean ready/has_tunnel "
+            f"({slot_body!r}), not block via -eq type coercion. "
+            f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        )
+    finally:
+        srv.shutdown()
+
+
+@_needs_powershell
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("payload", ["", "not json at all", "{}", '{"foo":"bar"}'])
+def test_ps1_hook_fails_open_on_unparseable_payload(payload):
+    r = _run_ps1_hook(payload, meridian_url=_free_url())
+    assert r.returncode == 0, "ps1 hook must fail open on unparseable/missing stdin"
+
+
+@_needs_powershell
+@pytest.mark.subprocess_isolated
+@pytest.mark.parametrize("tool", ["Bash", "Edit", "Write", "Read", "AskUserQuestion"])
+def test_ps1_hook_allows_all_other_tools(tool):
+    url, srv, _t = _start_plain_stub(
+        code_intel_enabled=1,
+        slot_body=json.dumps({"ready": True, "has_tunnel": True}),
+    )
+    try:
+        payload = json.dumps({"tool_name": tool, "tool_input": {}})
+        r = _run_ps1_hook(payload, meridian_url=url)
+        assert r.returncode == 0, f"{tool} must not be blocked by the code-intel guard"
+    finally:
+        srv.shutdown()
+
+
+@pytest.mark.subprocess_isolated
+def test_ps1_hook_is_pure_ascii_and_parses_with_zero_errors():
+    """883ce543 gotcha: the Edit tool writes BOM-less UTF-8, and PowerShell 5.1
+    reads a BOM-less .ps1 as cp1252, so any non-ASCII byte silently corrupts
+    em-dashes/smart-quotes and can break the parser. Verify the real hook file
+    is pure ASCII and parses cleanly via PowerShell's own AST parser."""
+    raw = _HOOK_PS1.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf"), "code_intel_guard.ps1 must not have a UTF-8 BOM"
+    non_ascii = [(i, b) for i, b in enumerate(raw) if b > 0x7F]
+    assert not non_ascii, f"code_intel_guard.ps1 has non-ASCII bytes at {non_ascii[:10]}"
+
+    ps = _powershell_exe()
+    if ps is None:
+        pytest.skip("no PowerShell interpreter available on this host")
+    ps_script = (
+        "$tokens=$null;$errors=$null;"
+        "[System.Management.Automation.Language.Parser]::ParseFile("
+        f"'{_HOOK_PS1.as_posix()}',[ref]$tokens,[ref]$errors)|Out-Null;"
+        "if($errors){$errors|ForEach-Object{Write-Output $_.Message};exit 1}"
+        "else{Write-Output 'PARSE_OK';exit 0}"
+    )
+    proc = subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+    assert proc.returncode == 0, f"code_intel_guard.ps1 failed to parse:\n{proc.stdout}\n{proc.stderr}"
+    assert "PARSE_OK" in proc.stdout
 
 
 # ===========================================================================

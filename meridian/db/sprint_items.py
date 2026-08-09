@@ -32,6 +32,7 @@ from meridian.db import (  # noqa: PLC0415
     serialize_touches_resources,
     parse_touches_resources,
     _resource_sets_conflict,
+    _resource_file_of,
     get_executor_config,
     get_project,
     set_executor_config,
@@ -343,7 +344,15 @@ _SPRINT_PRIORITY_DEFAULT_RANK = _SPRINT_PRIORITY_RANK["normal"]
 # again in the next, since nothing but human judgment stopped it. 'superseded'
 # is therefore a HARD gate, enforced inside claim_sprint_item itself (see the
 # blocked-dict check below), unlike 'manual's listing-only exclusion.
-_VALID_SPRINT_BLOCKER_KINDS = ("manual", "superseded")
+#
+# cc3864bd — 'systemic_invalidated_run' = the item belongs to a wave run whose
+# FOUNDATIONAL HYPOTHESIS was systemically invalidated (see
+# meridian.db.wave_runs.abort_wave_run_systemic /
+# block_sprint_items_for_systemic_invalidation) — a stronger, deterministic-
+# evidence-gated cousin of 'superseded'. Also a HARD gate, same enforcement
+# point, for the same reason: a stale goal block or prior session memory can
+# still hand an executor this item_id directly.
+_VALID_SPRINT_BLOCKER_KINDS = ("manual", "superseded", "systemic_invalidated_run")
 
 # 7c82f7c8 — github_channel values, mirroring the fdaa5b55 auto-filed-issue
 # labeling scheme (channel:nightly / channel:stable GitHub labels). NULL =
@@ -986,33 +995,116 @@ async def add_sprint_item(
     return item
 
 
+def _fan_out_spec_to_batch_entry(spec: Any, index: int) -> dict[str, Any]:
+    """Map one ``fan_out_sprint_items`` item-spec onto a
+    ``batch_management.execute_batch`` ``sprint_item`` create-entry (468ab67d).
+
+    Only translates fan_out's own historical field synonyms (``sprint`` ->
+    ``version``, ``item_group`` -> ``group``, ``description`` -> ``notes`` —
+    the exact same mapping the legacy insert loop below already performs);
+    everything else (``touches_resources``, ``force``, ``correlation_key``)
+    passes through by name unchanged, since it already matches
+    :func:`add_sprint_item`'s own kwarg names / ``execute_batch``'s own
+    entry shape. A non-dict ``spec`` is passed through as-is so it hits the
+    engine's own "entry must be an object" validation error (a real,
+    reportable per-entry outcome) instead of crashing this mapper with an
+    ``AttributeError`` the way the legacy loop would.
+    """
+    if not isinstance(spec, dict):
+        return spec
+    entry: dict[str, Any] = {"action": "create", "title": spec.get("title")}
+    version = spec.get("version") or spec.get("sprint")
+    if version:
+        entry["version"] = version
+    group = spec.get("group") or spec.get("item_group")
+    if group:
+        entry["group"] = group
+    description = spec.get("description")
+    if description:
+        entry["notes"] = description
+    if spec.get("touches_resources") is not None:
+        entry["touches_resources"] = spec.get("touches_resources")
+    if spec.get("force"):
+        entry["force"] = True
+    ck = spec.get("correlation_key")
+    if isinstance(ck, str) and ck.strip():
+        entry["correlation_key"] = ck
+    return entry
+
+
 async def fan_out_sprint_items(
     db: aiosqlite.Connection,
     project_id: str,
     items: list[dict[str, Any]],
-) -> list[str]:
+    *,
+    strict: bool = False,
+    mode: str = "all_or_nothing",
+    idempotency_key: str | None = None,
+    tenant_id: str | None = None,
+    actor: str | None = None,
+) -> list[str] | dict[str, Any]:
     """Bulk-insert sprint items for an orchestrator decomposing a goal.
 
     ``items`` is a list of dicts, each with at minimum ``title`` (required)
     and optionally ``description``, ``group``, and ``version``.  Missing
     ``version`` defaults to the empty string (same as the common add_sprint_item
-    convention).  Unlike add_sprint_item the duplicate guard is **not** applied
-    here — the orchestrator is assumed to have already deduped.
+    convention).
 
-    Returns the list of new item IDs in insertion order.
+    Legacy contract (``strict=False``, the default — UNCHANGED, 468ab67d):
+    the duplicate guard is **not** applied — the orchestrator is assumed to
+    have already deduped. Returns the bare ``list[str]`` of new item IDs in
+    insertion order, exactly as before. Every existing caller that never
+    passes ``strict=`` sees zero behavior change — this is the
+    compatibility-preserving half of 468ab67d's contract.
 
-    86e4ae44 — deliberately NOT rerouted through
-    :mod:`meridian.db.batch_management`'s shared batch engine. That engine's
-    ``sprint_item`` entry kind creates via :func:`add_sprint_item`, which DOES
-    enforce the 60%-word-overlap duplicate guard this function explicitly
-    skips (see the paragraph above) — rerouting would silently reject
-    near-duplicate titles that succeed today, a real behavior change for
-    every existing caller. See ``batch_management``'s module docstring
-    ("Compatibility: why fan_out_sprint_items / add_sprint_item_pointer are
-    NOT rerouted through this engine") for the full reasoning. The new
-    engine is the additive, atomic/idempotent/duplicate-guarded alternative
-    for callers who want that stricter contract instead of this one.
+    Strict, opt-in contract (``strict=True``, 468ab67d): reroutes through
+    :func:`meridian.db.batch_management.execute_batch`'s ``sprint_item``
+    create path (the SAME :func:`add_sprint_item`-backed engine
+    ``execute_batch``/``add_sprint_item`` already use — no second
+    duplicate/idempotency heuristic implemented here) instead of the raw
+    insert loop below, which gives a caller who explicitly opts in:
+
+    * the 60%-word-overlap duplicate guard (per-item ``force=True`` still
+      overrides it, same as :func:`add_sprint_item`);
+    * ``idempotency_key`` replay — a retried call with the same
+      ``(project_id, "sprint_item", idempotency_key)`` returns the FIRST
+      call's stored result verbatim instead of re-inserting;
+    * ``mode="all_or_nothing"`` (default) or ``"best_effort"`` batch
+      semantics, with compensating rollback on an ``all_or_nothing`` failure;
+    * a per-entry outcome (``ok``/``error``/``rolled_back``/``not_attempted``,
+      with ``error_code``/``error_message``/``retryable``) referencing the
+      created item's own id, instead of a bare id list that gives no
+      visibility into what happened to each entry;
+    * stable per-entry ``correlation_key`` echoing (an item spec's own
+      ``correlation_key``, when supplied) plus the always-present
+      deterministic ``index``.
+
+    Returns :class:`meridian.db.batch_management.BatchResult`'s
+    ``to_dict()`` when ``strict=True`` — a DIFFERENT shape from the legacy
+    ``list[str]`` return, by design: this is a new, explicitly-opted-into
+    contract, not a silent change to the existing one. Raises
+    :class:`meridian.db.batch_management.BatchEngineError` for a call-level
+    contract violation (e.g. every entry in ``items`` failed to map to a
+    dict with a title), matching ``execute_batch``'s own raise contract.
+
+    See ``batch_management``'s module docstring ("Compatibility: why
+    fan_out_sprint_items / add_sprint_item_pointer are NOT rerouted through
+    this engine [by default]") for the full history of why the DEFAULT stays
+    the legacy, unguarded loop.
     """
+    if strict:
+        from meridian.db import batch_management  # noqa: PLC0415 — lazy: db/__init__.py never imports batch_management itself, and this avoids any import-order dependence on where in db/__init__.py's load sequence sprint_items.py is reached.
+
+        entries = [
+            _fan_out_spec_to_batch_entry(spec, i) for i, spec in enumerate(items)
+        ]
+        result = await batch_management.execute_batch(
+            db, project_id=project_id, entry_kind="sprint_item", entries=entries,
+            mode=mode, idempotency_key=idempotency_key, tenant_id=tenant_id,
+            actor=actor,
+        )
+        return result.to_dict()
+
     ids: list[str] = []
     for spec in items:
         title = (spec.get("title") or "").strip()
@@ -2423,6 +2515,29 @@ async def claim_sprint_item(
                 "as-is. See the item's notes for what superseded it. A human "
                 "must clear blocker_kind via update_sprint_item to make it "
                 "claimable again."
+                + (f" Notes: {_notes}" if _notes else "")
+            ),
+            "item_id": item_id,
+        }
+    # cc3864bd — refuse an item blocked by a wave run's systemic invalidation.
+    # Hard gate, same enforcement point as 'superseded' above (a stale goal
+    # block or prior session memory can hand an executor this item_id
+    # directly, bypassing any listing filter) — see
+    # meridian.db.wave_runs.abort_wave_run_systemic /
+    # block_sprint_items_for_systemic_invalidation for how this gets set.
+    if (item.get("blocker_kind") or "").strip() == "systemic_invalidated_run":
+        _notes = (item.get("notes") or "").strip()
+        return {
+            "blocked": True,
+            "error": "SYSTEMIC_INVALIDATED_RUN",
+            "reason": (
+                "Sprint item is marked blocker_kind='systemic_invalidated_run' "
+                "— the wave run it belonged to was aborted because its "
+                "foundational hypothesis was systemically invalidated (see "
+                "the item's notes, and the wave run's executor_reports entry, "
+                "for the evidence). It must not be executed until a planner "
+                "reviews the evidence and clears blocker_kind via "
+                "update_sprint_item on a corrected board revision."
                 + (f" Notes: {_notes}" if _notes else "")
             ),
             "item_id": item_id,
@@ -4712,6 +4827,24 @@ def pack_groups_into_macro_waves(
     return macro_waves
 
 
+def _is_legacy_file_symbol_shorthand(resource: str) -> bool:
+    """6b3b2c0e — True when a ``file:`` resource id uses the legacy
+    single-colon ``file:<path>:<symbol>`` shorthand (2a176d6d's accepted
+    "preferred form" per the SYMBOL_SCOPE_HINT hint in meridian.mcp.handler)
+    rather than a plain ``file:<path>``.
+
+    Delegates entirely to :func:`_resource_file_of` — the ONE place that
+    already knows how to tell the two apart (including the Windows
+    drive-letter exemption, ``file:C:/repo/x.py``) for scheduler conflict
+    comparison (63b030a6/2a176d6d) — so this classification can never drift
+    from the real-file resolution the scheduler already relies on. False for
+    a non-``file:`` resource.
+    """
+    if not resource.startswith("file:"):
+        return False
+    return _resource_file_of(resource) != resource[len("file:"):]
+
+
 def _predict_resource_granularity(resource: str) -> str:
     """2a176d6d — STATIC, planning-time classification of one normalized
     ``touches_resources`` entry, based purely on its string shape (never an
@@ -4724,6 +4857,14 @@ def _predict_resource_granularity(resource: str) -> str:
 
     Returns one of:
       * ``"file"``   — a well-formed ``file:<path>`` resource.
+      * ``"file_legacy_symbol_suffix"`` (6b3b2c0e) — the single-colon
+        ``file:<path>:<symbol>`` shorthand (see
+        :func:`_is_legacy_file_symbol_shorthand`). Still resolves, for
+        LOCKING purposes, to the whole real file ``<path>`` — this
+        classification exists purely so a caller can SEE that a resource
+        used the coarse legacy shape instead of the canonical
+        ``symbol:<path>::<name>`` double-colon form, rather than that fact
+        being invisible until something goes wrong at claim time.
       * ``"symbol"`` — a well-formed ``symbol:<path>::<name>`` resource.
       * ``"malformed_symbol"`` — a bare ``symbol:<name>`` with no ``::`` file
         scope (finding 3's zero-lock case) — will acquire NO lock at claim
@@ -4731,7 +4872,7 @@ def _predict_resource_granularity(resource: str) -> str:
       * ``"other"``  — any other typed resource (``db:``, ``route:``, ...).
     """
     if resource.startswith("file:"):
-        return "file"
+        return "file_legacy_symbol_suffix" if _is_legacy_file_symbol_shorthand(resource) else "file"
     if resource.startswith("symbol:"):
         value = resource[len("symbol:"):]
         _path, sep, _sym = value.partition("::")
@@ -4818,11 +4959,23 @@ async def _live_resource_holder(
     ``{"holder_session_id", "lease_expiry", "claim_granularity"}`` when held.
     Mirrors the file⊃symbol hierarchy claim_symbol/claim_file already enforce:
     a whole-file lock blocks every symbol in that file too.
+
+    6b3b2c0e — the ``file:`` branch resolves through :func:`_resource_file_of`,
+    the SAME canonical real-file identity the scheduler's conflict coloring
+    (63b030a6/2a176d6d) already uses, instead of the raw
+    ``resource[len("file:"):]`` suffix. Without this, a legacy single-colon
+    ``file:<path>:<symbol>`` declaration (2a176d6d's accepted "preferred
+    form") checked liveness against a fabricated, per-declaration-unique key
+    ("<path>:<symbol>") that no other claim ever writes to — so this function
+    silently reported the resource as FREE even when the real file <path> was
+    genuinely held by another live session (the confirmed 6b3b2c0e planning
+    gap: scheduler prediction and claim-time enforcement disagreed on what
+    the resource actually was).
     """
     from meridian.db import get_file_claims, get_symbol_claims, get_resource_claims  # noqa: PLC0415
 
     if resource.startswith("file:"):
-        file_path = resource[len("file:"):]
+        file_path = _resource_file_of(resource) or resource[len("file:"):]
         claims = await get_file_claims(db, file_path)
         lock = claims.get("file_lock")
         if lock and lock.get("session_id"):
@@ -5308,6 +5461,19 @@ async def _claim_batch_resource(
         calling a zero-lock resource "claimed".
       * ``"n/a"`` — a non-code typed resource (``db:``, ``route:``, ...)
         where the file/symbol distinction does not apply.
+
+    6b3b2c0e — the ``file:`` branch below resolves the ACTUAL lock key
+    through :func:`_resource_file_of`, the same canonical real-file identity
+    the scheduler's conflict coloring already uses, instead of the raw
+    ``resource[len("file:"):]`` suffix. Before this fix, a legacy
+    single-colon ``file:<path>:<symbol>`` declaration (2a176d6d's accepted
+    "preferred form") was claimed under a fabricated, per-declaration-unique
+    key ("<path>:<symbol>") instead of the real file "<path>" — so two items
+    declaring ``file:x.py:funcA`` and ``file:x.py:funcB`` could BOTH acquire
+    a "lock" concurrently even though get_parallelizable_groups already
+    proves (and always has) that they must be treated as the SAME real file
+    and serialized. The outcome dict's ``resolved_from_legacy_shorthand``
+    flag makes that resolution auditable for a caller/test.
     """
     from meridian.db import (  # noqa: PLC0415
         claim_file, claim_symbol, claim_resource,
@@ -5315,23 +5481,30 @@ async def _claim_batch_resource(
     )
 
     if resource.startswith("file:"):
-        file_path = resource[len("file:"):]
+        file_path = _resource_file_of(resource) or resource[len("file:"):]
+        legacy_shorthand = file_path != resource[len("file:"):]
         pre = await get_file_claims(db, file_path)
         pre_held = bool((pre.get("file_lock") or {}).get("session_id") == session_id)
         result = await claim_file(db, file_path, session_id, mode="write")
         if result.get("claimed"):
-            return {
+            outcome = {
                 "acquired": True, "scope": "file", "resource": resource,
                 "file_path": file_path, "newly_acquired": not pre_held,
                 "claim_granularity": "file",
             }
-        return {
+            if legacy_shorthand:
+                outcome["resolved_from_legacy_shorthand"] = True
+            return outcome
+        outcome = {
             "acquired": False, "scope": "file", "resource": resource,
             "file_path": file_path,
             "holder_session_id": result.get("holder_session_id"),
             "reason": result.get("reason") or "locked",
             "claim_granularity": "file",
         }
+        if legacy_shorthand:
+            outcome["resolved_from_legacy_shorthand"] = True
+        return outcome
 
     if resource.startswith("symbol:"):
         value = resource[len("symbol:"):]
@@ -5783,13 +5956,21 @@ async def claim_parallel_batch(
             # resources landed a real symbol-range claim vs. a coarse
             # whole-file fallback, rather than inferring it from
             # fallback_reason presence/absence downstream.
-            resource_claims.append({
+            _resource_claim_record = {
                 "item_id": iid,
                 "resource": resource,
                 "scope": outcome.get("scope"),
                 "claim_granularity": outcome.get("claim_granularity"),
                 "fallback_reason": outcome.get("fallback_reason"),
-            })
+            }
+            # 6b3b2c0e — surface the legacy single-colon file:<path>:<symbol>
+            # classification on the PUBLIC batch result too (not just the
+            # internal _claim_batch_resource outcome), so a caller can audit
+            # which resources in a successful batch resolved through the
+            # legacy shorthand rather than a canonical declaration.
+            if outcome.get("resolved_from_legacy_shorthand"):
+                _resource_claim_record["resolved_from_legacy_shorthand"] = True
+            resource_claims.append(_resource_claim_record)
             if outcome.get("newly_acquired"):
                 outcome["_item_id"] = iid
                 outcome["_session_id"] = claim_session
@@ -7027,3 +7208,296 @@ async def evaluate_board_blockers(
     )
     decision["policy_source"] = policy_row.get("source")
     return decision
+
+
+async def block_sprint_items_for_systemic_invalidation(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_ids: "list[str]",
+    *,
+    wave_run_id: str,
+    reason_code: str,
+    basis: str,
+    actor: "str | None" = None,
+) -> dict[str, Any]:
+    """cc3864bd — mark every LIVE item in ``item_ids`` blocked by a wave
+    run's systemic invalidation, via the existing ``blocker_kind`` hard-gate
+    mechanism (:data:`_VALID_SPRINT_BLOCKER_KINDS`, same claim-time
+    enforcement point as ``'superseded'`` in :func:`claim_sprint_item`) —
+    never a new status value, so no existing status-dependent invariant
+    elsewhere in this module changes shape. Called from
+    :func:`meridian.db.wave_runs.abort_wave_run_systemic`; kept here (not
+    there) because it is fundamentally a sprint-item write, matching this
+    module's existing division of labor with ``wave_runs.py``.
+
+    Preserves independent completed evidence: an item already
+    ``status in {'done', 'skipped'}`` is NEVER touched — reported separately
+    under ``preserved_item_ids``. The entire point of quarantining rather
+    than reverting a systemically-invalidated run is that work already
+    verified independently STAYS verified.
+
+    Project isolation: an id that does not resolve to a live item inside
+    ``project_id`` is silently skipped (reported under
+    ``skipped_other_project_or_missing_ids``) rather than raising. A wave
+    run's own ``item_ids``/children are already project-scoped by
+    construction, but a caller-supplied ``evidence.affected_item_ids`` is
+    not trusted input — this is what stops one project's systemic
+    invalidation from ever reaching into another project's board.
+
+    Idempotent: an item already ``blocker_kind == 'systemic_invalidated_run'``
+    is left completely untouched (no duplicate write, no duplicate cache
+    invalidation) but still counted in ``blocked_item_ids`` — calling this
+    twice with the same inputs is a no-op the second time, matching
+    :func:`meridian.db.wave_runs.abort_wave_run_systemic`'s own idempotent
+    contract.
+
+    Returns ``{blocked_item_ids, preserved_item_ids,
+    skipped_other_project_or_missing_ids}`` (each sorted).
+    """
+    blocked: list[str] = []
+    preserved: list[str] = []
+    skipped: list[str] = []
+    marker = (
+        f"[blocker_kind=systemic_invalidated_run wave_run={wave_run_id} "
+        f"reason_code={reason_code}] {basis}"
+    )
+    for item_id in item_ids:
+        item = await get_sprint_item(db, item_id)
+        if item is None or item.get("project_id") != project_id:
+            skipped.append(item_id)
+            continue
+        if (item.get("status") or "") in ("done", "skipped"):
+            preserved.append(item_id)
+            continue
+        if (item.get("blocker_kind") or "").strip() == "systemic_invalidated_run":
+            blocked.append(item_id)
+            continue
+        existing_notes = (item.get("notes") or "").strip()
+        new_notes = f"{marker}\n\n{existing_notes}" if existing_notes else marker
+        await patch_sprint_item(
+            db, project_id, item_id,
+            blocker_kind="systemic_invalidated_run",
+            notes=new_notes,
+        )
+        blocked.append(item_id)
+    return {
+        "blocked_item_ids": sorted(blocked),
+        "preserved_item_ids": sorted(preserved),
+        "skipped_other_project_or_missing_ids": sorted(skipped),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 0d95003f — explicit, audited cross-project sprint-item reclassification +
+# a read-only dependency-mismatch audit scanner.
+#
+# The item's full ask spans sessions, tasks, notes, proposals, proposal
+# evidence, pointers, handoff bodies/pending goals, generated files, Redis
+# keys, and index shards. This section covers SPRINT ITEMS specifically —
+# the record type most directly tied to executor handoffs and completion
+# ("quarantine ambiguous or foreign records so they cannot enter an executor
+# handoff or be marked complete"). The other record types are explicit,
+# documented follow-up, not attempted here.
+#
+# Mirrors two already-proven patterns in this codebase rather than inventing
+# new ones: move_workspace_note_to_project's verify-then-write shape (this
+# module's sibling in workspace.py) for the move itself, and
+# set_project_blocker_policy's lazy-imported record_action_audit_event call
+# (same file, above) for the audit trail.
+# ---------------------------------------------------------------------------
+
+CROSS_PROJECT_MOVE_EVENT_TYPE = "sprint_item_cross_project_move"
+
+
+async def move_sprint_item_to_project(
+    db: aiosqlite.Connection,
+    item_id: str,
+    source_project_id: str,
+    destination_project_id: str,
+    *,
+    actor: "str | None",
+    reason: "str | None",
+) -> dict[str, Any]:
+    """Explicit, audited, idempotent reclassification of ONE sprint item from
+    ``source_project_id`` to ``destination_project_id`` (0d95003f).
+
+    Never infers a destination from title/path — both project ids are
+    caller-supplied and both are verified against real rows before anything
+    is written. Returns a structured result, never raises for an expected
+    condition::
+
+        {"moved": bool, "item": dict | None, "error": str | None}
+
+    Failure modes (all ``moved=False``, ``item=None``):
+
+    * empty ``reason``/``actor`` — mirrors every other audited-override
+      pattern in this codebase (code_intel_receipt, tool_discovery): an
+      unattributed, unexplained move is refused.
+    * ``"item not found"`` — no such sprint item.
+    * item's actual ``project_id`` does not match the supplied
+      ``source_project_id`` — refusing here (rather than moving anyway)
+      prevents a stale-caller-state race from silently reassigning the
+      wrong item.
+    * ``"destination project not found"`` — never creates a destination.
+
+    Idempotent: if the item is ALREADY on ``destination_project_id``, returns
+    ``{"moved": False, "item": <the item, unchanged>, "error": None}`` — a
+    repeat call is a safe no-op, not an error.
+
+    Audit: on an actual move, records a ``sprint_item_cross_project_move``
+    action_audit_log event with item_id/source/destination/actor/reason —
+    best-effort (a dropped audit row must never undo an otherwise-successful,
+    already-committed move; mirrors set_project_blocker_policy's identical
+    guard above).
+
+    Scope: moves the sprint_items row itself only. A ``depends_on`` pointing
+    at an item that stays behind in the source project becomes a genuine
+    cross-project dependency — surfaced by
+    :func:`find_cross_project_dependency_mismatches`, not silently repaired
+    here (auto-repairing a dependency graph risks reordering work the human
+    never asked to reorder; that is deliberately a human/audited decision,
+    not an automatic side effect of a move).
+    """
+    _reason = (reason or "").strip()
+    if not _reason:
+        return {"moved": False, "item": None, "error": "reason is required and must be non-empty."}
+    _actor = (actor or "").strip()
+    if not _actor:
+        return {"moved": False, "item": None, "error": "actor is required and must be non-empty."}
+
+    item = await get_sprint_item(db, item_id)
+    if item is None:
+        return {"moved": False, "item": None, "error": "item not found"}
+    if item.get("project_id") != source_project_id:
+        return {
+            "moved": False, "item": None,
+            "error": (
+                f"item's actual project_id ({item.get('project_id')!r}) does not match "
+                f"the supplied source_project_id ({source_project_id!r}) — refusing to "
+                "move based on stale/incorrect caller state."
+            ),
+        }
+    if item.get("project_id") == destination_project_id:
+        return {"moved": False, "item": item, "error": None}
+    if await get_project(db, destination_project_id) is None:
+        return {"moved": False, "item": None, "error": "destination project not found"}
+
+    await db.execute(
+        "UPDATE sprint_items SET project_id = ? WHERE id = ?",
+        (destination_project_id, item_id),
+    )
+    await db.commit()
+    moved_item = await get_sprint_item(db, item_id)
+
+    try:
+        # Lazy import: same circularity reason as set_project_blocker_policy's
+        # identical pattern above (workspace.py imports names FROM this module).
+        from . import workspace as _workspace_module  # noqa: PLC0415
+
+        await _workspace_module.record_action_audit_event(
+            db, CROSS_PROJECT_MOVE_EVENT_TYPE,
+            project_id=destination_project_id,
+            actor=_actor,
+            detail=json.dumps({
+                "item_id": item_id,
+                "source_project_id": source_project_id,
+                "destination_project_id": destination_project_id,
+                "reason": _reason,
+            }),
+        )
+    except Exception:  # noqa: BLE001 — a dropped audit entry must never undo the move
+        pass
+
+    return {"moved": True, "item": moved_item, "error": None}
+
+
+async def find_cross_project_dependency_mismatches(
+    db: aiosqlite.Connection, project_id: str,
+) -> list[dict[str, Any]]:
+    """Read-only, non-destructive audit (0d95003f): sprint items in
+    ``project_id`` whose ``depends_on`` points at an item belonging to a
+    DIFFERENT project. Never mutates anything.
+
+    A cross-project dependency is a genuine structural mismatch: the
+    dependent item's own wave/claim ordering assumes the depended-on item's
+    lifecycle is visible in the SAME project's board, which it is not once
+    the two diverge. Returns one entry per mismatch::
+
+        {"item_id", "item_project_id", "depends_on_id", "depends_on_project_id"}
+
+    An empty list means no mismatches found — not "not checked"; the scan
+    always covers every item currently in ``project_id`` with a non-null
+    ``depends_on``.
+    """
+    mismatches: list[dict[str, Any]] = []
+    async with db.execute(
+        "SELECT id, depends_on FROM sprint_items WHERE project_id = ? AND depends_on IS NOT NULL",
+        (project_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    for row in rows:
+        row_d = _row_to_dict(row)
+        dep_id = row_d.get("depends_on")
+        if not dep_id:
+            continue
+        dep_item = await get_sprint_item(db, dep_id)
+        if dep_item is None:
+            continue  # dangling depends_on is a different, pre-existing concern
+        dep_project_id = dep_item.get("project_id")
+        if dep_project_id != project_id:
+            mismatches.append({
+                "item_id": row_d.get("id"),
+                "item_project_id": project_id,
+                "depends_on_id": dep_id,
+                "depends_on_project_id": dep_project_id,
+            })
+    return mismatches
+
+
+async def audit_and_quarantine_sprint_item_dependency_mismatches(
+    db: aiosqlite.Connection, project_id: str, *, actor: str,
+) -> dict[str, Any]:
+    """Run find_cross_project_dependency_mismatches and flag each mismatch
+    found via the generic cross-project quarantine mechanism in
+    meridian/db/workspace.py (0d95003f).
+
+    The ONLY mutation this performs is an audited quarantine event per
+    mismatch — it never moves, deletes, or otherwise repairs anything
+    (repairing the dependency graph is deliberately left a human/audited
+    decision, same reasoning find_cross_project_dependency_mismatches'
+    docstring already gives for not auto-repairing). Safe to call
+    repeatedly: quarantine_cross_project_record is idempotent, so re-running
+    this against an unchanged board produces the same open entries rather
+    than duplicating them.
+
+    Returns::
+
+        {"mismatches": [...], "quarantined": [...]}
+
+    ``mismatches`` is find_cross_project_dependency_mismatches' full,
+    unfiltered result for this run. ``quarantined`` holds only the entries
+    NEWLY flagged this call (an already-open entry from a prior run is
+    still present in ``mismatches`` but omitted from ``quarantined``, since
+    nothing changed for it).
+    """
+    from . import workspace as _workspace_module  # noqa: PLC0415
+
+    mismatches = await find_cross_project_dependency_mismatches(db, project_id)
+    quarantined: list[dict[str, Any]] = []
+    for mismatch in mismatches:
+        result = await _workspace_module.quarantine_cross_project_record(
+            db,
+            "sprint_item",
+            mismatch["item_id"],
+            mismatch["item_project_id"],
+            reason=(
+                f"depends_on {mismatch['depends_on_id']} which belongs to "
+                f"project {mismatch['depends_on_project_id']}, not this "
+                f"item's own project {mismatch['item_project_id']}."
+            ),
+            actor=actor,
+            suspected_project_id=mismatch["depends_on_project_id"],
+        )
+        if result.get("quarantined"):
+            quarantined.append(result["entry"])
+    return {"mismatches": mismatches, "quarantined": quarantined}

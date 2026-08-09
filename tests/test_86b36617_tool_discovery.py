@@ -40,6 +40,7 @@ did not exist anywhere in the codebase before this item.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import json as _json
 import sys
@@ -573,6 +574,7 @@ def test_build_item_briefing_omits_tool_discovery_request_when_nothing_declared(
 # 6. run_targeted_tests — exit-code-safe orchestration.
 # ---------------------------------------------------------------------------
 
+@pytest.mark.subprocess_isolated
 async def test_run_targeted_tests_propagates_real_nonzero_exit_code():
     """List-exec form: the REAL exit code of the target process, unmasked."""
     result = await td.run_targeted_tests(
@@ -582,6 +584,7 @@ async def test_run_targeted_tests_propagates_real_nonzero_exit_code():
     assert result["exit_code"] == 3
 
 
+@pytest.mark.subprocess_isolated
 async def test_run_targeted_tests_propagates_real_zero_exit_code():
     result = await td.run_targeted_tests(
         [sys.executable, "-c", "import sys; sys.exit(0)"],
@@ -590,6 +593,7 @@ async def test_run_targeted_tests_propagates_real_zero_exit_code():
     assert result["exit_code"] == 0
 
 
+@pytest.mark.subprocess_isolated
 async def test_run_targeted_tests_parses_pytest_style_pass_fail_counts():
     result = await td.run_targeted_tests([
         sys.executable, "-c",
@@ -601,11 +605,16 @@ async def test_run_targeted_tests_parses_pytest_style_pass_fail_counts():
 
 
 async def test_run_targeted_tests_empty_cmd_is_a_clean_error():
+    """No subprocess_isolated marker: `cmd` is empty, so `run_targeted_tests`
+    short-circuits before ever spawning a process (see its `if not cmd:`
+    guard in meridian/tool_discovery.py) -- nothing here is xdist-contention
+    sensitive."""
     result = await td.run_targeted_tests([])
     assert result["status"] == "error"
     assert result["exit_code"] is None
 
 
+@pytest.mark.subprocess_isolated
 async def test_run_targeted_tests_timeout_kills_process_and_reports_status():
     result = await td.run_targeted_tests(
         [sys.executable, "-c", "import time; time.sleep(5)"],
@@ -615,6 +624,7 @@ async def test_run_targeted_tests_timeout_kills_process_and_reports_status():
     assert result["exit_code"] is None
 
 
+@pytest.mark.subprocess_isolated
 async def test_run_targeted_tests_shell_pipe_can_mask_exit_code_list_form_cannot():
     """Reproduces the EXACT root-cause class this acceptance criterion names
     ('not something masked by a pipe/tail'): a shell string that pipes the
@@ -640,3 +650,63 @@ async def test_run_targeted_tests_shell_pipe_can_mask_exit_code_list_form_cannot
     # target's exit code -- demonstrating exactly why the list-exec form is
     # the one this function documents as giving the safety guarantee.
     assert masked["exit_code"] != 3
+
+
+# ---------------------------------------------------------------------------
+# Regression: CI run 31289808800 -- Ruff F821 "undefined name `datetime`" at
+# tool_discovery.py:909 and :965 (validate_discovery_override's and
+# apply_discovery_override's `now: "datetime | None" = None` parameter).
+# Both functions only ever bound `datetime` *locally*, inside their own
+# bodies (`from datetime import datetime as _datetime, timezone as
+# _timezone`), never at module scope -- so the quoted forward-ref annotation
+# genuinely had nothing to resolve against for static analysis, even though
+# `from __future__ import annotations` meant it never broke at runtime. Fix
+# was a `if TYPE_CHECKING: from datetime import datetime` module-level
+# import, which Ruff/mypy resolve annotation forward-refs against without
+# adding a real runtime import. This test parses the module's own source so
+# it fails on the original bug and needs no `ruff` install (not in the
+# default pixi env; see tests/test_w5_736d300e_ruff_blocking.py).
+# ---------------------------------------------------------------------------
+
+def test_tool_discovery_datetime_annotation_resolves_at_module_scope():
+    def _binds_datetime(node: ast.stmt) -> bool:
+        if isinstance(node, ast.Import):
+            return any(
+                alias.name == "datetime" and (alias.asname or alias.name) == "datetime"
+                for alias in node.names
+            )
+        if isinstance(node, ast.ImportFrom):
+            return node.module == "datetime" and any(
+                alias.name == "datetime" and (alias.asname or alias.name) == "datetime"
+                for alias in node.names
+            )
+        return False
+
+    def _is_type_checking_guard(test: ast.expr) -> bool:
+        return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+            isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+        )
+
+    with open(td.__file__, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), filename=td.__file__)
+
+    bound_at_module_scope = any(_binds_datetime(node) for node in tree.body)
+    bound_under_type_checking = any(
+        _binds_datetime(inner)
+        for node in tree.body
+        if isinstance(node, ast.If) and _is_type_checking_guard(node.test)
+        for inner in node.body
+    )
+
+    assert bound_at_module_scope or bound_under_type_checking, (
+        "meridian/tool_discovery.py's `now: \"datetime | None\"` forward-ref "
+        "annotations (validate_discovery_override / apply_discovery_override) "
+        "reference `datetime`, but nothing binds that name at module scope or "
+        "inside an `if TYPE_CHECKING:` guard -- this is the exact CI run "
+        "31289808800 Ruff F821 regression (undefined name 'datetime')."
+    )
+
+    # The two annotated call sites themselves still exist and still use the
+    # bare `datetime` forward-ref -- guards against this test silently going
+    # stale if the annotation is later rewritten to something else entirely.
+    assert 'now: "datetime | None" = None' in open(td.__file__, encoding="utf-8").read()

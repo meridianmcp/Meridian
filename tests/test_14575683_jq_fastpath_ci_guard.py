@@ -262,6 +262,7 @@ def _start_multi_stub(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.subprocess_isolated
 @_needs_bash
 @_needs_jq_linux
 @_needs_bash_http_reachable
@@ -328,6 +329,7 @@ def test_jq_tool_name_structural_extraction_ignores_nested_decoy():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.subprocess_isolated
 @_needs_bash
 @_needs_jq_linux
 @_needs_bash_http_reachable
@@ -360,6 +362,7 @@ def test_jq_ready_false_triggers_failopen_not_ready_warning():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.subprocess_isolated
 @_needs_bash
 @_needs_jq_linux
 @_needs_bash_http_reachable
@@ -395,6 +398,7 @@ def test_jq_has_tunnel_false_triggers_failopen_no_tunnel_warning():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.subprocess_isolated
 @_needs_bash
 @_needs_jq_linux
 @_needs_bash_http_reachable
@@ -494,3 +498,67 @@ def test_hook_source_contains_jq_fastpath_and_regex_fallbacks():
         'grep -oE \'"has_tunnel"[[:space:]]*:[[:space:]]*(true|false)\''
         in source
     ), "Original has_tunnel regex fallback must remain in the hook source"
+
+
+# ---------------------------------------------------------------------------
+# Test 5: jq path, slot-readiness JSON missing ready/has_tunnel entirely --
+# must fail open (883ce543). `jq -r '.ready | tostring'` on a body with no
+# "ready" key yields the string "null", which the hook's
+# `case "$slot_ready" in true|false) ;; *) slot_ready="" ;; esac` guard must
+# reset to empty (unconfirmed) rather than ever letting "null" be treated as
+# a positive confirmation. This is the jq-path sibling of the
+# unreachable/malformed tests in test_code_intel_guard.py -- same contract,
+# proven specifically through the jq extraction path this time.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.subprocess_isolated
+@_needs_bash
+@_needs_jq_linux
+@_needs_bash_http_reachable
+def test_jq_slot_readiness_missing_fields_fails_open_not_block():
+    """jq's `.ready | tostring` on a body without "ready" yields "null", which
+    must be normalized to unconfirmed (empty), not treated as a block signal.
+    Before 883ce543, an unconfirmed value here fell through to BLOCK."""
+    port, _, counter = _start_multi_stub(
+        settings_body=json.dumps({"code_intel_enabled": 1}),
+        slot_body=json.dumps({}),  # valid JSON, no ready/has_tunnel keys at all
+    )
+    url = f"http://127.0.0.1:{port}"
+    payload = json.dumps({"tool_name": "Grep", "tool_input": {}})
+
+    r = _run_hook(payload, meridian_url=url)
+
+    assert r.returncode == 0, (
+        f"Hook must fail open when slot-readiness JSON is missing ready/has_tunnel "
+        f"(jq path), got {r.returncode}. This is the exact 883ce543 regression: "
+        f"an unconfirmed value must never satisfy the block condition."
+    )
+    # /slot-readiness was genuinely reached (proves the jq path parsed the
+    # top-level tool_name correctly and progressed past the settings gate).
+    slot_hits = [p for p in counter if "slot-readiness" in p]
+    assert len(slot_hits) >= 1, "stub never received a /slot-readiness request"
+
+
+# ---------------------------------------------------------------------------
+# Test 6 (structural, no subprocess): the fixed contract requires a
+# POSITIVE confirmation of both ready=true and has_tunnel=true to block --
+# it must no longer be possible for the block branch to run on merely "not
+# explicitly false" (883ce543 regression guard, keeps the fix from silently
+# reverting to the old fall-through-to-block shape).
+# ---------------------------------------------------------------------------
+
+
+def test_hook_block_condition_requires_positive_ready_and_tunnel_confirmation():
+    """Structural regression guard: `exit 2` must be gated by an explicit
+    `"$slot_ready" = "true"` AND `"$has_tunnel" = "true"` check, not merely
+    reachable by falling out of an `if [ -n "$slot_resp" ]` block."""
+    source = _HOOK_SH.read_text(encoding="utf-8")
+    assert (
+        'if [ "$slot_ready" = "true" ] && [ "$has_tunnel" = "true" ]; then'
+        in source
+    ), (
+        "The block path (exit 2) must be gated by a positive confirmation of "
+        "BOTH slot_ready and has_tunnel being exactly 'true' -- an unconfirmed "
+        "(empty/unparseable) or explicitly false value must never reach exit 2."
+    )

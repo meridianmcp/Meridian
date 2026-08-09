@@ -61,6 +61,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "resolve_sprint_item_pointers": 'resolve_sprint_item_pointers(project_id="abc-123", sprint_item_id="item-uuid")',
     "delete_sprint_item_pointer": 'delete_sprint_item_pointer(pointer_id="pointer-uuid")',
     "execute_batch": 'execute_batch(project_id="abc-123", operation="sprint_items", entries=[{"title": "Add rate limiting", "correlation_key": "a"}, {"title": "Add retry backoff", "correlation_key": "b"}], mode="all_or_nothing", idempotency_key="my-2026-08-05-batch-1")',
+    "batch_read": 'batch_read(project_id="abc-123", requests=[{"request_id": "items", "adapter": "sprint_board", "operation": "get_sprint_items", "args": {"status": "pending"}}, {"request_id": "ptrs", "adapter": "sprint_board", "operation": "get_sprint_item_pointers", "args": {"sprint_item_id": "item-uuid"}, "depends_on": ["items"]}])',
+    "batch_mutate": 'batch_mutate(project_id="abc-123", entries=[{"kind": "sprint_item_update", "item_id": "item-uuid", "priority": "high", "correlation_key": "a"}, {"kind": "sprint_item_pointer", "sprint_item_id": "item-uuid", "source_type": "file", "targets": [{"uri": "meridian/db/batch_management.py"}], "correlation_key": "b"}], mode="all_or_nothing", idempotency_key="my-2026-08-07-mutate-1")',
     "get_notes": 'get_notes(project_id="abc-123")',
     "read_note": 'read_note(project_id="abc-123", slug="deploy-note")',
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
@@ -202,7 +204,7 @@ _PLANNED_OUTPUT_SCHEMA: dict[str, Any] = {
         "source_type": {"type": "string", "description": "e.g. 'code', 'docs', 'experiment' — what kind of source the target lives in."},
         "targets": {
             "type": "array",
-            "description": "Non-empty array of {uri, selector, target_kind?, subSelector?} — see add_sprint_item_pointer for the full selector shape (range/symbol/node_id/zotero_key/text_quote/finding_id).",
+            "description": "Non-empty array of {uri, selector, target_kind?, subSelector?, freshness?} — see add_sprint_item_pointer for the full selector shape (range/symbol/node_id/zotero_key/text_quote/finding_id/directory/git/remote_fs/artifact, 62640241).",
             "items": {"type": "object"},
         },
         "label": {"type": "string", "description": "Optional human-readable label for this output."},
@@ -284,7 +286,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
           "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}, "session_name": {"type": "string", "description": "Optional (599d0097): omit or leave blank to auto-generate a meaningful name from the first pending sprint item title + a timestamp, instead of inventing a string."},
           "human_id": {"type": "string"},
           "client": {"type": "string", "enum": ["claude-code", "claude-desktop", "cursor", "other"]},
-          "role": {"type": "string", "enum": ["executor"], "description": "Pass 'executor' to inject executor_config and credentials guidance."},
+          "role": {"type": "string", "enum": ["executor", "planner"], "description": "325276f8 — 'executor' injects executor_config and credentials guidance and narrows active_tool_set to executor-oriented tools; 'planner' narrows active_tool_set to planner-oriented tools (no executor_config injection). Previously this enum only allowed 'executor', which made every connector/client-generated schema reject role='planner' with an enum validation error before the call ever reached the server, even though the server itself (_select_active_tool_set) has always supported both roles."},
           "compact": {"type": "boolean", "description": "Default true — slim orientation. Set false for the full goal/instructions payload."},
           "version": {"type": "string", "description": "Optional sprint-version bucket (e.g. 'v0.1.x') to scope this session to. Sprint progress/items in the orientation and /goal filter to it. Omit to auto-infer the bucket with the most pending items."},
           "mode": {"type": "string", "enum": ["continue"], "description": "Pass 'continue' to resume an already-active same-name session WITHOUT re-reading the full L0/L1/L2 orientation: returns just session_id + live pending items + the ready-to-paste /goal string. Auto-detected anyway within a 5-min heartbeat window; 'continue' widens that so a known-yours session resumes cleanly even after a longer gap."}},
@@ -1316,38 +1318,85 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "\"value\".\n"
         "• zotero_key — {\"type\":\"zotero_key\", \"key\":\"<zotero-key>\"} of a Zotero "
         "library item.\n"
+        "• text_quote — {\"type\":\"text_quote\", \"exact\":str, \"prefix\"?:str, "
+        "\"suffix\"?:str, \"archived_url\"?:str, \"archived_at\"?:str, "
+        "\"canonical_url\"?:str, \"retrieval_hash\"?:str} (W3C TextQuoteSelector; "
+        "source_type \"web\" — a URL — OR a local .docx path, resolving via a docx "
+        "paragraph-text match instead of an HTTP GET). Resolving re-fetches live and "
+        "flags content drift (the cited passage silently changed/vanished).\n"
+        "• finding_id — {\"type\":\"finding_id\", \"id\":\"<finding-note-id>\"} "
+        "(source_type \"experiment\") addresses a save_finding artifact.\n"
+        "• directory — {\"type\":\"directory\", \"root\":str, \"include\"?:[str,...], "
+        "\"exclude\"?:[str,...], \"manifest_id\"?:str, \"snapshot_id\"?:str} "
+        "(62640241) — a directory ROOT + glob include/exclude selector + optional "
+        "snapshot/manifest identity. Resolving it (local paths only by default) walks "
+        "the tree and returns a deterministic manifest + manifest_hash.\n"
+        "• git — {\"type\":\"git\", \"repository\":str, \"ref\"?:str, \"commit\"?:str, "
+        "\"path\"?:str} (62640241) — a Git repository identity; at least one of "
+        "\"ref\"/\"commit\" is required. A line range within \"path\" is expressed via "
+        "subSelector (a nested range), NOT a new field. Resolving it (local clones only "
+        "by default) checks reachability against the repo's current HEAD via `git "
+        "rev-parse`.\n"
+        "• remote_fs — {\"type\":\"remote_fs\", \"host_id\":str, \"filesystem_slot\":str, "
+        "\"path\":str, \"lease_id\"?:str, \"session_id\"?:str, \"snapshot_id\"?:str} "
+        "(62640241) — an opaque tunnel-connector host + filesystem slot + remote path, "
+        "optionally bound to the lease/session that captured it. No core-local default "
+        "resolver exists (requires an injected, tunnel-backed resolver) — reported "
+        "explicitly unresolved without one, never silently dropped.\n"
+        "• artifact — {\"type\":\"artifact\", \"manifest_uri\":str, \"fingerprint\"?:str, "
+        "\"run_id\"?:str, \"item_id\"?:str, \"provenance_id\"?:str} (62640241) — a "
+        "build/output artifact's manifest URI plus an optional fingerprint and a link to "
+        "the producing run/sprint-item/provenance record. Resolving it (local files only "
+        "by default) hashes the manifest file to report its current fingerprint.\n"
         "An optional selector.subSelector nests finer granularity (W3C hasSubSelector) — "
         "e.g. {\"type\":\"symbol\", \"qualified_name\":\"a.b.f\", \"subSelector\": "
         "{\"type\":\"range\", \"start_line\":3, \"end_line\":4}} = 'these lines, within "
         "this function'. A subSelector is itself a FULL selector and MUST carry its OWN "
         "explicit \"type\" (it does not inherit the parent's). source_type names the "
-        "domain (code | docs | citation | …). Each target may also carry "
-        "target_kind: \"existing\" | \"planned_new\" (300a063d) — set \"existing\" ONLY "
-        "when the file/symbol already exists (this is checked against the real "
+        "domain (code | docs | citation | web | experiment | …). Each target may also "
+        "carry target_kind: \"existing\" | \"planned_new\" (300a063d) — set \"existing\" "
+        "ONLY when the file/symbol already exists (this is checked against the real "
         "filesystem and REJECTED if the path isn't there); set \"planned_new\" for a "
         "file this sprint item will CREATE, which is explicitly exempt from that check. "
         "Omitting target_kind keeps the pre-existing, unchecked behavior (defaults to "
         "\"existing\" in the stored shape but is never filesystem-verified) — set it "
-        "explicitly to get real verification. Malformed pointers are rejected with a "
+        "explicitly to get real verification. 62640241 — a target may ALSO carry an "
+        "optional freshness proof: {\"content_hash\"?:str, \"source_revision\"?:str, "
+        "\"resolver_version\"?:str, \"captured_at\"?:str, \"state\"?: \"current\"|"
+        "\"stale\"|\"unknown\"|\"unavailable\"|\"ambiguous\"}. Purely additive/opt-in; "
+        "resolve_sprint_item_pointers recomputes a LIVE freshness_state for directory/"
+        "git/remote_fs/artifact/text_quote targets by comparing this declared proof "
+        "against what resolution finds right now. Malformed pointers are rejected with a "
         "clear error: a bad/missing selector.type, a missing required selector field "
-        "(e.g. node_id without \"id\", a subSelector with no \"type\", an invalid "
-        "target_kind, or target_kind=\"existing\" at a path that doesn't exist). "
-        "Returns the stored pointer.",
+        "(e.g. node_id without \"id\", git without ref or commit, a subSelector with no "
+        "\"type\", an invalid target_kind or freshness.state, or target_kind=\"existing\" "
+        "at a path that doesn't exist). Returns the stored pointer.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "sprint_item_id": {"type": "string", "description": "The sprint item to attach the pointer to."},
-         "source_type": {"type": "string", "description": "Domain of the pointer: code | docs | citation | … (free text)."},
+         "source_type": {"type": "string", "description": "Domain of the pointer: code | docs | citation | web | experiment | … (free text)."},
          "targets": {"type": "array", "description":
-             "Non-empty array of {uri, selector, subSelector?, target_kind?} targets. "
-             "Each selector is an object carrying an explicit \"type\" plus that type's "
-             "field: range {\"type\":\"range\", start_line, end_line, start_char?, "
-             "end_char?}; symbol {\"type\":\"symbol\", qualified_name}; node_id "
-             "{\"type\":\"node_id\", id} (field is \"id\", NOT \"value\"); zotero_key "
-             "{\"type\":\"zotero_key\", key}. An optional subSelector is itself a full "
-             "selector and MUST carry its own \"type\". target_kind is \"existing\" "
-             "(default; explicit \"existing\" is verified against the real filesystem) "
-             "or \"planned_new\" (a file not created yet — exempt from that check).",
+             "Non-empty array of {uri, selector, subSelector?, target_kind?, freshness?} "
+             "targets. Each selector is an object carrying an explicit \"type\" plus that "
+             "type's field(s): range {\"type\":\"range\", start_line, end_line, "
+             "start_char?, end_char?}; symbol {\"type\":\"symbol\", qualified_name}; "
+             "node_id {\"type\":\"node_id\", id} (field is \"id\", NOT \"value\"); "
+             "zotero_key {\"type\":\"zotero_key\", key}; text_quote {\"type\":"
+             "\"text_quote\", exact, prefix?, suffix?, archived_url?, archived_at?, "
+             "canonical_url?, retrieval_hash?}; finding_id {\"type\":\"finding_id\", id}; "
+             "directory {\"type\":\"directory\", root, include?, exclude?, manifest_id?, "
+             "snapshot_id?}; git {\"type\":\"git\", repository, ref?, commit? "
+             "(>=1 required), path?}; remote_fs {\"type\":\"remote_fs\", host_id, "
+             "filesystem_slot, path, lease_id?, session_id?, snapshot_id?}; artifact "
+             "{\"type\":\"artifact\", manifest_uri, fingerprint?, run_id?, item_id?, "
+             "provenance_id?} (62640241 for the last five). An optional subSelector is "
+             "itself a full selector and MUST carry its own \"type\". target_kind is "
+             "\"existing\" (default; explicit \"existing\" is verified against the real "
+             "filesystem) or \"planned_new\" (a file not created yet — exempt from that "
+             "check). freshness (62640241) is an optional {content_hash?, "
+             "source_revision?, resolver_version?, captured_at?, state?} proof of what "
+             "the source looked like at capture time.",
              "items": {"type": "object"}},
          "label": {"type": "string", "description": "Optional human-readable label for the pointer."}},
          "required": ["sprint_item_id", "source_type", "targets"]}},
@@ -1368,13 +1417,23 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "chain prospect_symbol uses (graph → Serena → semantic, 653579c5) when this "
         "session has an active code tunnel, falling back to the cached code-graph "
         "snapshot when it doesn't; node_id looks the element up in the doc-structure "
-        "store; zotero_key resolves via Zotero's local API. A subSelector narrows the "
-        "outer resolution ('these lines, within this function'). Every dispatch is "
-        "best-effort: an unresolvable target yields {resolved:false, reason} instead "
-        "of an error, and the pass NEVER fails. Returns {pointers:[{id, source_type, "
-        "label, targets:[<resolved-target>]}]}. Requires no network for range/symbol/"
-        "node_id; zotero_key needs Zotero running locally (else that target is just "
-        "unresolved).",
+        "store; zotero_key resolves via Zotero's local API; text_quote re-fetches the "
+        "URL (or docx paragraph text) and flags content drift; finding_id looks up a "
+        "save_finding artifact note. 62640241 — directory walks the local root and "
+        "returns a manifest + manifest_hash; git shells out to `git rev-parse` against a "
+        "local clone to check ref/commit reachability against HEAD; artifact hashes a "
+        "local manifest file for its current fingerprint; remote_fs has no core-local "
+        "default (requires a tunnel-backed resolver — reported explicitly unresolved "
+        "without one). Every one of these five ALSO gets a recomputed freshness_state "
+        "(current/stale/unknown/unavailable/ambiguous) on its resolved target, comparing "
+        "the target's declared freshness proof (if any) against what resolution finds "
+        "right now. A subSelector narrows the outer resolution ('these lines, within "
+        "this function'). Every dispatch is best-effort: an unresolvable target yields "
+        "{resolved:false, reason} instead of an error, and the pass NEVER fails. Returns "
+        "{pointers:[{id, source_type, label, targets:[<resolved-target>]}]}. Requires no "
+        "network for range/symbol/node_id/directory/git(local)/artifact(local); "
+        "zotero_key needs Zotero running locally and text_quote needs live web access "
+        "(else those targets are just unresolved).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
@@ -1445,6 +1504,72 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "session_id": {"type": "string", "description": "Batch-level default session_id used by 'notes' entries that omit their own session_id."},
          "max_entries": {"type": "integer", "description": "Optional cap on len(entries) for this call (default 100). Exceeding it rejects the whole call before anything is attempted."}},
          "required": ["operation", "entries", "mode", "idempotency_key"]}},
+    {"name": "batch_read", "description":
+        "133bfff6 — run a batch of DOMAIN-AWARE, CONCURRENT read requests in ONE call. "
+        "Each request names an 'adapter' + 'operation' + 'args'; independent requests "
+        "(no depends_on) execute concurrently via asyncio.gather — this is pure in-process "
+        "dispatch, no subagents/worktrees involved. A request with 'depends_on' (a list of "
+        "other requests' 'request_id's in this SAME batch) waits only for its own declared "
+        "prerequisites, not the whole batch; if a prerequisite fails, the dependent resolves "
+        "immediately with error_code='DEPENDENCY_FAILED' and is never executed. Two requests "
+        "with the identical adapter+operation+normalized-args+depends_on-set COALESCE to one "
+        "execution — duplicates come back with cache_hit=true and coalesced_with=<the request_id "
+        "that actually ran>; pass a non-default cache_policy to opt a specific request out of "
+        "coalescing. Adapters currently registered: 'sprint_board' with operations "
+        "'get_sprint_items' (args: status, show_blocked, include_human, version, "
+        "include_manual_blocker, include_deferred — same meaning as the get_sprint_items tool) "
+        "and 'get_sprint_item_pointers' (args: sprint_item_id — 404s if that item belongs to a "
+        "different project). Returns {results: [{request_id, status, adapter, operation, result, "
+        "error_code, error_message, elapsed_ms, cache_hit, coalesced_with}], elapsed_ms} — "
+        "results is ALWAYS in input order. error_code is one of VALIDATION_ERROR, "
+        "ADAPTER_NOT_FOUND, OPERATION_NOT_FOUND, DEPENDENCY_NOT_FOUND, DEPENDENCY_CYCLE, "
+        "DEPENDENCY_FAILED, NOT_FOUND, TIMEOUT, INTERNAL_ERROR. This tool is READ-ONLY — for "
+        "mutations use batch_mutate or execute_batch.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "requests": {"type": "array", "description": "Non-empty list of typed read requests.", "items": {"type": "object", "properties": {
+             "request_id": {"type": "string", "description": "Required, unique within this batch."},
+             "adapter": {"type": "string", "description": "Registered adapter name, e.g. 'sprint_board'."},
+             "operation": {"type": "string", "description": "Operation the adapter exposes, e.g. 'get_sprint_items'."},
+             "args": {"type": "object", "description": "Operation-specific arguments. Defaults to {}."},
+             "depends_on": {"type": "array", "items": {"type": "string"}, "description": "Optional list of this batch's own request_ids that must resolve first."},
+             "timeout_ms": {"type": "integer", "description": "Optional per-request timeout in milliseconds (default 10000)."},
+             "cache_policy": {"type": "string", "description": "Optional. Any value other than omitted/\"\"/\"default\" opts this request OUT of duplicate-coalescing."}},
+             "required": ["request_id", "adapter", "operation"]}},
+         "max_requests": {"type": "integer", "description": "Optional cap on len(requests) for this call (default 100)."}},
+         "required": ["requests"]}},
+    {"name": "batch_mutate", "description":
+        "133bfff6 — run a batch of TRANSACTIONAL mutation entries in ONE call, mixing TWO entry "
+        "kinds selected per-entry via 'kind': 'sprint_item_pointer' (attach a pointer — same "
+        "shape as add_sprint_item_pointer: sprint_item_id, source_type, targets, optional label) "
+        "and 'sprint_item_update' (patch an EXISTING sprint item — same shape as update_sprint_item: "
+        "item_id + at least one patchable field; sprint-item CREATION is not supported here, use "
+        "execute_batch(operation='sprint_items', ...) or add_sprint_item for that). Reuses the exact "
+        "same validated apply/compensate logic execute_batch and the single-item tools already use — "
+        "no separate/duplicated mutation path. mode is REQUIRED: 'all_or_nothing' validates every "
+        "entry BEFORE mutating anything — any validation failure writes NOTHING (status 'rejected'); "
+        "a mutation failure partway through rolls back every entry this call already wrote via a "
+        "compensating delete/revert (status 'failed', per-entry status 'rolled_back'). 'best_effort' "
+        "processes each entry independently (status 'ok' | 'partial' | 'failed'). idempotency_key is "
+        "REQUIRED (pass null or \"\" to explicitly opt out) — a retried call with the identical "
+        "(project_id, idempotency_key) tuple returns the FIRST call's stored result verbatim "
+        "(idempotent_replay:true) instead of re-executing. PROJECT ISOLATION: an entry MAY carry its "
+        "own 'project_id' field, but it MUST match this call's own project_id or the entry is rejected "
+        "outright — a mutation entry can never target a different project. Returns {status, mode, "
+        "project_id, idempotency_key, idempotent_replay, created_count, error_count, results:[{index, "
+        "correlation_key, status, id, outcome, error_code, error_message, retryable}], request_id, "
+        "committed_count, failures:[...failed results...], rollback_status: 'none'|'rolled_back'|"
+        "'rejected'} — results is ALWAYS in input order.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "entries": {"type": "array", "description": "Non-empty list of entries, each carrying its own 'kind' ('sprint_item_pointer' or 'sprint_item_update'). Each entry may carry an optional 'correlation_key' string echoed back on its result.", "items": {"type": "object"}},
+         "mode": {"type": "string", "enum": ["all_or_nothing", "best_effort"], "description": "REQUIRED — no default."},
+         "idempotency_key": {"type": "string", "description": "REQUIRED key (value may be null or \"\" to explicitly opt out)."},
+         "session_id": {"type": "string", "description": "Optional attribution for the idempotency receipt."},
+         "max_entries": {"type": "integer", "description": "Optional cap on len(entries) for this call (default 100)."}},
+         "required": ["entries", "mode", "idempotency_key"]}},
     {"name": "add_insight", "description":
         "Record a durable STRATEGIC INSIGHT — accumulated understanding that generates future "
         "decisions. A first-class knowledge type SEPARATE from decisions (choices with a "
@@ -1852,8 +1977,23 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "Bulk-insert sprint items from a single orchestrator call — decompose a goal into "
         "parallel work items without N sequential add_sprint_item calls. Pass a list of "
         "{title, description?, group?, version?} dicts; returns the list of new item_ids "
-        "in insertion order. No duplicate guard is applied (the caller is assumed to have "
-        "deduped). Items with empty titles are silently skipped.",
+        "in insertion order. By DEFAULT (strict omitted/false) no duplicate guard is applied "
+        "(the caller is assumed to have deduped) and titles that resolve to an empty string "
+        "are silently skipped — unchanged, original behavior, kept for compatibility.\n"
+        "468ab67d — pass strict=true to opt into the SAME shared engine execute_batch uses "
+        "(meridian.db.batch_management, add_sprint_item-backed): the 60%-word-overlap "
+        "duplicate guard applies (per-item force:true still overrides it), idempotency_key "
+        "makes a retried call with the same key replay the first call's result instead of "
+        "re-inserting, and mode picks all_or_nothing (validate-then-insert with compensating "
+        "rollback on failure, default) or best_effort (each item processed independently). "
+        "In strict mode the response is the execute_batch response shape "
+        "({status, mode, entry_kind, project_id, idempotency_key, idempotent_replay, "
+        "created_count, error_count, results:[{index, correlation_key, status, id, outcome, "
+        "error_code, error_message, retryable}]}) PLUS the usual item_ids/count keys — a "
+        "different, richer shape than the legacy bare item_ids/count, by design (a new "
+        "opt-in contract, not a silent change to the old one). Each item may carry its own "
+        "correlation_key (echoed back on its strict-mode result) and force (per-item "
+        "duplicate-guard override, strict mode only).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"},
          "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
@@ -1868,10 +2008,16 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
                      "group": {"type": "string", "description": "Optional objective group name."},
                      "version": {"type": "string", "description": "Optional sprint-version bucket; defaults to empty string."},
                      "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Optional typed resource identifiers (file:/db:/mcp_tool:/route:/pypi:/github:) for parallel conflict detection. For SYMBOL-LEVEL granularity append ':symbol_name' to a file id ('file:path.py:func') so items editing different symbols in the same file co-batch in parallel."},
+                     "force": {"type": "boolean", "description": "strict mode only — override the duplicate-title guard for this item (same meaning as add_sprint_item's own force). Ignored in legacy (non-strict) mode, which never applies the guard at all."},
+                     "correlation_key": {"type": "string", "description": "strict mode only — an arbitrary caller-chosen id echoed back on this item's result for reconciliation. Ignored in legacy mode."},
                  },
                  "required": ["title"],
              },
-         }},
+         },
+         "strict": {"type": "boolean", "description": "468ab67d — default false (legacy: no duplicate guard, bare item_ids/count response). Pass true to opt into the shared batch_management engine's duplicate guard + idempotency-key replay + mode semantics — see the tool description."},
+         "mode": {"type": "string", "enum": ["all_or_nothing", "best_effort"], "description": "strict mode only — default 'all_or_nothing'. Ignored unless strict=true."},
+         "idempotency_key": {"type": "string", "description": "strict mode only — a retried call with the same (project_id, idempotency_key) replays the first call's stored result instead of re-inserting. Ignored unless strict=true."},
+         },
          "required": ["items"]}},
     {"name": "update_sprint_item", "description":
         "Edit fields on an existing sprint item: title, version, notes, human_id (assignee), "
@@ -2746,13 +2892,15 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "urgency": {"type": "string", "enum": ["normal", "high", "blocking"]}},
          "required": ["file", "anchor", "content"]}},
     {"name": "claim_sprint_item",
-     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at + actor. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, its touches_files overlap active file claims from another live session, or (18c488b6) a touches_resources file:/symbol: entry is locked by another live session — this last check ACQUIRES the resource lock (via claim_file/claim_symbol) as part of claiming, is a hard block regardless of worktree isolation, and rolls back cleanly if the claim itself doesn't land.",
+     "description": "Claim a pending sprint item: sets status to in_progress and records claimed_at + actor. Read-only: false. Rejects if the item is already in_progress, done, failed, skipped, its touches_files overlap active file claims from another live session, or (18c488b6) a touches_resources file:/symbol: entry is locked by another live session — this last check ACQUIRES the resource lock (via claim_file/claim_symbol) as part of claiming, is a hard block regardless of worktree isolation, and rolls back cleanly if the claim itself doesn't land. 54c488b6/54d2c2af: every symbol:/file: resource this acquires also gets a durable lock-granularity receipt (achieved symbol vs. coarse-fallback grain, and why), auditable after the fact independent of this call's response payload.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "item_id": {"type": "string"},
          "actor": {"type": "string", "description": "Executor id/name recorded as having claimed the item (5823db0b; defaults to session_id)."},
-         "session_id": {"type": "string", "description": "Optional caller session id; its own file claims are ignored for conflict checks, and it is the identity any touches_resources symbol/file locks are acquired under (18c488b6). Omitting it skips resource-lock acquisition entirely (fail-open — no behavior change from before 18c488b6)."},
-         "resource_contents": {"type": "object", "description": "18c488b6 — optional map of {file_path: file_content} for any symbol: entries in the item's touches_resources. The server has no direct filesystem access to your repo, so supplying a file's current content here is what lets a symbol: resource get a REAL AST-resolved line-range lock (via claim_symbol) instead of falling back to a whole-file lock. Omit a file's content (or omit this arg entirely) and its symbol: resources fall back to a whole-file lock with an explicit fallback_reason in the response's resource_lock_scope — never a silent downgrade."}},
+         "session_id": {"type": "string", "description": "Optional caller session id; its own file claims are ignored for conflict checks, and it is the identity any touches_resources symbol/file locks are acquired under (18c488b6). Omitting it skips resource-lock acquisition entirely (fail-open — no behavior change from before 18c488b6) UNLESS strict_resource_locking=true, in which case a missing session_id on an item that declares resources is refused outright (MISSING_EXECUTION_IDENTITY)."},
+         "resource_contents": {"type": "object", "description": "18c488b6 — optional map of {file_path: file_content} for any symbol: entries in the item's touches_resources. The server has no direct filesystem access to your repo, so supplying a file's current content here is what lets a symbol: resource get a REAL AST-resolved line-range lock (via claim_symbol) instead of falling back to a whole-file lock. Omit a file's content (or omit this arg entirely) and its symbol: resources fall back to a whole-file lock with an explicit fallback_reason in the response's resource_lock_scope — never a silent downgrade, UNLESS strict_resource_locking=true (see below), in which case that same fallback is REJECTED instead."},
+         "strict_resource_locking": {"type": "boolean", "description": "54d2c2af — default false (zero behavior change). Set true to opt this call into the HARDENED, fail-closed contract: a symbol: resource that cannot get a real symbol-range lock (missing resource_contents for its file, or claim_symbol itself couldn't resolve the symbol — unparseable / not found / ambiguous) is REJECTED (ok=false, error=SYMBOL_LOCK_NOT_APPROVED, all-or-nothing rollback) instead of silently widening to a whole-file lock, unless allow_file_fallback=true is ALSO passed. Also promotes a missing session_id (on an item that declares resources) from the default fail-open skip to a hard MISSING_EXECUTION_IDENTITY block."},
+         "allow_file_fallback": {"type": "boolean", "description": "54d2c2af — explicit, audited approval for the whole-file-lock fallback that strict_resource_locking=true would otherwise reject for an unresolved symbol: resource. Ignored when strict_resource_locking is not set (the pre-54d2c2af default already allows this fallback implicitly). Pass true to say 'yes, lock the whole file for this resource' instead of supplying real resource_contents."}},
          "required": ["item_id"]}},
     {"name": "add_subtask",
      "description": "Add a child sprint item under an existing parent item. Inherits the parent's version. Status starts as pending. Rejects if the parent is already done, failed, or skipped. Pass owner='human' or owner='ai' to build a mixed-ownership task chain: owned subtasks added in sequence become a strict chain (each depends on the previous owned sibling), and completing one auto-advances ownership — an AI→human step files a HITL handoff, a human→AI step un-blocks the next AI subtask. The parent stays in_progress until all subtasks are terminal.",
@@ -2929,6 +3077,7 @@ _READ_ONLY_TOOLS = {
     "get_sprint_item_pointers", "resolve_sprint_item_pointers",
     "analyze_model_efficiency",
     "get_custom_hooks",
+    "batch_read",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook"}
 
@@ -3016,6 +3165,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "resolve_sprint_item_pointers":  "sprint-management",
     "delete_sprint_item_pointer":    "sprint-management",
     "execute_batch":                 "sprint-management",
+    "batch_read":                    "sprint-management",
+    "batch_mutate":                  "sprint-management",
     # project CRUD
     "create_project":      "project",
     "set_parent_project":  "project",
@@ -3161,6 +3312,8 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "resolve_sprint_item_pointers":  "both",
     "delete_sprint_item_pointer":    "executor",
     "execute_batch":                 "both",
+    "batch_read":                    "both",
+    "batch_mutate":                  "both",
     "claim_file":                "executor",
     "release_file":              "executor",
     "get_file_claims":           "executor",
@@ -3377,6 +3530,8 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "split_sprint_item":          "common-support",
     "add_sprint_item_pointer":    "common-support",
     "execute_batch":              "common-support",
+    "batch_read":                 "common-support",
+    "batch_mutate":               "common-support",
     "update_sprint_item":         "common-support",
     # notes / knowledge (regular lookups)
     "log_task":                   "common-support",
@@ -3741,6 +3896,53 @@ def _extract_kws(text: str) -> set[str]:
     return {w for w in words if w not in _KW_STOP}
 
 
+def match_categories_by_keywords(
+    text: "str | None",
+    keyword_affinity: "dict[str, str]",
+) -> "tuple[set[str], list[str]]":
+    """Generalized keyword -> category-affinity matcher (e5a7ce7f, decision 2a3a3882).
+
+    Extracted as a standalone, reusable primitive from the SAME keyword ->
+    category lookup ``_select_active_tool_set`` performs inline below, so the
+    identical deterministic matching logic is available to callers that are
+    NOT selecting among Meridian's own MCP tools — e.g.
+    ``meridian.tool_routing``'s "exact category matching" routing layer,
+    which matches an arbitrary caller-supplied ``keyword_affinity`` mapping
+    (its own categories/tool names, not ``_TOOL_CATEGORY``). This closes the
+    "generalizing ``_select_active_tool_set`` beyond Meridian's own tools"
+    gap recorded in finding 5569beca / pinned decision 2a3a3882 for item
+    78127d55, per decision 2a3a3882: "generalize ... don't build new
+    matching/ranking logic."
+
+    Deliberately does NOT replace ``_select_active_tool_set``'s own inline
+    loop (below) — that loop's "only record the keyword that FIRST newly
+    adds a given category" dedup behavior is specific, already covered by
+    passing regression tests, and out of scope to touch here. This function
+    instead returns ALL matching keywords (no base-set-aware dedup), which
+    is the correct, simpler contract for a generic "does this text match any
+    of these categories" caller that has no pre-existing base set to dedup
+    against.
+
+    Pure, DB-free, no I/O, same determinism guarantees as ``_extract_kws``.
+
+    Returns ``(matched_categories, keyword_signals)`` — ``keyword_signals``
+    lists every keyword (in ``_extract_kws``'s own iteration order) whose
+    affinity mapping produced a match, so a caller can surface which
+    specific words drove a match even when several keywords map to the same
+    category.
+    """
+    matched: set[str] = set()
+    signals: list[str] = []
+    if not text:
+        return matched, signals
+    for kw in _extract_kws(text):
+        cat = keyword_affinity.get(kw)
+        if cat:
+            matched.add(cat)
+            signals.append(kw)
+    return matched, signals
+
+
 def _select_active_tool_set(
     role: "str | None",
     goal_text: "str | None" = None,
@@ -3848,3 +4050,277 @@ def _select_active_tool_set(
         "keyword_signals": keyword_signals,
         "mode": "deterministic",
     }
+
+
+# ---------------------------------------------------------------------------
+# INVESTIGATE f30bbd89 (item_group: proposal:rag-semantic-tool-routing)
+# "define offline routing benchmarks, shadow-mode telemetry, reproducible
+# tie-breaking, audit provenance, and rollout gates" for a semantic
+# (embedding-based) upgrade to MCP tool-routing/pre-selection.
+#
+# THIS BLOCK IS DESIGN ONLY -- nothing below is wired up or imported by
+# anything. It exists so a future implementer of the "rag-semantic-tool-
+# routing" proposal starts from a grounded design instead of a blank page,
+# and so this investigation is reviewable without an ad hoc root-level
+# markdown file -- mirroring how retrieval_eval.py's and
+# db/vector_index_state.py's own module docstrings already carry design
+# rationale next to the code they describe, rather than in a separate doc.
+#
+# WHAT EXISTS TODAY (read this before building anything new)
+# ---------------------------------------------------------------------
+# There are two unrelated "routing/search" mechanisms in this codebase and
+# it is easy to conflate them:
+#
+#  1. Tool pre-selection (a749f87c, THIS file, `_select_active_tool_set`
+#     above) -- decides which MCP TOOLS to recommend for a session. Pure
+#     keyword-category membership: role -> base category set, /goal text
+#     keywords -> category expansion (`_KEYWORD_CATEGORY_AFFINITY`). No
+#     embeddings, no scores, no ties -- a tool's presence is a boolean
+#     (category in base_cats), not a ranked decision. Its output
+#     (`active_tool_set`) is ADVISORY ONLY today: `meridian/mcp/handlers/
+#     project_tools.py`'s start_session handler stuffs it into the
+#     orientation response, but the MCP `tools/list` surface (server.py,
+#     backed by `_MCP_TOOLS_LIST`) always returns every tool regardless --
+#     `active_tool_set` never filters what a client can actually call. In
+#     the shadow-mode sense used below, this mechanism has effectively
+#     always run in "shadow" (zero power to hide a tool), but with zero
+#     telemetry on whether its recommendation was ever followed.
+#
+#  2. Semantic/RAG content search (56cd8712 / 3d3ccf2d,
+#     meridian/semantic_search.py) -- decides which NOTES / DECISIONS /
+#     SPRINT-ITEMS a keyword-miss query should surface. Real Model2Vec
+#     embeddings, real cosine scores, and an already-built, already-tested
+#     deterministic tie-break/abstention gate (`score_confidence`: absolute
+#     floor + nearest-neighbor margin, see its docstring above in this
+#     module's sibling file). This is the ONLY place in the codebase today
+#     that actually needs, and has, reproducible tie-breaking.
+#
+# The "rag-semantic-tool-routing" proposal is: apply (2)'s machinery -- real
+# embeddings + score_confidence-style scored/ranked candidates + deterministic
+# abstention -- to (1)'s problem (choosing tools), instead of (1)'s current
+# static keyword dict. That introduces something that does NOT exist today: a
+# RANKED, SCORED tool-selection decision that CAN tie -- which is why all 5
+# areas below are real gaps, not already-solved problems.
+#
+# DESIGN -- the 5 areas
+# ---------------------------------------------------------------------
+# (a) Offline routing benchmarks
+#     Reuse retrieval_eval.py's shape rather than reinventing it: a
+#     disposable shadow-project harness (mirroring `run_evaluation`) that
+#     builds a labeled dataset and turns metrics into a pass/fail
+#     `GateDecision` (mirroring `evaluate_gate`). For tool-routing the
+#     "corpus" is (goal_text, role, expected_tools_or_categories) tuples
+#     instead of (query, expected_record_id) -- and most of it can be
+#     MINED, not hand-written: every historical `start_session(role=...)`
+#     paired with the tools a session actually called before its next
+#     `generate_handoff` is a free, real label (goal text -> tools actually
+#     used). `tests/test_a749f87c_tool_preselection.py`'s existing
+#     keyword-expansion cases (code/docx/research) are a ready-made starter
+#     set of hand-labeled positives. Metrics: category-level
+#     precision/recall against the mined "tools actually used" set (NOT
+#     recall@1 -- routing is multi-label; a session legitimately uses many
+#     tools across one goal), false-exclusion rate (a tool the session
+#     needed but the router would have hidden -- the one unacceptable-by-
+#     default metric, mirroring retrieval_eval's zero-leakage hard gate),
+#     and decision churn (how much the active set differs run-to-run for
+#     IDENTICAL input -- see (c), this must be zero).
+#
+# (b) Shadow-mode telemetry
+#     Never change `active_tool_set`'s current advisory-only contract as
+#     part of turning on a semantic scorer. Log BOTH the existing
+#     deterministic result and the new semantic candidate result on every
+#     `_select_active_tool_set` call, tagged with a decision id, without
+#     ever acting on the semantic one. The natural sink is the same
+#     append-only `action_audit_log` table `meridian/code_intel_receipt.py`
+#     already writes prospecting receipts to (a new event_type
+#     discriminates rows in one existing table rather than a new migration)
+#     -- e.g. event_type="tool_routing_shadow_decision" with a JSON payload
+#     of {deterministic_result, semantic_result, agreement, model_version}.
+#     Divergence rate (deterministic active_tools != semantic active_tools)
+#     over real traffic is the headline shadow metric and is a PRECONDITION
+#     for any rollout-gate discussion in (e) -- the offline benchmark in (a)
+#     alone is not sufficient evidence to promote out of shadow.
+#
+# (c) Reproducible tie-breaking
+#     Do not invent a new abstention rule -- port `score_confidence`'s
+#     contract verbatim: an absolute confidence floor on the raw semantic
+#     score (never the fused one) PLUS a nearest-neighbor margin check in
+#     BOTH directions, so two near-tied categories both abstain rather than
+#     one being arbitrarily promoted. For tool-routing specifically,
+#     "abstain" means: keep the CURRENT deterministic keyword result for
+#     that category rather than trusting the semantic scorer -- the
+#     deterministic router is always the safe fallback, exactly the role
+#     keyword-only search already plays for semantic_search.py (never the
+#     other way around). Determinism additionally requires (i) a FIXED
+#     candidate order fed to the embedder -- sorted by tool/category name,
+#     never dict/set iteration order, so re-runs on identical input cannot
+#     silently reorder a tie -- and (ii) rounding scores (score_confidence
+#     already rounds to 4dp) before any equality/margin comparison, so
+#     float noise from a batch-size-dependent encode path can never flip a
+#     decision. The regression tests added alongside this block
+#     (test_score_confidence_exact_tie_is_reproducible_and_ambiguous,
+#     test_score_confidence_three_way_near_tie_all_abstain,
+#     test_select_active_tool_set_is_deterministic_across_repeated_calls)
+#     lock in the CURRENT baseline behavior of both routers that this
+#     future work must not regress.
+#
+# (d) Audit provenance
+#     Mirror `db/vector_index_state.py`'s pattern exactly: persist, per
+#     revision of the routing config (not per call -- volume), the
+#     embedding model name/version (`semantic_search.model_name()` already
+#     exists for this), a hash of the input (goal-text hash, never raw
+#     text -- avoid writing arbitrary user text into a long-lived audit
+#     row), the scored candidates, and the final decision + reason
+#     ("confident_match" / "ambiguous_runner_up" /
+#     "below_confidence_threshold" / "deterministic_fallback" -- the same
+#     vocabulary `score_confidence` already returns, extended with the one
+#     fallback reason that is new to routing). A benchmark-gated enable
+#     flag (e.g. `semantic_routing_enabled`), flipped ONLY by a
+#     `record_tool_routing_benchmark`-shaped function analogous to
+#     `record_vector_backend_benchmark` -- i.e. the flag is evidence-gated,
+#     never hand-flipped, and the evidence blob IS the audit trail (same
+#     "do not introduce X merely because it exists" contract
+#     vector_index_state.py's docstring states for pgvector).
+#
+# (e) Rollout gates
+#     Three stages, phrased with the capability-manifest availability_policy
+#     vocabulary this repo already uses elsewhere (degraded_ok / optional /
+#     required -- AGENTS.md, meridian/capability_manifest.py) so a future
+#     capability id like "semantic_tool_routing" slots into the existing
+#     manifest system without inventing new terminology:
+#       stage 0 "shadow"    -- (b)'s logging only, 0% behavioral effect.
+#                              Gate to stage 1 requires a minimum shadow
+#                              sample size (e.g. >=200 real sessions) AND a
+#                              divergence-rate review showing no systematic
+#                              false-exclusion pattern.
+#       stage 1 "advisory"  -- the semantic result REPLACES the
+#                              deterministic one in `active_tool_set`'s
+#                              advisory metadata (still non-enforcing --
+#                              tools/list is untouched). Gate to stage 2
+#                              requires the offline benchmark (a) passing
+#                              evaluate_gate-style thresholds
+#                              (false_exclusion_rate == 0, precision/recall
+#                              above a floor) AND zero unexplained
+#                              high-severity divergences carried over from
+#                              the stage-0 shadow window.
+#       stage 2 "enforcing" -- `active_tool_set` actually filters the
+#                              tools/list surface. This is a materially
+#                              bigger behavioral change than anything
+#                              semantic_search.py ever makes (that system
+#                              only ever ADDS candidates atop lexical
+#                              results; it never hides one) and needs its
+#                              own separate, explicitly HITL-reviewed
+#                              sprint item before it is ever built --
+#                              deliberately out of scope for this
+#                              investigation.
+#     Any stage can roll back to "shadow" instantly by flipping the
+#     evidence-gated flag in (d) back to disabled -- no code deploy
+#     required, mirroring `pgvector_enabled`'s own rollback story.
+#
+# WHAT THIS INVESTIGATION DELIBERATELY DID NOT BUILD
+# ---------------------------------------------------------------------
+# No new production module, no new DB table/migration, no embedding
+# integration for tool-routing. The lowest-risk, highest-signal next step
+# is the offline benchmark harness (a): it needs no new persistence and no
+# behavioral change, and it would answer whether a semantic scorer even
+# beats the current keyword dict before any telemetry/provenance/rollout
+# machinery is worth building at all. The regression tests added alongside
+# this block establish the CURRENT deterministic behavior of both existing
+# routers as the baseline that harness must be measured against.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# INVESTIGATE db7eb0f5 (item_group: proposal:rag-semantic-tool-routing)
+# "compare deterministic sequential/graph orchestration with agentic
+# routing and define Meridian's authoritative execution boundary."
+#
+# THIS BLOCK IS DOCUMENTATION ONLY -- it names and cross-references code that
+# already exists and already behaves this way; nothing below changes runtime
+# behavior. Companion to the f30bbd89 block directly above (same
+# item_group): that block scoped ONE mechanism (MCP tool pre-selection,
+# `_select_active_tool_set`); this one answers the broader question the
+# item_group's title poses -- across the WHOLE session lifecycle, not just
+# tool listing, where does Meridian's own server-side control end and an
+# executing agent's free judgment begin. See pinned decision "db7eb0f5:
+# Meridian's authoritative execution boundary" for the canonical statement;
+# this comment is the code-grounded evidence trail behind it.
+#
+# TWO MECHANISMS THAT LOOK SIMILAR BUT ARE NOT
+# ---------------------------------------------------------------------
+#  1. Deterministic sequential/graph orchestration -- decides WHETHER a
+#     state transition is allowed to happen at all, and CAN say no.
+#     Lives in `meridian/db/sprint_items.py` (`claim_sprint_item`,
+#     `complete_sprint_item`, `get_blocking_dependency_for_sprint_item`
+#     (the `depends_on` graph), `_get_blocking_wave_gate` /
+#     `get_parallelizable_groups` / `assign_sprint_waves` (the wave/
+#     resource-conflict graph)), `meridian/capability_manifest.py` +
+#     `meridian/capability_contract.py` (a `required` capability with no
+#     available fallback makes the session non-executable -- fail closed,
+#     per AGENTS.md's capability-manifest contract), and the completion
+#     evidence gates layered onto `complete_sprint_item` itself
+#     (`required_notes`, `require_verification`/e2e1b682,
+#     `require_strict_evidence`/5fe3502e, the `code_intel_prospecting`
+#     receipt/a8c0f3b7, the claim-ownership check/8693b6a8). Every one of
+#     these can REFUSE the call outright (a typed rejection reason, not
+#     advice) regardless of what the calling agent intended -- that is the
+#     one property that makes this side "authoritative": it is enforced by
+#     the server, not by the agent choosing to comply.
+#
+#  2. Agentic routing -- everything an executing session (Claude Code,
+#     Codex, any MCP client) decides FOR ITSELF once it is inside a
+#     claimed item, and that Meridian can only ever hint at, never compel:
+#     which MCP tool to call and in what order
+#     (`_select_active_tool_set`/a749f87c above -- advisory-only, per the
+#     f30bbd89 block's own finding that `tools/list` ignores it
+#     entirely), which notes/decisions are relevant
+#     (`semantic_search.py`'s Model2Vec recall -- an ADDITIVE recall aid,
+#     never a filter, per decision bbd05ceb), which tool a given item
+#     probably needs first (`executor_contract.build_routing_hint` /
+#     `build_routing_summary` -- explicit `tool_requirements` when
+#     present, else a best-effort keyword-INFERRED default that is always
+#     `required_or_preferred="preferred"`, never a hard block -- see its
+#     own docstring), how many turns to spend planning before acting
+#     (`executor_config.build_execution_policy`'s `max_planning_turns` /
+#     `required_first_action` -- a strong, documented CONVENTION an
+#     executor is expected to follow, but the field itself carries no
+#     server-side enforcement path the way a `claim_sprint_item` rejection
+#     does), and when a blocker is "genuine" enough to escalate via
+#     `request_hitl` (`GENUINE_BLOCKER_ESCALATION_RULE` -- prose guidance
+#     only). None of side (2) can make Meridian actually refuse a
+#     `claim_sprint_item`/`complete_sprint_item` call; it only shapes what
+#     the agent chooses to do on its own before making one.
+#
+# THE BOUNDARY
+# ---------------------------------------------------------------------
+# The authoritative execution boundary is the sprint-item claim/completion
+# gate itself -- not a layer "above" orchestration or "below" it. Anything
+# that determines WHICH items may run, in WHAT order, and WHETHER a given
+# claim/completion is even permitted right now is side (1): deterministic,
+# server-enforced, agent-intent-independent. Anything that determines HOW
+# an already-claimed item gets done -- tool choice, reasoning order, note
+# interpretation, escalation judgment, which routing/search hint to trust
+# -- is side (2): agentic, advisory-only, and Meridian never gates
+# completion on whether those hints were followed. This is precisely why
+# f30bbd89's stage-2 "enforcing" tool-filter proposal was flagged as
+# needing its OWN separate, explicitly HITL-reviewed sprint item rather
+# than folding into that investigation: moving any part of side (2) so
+# that it can refuse an action would be a boundary-crossing change, not an
+# incremental one, and deserves review as exactly that.
+#
+# WHAT THIS INVESTIGATION DELIBERATELY DID NOT BUILD
+# ---------------------------------------------------------------------
+# No new gate, no new advisory mechanism, no change to any of the
+# functions named above. The dependency graph, wave gates, capability
+# fail-closed contract, and evidence gates already behave exactly as
+# described (each already has its own dedicated test coverage --
+# `tests/test_d2430713_complete_wave_gate.py`,
+# `tests/test_capability_contract.py`,
+# `tests/test_a749f87c_tool_preselection.py`, and the sprint-item
+# claim/complete suites in `tests/test_core.py` -- so this block adds no
+# new regression tests of its own; it would only be re-asserting facts
+# those suites already pin). The deliverable is the boundary statement
+# itself, made explicit and citable, so a future item proposing to move
+# ANY mechanism from side (2) to side (1) (e.g. f30bbd89's own stage-2) has
+# a documented line to say it is crossing.
+# ---------------------------------------------------------------------------

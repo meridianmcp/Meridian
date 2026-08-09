@@ -60,7 +60,22 @@ async def handle_pin_decision(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: pin_decision."""
+    """MCP tool: pin_decision.
+
+    9149e132 — optional ``evidence`` param: when given, atomically attaches
+    ONE typed, code-linked decision_evidence row to the just-created decision
+    (see meridian.db.decision_evidence). Shape:
+    ``{pointer: {source_type, targets:[...], label?}, text: str,
+    assumptions?: str, applicability_scope?: str, confidence?: float,
+    version?: str}`` — ``pointer`` and ``text`` are required for the evidence
+    to be created; ``pointer`` is validated via the SAME generic pointer
+    primitive (:mod:`meridian.pointers`) sprint_item_pointers already uses.
+    Omitting ``evidence`` entirely is a complete no-op change from before
+    this item — pin_decision's pre-existing behavior and return shape are
+    unchanged. A malformed pointer degrades to an ``evidence_error`` field on
+    the result rather than failing the whole pin_decision call — the
+    decision itself is never lost because its evidence was malformed.
+    """
     validate_input_size(args.get("title"), "decision title", 500)
     validate_input_size(args.get("body"), "decision body", 100_000)
     category = args.get("category", "TECHNICAL")
@@ -70,6 +85,30 @@ async def handle_pin_decision(
         assumption=args.get("assumption"),
     )
     await _server._append_decision_to_md(args["title"], args["body"], category)
+    evidence = args.get("evidence")
+    if isinstance(evidence, dict) and isinstance(result, dict) and result.get("id"):
+        pointer = evidence.get("pointer")
+        evidence_text = evidence.get("text") or evidence.get("evidence")
+        if pointer and evidence_text:
+            validate_input_size(evidence_text, "decision evidence text", 100_000)
+            validate_input_size(evidence.get("assumptions"), "decision evidence assumptions", 100_000)
+            validate_input_size(
+                evidence.get("applicability_scope"), "decision evidence applicability_scope", 100_000,
+            )
+            try:
+                ev_row = await db_module.create_decision_evidence(
+                    db, args["project_id"], result["id"], pointer, evidence_text,
+                    assumptions=evidence.get("assumptions"),
+                    applicability_scope=evidence.get("applicability_scope"),
+                    confidence=evidence.get("confidence"),
+                    version=evidence.get("version"),
+                )
+                result = {**result, "evidence": ev_row}
+            except (ValueError, TypeError) as exc:
+                # PointerValidationError is a ValueError subclass — a
+                # malformed pointer/evidence shape never fails the whole
+                # pin_decision call; the decision itself already committed.
+                result = {**result, "evidence_error": str(exc)}
     return result
 
 

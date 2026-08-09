@@ -121,6 +121,37 @@ class ForeignLeaseError(PermissionError):
     belongs to whom."""
 
 
+class OwnerConflictError(RuntimeError):
+    """39c8cf2c — :meth:`ProcessLeaseBroker.acquire_exclusive` refused
+    because a DIFFERENT, VERIFIED-STILL-LIVE lease already holds the same
+    ``(client, owner_key)`` identity. This is the single-owner-lease
+    guardrail the tunnel-restart-lifecycle sprint item asks for: a second
+    wrapper process starting up while an earlier one is genuinely still
+    running (not just a process that never got its PID reused) must not
+    silently coexist with it — the incident this item is fixing was
+    exactly "the old wrapper remained alive with an established network
+    connection" alongside a NEW one that had already reported itself
+    connected.
+
+    The broker never kills anything to resolve this — see the module
+    docstring's "deliberately conservative about destruction" note. The
+    caller decides: report and exit, prompt for an explicit ``force=True``
+    takeover, or something else appropriate to the calling context.
+    """
+
+    def __init__(self, client: str, owner_key: str, lease: "WorkerLease") -> None:
+        self.client = client
+        self.owner_key = owner_key
+        self.lease = lease
+        super().__init__(
+            f"client {client!r} already holds a live exclusive lease for "
+            f"owner_key {owner_key!r} (run_id={lease.run_id!r}, pid={lease.pid}, "
+            "verified still alive) — refusing a second concurrent owner. "
+            "Pass force=True to explicitly take over, or investigate/stop "
+            "the other holder first."
+        )
+
+
 @dataclass
 class WorkerLease:
     """One registered external worker/MCP-server process.
@@ -141,6 +172,12 @@ class WorkerLease:
     group_id: "int | None" = None
     job_id: "int | None" = None
     shared_runtime: "str | None" = None
+    # 39c8cf2c — logical single-owner identity (e.g. "tunnel-wrapper:<repo>"),
+    # independent of PID/run_id. Two live leases sharing the same
+    # (client, owner_key) is exactly the "old wrapper remained alive" bug;
+    # see :meth:`ProcessLeaseBroker.acquire_exclusive`. Optional and additive
+    # — leases that never set it (every pre-existing caller) are unaffected.
+    owner_key: "str | None" = None
     ttl_seconds: float = DEFAULT_TTL_SECONDS
     registered_at: float = 0.0
     last_heartbeat_at: float = 0.0
@@ -265,12 +302,19 @@ class ProcessLeaseBroker:
         job_id: "int | None" = None,
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
         shared_runtime: "str | None" = None,
+        owner_key: "str | None" = None,
     ) -> WorkerLease:
         """Register a new lease for *client*'s process *pid*. Generates a
         fresh ``run_id`` (via ``process_lifecycle.new_run_id`` — independent
         of, and stable across, PID reuse) unless the caller supplies one.
         Raises ``ValueError`` if the supplied ``run_id`` is already live —
-        registration is not an upsert."""
+        registration is not an upsert.
+
+        *owner_key* (39c8cf2c) is an optional logical single-owner identity;
+        see :meth:`acquire_exclusive` for the exclusivity semantics built on
+        top of it. Passing it here directly (without going through
+        :meth:`acquire_exclusive`) does NOT enforce exclusivity — it only
+        tags the lease so a later ``acquire_exclusive`` call can find it."""
         if not client:
             raise ValueError("client is required")
         run_id = run_id or _process_lifecycle.new_run_id()
@@ -289,6 +333,7 @@ class ProcessLeaseBroker:
             group_id=group_id,
             job_id=job_id,
             shared_runtime=shared_runtime,
+            owner_key=owner_key,
             ttl_seconds=float(ttl_seconds),
             registered_at=now,
             last_heartbeat_at=now,
@@ -298,6 +343,75 @@ class ProcessLeaseBroker:
             self._shared_runtime_holders.setdefault(shared_runtime, set()).add((client, run_id))
         self._maybe_save()
         return lease
+
+    def acquire_exclusive(
+        self,
+        client: str,
+        owner_key: str,
+        pid: int,
+        *,
+        executable: str = "",
+        cwd: "str | None" = None,
+        cmdline: "list[str] | None" = None,
+        create_time: "float | None" = None,
+        group_id: "int | None" = None,
+        job_id: "int | None" = None,
+        ttl_seconds: float = DEFAULT_TTL_SECONDS,
+        run_id: "str | None" = None,
+        force: bool = False,
+    ) -> WorkerLease:
+        """39c8cf2c — single-owner lease acquisition with stale-wrapper
+        detection/replacement, built on the existing PID-reuse-guarded
+        liveness check (:meth:`is_process_alive`) rather than a new
+        mechanism.
+
+        Looks at every live (non-released) lease already registered by
+        *client* under this *owner_key*:
+
+        * None found → register and return a fresh lease. The common cold-
+          start case.
+        * Found, but :meth:`is_process_alive` says it's NOT the same live
+          process any more (the recorded PID exited, or the OS reused the
+          PID for something else — verified via create_time, never a bare
+          ``pid_exists``) → this is a genuine STALE WRAPPER. It is
+          automatically released (nothing to kill — it's already gone) and
+          a fresh lease takes over. This is "stale-wrapper detection and
+          replacement."
+        * Found, and :meth:`is_process_alive` confirms it's still genuinely
+          running → a real second owner would coexist with a live first
+          owner, the exact incident this exists to prevent. Refuses with
+          :class:`OwnerConflictError` UNLESS *force* is True, in which case
+          the caller has explicitly asked to take over: the old lease is
+          released (still never killing the underlying process — that
+          remains the caller's own decision) and a fresh one is registered.
+
+        Never kills a process itself, mirroring every other method on this
+        broker.
+        """
+        for existing in self.list_leases(client=client):
+            if existing.owner_key != owner_key:
+                continue
+            if self.is_process_alive(existing):
+                if not force:
+                    raise OwnerConflictError(client, owner_key, existing)
+                self.release(client, existing.run_id)
+            else:
+                # Stale wrapper: verified NOT the same live process anymore.
+                # Nothing to kill — just stop tracking it as live.
+                self.release(client, existing.run_id)
+        return self.register(
+            client,
+            pid,
+            run_id=run_id,
+            executable=executable,
+            cwd=cwd,
+            cmdline=cmdline,
+            create_time=create_time,
+            group_id=group_id,
+            job_id=job_id,
+            ttl_seconds=ttl_seconds,
+            owner_key=owner_key,
+        )
 
     def _get_owned(self, client: str, run_id: str) -> WorkerLease:
         lease = self._leases.get(run_id)

@@ -150,24 +150,39 @@ single-entry calls.
 
 -------------------------------------------------------------------------
 Compatibility: why fan_out_sprint_items / add_sprint_item_pointer are NOT
-rerouted through this engine
+rerouted through this engine BY DEFAULT
 -------------------------------------------------------------------------
 
 :func:`meridian.db.sprint_items.fan_out_sprint_items` has a DELIBERATELY
-different contract from this engine's ``sprint_item`` entry kind: its own
-docstring says "the duplicate guard is **not** applied here -- the
+different DEFAULT contract from this engine's ``sprint_item`` entry kind:
+its own docstring says "the duplicate guard is **not** applied here -- the
 orchestrator is assumed to have already deduped". This engine's
 ``sprint_item`` create path calls ``add_sprint_item``, which DOES enforce
-the 60%-word-overlap duplicate guard. Rerouting ``fan_out_sprint_items``
-through this engine would silently reject near-duplicate titles that
-succeed today -- a real behavior change for every existing caller (the
-orchestrator fan-out flow, tested in ``tests/test_ba4f879b_sprint_tools_dispatch.py``
-and others). Per this item's own acceptance criteria ("if full rerouting
-risks behavior changes for existing callers, it's fine to keep the new
-engine as an ADDITIVE new code path"), ``fan_out_sprint_items`` is left
-untouched; this module is the new, additive, atomic/idempotent path for
-callers who explicitly want validated + duplicate-guarded + rollback-safe
-bulk sprint-item writes.
+the 60%-word-overlap duplicate guard. Unconditionally rerouting
+``fan_out_sprint_items`` through this engine would silently reject
+near-duplicate titles that succeed today -- a real behavior change for
+every existing caller (the orchestrator fan-out flow, tested in
+``tests/test_ba4f879b_sprint_tools_dispatch.py`` and others). Per this
+item's own acceptance criteria ("if full rerouting risks behavior changes
+for existing callers, it's fine to keep the new engine as an ADDITIVE new
+code path"), ``fan_out_sprint_items``'s DEFAULT (``strict=False``) is left
+untouched.
+
+468ab67d (a later, focused follow-up) added an explicit, OPT-IN
+``strict=True`` parameter to ``fan_out_sprint_items`` itself that DOES
+reroute through this exact engine (``execute_batch`` with
+``entry_kind="sprint_item"``) -- giving a caller who explicitly asks for it
+the duplicate guard, idempotency-key replay, and best_effort/all_or_nothing
+semantics documented above, reusing this module's implementation rather
+than a second title-overlap heuristic. This is still "additive" in the
+sense the acceptance criteria above intended: nothing about the DEFAULT
+call shape (no ``strict=`` kwarg passed) changed at all; the new behavior
+is reached only through a parameter that did not previously exist. See
+``fan_out_sprint_items``'s own docstring for the strict-mode contract.
+Separately, this module remains the new, additive, atomic/idempotent path
+for callers who want validated + duplicate-guarded + rollback-safe bulk
+sprint-item writes without going through ``fan_out_sprint_items`` at all
+(e.g. via ``execute_batch``/``batch_ops.execute_batch_operation`` directly).
 
 :func:`meridian.db.sprint_items.add_sprint_item_pointer` needed no changes
 at all in the other direction: it is already a clean validate-then-insert
@@ -204,6 +219,21 @@ BATCH_ENTRY_KINDS: tuple[str, ...] = ("sprint_item", "sprint_item_pointer", "spr
 
 #: Supported batch modes -- see the module docstring for the semantics of each.
 BATCH_MODES: tuple[str, ...] = ("all_or_nothing", "best_effort")
+
+#: Entry kinds accepted by :func:`execute_mixed_mutation_batch` (133bfff6's
+#: ``batch_mutate`` engine) -- a deliberately narrow, MIXED-kind sibling of
+#: :func:`execute_batch`. Excludes plain sprint-item CREATE and sprint_note
+#: entirely; only pointer-attach and sprint-item UPDATE are exposed here. See
+#: :func:`execute_mixed_mutation_batch`'s own docstring for why this is a
+#: separate engine rather than a mode of :func:`execute_batch`.
+MIXED_MUTATION_ENTRY_KINDS: tuple[str, ...] = ("sprint_item_pointer", "sprint_item_update")
+
+#: ``entry_kind`` label :func:`execute_mixed_mutation_batch` stamps on its own
+#: idempotency receipts -- distinct from :func:`execute_batch`'s own
+#: entry_kind strings ("sprint_item", "sprint_item_pointer", "sprint_note")
+#: so an ``idempotency_key`` reused across the homogeneous and mixed engines
+#: can never collide on the same ``action_audit_log`` receipt row.
+MIXED_MUTATION_RECEIPT_KIND = "batch_mutate_mixed"
 
 #: Default cap on entries per call (mirrors ``handoff.py``'s
 #: ``_MAX_ENRICHED_ITEMS = 100`` -- the established "how big is a reasonable
@@ -949,6 +979,251 @@ async def execute_batch(
     if idempotency_key:
         await _write_batch_receipt(
             db, tenant_id=tenant_id, project_id=project_id, entry_kind=entry_kind,
+            idempotency_key=idempotency_key, actor=actor, result=batch_result,
+        )
+    return batch_result
+
+
+# ---------------------------------------------------------------------------
+# 133bfff6 -- batch_mutate's core engine: a MIXED-kind sibling of
+# execute_batch, restricted to sprint_item_pointer + sprint_item UPDATE.
+# ---------------------------------------------------------------------------
+
+async def execute_mixed_mutation_batch(
+    db: Any,
+    *,
+    project_id: str,
+    entries: list[dict[str, Any]],
+    mode: str = "all_or_nothing",
+    idempotency_key: str | None = None,
+    tenant_id: str | None = None,
+    actor: str | None = None,
+    session_id: str | None = None,
+    max_entries: int = DEFAULT_MAX_BATCH_ENTRIES,
+) -> BatchResult:
+    """133bfff6 -- ``batch_mutate``'s core engine.
+
+    A MIXED-kind sibling of :func:`execute_batch`: a single call may combine
+    ``sprint_item_pointer`` entries (attach a pointer) and
+    ``sprint_item_update`` entries (patch an EXISTING sprint item --
+    creation is deliberately not offered here; only ``execute_batch``'s
+    ``entry_kind="sprint_item"`` with ``action="create"`` creates) in ONE
+    call, each entry selecting its own adapter via a required ``"kind"``
+    field. That per-entry kind selection is the one structural difference
+    from :func:`execute_batch`, which requires every entry in a call to
+    share the SAME ``entry_kind`` (see that function's own "homogeneous"
+    framing). Everything else -- validate-before-mutate, all_or_nothing
+    compensation, best_effort partial commit, deterministic input-order
+    results, idempotency-replay receipts -- is the identical contract, and
+    this function reuses :func:`execute_batch`'s own adapters
+    (``_ADAPTERS["sprint_item_pointer"]`` -> :func:`_apply_pointer_entry` /
+    :func:`_validate_pointer_entry` / :func:`_compensate_pointer_entry`, and
+    ``_ADAPTERS["sprint_item"]`` -> :func:`_apply_sprint_item_entry` /
+    :func:`_validate_sprint_item_entry` / :func:`_compensate_sprint_item_entry`)
+    AS-IS -- no duplicated validation/mutation/compensation logic, per this
+    item's acceptance criteria.
+
+    A ``sprint_item_update`` entry's ``action`` is force-set to ``"update"``
+    before validation (mirroring ``meridian.batch_ops``'s
+    ``_normalize_entries_for_operation`` forced-action pattern for its
+    ``item_updates`` operation, including its default: an entry that omits
+    ``action`` entirely -- the common case, callers pass ``item_id`` + fields,
+    never ``action`` -- defaults to ``"update"`` here, NOT
+    ``_validate_sprint_item_entry``'s own bare default of ``"create"``,
+    which would otherwise misfire for every caller who (correctly) omits
+    ``action`` on an update entry). An entry that explicitly names
+    ``action="create"`` is rejected with a clear, actionable message rather
+    than silently creating a sprint item through what is documented as an
+    update-only surface.
+
+    Project/tenant isolation: an entry MAY optionally carry its own
+    ``project_id`` field (e.g. a caller that copy-pasted an entry from
+    another context) -- if present, it MUST match this call's own
+    *project_id* exactly, or the entry is rejected before any mutation is
+    attempted, never silently ignored. This is on top of (not instead of)
+    the isolation the underlying adapters already provide:
+    ``_apply_pointer_entry``/``_apply_sprint_item_entry`` both write/patch
+    scoped to *project_id*, and ``_validate_sprint_item_entry``'s own
+    ``snapshot.get("project_id") != project_id`` check already 404s an
+    ``item_id`` that resolves to a DIFFERENT project -- so a cross-project
+    ``item_id`` guess is already impossible even without this extra guard;
+    this guard's job is rejecting an explicit conflicting ``project_id``
+    field outright.
+
+    See :func:`execute_batch` for the full parameter/return/raise contract
+    (identical here except ``entry_kind`` does not exist as a parameter --
+    it is chosen per-entry via ``"kind"``) -- this docstring only calls out
+    what is DIFFERENT.
+    """
+    if not project_id or not isinstance(project_id, str):
+        raise BatchEngineError("project_id is required")
+    if mode not in BATCH_MODES:
+        raise BatchEngineError(f"mode must be one of {BATCH_MODES}, got {mode!r}")
+    if not isinstance(entries, list) or not entries:
+        raise BatchEngineError("entries must be a non-empty list")
+    if len(entries) > max_entries:
+        raise BatchEngineError(
+            f"entries has {len(entries)} items, exceeding max_entries={max_entries}; "
+            "split into smaller batches"
+        )
+
+    if idempotency_key:
+        replay = await _load_batch_receipt(
+            db, tenant_id=tenant_id, project_id=project_id,
+            entry_kind=MIXED_MUTATION_RECEIPT_KIND, idempotency_key=idempotency_key,
+        )
+        if replay is not None:
+            return replay
+
+    ctx = _EntryContext(actor=actor, session_id=session_id)
+
+    # ---- Phase 0: resolve each entry's adapter from its own 'kind', force
+    # the update-only action, and enforce project isolation. Pure structural
+    # checks -- no DB access yet. --------------------------------------------
+    resolved_entries: list[Any] = [None] * len(entries)
+    resolved_adapter: list[_EntryAdapter | None] = [None] * len(entries)
+    entry_errors: dict[int, _EntryError] = {}
+    for i, raw in enumerate(entries):
+        if not isinstance(raw, dict):
+            entry_errors[i] = _EntryError(ERROR_VALIDATION, "entry must be an object")
+            continue
+        kind = raw.get("kind")
+        if kind not in MIXED_MUTATION_ENTRY_KINDS:
+            entry_errors[i] = _EntryError(
+                ERROR_VALIDATION,
+                f"entry 'kind' must be one of {MIXED_MUTATION_ENTRY_KINDS}, got {kind!r}",
+            )
+            continue
+        entry_pid = raw.get("project_id")
+        if entry_pid is not None and str(entry_pid) != str(project_id):
+            entry_errors[i] = _EntryError(
+                ERROR_VALIDATION,
+                f"entry project_id {entry_pid!r} does not match this batch's own "
+                f"project_id {project_id!r} -- a mutation entry cannot target a "
+                "different project",
+            )
+            continue
+        if kind == "sprint_item_pointer":
+            resolved_adapter[i] = _ADAPTERS["sprint_item_pointer"]
+            resolved_entries[i] = raw
+        else:  # "sprint_item_update"
+            action = raw.get("action") or "update"
+            if action != "update":
+                entry_errors[i] = _EntryError(
+                    ERROR_VALIDATION,
+                    "kind='sprint_item_update' only supports action='update' "
+                    "(sprint-item creation is not exposed through batch_mutate) "
+                    f"-- got action={action!r}",
+                )
+                continue
+            entry = dict(raw)
+            entry["action"] = "update"
+            resolved_adapter[i] = _ADAPTERS["sprint_item"]
+            resolved_entries[i] = entry
+
+    # ---- Phase 1: structural, pre-mutation validation (read-only). --------
+    normalized: list[Any] = [None] * len(entries)
+    for i in range(len(entries)):
+        if i in entry_errors:
+            continue
+        adapter = resolved_adapter[i]
+        assert adapter is not None
+        try:
+            normalized[i] = await adapter.validate(db, project_id, resolved_entries[i], ctx)
+        except _EntryError as exc:
+            entry_errors[i] = exc
+        except ValueError as exc:
+            entry_errors[i] = _EntryError(ERROR_VALIDATION, str(exc))
+
+    if mode == "all_or_nothing" and entry_errors:
+        results = [
+            _pre_error_result(i, entries[i], entry_errors[i]) if i in entry_errors
+            else _not_attempted_result(i, entries[i])
+            for i in range(len(entries))
+        ]
+        batch_result = BatchResult(
+            status="rejected", mode=mode, entry_kind=MIXED_MUTATION_RECEIPT_KIND,
+            project_id=project_id, idempotency_key=idempotency_key, results=results,
+        )
+        if idempotency_key:
+            await _write_batch_receipt(
+                db, tenant_id=tenant_id, project_id=project_id,
+                entry_kind=MIXED_MUTATION_RECEIPT_KIND,
+                idempotency_key=idempotency_key, actor=actor, result=batch_result,
+            )
+        return batch_result
+
+    # ---- Phase 2: mutate, strictly in input order, each entry through its
+    # own resolved adapter. Never spans an external call (see execute_batch's
+    # module docstring -- identical rule here). -----------------------------
+    results: list[BatchEntryResult | None] = [None] * len(entries)
+    compensations: list[tuple[_EntryAdapter, tuple[Any, ...]]] = []
+    aborted = False
+    for i, raw in enumerate(entries):
+        ckey = _correlation_key(raw, i)
+        if i in entry_errors:
+            results[i] = _pre_error_result(i, raw, entry_errors[i])
+            if mode == "all_or_nothing":
+                aborted = True
+                break
+            continue
+        adapter = resolved_adapter[i]
+        assert adapter is not None
+        try:
+            entry_id, outcome, comp_state = await adapter.apply(
+                db, project_id, normalized[i], ctx
+            )
+            results[i] = BatchEntryResult(
+                index=i, correlation_key=ckey, status="ok", id=entry_id, outcome=outcome,
+            )
+            compensations.append((adapter, comp_state))
+        except _EntryError as exc:
+            results[i] = BatchEntryResult(
+                index=i, correlation_key=ckey, status="error", error_code=exc.code,
+                error_message=exc.message, retryable=exc.retryable,
+                outcome={"payload": exc.payload} if exc.payload else None,
+            )
+            if mode == "all_or_nothing":
+                aborted = True
+                break
+        except Exception as exc:  # noqa: BLE001 -- unexpected DB/driver error
+            results[i] = BatchEntryResult(
+                index=i, correlation_key=ckey, status="error", error_code=ERROR_INTERNAL,
+                error_message=str(exc), retryable=True,
+            )
+            if mode == "all_or_nothing":
+                aborted = True
+                break
+
+    if mode == "all_or_nothing" and aborted:
+        # Undo every entry this call already wrote, most-recent first, each
+        # through the SAME adapter it was applied with.
+        for adapter, comp_state in reversed(compensations):
+            await adapter.compensate(db, project_id, comp_state, ctx)
+        for j in range(len(results)):
+            if results[j] is None:
+                results[j] = _not_attempted_result(j, entries[j])
+            elif results[j].status == "ok":
+                results[j] = replace(
+                    results[j], status="rolled_back",
+                    outcome={**(results[j].outcome or {}), "rolled_back": True},
+                )
+        overall_status = "failed"
+    else:
+        for j in range(len(results)):
+            if results[j] is None:
+                results[j] = _not_attempted_result(j, entries[j])
+        ok_n = sum(1 for r in results if r.status == "ok")
+        overall_status = "ok" if ok_n == len(results) else ("failed" if ok_n == 0 else "partial")
+
+    batch_result = BatchResult(
+        status=overall_status, mode=mode, entry_kind=MIXED_MUTATION_RECEIPT_KIND,
+        project_id=project_id, idempotency_key=idempotency_key, results=results,  # type: ignore[arg-type]
+    )
+    if idempotency_key:
+        await _write_batch_receipt(
+            db, tenant_id=tenant_id, project_id=project_id,
+            entry_kind=MIXED_MUTATION_RECEIPT_KIND,
             idempotency_key=idempotency_key, actor=actor, result=batch_result,
         )
     return batch_result

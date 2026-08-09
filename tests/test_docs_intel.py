@@ -679,6 +679,154 @@ def test_synth_id_deterministic_across_calls():
 
 
 # ---------------------------------------------------------------------------
+# e21b2ca7 — durable document-bound synth-id addressing. caf5ee34 (above)
+# fixed drift under insertion elsewhere; these cover the residual mutability
+# that fix's own follow-up notes flagged: ancestry, content-edit, and
+# duplicate-order sensitivity of the sp<hash> fallback.
+# ---------------------------------------------------------------------------
+
+
+def test_synth_id_survives_ancestor_heading_retitle():
+    """Core e21b2ca7 fix: a paragraph's synth id must NOT change just because
+    an ANCESTOR heading's own text was edited. Only the paragraph's own
+    content and its document-order occurrence among identical text feed the
+    hash now — the ancestor heading's text no longer does."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+
+    def _xml(heading_text: str) -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>{heading_text}</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>The target paragraph.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+
+    before = docs_intel.parse_docx(_make_docx_from_xml(_xml("Chapter One")))
+    after = docs_intel.parse_docx(_make_docx_from_xml(_xml("Chapter One (Revised)")))
+
+    target_before = next(p for p in before if p["text"] == "The target paragraph.")
+    target_after = next(p for p in after if p["text"] == "The target paragraph.")
+
+    assert target_before["para_id"].startswith("sp")
+    assert target_before["para_id"] == target_after["para_id"], (
+        "retitling an ancestor heading must not change a descendant "
+        f"paragraph's synth id: {target_before['para_id']!r} -> "
+        f"{target_after['para_id']!r}"
+    )
+
+
+def test_synth_id_travels_with_content_not_position_on_reorder():
+    """e21b2ca7 reorder coverage: two distinct (non-duplicate) paragraphs
+    swapping document order each keep THEIR OWN id — ids are keyed by
+    content + occurrence, not raw position, so a pure reorder of
+    non-duplicate content is fully stable."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+    original_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p><w:r><w:t>Alpha paragraph.</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Beta paragraph.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    reordered_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p><w:r><w:t>Beta paragraph.</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Alpha paragraph.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    before = {
+        p["text"]: p["para_id"]
+        for p in docs_intel.parse_docx(_make_docx_from_xml(original_xml))
+    }
+    after = {
+        p["text"]: p["para_id"]
+        for p in docs_intel.parse_docx(_make_docx_from_xml(reordered_xml))
+    }
+
+    assert before["Alpha paragraph."] == after["Alpha paragraph."]
+    assert before["Beta paragraph."] == after["Beta paragraph."]
+
+
+def test_synth_id_own_text_edit_is_a_documented_residual_limitation():
+    """e21b2ca7: editing a paragraph's OWN text still changes its own synth
+    id — an inherent property of a purely content-derived id with no
+    persisted state (there is nothing else here to hash from). Explicitly
+    accepted and pinned down by this test (see _build_synth_id_map's own
+    docstring) rather than left as a silent, untested gap. Fully closing
+    this needs a real persisted identity layer, out of scope for this
+    function's stateless, single-parse contract."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+
+    def _xml(text: str) -> str:
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p><w:r><w:t>{text}</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+
+    before = docs_intel.parse_docx(_make_docx_from_xml(_xml("Original text.")))[0]
+    after = docs_intel.parse_docx(_make_docx_from_xml(_xml("Edited text.")))[0]
+    assert before["para_id"] != after["para_id"], (
+        "documenting the known limitation: a same-slot paragraph's own text "
+        "edit still changes its synth id today"
+    )
+
+
+def test_synth_id_duplicate_order_shift_is_a_documented_residual_limitation():
+    """e21b2ca7: inserting a NEW earlier occurrence of duplicated text still
+    shifts the occurrence index (and therefore the id) of every LATER
+    paragraph sharing that exact text — explicitly documented and tested
+    known limitation, not a silent gap. Fully closing this also needs a real
+    persisted identity layer (see _build_synth_id_map's docstring)."""
+    _ns = (
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+        'xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"'
+    )
+    before_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p><w:r><w:t>Repeated text.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    after_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document {_ns}>
+  <w:body>
+    <w:p><w:r><w:t>Repeated text.</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Repeated text.</w:t></w:r></w:p>
+  </w:body>
+</w:document>"""
+    before_ids = [
+        p["para_id"] for p in docs_intel.parse_docx(_make_docx_from_xml(before_xml))
+    ]
+    after_ids = [
+        p["para_id"] for p in docs_intel.parse_docx(_make_docx_from_xml(after_xml))
+    ]
+
+    # The FIRST occurrence keeps occurrence-index 0 both times...
+    assert before_ids[0] == after_ids[0]
+    # ...but a caller who resolves an id against a document that has since
+    # gained an EARLIER duplicate must be prepared for later occurrences to
+    # shift — this is the known, documented, tested residual gap.
+    assert len(after_ids) == 2
+    assert after_ids[0] != after_ids[1]
+
+
+# ---------------------------------------------------------------------------
 # 57336a87 — perf micro-benchmark: a few hundred paragraphs must parse well
 # under a real-time threshold. We MEASURE, not assume.
 # ---------------------------------------------------------------------------

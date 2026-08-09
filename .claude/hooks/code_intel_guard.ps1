@@ -45,36 +45,67 @@ if ($ciVal -ne $null -and [int]$ciVal -eq 1) {
     try {
         $slotResp = Invoke-RestMethod -Uri "$MeridianUrl/projects/$ProjectId/slot-readiness" -Method Get -TimeoutSec 7
     } catch { }
+    # 883ce543 -- shared fail-open/block contract with code_intel_guard.sh:
+    # slotReady/hasTunnel start UNCONFIRMED ($null) and are only ever set from
+    # a successfully-returned response. Blocking below requires BOTH to be
+    # positively confirmed $true -- every other outcome (endpoint unreachable
+    # or an exception, a response missing ready/has_tunnel, explicit
+    # ready=false, explicit has_tunnel=false) falls through to fail-open.
+    # $null -eq $true and $null -eq $false both evaluate to False in
+    # PowerShell, so a missing/null value never accidentally satisfies either
+    # check below. Previously this function only special-cased
+    # ready=false/has_tunnel=false explicitly and fell through to BLOCK for
+    # anything unhandled ($slotResp -eq $null, missing ready/has_tunnel keys)
+    # -- the exact opposite of the documented policy.
+    #
+    # Verifier-found gap (post-883ce543 fix): PowerShell's -eq coerces its RHS
+    # to the LHS's type, so a non-boolean JSON value like ready=1 (int) makes
+    # "$slotReady -eq $true" coerce $true -> 1 and compare 1 -eq 1 -> True,
+    # wrongly treated as a positive confirmation and BLOCKING -- diverging
+    # from code_intel_guard.sh, whose jq/regex path only ever matches the
+    # literal strings "true"/"false" and fails open on anything else. The
+    # helper below requires the value to actually be PowerShell's native
+    # [bool] type (which ConvertFrom-Json only produces from a real JSON
+    # true/false literal) before the -eq comparison runs, closing that gap.
+    $slotReady = $null
+    $hasTunnel = $null
     if ($slotResp -ne $null) {
         $slotReady = $slotResp.ready
         $hasTunnel = $slotResp.has_tunnel
-        if ($slotReady -eq $false) {
-            # Slot is not ready yet -- brief retry (warmup may be in progress).
-            Start-Sleep -Seconds 3
-            $slotResp2 = $null
-            try {
-                $slotResp2 = Invoke-RestMethod -Uri "$MeridianUrl/projects/$ProjectId/slot-readiness" -Method Get -TimeoutSec 7
-            } catch { }
-            if ($slotResp2 -ne $null) { $slotReady = $slotResp2.ready }
-            if ($slotReady -ne $true) {
-                # Still not ready after retry -- fail open with a VISIBLE warning.
-                [Console]::Error.WriteLine("Meridian code-intel guard (81b10dec): code-intel slot NOT ready after warmup probe. The Serena/code-intel daemon may still be starting. Failing open -- ${tool} is allowed this time. Retry in a moment or check 'meridian --tunnel' status.")
-                exit 0
-            }
-        } elseif ($hasTunnel -eq $false) {
-            # No tunnel active (self-hosted or tunnel not connected) -- fail open.
-            [Console]::Error.WriteLine("Meridian code-intel guard (81b10dec): code-intel enabled but no tunnel slot is connected. Failing open -- ${tool} is allowed. Connect the meridian tunnel to enable slot-based enforcement.")
-            exit 0
-        }
     }
-    # Slot is ready (or probe was skipped) -- block the tool call.
-    [Console]::Error.WriteLine("Meridian code-intel guard (aeba8a80): this project has a code-intel index. Use code-intel tools INSTEAD of ${tool}:
+    if ($slotReady -eq $false) {
+        # Slot is not ready yet -- brief retry (warmup may be in progress).
+        Start-Sleep -Seconds 3
+        $slotResp2 = $null
+        try {
+            $slotResp2 = Invoke-RestMethod -Uri "$MeridianUrl/projects/$ProjectId/slot-readiness" -Method Get -TimeoutSec 7
+        } catch { }
+        $slotReady = $null
+        if ($slotResp2 -ne $null) { $slotReady = $slotResp2.ready }
+    }
+    function Test-PositiveBool($v) { ($v -is [bool]) -and ($v -eq $true) }
+    if ((Test-PositiveBool $slotReady) -and (Test-PositiveBool $hasTunnel)) {
+        # Positively confirmed ready AND tunneled -- block the tool call.
+        [Console]::Error.WriteLine("Meridian code-intel guard (aeba8a80): this project has a code-intel index. Use code-intel tools INSTEAD of ${tool}:
   - find_symbol / extractor__find_symbol        -- exact symbol lookup (fastest, most accurate)
   - search_graph / codebase__search_graph       -- structural graph queries (callers, callees, paths)
   - search_code / search_code_semantic          -- fuzzy / conceptual queries across the codebase
   - find_referencing_symbols                    -- find all callers of a function
   - get_code_snippet / get_architecture         -- retrieve file sections or the whole-project architecture
 Raw grep/glob is a LAST RESORT for code search (443aa32a) -- the above tools are faster, use far fewer tokens, and don't miss symbol aliases. Fall back to ${tool} ONLY for non-symbol content (log output, data files, config values) or after code-intel tools confirm a file path.")
-    exit 2
+        exit 2
+    }
+    # Fail open -- every unconfirmed case lands here with a VISIBLE reason.
+    if ($slotResp -eq $null) {
+        [Console]::Error.WriteLine("Meridian code-intel guard (81b10dec): the slot-readiness endpoint was unreachable or returned an error. Failing open -- ${tool} is allowed. Check 'meridian --tunnel' status or MERIDIAN_URL.")
+    } elseif ($slotReady -ne $true) {
+        # Still not ready after retry, or the response was missing/unparseable
+        # -- fail open with a VISIBLE warning either way.
+        [Console]::Error.WriteLine("Meridian code-intel guard (81b10dec): code-intel slot NOT ready after warmup probe. The Serena/code-intel daemon may still be starting. Failing open -- ${tool} is allowed this time. Retry in a moment or check 'meridian --tunnel' status.")
+    } else {
+        # No tunnel active (self-hosted or tunnel not connected) -- fail open.
+        [Console]::Error.WriteLine("Meridian code-intel guard (81b10dec): code-intel enabled but no tunnel slot is connected. Failing open -- ${tool} is allowed. Connect the meridian tunnel to enable slot-based enforcement.")
+    }
+    exit 0
 }
 exit 0

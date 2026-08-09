@@ -213,6 +213,16 @@ async def _build_executor_goal_messages(
         ),
         max_turns=_max_turns_from_settings(_goal_settings),
         pointer_evidence_ids=_tpl_pointer_evidence_ids,
+        # c1ec3517 — this prompt already prepends its own numbered
+        # start_session-first protocol above (see the returned message body
+        # below), but the embedded quick_start_goal itself is exactly the
+        # substring most likely to be copy-pasted on its own (it's the
+        # literal /goal block) — so it needs to carry the same self-start
+        # bootstrap in its own <first_step> as the goal-only handoff mode.
+        # See _build_quick_start_goal's project_id/project_name/identity
+        # docstring.
+        project_id=pid,
+        project_name=pname,
     )
     if pending:
         item_lines = "\n".join(
@@ -1699,6 +1709,9 @@ async def _sprint_item_resource_claim_gate(
     session_id: str | None,
     *,
     resource_contents: "dict[str, Any] | None" = None,
+    strict_resource_locking: bool = False,
+    allow_file_fallback: bool = False,
+    tenant_id: "str | None" = None,
 ) -> dict[str, Any]:
     """18c488b6 — transactional claim-time symbol/file resource-lock gate.
 
@@ -1715,15 +1728,73 @@ async def _sprint_item_resource_claim_gate(
     Fail-open only for the cases that are genuinely "nothing to enforce":
     no ``session_id`` (no identity to acquire under — every pre-18c488b6
     caller that omits it, direct ``db_module.claim_sprint_item()`` callers
-    included, sees zero behavior change), item not found, or no declared
+    included, sees zero behavior change UNLESS ``strict_resource_locking=True``
+    is explicitly passed, see below), item not found, or no declared
     ``touches_resources``. A REAL conflict is always a hard ``ok=False``, never
     silently swallowed.
 
+    54d2c2af — ``strict_resource_locking`` (default ``False``, fully additive)
+    opts a single call into the HARDENED contract: a ``symbol:`` resource that
+    cannot get a real symbol-range lock (no ``resource_contents`` supplied for
+    its file, or ``claim_symbol`` itself couldn't resolve it — unparseable /
+    symbol not found / ambiguous) is REJECTED (``ok=False``,
+    ``error="SYMBOL_LOCK_NOT_APPROVED"``, all-or-nothing rollback via the same
+    ``_blocked`` path a genuine conflict uses) instead of silently widening to
+    a whole-file lock, UNLESS the caller ALSO passes ``allow_file_fallback=True``
+    to explicitly approve that exact widening for this call. When
+    ``strict_resource_locking`` is True, a missing ``session_id`` is likewise
+    promoted from the fail-open skip to a hard ``MISSING_EXECUTION_IDENTITY``
+    block (mirroring ``handle_claim_sprint_item``'s own call-site identity gate,
+    2a176d6d finding 1) for any item that actually declares resources — a
+    strict caller must never believe it acquired protection it didn't. The
+    DEFAULT (``strict_resource_locking=False``) behavior is completely
+    unchanged from before 54d2c2af — every existing direct caller of this
+    function (pinned by its own unit tests) sees zero behavior change.
+
+    Every resource this gate resolves to a ``symbol:`` grain decision (real
+    symbol lock, coarse fallback, or strict rejection) also gets a durable
+    audit row via :mod:`meridian.lock_granularity_receipt`, regardless of
+    ``strict_resource_locking`` — best-effort, never blocks the claim.
+
     Returns ``{"ok": True, "lock_scope": [...]}`` on success (including the
-    no-op cases above), or ``{"ok": False, "error": "RESOURCE_LOCKED",
-    "lock_scope": [...], "conflicts": [...], "message": ...}`` on conflict.
+    no-op cases above), or ``{"ok": False, "error": "RESOURCE_LOCKED" |
+    "SYMBOL_LOCK_NOT_APPROVED" | "MISSING_EXECUTION_IDENTITY", "lock_scope":
+    [...], "conflicts": [...], "message": ...}`` on conflict/rejection.
     """
+    async def _record_receipt(
+        resource: str, achieved: str, reason: "str | None", approved: "bool | None" = None,
+    ) -> None:
+        try:
+            from .. import lock_granularity_receipt as _lgr  # noqa: PLC0415
+            await _lgr.record_lock_granularity_receipt(
+                db, tenant_id=tenant_id, project_id=project_id, session_id=session_id,
+                item_id=item_id, resource=resource, requested_granularity="symbol",
+                achieved_granularity=achieved, reason=reason, approved=approved,
+            )
+        except Exception:  # noqa: BLE001 — a receipt failure must never break the claim
+            pass
+
     if not session_id:
+        if strict_resource_locking:
+            _identity_item = await db_module.get_sprint_item(db, item_id)
+            _declared_for_identity: list[str] = []
+            if _identity_item is not None and _identity_item.get("project_id") == project_id:
+                _declared_for_identity = db_module.parse_touches_resources(
+                    _identity_item.get("touches_resources")
+                )
+            if _declared_for_identity:
+                return {
+                    "ok": False,
+                    "error": "MISSING_EXECUTION_IDENTITY",
+                    "message": (
+                        "Cannot acquire resource locks: strict_resource_locking=true "
+                        "requires a session_id to acquire locks under, but none was "
+                        f"supplied, and this item declares {len(_declared_for_identity)} "
+                        "touches_resources entry(ies)."
+                    ),
+                    "lock_scope": [],
+                    "declared_resources": _declared_for_identity,
+                }
         return {"ok": True, "lock_scope": [], "skipped_reason": "no_session_id"}
 
     item = await db_module.get_sprint_item(db, item_id)
@@ -1746,12 +1817,14 @@ async def _sprint_item_resource_claim_gate(
                     db, session_id, entry["file_path"], entry["symbol"]
                 )
 
-    async def _blocked(entry: dict[str, Any], message: str) -> dict[str, Any]:
+    async def _blocked(
+        entry: dict[str, Any], message: str, error_code: str = "RESOURCE_LOCKED",
+    ) -> dict[str, Any]:
         lock_scope.append(entry)
         await _rollback()
         return {
             "ok": False,
-            "error": "RESOURCE_LOCKED",
+            "error": error_code,
             "message": message,
             "lock_scope": lock_scope,
             "conflicts": [entry],
@@ -1829,6 +1902,7 @@ async def _sprint_item_resource_claim_gate(
                         acquired_this_call.append({
                             "kind": "symbol", "file_path": file_path, "symbol": symbol_name,
                         })
+                    await _record_receipt(resource, "symbol", None)
                     continue
                 if symbol_result.get("reason") in ("symbol_conflict", "file_locked"):
                     _holder = symbol_result.get("holder_session_id")
@@ -1854,13 +1928,42 @@ async def _sprint_item_resource_claim_gate(
                         f"Cannot claim sprint item: symbol {resource!r} is locked "
                         "by another live session.",
                     )
-                # unparseable / symbol_not_found — explicit fallback, recorded below.
+                # unparseable / symbol_not_found / ambiguous_symbol — resolution
+                # failed even though content WAS supplied.
                 fallback_reason = symbol_result.get("reason") or "unparseable"
             else:
                 fallback_reason = "no_source_supplied"
 
+            # 54d2c2af — STRICT mode: a symbol-level claim that cannot achieve
+            # real symbol grain must be REJECTED, not silently widened to a
+            # whole-file lock, unless the caller explicitly approved the
+            # fallback for THIS call via allow_file_fallback=True. Reuses the
+            # same all-or-nothing _blocked()/_rollback() path a genuine
+            # conflict uses, so an earlier resource acquired in this same call
+            # is rolled back too.
+            if strict_resource_locking and not allow_file_fallback:
+                await _record_receipt(resource, "rejected", fallback_reason, approved=False)
+                return await _blocked(
+                    {
+                        "resource": resource, "scope": "symbol", "file_path": file_path,
+                        "symbol": symbol_name, "acquired": False,
+                        "fallback_reason": fallback_reason,
+                        "claim_granularity": "unresolved",
+                    },
+                    f"Cannot claim sprint item: symbol-level lock for {resource!r} "
+                    f"could not be resolved ({fallback_reason}) and "
+                    "strict_resource_locking=true requires either the file's current "
+                    "source in resource_contents (so a real symbol-range lock can be "
+                    "attempted) or explicit allow_file_fallback=true to approve a "
+                    "whole-file lock for this resource instead.",
+                    error_code="SYMBOL_LOCK_NOT_APPROVED",
+                )
+
             pre_held_file = await _session_holds_file_lock(db, file_path, session_id)
             file_result = await db_module.claim_file(db, file_path, session_id, mode="write")
+            _fallback_approved = (
+                True if (strict_resource_locking and allow_file_fallback) else None
+            )
             if file_result.get("claimed"):
                 lock_scope.append({
                     "resource": resource, "scope": "file", "file_path": file_path,
@@ -1874,9 +1977,17 @@ async def _sprint_item_resource_claim_gate(
                     # _claim_batch_resource's identical distinction).
                     "claim_granularity": "coarse",
                     "lease_expiry": file_result.get("expires_at"),
+                    # 54d2c2af — explicit when this fallback happened under
+                    # strict_resource_locking + an audited allow_file_fallback
+                    # approval, vs. None (not in strict mode — fallback was
+                    # always implicitly allowed, pre-54d2c2af default).
+                    "fallback_approved": _fallback_approved,
                 })
                 if not pre_held_file:
                     acquired_this_call.append({"kind": "file", "file_path": file_path})
+                await _record_receipt(
+                    resource, "coarse", fallback_reason, approved=_fallback_approved
+                )
                 continue
             return await _blocked(
                 {
@@ -3012,6 +3123,21 @@ async def _handle_task_tools(
                 "selection_rejected": exc.rejected,
                 "message": str(exc),
             }
+        except handoff_module_local.HandoffScopeNonExecutable as exc:
+            # fb82e51f — selected_item_ids validated cleanly (every id
+            # genuinely pending/in-project/in-version) but every requested id
+            # was independently excluded from the claimable batch by a
+            # separate structural gate (no prospecting evidence, backburner,
+            # manual, or wave-gate pending). Nothing was rendered/written/
+            # persisted for this call — fail CLOSED instead of returning a
+            # handoff that declares a scope with zero executable items in it.
+            return {
+                "error": "HANDOFF_SCOPE_NON_EXECUTABLE",
+                "project_id": args["project_id"],
+                "requested_ids": exc.requested_ids,
+                "excluded_requested": exc.excluded,
+                "message": str(exc),
+            }
         except handoff_module_local.HandoffContinuationRequired as exc:
             # ecc8b280 — strict_continuation=True, this call is NOT
             # checkpoint=True, and actionable pending/in_progress items
@@ -4025,7 +4151,7 @@ async def _handle_sprint_tools(
     merge_sprint_items, complete_sprint_item, add_sprint_item_pointer,
     get_sprint_item_pointers, resolve_sprint_item_pointers,
     delete_sprint_item_pointer, execute_batch, complete_wave_gate, configure_wave_gate,
-    start_wave_run, finalize_wave_run, resume_wave.
+    start_wave_run, finalize_wave_run, resume_wave, batch_read, batch_mutate.
 
     ba4f879b — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -4062,6 +4188,8 @@ async def _handle_sprint_tools(
         handle_start_wave_run,
         handle_finalize_wave_run,
         handle_resume_wave,
+        handle_batch_read,
+        handle_batch_mutate,
     )
 
     _standard_dispatch: dict[str, Any] = {
@@ -4092,6 +4220,8 @@ async def _handle_sprint_tools(
         "start_wave_run": handle_start_wave_run,
         "finalize_wave_run": handle_finalize_wave_run,
         "resume_wave": handle_resume_wave,
+        "batch_read": handle_batch_read,
+        "batch_mutate": handle_batch_mutate,
     }
 
     if name in _standard_dispatch:

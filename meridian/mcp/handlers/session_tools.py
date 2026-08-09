@@ -44,11 +44,19 @@ async def handle_checkpoint(
     _ckpt_project = await db_module.get_project(db, project_id)
     _commits = await fetch_recent_commits(_ckpt_project or {}, tenant)
     try:
+        # 60eed526 — checkpoint=True bounds the RETURNED delta content to
+        # _DEFAULT_CHECKPOINT_MAX_BYTES instead of full/delta's generous
+        # 300_000-byte default: checkpoint() is a mid-run progress ping,
+        # often called many times per session, and was observed returning an
+        # oversized (~139KB) "summary" field without it. Persistence (disk
+        # file / handoffs table / pending_goal) is unaffected either way —
+        # see generate_handoff's own checkpoint/max_content_bytes docstrings.
         _, content, _ = await asyncio.wait_for(
             handoff_module_local.generate_handoff(
                 db, project_id, data_dir, mode="delta", session_id=session_id,
                 commit_messages=[c["message"] for c in _commits],
                 identity=resolve_caller_identity(tenant),
+                checkpoint=True,
             ),
             timeout=30.0,
         )

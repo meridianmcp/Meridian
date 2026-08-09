@@ -3100,6 +3100,144 @@ async def _migrate_pg_project_parent_id(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_decision_evidence(conn: PostgresConnection) -> None:
+    """9149e132 — decision_evidence: typed, code-linked decision evidence
+    (mirrors db.decision_evidence._migrate_decision_evidence).
+
+    One row per typed evidence link: a decision_id, a durable pointer (JSON,
+    the same meridian.pointers shape sprint_item_pointers already uses),
+    searchable evidence text, optional assumptions/applicability_scope/
+    confidence, and a supersession/reversal lineage (status +
+    supersedes_id/superseded_by/reversal_reason) — nothing is ever hard
+    deleted. Wired into planning_search via the
+    _PLANNING_SOURCE_SPECS["decision_evidence"] entry in db/__init__.py, the
+    same generic lexical-only retrieval path every other source type uses.
+    CREATE TABLE / INDEX IF NOT EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS decision_evidence ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    decision_id TEXT NOT NULL,"
+        "    version TEXT,"
+        "    pointer TEXT NOT NULL,"
+        "    evidence TEXT NOT NULL,"
+        "    assumptions TEXT,"
+        "    applicability_scope TEXT,"
+        "    confidence REAL,"
+        "    status TEXT NOT NULL DEFAULT 'active',"
+        "    supersedes_id TEXT,"
+        "    superseded_by TEXT,"
+        "    reversal_reason TEXT,"
+        "    created_at TEXT NOT NULL DEFAULT (to_char(now() at time zone 'utc', 'YYYY-MM-DD HH24:MI:SS.US')),"
+        "    updated_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_decision_evidence_decision "
+        "ON decision_evidence(decision_id);"
+        "CREATE INDEX IF NOT EXISTS idx_decision_evidence_project "
+        "ON decision_evidence(project_id);"
+    )
+
+
+async def _migrate_pg_ai_log_events(conn: PostgresConnection) -> None:
+    """9e83be4a (Round 1 proposal e143949d) — ai_log_events: canonical,
+    versioned, append-only ExecutionEvent storage (mirrors
+    db.ai_log._migrate_ai_log_events_table — see meridian.ai_log's module
+    docstring for the full envelope/versioning rationale).
+
+    Schema/contract scaffold only — nothing in this codebase calls
+    append_event yet (no capture/ingestion pipeline wired to this table).
+    ``recorded_at`` defaults via ``_TS`` (clock_timestamp()-based), not
+    ``now()`` — this repo's now()-vs-clock_timestamp() note (AGENTS.md /
+    project memory) applies to any multi-row-per-transaction insert
+    sequence, and this table is written one row per append_event call, so
+    using the already-fixed ``_TS`` expression here is simply staying
+    consistent with the newer tables (executor_reports, wave_run_summaries)
+    rather than the older ``now()``-based ones.
+
+    CREATE TABLE / INDEX IF NOT EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS ai_log_events ("
+        "    id TEXT PRIMARY KEY,"
+        "    schema_version INTEGER NOT NULL,"
+        "    event_type TEXT NOT NULL,"
+        "    project_id TEXT NOT NULL,"
+        "    session_id TEXT,"
+        "    tenant_id TEXT,"
+        "    actor_kind TEXT NOT NULL,"
+        "    actor_id TEXT,"
+        "    correlation_id TEXT,"
+        "    parent_event_id TEXT,"
+        "    source TEXT,"
+        "    payload TEXT NOT NULL DEFAULT '{}',"
+        "    payload_schema TEXT,"
+        "    occurred_at TEXT NOT NULL,"
+        "    idempotency_key TEXT,"
+        "    event_hash TEXT,"
+        f"    recorded_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_ai_log_events_project "
+        "ON ai_log_events(project_id, recorded_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_ai_log_events_session "
+        "ON ai_log_events(session_id, recorded_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_ai_log_events_type "
+        "ON ai_log_events(project_id, event_type, recorded_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_ai_log_events_correlation "
+        "ON ai_log_events(correlation_id);"
+        "CREATE INDEX IF NOT EXISTS idx_ai_log_events_parent "
+        "ON ai_log_events(parent_event_id);"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ai_log_events_idempotency "
+        "ON ai_log_events(project_id, idempotency_key) "
+        "WHERE idempotency_key IS NOT NULL;"
+    )
+
+
+async def _migrate_pg_proposal_intake_drafts(conn: PostgresConnection) -> None:
+    """3f892ea6 — proposal_intake_drafts: one row per parsed, non-code
+    deterministic proposal-intake block (mirrors
+    db.workspace._migrate_proposal_intake_drafts). Not present in the base
+    CREATE_TABLES_CORE literal — this guarded migration is the only creation
+    path on Postgres, matching _migrate_pg_proposal_evidence_links.
+
+    The UNIQUE index on (proposal_id, block_id) is what makes
+    ingest_proposal_intake's upsert-by-block-position logic correct.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS proposal_intake_drafts ("
+        "    id TEXT PRIMARY KEY,"
+        "    proposal_id TEXT NOT NULL,"
+        "    tenant_id TEXT,"
+        "    block_id TEXT NOT NULL,"
+        "    position INTEGER NOT NULL,"
+        "    intake_key TEXT NOT NULL,"
+        "    text TEXT NOT NULL,"
+        "    source_hash TEXT NOT NULL,"
+        "    route TEXT,"
+        "    candidate_ids TEXT NOT NULL DEFAULT '[]',"
+        "    is_code INTEGER NOT NULL DEFAULT 0,"
+        "    is_duplicate INTEGER NOT NULL DEFAULT 0,"
+        "    duplicate_of_block_id TEXT,"
+        "    revision INTEGER NOT NULL DEFAULT 1,"
+        "    history TEXT NOT NULL DEFAULT '[]',"
+        "    status TEXT NOT NULL DEFAULT 'draft',"
+        "    line_start INTEGER,"
+        "    line_end INTEGER,"
+        "    promoted_to_sprint_item_id TEXT,"
+        "    promoted_to_project_id TEXT,"
+        "    promoted_at TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_intake_drafts_block "
+        "ON proposal_intake_drafts(proposal_id, block_id);"
+        "CREATE INDEX IF NOT EXISTS idx_proposal_intake_drafts_position "
+        "ON proposal_intake_drafts(proposal_id, position);"
+        "CREATE INDEX IF NOT EXISTS idx_proposal_intake_drafts_promoted "
+        "ON proposal_intake_drafts(promoted_to_sprint_item_id);"
+    )
+
+
 async def _migrate_pg_session_goal_compliance(conn: PostgresConnection) -> None:
     """5abf3e12 — sessions.goal_compliance: stored per-session goal-compliance
     metric (JSON: listed N vs completed M vs fully_completed).
@@ -4230,6 +4368,46 @@ async def _migrate_pg_executor_reports(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_wave_run_summaries(conn: PostgresConnection) -> None:
+    """bbb447ec — immutable wave-completion summaries keyed by wave_id.
+
+    Mirrors db.wave_run_summary._migrate_wave_run_summaries. Re-running this
+    migration is safe and intentionally idempotent.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS wave_run_summaries ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    version_filter TEXT NOT NULL DEFAULT '',"
+        "    wave_id TEXT NOT NULL,"
+        "    wave_run_id TEXT,"
+        "    session_id TEXT,"
+        "    board_revision_hash TEXT,"
+        "    items TEXT NOT NULL DEFAULT '[]',"
+        "    commits TEXT NOT NULL DEFAULT '[]',"
+        "    changed_resources TEXT NOT NULL DEFAULT '[]',"
+        "    test_receipts TEXT NOT NULL DEFAULT '[]',"
+        "    blockers TEXT NOT NULL DEFAULT '[]',"
+        "    exclusions TEXT NOT NULL DEFAULT '[]',"
+        "    tool_availability TEXT NOT NULL DEFAULT '[]',"
+        "    handoff_status TEXT,"
+        "    summary_hash TEXT,"
+        "    actor TEXT,"
+        "    supersedes TEXT,"
+        "    superseded_by TEXT,"
+        "    correction_reason TEXT,"
+        "    seq INTEGER NOT NULL DEFAULT 1,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_summaries_lookup "
+        "ON wave_run_summaries(project_id, version_filter, wave_id, seq DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_summaries_run "
+        "ON wave_run_summaries(wave_run_id);"
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_summaries_supersedes "
+        "ON wave_run_summaries(supersedes);"
+    )
+
+
 # Late migrations — run on every DB after the hosted-only set.
 _PG_MIGRATIONS_LATE = (
     _migrate_pg_workspace_tenant_isolation,
@@ -4340,4 +4518,8 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_vector_index_state,
     _migrate_pg_pixi_env_roots,
     _migrate_pg_executor_reports,
+    _migrate_pg_wave_run_summaries,
+    _migrate_pg_decision_evidence,
+    _migrate_pg_ai_log_events,
+    _migrate_pg_proposal_intake_drafts,
 )

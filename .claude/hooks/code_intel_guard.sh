@@ -66,10 +66,19 @@ if [ "$ci_val" -eq 1 ] 2>/dev/null; then
     # Fail open (exit 0) with a VISIBLE log when the slot is not yet ready after
     # one retry, rather than silently passing through.
     slot_resp="$(curl -sf --max-time 6 "$MERIDIAN_URL/projects/$PROJECT_ID/slot-readiness" 2>/dev/null || true)"
+    # 883ce543 -- shared fail-open/block contract with code_intel_guard.ps1:
+    # slot_ready/has_tunnel start UNCONFIRMED (empty) and are only ever set from
+    # a successfully-parsed response. Blocking below requires BOTH to be
+    # positively confirmed "true" -- every other outcome (endpoint unreachable,
+    # malformed/unparseable body, explicit ready=false, explicit
+    # has_tunnel=false) falls through to fail-open. Previously this function
+    # only special-cased ready=false/has_tunnel=false explicitly and fell
+    # through to BLOCK for anything unhandled (empty slot_resp, unparseable
+    # ready/has_tunnel) -- the exact opposite of the documented policy.
+    slot_ready=""
+    has_tunnel=""
     if [ -n "$slot_resp" ]; then
         # Extract "ready": true/false tolerantly (jq fast path, else regex).
-        slot_ready=""
-        has_tunnel=""
         if [ "$_jq_fastpath" -eq 1 ]; then
             slot_ready="$(printf '%s' "$slot_resp" | jq -r '.ready | tostring' 2>/dev/null || true)"
             has_tunnel="$(printf '%s' "$slot_resp" | jq -r '.has_tunnel | tostring' 2>/dev/null || true)"
@@ -82,40 +91,45 @@ if [ "$ci_val" -eq 1 ] 2>/dev/null; then
         if [ -z "$has_tunnel" ]; then
             has_tunnel="$(printf '%s' "$slot_resp" | grep -oE '"has_tunnel"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
         fi
-        if [ "$slot_ready" = "false" ]; then
-            # Slot is not ready yet -- brief retry (warmup may be in progress).
-            sleep 3
-            slot_resp2="$(curl -sf --max-time 6 "$MERIDIAN_URL/projects/$PROJECT_ID/slot-readiness" 2>/dev/null || true)"
-            if [ -n "$slot_resp2" ]; then
-                slot_ready=""
-                if [ "$_jq_fastpath" -eq 1 ]; then
-                    slot_ready="$(printf '%s' "$slot_resp2" | jq -r '.ready | tostring' 2>/dev/null || true)"
-                    case "$slot_ready" in true|false) ;; *) slot_ready="" ;; esac
-                fi
-                if [ -z "$slot_ready" ]; then
-                    slot_ready="$(printf '%s' "$slot_resp2" | grep -oE '"ready"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
-                fi
+    fi
+    if [ "$slot_ready" = "false" ]; then
+        # Slot is not ready yet -- brief retry (warmup may be in progress).
+        sleep 3
+        slot_resp2="$(curl -sf --max-time 6 "$MERIDIAN_URL/projects/$PROJECT_ID/slot-readiness" 2>/dev/null || true)"
+        slot_ready=""
+        if [ -n "$slot_resp2" ]; then
+            if [ "$_jq_fastpath" -eq 1 ]; then
+                slot_ready="$(printf '%s' "$slot_resp2" | jq -r '.ready | tostring' 2>/dev/null || true)"
+                case "$slot_ready" in true|false) ;; *) slot_ready="" ;; esac
             fi
-            if [ "$slot_ready" != "true" ]; then
-                # Still not ready after retry -- fail open with a VISIBLE warning.
-                echo "Meridian code-intel guard (81b10dec): code-intel slot NOT ready after warmup probe. The Serena/code-intel daemon may still be starting. Failing open -- $tool is allowed this time. Retry in a moment or check 'meridian --tunnel' status." >&2
-                exit 0
+            if [ -z "$slot_ready" ]; then
+                slot_ready="$(printf '%s' "$slot_resp2" | grep -oE '"ready"[[:space:]]*:[[:space:]]*(true|false)' | grep -oE '(true|false)$' || true)"
             fi
-        elif [ "$has_tunnel" = "false" ]; then
-            # No tunnel active (self-hosted or tunnel not connected) -- fail open.
-            # The enabled flag alone isn't enough; a live slot is needed to block.
-            echo "Meridian code-intel guard (81b10dec): code-intel enabled but no tunnel slot is connected. Failing open -- $tool is allowed. Connect the meridian tunnel to enable slot-based enforcement." >&2
-            exit 0
         fi
     fi
-    # Slot is ready (or probe was skipped due to no-tunnel) -- block the tool call.
-    echo "Meridian code-intel guard (aeba8a80): this project has a code-intel index. Use code-intel tools INSTEAD of $tool:
+    if [ "$slot_ready" = "true" ] && [ "$has_tunnel" = "true" ]; then
+        # Positively confirmed ready AND tunneled -- block the tool call.
+        echo "Meridian code-intel guard (aeba8a80): this project has a code-intel index. Use code-intel tools INSTEAD of $tool:
   - find_symbol / extractor__find_symbol        -- exact symbol lookup (fastest, most accurate)
   - search_graph / codebase__search_graph       -- structural graph queries (callers, callees, paths)
   - search_code / search_code_semantic          -- fuzzy / conceptual queries across the codebase
   - find_referencing_symbols                    -- find all callers of a function
   - get_code_snippet / get_architecture         -- retrieve file sections or the whole-project architecture
 Raw grep/glob is a LAST RESORT for code search (443aa32a) -- the above tools are faster, use far fewer tokens, and don't miss symbol aliases. Fall back to $tool ONLY for non-symbol content (log output, data files, config values) or after code-intel tools confirm a file path." >&2
-    exit 2
+        exit 2
+    fi
+    # Fail open -- every unconfirmed case lands here with a VISIBLE reason.
+    if [ -z "$slot_resp" ]; then
+        echo "Meridian code-intel guard (81b10dec): the slot-readiness endpoint was unreachable. Failing open -- $tool is allowed. Check 'meridian --tunnel' status or MERIDIAN_URL." >&2
+    elif [ "$slot_ready" != "true" ]; then
+        # Still not ready after retry, or the response was unparseable -- fail
+        # open with a VISIBLE warning either way.
+        echo "Meridian code-intel guard (81b10dec): code-intel slot NOT ready after warmup probe. The Serena/code-intel daemon may still be starting. Failing open -- $tool is allowed this time. Retry in a moment or check 'meridian --tunnel' status." >&2
+    else
+        # No tunnel active (self-hosted or tunnel not connected) -- fail open.
+        # The enabled flag alone isn't enough; a live slot is needed to block.
+        echo "Meridian code-intel guard (81b10dec): code-intel enabled but no tunnel slot is connected. Failing open -- $tool is allowed. Connect the meridian tunnel to enable slot-based enforcement." >&2
+    fi
+    exit 0
 fi
 exit 0

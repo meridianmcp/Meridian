@@ -334,6 +334,41 @@ def get_document_review(
 
 
 @mcp.tool()
+def audit_document(
+    docx_path: str,
+    index_db_path: str | None = None,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """d092d2a4 -- read-only, authoritative figure/table/caption OWNERSHIP
+    audit: reconciles headings, paragraphs, captions, embedded media,
+    relationships, and tables into ONE structural-ownership graph (nodes +
+    edges, each id from the SAME stable id scheme locate_anchor /
+    get_paragraph / insert_caption already resolve), plus a findings list
+    covering orphan_image, repeated_embed, caption_only_figure,
+    non_adjacent_caption_attachment, table_cell_image_ambiguity,
+    duplicate_para_id, and (when index_db_path is given)
+    stale_or_empty_sidecar.
+
+    This is the read-only detector build_document_review's "structure" /
+    "ownership" categories were left reserved for -- kept as its own tool
+    since it does meaningfully more work (a second document_content_tree
+    walk plus a raw-XML image/table-cell scan) than build_document_review's
+    existing primitives. Composes existing read-only helpers only; never
+    uses vector/semantic search as authority for XML integrity, and never
+    mutates docx_path. Pass expected_source_fingerprint (a value previously
+    returned as source_fingerprint) to detect the document having changed
+    since a stashed audit -- a mismatch returns {"status": "stale", ...}
+    with empty findings. See :func:`meridian_docs.docs_intel.audit_document`
+    for the full contract.
+    """
+    return docs_intel.audit_document(
+        docx_path,
+        index_db_path=index_db_path,
+        expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
+@mcp.tool()
 def check_render_capability(docx_path: str) -> dict[str, Any]:
     """93cd9798 -- lightweight render-capability detection for visual QA.
 
@@ -632,6 +667,127 @@ def insert_figure_block(
         section_heading=section_heading,
         index_db_path=index_db_path,
         style_policy=style_policy,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
+def insert_media_part(
+    docx_path: str,
+    image_path: str,
+    anchor_para_id: str | None = None,
+    position: str = "after",
+    width_inches: float | None = None,
+    height_inches: float | None = None,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """d371b00b -- safe insertion of a brand-new image/media package member.
+
+    Lower-level, caption-less sibling of insert_figure_block (pair with
+    insert_caption / insert_figure_block for a captioned figure, same
+    two-step composition insert_image already documents). Adds beyond
+    insert_image: collision-free relationship id + media part name
+    generation that is explicitly RE-VERIFIED (not just trusted) before use;
+    matching [Content_Types].xml Default/Override entries (a Default is
+    reused when it already declares the right content type, added when the
+    extension is new to the package, or a part-specific Override is added
+    instead of mutating a pre-existing, disagreeing Default other parts may
+    rely on); the same drawing/frame-extent construction insert_figure_block
+    uses; and an explicit post-write relationship<->media BIJECTION check
+    (the new relationship id and new media part must be a clean 1:1 pairing)
+    before the write is ever reported as successful.
+
+    Routed through the same transactional backup/CAS-safe write envelope,
+    _docx_promotion_lock discipline, and tri-state real-render canary as
+    insert_figure_block. allow_degraded_render/degraded_render_reason: same
+    audited opt-in contract as insert_figure_block's own.
+
+    Anchor resolution, supported image formats, and dimension inference all
+    match insert_image.
+
+    Returns {status, image_para_id, image_name, relationship_id,
+    content_type_action, width_emu, height_emu, docx_path, render_status,
+    render_verified, ...}, or {error: message} without mutating the document
+    on validation failure, structural/bijection verification failure, or a
+    render-verification failure that could not be cleanly restored.
+
+    session_id: 273df573 — identifies the calling Meridian session to the
+      tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+      meridian/routes/tunnel.py). Not forwarded to docs_intel; has no effect
+      when this tool is invoked outside Meridian's tunnel (e.g. standalone
+      `uvx meridian-docs`).
+    """
+    return docs_intel.insert_docx_media_part(
+        docx_path=docx_path,
+        image_path=image_path,
+        anchor_para_id=anchor_para_id,
+        position=position,
+        width_inches=width_inches,
+        height_inches=height_inches,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
+def remove_package_part(
+    docx_path: str,
+    part_name: str,
+    dry_run: bool = True,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """d371b00b -- reference-counted, dry-run-capable removal of an
+    unreferenced word/media/* package part and its relationship(s).
+
+    part_name (e.g. "word/media/image3.png") must name a word/media/* ZIP
+    member — removal of any other package part is refused outright; this
+    tool's scope is deliberately narrow, not arbitrary-part removal.
+
+    Every relationship in word/_rels/document.xml.rels that targets
+    part_name is found, then word/document.xml is scanned for any attribute
+    referencing one of those relationship ids — a real reference count, not
+    a heuristic restricted to just inline images. A part with a NONZERO
+    reference count is REFUSED (a real error, status="refused_still_
+    referenced", never a silent skip) whether dry_run is True or False.
+
+    dry_run=True (the default — fail-safe): for a genuinely zero-reference
+    part, reports exactly what WOULD be removed (relationship ids, and which
+    [Content_Types].xml Default/Override entries would be cleaned up)
+    WITHOUT touching the zip.
+
+    dry_run=False: performs the removal for real through the same
+    transactional backup/CAS-safe write envelope, _docx_promotion_lock
+    discipline, and tri-state real-render canary insert_figure_block uses.
+    allow_degraded_render/degraded_render_reason: same audited opt-in
+    contract as insert_figure_block's own.
+
+    Returns, on success: {status: "dry_run"|"removed", part_name,
+    relationship_ids / relationship_ids_removed,
+    content_type_overrides_removed, content_type_defaults_removed,
+    reference_count: 0, docx_path, ...render fields on a real removal...}.
+    On refusal: {error, status: "refused_still_referenced", reference_count,
+    part_name, referencing_relationship_ids}. On any other failure: {error}
+    without mutating the document.
+
+    session_id: 273df573 — identifies the calling Meridian session to the
+      tunnel-layer DOCX region-claim guard (check_docs_write_conflict in
+      meridian/routes/tunnel.py). Not forwarded to docs_intel; has no effect
+      when this tool is invoked outside Meridian's tunnel (e.g. standalone
+      `uvx meridian-docs`).
+    """
+    return docs_intel.remove_docx_package_part(
+        docx_path=docx_path,
+        part_name=part_name,
+        dry_run=dry_run,
+        index_db_path=index_db_path,
         allow_degraded_render=allow_degraded_render,
         degraded_render_reason=degraded_render_reason,
     )
@@ -1208,19 +1364,29 @@ def edit_equation(
     docx_path: str,
     equation_para_id: str,
     new_payload: str,
+    equation_index: int | None = None,
     index_db_path: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Replace the <m:oMath> in an existing equation paragraph.
 
     Locates the paragraph by equation_para_id, verifies it contains at least
-    one <m:oMath>, removes the existing equation content, and inserts the new
-    equation resolved from OMML or LaTeX.
+    one <m:oMath>, and replaces exactly ONE targeted equation with a precise
+    single-element swap, preserving every other child of the paragraph (other
+    equations, text runs, fields, bookmarks, drawings) in its exact original
+    order.
+
+    b6a9ec99 — when a paragraph contains multiple equations, equation_index
+    is required so the operation never guesses (and never silently drops
+    the equations it doesn't touch).
 
     Args:
       docx_path:         Absolute path to the .docx file (mutated in place).
       equation_para_id:  w14:paraId or p{N} of the equation paragraph.
       new_payload:       Replacement OMML XML or LaTeX expression.
+      equation_index:    0-based index (document order) of which equation to
+                         replace when the paragraph holds more than one.
+                         Required in that case.
       index_db_path:     If supplied, sidecar is invalidated after write.
       session_id:        273df573 — identifies the calling Meridian session
                          to the tunnel-layer DOCX region-claim guard
@@ -1230,13 +1396,14 @@ def edit_equation(
                          tunnel (e.g. standalone `uvx meridian-docs`).
 
     Returns:
-      {status, equation_para_id, omml, docx_path}
+      {status, equation_para_id, equation_index, omml, docx_path}
       or {error: <message>} on failure.
     """
     return docs_intel.edit_equation_local(
         docx_path=docx_path,
         equation_para_id=equation_para_id,
         new_payload=new_payload,
+        equation_index=equation_index,
         index_db_path=index_db_path,
     )
 

@@ -928,6 +928,63 @@ def test_score_confidence_lexical_boost_cannot_rescue_low_semantic_score():
     assert m.reason == "below_confidence_threshold"
 
 
+def test_score_confidence_exact_tie_is_reproducible_and_ambiguous():
+    """f30bbd89 — reproducible tie-breaking baseline: two candidates with the
+    EXACT same fused_score (margin == 0.0, not merely "close") must both
+    abstain, and repeated calls on the identical input must produce
+    byte-identical verdicts (same order, same reason) every time — this is
+    the concrete "reproducible" half of the tie-breaking contract a future
+    semantic tool-router would also need."""
+    ranked = [("a", 0.60), ("b", 0.60)]
+    first = score_confidence(ranked, floor=0.37, min_margin=0.05)
+    second = score_confidence(ranked, floor=0.37, min_margin=0.05)
+    assert first == second  # dataclasses are comparable by value — must match exactly
+    for m in first:
+        assert m.margin == 0.0
+        assert m.confident is False
+        assert m.reason == "ambiguous_runner_up"
+    # Stable-sort contract: equal fused_score keeps the ORIGINAL input order
+    # rather than being reordered arbitrarily (Python's sort is stable and
+    # score_confidence must not defeat that by re-keying on id/hash).
+    assert [m.id for m in first] == ["a", "b"]
+
+
+def test_score_confidence_three_way_near_tie_all_abstain():
+    """f30bbd89 — a chain of three near-tied candidates (each adjacent gap
+    below min_margin) must ALL abstain, not just the two closest ones —
+    the margin check compares each candidate to its NEAREST neighbor in
+    either direction, so the middle candidate's two small gaps (to its
+    left AND right neighbor) both fail the margin independently of the
+    top/bottom candidates' single gap."""
+    ranked = [("top", 0.62), ("mid", 0.60), ("bottom", 0.58)]
+    matches = score_confidence(ranked, floor=0.37, min_margin=0.05)
+    by_id = {m.id: m for m in matches}
+    assert by_id["top"].confident is False
+    assert by_id["mid"].confident is False
+    assert by_id["bottom"].confident is False
+    for m in matches:
+        assert m.reason == "ambiguous_runner_up"
+    # The middle candidate's margin is the min of its two (equal) gaps, not
+    # their sum — confirms both-direction nearest-neighbor semantics.
+    assert by_id["mid"].margin == pytest.approx(0.02, abs=1e-9)
+
+
+def test_score_confidence_never_fabricates_ids_outside_input():
+    """9149e132 — the structural safety property meridian.db.planning_search's
+    optional ``rerank_semantic`` relies on: score_confidence() (and, by
+    construction, SemanticSearcher.rank()/rank_confident()) can only ever
+    return ids that were present in its `ranked` input — never an id it
+    invented. This is what makes it safe to layer over an already
+    lexically-retrieved result set: reordering that set can never silently
+    smuggle in a candidate lexical search did not already find, because the
+    ranker has no way to produce an id it wasn't given."""
+    ranked = [("real-a", 0.9), ("real-b", 0.5)]
+    matches = score_confidence(ranked, floor=0.0, min_margin=0.0)
+    ids = {m.id for m in matches}
+    assert ids == {"real-a", "real-b"}
+    assert "fabricated-id" not in ids
+
+
 def test_rank_confident_wraps_rank_and_scores(monkeypatch):
     """SemanticSearcher.rank_confident() = rank() + score_confidence(): only
     candidates that survive rank()'s own floor filter reach scoring at all."""
@@ -957,6 +1014,94 @@ def test_rank_confident_empty_when_rank_unavailable(monkeypatch):
     s = SemanticSearcher()
     monkeypatch.setattr(s, "embed", lambda texts: None)
     assert s.rank_confident("q", [("a", "text")]) == []
+
+
+# ---------------------------------------------------------------------------
+# retrieval_hit_from_semantic_match — bridge into the shared BM25-first plus
+# Model2Vec retrieval contract (5044d8eb, meridian.retrieval_contract).
+# ---------------------------------------------------------------------------
+
+
+def test_retrieval_hit_from_semantic_match_matches_schema_fields():
+    from meridian.retrieval_contract import RETRIEVAL_HIT_FIELDS
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="task-1", lexical_score=0.5, semantic_score=0.9, fused_score=0.66,
+        threshold=0.37, margin=0.1, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(match, source="tasks")
+    assert set(hit.keys()) == set(RETRIEVAL_HIT_FIELDS)
+
+
+def test_retrieval_hit_from_semantic_match_passes_scores_through_verbatim():
+    """The match's own fused_score (already computed by score_confidence with
+    the SAME weights as retrieval_contract.fuse_scores) must be carried
+    through unchanged, never silently recomputed."""
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="note-1", lexical_score=0.2, semantic_score=0.8, fused_score=0.44,
+        threshold=0.37, margin=0.05, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(match, source="notes")
+    assert hit["id"] == "note-1"
+    assert hit["lexical_score"] == pytest.approx(0.2)
+    assert hit["semantic_score"] == pytest.approx(0.8)
+    assert hit["fused_score"] == pytest.approx(0.44)
+    assert hit["source"] == "notes"
+
+
+def test_retrieval_hit_from_semantic_match_defaults_to_degraded_freshness():
+    """A SemanticMatch always came from a real embed/rank pass over a
+    bounded, capped corpus window — it must never be labeled "current"
+    (exhaustive) by default."""
+    from meridian.retrieval_contract import FRESHNESS_DEGRADED
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="x", lexical_score=None, semantic_score=0.5, fused_score=0.5,
+        threshold=0.37, margin=0.5, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(match, source="sprint_items")
+    assert hit["freshness"] == FRESHNESS_DEGRADED
+
+
+def test_retrieval_hit_from_semantic_match_freshness_override_respected():
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="x", lexical_score=None, semantic_score=0.5, fused_score=0.5,
+        threshold=0.37, margin=0.5, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(match, source="sprint_items", freshness="current")
+    assert hit["freshness"] == "current"
+
+
+def test_retrieval_hit_from_semantic_match_carries_structure_and_content_hash():
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="dec-1", lexical_score=0.4, semantic_score=0.6, fused_score=0.48,
+        threshold=0.37, margin=0.2, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(
+        match, source="decisions", structure={"category": "TECHNICAL"}, content_hash="deadbeef",
+    )
+    assert hit["structure"] == {"category": "TECHNICAL"}
+    assert hit["content_hash"] == "deadbeef"
+
+
+def test_retrieval_hit_from_semantic_match_no_provenance_by_default():
+    from meridian.retrieval_contract import PROVENANCE_NOT_TRACKED
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="x", lexical_score=None, semantic_score=0.5, fused_score=0.5,
+        threshold=0.37, margin=0.5, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(match, source="tasks")
+    assert hit["provenance_status"] == PROVENANCE_NOT_TRACKED
 
 
 # ---------------------------------------------------------------------------

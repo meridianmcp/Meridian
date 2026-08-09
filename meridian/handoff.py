@@ -39,7 +39,9 @@ from . import continuation_gate as continuation_gate_module
 from . import db as db_module
 from . import docx_integrity_gate as docx_integrity_gate_module
 from . import executor_contract as executor_contract_module
+from . import hook_paths as hook_paths_module
 from . import pointers as pointers_module
+from . import test_run_receipt as test_run_receipt_module
 from . import tool_discovery as tool_discovery_module
 from . import tool_requirements as tool_requirements_module
 from .db.sprint_items import (
@@ -1606,6 +1608,59 @@ _DEFAULT_HANDOFF_MAX_BYTES = 300_000
 _DEFAULT_STARTER_MAX_BYTES = 16_000
 _DEFAULT_GOAL_MAX_BYTES = 12_000
 
+# 60eed526 — mode-aware backstop for checkpoint()'s own mid-run progress
+# ping. ``checkpoint()`` (meridian/mcp/handlers/session_tools.py::
+# handle_checkpoint) calls generate_handoff(mode="delta", checkpoint=True)
+# on EVERY call — often many times per session — so its RETURNED content
+# needs the same "small by default" treatment starter/goal already get via
+# the two constants above, even though delta's own item-listing sections
+# (bc834237/7732e096) are independently capped at 20 items each with
+# truncated titles. Confirmed root cause, distinct from the 248c0bb9
+# starter/goal fix: the SHARED quick_start_goal build at the full/delta call
+# site never passed full_contract_max_items (still doesn't, for a plain
+# checkpoint=False call — see the comment at that call site), so a session
+# working a large pending backlog produced an observed ~139KB checkpoint()
+# response — the <tool_requirements>/<sprint_item_pointers>/
+# <artifact_pointer_findings> clauses embedded inside quick_start_goal
+# serialize the FULL pending inventory exactly like the 248c0bb9 goal-mode
+# regression did, just reached through checkpoint()'s own delta call instead
+# of a direct mode='goal' call.
+#
+# Deliberately a byte-budget backstop only (mirrors the pre-248c0bb9
+# relationship between _DEFAULT_HANDOFF_MAX_BYTES and full/delta): a
+# checkpoint=True call keeps full_contract_max_items=None (unbounded
+# construction, same as any other full/delta call — see the full/delta
+# quick_start_goal call site below), so what gets PERSISTED (disk file,
+# handoffs table, pending_goal) is always the complete, untruncated render —
+# only the value RETURNED over MCP is bounded, via format_handoff_mcp_content
+# (the exact same integrity-first, non-silent, goal-token-preserving
+# mechanism starter/goal already use). A plain generate_handoff(mode='delta')
+# call (checkpoint=False, the default — every pre-existing caller) is
+# completely unaffected: "full/delta mode may include full detail as today"
+# still holds byte-for-byte. Only a call that explicitly opts into
+# checkpoint=True (today: handle_checkpoint's own internal call, and any
+# direct MCP caller of the generate_handoff tool that passes checkpoint=true)
+# gets this bound.
+_DEFAULT_CHECKPOINT_MAX_BYTES = 40_000
+
+# 60eed526 — same size-class backstop as _DEFAULT_CHECKPOINT_MAX_BYTES above,
+# for meridian/server.py::_build_continue_payload's own "just continue"
+# resume goal_string. That path builds its /goal via _build_quick_start_goal
+# directly (not through generate_handoff), so it has no mode dial to key off
+# of and previously had NO byte-level backstop at all — only
+# full_contract_max_items's ITEM-COUNT cap (bounds how many pending items'
+# tool_requirements get inlined, not how large each inlined entry is).
+# Confirmed regression: a board with a handful of items carrying large
+# per-item tool_requirements payloads still produced a ~59KB goal_string
+# even after the item-count cap, because a single item's own
+# tool_requirements JSON can already be large. format_handoff_mcp_content is
+# applied on top (same integrity-first, non-silent, goal-token-preserving
+# mechanism every other mode uses) as the actual byte-level guarantee; the
+# item-count cap stays in place too since it keeps the UNCUT prefix
+# (directives, stop conditions, item list) smaller to begin with, so less of
+# it needs trimming by the byte budget below.
+_DEFAULT_CONTINUE_GOAL_MAX_BYTES = 40_000
+
 # Sentinel distinguishing "caller did not pass max_content_bytes" (use the
 # mode-aware default above) from an explicit `None` (which has always meant
 # "opt out of budgeting entirely" — see format_handoff_mcp_content's
@@ -1697,6 +1752,14 @@ def format_handoff_mcp_content(
     ``<goal_token>`` value itself remains valid for plain provenance
     verification (``verify_handoff_token(project_id, token)`` with no
     ``body``) regardless.
+
+    ``max_bytes`` is a budget on the RETURNED string, marker included
+    (60eed526) — the appended truncation marker itself is not free bytes
+    outside the budget it is reporting against. The cut point below reserves
+    room for the marker before slicing, then runs one exact correction pass,
+    so ``len(result.encode("utf-8")) <= max_bytes`` whenever the protected
+    banner floor allows it (confirmed regression: a naive cut-then-append
+    let a ~460-byte marker push a 40000-byte budget to 40464 bytes).
     """
     if not isinstance(content, str):
         return content
@@ -1709,23 +1772,44 @@ def format_handoff_mcp_content(
     _banner_match = _GOAL_TOKEN_BANNER_RE.search(content)
     if _banner_match:
         _protected_end = len(content[: _banner_match.end()].encode("utf-8"))
-    _cut = max(max_bytes, _protected_end)
+    _total_bytes = len(_raw)
+
+    def _marker_bytes_for(omitted: int) -> bytes:
+        return (
+            "\n\n<!-- TRUNCATED (cb00889c bounded handoff profile): "
+            f"{omitted} of {_total_bytes} total bytes omitted to satisfy the "
+            f"handoff response-size budget (limit={max_bytes} bytes). Everything "
+            "up to and including any <goal_token>/SECURITY banner above is "
+            "complete and byte-identical to the original render. "
+            "Narrative/context beyond this point was trimmed to fit the budget "
+            "-- request mode='goal' for the minimal bounded executable profile, "
+            "or a narrower version scope, to see it in full. -->"
+        ).encode("utf-8")
+
+    # 60eed526 — iterate to a fixed point: the marker's own length depends
+    # on the omitted-byte count it names, which depends on the cut point.
+    # Converges in 1-2 tries in practice (the marker only grows/shrinks when
+    # `_omitted`'s digit count crosses a power-of-ten boundary); the exact
+    # correction pass right after this loop makes the final result precise
+    # regardless of how many tries it takes.
+    _cut = max_bytes
+    for _ in range(5):
+        _marker_len = len(_marker_bytes_for(_total_bytes - _cut))
+        _next_cut = max(_protected_end, min(_cut, max_bytes - _marker_len))
+        if _next_cut == _cut:
+            break
+        _cut = _next_cut
     _kept_raw = _raw[:_cut]
+    _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw))
+    _overshoot = (len(_kept_raw) + len(_marker_bytes)) - max_bytes
+    if _overshoot > 0 and _cut > _protected_end:
+        _cut = max(_protected_end, _cut - _overshoot)
+        _kept_raw = _raw[:_cut]
+        _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw))
     # errors="ignore" — never split a multi-byte UTF-8 sequence into an
     # invalid trailing fragment; at most drops the final incomplete char.
     _kept_text = _kept_raw.decode("utf-8", errors="ignore")
-    _omitted = len(_raw) - len(_kept_raw)
-    _marker = (
-        "\n\n<!-- TRUNCATED (cb00889c bounded handoff profile): "
-        f"{_omitted} of {len(_raw)} total bytes omitted to satisfy the "
-        f"handoff response-size budget (limit={max_bytes} bytes). Everything "
-        "up to and including any <goal_token>/SECURITY banner above is "
-        "complete and byte-identical to the original render. "
-        "Narrative/context beyond this point was trimmed to fit the budget "
-        "-- request mode='goal' for the minimal bounded executable profile, "
-        "or a narrower version scope, to see it in full. -->"
-    )
-    return _kept_text + _marker
+    return _kept_text + _marker_bytes.decode("utf-8")
 
 
 # 08c355c2 — staleness threshold for the legacy goal_states.sprint free-text
@@ -2694,6 +2778,58 @@ def _build_scheduler_lease_clause(parallel_groups: "dict[str, Any] | None") -> s
     return out
 
 
+def _build_self_start_bootstrap_clause(
+    project_id: "str | None",
+    project_name: "str | None" = None,
+    identity: "str | None" = None,
+) -> str:
+    """c1ec3517 — render the exact ``start_session(...)`` call a receiving
+    session must make FIRST when a /goal block is its only context (handed to
+    a fresh sub-agent with zero framing, or copy-pasted directly into a cold
+    chat with no prior Meridian tool calls).
+
+    Returns ``""`` when ``project_id`` is falsy — every existing call site
+    that has not been updated to pass it gets byte-for-byte unchanged output
+    from :func:`_build_quick_start_goal` (see that function's own
+    project_id/project_name/identity docstring for exactly which two call
+    sites opt in and why).
+
+    Deliberately phrased as a CONDITIONAL first action ("if you do not
+    already have an active session_id") rather than an unconditional one:
+    this same rendered text is also reachable via ``start_session``'s own
+    ``pending_goal`` field / ``load_handoff()`` — contexts where a session
+    already exists — and an unconditional re-invocation would register a
+    second, redundant session under a new session_name instead of resuming
+    the caller's real one.
+
+    ``project_name``/``identity`` are user-authored strings (project display
+    name / caller identity) and are therefore run through ``_xml_escape``
+    before interpolation, unlike ``project_id`` (a server-generated uuid4 —
+    see ``db._new_id`` — that never contains XML-special characters).
+    """
+    if not project_id:
+        return ""
+    _pid = _xml_escape(str(project_id))
+    _name_clause = (
+        f', project_name="{_xml_escape(str(project_name))}"' if project_name else ""
+    )
+    _human_clause = (
+        f', human_id="{_xml_escape(str(identity))}"' if identity else ""
+    )
+    _call = (
+        f'start_session(project_id="{_pid}"{_name_clause}{_human_clause}, '
+        'session_name="describe-what-youre-doing", role="executor")'
+    )
+    return (
+        "If you do not already have an active Meridian session_id in this "
+        f"conversation, your REQUIRED FIRST CALL is {_call} -- this registers "
+        "you as an executor and is what makes this /goal block self-starting "
+        "from a cold context with zero other framing. If a session_id already "
+        "exists (e.g. this block arrived via start_session's own pending_goal "
+        "field, or load_handoff()), skip straight to the next call. "
+    )
+
+
 def _build_quick_start_goal(
     pending_sprint_items: list[dict[str, Any]],
     *,
@@ -2718,7 +2854,11 @@ def _build_quick_start_goal(
     execution_policy: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
     selected_scope: "dict[str, Any] | None" = None,
+    selected_scope_outcome: "dict[str, Any] | None" = None,
     full_contract_max_items: "int | None" = None,
+    project_id: "str | None" = None,
+    project_name: "str | None" = None,
+    identity: "str | None" = None,
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -2753,6 +2893,22 @@ def _build_quick_start_goal(
     mode narrows its own item list BEFORE calling this function), so this
     parameter only controls the DECLARATION rendered alongside whatever items
     were already passed in.
+
+    ``selected_scope_outcome`` (fb82e51f) — optional output dict, same
+    purely-additive out-param shape as ``evidence_status``: when given (any
+    dict, typically ``{}``) AND ``selected_scope`` is also given, populated in
+    place with ``{"requested_ids", "executable_ids", "excluded_requested",
+    "all_excluded"}`` — computed AFTER every exclusion filter below
+    (manual/backburner/unprospected/wave-gate) has run, so it reflects
+    exactly which of the caller's originally-requested ids (not merely the
+    dependency-closure) survived into the rendered ``<sprint_items>`` batch.
+    ``excluded_requested`` carries a machine-readable reason per dropped id
+    (``unprospected``/``backburner``/``manual``/``wave_gate_pending``), and
+    ``all_excluded`` is True when NONE of the requested ids made it through —
+    the signal :class:`HandoffScopeNonExecutable` acts on (see its docstring
+    for the incident this closes). A caller that omits this argument, or
+    never passes ``selected_scope`` in the first place, sees zero functional
+    change to this function's return value.
 
     ``force_included_ids`` (0a65f5cc) — ids exempted from the
     backburner/deferred exclusion below (see ``_is_backburner_sprint_item``)
@@ -2869,6 +3025,27 @@ def _build_quick_start_goal(
     ``_render_test_floor_clause``. This is the fix for the reported bug: a
     receiving repo used to be told its floor was Meridian's own historical
     "2150+" pass count regardless of how many tests it actually had.
+
+    ``project_id``/``project_name``/``identity`` (c1ec3517) — OPT-IN, ``None``
+    by default for every pre-existing call site, which keeps this function's
+    output byte-for-byte unchanged unless a caller has been updated to pass
+    them. When ``project_id`` IS given, ``<first_step>`` (in both the normal
+    and empty-board branches) is prefixed with an explicit, copy-pasteable
+    ``start_session(project_id=..., ...)`` bootstrap call — see
+    :func:`_build_self_start_bootstrap_clause`. This closes the confirmed
+    CRITICAL gap (c1ec3517): ``mode="goal"`` is documented as "for a caller
+    that wants nothing but the executor-facing directive itself, e.g. to hand
+    straight to a fresh sub-agent with zero framing" — but a fresh sub-agent
+    with zero framing has no session_id and no project identity unless the
+    /goal block itself carries a bootstrap call. Every other handoff mode
+    (full/delta's Jinja "## Start a New Session" section, starter's
+    ``_render_starter_handoff`` header line) already carries its own separate
+    start_session mention outside this function, which is why only the
+    goal-only call site (:func:`_generate_goal_only_handoff`) and the
+    ``executor-goal`` MCP prompt (:func:`_build_executor_goal_messages` in
+    ``meridian/mcp/handler.py``) pass these params today — the two surfaces
+    where the /goal body can plausibly be copied/forwarded on its own,
+    stripped of any surrounding wrapper prose.
     """
     _completion_override = (
         completion_criteria_override.strip()
@@ -2920,6 +3097,13 @@ def _build_quick_start_goal(
     # capability_contract._resolve_pending_items_for_contract and
     # _build_tool_requirements_clause below.
     _all_pending_for_tool_requirements = list(pending_sprint_items)
+    # fb82e51f — track WHY each id ends up excluded from the claimable batch
+    # below, keyed by item id, first-writer-wins (an item is only ever
+    # dropped by the first exclusion filter it hits). Only consulted when
+    # selected_scope_outcome is populated at the very end of this function —
+    # see that out-param's docstring above; zero cost/behavior change for
+    # every caller that doesn't opt in.
+    _scope_exclusion_reason_by_id: dict[str, str] = {}
     # 3a02041a — split MANUAL/human items out of the executable list so they are
     # never named under the "claim and execute" directive; they're surfaced
     # separately as the maintainer's own todo (no completion-pressure language).
@@ -2927,6 +3111,9 @@ def _build_quick_start_goal(
     pending_sprint_items = [
         it for it in pending_sprint_items if not _is_manual_sprint_item(it)
     ]
+    for _it in _manual_items:
+        if _it.get("id"):
+            _scope_exclusion_reason_by_id.setdefault(_it["id"], "manual")
     _manual_note = _build_manual_todo_note(_manual_items)
     # 0a65f5cc — same treatment for track=='backburner'/deferred_until items:
     # keep them out of the claimable batch instead of silently letting them
@@ -2941,6 +3128,9 @@ def _build_quick_start_goal(
         it for it in pending_sprint_items
         if it.get("id") in _force_included or not _is_backburner_sprint_item(it)
     ]
+    for _it in _backburner_items:
+        if _it.get("id"):
+            _scope_exclusion_reason_by_id.setdefault(_it["id"], "backburner")
     _backburner_note = _build_backburner_todo_note(_backburner_items)
     # 94c26322/d5849a67 — STRUCTURAL PROSPECTING GATE: an item that DECLARED
     # real code-touching resources (touches_resources) but has no durable
@@ -2989,6 +3179,9 @@ def _build_quick_start_goal(
         else:
             _excluded_unprospected.append(_it)
     pending_sprint_items = _included_sprint_items
+    for _it in _excluded_unprospected:
+        if _it.get("id"):
+            _scope_exclusion_reason_by_id.setdefault(_it["id"], "unprospected")
     # Build the structured exclusion note — empty string when nothing excluded.
     _excluded_unprospected_note = ""
     if _excluded_unprospected:
@@ -3038,6 +3231,9 @@ def _build_quick_start_goal(
             else:
                 _kept.append(_it)
         pending_sprint_items = _kept
+        for _it in _excluded_wave_gated:
+            if _it.get("id"):
+                _scope_exclusion_reason_by_id.setdefault(_it["id"], "wave_gate_pending")
     _excluded_wave_gate_note = ""
     if _excluded_wave_gated:
         _exc_ids = ", ".join(it["id"] for it in _excluded_wave_gated if it.get("id"))
@@ -3059,12 +3255,45 @@ def _build_quick_start_goal(
             "just this prose note. -->"
         )
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
+    # fb82e51f — record the selected-scope outcome now that every exclusion
+    # filter above (manual/backburner/unprospected/wave-gate) has run and
+    # `item_ids` reflects the FINAL claimable batch. See
+    # `selected_scope_outcome`'s own docstring above for the shape and the
+    # incident this closes; a no-op unless the caller opted into both
+    # `selected_scope` and `selected_scope_outcome`.
+    if selected_scope is not None:
+        _requested_scope_ids = list(selected_scope.get("selected_item_ids") or [])
+        _final_ids_set = set(item_ids)
+        _executable_requested_ids = [
+            rid for rid in _requested_scope_ids if rid in _final_ids_set
+        ]
+        _excluded_requested_ids = [
+            {
+                "id": rid,
+                "reason": _scope_exclusion_reason_by_id.get(rid, "not_in_pending_batch"),
+            }
+            for rid in _requested_scope_ids
+            if rid not in _final_ids_set
+        ]
+        if selected_scope_outcome is not None:
+            selected_scope_outcome.clear()
+            selected_scope_outcome.update({
+                "requested_ids": _requested_scope_ids,
+                "executable_ids": _executable_requested_ids,
+                "excluded_requested": _excluded_requested_ids,
+                "all_excluded": bool(_requested_scope_ids)
+                and not _executable_requested_ids,
+            })
     # 682005f4 — computed against the FINAL filtered pending_sprint_items (after
     # manual/backburner/unprospected/wave-gate exclusion above), so a pointer
     # line never appears for an item that was itself excluded from the batch.
     _pointer_lines_block = (
         _build_goal_pointer_lines(pending_sprint_items) if include_pointer_lines else ""
     )
+    # c1ec3517 — computed once, reused by both the empty-board and normal
+    # return branches below; "" (no-op) unless a caller opted in via
+    # project_id — see _build_self_start_bootstrap_clause's own docstring.
+    _self_start = _build_self_start_bootstrap_clause(project_id, project_name, identity)
     if not item_ids:
         _empty_completion = _completion_override or (
             "Done when remaining work is verified against its stated scope "
@@ -3074,11 +3303,21 @@ def _build_quick_start_goal(
         # test floor, generate_handoff, turn/HITL stop) re-expressed as XML tags.
         # This branch has no items and therefore no anti-stop completion clause,
         # exactly as the prior prose form did.
+        # c1ec3517 — <first_step> only appears here when a bootstrap was
+        # actually rendered (project_id was given): an empty board otherwise
+        # had NO <first_step> tag at all before this fix, and every existing
+        # non-project_id caller must keep rendering byte-for-byte the same.
+        _empty_first_step = (
+            f"<first_step>{_self_start}Then verify remaining work is complete."
+            "</first_step>\n"
+            if _self_start else ""
+        )
         return (
             f"{_loop_prefix}/goal\n"
             "<executor_directive>Verify remaining work is complete.</executor_directive>"
             f"{_policy_clause}"
             f"{_build_selected_scope_clause(selected_scope)}\n"
+            f"{_empty_first_step}"
             # 0d5453bc — explicit single-run wording: full suite runs once,
             # at the end of the megasprint, not per item.
             f"<completion_criteria>{_xml_escape(_empty_completion)}"
@@ -3296,7 +3535,15 @@ def _build_quick_start_goal(
         # 4cfaecc2 — the baked-in id list is a point-in-time snapshot; a live
         # board query keeps a resumed session honest about mid-run injections
         # and already-claimed items instead of trusting a stale list.
-        '<first_step>First call get_sprint_items(status="pending") to load the '
+        # c1ec3517 — when _self_start is "" (every pre-existing caller that
+        # has not opted into project_id), this renders BYTE-FOR-BYTE the same
+        # "First call get_sprint_items(...)" text as before this fix; when a
+        # caller opted in, the bootstrap call is prepended and the wording
+        # shifts to "Then call" so it still reads correctly as a sequence.
+        "<first_step>"
+        + _self_start
+        + ("First call " if not _self_start else "Then call ")
+        + 'get_sprint_items(status="pending") to load the '
         "live board (the ids below are a snapshot and may have shifted)."
         "</first_step>\n"
         f"{_build_executor_item_ids_clause(pending_sprint_items)}\n"
@@ -4830,16 +5077,45 @@ async def _annotate_code_pointers(
     if not registry:
         return pending_items
     _priority = priority_ids or frozenset()
-    # 3cab355a — the cap is computed over NON-priority items only: split first,
-    # then take the tail of that ordinary-item subsequence as the capped-out
-    # set. A priority item is never in this set no matter where it sits in
-    # ``pending_items``. When ``priority_ids`` is empty (every pre-existing
-    # call site), ``_ordinary`` is exactly ``pending_items`` and this reduces
-    # to the original ``pending_items[_MAX_ENRICHED_ITEMS:]`` slice — zero
-    # behavior change for callers that don't pass it.
-    _ordinary = [it for it in pending_items if it.get("id") not in _priority]
+
+    def _needs_prospect_capacity(it: dict[str, Any]) -> bool:
+        """23a7c721 — an item only consumes enrichment-cap capacity when this
+        pass would actually issue a fresh prospector search for it. A manual
+        item is never searched (always ``skipped_manual``) and, absent
+        ``reprospect=True``, an item that already carries a pointer from a
+        prior run is left alone (``cached``) rather than re-searched — see
+        the two branches below. The confirmed bug (23a7c721): the OLD cap was
+        purely POSITIONAL over every non-priority item, so on a live board
+        where most earlier items are long since manual/cached (and therefore
+        free — no search call either way), a handful of newly created items
+        with durable ``touches_resources`` landed past the cap and came back
+        ``skipped_cap`` purely because >= ``_MAX_ENRICHED_ITEMS`` earlier
+        items preceded them in list order, not because prospecting capacity
+        was genuinely exhausted. Scoping the cap to items that actually need
+        a fresh search this pass gives new/uncached items their fair share of
+        capacity instead of losing slots to no-op manual/cached items.
+        """
+        if _is_manual_sprint_item(it):
+            return False
+        if not reprospect and (it.get("code_pointers") or it.get("pointers")):
+            return False
+        return True
+
+    # 3cab355a / 23a7c721 — the cap is computed over NON-priority items that
+    # actually need prospecting capacity this pass: split first, then take
+    # the tail of that subsequence as the capped-out set. A priority item is
+    # never in this set no matter where it sits in ``pending_items``. On a
+    # fresh board where every item still needs prospecting (no manual items,
+    # no cached pointers yet — the original ``pending_items[_MAX_ENRICHED_ITEMS:]``
+    # scenario), this is identical to the pre-23a7c721 purely-positional cap.
+    _ordinary_needing_capacity = [
+        it for it in pending_items
+        if it.get("id") not in _priority and _needs_prospect_capacity(it)
+    ]
     _capped_ids = {
-        it.get("id") for it in _ordinary[_MAX_ENRICHED_ITEMS:] if it.get("id")
+        it.get("id")
+        for it in _ordinary_needing_capacity[_MAX_ENRICHED_ITEMS:]
+        if it.get("id")
     }
     # 182468a6 — surface the cap instead of silently dropping items past it: any
     # non-manual item beyond the enrichment cap is marked skipped_cap so the caller
@@ -6356,6 +6632,13 @@ async def _write_sprint_guard_hooks(
     a real checkout with a ``.claude`` dir), the write is skipped entirely — a
     project with no repo of its own has no business getting a foreign repo's
     hook files.
+
+    e5eec33b — the stored ``repo_path`` is validated through
+    ``hook_paths.resolve_repo_root_for_handoff`` rather than a bare
+    ``Path(repo_path)`` check, so a path recorded from a WSL/Linux session
+    (``/mnt/c/Users/...``) still resolves correctly when this handoff runs
+    on native Windows, instead of silently and permanently skipping the
+    write for that project.
     """
     if root is None and "PYTEST_CURRENT_TEST" in os.environ:
         return
@@ -6365,9 +6648,10 @@ async def _write_sprint_guard_hooks(
         else:
             executor_config = await db_module.get_executor_config(db, project_id)
             repo_path = (executor_config.get("repo_path") or "").strip()
-            if not repo_path or not (Path(repo_path) / ".claude").exists():
+            resolved_repo_root = hook_paths_module.resolve_repo_root_for_handoff(repo_path)
+            if resolved_repo_root is None:
                 return  # no configured repo for this project — nothing to do
-            repo_root = Path(repo_path)
+            repo_root = resolved_repo_root
         hooks_dir = repo_root / ".claude" / "hooks"
         url = os.environ.get("MERIDIAN_URL") or "http://localhost:7878"
         hooks_dir.mkdir(parents=True, exist_ok=True)
@@ -7345,6 +7629,32 @@ class HandoffContinuationRequired(ValueError):
         )
 
 
+class HandoffTestEvidenceRequired(ValueError):
+    """Raised by generate_handoff when ``strict_test_evidence=True`` and the
+    current local test-run receipt (:mod:`meridian.test_run_receipt`) does
+    not classify as ``passed`` — e24f2daa.
+
+    Mirrors :class:`HandoffContinuationRequired`'s opt-in, fail-closed
+    contract exactly: never engages for a caller that didn't pass
+    ``strict_test_evidence=True``, and when it does engage, NOTHING is
+    rendered, written to disk, or persisted for this call. A missing record,
+    a non-terminal run, a crash/timeout/cancellation, or a self-reported
+    "passed" state whose evidence doesn't independently hold up (see
+    ``test_run_receipt.classify_test_run_record``) all refuse the handoff
+    identically — the point is a caller can never walk away with a handoff
+    claiming "tests passed" on the strength of an empty, ambiguous, or
+    stale receipt.
+    """
+
+    def __init__(self, evidence: dict[str, Any]):
+        self.evidence = evidence
+        super().__init__(
+            "generate_handoff refused (strict_test_evidence=True): latest "
+            f"test-run receipt classifies as {evidence.get('classification')!r} "
+            f"({evidence.get('reason')})"
+        )
+
+
 class HandoffStaleReferenceError(ValueError):
     """Raised by generate_handoff BEFORE any mode (starter/compact, goal,
     full, delta) renders, persists, or mints a goal_token, when the live
@@ -7434,6 +7744,75 @@ class HandoffSelectionError(ValueError):
             f"selected_item_ids contains {len(rejected)} invalid id(s) — "
             f"{detail}. Fix or drop the invalid id(s); this call will NOT "
             "silently widen to the unfiltered backlog."
+        )
+
+
+class HandoffScopeNonExecutable(ValueError):
+    """fb82e51f — raised by generate_handoff when a caller passed a VALID
+    ``selected_item_ids`` scope (every requested id passed
+    :func:`_resolve_selected_item_scope`'s own checks — it is genuinely
+    ``todo``/``pending``, in this project, in this version) but every one of
+    those requested ids was subsequently stripped back out of the claimable
+    batch by a SEPARATE structural gate this function does not override:
+    the unprospected-evidence gate, the backburner/deferred gate, the
+    manual-item split, or a pending wave gate boundary.
+
+    This is the 2026-07-27 gap :class:`HandoffSelectionError` does not close:
+    that error only fires for a *malformed* selection (unknown/foreign/
+    already-claimed/terminal id). A selection can be perfectly well-formed —
+    the item genuinely IS pending — and still end up with zero executable
+    items once ``_build_quick_start_goal``'s independent exclusion filters
+    run, because ``selected_item_ids`` narrows the CANDIDATE pool, it does
+    not exempt anything from those filters. Left unhandled, the caller gets a
+    handoff that renders, persists, and mints a token successfully, declares
+    ``<selected_item_scope requested="...">``, yet has NOTHING in
+    ``<sprint_items>`` for the requested id(s) — silently indistinguishable
+    from "the board is legitimately empty" to a receiving executor. That is
+    exactly the incident this sprint item records: a planner's intended item
+    was emitted only under ``<excluded_unprospected>``, the executable batch
+    was empty, and nothing marked the handoff as non-executable for its own
+    stated scope.
+
+    Fails CLOSED like its siblings (:class:`HandoffSelectionError`,
+    :class:`HandoffStaleReferenceError`): nothing is rendered, written to
+    disk, or persisted for a call that raises this — the check runs
+    immediately after ``_build_quick_start_goal`` returns, before
+    ``_mint_and_embed_goal_token``. A caller that never passes
+    ``selected_item_ids`` (every pre-existing call site) is unaffected; a
+    caller whose selection DOES yield at least one executable item is also
+    unaffected — this only fires when the requested scope collapses to zero.
+
+    ``excluded`` mirrors ``HandoffSelectionError.rejected``'s shape: each
+    entry is ``{"id": ..., "reason": ...}`` with ``reason`` one of
+    ``unprospected`` (no durable pointer evidence and no ``prospect_bypass``),
+    ``backburner`` (deferred/backburner track), ``manual`` (a human-owned
+    item, never part of the auto-run claimable batch), ``wave_gate_pending``
+    (blocked behind a configured-but-unpassed wave gate), or
+    ``not_in_pending_batch`` (present in the validated closure but absent
+    from the exclusion-tracked batch — a defensive fallback that should not
+    occur in practice).
+    """
+
+    def __init__(
+        self,
+        project_id: str,
+        requested_ids: list[str],
+        excluded: list[dict[str, Any]],
+    ):
+        self.project_id = project_id
+        self.requested_ids = list(requested_ids)
+        self.excluded = list(excluded)
+        self.code = "SELECTED_SCOPE_NON_EXECUTABLE"
+        detail = "; ".join(
+            f"{e.get('id')} ({e.get('reason')})" for e in excluded
+        )
+        super().__init__(
+            f"generate_handoff refused for project {project_id!r}: every "
+            f"requested selected_item_ids id was excluded from the "
+            f"executable batch by a separate structural gate — {detail}. "
+            "This handoff would have rendered with zero executable items "
+            "for its own declared scope; refusing rather than silently "
+            "presenting it as a normal executor handoff."
         )
 
 
@@ -7817,6 +8196,9 @@ async def generate_handoff(
     continuation_status: dict[str, Any] | None = None,
     selected_item_ids: list[str] | None = None,
     promotion_readiness: dict[str, Any] | None = None,
+    strict_test_evidence: bool = False,
+    test_run_evidence: dict[str, Any] | None = None,
+    test_run_repo_root: "str | None" = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -7992,12 +8374,27 @@ async def generate_handoff(
     degrades to the pre-836ca1d5 delta output (no tag), never a broken
     handoff.
 
-    ``checkpoint`` (ecc8b280) — optional, ``False`` by default. Marks this
-    call as a mid-run progress report rather than a final, session-ending
-    handoff. Applies to the ``full``/``delta`` modes only (``goal`` is
-    already bare-batch and ``starter``/``compact`` are already explicitly
-    non-final). Purely a signal to the ``strict_continuation`` gate below —
-    it changes nothing about what gets rendered.
+    ``checkpoint`` (ecc8b280, size behaviour added 60eed526) — optional,
+    ``False`` by default. Marks this call as a mid-run progress report rather
+    than a final, session-ending handoff. Applies to the ``full``/``delta``
+    modes only (``goal`` is already bare-batch and ``starter``/``compact``
+    are already explicitly non-final). Two effects, both purely additive for
+    a caller that never opts in:
+
+    1. (ecc8b280) A signal to the ``strict_continuation`` gate below — see
+       its own docstring.
+    2. (60eed526) When ``max_content_bytes`` is left at its default (the
+       ``_MODE_DEFAULT_MAX_BYTES`` sentinel), the RETURNED content's byte
+       budget resolves to ``_DEFAULT_CHECKPOINT_MAX_BYTES`` instead of the
+       generous full/delta ``_DEFAULT_HANDOFF_MAX_BYTES`` — see that
+       constant's own module-level comment for the confirmed ~139KB
+       ``checkpoint()`` regression this closes. This never changes what gets
+       rendered or persisted (disk file / ``handoffs`` table / pending_goal
+       always keep the complete render, exactly like every other mode); only
+       the value handed back over MCP is bounded, via the same
+       integrity-first ``format_handoff_mcp_content`` truncation starter/goal
+       already rely on. An explicit ``max_content_bytes`` argument still
+       always wins over this default, exactly as for every other mode.
 
     ``strict_continuation`` (ecc8b280) — optional, ``False`` by default,
     mirrors ``strict_evidence``'s opt-in/fail-closed shape. When ``True``
@@ -8018,6 +8415,37 @@ async def generate_handoff(
     regardless of ``strict_continuation``/``checkpoint``, so a caller can
     always read the machine-readable continuation/terminal-ready state
     without opting into the hard refusal.
+
+    ``test_run_evidence`` (e24f2daa) — optional output dict, populated in
+    place (same purely-additive shape as ``evidence_status``/
+    ``continuation_status`` above) with
+    ``test_run_receipt.get_test_run_evidence``'s result for the checkout
+    this handoff is being generated for: ``classification`` (one of
+    ``passed``/``failed``/``infra_crash``/``timeout``/``cancelled``/
+    ``missing_or_ambiguous``), ``run_id``, ``state``, ``exit_code``,
+    ``signal``, ``phase``, ``last_progress_at``, ``timeout_kind``,
+    ``cleanup_status``, and ``duplicate_active_run`` (non-``None`` when
+    another test run currently owns this checkout's lock). Computed
+    whenever EITHER ``test_run_evidence`` is not ``None`` OR
+    ``strict_test_evidence=True``; a caller that passes neither sees zero
+    functional change (no receipt lookup even attempted).
+
+    ``strict_test_evidence`` (e24f2daa) — optional, ``False`` by default,
+    mirrors ``strict_continuation``'s opt-in/fail-closed shape and placement
+    (computed at the exact same point, before anything below is rendered or
+    persisted). When ``True`` and the resolved evidence's ``classification``
+    is not ``"passed"``, raises ``HandoffTestEvidenceRequired`` — a missing
+    receipt, a non-terminal run, a crash/timeout/cancellation, or a
+    self-reported "passed" state whose evidence doesn't independently hold
+    up (see ``test_run_receipt.classify_test_run_record``) all refuse the
+    handoff identically. A caller that never opts in is completely
+    unaffected.
+
+    ``test_run_repo_root`` (e24f2daa) — optional explicit checkout path used
+    to locate the test-run receipt in place of the default resolution
+    (``session_id``'s own registered worktree when resolvable, else the
+    server's main checkout — see
+    ``test_run_receipt.resolve_repo_root_for_session``).
 
     ``selected_item_ids`` (cffb9323) — optional explicit INCLUDE-ONLY item
     scope, ``None`` by default (every pre-existing call site is completely
@@ -8083,6 +8511,12 @@ async def generate_handoff(
             _resolved_max_bytes: "int | None" = _DEFAULT_STARTER_MAX_BYTES
         elif mode == "goal":
             _resolved_max_bytes = _DEFAULT_GOAL_MAX_BYTES
+        elif checkpoint:
+            # 60eed526 — a mid-run progress ping never needs full/delta's
+            # generous 300_000-byte ceiling; see _DEFAULT_CHECKPOINT_MAX_BYTES's
+            # own module-level comment. Checked before the full/delta
+            # fallback below so checkpoint=True wins regardless of mode.
+            _resolved_max_bytes = _DEFAULT_CHECKPOINT_MAX_BYTES
         else:
             _resolved_max_bytes = _DEFAULT_HANDOFF_MAX_BYTES
     else:
@@ -8119,6 +8553,12 @@ async def generate_handoff(
     _selected_scope = await _resolve_selected_item_scope(
         db, project_id, selected_item_ids, effective_version=_effective_version,
     )
+    # fb82e51f — out-param for _build_quick_start_goal's full/delta call below
+    # (the starter/goal-only modes compute their own inside their respective
+    # helper functions, which already receive _selected_scope as an
+    # argument). See HandoffScopeNonExecutable's docstring for the check this
+    # feeds.
+    _selected_scope_outcome: dict[str, Any] = {}
     # 2204ce80 — optional, additive "related planning records" lookup. Runs
     # only when the caller opted in on BOTH arguments; see the docstring above.
     if related_records_query is not None and related_records is not None:
@@ -8611,6 +9051,34 @@ async def generate_handoff(
         continuation_status.update(_continuation_state)
     if strict_continuation and not checkpoint and _continuation_state["continuation_required"]:
         raise HandoffContinuationRequired(_continuation_state)
+    # e24f2daa — fail-closed test-run-receipt gate. Same placement/contract as
+    # strict_continuation directly above: computed here, before anything
+    # below has rendered or persisted, so a strict_test_evidence=True refusal
+    # never leaves a half-written handoff behind. Only attempts the receipt
+    # lookup at all when a caller actually asked for it (test_run_evidence
+    # out-param supplied, or strict_test_evidence=True) — otherwise this is a
+    # complete no-op, zero functional change.
+    if test_run_evidence is not None or strict_test_evidence:
+        try:
+            _test_repo_root = await test_run_receipt_module.resolve_repo_root_for_session(
+                db, test_run_repo_root, session_id,
+            )
+            _test_run_evidence_result = test_run_receipt_module.get_test_run_evidence(
+                _test_repo_root
+            )
+        except Exception as _tr_exc:  # noqa: BLE001 — evidence surfacing must never crash a handoff
+            _test_run_evidence_result = {
+                "classification": test_run_receipt_module.CLASS_MISSING_OR_AMBIGUOUS,
+                "reason": f"test-run receipt lookup failed: {_tr_exc}",
+            }
+        if test_run_evidence is not None:
+            test_run_evidence.clear()
+            test_run_evidence.update(_test_run_evidence_result)
+        if strict_test_evidence and (
+            _test_run_evidence_result.get("classification")
+            != test_run_receipt_module.CLASS_PASSED
+        ):
+            raise HandoffTestEvidenceRequired(_test_run_evidence_result)
     # d5849a67 — batch-resolve durable pointer evidence for the pending batch so
     # the excluded_unprospected list below uses the SAME evidence signal
     # claim_sprint_item checks per-item (sprint_item_pointers rows), not the
@@ -8622,6 +9090,14 @@ async def generate_handoff(
     _effective_execution_mode = db_module.normalize_execution_mode(
         project.get("execution_mode")
     )
+    # 60eed526 — deliberately NOT passing full_contract_max_items here even
+    # when checkpoint=True: capping construction would also shrink what gets
+    # WRITTEN to disk / the handoffs table / pending_goal (this same
+    # quick_start_goal is embedded in `content` below and persisted
+    # unconditionally), which the cb00889c contract promises stays complete
+    # for every mode. checkpoint=True instead bounds only the RETURNED value,
+    # via the mode-aware max_content_bytes resolved above — see
+    # _DEFAULT_CHECKPOINT_MAX_BYTES's own comment.
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=_effective_execution_mode,
@@ -8669,7 +9145,20 @@ async def generate_handoff(
         # durable pointer row exists but never actually resolved.
         strict_pointer_evidence=strict_pointer_evidence,
         selected_scope=_selected_scope,
+        selected_scope_outcome=_selected_scope_outcome,
     )
+    # fb82e51f — a selected_item_ids scope that validated cleanly (every id
+    # genuinely pending) can still collapse to zero executable items once the
+    # unprospected/backburner/manual/wave-gate filters above have run. Fail
+    # CLOSED here, same placement/contract as HandoffEvidenceRequired/
+    # HandoffContinuationRequired: BEFORE the token is minted or anything is
+    # written/persisted. See HandoffScopeNonExecutable's own docstring.
+    if _selected_scope and _selected_scope_outcome.get("all_excluded"):
+        raise HandoffScopeNonExecutable(
+            project_id,
+            _selected_scope_outcome.get("requested_ids") or [],
+            _selected_scope_outcome.get("excluded_requested") or [],
+        )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
     # _mint_and_embed_goal_token; 4611b9a2 also wires this into the
@@ -9373,6 +9862,10 @@ async def _generate_starter_handoff(
     _s_execution_mode = db_module.normalize_execution_mode(
         project.get("execution_mode")
     )
+    # fb82e51f — see HandoffScopeNonExecutable's docstring: a selected_scope
+    # that validated cleanly can still collapse to zero executable items once
+    # the exclusion filters below run.
+    _s_selected_scope_outcome: dict[str, Any] = {}
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=_s_execution_mode,
@@ -9401,6 +9894,7 @@ async def _generate_starter_handoff(
         execution_policy=_execution_policy_from_settings(settings, _s_execution_mode),
         strict_pointer_evidence=strict_pointer_evidence,
         selected_scope=selected_scope,
+        selected_scope_outcome=_s_selected_scope_outcome,
         # 248c0bb9 — starter/compact stays compact even on a large board: cap
         # the full per-item tool_requirements/sprint_item_pointers/
         # artifact_pointer_findings JSON instead of inlining the entire
@@ -9408,6 +9902,14 @@ async def _generate_starter_handoff(
         # full_contract_max_items docstring for the fetch-on-demand fallback.
         full_contract_max_items=_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
     )
+    # fb82e51f — fail CLOSED before the token is minted or anything is
+    # written/persisted. See HandoffScopeNonExecutable's own docstring.
+    if selected_scope and _s_selected_scope_outcome.get("all_excluded"):
+        raise HandoffScopeNonExecutable(
+            project_id,
+            _s_selected_scope_outcome.get("requested_ids") or [],
+            _s_selected_scope_outcome.get("excluded_requested") or [],
+        )
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the
     # full/delta path was the only caller of this shared helper). Mint one here
@@ -9670,6 +10172,10 @@ async def _generate_goal_only_handoff(
         _pointer_evidence_ids = None
 
     _g_execution_mode = db_module.normalize_execution_mode(project.get("execution_mode"))
+    # fb82e51f — see HandoffScopeNonExecutable's docstring: a selected_scope
+    # that validated cleanly can still collapse to zero executable items once
+    # the exclusion filters below run.
+    _g_selected_scope_outcome: dict[str, Any] = {}
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=_g_execution_mode,
@@ -9701,11 +10207,29 @@ async def _generate_goal_only_handoff(
         execution_policy=_execution_policy_from_settings(proj_settings, _g_execution_mode),
         strict_pointer_evidence=strict_pointer_evidence,
         selected_scope=selected_scope,
+        selected_scope_outcome=_g_selected_scope_outcome,
         # 248c0bb9 — goal-only mode stays a genuinely bounded executable block
         # even on a large board: same cap as starter/compact — see
         # _build_quick_start_goal's own full_contract_max_items docstring.
         full_contract_max_items=_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+        # c1ec3517 — mode="goal" is the ONE surface documented as "hand
+        # straight to a fresh sub-agent with zero framing": no readiness
+        # header, no L0/L1/L2 context carries a start_session mention
+        # elsewhere the way full/delta/starter do. Passing project identity
+        # here is what makes _build_quick_start_goal render the self-start
+        # bootstrap in <first_step> — see that function's own
+        # project_id/project_name/identity docstring.
+        project_id=project_id,
+        project_name=project.get("name"),
     )
+    # fb82e51f — fail CLOSED before the token is minted or anything is
+    # written/persisted. See HandoffScopeNonExecutable's own docstring.
+    if selected_scope and _g_selected_scope_outcome.get("all_excluded"):
+        raise HandoffScopeNonExecutable(
+            project_id,
+            _g_selected_scope_outcome.get("requested_ids") or [],
+            _g_selected_scope_outcome.get("excluded_requested") or [],
+        )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.
     quick_start_goal = await _mint_and_embed_goal_token(db, project_id, quick_start_goal)

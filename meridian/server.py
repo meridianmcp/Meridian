@@ -130,6 +130,7 @@ from . import goal_md as goal_md_module
 from . import enqueue as enqueue_module
 from . import dispatcher as dispatcher_module
 from . import handoff as handoff_module
+from . import hook_paths as hook_paths_module
 from . import toml_config as toml_config_module
 from . import md_anchors as md_anchors_module
 from . import git_md as git_md_module
@@ -3034,6 +3035,33 @@ async def toggle_orphan_reaper(
     }
 
 
+# ---------------------------------------------------------------------------
+# 60a96ece — runtime-pressure diagnostics (read-only; never kills anything)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/projects/{project_id}/runtime_diagnostics")
+async def get_runtime_diagnostics(project_id: str, request: Request) -> dict[str, Any]:
+    """60a96ece — dashboard-visible, opt-in diagnostic snapshot of
+    Meridian-relevant Serena/MCP runtime processes on the machine running
+    this server: live-process enumeration, duplicate (repo, runtime_kind)
+    fingerprint groups, and best-effort per-process kernel-pool/
+    process-group evidence (see ``orphan_reaper.diagnose_runtime_pressure``
+    for the full contract). Purely observational — this route NEVER kills,
+    signals, or otherwise mutates any process, matching its sibling
+    ``GET .../orphan_reaper`` status route's read-only contract. Does not
+    require the orphan-reaper hook to be registered or enabled for this
+    project; it is independent of that opt-in cleanup feature.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    from . import orphan_reaper as orphan_reaper_module  # noqa: PLC0415 — avoid import cycle at module load
+
+    return orphan_reaper_module.diagnose_runtime_pressure()
+
+
 # Decisions routes → meridian/routes/decisions.py
 # ---------------------------------------------------------------------------
 # v2.4 — HITL (human-in-the-loop) queue
@@ -5040,6 +5068,21 @@ async def _build_continue_payload(
     # `goal_string` (not `goal`) deliberately — consumers like hooks_session_start
     # treat a result `goal` key as the goal *dict* (north_star/sprint); this is the
     # ready-to-paste /goal *command* string, a distinct shape.
+    # 60eed526 — this payload's own docstring promises a "compact" resume
+    # block, but _build_quick_start_goal's <tool_requirements>/
+    # <sprint_item_pointers>/<artifact_pointer_findings> clauses default to
+    # UNBOUNDED (the same full/delta contract generate_handoff's full/delta
+    # modes deliberately keep) — with no generate_handoff-style
+    # max_content_bytes backstop wired for this code path at all, an
+    # un-capped call here could silently reproduce the same class of
+    # oversized payload the checkpoint() fix addresses. This resume block is
+    # never persisted anywhere (unlike generate_handoff's full/delta
+    # content), so capping construction here loses nothing durable — the
+    # omitted items' full contracts remain available via this SAME
+    # response's capability_contract field (get_capability_manifest /
+    # get_effective_capability_profile) or a follow-up
+    # generate_handoff(mode='full') call, exactly like the 248c0bb9
+    # starter/goal fix's own fallback story.
     goal_string = handoff_module._build_quick_start_goal(
         pending,
         version=scoped_version,
@@ -5048,6 +5091,19 @@ async def _build_continue_payload(
         hitl_auto_answer_mode=_hitl_mode,
         pointer_evidence_ids=_continue_pointer_evidence_ids,
         execution_policy=_exec_policy,
+        full_contract_max_items=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+    )
+    # 60eed526 — full_contract_max_items above only caps how many pending
+    # items' tool_requirements get inlined; it does not bound how large a
+    # SINGLE item's own entry is. Apply the same byte-budget backstop every
+    # generate_handoff mode already gets via format_handoff_mcp_content so
+    # this resume block can't reproduce the same class of oversized payload
+    # regardless of per-item contract size. No <goal_token> banner is ever
+    # embedded in this resume goal_string (this path never calls
+    # _mint_and_embed_goal_token), so there is no protected-content floor to
+    # honor here.
+    goal_string = handoff_module.format_handoff_mcp_content(
+        goal_string, max_bytes=handoff_module._DEFAULT_CONTINUE_GOAL_MAX_BYTES,
     )
     recent = await db_module.get_tasks(db, project_id, limit=5)
     pending_slim = [
@@ -6429,14 +6485,13 @@ def _normalize_hook_cwd_path(path: str) -> str:
     Mirrors the nested ``_normalize_hook_cwd`` in ``hooks_session_start`` so the
     stop hook resolves a project from a cwd the exact same way session-start
     does (WSL /mnt/c/... → C:/..., backslashes → forward slashes, no trailing /).
+
+    e5eec33b — delegates to ``hook_paths.normalize_wsl_path``, the one
+    canonical implementation shared by the active-repository hook-path
+    resolver, so this and every other WSL-aware path consumer never drift
+    apart.
     """
-    value = (path or "").strip().replace("\\", "/")
-    m = re.match(r"^/mnt/([a-zA-Z])(?:/(.*))?$", value)
-    if m:
-        drive = m.group(1).upper()
-        rest = (m.group(2) or "").strip("/")
-        value = f"{drive}:/{rest}" if rest else f"{drive}:/"
-    return value.rstrip("/")
+    return hook_paths_module.normalize_wsl_path(path)
 
 
 async def _resolve_hook_project_id(

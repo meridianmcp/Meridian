@@ -30,6 +30,7 @@ import meridian.server as _server
 from meridian import continuation_gate as continuation_gate_module
 from meridian import db as db_module
 from meridian import goal_md as goal_md_module
+from meridian import test_run_receipt as test_run_receipt_module
 from meridian._deps import validate_input_size, _hosted_mode
 
 
@@ -236,17 +237,23 @@ async def handle_fan_out_sprint_items(
 ) -> Any:
     """MCP tool: fan_out_sprint_items.
 
-    86e4ae44 — this handler's call to ``db_module.fan_out_sprint_items`` below
-    is deliberately UNCHANGED: that function's docstring documents a contract
-    (no duplicate-title guard -- "the orchestrator is assumed to have already
-    deduped") that the new ``meridian.db.batch_management`` shared batch
-    engine's ``sprint_item`` entry kind does NOT share (it creates via
+    86e4ae44 — the DEFAULT call shape below (no ``strict``) is deliberately
+    UNCHANGED: ``db_module.fan_out_sprint_items``'s legacy contract (no
+    duplicate-title guard -- "the orchestrator is assumed to have already
+    deduped") does NOT share the new ``meridian.db.batch_management`` shared
+    batch engine's ``sprint_item`` entry kind's contract (it creates via
     ``add_sprint_item``, which DOES enforce the duplicate guard). Rerouting
-    this handler through the new engine would silently reject near-duplicate
-    titles this tool accepts today -- a real behavior change for every
-    existing caller. See ``batch_management``'s module docstring for the
-    full reasoning; exposing the new engine as an atomic/idempotent
-    alternative tool is sprint item 627187b8's job, not this one's.
+    this handler through the new engine BY DEFAULT would silently reject
+    near-duplicate titles this tool accepts today -- a real behavior change
+    for every existing caller.
+
+    468ab67d — added an explicit, OPT-IN ``args["strict"]`` flag: when true,
+    this handler forwards ``mode``/``idempotency_key`` to
+    ``db_module.fan_out_sprint_items(..., strict=True, ...)``, which reroutes
+    through that exact shared engine (see its own docstring for the full
+    strict-mode contract: duplicate guard, idempotency replay, best_effort/
+    all_or_nothing semantics, per-entry outcomes). A caller who never passes
+    ``strict`` sees byte-identical behavior to before this item.
     """
     from ..handler import (  # noqa: PLC0415
         _infer_touches_resources,
@@ -270,10 +277,39 @@ async def handle_fan_out_sprint_items(
             if _inf:
                 spec = {**spec, "touches_resources": _inf}
         _enriched.append(spec)
-    ids = await db_module.fan_out_sprint_items(
-        db, args["project_id"], _enriched
-    )
-    _result: dict[str, Any] = {"item_ids": ids, "count": len(ids)}
+    # 468ab67d — opt-in strict mode: explicit duplicate safety + replay
+    # idempotency via the shared batch_management engine. Absent/false
+    # `strict` takes the exact same code path as before this item.
+    _strict = bool(args.get("strict"))
+    if _strict:
+        from meridian.db import batch_management  # noqa: PLC0415 — lazy, see fan_out_sprint_items' own import for why.
+
+        _mode = args.get("mode") or "all_or_nothing"
+        if _mode not in batch_management.BATCH_MODES:
+            return {
+                "error": f"mode must be one of {batch_management.BATCH_MODES}, got {_mode!r}"
+            }
+        try:
+            _batch_result = await db_module.fan_out_sprint_items(
+                db, args["project_id"], _enriched,
+                strict=True, mode=_mode,
+                idempotency_key=args.get("idempotency_key") or None,
+                tenant_id=_mcp_tenant_id, actor=args.get("session_id"),
+            )
+        except batch_management.BatchEngineError as exc:
+            return {"error": str(exc)}
+        ids = [
+            r["id"] for r in _batch_result.get("results", [])
+            if r.get("status") == "ok" and r.get("id")
+        ]
+        _result: dict[str, Any] = dict(_batch_result)
+        _result["item_ids"] = ids
+        _result["count"] = len(ids)
+    else:
+        ids = await db_module.fan_out_sprint_items(
+            db, args["project_id"], _enriched
+        )
+        _result = {"item_ids": ids, "count": len(ids)}
     # 02a52bf6 — mirror add_sprint_item's inline prospecting/pointer-persist for
     # each bulk-filed item. Without this, an item fanned out with real (declared
     # or inferred) touches_resources ends up with zero rows in
@@ -882,9 +918,17 @@ async def handle_claim_sprint_item(
     # CONFLICT check above, this is NEVER softened by worktree isolation —
     # worktrees isolate the working tree, not the eventual merge, so a real
     # symbol-range overlap stays a hard block regardless of isolation mode.
+    # 54d2c2af — opt-in STRICT contract: strict_resource_locking=true rejects
+    # (rather than silently widening) a symbol: resource that can't get a real
+    # symbol-range lock, unless allow_file_fallback=true explicitly approves
+    # that widening for this call. Both default False — zero behavior change
+    # for every existing caller that doesn't pass them.
     _resource_lock_gate = await _sprint_item_resource_claim_gate(
         db, args["project_id"], args["item_id"], args.get("session_id"),
         resource_contents=args.get("resource_contents"),
+        strict_resource_locking=bool(args.get("strict_resource_locking")),
+        allow_file_fallback=bool(args.get("allow_file_fallback")),
+        tenant_id=_mcp_tenant_id,
     )
     if not _resource_lock_gate.get("ok"):
         return _resource_lock_gate
@@ -948,7 +992,27 @@ async def handle_claim_sprint_item(
         # would have defeated the whole point of the multi-signal check above.
         # Re-run the (cheap, read-only) classifier here purely to surface WHY.
         _stale_item = await db_module.get_sprint_item(db, args["item_id"])
-        if _stale_item and _stale_item.get("status") == "in_progress":
+        _claim_age_h: float | None = None
+        if _stale_item and _stale_item.get("claimed_at"):
+            from datetime import datetime as _dt_cls  # noqa: PLC0415
+
+            try:
+                _ca = _dt_cls.fromisoformat(_stale_item["claimed_at"].split(".")[0].replace("Z", ""))
+                _claim_age_h = (_dt_cls.utcnow() - _ca).total_seconds() / 3600
+            except Exception:  # noqa: BLE001
+                _claim_age_h = None
+        # Only consult the classifier once a claim is actually old enough to be
+        # a staleness CANDIDATE (db_module._RECONCILE_STALE_HOURS, same
+        # threshold this block always used, re-exported from
+        # sprint_items._CLAIM_OWNERSHIP_STALE_HOURS) — a fresh, genuinely-
+        # active claim must keep falling through to the plain "already_claimed"
+        # / next-item response below unchanged, exactly as it did before this item.
+        if (
+            _stale_item
+            and _stale_item.get("status") == "in_progress"
+            and _claim_age_h is not None
+            and _claim_age_h > db_module._RECONCILE_STALE_HOURS
+        ):
             try:
                 _verdict = await db_module.classify_stale_claim(db, _stale_item)
             except Exception:  # noqa: BLE001
@@ -1609,6 +1673,65 @@ async def handle_complete_sprint_item(
                     ),
                 }
 
+    # e24f2daa — fail-closed TEST-RUN-RECEIPT gate + evidence surfacing.
+    # Two independent pieces, mirroring the strict_evidence/code_intel_receipt
+    # blocks above exactly:
+    #   1. ALWAYS best-effort (never raises, never blocks on its own): looks
+    #      up the current durable test-run receipt for this checkout
+    #      (scripts/run_tests.py's TestRunRecord, via test_run_receipt.py) and
+    #      classifies it -- attached to the completed item below regardless
+    #      of whether the strict gate engages, so run_id/state/exit_code/
+    #      signal/phase/last_progress/timeout_kind/cleanup_status are always
+    #      visible completion evidence, not just a pass/fail boolean.
+    #   2. OPT-IN (strict_test_evidence=true, or the item's own
+    #      require_strict_test_evidence flag): a real fail-closed reject
+    #      unless the resolved evidence classifies as "passed" -- missing,
+    #      non-terminal, crashed, timed-out, cancelled, or an
+    #      insufficiently-evidenced "passed" record are ALL refused, never
+    #      silently treated as success. override_test_run_receipt=true with a
+    #      non-empty override_reason acknowledges and completes anyway
+    #      (audited via record_test_run_receipt_override), same pattern as
+    #      override_strict_evidence / override_code_intel_receipt.
+    _test_run_evidence: dict[str, Any] | None = None
+    _test_run_receipt_override: dict[str, Any] | None = None
+    try:
+        _test_run_repo_root = await test_run_receipt_module.resolve_repo_root_for_session(
+            db, _server._REPO_ROOT, _complete_session_id or None,
+        )
+        _test_run_evidence = test_run_receipt_module.get_test_run_evidence(_test_run_repo_root)
+    except Exception:  # noqa: BLE001 — evidence surfacing must never block completion
+        _test_run_evidence = None
+    _strict_test_evidence = bool(args.get("strict_test_evidence")) or bool(
+        (_pre_item or {}).get("require_strict_test_evidence")
+    )
+    if (
+        _strict_test_evidence
+        and _pre_item is not None
+        and _pre_item.get("project_id") == args["project_id"]
+    ):
+        _tr_check = await test_run_receipt_module.verify_test_run_receipt_evidence(
+            db, _server._REPO_ROOT, _pre_item, session_id=_complete_session_id or None,
+        )
+        _test_run_evidence = _tr_check.get("evidence") or _test_run_evidence
+        if not _tr_check.get("ok"):
+            _tr_override_requested = bool(args.get("override_test_run_receipt"))
+            _tr_override_reason = (args.get("override_reason") or "").strip()
+            if _tr_override_requested and _tr_override_reason:
+                _test_run_receipt_override = await test_run_receipt_module.record_test_run_receipt_override(
+                    db, args["project_id"], args["item_id"],
+                    actor=_complete_actor,
+                    reason=_tr_override_reason,
+                    evidence=_tr_check.get("evidence") or {},
+                    tenant_id=(tenant or {}).get("id"),
+                )
+            else:
+                return {
+                    "error": _tr_check.get("code") or "TEST_RUN_RECEIPT_BLOCKED",
+                    "item_id": args["item_id"],
+                    "test_run_receipt": _tr_check.get("evidence"),
+                    "message": _tr_check.get("message"),
+                }
+
     # 5823db0b — quality gate + actor attribution. Pass evidence notes and
     # the completing actor; surface the required_notes gate as a clean error.
     try:
@@ -1702,6 +1825,15 @@ async def handle_complete_sprint_item(
             item["code_intel_receipt"] = _code_intel_check.get("receipt")
         if _code_intel_override:
             item["code_intel_receipt_override"] = _code_intel_override
+    if _test_run_evidence is not None:
+        # e24f2daa — always surface the current test-run receipt classification
+        # (run_id/state/exit_code/signal/phase/last_progress_at/timeout_kind/
+        # cleanup_status) on the completed item, regardless of whether the
+        # strict gate above engaged — this is evidence, not just a verdict.
+        item = dict(item)
+        item["test_run_receipt"] = _test_run_evidence
+        if _test_run_receipt_override:
+            item["test_run_receipt_override"] = _test_run_receipt_override
     # fdaa5b55 — item has a linked GitHub issue: auto-close (meridian_auto)
     # or post a proposed-closure comment + non-blocking HITL (manual/unset).
     # Never lets a GitHub failure undo the completion that already succeeded
@@ -2043,6 +2175,99 @@ async def handle_execute_batch(
         return {"error": str(exc)}
 
 
+async def handle_batch_read(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: batch_read.
+
+    133bfff6 — generalized, domain-aware CONCURRENT batch-read dispatch.
+    Request-shape/execution logic lives entirely in ``meridian.batch_read``
+    (pure in-process ``asyncio`` dispatch — never subagents/worktrees);
+    this handler only resolves project_id and forwards the call.
+    """
+    from ... import batch_read as batch_read_module  # noqa: PLC0415
+
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    requests = args.get("requests") or []
+    validate_input_size(json.dumps(requests, default=str), "batch_read requests", 2_000_000)
+    max_requests_raw = args.get("max_requests")
+    try:
+        max_requests = (
+            int(max_requests_raw) if max_requests_raw
+            else batch_read_module.DEFAULT_MAX_BATCH_REQUESTS
+        )
+    except (TypeError, ValueError):
+        return {"error": "max_requests must be an integer"}
+    try:
+        return await batch_read_module.batch_read(
+            db,
+            project_id=args["project_id"],
+            requests=requests,
+            tenant_id=_mcp_tenant_id,
+            max_requests=max_requests,
+        )
+    except batch_read_module.BatchReadRequestError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_batch_mutate(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: batch_mutate.
+
+    133bfff6 — transactional, MIXED-kind (sprint_item_pointer +
+    sprint_item_update only) batch mutation. All request-shape validation
+    (mode/idempotency_key) and the actual engine live in
+    ``meridian.batch_mutate`` / ``meridian.db.batch_management.
+    execute_mixed_mutation_batch``, reusing the exact same per-entry
+    adapters ``execute_batch`` already uses — no duplicated mutation logic.
+    """
+    from ... import batch_mutate as batch_mutate_module  # noqa: PLC0415
+
+    if not args.get("project_id"):
+        return {"error": "project_id is required (or pass project_name)"}
+    try:
+        batch_mutate_module.validate_batch_mutate_request_shape(args)
+    except batch_mutate_module.BatchMutateRequestError as exc:
+        return {"error": str(exc)}
+    entries = args.get("entries") or []
+    validate_input_size(json.dumps(entries, default=str), "batch_mutate entries", 2_000_000)
+    max_entries_raw = args.get("max_entries")
+    try:
+        max_entries = (
+            int(max_entries_raw) if max_entries_raw
+            else batch_mutate_module.DEFAULT_MAX_BATCH_ENTRIES
+        )
+    except (TypeError, ValueError):
+        return {"error": "max_entries must be an integer"}
+    try:
+        return await batch_mutate_module.batch_mutate(
+            db,
+            project_id=args["project_id"],
+            entries=entries,
+            mode=args["mode"],
+            idempotency_key=args.get("idempotency_key") or None,
+            tenant_id=_mcp_tenant_id,
+            actor=args.get("session_id"),
+            session_id=args.get("session_id"),
+            max_entries=max_entries,
+        )
+    except (
+        batch_mutate_module.BatchMutateRequestError,
+        batch_mutate_module.batch_management.BatchEngineError,
+    ) as exc:
+        return {"error": str(exc)}
+
+
 async def handle_complete_wave_gate(
     args: dict[str, Any],
     db: Any,
@@ -2257,6 +2482,62 @@ async def handle_finalize_wave_run(
         }
     except ValueError as exc:
         return {"error": str(exc), "finalized": False}
+
+
+async def handle_abort_wave_run_systemic(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: abort_wave_run_systemic.
+
+    cc3864bd — fail closed: abort a wave run because its FOUNDATIONAL
+    HYPOTHESIS was systemically invalidated, as opposed to an ordinary
+    per-item failure (which stays on the existing finalize_wave_run /
+    failure_mode contract, untouched by this tool). ``evidence`` must be a
+    dict with ``reason_code`` (one of
+    ``meridian.db.wave_runs.SYSTEMIC_INVALIDATION_REASONS``) and a non-blank
+    ``basis`` — see :func:`meridian.db.wave_runs.validate_systemic_invalidation_evidence`
+    for the full deterministic-policy gate; a bare guess is refused.
+
+    On success: the run moves to 'aborted', every affected pending/in-flight
+    sprint item (this run's own item_ids/children, plus any explicit
+    ``evidence.affected_item_ids``) is marked
+    ``blocker_kind='systemic_invalidated_run'`` (a claim-time hard gate — see
+    ``claim_sprint_item``), items with an already-``succeeded`` outcome are
+    left untouched, and a non-executable executor-to-planner corrective
+    report is durably recorded (``meridian.db.executor_reports``) for a
+    planner to review before creating a corrected board revision and
+    starting a NEW wave run. Idempotent on retry with identical evidence.
+
+    NOTE (deliberate, documented scope decision — see the cc3864bd session
+    report): this handler is not yet registered in mcp_tools.py's tool-schema
+    list or mcp/handler.py's dispatch table. Both files sit outside this
+    item's resource-claim scope (AGENTS.md e2ac066b) — wiring the schema/
+    dispatch entry is an explicit, flagged follow-up, not a silent omission.
+    The full DB-layer contract (this function's callee) is complete and
+    tested independent of that wiring.
+    """
+    wave_run_id = str(args.get("wave_run_id") or "").strip()
+    if not wave_run_id:
+        return {"error": "wave_run_id is required"}
+
+    evidence = args.get("evidence")
+    actor = str(args.get("actor") or "").strip() or None
+
+    from ...db.wave_runs import abort_wave_run_systemic  # noqa: PLC0415
+    try:
+        return await abort_wave_run_systemic(
+            db, wave_run_id, evidence=evidence, actor=actor,
+        )
+    except ValueError as exc:
+        # Covers both SystemicInvalidationRejected (a ValueError subclass —
+        # bad/missing evidence) and every other fail-closed refusal
+        # abort_wave_run_systemic raises (unknown run, already terminal for
+        # a different reason, merged, transition-table refusal).
+        return {"error": str(exc), "aborted": False}
 
 
 # efaa918a — token-outcome -> actionable hint, distinguishing genuine spoofing

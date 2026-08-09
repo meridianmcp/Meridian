@@ -36,7 +36,6 @@ def build_mcp_server():
     # deferred to function-call time to avoid a circular import at module load.
     from ..server import (
         _dispatch_mcp_tool,
-        _start_session_composite,
         _regenerate_claude_md,
         _idle_until_session_done,
         _maybe_add_log_task_nudge,
@@ -594,6 +593,18 @@ def build_mcp_server():
             # divergent schemas for these tools going forward.
             _shared_tool("load_handoff"),
             _shared_tool("verify_handoff_token"),
+            # d0854621 — record_handoff_correction had the exact same gap
+            # f46372e8 fixed for load_handoff/verify_handoff_token above: it
+            # is fully implemented and dispatched on the HTTP MCP transport
+            # (meridian/mcp/handler.py's _handle_task_tools) and as its own
+            # REST route (meridian/routes/handoff.py's
+            # record_handoff_correction_endpoint), but was never advertised
+            # OR dispatched on the stdio transport, so a self-hosted stdio
+            # client had no way to record a corrective handoff or invoke its
+            # regenerate=true new-revision path — every call fell through to
+            # call_tool()'s final "unknown tool" branch. Same _shared_tool()
+            # schema-parity guarantee as load_handoff/verify_handoff_token.
+            _shared_tool("record_handoff_correction"),
             Tool(
                 name="get_context_block",
                 description=(
@@ -2022,62 +2033,19 @@ def build_mcp_server():
             # execute_batch's request/response contract can never drift between
             # transports — see meridian/batch_ops.py's module docstring.
             _shared_tool("execute_batch"),
-            Tool(
-                name="start_session",
-                description=(
-                    "Single call to start a coordinated session. Registers "
-                    "you, reads goal + ambient context, shows recent work, "
-                    "lists active sessions, and tells you where the handoff "
-                    "file is. If project_id is unknown, call list_projects() "
-                    "first. Call this INSTEAD of register_session + "
-                    "get_goal + get_tasks separately. Returns: session_id, "
-                    "goal (with ambient_tasks), recent_tasks (last 10), "
-                    "active_sessions, handoff_exists, handoff_path, files."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "project_id": {"type": "string"},
-                        "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-                        "session_name": {"type": "string"},
-                        "human_id": {
-                            "type": "string",
-                            "description": "Optional human owner identifier.",
-                        },
-                        "client": {
-                            "type": "string",
-                            "enum": ["claude-code", "claude-desktop", "cursor", "other"],
-                            "description": "Client app — used for presence indicators.",
-                        },
-                        "role": {
-                            "type": "string",
-                            "enum": ["executor"],
-                            "description": "Pass 'executor' to inject executor_config and credentials guidance.",
-                        },
-                        "version": {
-                            "type": "string",
-                            "description": (
-                                "Optional sprint-version bucket (e.g. 'v0.1.x') to "
-                                "scope this session to — sprint progress/items in the "
-                                "orientation and /goal filter to it. Omit to auto-infer "
-                                "the bucket with the most pending items."
-                            ),
-                        },
-                        "expand_stale": {
-                            "type": "boolean",
-                            "description": (
-                                "Default false. When a goal field (north_star / "
-                                "version_goal / sprint) is flagged stale by the "
-                                "coherence check, the orientation collapses it to a "
-                                "one-line summary instead of dumping the week-old "
-                                "body. Pass true to expand those fields to their "
-                                "full text (get_session_brief also returns full text)."
-                            ),
-                        },
-                    },
-                    "required": ["session_name"],
-                },
-            ),
+            # 133bfff6 — same _shared_tool() schema-parity pattern as
+            # execute_batch above: batch_read/batch_mutate schemas live once
+            # in meridian/mcp_tools.py's _MCP_TOOLS_LIST, never duplicated.
+            _shared_tool("batch_read"),
+            _shared_tool("batch_mutate"),
+            # 325276f8 — was a hand-duplicated inputSchema that had drifted from
+            # the canonical one in meridian/mcp_tools.py: it was missing "compact"
+            # and "mode" entirely, and its "role" enum only allowed "executor"
+            # (the server has always accepted role="planner" too — see
+            # _select_active_tool_set). _shared_tool() pulls the exact same
+            # schema/description the HTTP/streamable-HTTP transport advertises so
+            # the three transports can no longer drift apart on this tool.
+            _shared_tool("start_session"),
             Tool(
                 name="list_projects",
                 description=(
@@ -2507,13 +2475,20 @@ def build_mcp_server():
                 result = await _dispatch_mcp_tool(
                     "get_context_block", arguments, db, state["data_dir"]
                 )
-            elif name in ("load_handoff", "verify_handoff_token"):
-                # f46372e8 — these two were advertised nowhere and dispatched
-                # nowhere on the stdio transport (see the list_tools() comment
-                # above _shared_tool("load_handoff")); route through the same
-                # _dispatch_mcp_tool -> _handle_task_tools path the HTTP MCP
-                # transport uses so all three transports share one
-                # implementation and can't drift out of sync with each other.
+            elif name in (
+                "load_handoff", "verify_handoff_token",
+                "record_handoff_correction",
+            ):
+                # f46372e8 (load_handoff/verify_handoff_token) + d0854621
+                # (record_handoff_correction) — these were advertised nowhere
+                # and dispatched nowhere on the stdio transport (see the
+                # list_tools() comment above _shared_tool("load_handoff"));
+                # route through the same _dispatch_mcp_tool -> _handle_task_tools
+                # path the HTTP MCP transport uses so all three transports
+                # share one implementation and can't drift out of sync with
+                # each other. This also covers record_handoff_correction's
+                # regenerate=true path (delegates internally to
+                # regenerate_handoff_correction) with zero extra wiring here.
                 result = await _dispatch_mcp_tool(
                     name, arguments, db, state["data_dir"]
                 )
@@ -2538,6 +2513,7 @@ def build_mcp_server():
                 "add_sprint_item_pointer", "get_sprint_item_pointers",
                 "resolve_sprint_item_pointers",
                 "execute_batch",
+                "batch_read", "batch_mutate",
                 "add_workspace_note", "get_workspace_notes",
                 "get_workspace_proposals",
                 "pin_workspace_decision", "get_workspace_decisions",
@@ -2583,47 +2559,33 @@ def build_mcp_server():
                 )
                 result = {"session_id": arguments["session_id"], "ok": ok}
             elif name == "start_session":
-                # 3689f680 — compact by default (full block via compact=False).
-                # a76cb7c0 — optional `version` scopes the session to a
-                # sprint-version bucket.
-                # ce3693e4 — resolve project_name → project_id. The stdio path
-                # never went through _dispatch_mcp_tool's central resolver, so
-                # start_session(project_name=...) raised a bare
-                # KeyError('project_id') here even though every project-scoped
-                # stdio schema advertises project_name. Resolve it (project_id
-                # wins when both are given), then guard so a missing project
-                # returns a clean error instead of a KeyError.
-                _pid = (arguments.get("project_id") or "").strip()
-                if not _pid and arguments.get("project_name"):
-                    _p = await db_module.get_project_by_name(
-                        db, str(arguments["project_name"])
-                    )
-                    _pid = (_p or {}).get("id", "") if _p else ""
-                if not _pid:
-                    result = {"error": "project_id (or project_name) is required"}
-                else:
-                    # 599d0097 — session_name is optional; generate a default
-                    # from the first pending item when omitted/blank.
-                    _sname = (arguments.get("session_name") or "").strip()
-                    if not _sname:
-                        _sname = await db_module.generate_default_session_name(
-                            db, _pid
-                        )
-                    result = await _start_session_composite(
-                        db,
-                        _pid,
-                        _sname,
-                        state["data_dir"],
-                        human_id=arguments.get("human_id"),
-                        client_type=arguments.get("client"),
-                        role=arguments.get("role"),
-                        compact=arguments.get("compact", True),
-                        version=arguments.get("version"),
-                        # 2b4e69aa — collapse coherence-flagged-stale goal fields
-                        # to a one-liner by default; opt back into full bodies
-                        # with expand_stale=true.
-                        expand_stale=bool(arguments.get("expand_stale", False)),
-                    )
+                # 325276f8 — route through _dispatch_mcp_tool (meridian/mcp/handler.py)
+                # so stdio shares ONE start_session implementation with the HTTP /
+                # streamable-HTTP transports, exactly like get_context_block and
+                # load_handoff/verify_handoff_token do below (v2.4/v0.9, f46372e8).
+                #
+                # Before this fix the stdio path called _start_session_composite
+                # directly and silently diverged from the HTTP surface on every
+                # enrichment handle_start_session (meridian/mcp/handlers/project_tools.py)
+                # has added since: active_tool_set (a749f87c), pending_goal delivery
+                # (5efe254b), capability_contract (98aaccf4), execution_policy
+                # (75ac1c8e), the /goal-skill setup_warning check (issue #9), the
+                # "mode" argument (c793377d's mode="continue" fast-resume — the old
+                # inline code read compact/version/expand_stale but never forwarded
+                # mode at all), and executor_sessions registration for the
+                # bf51b12e planner-refresh-nudge gate (stdio executor sessions were
+                # never added to _EXECUTOR_SESSIONS, so the planner nudge could fire
+                # for them).
+                #
+                # ce3693e4's project_name -> project_id resolution and 599d0097's
+                # default session_name are both still applied — by
+                # _dispatch_mcp_tool's own central resolver and by
+                # handle_start_session respectively (same "project_id (or
+                # project_name) is required" error string) — so this is a pure
+                # behavior superset, not a regression.
+                result = await _dispatch_mcp_tool(
+                    "start_session", arguments, db, state["data_dir"]
+                )
             elif name == "list_projects":
                 result = await db_module.list_project_summaries(db)
             elif name == "get_project_by_name":

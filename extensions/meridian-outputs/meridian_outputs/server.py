@@ -243,7 +243,8 @@ def get_convergence_state(
     Returns:
       {outputs_dir, subtree, converged, walk_complete, scan_boundary,
       pending_count, indexed_count, expected_count, last_error, fts_pending,
-      partial, index_lock}, or {error: ...} if ``outputs_dir`` doesn't exist.
+      partial, index_lock, never_walked}, or {error: ...} if ``outputs_dir``
+      doesn't exist.
       ``index_lock`` (a52216e2): a read-only snapshot of this index's
       single-writer lock/lease -- {held, pid, hostname, session_id,
       started_at, heartbeat_at, age_seconds, lock_mode, pid_alive, is_stale,
@@ -252,6 +253,15 @@ def get_convergence_state(
       never touched) from a STALE one (a leftover lock file from a crashed
       owner, safe to reclaim on the next acquire). This call never acquires
       the lock itself and never disturbs whatever process currently holds it.
+      ``never_walked`` (3f758063): ``True`` only when this index has ZERO
+      recorded evidence a walk has ever touched ``outputs_dir`` -- no scan
+      boundary, no indexed rows, no pending backlog, no confirmed expected
+      count. ``converged`` is always ``False`` whenever this is ``True``:
+      fail closed rather than reporting a genuinely never-examined tree as
+      "confirmed converged, nothing here" (the exact hosted/local mismatch
+      this item exists to close). Never ``True`` for an in-progress walk, a
+      durably-persisted interrupted walk, or a real completed pass -- even
+      one that confirmed a genuinely empty directory.
     """
     return outputs_local.get_convergence_state(outputs_dir, subtree=subtree)
 
@@ -535,6 +545,45 @@ def find_outputs_by_source(
     """
     return provenance.find_outputs_by_source(
         outputs_dir, source_path, limit=limit, search_limit=search_limit,
+    )
+
+
+@mcp.tool()
+def bind_artifact_provenance(
+    outputs_dir: str,
+    artifacts: "list[dict[str, Any]]",
+    fuzzy_limit: int = 25,
+) -> dict[str, Any]:
+    """Join structural document artifacts (figures/tables/equations) to
+    authoritative per-file provenance, fail-closed (item 6d02f343).
+
+    Given a document's own list of structural artifacts -- one entry per
+    figure/table/equation it currently embeds, each carrying whatever
+    ``canonical_path``/``expected_sha256`` the document-writing tool already
+    knows -- resolves each against meridian-outputs' per-file provenance
+    (:func:`resolve_figure_output`'s exact + basename tiers, authoritative;
+    :func:`get_provenance_status`'s directory-level note, fallback evidence
+    only) and classifies it so a caller can reject or quarantine a write
+    instead of silently promoting an orphaned or hash-mismatched artifact.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      artifacts:    One dict per structural artifact: ``{"artifact_id": <str>,
+                    "kind": <"figure"|"table"|"equation">,
+                    "canonical_path": <str|None>, "expected_sha256":
+                    <str|None>}``. ``artifact_id``/``kind`` are carried
+                    through unchanged for the caller's own bookkeeping.
+      fuzzy_limit:  Forwarded to the basename-fallback tier (default 25).
+
+    Returns:
+      ``{"bindings": [...], "counts": {...}, "all_clear": bool}`` -- see
+      :func:`meridian_outputs.provenance.bind_artifact_provenance` for the
+      full per-binding shape and status semantics (``resolved``/
+      ``hash_mismatch``/``orphaned``/``unresolved``). ``all_clear`` is
+      ``True`` only when every artifact is ``resolved``.
+    """
+    return provenance.bind_artifact_provenance(
+        outputs_dir, artifacts, fuzzy_limit=fuzzy_limit,
     )
 
 

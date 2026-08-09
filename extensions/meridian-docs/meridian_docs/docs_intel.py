@@ -337,17 +337,27 @@ def parse_docx(source: str | bytes | bytearray) -> list[dict[str, Any]]:
     the same three-tier scheme every mutation primitive in this module already
     uses (``_find_para_by_id``, ``_locate_section_bounds``,
     ``_vendored_content_tree._paragraph_node``): the native ``w14:paraId`` when
-    Word wrote one (stable across edits), else the synthesized ``sp<hash>`` id
-    from :func:`_vendored_content_tree._build_synth_id_map` (a content-derived
-    id that is ALSO stable across edits -- unlike a raw position counter), else
-    a positional ``p{index}`` fallback. Returns an empty list for a document
-    with no body.
+    Word wrote one (stable across edits -- prefer this whenever present), else
+    the synthesized ``sp<hash>`` id from
+    :func:`_vendored_content_tree._build_synth_id_map` (a content-derived id,
+    stable across insertions elsewhere in the document and, as of e21b2ca7, no
+    longer perturbed by an ancestor heading being retitled -- see that
+    function's docstring for exactly what is and is not stable about it),
+    else a positional ``p{index}`` fallback kept only for explicit legacy
+    compatibility. Returns an empty list for a document with no body.
 
     71db285b -- previously this used a bare ``p{index}`` position counter,
     unaware of the synth_id scheme that ``move_section``/``copy_section``/
     ``_locate_section_bounds`` actually resolve against, so ``document_outline``
     handed back ids that those functions could not reliably locate on any real
     (non-synthetic) docx lacking ``w14:paraId`` on every paragraph.
+
+    e21b2ca7 -- the synth-id fallback's hash inputs changed (ancestor heading
+    TEXT dropped); see :func:`_vendored_content_tree._build_synth_id_map` for
+    the exact stability guarantees this gives, and what remains a known,
+    accepted limitation (own-text edits and duplicate-order shifts still
+    change a synth id -- both require real persisted identity to fully fix,
+    which this stateless, single-parse function does not implement).
     """
     if isinstance(source, (bytes, bytearray)):
         zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
@@ -2879,6 +2889,63 @@ def _enforce_render_verification(
     return error, None
 
 
+def _check_artifact_provenance_binding(
+    artifact_provenance: "dict[str, Any] | None",
+) -> "dict[str, Any] | None":
+    """Fail-closed gate on a caller-supplied, pre-computed artifact-provenance
+    binding verdict (sprint item 6d02f343 -- bind figure/table/equation
+    artifacts to per-file provenance and fail closed on mismatched writes).
+
+    ``artifact_provenance`` is the plain dict returned by
+    ``meridian_outputs.provenance.bind_artifact_provenance`` (or an
+    equivalent caller-built dict sharing its ``{"all_clear": bool,
+    "bindings": [...]}`` shape). This module deliberately never imports
+    ``meridian_outputs`` itself -- it is a separate, optionally-installed
+    extension package. The CALLER computes the provenance verdict and hands
+    the resulting plain dict in here, duck-typed -- the same pattern
+    ``meridian_outputs.provenance_status.get_manifest_backed_provenance_status``
+    already established for consuming an externally-computed verdict without
+    a cross-package import. ``None`` (the default everywhere this is called
+    from) means the caller did not ask for this check -- zero behavior
+    change for every write path that predates this item.
+
+    Returns ``None`` when ``artifact_provenance`` is ``None``, or is
+    supplied and cleanly ``all_clear``. Otherwise returns an error dict in
+    the same ``{"error": ...}`` shape every other verification failure in
+    this module already uses, with an additive
+    ``artifact_provenance_mismatches`` key listing the offending bindings --
+    never silently treats "could not check" as "passed".
+    """
+    if artifact_provenance is None:
+        return None
+    if not isinstance(artifact_provenance, dict) or "all_clear" not in artifact_provenance:
+        return {
+            "error": (
+                "post-write verification failed: artifact_provenance was "
+                "supplied but is not a valid binding-verdict dict (missing "
+                "'all_clear') -- refusing to treat an unconfirmed artifact "
+                "provenance state as a success"
+            ),
+            "artifact_provenance_mismatches": None,
+        }
+    if not artifact_provenance.get("all_clear"):
+        rejected = [
+            binding
+            for binding in (artifact_provenance.get("bindings") or [])
+            if binding.get("status") != "resolved"
+        ]
+        return {
+            "error": (
+                "post-write verification failed: one or more figure/table/"
+                "equation artifacts failed provenance binding (orphaned, "
+                "hash-mismatched, or unresolved) -- returning an error "
+                "instead of a false success payload"
+            ),
+            "artifact_provenance_mismatches": rejected,
+        }
+    return None
+
+
 def _verify_docx_write(
     docx_path: str,
     *,
@@ -2887,6 +2954,7 @@ def _verify_docx_write(
     expected_range: tuple[int, int] | None = None,
     locate_by_paraid: str | None = None,
     expected_len: int = 1,
+    artifact_provenance: "dict[str, Any] | None" = None,
 ) -> dict[str, Any] | None:
     """Mandatory post-write verification (9907df44). Returns ``None`` when the
     on-disk document matches expectations, or an error dict when it doesn't.
@@ -2901,6 +2969,12 @@ def _verify_docx_write(
     ``w14:paraId`` (``locate_by_paraid`` -- used by copy_section, whose final
     position can shift again if the caller also trims the original section
     after inserting the copy).
+
+    ``artifact_provenance`` (6d02f343, optional) -- checked via
+    :func:`_check_artifact_provenance_binding` ONLY after every structural
+    check above has already passed (this item's own instruction: provenance
+    gating runs "only after structural verification succeeds"). ``None``
+    (the default) skips this check entirely.
     """
     try:
         raw2, root2 = _load_docx_xml_stdlib(docx_path)
@@ -2973,7 +3047,8 @@ def _verify_docx_write(
             "count_mismatches": count_mismatches,
             "content_hash_mismatch": hash_mismatch,
         }
-    return None
+
+    return _check_artifact_provenance_binding(artifact_provenance)
 
 
 # ---------------------------------------------------------------------------
@@ -3195,6 +3270,32 @@ def _verify_image_ownership(
     return None
 
 
+class AmbiguousParagraphIdError(ValueError):
+    """e21b2ca7 -- ``para_id`` matches MORE THAN ONE paragraph in the current
+    document, so :func:`_find_para_by_id` refuses to silently guess which
+    one the caller means (previously it returned whichever match it hit
+    first in document order, i.e. a silent, non-deterministic-feeling
+    choice from the caller's perspective).
+
+    This can only happen for the native ``w14:paraId`` tier: a real Word
+    document should never assign the same ``w14:paraId`` to two paragraphs,
+    but a hand-edited or generated-by-another-tool ``.docx`` sometimes does
+    (see :func:`_vendored_content_tree._find_duplicate_native_para_ids`,
+    already surfaced read-only via ``document_content_tree``'s
+    ``duplicate_para_ids``). The synthesized ``sp<hash>`` and legacy
+    ``p{N}`` tiers are unique by construction within one parse, so neither
+    can trigger this.
+
+    Every one of this function's write-path callers (insert_caption,
+    move_section, copy_section, edit_equation_local, etc.) would otherwise
+    risk silently mutating the WRONG one of two identically-id'd paragraphs
+    -- failing closed here instead of guessing matches the fail-closed
+    convention already used elsewhere in this module for OOXML writes
+    (b6a9ec99, ambiguity/nesting rejection in equation and bibliography
+    rewriting).
+    """
+
+
 def _find_para_by_id(
     root: ET.Element, para_id: str
 ) -> tuple[ET.Element, ET.Element, int] | None:
@@ -3224,8 +3325,13 @@ def _find_para_by_id(
 
     Only schemes 1 and 3 apply to paragraphs inside tables -- like
     ``document_content_tree``, the synth-id map is built over direct body
-    children only (table-cell paragraphs are not part of the
-    heading-path/synth-id scheme).
+    children only (table-cell paragraphs are not part of the synth-id
+    scheme).
+
+    e21b2ca7 -- raises :class:`AmbiguousParagraphIdError` (fail closed,
+    instead of silently resolving to the first match in document order)
+    when ``para_id`` is a native ``w14:paraId`` that more than one
+    paragraph in the document carries. See that exception's docstring.
 
     Returns ``None`` when ``para_id`` matches none of the three schemes.
     The ``body_child_index`` is the index of the direct body child that contains
@@ -3237,9 +3343,23 @@ def _find_para_by_id(
     w_p = _q(_W, "p")
     w14_para_id = _q(_W14, "paraId")
 
-    from ._vendored_content_tree import _build_synth_id_map  # noqa: PLC0415
+    from ._vendored_content_tree import (  # noqa: PLC0415
+        _build_synth_id_map,
+        _find_duplicate_native_para_ids,
+    )
 
     synth_map = _build_synth_id_map(body)
+    duplicate_native_ids = {
+        entry["para_id"] for entry in _find_duplicate_native_para_ids(body)
+    }
+    if para_id in duplicate_native_ids:
+        raise AmbiguousParagraphIdError(
+            f"paraId {para_id!r} is assigned to more than one paragraph in "
+            "this document (Word-invalid duplicate w14:paraId) -- refusing "
+            "to guess which one the caller means. See "
+            "document_content_tree's duplicate_para_ids report to locate "
+            "and disambiguate the affected paragraphs."
+        )
 
     global_p_idx = 0
     for child_idx, child in enumerate(list(body)):
@@ -4563,6 +4683,1097 @@ def insert_figure_block(
     }
 
 
+# ---------------------------------------------------------------------------
+# d371b00b -- verified DOCX package-part and relationship add/remove
+# primitives.
+#
+# Two directions over the SAME package-level infrastructure
+# insert_image/insert_figure_block already use (word/_rels/document.xml.rels
+# relationships, [Content_Types].xml Default/Override entries, word/media/*
+# parts):
+#
+#   1. :func:`remove_docx_package_part` -- dry-run-capable, reference-counted
+#      REMOVAL. Never deletes a part that is still referenced anywhere in
+#      word/document.xml (a real refusal, not a silent skip); on a real
+#      removal, cleans up the relationship(s) that pointed at the deleted
+#      part and any [Content_Types].xml entry that is no longer needed.
+#   2. :func:`insert_docx_media_part` -- safe INSERTION of a brand-new
+#      image/media package member: collision-free relationship id + media
+#      part name (reusing :func:`_next_relationship_id` /
+#      :func:`_next_media_name`), matching Default/Override content-type
+#      entries, and the same drawing/frame-extent construction
+#      :func:`insert_figure_block` uses (:func:`_build_image_drawing` /
+#      :func:`_image_size_emu`) -- plus an explicit post-write
+#      relationship<->media BIJECTION check before the write is ever reported
+#      as successful.
+#
+# Both route through the SAME transactional backup/CAS-safe write envelope
+# every other writer in this module uses (:func:`_atomic_write_docx_bytes`
+# via a thin per-primitive save helper), hold :func:`_docx_promotion_lock`
+# across their own stage+promote -> verify -> conditional-restore sequence
+# (5988a5bb discipline), and run the SAME tri-state real-render canary
+# (:func:`_enforce_render_verification`) after structural verification
+# passes -- on Windows a failed/unavailable render fails the write closed by
+# default; ``allow_degraded_render=True`` + a non-empty
+# ``degraded_render_reason`` is the same audited opt-in
+# :func:`insert_figure_block` already exposes.
+#
+# Scope (documented, not silently assumed): both primitives operate on
+# word/media/* parts reachable via word/_rels/document.xml.rels and
+# referenced from word/document.xml only -- header/footer-embedded media
+# (their own separate word/_rels/header<N>.xml.rels parts) are out of scope
+# for this sprint item, matching this module's existing image tooling
+# (insert_image/insert_figure_block/find_image_paragraph are all
+# document-body-only too).
+# ---------------------------------------------------------------------------
+
+
+def _docx_zip_entries(raw: bytes) -> dict[str, bytes]:
+    """Every ZIP member of ``raw`` as an in-memory ``{name: bytes}`` map.
+
+    Same "load once, mutate the dict, repack" shape :func:`insert_image` /
+    :func:`insert_figure_block` / :func:`_save_docx_with_image` already build
+    inline at each call site -- factored out here so the two new package-part
+    primitives (and their shared helpers) don't each re-derive it.
+    """
+    entries: dict[str, bytes] = {}
+    with zipfile.ZipFile(io.BytesIO(raw)) as source:
+        for info in source.infolist():
+            entries[info.filename] = source.read(info.filename)
+    return entries
+
+
+def _rel_target_part_name(target: str, part_dir: str = "word") -> str:
+    """Resolve a ``<Relationship Target="...">`` value into a full ZIP member
+    path, relative to ``part_dir`` (the directory the ``.rels`` part itself
+    lives alongside -- ``"word"`` for ``word/_rels/document.xml.rels``).
+
+    Handles a leading ``"/"`` (package-root-absolute, per OPC) and ``".."``
+    segments (a relationship target may legally climb out of ``part_dir``,
+    though real Word output for media never does).
+    """
+    if target.startswith("/"):
+        return target.lstrip("/")
+    combined = f"{part_dir}/{target}"
+    parts: list[str] = []
+    for segment in combined.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(segment)
+    return "/".join(parts)
+
+
+def _docx_relationships_targeting_part(
+    rels_root: ET.Element, part_name: str, part_dir: str = "word"
+) -> list[str]:
+    """Every ``Relationship`` id in ``rels_root`` whose (resolved, non-
+    External) ``Target`` is ``part_name``."""
+    matches: list[str] = []
+    for child in rels_root:
+        if child.get("TargetMode") == "External":
+            continue
+        target = child.get("Target")
+        rid = child.get("Id")
+        if not target or not rid:
+            continue
+        if _rel_target_part_name(target, part_dir) == part_name:
+            matches.append(rid)
+    return matches
+
+
+def _docx_attribute_value_reference_count(xml_bytes: bytes, value: str) -> int:
+    """Count every element attribute anywhere in ``xml_bytes`` whose VALUE is
+    exactly ``value``.
+
+    Deliberately namespace/attribute-name agnostic -- a relationship id can
+    be referenced as ``r:embed`` (inline image), ``r:link`` (linked image),
+    ``r:id`` (hyperlink/OLE/chart/etc.), or other relationship-typed
+    attributes this module does not enumerate individually; scanning every
+    attribute VALUE in the tree is the only way to get a real reference
+    count instead of an incomplete allowlist that silently under-counts.
+    Returns 0 (never raises) for unparsable XML -- a caller treats that as
+    "could not confirm any reference", which is the fail-closed direction
+    for a REMOVAL gate (see :func:`remove_docx_package_part`).
+    """
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return 0
+    count = 0
+    for el in root.iter():
+        for attr_value in el.attrib.values():
+            if attr_value == value:
+                count += 1
+    return count
+
+
+def _docx_media_bijection_report(
+    media_part_names: "set[str] | list[str]",
+    rels_root: ET.Element,
+    part_dir: str = "word",
+) -> dict[str, Any]:
+    """Package-wide relationship<->media reference map for the parts named in
+    ``media_part_names`` (typically every ``word/media/*`` entry).
+
+    Returns ``{"media_to_relationship_ids": {part_name: [rel_id, ...]},
+    "orphaned_media": [...], "dangling_relationships": [...],
+    "shared_media": {part_name: [rel_id, ...]}}``:
+
+    * ``orphaned_media`` -- media parts targeted by ZERO image relationships
+      (candidates :func:`remove_docx_package_part` would report as safe to
+      remove).
+    * ``dangling_relationships`` -- image-type relationship ids whose Target
+      does not resolve to any part in ``media_part_names`` (package
+      inconsistency: a relationship pointing at nothing).
+    * ``shared_media`` -- media parts targeted by MORE THAN ONE relationship
+      id. Not itself an error (legitimate relationship reuse is possible),
+      but :func:`insert_docx_media_part`'s own post-write bijection check
+      treats its OWN brand-new media part appearing here as a hard failure --
+      a freshly inserted part must be a clean 1:1 pairing with the
+      relationship this write itself created.
+    """
+    media_to_rel_ids: dict[str, list[str]] = {name: [] for name in media_part_names}
+    dangling: list[str] = []
+    for child in rels_root:
+        rel_type = child.get("Type") or ""
+        if not rel_type.endswith("/image"):
+            continue
+        if child.get("TargetMode") == "External":
+            continue
+        target = child.get("Target")
+        rid = child.get("Id")
+        if not target or not rid:
+            continue
+        resolved = _rel_target_part_name(target, part_dir)
+        if resolved in media_to_rel_ids:
+            media_to_rel_ids[resolved].append(rid)
+        else:
+            dangling.append(rid)
+    orphaned = [name for name, rids in media_to_rel_ids.items() if not rids]
+    shared = {name: rids for name, rids in media_to_rel_ids.items() if len(rids) > 1}
+    return {
+        "media_to_relationship_ids": media_to_rel_ids,
+        "orphaned_media": orphaned,
+        "dangling_relationships": dangling,
+        "shared_media": shared,
+    }
+
+
+def _cleanup_content_types_after_removal(
+    content_types_root: ET.Element,
+    removed_part_name: str,
+    remaining_entries: "dict[str, bytes] | set[str]",
+) -> dict[str, Any]:
+    """Mutate ``content_types_root`` in place to drop [Content_Types].xml
+    entries made unnecessary by removing ``removed_part_name``.
+
+    1. Any ``Override`` entry naming ``removed_part_name`` exactly is always
+       dropped -- an Override is per-PartName, so it is unconditionally
+       orphaned once that part is gone.
+    2. The ``Default`` entry for ``removed_part_name``'s extension is dropped
+       ONLY if no part remaining in ``remaining_entries`` still needs it --
+       i.e. no other remaining part shares that extension without its own
+       Override (Default is a package-wide, extension-keyed fallback other
+       parts may legitimately still rely on).
+
+    Returns ``{"removed_overrides": [...], "removed_defaults": [...]}`` for
+    the caller's dry-run preview / success payload. Never raises.
+    """
+    ct_override = _q(_CONTENT_TYPES_NS, "Override")
+    ct_default = _q(_CONTENT_TYPES_NS, "Default")
+    target_partname = "/" + removed_part_name.lstrip("/")
+
+    removed_overrides: list[str] = []
+    for child in list(content_types_root):
+        if child.tag == ct_override and child.get("PartName") == target_partname:
+            content_types_root.remove(child)
+            removed_overrides.append(target_partname)
+
+    removed_defaults: list[str] = []
+    extension = os.path.splitext(removed_part_name)[1].lstrip(".").lower()
+    if extension:
+        override_partnames = {
+            child.get("PartName", "").lstrip("/")
+            for child in content_types_root
+            if child.tag == ct_override
+        }
+        still_needed = any(
+            os.path.splitext(name)[1].lstrip(".").lower() == extension
+            and name not in override_partnames
+            for name in remaining_entries
+        )
+        if not still_needed:
+            for child in list(content_types_root):
+                if (
+                    child.tag == ct_default
+                    and child.get("Extension", "").lower() == extension
+                ):
+                    content_types_root.remove(child)
+                    removed_defaults.append(extension)
+    return {"removed_overrides": removed_overrides, "removed_defaults": removed_defaults}
+
+
+def _save_docx_with_part_removed_stdlib(
+    raw: bytes,
+    *,
+    remove_part_names: tuple[str, ...],
+    updated_parts: dict[str, bytes],
+    dest: str,
+) -> dict[str, Any]:
+    """Repackage ``raw`` with ``remove_part_names`` DROPPED and
+    ``updated_parts`` applied (overwritten if pre-existing, appended if not),
+    routed through the SAME :func:`_atomic_write_docx_bytes` stage -> verify
+    -> promote transaction every other writer in this module uses.
+
+    The genuinely new capability :func:`_save_docx_with_new_parts_stdlib`
+    does not have: that writer can add or overwrite parts but never drops
+    one. ``protected_keys=("style_count",)`` -- media/relationship counts are
+    EXPECTED to decrease by exactly the removal this call performs; the
+    caller (:func:`remove_docx_package_part`) verifies that precise delta
+    itself post-write (see :func:`_verify_part_removal_write`) rather than
+    relying on an exact-match invariant here, which has no way to express
+    "decreased by exactly N".
+    """
+    out = io.BytesIO()
+    removed = set(remove_part_names)
+    written: set[str] = set()
+    with zipfile.ZipFile(io.BytesIO(raw)) as src:
+        infos = src.infolist()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+            for info in infos:
+                if info.filename in removed:
+                    continue
+                data = src.read(info.filename)
+                if info.filename in updated_parts:
+                    data = updated_parts[info.filename]
+                dst.writestr(info, data)
+                written.add(info.filename)
+            for part_name, data in updated_parts.items():
+                if part_name not in written and part_name not in removed:
+                    dst.writestr(part_name, data)
+
+    return _atomic_write_docx_bytes(
+        out.getvalue(),
+        dest,
+        pre_manifest=_docx_structural_manifest(raw),
+        protected_keys=("style_count",),
+        changed_parts=dict(updated_parts),
+    )
+
+
+def _verify_part_removal_write(
+    docx_path: str,
+    *,
+    removed_part_name: str,
+    removed_relationship_ids: list[str],
+) -> dict[str, Any] | None:
+    """d371b00b post-write verification for :func:`remove_docx_package_part`.
+
+    Re-reads ``docx_path`` FRESH FROM DISK (never the in-memory state this
+    function's own caller just built -- same discipline as every other
+    ``_verify_*`` helper in this module) and confirms: ``removed_part_name``
+    is genuinely gone from the ZIP; every relationship id in
+    ``removed_relationship_ids`` is genuinely gone from
+    ``word/_rels/document.xml.rels``; and the resulting package has NO
+    dangling image relationship (a relationship whose Target no longer
+    resolves to any part -- the bijection invariant, checked package-wide
+    here since a removal is the one operation that can introduce a dangling
+    reference elsewhere if this function's own relationship cleanup missed
+    something). Returns ``None`` on success, an ``{"error": ...}`` dict on
+    the first violation.
+    """
+    try:
+        raw2, _root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    with zipfile.ZipFile(io.BytesIO(raw2)) as zf2:
+        names2 = set(zf2.namelist())
+        if removed_part_name in names2:
+            return {
+                "error": (
+                    "post-write verification failed: package part "
+                    f"{removed_part_name!r} is still present in {docx_path} "
+                    "after removal"
+                )
+            }
+        rels_path = "word/_rels/document.xml.rels"
+        rels_root2 = (
+            ET.fromstring(zf2.read(rels_path))
+            if rels_path in names2
+            else ET.Element(_q(_PACKAGE_REL_NS, "Relationships"))
+        )
+        remaining_ids = {child.get("Id") for child in rels_root2}
+        leftover = [rid for rid in removed_relationship_ids if rid in remaining_ids]
+        if leftover:
+            return {
+                "error": (
+                    f"post-write verification failed: relationship id(s) "
+                    f"{leftover!r} that should have been removed with "
+                    f"{removed_part_name!r} are still present in {rels_path}"
+                )
+            }
+        media_names = {name for name in names2 if name.startswith("word/media/")}
+        bijection = _docx_media_bijection_report(media_names, rels_root2)
+        if bijection["dangling_relationships"]:
+            return {
+                "error": (
+                    "post-write verification failed: removal left dangling "
+                    f"relationship id(s) {bijection['dangling_relationships']!r} "
+                    "whose target part no longer exists"
+                ),
+                "dangling_relationships": bijection["dangling_relationships"],
+            }
+    return None
+
+
+def remove_docx_package_part(
+    docx_path: str,
+    part_name: str,
+    dry_run: bool = True,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """d371b00b -- reference-counted, dry-run-capable removal of an
+    unreferenced ``word/media/*`` package part and its relationship(s).
+
+    ``part_name`` (e.g. ``"word/media/image3.png"``) must name a
+    ``word/media/*`` ZIP member -- removal of any other package part
+    (``word/document.xml``, style/rels/content-types infrastructure, etc.)
+    is refused outright; this primitive's scope is deliberately narrow
+    (arbitrary-part removal is explicitly NOT supported).
+
+    Reference counting: every relationship in
+    ``word/_rels/document.xml.rels`` whose Target resolves to ``part_name``
+    is found first; then ``word/document.xml`` is scanned for any attribute
+    whose value equals one of those relationship ids (a real reference
+    count, not a heuristic scoped to just ``<a:blip r:embed>`` -- see
+    :func:`_docx_attribute_value_reference_count`). A part with a NONZERO
+    reference count is REFUSED -- a real ``{"error": ...}`` result with
+    ``status="refused_still_referenced"``, never a silent skip -- identically
+    whether ``dry_run`` is ``True`` or ``False``, since dry-run's entire
+    point is to preview the exact decision a real run would make.
+
+    ``dry_run=True`` (the default -- fail-safe): for a genuinely
+    zero-reference part, reports exactly what WOULD be removed
+    (``relationship_ids``, and which [Content_Types].xml Default/Override
+    entries would be cleaned up) WITHOUT touching the zip at all.
+
+    ``dry_run=False``: performs the removal for real, through the SAME
+    transactional backup/CAS-safe write envelope every other writer in this
+    module uses (:func:`_save_docx_with_part_removed_stdlib` ->
+    :func:`_atomic_write_docx_bytes`), holding :func:`_docx_promotion_lock`
+    across stage+promote -> :func:`_verify_part_removal_write` ->
+    conditional restore (5988a5bb discipline: a verification failure is
+    restored from backup ONLY when compare-and-swap confirms no OTHER
+    writer's promotion has landed since ours -- see
+    :func:`_safe_restore_after_verification_failure`). After structural
+    verification passes, the same tri-state real-render canary
+    :func:`insert_figure_block` uses
+    (:func:`_enforce_render_verification`) gates final promotion:
+    ``allow_degraded_render``/``degraded_render_reason`` are the identical
+    audited opt-in for the "no render backend available" case.
+
+    Returns, on success: ``{"status": "dry_run"|"removed", "part_name",
+    "relationship_ids"|"relationship_ids_removed",
+    "content_type_overrides_removed", "content_type_defaults_removed",
+    "reference_count": 0, "docx_path", ...render fields on a real
+    removal...}``. On refusal: ``{"error": ..., "status":
+    "refused_still_referenced", "reference_count", "part_name",
+    "referencing_relationship_ids"}``. On any other failure: ``{"error":
+    ...}`` without mutating the document.
+    """
+    if not isinstance(docx_path, str) or not docx_path:
+        return {"error": "docx_path must be a non-empty string"}
+    if not isinstance(part_name, str) or not part_name.strip():
+        return {"error": "part_name must be a non-empty string"}
+    normalized_part = part_name.strip().lstrip("/")
+    if not normalized_part.startswith("word/media/"):
+        return {
+            "error": (
+                "part_name must be a word/media/* package part -- got "
+                f"{part_name!r}. This primitive refuses arbitrary-part "
+                "removal by design (content parts like word/document.xml, "
+                "or package infrastructure like [Content_Types].xml, can "
+                "never be removed through it)."
+            )
+        }
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+    if not os.path.exists(docx_path):
+        return {"error": f"no such file: {docx_path}"}
+
+    with open(docx_path, "rb") as fh:
+        raw = fh.read()
+    try:
+        entries = _docx_zip_entries(raw)
+    except zipfile.BadZipFile as exc:
+        return {"error": f"not a valid .docx (not a ZIP): {docx_path}: {exc}"}
+
+    if "word/document.xml" not in entries:
+        return {"error": f"not a valid .docx: missing word/document.xml: {docx_path}"}
+    if normalized_part not in entries:
+        return {"error": f"package part not found: {normalized_part!r} in {docx_path}"}
+
+    rels_path = "word/_rels/document.xml.rels"
+    rels_xml = entries.get(rels_path)
+    try:
+        rels_root = (
+            ET.fromstring(rels_xml)
+            if rels_xml
+            else ET.Element(_q(_PACKAGE_REL_NS, "Relationships"))
+        )
+        document_xml = entries["word/document.xml"]
+        ET.fromstring(document_xml)  # fail fast on malformed document.xml
+    except ET.ParseError as exc:
+        return {"error": f"malformed XML part in {docx_path}: {exc}"}
+
+    referencing_rel_ids = _docx_relationships_targeting_part(rels_root, normalized_part)
+    reference_count = sum(
+        _docx_attribute_value_reference_count(document_xml, rid)
+        for rid in referencing_rel_ids
+    )
+
+    if reference_count > 0:
+        return {
+            "error": (
+                f"refusing to remove {normalized_part!r}: it is still "
+                f"referenced {reference_count} time(s) in word/document.xml "
+                f"via relationship id(s) {referencing_rel_ids!r} -- remove "
+                "the referencing drawing(s)/content first, or target a "
+                "genuinely unreferenced part"
+            ),
+            "status": "refused_still_referenced",
+            "part_name": normalized_part,
+            "reference_count": reference_count,
+            "referencing_relationship_ids": referencing_rel_ids,
+            "dry_run": dry_run,
+        }
+
+    content_types_xml = entries.get("[Content_Types].xml")
+    remaining_entries = {name for name in entries if name != normalized_part}
+
+    if dry_run:
+        preview_root = (
+            ET.fromstring(content_types_xml)
+            if content_types_xml
+            else ET.Element(_q(_CONTENT_TYPES_NS, "Types"))
+        )
+        ct_preview = _cleanup_content_types_after_removal(
+            preview_root, normalized_part, remaining_entries
+        )
+        return {
+            "status": "dry_run",
+            "would_remove": {
+                "part_name": normalized_part,
+                "relationship_ids": referencing_rel_ids,
+                "content_type_overrides_removed": ct_preview["removed_overrides"],
+                "content_type_defaults_removed": ct_preview["removed_defaults"],
+            },
+            "part_name": normalized_part,
+            "relationship_ids": referencing_rel_ids,
+            "reference_count": 0,
+            "docx_path": docx_path,
+            "dry_run": True,
+        }
+
+    # --- Real removal ---
+    for rel_id in referencing_rel_ids:
+        for child in list(rels_root):
+            if child.get("Id") == rel_id:
+                rels_root.remove(child)
+    new_rels_bytes = ET.tostring(rels_root, encoding="utf-8", xml_declaration=True)
+
+    content_types_root = (
+        ET.fromstring(content_types_xml)
+        if content_types_xml
+        else ET.Element(_q(_CONTENT_TYPES_NS, "Types"))
+    )
+    ct_result = _cleanup_content_types_after_removal(
+        content_types_root, normalized_part, remaining_entries
+    )
+    new_ct_bytes = ET.tostring(content_types_root, encoding="utf-8", xml_declaration=True)
+
+    updated_parts: dict[str, bytes] = {
+        rels_path: new_rels_bytes,
+        "[Content_Types].xml": new_ct_bytes,
+    }
+
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_with_part_removed_stdlib(
+                raw,
+                remove_part_names=(normalized_part,),
+                updated_parts=updated_parts,
+                dest=docx_path,
+            )
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256")
+
+        verify_error = _verify_part_removal_write(
+            docx_path,
+            removed_part_name=normalized_part,
+            removed_relationship_ids=referencing_rel_ids,
+        )
+        if verify_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["part_name"] = normalized_part
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["part_name"] = normalized_part
+            render_error["docx_path"] = docx_path
+            return render_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+    return {
+        "status": "removed",
+        "part_name": normalized_part,
+        "relationship_ids_removed": referencing_rel_ids,
+        "content_type_overrides_removed": ct_result["removed_overrides"],
+        "content_type_defaults_removed": ct_result["removed_defaults"],
+        "docx_path": docx_path,
+        **render_info,
+    }
+
+
+def _verify_media_part_insertion_write(
+    docx_path: str,
+    *,
+    image_para_id: str,
+    relationship_id: str,
+    media_part_name: str,
+    expected_media_bytes: bytes,
+    expected_width_emu: int,
+    expected_height_emu: int,
+) -> dict[str, Any] | None:
+    """d371b00b post-write verification for :func:`insert_docx_media_part`.
+
+    Re-reads ``docx_path`` FRESH FROM DISK and confirms, in order: the image
+    paragraph is present and centered; its ``wp:extent`` frame matches the
+    expected EMU width/height (frame-extent check); its ``a:blip`` references
+    ``relationship_id``; that relationship resolves (in the freshly re-read
+    rels part) to ``media_part_name``, which genuinely exists in the ZIP with
+    the EXACT expected bytes; and finally the explicit BIJECTION check --
+    ``relationship_id`` appears exactly once in the rels part, and
+    ``media_part_name`` is not targeted by any OTHER relationship (via
+    :func:`_docx_media_bijection_report`'s ``shared_media`` -- this brand-new
+    part must be a clean 1:1 pairing, never reused). Also confirms
+    [Content_Types].xml declares an applicable Default or Override for it.
+    Returns ``None`` on success, an ``{"error": ...}`` dict on the first
+    violation.
+    """
+    try:
+        raw2, root2 = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "error": (
+                "post-write verification failed: could not re-read "
+                f"{docx_path} after writing it: {exc}"
+            )
+        }
+
+    body2 = root2.find(_q(_W, "body"))
+    if body2 is None:
+        return {
+            "error": (
+                f"post-write verification failed: re-read of {docx_path} "
+                "has no <w:body> element"
+            )
+        }
+
+    w14_para_id = _q(_W14, "paraId")
+    image_para = next(
+        (el for el in body2 if el.get(w14_para_id) == image_para_id), None
+    )
+    if image_para is None:
+        return {
+            "error": (
+                f"post-write verification failed: image paragraph "
+                f"{image_para_id!r} not found anywhere in {docx_path} after "
+                "the write"
+            )
+        }
+    if _paragraph_alignment(image_para) != "center":
+        return {
+            "error": (
+                "post-write verification failed: image paragraph "
+                f"{image_para_id!r} is not centered (w:jc=\"center\") after "
+                "the write"
+            )
+        }
+
+    extent = image_para.find(f".//{_q(_WP, 'extent')}")
+    if extent is None:
+        return {
+            "error": (
+                "post-write verification failed: image paragraph "
+                f"{image_para_id!r} has no wp:extent frame element after "
+                "the write"
+            )
+        }
+    actual_cx, actual_cy = extent.get("cx"), extent.get("cy")
+    if actual_cx != str(expected_width_emu) or actual_cy != str(expected_height_emu):
+        return {
+            "error": (
+                "post-write verification failed: image frame extents "
+                f"mismatch (expected cx={expected_width_emu} "
+                f"cy={expected_height_emu}, got cx={actual_cx} cy={actual_cy})"
+            )
+        }
+
+    blip = image_para.find(f".//{_q(_A, 'blip')}")
+    embed_attr = _q(_IMAGE_REL_NS, "embed")
+    actual_rid = blip.get(embed_attr) if blip is not None else None
+    if actual_rid != relationship_id:
+        return {
+            "error": (
+                f"post-write verification failed: image paragraph "
+                f"{image_para_id!r} does not reference relationship "
+                f"{relationship_id!r} (found {actual_rid!r})"
+            )
+        }
+
+    with zipfile.ZipFile(io.BytesIO(raw2)) as zf2:
+        names2 = set(zf2.namelist())
+        rels_path = "word/_rels/document.xml.rels"
+        if rels_path not in names2:
+            return {
+                "error": (
+                    f"post-write verification failed: {rels_path} is "
+                    "missing after the write"
+                )
+            }
+        rels_root2 = ET.fromstring(zf2.read(rels_path))
+        matching = [child for child in rels_root2 if child.get("Id") == relationship_id]
+        if len(matching) != 1:
+            return {
+                "error": (
+                    "post-write verification failed: relationship id "
+                    f"{relationship_id!r} bijection violated -- expected "
+                    f"exactly one matching <Relationship>, found "
+                    f"{len(matching)}"
+                )
+            }
+        resolved_target = _rel_target_part_name(matching[0].get("Target") or "", "word")
+        if resolved_target != media_part_name:
+            return {
+                "error": (
+                    f"post-write verification failed: relationship "
+                    f"{relationship_id!r} targets {resolved_target!r}, "
+                    f"expected {media_part_name!r}"
+                )
+            }
+        if media_part_name not in names2:
+            return {
+                "error": (
+                    f"post-write verification failed: media part "
+                    f"{media_part_name!r} is missing from the package "
+                    "after the write"
+                )
+            }
+        actual_bytes = zf2.read(media_part_name)
+        if actual_bytes != expected_media_bytes:
+            return {
+                "error": (
+                    f"post-write verification failed: media part "
+                    f"{media_part_name!r} bytes do not match what was "
+                    "written"
+                )
+            }
+
+        media_names = {name for name in names2 if name.startswith("word/media/")}
+        bijection = _docx_media_bijection_report(media_names, rels_root2)
+        if media_part_name in bijection["shared_media"]:
+            return {
+                "error": (
+                    f"post-write verification failed: media part "
+                    f"{media_part_name!r} bijection violated -- referenced "
+                    "by multiple relationships "
+                    f"{bijection['shared_media'][media_part_name]!r}"
+                )
+            }
+
+        content_types_path = "[Content_Types].xml"
+        if content_types_path not in names2:
+            return {
+                "error": (
+                    f"post-write verification failed: {content_types_path} "
+                    "is missing after the write"
+                )
+            }
+        content_types_root2 = ET.fromstring(zf2.read(content_types_path))
+        extension = os.path.splitext(media_part_name)[1].lstrip(".").lower()
+        ct_default = _q(_CONTENT_TYPES_NS, "Default")
+        ct_override = _q(_CONTENT_TYPES_NS, "Override")
+        has_default = any(
+            child.tag == ct_default and child.get("Extension", "").lower() == extension
+            for child in content_types_root2
+        )
+        has_override = any(
+            child.tag == ct_override and child.get("PartName") == f"/{media_part_name}"
+            for child in content_types_root2
+        )
+        if not (has_default or has_override):
+            return {
+                "error": (
+                    "post-write verification failed: [Content_Types].xml "
+                    "declares no Default or Override content-type entry "
+                    f"for {media_part_name!r} after the write"
+                )
+            }
+    return None
+
+
+def insert_docx_media_part(
+    docx_path: str,
+    image_path: str,
+    anchor_para_id: str | None = None,
+    position: str = "after",
+    width_inches: float | None = None,
+    height_inches: float | None = None,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """d371b00b -- safe insertion of a brand-new image/media package member.
+
+    Lower-level, caption-less sibling of :func:`insert_figure_block` (pair
+    with :func:`insert_caption` / :func:`insert_figure_block` for a captioned
+    figure -- same documented two-step composition :func:`insert_image`
+    already offers). What this primitive adds beyond :func:`insert_image`:
+
+    * COLLISION-FREE relationship id (:func:`_next_relationship_id`) and
+      media part name (:func:`_next_media_name`) generation, re-verified
+      (not just trusted) before use.
+    * MATCHING content-type entries: reuses an existing ``Default`` for the
+      image's extension when its declared ContentType already matches;
+      registers a new ``Default`` when the extension is wholly new to the
+      package; and falls back to a part-specific ``Override`` (never
+      mutating a pre-existing, DIFFERENT ``Default`` out from under every
+      other part relying on it) when the extension's Default disagrees with
+      this image's own content type.
+    * The SAME drawing/frame-extent construction :func:`insert_figure_block`
+      uses (:func:`_build_image_drawing` / :func:`_image_size_emu`).
+    * An explicit post-write relationship<->media BIJECTION check
+      (:func:`_verify_media_part_insertion_write`) -- the new relationship id
+      and the new media part must be a clean 1:1 pairing, not merely "both
+      present somewhere" -- before the write is ever reported as successful.
+
+    Routes through :func:`_save_docx_with_new_parts_stdlib` with
+    ``protected_keys=("style_count",)`` (media/relationship counts are
+    EXPECTED to grow by exactly one here -- this write's entire point --
+    unlike that helper's other, non-media-touching callers), holds
+    :func:`_docx_promotion_lock` across stage+promote -> verify ->
+    conditional restore (5988a5bb discipline, identical to
+    :func:`insert_figure_block`), and runs the SAME tri-state real-render
+    canary after structural verification passes
+    (:func:`_enforce_render_verification`) -- ``allow_degraded_render`` /
+    ``degraded_render_reason`` are the identical audited opt-in.
+
+    Anchor resolution (``anchor_para_id`` / ``position``), supported image
+    formats, and dimension inference all match :func:`insert_image`.
+
+    Returns ``{status, image_para_id, image_name, relationship_id,
+    content_type_action, width_emu, height_emu, docx_path, render_status,
+    render_verified, ...}``, or ``{"error": message}`` without mutating the
+    document on validation failure, structural/bijection verification
+    failure, or render-verification failure that could not be cleanly
+    restored.
+    """
+    if not isinstance(docx_path, str) or not docx_path:
+        return {"error": "docx_path must be a non-empty string"}
+    if not isinstance(image_path, str) or not image_path:
+        return {"error": "image_path must be a non-empty string"}
+    if position not in ("before", "after"):
+        return {"error": "position must be before or after"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+    suffix = os.path.splitext(image_path)[1].lower()
+    image_type = _IMAGE_TYPES.get(suffix)
+    if image_type is None:
+        return {"error": f"unsupported image format: {suffix or 'missing extension'}"}
+    if width_inches is not None and width_inches <= 0:
+        return {"error": "width_inches must be greater than zero"}
+    if height_inches is not None and height_inches <= 0:
+        return {"error": "height_inches must be greater than zero"}
+    try:
+        with open(image_path, "rb") as handle:
+            image_bytes = handle.read()
+    except OSError as exc:
+        return {"error": f"could not read image {image_path}: {exc}"}
+    if not image_bytes:
+        return {"error": f"image file is empty: {image_path}"}
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+        width_emu, height_emu = _image_size_emu(
+            image_bytes, suffix, width_inches, height_inches
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"document has no body: {docx_path}"}
+    children = list(body)
+    if anchor_para_id is None:
+        insert_at = next(
+            (idx for idx, child in enumerate(children) if child.tag == _q(_W, "sectPr")),
+            len(children),
+        )
+    else:
+        located = _find_para_by_id(root, anchor_para_id)
+        if located is None:
+            return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+        _located_body, anchor, anchor_idx = located
+        if _located_body is not body or children[anchor_idx] is not anchor:
+            return {
+                "error": (
+                    "anchor_para_id must identify a direct body paragraph; "
+                    "table-cell paragraphs cannot anchor image insertion"
+                )
+            }
+        insert_at = anchor_idx + (1 if position == "after" else 0)
+
+    entries = _docx_zip_entries(raw)
+    rels_path = "word/_rels/document.xml.rels"
+    rels_xml = entries.get(rels_path)
+    rels_root = (
+        ET.fromstring(rels_xml)
+        if rels_xml
+        else ET.Element(_q(_PACKAGE_REL_NS, "Relationships"))
+    )
+
+    # Collision-free relationship id -- re-asserted explicitly (never just
+    # trusted) rather than only relying on _next_relationship_id's own
+    # correctness, since a colliding id would silently corrupt the bijection
+    # this primitive exists to guarantee.
+    relationship_id = _next_relationship_id(rels_root)
+    if any(child.get("Id") == relationship_id for child in rels_root):
+        return {
+            "error": (
+                f"internal error: generated relationship id "
+                f"{relationship_id!r} already exists in {rels_path}"
+            )
+        }
+
+    # Collision-free media part name -- same explicit re-assertion.
+    image_name = _next_media_name(entries, f".{image_type[0]}")
+    if image_name in entries:
+        return {
+            "error": (
+                f"internal error: generated media part name {image_name!r} "
+                f"already exists in {docx_path}"
+            )
+        }
+
+    taken = _existing_para_ids(root)
+    image_para_id = _new_para_id(taken)
+    doc_pr_id = len(root.findall(f".//{_q(_WP, 'docPr')}")) + 1
+
+    paragraph = ET.Element(_q(_W, "p"))
+    paragraph.set(_q(_W14, "paraId"), image_para_id)
+    ppr = ET.SubElement(paragraph, _q(_W, "pPr"))
+    ET.SubElement(ppr, _q(_W, "jc"), {_q(_W, "val"): "center"})
+    run = ET.SubElement(paragraph, _q(_W, "r"))
+    run.append(
+        _build_image_drawing(relationship_id, width_emu, height_emu, doc_pr_id, image_name)
+    )
+    body.insert(insert_at, paragraph)
+
+    ET.SubElement(
+        rels_root, _q(_PACKAGE_REL_NS, "Relationship"),
+        {
+            "Id": relationship_id,
+            "Type": _IMAGE_REL_TYPE,
+            "Target": f"media/{os.path.basename(image_name)}",
+        },
+    )
+    new_rels_bytes = ET.tostring(rels_root, encoding="utf-8", xml_declaration=True)
+
+    content_types_xml = entries.get("[Content_Types].xml")
+    content_types_root = (
+        ET.fromstring(content_types_xml)
+        if content_types_xml
+        else ET.Element(_q(_CONTENT_TYPES_NS, "Types"))
+    )
+    extension = os.path.splitext(image_name)[1].lstrip(".")
+    content_type = image_type[1]
+    ct_default = _q(_CONTENT_TYPES_NS, "Default")
+    ct_override = _q(_CONTENT_TYPES_NS, "Override")
+    existing_default = next(
+        (
+            child for child in content_types_root
+            if child.tag == ct_default
+            and child.get("Extension", "").lower() == extension.lower()
+        ),
+        None,
+    )
+    if existing_default is None:
+        ET.SubElement(
+            content_types_root, ct_default,
+            {"Extension": extension, "ContentType": content_type},
+        )
+        content_type_action = "default_added"
+    elif existing_default.get("ContentType") == content_type:
+        content_type_action = "default_reused"
+    else:
+        # The extension's shared Default disagrees with THIS part's required
+        # content type -- add a part-specific Override instead of mutating a
+        # Default entry every other part with this extension may rely on.
+        ET.SubElement(
+            content_types_root, ct_override,
+            {"PartName": f"/{image_name}", "ContentType": content_type},
+        )
+        content_type_action = "override_added"
+    new_ct_bytes = ET.tostring(content_types_root, encoding="utf-8", xml_declaration=True)
+
+    new_document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+        + ET.tostring(root, encoding="unicode")
+    ).encode("utf-8")
+
+    updated_parts: dict[str, bytes] = {
+        rels_path: new_rels_bytes,
+        "[Content_Types].xml": new_ct_bytes,
+        "word/document.xml": new_document_xml,
+        image_name: image_bytes,
+    }
+
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_with_new_parts_stdlib(
+                raw, updated_parts, docx_path,
+                protected_keys=("style_count",),
+            )
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        promoted_sha256 = transaction.get("promoted_sha256")
+
+        verify_error = _verify_media_part_insertion_write(
+            docx_path,
+            image_para_id=image_para_id,
+            relationship_id=relationship_id,
+            media_part_name=image_name,
+            expected_media_bytes=image_bytes,
+            expected_width_emu=width_emu,
+            expected_height_emu=height_emu,
+        )
+        if verify_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["image_para_id"] = image_para_id
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+        render_error, render_info = _enforce_render_verification(
+            docx_path,
+            promoted_sha256=promoted_sha256,
+            allow_degraded_render=allow_degraded_render,
+            degraded_render_reason=degraded_render_reason,
+        )
+        if render_error is not None:
+            render_error["image_para_id"] = image_para_id
+            render_error["docx_path"] = docx_path
+            return render_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+    return {
+        "status": "inserted",
+        "image_para_id": image_para_id,
+        "image_name": image_name,
+        "relationship_id": relationship_id,
+        "content_type_action": content_type_action,
+        "width_emu": width_emu,
+        "height_emu": height_emu,
+        "docx_path": docx_path,
+        **render_info,
+    }
+
+
 def find_image_paragraph(
     docx_path: str,
     figure_index: int | None = None,
@@ -4777,6 +5988,7 @@ def insert_caption(
     style_policy: dict[str, Any] | None = None,
     allow_degraded_render: bool = False,
     degraded_render_reason: str | None = None,
+    artifact_provenance: "dict[str, Any] | None" = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real Word Caption paragraph into a .docx file.
 
@@ -4839,6 +6051,14 @@ def insert_caption(
                          extension does not persist it itself — a caller with
                          DB access, e.g. Meridian core, is responsible for
                          logging/pinning it).
+        artifact_provenance: 6d02f343 — a caller-precomputed figure/table
+                         provenance-binding verdict (see
+                         :func:`_check_artifact_provenance_binding`),
+                         checked only AFTER structural and render
+                         verification above both succeed. Not cleanly
+                         ``all_clear`` fails the write closed with the same
+                         restore-if-safe handling as a structural or render
+                         failure. ``None`` (the default) skips this check.
 
     Returns:
         ``{status, kind, seq_number, label_text, section_heading, ref_bookmark,
@@ -4986,6 +6206,47 @@ def insert_caption(
             render_error["kind"] = kind
             render_error["docx_path"] = docx_path
             return render_error
+
+        # 6d02f343 -- structural AND render verification have both already
+        # succeeded above; only now is it safe to additionally gate on
+        # artifact provenance (this item's own instruction: caption edits
+        # "update provenance only after structural verification succeeds").
+        # Still inside the promotion lock, so a fail-closed restore gets the
+        # same CAS safety every other verification failure here gets.
+        artifact_provenance_error = _check_artifact_provenance_binding(
+            artifact_provenance
+        )
+        if artifact_provenance_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            artifact_provenance_error["file_restored"] = restored
+            artifact_provenance_error["concurrent_write_detected"] = (
+                concurrent_write_detected
+            )
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    artifact_provenance_error["error"] = (
+                        artifact_provenance_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    artifact_provenance_error["error"] = (
+                        artifact_provenance_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            artifact_provenance_error["kind"] = kind
+            artifact_provenance_error["docx_path"] = docx_path
+            return artifact_provenance_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
@@ -7272,28 +8533,67 @@ def insert_equation_local(
     }
 
 
+def _direct_parent_in_paragraph(
+    para_elem: ET.Element, target: ET.Element
+) -> ET.Element | None:
+    """b6a9ec99 -- find ``target``'s real direct parent within ``para_elem``.
+
+    ``xml.etree.ElementTree`` gives no parent pointers, so this walks every
+    element in the paragraph (itself included) and returns the first one
+    whose immediate children contain ``target`` (by identity -- ``Element``
+    has no custom ``__eq__``, so ``in`` here is exactly "is this the same
+    node", never a structural/content match). Returns ``None`` if ``target``
+    is not a descendant of ``para_elem`` at all.
+    """
+    for candidate in para_elem.iter():
+        if target in list(candidate):
+            return candidate
+    return None
+
+
 def edit_equation_local(
     docx_path: str,
     equation_para_id: str,
     new_payload: str,
+    equation_index: int | None = None,
     index_db_path: str | None = None,
 ) -> dict[str, Any]:
     """a80af3a0 — Replace the <m:oMath> in an existing equation paragraph.
 
     Locates the paragraph by equation_para_id, verifies it contains at
-    least one <m:oMath>, removes all existing equation containers, and
-    inserts the new equation (resolved from OMML or LaTeX). The replacement
-    occupies the first existing equation slot so surrounding text runs retain
-    their original order.
+    least one <m:oMath>, and replaces exactly ONE targeted equation with a
+    precise single-element swap inside that equation's OWN real parent --
+    the paragraph itself, a display-equation <m:oMathPara> wrapper, or any
+    other container the source document nested it in (e.g. a hyperlink or
+    content control). Every other child of that parent -- other equations,
+    text runs, fields, bookmarks, drawings -- keeps its exact original
+    identity and order; nothing is ever rebuilt or reordered wholesale.
+
+    b6a9ec99 -- fail-closed hardening. The previous implementation rebuilt
+    the paragraph's ENTIRE child list and kept only the FIRST direct
+    <m:oMath>/<m:oMathPara> child, silently discarding every other
+    equation a multi-equation paragraph held (real data loss with no error
+    and no warning). It also picked the first nested <m:oMath> found
+    anywhere in the paragraph via document-order traversal without ever
+    checking whether that pick was unambiguous. Both are fixed here: when
+    the paragraph contains more than one <m:oMath> (direct children,
+    equations nested elsewhere, or several stacked under one shared
+    <m:oMathPara>), equation_index is now REQUIRED -- mirroring
+    append_text_run_after_math's existing math_index contract -- so this
+    function never again guesses which equation to touch.
 
     Args:
         docx_path:         Absolute path to the .docx file (mutated in place).
         equation_para_id:  w14:paraId or p{N} of the equation paragraph.
         new_payload:       Raw OMML XML or LaTeX expression.
+        equation_index:    0-based index (document order) of which equation
+                            to replace when the paragraph holds more than
+                            one. Required in that case; ignored (the sole
+                            equation is used) when there is exactly one.
         index_db_path:     If supplied, sidecar is invalidated after write.
 
     Returns:
-        {status, equation_para_id, omml, docx_path}
+        {status, equation_para_id, equation_index, omml, docx_path}
         or {"error": <message>} on failure.
     """
     if not new_payload or not str(new_payload).strip():
@@ -7320,8 +8620,6 @@ def edit_equation_local(
     _body, para_elem, _cidx = result
 
     m_omath_tag = _qm("oMath")
-    m_omath_para_tag = _qm("oMathPara")
-    equation_container_tags = (m_omath_tag, m_omath_para_tag)
     existing = list(para_elem.iter(m_omath_tag))
     if not existing:
         return {
@@ -7331,36 +8629,42 @@ def edit_equation_local(
             )
         }
 
-    # Replace the first direct equation container in place. A display equation
-    # may be wrapped in <m:oMathPara>; replacing that wrapper preserves the
-    # paragraph child slot just as replacing a direct <m:oMath> does.
-    replacement = ET.fromstring(omml)
-    direct_containers = [
-        child for child in list(para_elem) if child.tag in equation_container_tags
-    ]
-    if direct_containers:
-        new_children = []
-        inserted = False
-        for child in list(para_elem):
-            if child.tag in equation_container_tags:
-                if not inserted:
-                    new_children.append(replacement)
-                    inserted = True
-            else:
-                new_children.append(child)
-        para_elem[:] = new_children
+    if equation_index is None and len(existing) != 1:
+        return {
+            "error": (
+                f"paragraph {equation_para_id!r} contains {len(existing)} equations; "
+                "equation_index is required to avoid guessing which one to replace"
+            )
+        }
+    if equation_index is None:
+        selected_index = 0
+    elif not isinstance(equation_index, int) or isinstance(equation_index, bool):
+        return {"error": "equation_index must be a non-negative integer"}
+    elif equation_index < 0 or equation_index >= len(existing):
+        return {
+            "error": (
+                f"equation_index {equation_index} is out of range for "
+                f"{len(existing)} equations"
+            )
+        }
     else:
-        # Preserve legacy behavior for unusual nested equation markup by
-        # replacing the first nested <m:oMath> in its existing parent.
-        parent = next(
-            (candidate for candidate in para_elem.iter() if existing[0] in list(candidate)),
-            None,
-        )
-        if parent is None:
-            return {"error": "could not locate the existing equation container"}
-        children = list(parent)
-        children[children.index(existing[0])] = replacement
-        parent[:] = children
+        selected_index = equation_index
+
+    target_omath = existing[selected_index]
+    target_parent = _direct_parent_in_paragraph(para_elem, target_omath)
+    if target_parent is None:
+        return {"error": "could not locate the existing equation container"}
+
+    # Precise single-slot swap: replace ONLY target_omath within its own
+    # direct parent's children, at its own index. Whether that parent is
+    # the paragraph, an <m:oMathPara> wrapper (preserved intact -- including
+    # any oMathParaPr formatting -- unlike the old wrapper-replacing path),
+    # or a deeper nested container, every sibling keeps its exact identity
+    # and order.
+    replacement = ET.fromstring(omml)
+    siblings = list(target_parent)
+    siblings[siblings.index(target_omath)] = replacement
+    target_parent[:] = siblings
 
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)
@@ -7372,6 +8676,7 @@ def edit_equation_local(
     return {
         "status": "edited",
         "equation_para_id": equation_para_id,
+        "equation_index": selected_index,
         "omml": omml,
         "docx_path": docx_path,
     }
@@ -7434,19 +8739,60 @@ def append_text_run_after_math(
         selected_index = math_index
 
     selected = equations[selected_index]
-    parent = next(
-        (candidate for candidate in para_elem.iter() if selected in list(candidate)),
-        None,
-    )
-    if parent is None:
+    direct_parent = _direct_parent_in_paragraph(para_elem, selected)
+    if direct_parent is None:
         return {"error": "could not locate the selected equation container"}
+
+    # b6a9ec99 -- a bare <w:r> run is not a schema-valid child of
+    # <m:oMathPara> (CT_OMathPara only allows an optional oMathParaPr plus
+    # one or more oMath elements); the old code inserted directly inside it
+    # whenever a display equation happened to be wrapped that way, silently
+    # producing ill-formed OOXML. Climb to insert after the WHOLE wrapper
+    # instead -- but only when `selected` is the SOLE equation inside it: a
+    # multi-equation <m:oMathPara> block has no single unambiguous "right
+    # after this one" slot without splitting the block apart, so that case
+    # is rejected below rather than guessed at.
+    m_omath_para_tag = _qm("oMathPara")
+    if direct_parent.tag == m_omath_para_tag:
+        stacked = [c for c in direct_parent if c.tag == m_omath_tag]
+        if len(stacked) != 1:
+            return {
+                "error": (
+                    f"equation {selected_index} in paragraph {equation_para_id!r} is "
+                    "one of several equations stacked inside a shared <m:oMathPara> "
+                    "block; appending a run immediately after just one of them is "
+                    "ambiguous -- edit the paragraph directly instead"
+                )
+            }
+        container_elem = direct_parent
+        container_parent = _direct_parent_in_paragraph(para_elem, direct_parent)
+    else:
+        container_elem = selected
+        container_parent = direct_parent
+
+    # Fail closed rather than guess: only insert when the resolved slot is a
+    # DIRECT child of the paragraph itself. An equation nested any deeper --
+    # inside a hyperlink, a content control's sdtContent, a drawing's
+    # txbxContent, or similar -- has no single obviously-correct place for a
+    # brand-new run relative to that container's own semantics (e.g.
+    # inserting inside a hyperlink would silently make the appended text
+    # part of the hyperlink).
+    if container_parent is not para_elem:
+        return {
+            "error": (
+                f"equation {selected_index} in paragraph {equation_para_id!r} is "
+                "nested inside a container (hyperlink, content control, drawing "
+                "text box, or similar) this tool will not guess an insertion "
+                "point inside of -- edit the paragraph directly instead"
+            )
+        }
 
     run = ET.Element(_q(_W, "r"))
     text_elem = ET.SubElement(run, _q(_W, "t"))
     text_elem.text = text
-    children = list(parent)
-    children.insert(children.index(selected) + 1, run)
-    parent[:] = children
+    children = list(container_parent)
+    children.insert(children.index(container_elem) + 1, run)
+    container_parent[:] = children
 
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)
@@ -8161,11 +9507,37 @@ def update_bibliography_entry(
     if not formatted_text.strip():
         return {"error": "formatted reference text is empty — malformed CSL-JSON item?"}
 
-    # Replace the first <w:t> text run in the paragraph.
-    for t_el in entry_elem.iter(_q(_W, "t")):
-        t_el.text = formatted_text
-        t_el.set(_q(_XML_NS, "space"), "preserve")
-        break
+    # b6a9ec99 -- fail-closed hardening: the prior implementation replaced
+    # only the FIRST <w:t> found (via document-order iteration) and `break`,
+    # unconditionally. Two related gaps: a paragraph with zero <w:t> runs
+    # (e.g. hand-edited down to just its bookmark pair) silently reported
+    # {"status": "updated"} despite writing nothing; a paragraph with MORE
+    # than one <w:t> silently overwrote only the first and left every other
+    # run's stale old text sitting right next to the new text -- corrupting
+    # the entry rather than updating it. Both now fail closed instead of
+    # guessing. This does not touch element order/structure at all (only
+    # .text on the single matched node), so it carries no OMML/child-order
+    # risk of its own -- it does not share edit_equation_local's rewrite path.
+    text_elems = list(entry_elem.iter(_q(_W, "t")))
+    if not text_elems:
+        return {
+            "error": (
+                f"bibliography entry {clean_key!r} has no <w:t> text run to update "
+                "-- the paragraph may have been hand-edited into an unexpected "
+                "shape; fix it in Word or remove and re-insert the entry"
+            )
+        }
+    if len(text_elems) > 1:
+        return {
+            "error": (
+                f"bibliography entry {clean_key!r} contains {len(text_elems)} text "
+                "runs; refusing to guess which one holds the reference text -- "
+                "silently overwriting the first and leaving the rest stale would "
+                "corrupt the entry -- fix it in Word or remove and re-insert it"
+            )
+        }
+    text_elems[0].text = formatted_text
+    text_elems[0].set(_q(_XML_NS, "space"), "preserve")
 
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)
@@ -11679,6 +13051,7 @@ def relocate_figure(
     allow_bookmark_split: bool = False,
     draft_output_path: str | None = None,
     wave_run_id: str | None = None,
+    artifact_provenance: "dict[str, Any] | None" = None,
 ) -> dict[str, Any]:
     """Relocate one image paragraph together with its immediately following Figure caption.
 
@@ -11713,6 +13086,15 @@ def relocate_figure(
     ``draft_output_path`` when given (fe989980; requires ``wave_run_id`` too
     -- see :func:`move_section`), else the input ``docx_path`` (unchanged
     legacy behavior).
+
+    ``artifact_provenance`` (6d02f343, optional) -- a caller-precomputed
+    figure/table/equation provenance-binding verdict (see
+    :func:`_check_artifact_provenance_binding`), forwarded to
+    :func:`_verify_docx_write` and checked only after this call's own
+    structural/hash/image-ownership checks all pass. Not cleanly
+    ``all_clear`` fails the write exactly like any other post-write
+    verification failure above (same restore-if-safe handling). ``None``
+    (the default) skips this check entirely -- unchanged behavior.
     """
     if destination_position not in ("before", "after"):
         return {
@@ -11888,6 +13270,7 @@ def relocate_figure(
             expected_counts=baseline_counts,
             expected_hash=expected_hash,
             expected_range=(insert_at, insert_at + removed_count),
+            artifact_provenance=artifact_provenance,
         )
         if verify_error is not None:
             # 5988a5bb -- do NOT blindly restore: a different (concurrent)
@@ -13470,7 +14853,13 @@ _MINIMAL_DOCUMENT_RELS_XML = (
 ).encode("utf-8")
 
 
-def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes], dest: str) -> None:
+def _save_docx_with_new_parts_stdlib(
+    raw: bytes,
+    updated_parts: dict[str, bytes],
+    dest: str,
+    *,
+    protected_keys: tuple[str, ...] = ("media_count", "style_count"),
+) -> dict[str, Any]:
     """Write MULTIPLE ZIP parts back into ``dest`` in one repackage.
 
     Unlike :func:`_save_docx_xml_stdlib` (which can only ever overwrite the
@@ -13479,18 +14868,35 @@ def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes]
     that are. Every other original ZIP member is preserved byte-for-byte.
 
     Hardened (dccc2311) to route through :func:`_atomic_write_docx_bytes`'s
-    stage -> verify -> promote transaction, gating media/style counts to be
-    UNCHANGED. Unlike :func:`_save_docx_xml_stdlib`, relationship and
-    equation counts are deliberately NOT gated here: every current caller of
-    this multi-part writer (insert_word_comment, highlight_document_matches,
+    stage -> verify -> promote transaction, gating ``protected_keys`` (default
+    ``("media_count", "style_count")``) to be UNCHANGED. Unlike
+    :func:`_save_docx_xml_stdlib`, relationship and equation counts are
+    deliberately NOT gated by the default: every pre-d371b00b caller of this
+    multi-part writer (insert_word_comment, highlight_document_matches,
     set_page_header/footer) legitimately adds relationships and/or new
     content-type overrides as part of a correct write, so a relationship-count
     delta is expected, not a corruption signal. Media and styles are never
-    legitimately touched by any of them, so those two stay hard invariants.
+    legitimately touched by any of them, so those two stay hard invariants by
+    default.
+
+    d371b00b -- ``protected_keys`` is now caller-overridable so a writer that
+    LEGITIMATELY changes media (:func:`insert_docx_media_part`, which adds a
+    brand-new ``word/media/*`` part as its entire point) can pass
+    ``protected_keys=("style_count",)`` instead of inheriting an invariant
+    that would always reject its own correct write. That caller is
+    responsible for its OWN precise verification of the media/relationship
+    delta it expects (see :func:`_verify_media_part_insertion_write`) --
+    widening ``protected_keys`` here only removes an invariant that would
+    always fire false-positive for it; it adds no new laxness of its own.
 
     Backs up the existing file to ``dest + ".bak"`` when it already exists
     (best-effort, non-fatal on failure -- same pattern as
     :func:`_save_docx_xml_stdlib`).
+
+    Returns :func:`_atomic_write_docx_bytes`'s transaction dict, ``{
+    "manifest_hash", "pre_counts", "post_counts", "promoted_sha256"}`` --
+    pre-existing callers that ignore the return value (every call site before
+    d371b00b) are unaffected.
     """
     out = io.BytesIO()
     written: set[str] = set()
@@ -13509,11 +14915,11 @@ def _save_docx_with_new_parts_stdlib(raw: bytes, updated_parts: dict[str, bytes]
                 if part_name not in written:
                     dst.writestr(part_name, data)
 
-    _atomic_write_docx_bytes(
+    return _atomic_write_docx_bytes(
         out.getvalue(),
         dest,
         pre_manifest=_docx_structural_manifest(raw),
-        protected_keys=("media_count", "style_count"),
+        protected_keys=protected_keys,
         changed_parts=dict(updated_parts),
     )
 
@@ -15440,6 +16846,523 @@ def build_document_review(
     }
 
 
+# ---------------------------------------------------------------------------
+# d092d2a4 -- authoritative figure/table/caption OWNERSHIP graph, read-only.
+#
+# build_document_review (b67ec6b5, above) intentionally reserves "structure"
+# / "section_page" / "ownership" as always-0 categories in its first version
+# (see REVIEW_CATEGORIES's docstring -- "reserved ... see the sprint item
+# notes"). This is that follow-up: a dedicated read-only audit exposing the
+# ownership/structural-integrity detectors those placeholders were left for.
+# Kept as its OWN tool rather than folded into build_document_review because
+# it does real additional work (a second document_content_tree walk plus a
+# raw-XML image/table-cell scan) that a caller who only wants the lighter
+# equation/caption/provenance findings should not have to pay for.
+#
+# Composes ONLY existing read-only primitives -- document_content_tree (via
+# the vendored copy; duplicate_para_ids/w14:paraId-collision detection comes
+# for free from it), _direct_body_image_paragraphs / _has_figure_seq_field /
+# _image_paragraph_relationship_ids (the SAME building blocks
+# _verify_image_ownership composes -- reused directly rather than
+# re-derived), _is_figure_caption / _is_table_caption / _seq_cached_number,
+# find_image_paragraph (cross-check for the total image-paragraph count,
+# body + table cells), get_structure_freshness / get_local_structure_elements
+# (sidecar staleness/emptiness), and _find_para_by_id (round-trip validation
+# that every emitted node id actually resolves). No detector here mutates
+# anything, and none uses vector/semantic search as authority for XML
+# integrity -- every finding is derived from parsed OOXML structure.
+#
+# Every paragraph/heading node's "id" is the SAME three-tier scheme
+# _find_para_by_id / document_content_tree already resolve (native
+# w14:paraId > synthesized sp<hash> > legacy p{N}), so an id returned here
+# resolves correctly through locate_anchor / get_paragraph / insert_caption
+# without a second id space. Tables (no native paraId of their own) get a
+# stable f"table:{body_index}" id.
+# ---------------------------------------------------------------------------
+
+def _stable_body_id(
+    blocks_by_index: dict[int, dict[str, Any]],
+    index: int,
+    element: ET.Element | None,
+) -> str:
+    """Resolve the stable structural id for body-child *index*.
+
+    Prefers the native ``w14:paraId`` straight off *element*; falls back to
+    the matching :func:`document_content_tree` block's own ``para_id``
+    (covers the synthesized ``sp<hash>`` scheme for paragraphs with no
+    native id -- the same synth-id algorithm :func:`_find_para_by_id` itself
+    resolves, via the shared ``_vendored_content_tree`` module); falls back
+    to the ``body-index-N`` fallback :func:`_verify_image_ownership` already
+    uses for anything neither source resolves (a table, or an element
+    ``document_content_tree`` didn't emit a block for).
+    """
+    if element is not None:
+        native = element.get(_q(_W14, "paraId"))
+        if native:
+            return native
+    block = blocks_by_index.get(index)
+    if block is not None and block.get("para_id"):
+        return block["para_id"]
+    return f"body-index-{index}"
+
+
+def _table_cell_image_findings(body: ET.Element) -> list[dict[str, Any]]:
+    """Images embedded inside table cells can never be resolved by the
+    direct-body "immediately followed by a SEQ Figure caption" ownership
+    rule every other detector in this module relies on -- a caption
+    paragraph is, per that same OOXML idiom, a DIRECT BODY sibling, never a
+    table-cell paragraph, so a table-cell image's caption (if any) cannot be
+    attributed positionally. Every such image is reported as an ownership
+    ambiguity -- informational, not necessarily a defect -- rather than
+    silently assumed orphaned or silently assumed fine.
+    """
+    findings: list[dict[str, Any]] = []
+    w_p = _q(_W, "p")
+    w_tbl = _q(_W, "tbl")
+    w_tr = _q(_W, "tr")
+    w_tc = _q(_W, "tc")
+    w_drawing = _q(_W, "drawing")
+    w_pict = _q(_W, "pict")
+
+    for table_index, table_el in enumerate(body):
+        if table_el.tag != w_tbl:
+            continue
+        # Matches the f"table:{idx}" id every table node is given above --
+        # both derive from the same direct-body-child index.
+        table_id = f"table:{table_index}"
+        for row_idx, tr in enumerate(table_el.findall(w_tr)):
+            for col_idx, tc in enumerate(tr.findall(w_tc)):
+                for cell_para in tc.findall(w_p):
+                    has_image = (
+                        cell_para.find(f".//{w_drawing}") is not None
+                        or cell_para.find(f".//{w_pict}") is not None
+                    )
+                    if not has_image:
+                        continue
+                    findings.append({
+                        "type": "table_cell_image_ambiguity",
+                        "severity": "info",
+                        "table_id": table_id,
+                        "table_body_index": table_index,
+                        "row": row_idx,
+                        "col": col_idx,
+                        "relationship_ids": _image_paragraph_relationship_ids(cell_para),
+                        "detail": (
+                            "image embedded inside a table cell; ownership by "
+                            "position cannot be resolved the way direct-body "
+                            "image/caption adjacency can -- reported for "
+                            "manual review, not auto-classified as orphaned"
+                        ),
+                    })
+    return findings
+
+
+def audit_document(
+    docx_path: str,
+    *,
+    index_db_path: str | None = None,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """d092d2a4 -- read-only, authoritative figure/table/caption ownership
+    audit: reconciles headings, paragraphs, captions, embedded media,
+    relationships, and tables into ONE structural-ownership graph with
+    stable ids, plus a findings list for known integrity defect classes.
+
+    Re-reads ``docx_path`` FRESH FROM DISK on every call -- same "no sidecar
+    index, so nothing can go stale between calls" discipline as
+    :func:`locate_anchor` / :func:`build_document_review`. Pass
+    ``expected_source_fingerprint`` (a value previously returned as
+    ``source_fingerprint``) to detect the document having changed underneath
+    a stashed audit; a mismatch short-circuits to ``{"status": "stale", ...}``
+    with empty findings rather than resolving against what may now be the
+    wrong document.
+
+    Detects, as distinct finding ``type`` values:
+
+      * ``orphan_image``                  -- an image paragraph (or adjacent
+                                              multi-image composite) not
+                                              immediately followed by a SEQ
+                                              Figure caption.
+      * ``repeated_embed``                -- the same ``r:embed``
+                                              relationship id referenced by
+                                              more than one independent image
+                                              block (a copy/duplicate
+                                              operation that forgot to mint a
+                                              fresh relationship).
+      * ``caption_only_figure``           -- a SEQ Figure caption with no
+                                              image paragraph immediately
+                                              before or nearby.
+      * ``non_adjacent_caption_attachment`` -- a SEQ Figure caption not
+                                              immediately preceded by an
+                                              image, but with one nearby
+                                              (within a small backward
+                                              window, not crossing a
+                                              heading) -- likely mis-anchored
+                                              rather than truly orphaned.
+      * ``table_cell_image_ambiguity``    -- an image embedded in a table
+                                              cell, whose ownership cannot be
+                                              resolved by direct-body
+                                              adjacency at all.
+      * ``duplicate_para_id``             -- a native ``w14:paraId`` value
+                                              assigned to more than one
+                                              paragraph (via
+                                              ``document_content_tree``'s own
+                                              collision report -- this
+                                              function never renumbers or
+                                              otherwise repairs one it
+                                              finds).
+      * ``stale_or_empty_sidecar``        -- (only when ``index_db_path`` is
+                                              given) the structural sidecar
+                                              is not trustworthy (stale/
+                                              incomplete), or is trustworthy
+                                              but reports zero headings/
+                                              figures/tables while the source
+                                              document is non-empty.
+      * ``unresolvable_structural_id``    -- (defensive) an emitted node id
+                                              did not round-trip through
+                                              :func:`_find_para_by_id`; would
+                                              indicate an id-scheme drift bug
+                                              in this function itself, never
+                                              expected in normal operation.
+
+    Returns ``{status: "ok", docx_path, source_fingerprint, nodes, edges,
+    duplicate_relationships, total_image_paragraphs, sidecar, findings,
+    finding_count, findings_by_type}`` on success, ``{status: "stale", ...}``
+    on a fingerprint mismatch, or ``{"error": <message>}`` when the file
+    cannot be read or parsed. Never mutates ``docx_path``.
+    """
+    try:
+        with open(docx_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    source_fingerprint = _source_fingerprint(raw)
+    if expected_source_fingerprint and expected_source_fingerprint != source_fingerprint:
+        return {
+            "status": "stale",
+            "docx_path": docx_path,
+            "reason": "source_fingerprint_mismatch",
+            "expected_source_fingerprint": expected_source_fingerprint,
+            "source_fingerprint": source_fingerprint,
+            "nodes": [],
+            "edges": [],
+            "findings": [],
+            "finding_count": 0,
+            "findings_by_type": {},
+        }
+
+    from ._vendored_content_tree import document_content_tree  # noqa: PLC0415
+
+    try:
+        tree = document_content_tree(raw)
+    except (zipfile.BadZipFile, ET.ParseError, KeyError) as exc:
+        return {"error": str(exc)}
+
+    try:
+        _raw2, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": f"{docx_path} has no <w:body> element"}
+
+    blocks: list[dict[str, Any]] = tree.get("blocks") or []
+    blocks_by_index = {b["index"]: b for b in blocks}
+    body_list = list(body)
+    w_p = _q(_W, "p")
+
+    # ---- Nodes: one entry per heading/paragraph/table. ----
+    nodes: list[dict[str, Any]] = []
+    for block in blocks:
+        idx = block["index"]
+        if block["kind"] == "table":
+            nodes.append({
+                "id": f"table:{idx}", "kind": "table", "index": idx,
+                "row_count": block.get("row_count", 0),
+                "col_count": block.get("col_count", 0),
+            })
+            continue
+        node: dict[str, Any] = {
+            "id": block.get("para_id") or f"p{idx}",
+            "kind": block["kind"],
+            "index": idx,
+            "text": (block.get("text") or "")[:200],
+        }
+        if block["kind"] == "heading":
+            node["level"] = block.get("level")
+        if _is_figure_caption(block):
+            node["role"] = "figure_caption"
+            node["seq_number"] = _seq_cached_number(block, _SEQ_FIGURE_RE)
+        elif _is_table_caption(block):
+            node["role"] = "table_caption"
+            node["seq_number"] = _seq_cached_number(block, _SEQ_TABLE_RE)
+        nodes.append(node)
+
+    # ---- Image ownership: the SAME grouping _verify_image_ownership uses. ----
+    image_paras = _direct_body_image_paragraphs(body)
+    image_para_indices = {idx for idx, _ in image_paras}
+
+    image_nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
+    relationship_owners: dict[str, list[str]] = {}
+    orphan_or_uncaptioned: list[dict[str, Any]] = []
+
+    pos = 0
+    while pos < len(image_paras):
+        group_start = pos
+        while (
+            pos + 1 < len(image_paras)
+            and image_paras[pos + 1][0] == image_paras[pos][0] + 1
+        ):
+            pos += 1
+        group = image_paras[group_start:pos + 1]
+        pos += 1
+
+        block_key = _stable_body_id(blocks_by_index, group[0][0], group[0][1])
+        member_ids: list[str] = []
+        for member_idx, member_el in group:
+            member_id = _stable_body_id(blocks_by_index, member_idx, member_el)
+            member_ids.append(member_id)
+            rel_ids = _image_paragraph_relationship_ids(member_el)
+            for rel_id in rel_ids:
+                relationship_owners.setdefault(rel_id, []).append(block_key)
+            image_nodes.append({
+                "id": member_id, "kind": "image", "index": member_idx,
+                "relationship_ids": rel_ids, "composite_key": block_key,
+                "composite_size": len(group),
+            })
+
+        last_idx = group[-1][0]
+        next_idx = last_idx + 1
+        has_caption = (
+            next_idx < len(body_list)
+            and body_list[next_idx].tag == w_p
+            and _has_figure_seq_field(body_list[next_idx])
+        )
+        if has_caption:
+            caption_id = _stable_body_id(blocks_by_index, next_idx, body_list[next_idx])
+            for member_id in member_ids:
+                edges.append({
+                    "type": "image_caption", "image_id": member_id,
+                    "caption_id": caption_id,
+                })
+        else:
+            orphan_or_uncaptioned.append({
+                "composite_key": block_key, "image_ids": member_ids,
+                "composite_size": len(group),
+            })
+
+    duplicate_relationships = {
+        rel_id: sorted(set(owners))
+        for rel_id, owners in relationship_owners.items()
+        if len(set(owners)) > 1
+    }
+
+    findings: list[dict[str, Any]] = []
+
+    for orphan in orphan_or_uncaptioned:
+        findings.append({
+            "type": "orphan_image",
+            "severity": "warning",
+            "composite_key": orphan["composite_key"],
+            "image_ids": orphan["image_ids"],
+            "composite_size": orphan["composite_size"],
+            "detail": (
+                "image paragraph(s) not immediately followed by a SEQ "
+                "Figure caption"
+            ),
+        })
+
+    for rel_id, owners in duplicate_relationships.items():
+        findings.append({
+            "type": "repeated_embed",
+            "severity": "error",
+            "relationship_id": rel_id,
+            "owning_blocks": owners,
+            "detail": (
+                "the same r:embed relationship id is referenced by more "
+                "than one independent image block -- a copy/duplicate "
+                "operation likely reused a relationship instead of minting "
+                "a fresh one"
+            ),
+        })
+
+    # Caption-only figures / non-adjacent caption attachment: a figure
+    # caption whose immediately preceding body child is NOT an image. Look a
+    # bounded window backward (stopping at a heading boundary) for a nearby
+    # image before concluding there is no image at all.
+    for block in blocks:
+        if block["kind"] != "paragraph" or not _is_figure_caption(block):
+            continue
+        idx = block["index"]
+        if (idx - 1) in image_para_indices:
+            continue  # immediately-adjacent case is not a defect.
+        caption_id = block.get("para_id") or f"p{idx}"
+        nearby_image_idx: int | None = None
+        for lookback in range(1, 4):
+            candidate = idx - lookback
+            if candidate < 0:
+                break
+            candidate_block = blocks_by_index.get(candidate)
+            if candidate_block is not None and candidate_block["kind"] == "heading":
+                break
+            if candidate in image_para_indices:
+                nearby_image_idx = candidate
+                break
+        if nearby_image_idx is not None:
+            findings.append({
+                "type": "non_adjacent_caption_attachment",
+                "severity": "warning",
+                "caption_id": caption_id,
+                "distance": idx - nearby_image_idx,
+                "detail": (
+                    "SEQ Figure caption is not immediately preceded by an "
+                    "image paragraph, but one appears nearby -- caption may "
+                    "be mis-anchored"
+                ),
+            })
+        else:
+            findings.append({
+                "type": "caption_only_figure",
+                "severity": "warning",
+                "caption_id": caption_id,
+                "detail": (
+                    "SEQ Figure caption has no image paragraph immediately "
+                    "before or nearby -- caption with nothing to caption"
+                ),
+            })
+
+    findings.extend(_table_cell_image_findings(body))
+
+    for dup in tree.get("duplicate_para_ids") or []:
+        findings.append({
+            "type": "duplicate_para_id",
+            "severity": "error",
+            "para_id": dup["para_id"],
+            "occurrence_count": dup["occurrence_count"],
+            "occurrences": dup["occurrences"],
+            "detail": (
+                f"native w14:paraId {dup['para_id']!r} is assigned to "
+                f"{dup['occurrence_count']} paragraphs -- ids must be "
+                "document-unique"
+            ),
+        })
+
+    # Cross-check against find_image_paragraph's independent body+table-cell
+    # walk -- purely informational (never itself raises a finding), reused
+    # per this item's notes rather than re-deriving a second body-walk.
+    total_image_paragraphs: int | None = None
+    try:
+        all_images = find_image_paragraph(docx_path)
+    except Exception:  # noqa: BLE001 -- cross-check must never break the audit
+        all_images = None
+    if isinstance(all_images, dict) and "error" not in all_images:
+        total_image_paragraphs = all_images.get("count")
+
+    sidecar: dict[str, Any] | None = None
+    if index_db_path is not None:
+        freshness = get_structure_freshness(index_db_path)
+        sidecar = dict(freshness)
+        if freshness.get("indexed") and freshness.get("trustworthy"):
+            try:
+                elements = get_local_structure_elements(index_db_path, allow_stale=True)
+            except sqlite3.OperationalError:
+                elements = {"headings": [], "figures": [], "tables": []}
+            sidecar_empty = not (
+                elements.get("headings") or elements.get("figures") or elements.get("tables")
+            )
+            doc_nonempty = bool(
+                tree.get("heading_count")
+                or tree.get("table_count")
+                or any(
+                    _is_figure_caption(b) for b in blocks if b["kind"] == "paragraph"
+                )
+            )
+            sidecar["empty"] = sidecar_empty
+            if sidecar_empty and doc_nonempty:
+                findings.append({
+                    "type": "stale_or_empty_sidecar",
+                    "severity": "warning",
+                    "index_db_path": index_db_path,
+                    "detail": (
+                        "structural sidecar reports as trustworthy/complete "
+                        "but has zero headings/figures/tables while the "
+                        "source document is non-empty -- likely built "
+                        "against an empty/placeholder document, or never "
+                        "actually populated"
+                    ),
+                })
+        elif not freshness.get("trustworthy", True):
+            sidecar["empty"] = None
+            findings.append({
+                "type": "stale_or_empty_sidecar",
+                "severity": "warning",
+                "index_db_path": index_db_path,
+                "detail": (
+                    "structural sidecar is not trustworthy: "
+                    f"{freshness.get('reason')}"
+                ),
+            })
+
+    # Defensive round-trip: every paragraph/heading node id must resolve
+    # back through the SAME lookup callers (locate_anchor, get_paragraph,
+    # insert_caption, ...) already use.
+    #
+    # d092d2a4 gap fix: _find_para_by_id raises AmbiguousParagraphIdError
+    # (e21b2ca7) instead of returning a value when a node's id is a native
+    # w14:paraId shared by more than one paragraph. That fail-closed
+    # behavior is correct and load-bearing for _find_para_by_id's MUTATING
+    # callers (insert_caption, move_section, edit_equation_local, ...), which
+    # must never silently guess which of two identically-id'd paragraphs to
+    # write to -- it must stay exactly as-is. audit_document is a read-only
+    # INSPECTION pass, not a mutation, so that exception is not an audit
+    # failure here: the id DID resolve, just to more than one paragraph, and
+    # that exact condition is already reported deterministically above as a
+    # `duplicate_para_id` finding (sourced independently from
+    # document_content_tree's own collision detection). Letting the
+    # exception escape would crash the whole audit over a condition the
+    # audit already has a dedicated, diagnostic finding type for -- so it is
+    # caught here and treated as "resolved (ambiguously)", not as the
+    # id-scheme-drift bug unresolvable_structural_id exists to catch.
+    for node in nodes:
+        if node["kind"] not in ("paragraph", "heading"):
+            continue
+        try:
+            located = _find_para_by_id(root, node["id"])
+        except AmbiguousParagraphIdError:
+            continue
+        if located is None:
+            findings.append({
+                "type": "unresolvable_structural_id",
+                "severity": "error",
+                "node_id": node["id"],
+                "detail": (
+                    f"node id {node['id']!r} did not resolve via "
+                    "_find_para_by_id -- id-scheme drift bug"
+                ),
+            })
+
+    findings_by_type: dict[str, int] = {}
+    for f in findings:
+        findings_by_type[f["type"]] = findings_by_type.get(f["type"], 0) + 1
+
+    return {
+        "status": "ok",
+        "docx_path": docx_path,
+        "source_fingerprint": source_fingerprint,
+        "nodes": nodes + image_nodes,
+        "edges": edges,
+        "duplicate_relationships": duplicate_relationships,
+        "total_image_paragraphs": total_image_paragraphs,
+        "sidecar": sidecar,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+    }
+
+
 def read_document_snapshot(
     docx_path: str,
     page_size: int | None = None,
@@ -15623,3 +17546,158 @@ def read_document_snapshot(
     result["total"] = len(scoped_paragraphs)
     result["section_anchor"] = section_anchor
     return result
+
+
+# ---------------------------------------------------------------------------
+# INVESTIGATE 1c547624 (item_group: proposal:rag-semantic-tool-routing)
+# "design structure-aware RAG for OOXML, code graphs, captions, sections, and
+# provenance instead of generic blind chunking"
+#
+# THIS BLOCK IS DESIGN ONLY -- nothing below is wired up or imported by
+# anything. Mirrors how the sibling investigation in this same proposal
+# (f30bbd89, "define offline routing benchmarks...") landed its own
+# design-only write-up as a docstring-style comment in the file most central
+# to the question, rather than an ad hoc root-level markdown file.
+#
+# WHAT EXISTS TODAY (read this before building anything new) -- the premise
+# in the item title ("instead of generic blind chunking") does NOT hold for
+# any of the three domains named. All three already chunk on real structure:
+# ---------------------------------------------------------------------
+#  1. OOXML docs (THIS file). Two independent, already-shipped structure-
+#     aware layers, not one:
+#       - Chunk-level: :func:`_build_chunks_from_paras` (c84ca127) groups
+#         paragraphs at HEADING BOUNDARIES, not fixed windows -- each chunk
+#         carries a ``heading_path`` breadcrumb (ancestor heading texts,
+#         root first) via a level-tracking stack, with a synthetic
+#         "preamble" chunk for pre-first-heading content. Indexed into
+#         ``docx_chunks`` + an FTS5 ``docx_chunks_fts`` virtual table
+#         (:func:`index_docx_chunks`), searched via BM25 with heading text
+#         weighted above body text (:func:`fts5_search_chunks`,
+#         ``_CHUNK_WEIGHT_HEADING`` > ``_CHUNK_WEIGHT_BODY``) -- so a heading
+#         match ranks a chunk higher than an equal-count body match. Well
+#         covered today: ``test_build_chunks_from_paras_*`` (boundaries,
+#         nested heading_path, sibling-level reset, preamble, empty doc,
+#         sequential ids) in both ``tests/test_docs_intel.py`` and
+#         ``extensions/meridian-docs/tests/test_docs_intel_chunks.py``.
+#       - Element-level: :func:`index_docx_structure` /
+#         :func:`get_local_structure_elements` index headings/figures/tables
+#         as typed structural elements (separately from prose chunks);
+#         captions get their own real-Word-Caption-paragraph write-back
+#         (:func:`insert_caption` / :func:`link_figure_caption` /
+#         :func:`link_table_caption` / :func:`retrofit_plaintext_captions`),
+#         equations their own OMML extraction/index
+#         (:func:`index_docx_equations` / :func:`parse_docx_equations_local`),
+#         and sections their own anchor-scoped read/write surface
+#         (:func:`get_section_content` / :func:`_locate_section_bounds` /
+#         :func:`write_section` / :func:`move_section` / :func:`copy_section`).
+#       Neither layer does fixed-size/blind windowing anywhere in this file.
+#
+#  2. Code graphs (``extensions/meridian-codeindex/meridian_codeindex/
+#     code_index.py``, re-exported host-side by ``meridian/code_index.py``).
+#     :func:`chunk_file` is tree-sitter/AST semantic chunking at
+#     function/class/method granularity (per its own module docstring),
+#     with gap-filling "module" chunks covering the un-named lines between
+#     symbols so every line lands in exactly one chunk (coverage a
+#     named-symbols-only index would lack) -- never a fixed-token sliding
+#     window. Hybrid search layers DuckDB native FTS with an OPTIONAL vector
+#     leg behind a backend-neutral, evidence-gated contract
+#     (``meridian_codeindex.vector_index``: ``DuckDBVSSBackend`` /
+#     ``PgVectorBackend`` / ``LexicalBM25Backend``, the pgvector leg gated by
+#     measured recall/latency/memory/cost evidence via
+#     ``meridian/db/vector_index_state.py``'s ``pgvector_enabled`` flag --
+#     "do not introduce it merely because it exists"). Well covered:
+#     ``test_chunk_python_named_symbols`` /
+#     ``test_chunk_python_unnamed_blocks_fill_the_gap`` /
+#     ``test_chunk_python_lines_are_covered_exactly_once`` /
+#     ``test_chunk_syntactically_broken_file_still_yields_one_module_chunk``
+#     in ``extensions/meridian-codeindex/tests/test_code_index.py``.
+#
+#  3. Provenance (``extensions/meridian-outputs/meridian_outputs/``).
+#     Not a text-chunk corpus at all -- a structured, bidirectional
+#     path/fingerprint lineage graph. ``provenance.py``'s
+#     :func:`resolve_figure_output` / :func:`find_outputs_by_source` trace
+#     figure<->source-script relationships (relocation-tolerant, not the
+#     exact-path-only lookup that predated it -- see the module's own
+#     e422de44 history note); ``search.py``'s :func:`search_outputs`
+#     layers a literal-filename-match boost on top of ``outputs_local``'s
+#     BM25 so an exact-match canonical file outranks a decoy/archival
+#     twin. This is metadata/lineage search, not prose retrieval, and
+#     should stay that way (see (c) below).
+#
+# THE REAL GAP -- these three domains are each already structure-aware in
+# isolation, but there is no FEDERATION across them. Each has its own scoring
+# scale (FTS5 BM25 weighted-column rank for docs chunks; hybrid BM25+VSS
+# cosine for code chunks; BM25+literal-boost for outputs) and its own tool
+# entry point (``fts5_search_chunks`` / ``search_code_semantic`` /
+# ``search_outputs``) with no common ranking, no shared relevance scale, and
+# no fused ordering. ``meridian/semantic_search.py`` -- the one module in this
+# codebase that already has real embeddings AND a deterministic
+# floor+margin abstention gate (``score_confidence``, the same mechanism
+# f30bbd89 grounded for tool-routing) -- is wired TODAY only to
+# notes/decisions/sprint-items (``meridian/db/__init__.py``,
+# ``meridian/db/decision_evidence.py``); none of the three domains above
+# route through it. A query spanning "everything related to X" today needs
+# 3 separate tool calls with no way to compare or merge their results.
+#
+# DESIGN -- a federated retrieval layer over the existing structure-aware
+# indexes (additive; replaces none of the three native entry points above)
+# ---------------------------------------------------------------------
+# (a) Common candidate contract. A thin per-domain adapter yielding
+#     ``(id, text, structural_path, source_domain, source_ref)`` tuples --
+#     ``heading_path`` for docs chunks, dotted symbol path
+#     (module.Class.method) for code chunks, path+tag hierarchy for outputs
+#     -- reusing ``vector_index.py``'s backend-neutral contract, which its
+#     OWN docstring already states is meant for "callers other than
+#     CodeIndex (e.g. a host application's notes/handoffs/sprint-item
+#     search)". Building a 4th bespoke embedding pipeline here would ignore
+#     that the extension point already exists and is already documented as
+#     reusable.
+#
+# (b) Fusion ranking. Port ``score_confidence``'s floor+margin contract
+#     verbatim as the cross-domain tie-break/abstention layer over each
+#     domain's OWN native top-k (never re-score raw text with a foreign
+#     model -- that would silently regress each domain's already-tuned
+#     ranking, e.g. docs' heading-weighted BM25 or outputs' literal-match
+#     boost). Per-domain scores are min-max normalized to [0, 1] over THAT
+#     CALL's own candidate set (never a fixed constant -- a hardcoded scale
+#     would let one domain's typical score range silently dominate fusion
+#     regardless of relevance) before cross-domain merge. Each domain's
+#     native top-1 is always kept as a deterministic fallback slot, so
+#     fusion can never make a domain-legitimate direct hit disappear behind
+#     a cross-domain abstention.
+#
+# (c) Provenance-aware surfacing, not flattening. Every fused hit keeps its
+#     originating domain, structural path, and -- for a hit sourced from
+#     ``meridian-outputs`` -- its lineage fields (source file,
+#     content-hash) verbatim, so a caller can distinguish "this doc chunk
+#     CITES this code symbol" from "this figure output was PRODUCED BY this
+#     code symbol." This is why (a) explicitly does NOT propose chunking
+#     provenance records into embeddable prose -- collapsing a structured
+#     lineage edge into a text blob for embedding would destroy exactly the
+#     bidirectional relocation-tolerant signal ``provenance.py`` was built
+#     (e422de44) to preserve.
+#
+# (d) Evidence-gated rollout. Extend, don't replace,
+#     ``vector_index_state.py``'s existing ``(project_id, scope)`` shape --
+#     a per-domain ``scope`` value (e.g. ``"docs_chunks"``,
+#     ``"code_chunks"``) already fits its existing unique key with NO schema
+#     change, and a new ``scope="federated"`` row records the fused layer's
+#     own backend/benchmark state using the exact same
+#     :func:`record_vector_backend_benchmark`-gated-flip pattern (evidence
+#     in, decision reason recorded, never hand-flipped) already enforced
+#     for ``pgvector_enabled``.
+#
+# WHAT THIS INVESTIGATION DELIBERATELY DID NOT BUILD
+# ---------------------------------------------------------------------
+# No new embedding model, no new DB table or migration (scope (d) fits the
+# existing ``vector_index_state`` schema), no change to any of the three
+# domains' existing native search entry points, and no code wiring
+# semantic_search.py to any of the three domains. The baseline structure-
+# aware chunking behavior in all three domains is already locked in by the
+# existing test suites cited above; this investigation adds no new tests
+# because it changes no runtime behavior. The lowest-risk, highest-signal
+# next step is (a) -- the per-domain candidate adapter -- since it requires
+# no scoring change and no persistence, and would make (b)'s fusion
+# benchmark possible to build without first deciding anything about (d)'s
+# rollout gate.
+# ---------------------------------------------------------------------------

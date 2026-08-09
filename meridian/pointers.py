@@ -75,15 +75,65 @@ below is the type-specific key it also needs (443d9453):
                   ``meridian.doc_store`` element (9ee6d2ec).
 * ``zotero_key``— ``{"type":"zotero_key", key}`` (resolved via
                   ``zotero_client.resolve_citation_ref``).
-* ``text_quote``— ``{exact, prefix?, suffix?, archived_url?, archived_at?}`` (W3C
-                  TextQuoteSelector for source_type "web", 1d3f6e71; resolving it
-                  re-fetches the URL and flags content drift). 06df6ab3 — the SAME
-                  selector also anchors against docx paragraph text: a ``uri``
-                  that is a local ``.docx`` path resolves via
-                  ``web_archive.default_web_fetcher``'s docx branch instead of an
-                  HTTP GET, so one mechanism covers web AND docs.
+* ``text_quote``— ``{exact, prefix?, suffix?, archived_url?, archived_at?,
+                  canonical_url?, retrieval_hash?}`` (W3C TextQuoteSelector for
+                  source_type "web", 1d3f6e71; resolving it re-fetches the URL and
+                  flags content drift). 06df6ab3 — the SAME selector also anchors
+                  against docx paragraph text: a ``uri`` that is a local ``.docx``
+                  path resolves via ``web_archive.default_web_fetcher``'s docx
+                  branch instead of an HTTP GET, so one mechanism covers web AND
+                  docs. 62640241 — ``canonical_url`` (the source's stable/canonical
+                  address, when it differs from the fetch ``uri``, e.g. a mirror or
+                  redirect) and ``retrieval_hash`` (a content hash of the fetched
+                  body at capture time) are additive, optional fields completing
+                  the "web target" freshness story alongside the pre-existing
+                  ``archived_url``/``archived_at``.
 * ``finding_id``— ``{id}`` (source_type "experiment", 1f1cd4d9; a ``save_finding``
                   artifact note resolved via ``db.get_project_note``).
+* ``directory``  — ``{root, include?, exclude?, manifest_id?, snapshot_id?}``
+                  (62640241) — a directory ROOT identity plus an include/exclude
+                  glob selector and an optional snapshot/manifest identity.
+                  Resolving it (best-effort, local-path-only by default) walks
+                  ``root`` and returns a deterministic manifest (sorted relative
+                  paths + a ``manifest_hash``) usable as a freshness proof.
+* ``git``        — ``{repository, ref?, commit?, path?}`` (62640241) — a Git
+                  REPOSITORY identity plus at least one of ``ref``/``commit``; an
+                  optional ``path`` within the repo. A file/line range within
+                  ``path`` is expressed via the EXISTING ``subSelector`` mechanism
+                  (a nested ``{"type":"range", ...}``) — never duplicated as a new
+                  field here. Resolving it (best-effort, local clones only by
+                  default) shells out to ``git rev-parse`` to report the repo's
+                  current HEAD and whether the requested ref/commit is reachable.
+* ``remote_fs``  — ``{host_id, filesystem_slot, path, lease_id?, session_id?,
+                  snapshot_id?}`` (62640241) — an opaque tunnel-connector HOST
+                  identity, the filesystem SLOT it was exposed under (mirrors the
+                  ``Filesystem:``-prefixed tool-slot naming in AGENTS.md), a remote
+                  PATH, and an optional lease/session identity binding the pointer
+                  to the connector session that captured it. No core-local default
+                  resolver exists (mirrors ``verify_target_readiness``'s
+                  ``provenance_getter`` seam) — resolving one requires an injected,
+                  tunnel-backed resolver; without one it is reported unresolved,
+                  never silently dropped.
+* ``artifact``   — ``{manifest_uri, fingerprint?, run_id?, item_id?,
+                  provenance_id?}`` (62640241) — a build/output ARTIFACT's manifest
+                  URI, an optional file fingerprint, and an optional link to the
+                  producing run/sprint-item/provenance record. Resolving it
+                  (best-effort, local files only by default) hashes the manifest
+                  file to report its current fingerprint.
+
+62640241 — every target MAY also carry an optional ``freshness`` object —
+``{content_hash?, source_revision?, resolver_version?, captured_at?, state?}`` —
+the pointer author's proof of what the source looked like when the pointer was
+captured. ``state`` is one of ``current`` | ``stale`` | ``unknown`` |
+``unavailable`` | ``ambiguous`` (defaults to ``unknown`` when the object is
+present but ``state`` is omitted). Purely additive/opt-in exactly like
+``target_kind`` — a target with no ``freshness`` key behaves byte-for-byte as
+before. :func:`resolve_pointer` RECOMPUTES a live freshness state for
+``directory``/``git``/``artifact``/``remote_fs``/``text_quote`` targets by
+comparing this declared proof against what resolution finds right now (see
+``_freshness_state_for_target``); :func:`strict_freshness_gate` is the
+fail-closed check a strict handoff consults to block on ``stale``/``unknown``/
+``unavailable``/``ambiguous`` targets with an actionable reason.
 
 This module owns:
 
@@ -101,11 +151,13 @@ a live Zotero.
 """
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import logging
 import os
 import re
+import subprocess
 from typing import Any, Awaitable, Callable
 from urllib.parse import unquote, urlsplit
 
@@ -124,8 +176,26 @@ _log = logging.getLogger(__name__)
 #                 source_type "experiment" (1f1cd4d9): a zero-ceremony run log
 #                 (input / output / params / timestamp), no stages, no YAML.
 _SELECTOR_TYPES = frozenset(
-    {"range", "symbol", "node_id", "zotero_key", "text_quote", "finding_id"}
+    {
+        "range", "symbol", "node_id", "zotero_key", "text_quote", "finding_id",
+        # 62640241 — typed external pointer targets: directory / git /
+        # remote_fs / artifact. See the module docstring for the full shape
+        # of each.
+        "directory", "git", "remote_fs", "artifact",
+    }
 )
+
+# 62640241 — the five universal freshness states a target's (optional)
+# ``freshness`` proof, or a resolver's live re-check of it, can report.
+_FRESHNESS_STATES = frozenset({"current", "stale", "unknown", "unavailable", "ambiguous"})
+_DEFAULT_FRESHNESS_STATE = "unknown"
+
+# Selector types :func:`resolve_pointer` recomputes a LIVE freshness state
+# for (see ``_freshness_state_for_target``). The original six selector types
+# (range/symbol/node_id/zotero_key/finding_id, plus text_quote's own
+# pre-existing drift check being the exception) are left untouched — this
+# module's docstring's "preserve existing behavior" guarantee.
+_FRESHNESS_APPLICABLE_TYPES = frozenset({"directory", "git", "remote_fs", "artifact", "text_quote"})
 
 # 300a063d — target_kind distinguishes a pointer at real, already-present code
 # from a pointer at a planned-but-not-yet-created file. See the module
@@ -426,7 +496,11 @@ def _validate_selector(selector: Any, *, is_sub: bool = False) -> dict[str, Any]
                 f"{what} text_quote requires a non-empty exact"
             )
         out["exact"] = exact
-        for opt in ("prefix", "suffix", "archived_url", "archived_at"):
+        for opt in (
+            "prefix", "suffix", "archived_url", "archived_at",
+            # 62640241 — additive "web target" freshness fields.
+            "canonical_url", "retrieval_hash",
+        ):
             if opt in selector and selector[opt] is not None:
                 val = selector[opt]
                 if not isinstance(val, str):
@@ -439,11 +513,132 @@ def _validate_selector(selector: Any, *, is_sub: bool = False) -> dict[str, Any]
         out["id"] = _require_str_field(
             selector, "id", what=what, stype="finding_id"
         )
+    elif stype == "directory":
+        # 62640241 — a directory ROOT identity + include/exclude glob selector
+        # + optional snapshot/manifest identity. See module docstring.
+        out["root"] = _require_str_field(selector, "root", what=what, stype="directory")
+        for field in ("include", "exclude"):
+            if field in selector and selector[field] is not None:
+                val = selector[field]
+                if not isinstance(val, list) or not val or not all(
+                    isinstance(v, str) and v.strip() for v in val
+                ):
+                    raise PointerValidationError(
+                        f"{what} directory {field!r} must be a non-empty list of "
+                        "non-empty strings (glob patterns)"
+                    )
+                out[field] = [v.strip() for v in val]
+        for field in ("manifest_id", "snapshot_id"):
+            if field in selector and selector[field] is not None:
+                val = selector[field]
+                if not isinstance(val, str) or not val.strip():
+                    raise PointerValidationError(
+                        f"{what} directory {field!r} must be a non-empty string"
+                    )
+                out[field] = val.strip()
+    elif stype == "git":
+        # 62640241 — a Git REPOSITORY identity + ref/commit (at least one
+        # required) + optional path within the repo. A line range within
+        # that path reuses the EXISTING subSelector mechanism, never a new
+        # field here.
+        out["repository"] = _require_str_field(
+            selector, "repository", what=what, stype="git"
+        )
+        ref, commit = selector.get("ref"), selector.get("commit")
+        has_ref = isinstance(ref, str) and ref.strip()
+        has_commit = isinstance(commit, str) and commit.strip()
+        if ref is not None and not has_ref:
+            raise PointerValidationError(f"{what} git 'ref' must be a non-empty string")
+        if commit is not None and not has_commit:
+            raise PointerValidationError(f"{what} git 'commit' must be a non-empty string")
+        if not has_ref and not has_commit:
+            raise PointerValidationError(
+                f"{what} git requires at least one of a non-empty 'ref' or 'commit'"
+            )
+        if has_ref:
+            out["ref"] = ref.strip()
+        if has_commit:
+            out["commit"] = commit.strip()
+        if "path" in selector and selector["path"] is not None:
+            path = selector["path"]
+            if not isinstance(path, str) or not path.strip():
+                raise PointerValidationError(f"{what} git 'path' must be a non-empty string")
+            out["path"] = path.strip()
+    elif stype == "remote_fs":
+        # 62640241 — an opaque tunnel-connector HOST + filesystem SLOT + remote
+        # PATH, plus an optional lease/session identity binding the pointer to
+        # the connector session that captured it.
+        out["host_id"] = _require_str_field(selector, "host_id", what=what, stype="remote_fs")
+        out["filesystem_slot"] = _require_str_field(
+            selector, "filesystem_slot", what=what, stype="remote_fs"
+        )
+        out["path"] = _require_str_field(selector, "path", what=what, stype="remote_fs")
+        for field in ("lease_id", "session_id", "snapshot_id"):
+            if field in selector and selector[field] is not None:
+                val = selector[field]
+                if not isinstance(val, str) or not val.strip():
+                    raise PointerValidationError(
+                        f"{what} remote_fs {field!r} must be a non-empty string"
+                    )
+                out[field] = val.strip()
+    elif stype == "artifact":
+        # 62640241 — a build/output ARTIFACT's manifest URI + optional
+        # fingerprint + optional link to the producing run/item/provenance
+        # record (any subset — at least the manifest_uri is required).
+        out["manifest_uri"] = _require_str_field(
+            selector, "manifest_uri", what=what, stype="artifact"
+        )
+        for field in ("fingerprint", "run_id", "item_id", "provenance_id"):
+            if field in selector and selector[field] is not None:
+                val = selector[field]
+                if not isinstance(val, str) or not val.strip():
+                    raise PointerValidationError(
+                        f"{what} artifact {field!r} must be a non-empty string"
+                    )
+                out[field] = val.strip()
 
     # W3C hasSubSelector — optional, recursive, validated by the same rules.
     sub = selector.get("subSelector")
     if sub is not None:
         out["subSelector"] = _validate_selector(sub, is_sub=True)
+    return out
+
+
+_FRESHNESS_STR_FIELDS = ("content_hash", "source_revision", "resolver_version", "captured_at")
+
+
+def _validate_freshness(freshness: Any) -> dict[str, Any]:
+    """Validate one target's optional ``freshness`` proof object; return a
+    normalized copy. See the module docstring for the field shape.
+
+    Every string field is optional (a caller may supply only the ones it
+    actually has evidence for — e.g. just ``captured_at`` with no hash yet).
+    ``state`` defaults to :data:`_DEFAULT_FRESHNESS_STATE` ("unknown") when
+    the object is present but omits it — presence of a ``freshness`` object
+    with no explicit state is itself meaningful ("I know I captured this,
+    I just don't have a computed state for it"), distinct from omitting the
+    whole object (no freshness claim at all).
+    """
+    if not isinstance(freshness, dict):
+        raise PointerValidationError("freshness must be an object")
+    out: dict[str, Any] = {}
+    for field in _FRESHNESS_STR_FIELDS:
+        if field in freshness and freshness[field] is not None:
+            val = freshness[field]
+            if not isinstance(val, str) or not val.strip():
+                raise PointerValidationError(
+                    f"freshness {field!r} must be a non-empty string"
+                )
+            out[field] = val.strip()
+    state = freshness.get("state")
+    if state is not None:
+        if state not in _FRESHNESS_STATES:
+            raise PointerValidationError(
+                f"freshness state must be one of {sorted(_FRESHNESS_STATES)}, got {state!r}"
+            )
+        out["state"] = state
+    else:
+        out["state"] = _DEFAULT_FRESHNESS_STATE
     return out
 
 
@@ -503,7 +698,13 @@ def _validate_target(
                 "(use target_kind='planned_new' for a file that does not exist yet)"
             )
 
-    return {"uri": uri, "selector": selector, "target_kind": kind}
+    out_target: dict[str, Any] = {"uri": uri, "selector": selector, "target_kind": kind}
+    # 62640241 — optional, additive universal freshness proof. Omitted
+    # entirely when the caller didn't supply one — matches target_kind's own
+    # backward-compat contract of never inventing a value that wasn't there.
+    if "freshness" in target and target["freshness"] is not None:
+        out_target["freshness"] = _validate_freshness(target["freshness"])
+    return out_target
 
 
 def validate_pointer(
@@ -604,6 +805,16 @@ NodeResolver = Callable[..., Awaitable[dict[str, Any] | None]]
 CitationResolver = Callable[..., Awaitable[dict[str, Any] | None]]
 WebFetcher = Callable[..., Awaitable[str | None]]
 FindingResolver = Callable[..., Awaitable[dict[str, Any] | None]]
+# 62640241 — resolver seams for the four new typed target contracts. Each is
+# ``async (selector: dict) -> dict|None``, matching the shape of the seams
+# above: the FULL normalized selector goes in, an implementation-defined
+# "what did resolution find" dict (or ``None`` for "not found") comes out.
+# Guarded by their dispatch wrapper exactly like every other selector type —
+# a resolver that raises degrades to an unresolved result, never propagates.
+DirectoryResolver = Callable[..., Awaitable[dict[str, Any] | None]]
+GitResolver = Callable[..., Awaitable[dict[str, Any] | None]]
+RemoteFsResolver = Callable[..., Awaitable[dict[str, Any] | None]]
+ArtifactResolver = Callable[..., Awaitable[dict[str, Any] | None]]
 
 # ---------------------------------------------------------------------------
 # e9d72d17 — pluggable reference-manager backend registry.
@@ -849,6 +1060,222 @@ async def _resolve_finding_id(
     }
 
 
+# ---------------------------------------------------------------------------
+# 62640241 — resolvers for the four new typed target contracts. Each default
+# is core-local and LOCAL-FILESYSTEM-ONLY (no network, no tunnel) — a real,
+# working implementation for the common self-hosted case, not a stub. A
+# richer caller (a tunnel-backed remote_fs resolver, a network-aware git
+# resolver for a remote repository URL) injects its own; there is
+# deliberately NO core-local default for remote_fs (mirrors
+# ``verify_target_readiness``'s ``provenance_getter`` seam — the tunnel
+# infrastructure it needs lives outside this module and is not importable
+# here without an import cycle / a hard runtime dependency this module must
+# not take on).
+# ---------------------------------------------------------------------------
+
+
+def _default_directory_resolver() -> DirectoryResolver:
+    """Core-local default: verify ``root`` is a local directory and build a
+    deterministic manifest (sorted relative paths, filtered by ``include``/
+    ``exclude`` glob patterns, plus a ``manifest_hash`` over that list) — no
+    network. ``None`` when ``root`` is missing, not a local path, or not a
+    directory; every filesystem error is guarded (never raises)."""
+
+    async def _resolver(selector: dict[str, Any]) -> dict[str, Any] | None:
+        root = selector.get("root") or ""
+        if not _looks_like_local_path(root):
+            return None
+        exists, matched = _resolve_local_existence(root, os.path.isdir)
+        if not exists:
+            return None
+        include = selector.get("include") or ["*"]
+        exclude = selector.get("exclude") or []
+        entries: list[str] = []
+        try:
+            for dirpath, _dirnames, filenames in os.walk(matched):
+                for fname in filenames:
+                    rel = os.path.relpath(os.path.join(dirpath, fname), matched)
+                    rel_posix = rel.replace(os.sep, "/")
+                    if not any(fnmatch.fnmatch(rel_posix, pat) for pat in include):
+                        continue
+                    if any(fnmatch.fnmatch(rel_posix, pat) for pat in exclude):
+                        continue
+                    entries.append(rel_posix)
+        except OSError:
+            return None
+        entries.sort()
+        manifest_hash = hashlib.sha256("\n".join(entries).encode("utf-8")).hexdigest()
+        _cap = 500
+        return {
+            "root": matched,
+            "entry_count": len(entries),
+            "entries": entries[:_cap],
+            "truncated": len(entries) > _cap,
+            "manifest_hash": manifest_hash,
+        }
+
+    return _resolver
+
+
+def _default_git_resolver() -> GitResolver:
+    """Core-local default: for a LOCAL repository path only (no network
+    fetch of a remote URL — that requires an injected, network-aware
+    resolver), shell out to ``git rev-parse`` to report the repo's current
+    HEAD and whether the requested ``ref``/``commit`` is currently
+    reachable. ``None`` when ``repository`` isn't a local directory, ``git``
+    isn't on PATH, or the subprocess call fails/times out — never raises."""
+
+    async def _resolver(selector: dict[str, Any]) -> dict[str, Any] | None:
+        repo = selector.get("repository") or ""
+        if not _looks_like_local_path(repo):
+            return None
+        exists, matched = _resolve_local_existence(repo, os.path.isdir)
+        if not exists:
+            return None
+        want = selector.get("commit") or selector.get("ref")
+        if not want:
+            return None
+        try:
+            head = subprocess.run(
+                ["git", "-C", matched, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            wanted = subprocess.run(
+                ["git", "-C", matched, "rev-parse", want],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        if head.returncode != 0:
+            return None
+        reachable = wanted.returncode == 0
+        return {
+            "repository": matched,
+            "head": head.stdout.strip(),
+            "requested": want,
+            "requested_sha": wanted.stdout.strip() if reachable else None,
+            "reachable": reachable,
+        }
+
+    return _resolver
+
+
+def _default_artifact_resolver() -> ArtifactResolver:
+    """Core-local default: for a LOCAL ``manifest_uri`` file only, hash its
+    current bytes to report a fresh fingerprint. ``None`` when the uri isn't
+    a local path or the file can't be read — never raises."""
+
+    async def _resolver(selector: dict[str, Any]) -> dict[str, Any] | None:
+        manifest_uri = selector.get("manifest_uri") or ""
+        if not _looks_like_local_path(manifest_uri):
+            return None
+        exists, matched = _resolve_local_existence(manifest_uri, os.path.isfile)
+        if not exists:
+            return None
+        current_hash = _local_sha256_file(matched)
+        if current_hash is None:
+            return None
+        return {"manifest_uri": matched, "content_hash": current_hash}
+
+    return _resolver
+
+
+async def _resolve_directory(
+    selector: dict[str, Any], uri: str, directory_resolver: DirectoryResolver | None,
+) -> dict[str, Any]:
+    """``directory`` — resolve a directory root + include/exclude selector
+    to a deterministic manifest (62640241)."""
+    root = selector.get("root")
+    base = {"selector_type": "directory", "uri": uri, "root": root}
+    if directory_resolver is None:
+        return _unresolved("no directory resolver available", **base)
+    try:
+        found = await directory_resolver(selector)
+    except Exception:  # noqa: BLE001 — a resolver failure is just "unresolvable"
+        _log.debug("directory resolve failed for %r", root, exc_info=True)
+        return _unresolved("directory resolve failed", **base)
+    if not found:
+        return _unresolved("directory root not found", **base)
+    return {"resolved": True, **base, "manifest": found}
+
+
+async def _resolve_git(
+    selector: dict[str, Any], uri: str, git_resolver: GitResolver | None,
+) -> dict[str, Any]:
+    """``git`` — resolve a repository + ref/commit to its current
+    reachability against HEAD (62640241)."""
+    repository = selector.get("repository")
+    requested = selector.get("commit") or selector.get("ref")
+    base = {
+        "selector_type": "git", "uri": uri, "repository": repository,
+        "requested": requested,
+    }
+    if git_resolver is None:
+        return _unresolved("no git resolver available", **base)
+    try:
+        found = await git_resolver(selector)
+    except Exception:  # noqa: BLE001
+        _log.debug("git resolve failed for %r", repository, exc_info=True)
+        return _unresolved("git resolve failed", **base)
+    if not found:
+        return _unresolved("git repository or ref/commit not found", **base)
+    out = {"resolved": True, **base, **found}
+    if not found.get("reachable", True):
+        out["resolved"] = False
+        out["reason"] = (
+            f"{requested!r} is not reachable in repository {repository!r} "
+            f"(current HEAD is {found.get('head')!r})"
+        )
+    return out
+
+
+async def _resolve_remote_fs(
+    selector: dict[str, Any], uri: str, remote_fs_resolver: RemoteFsResolver | None,
+) -> dict[str, Any]:
+    """``remote_fs`` — resolve an opaque host_id/filesystem_slot/path
+    identity via an injected, tunnel-backed resolver (62640241). No
+    core-local default — see the section docstring above."""
+    host_id = selector.get("host_id")
+    path = selector.get("path")
+    base = {
+        "selector_type": "remote_fs", "uri": uri, "host_id": host_id,
+        "filesystem_slot": selector.get("filesystem_slot"), "path": path,
+    }
+    if remote_fs_resolver is None:
+        return _unresolved(
+            "no remote filesystem resolver available — remote_fs targets "
+            "require a tunnel-backed resolver to be injected; this is an "
+            "auditable unavailable result, not a silent drop", **base,
+        )
+    try:
+        found = await remote_fs_resolver(selector)
+    except Exception:  # noqa: BLE001
+        _log.debug("remote_fs resolve failed for %r/%r", host_id, path, exc_info=True)
+        return _unresolved("remote filesystem resolve failed", **base)
+    if not found:
+        return _unresolved("remote filesystem path not found", **base)
+    return {"resolved": True, **base, "manifest": found}
+
+
+async def _resolve_artifact(
+    selector: dict[str, Any], uri: str, artifact_resolver: ArtifactResolver | None,
+) -> dict[str, Any]:
+    """``artifact`` — resolve a manifest_uri (+ optional fingerprint/
+    run/item/provenance link) to its current fingerprint (62640241)."""
+    manifest_uri = selector.get("manifest_uri")
+    base = {"selector_type": "artifact", "uri": uri, "manifest_uri": manifest_uri}
+    if artifact_resolver is None:
+        return _unresolved("no artifact resolver available", **base)
+    try:
+        found = await artifact_resolver(selector)
+    except Exception:  # noqa: BLE001
+        _log.debug("artifact resolve failed for %r", manifest_uri, exc_info=True)
+        return _unresolved("artifact resolve failed", **base)
+    if not found:
+        return _unresolved("artifact manifest not found", **base)
+    return {"resolved": True, **base, "manifest": found}
+
+
 async def _resolve_selector(
     db: Any,
     project_id: str,
@@ -860,6 +1287,10 @@ async def _resolve_selector(
     citation_resolver: CitationResolver,
     web_fetcher: WebFetcher | None = None,
     finding_resolver: FindingResolver | None = None,
+    directory_resolver: DirectoryResolver | None = None,
+    git_resolver: GitResolver | None = None,
+    remote_fs_resolver: RemoteFsResolver | None = None,
+    artifact_resolver: ArtifactResolver | None = None,
 ) -> dict[str, Any]:
     """Dispatch ONE selector to its type-specific resolver (guarded)."""
     stype = selector.get("type")
@@ -875,7 +1306,70 @@ async def _resolve_selector(
         return await _resolve_text_quote(selector, uri, web_fetcher)
     if stype == "finding_id":
         return await _resolve_finding_id(selector, uri, finding_resolver)
+    if stype == "directory":
+        return await _resolve_directory(selector, uri, directory_resolver)
+    if stype == "git":
+        return await _resolve_git(selector, uri, git_resolver)
+    if stype == "remote_fs":
+        return await _resolve_remote_fs(selector, uri, remote_fs_resolver)
+    if stype == "artifact":
+        return await _resolve_artifact(selector, uri, artifact_resolver)
     return _unresolved(f"unknown selector.type {stype!r}", uri=uri)
+
+
+def _freshness_state_for_target(
+    stype: str, declared: "dict[str, Any] | None", outer: dict[str, Any],
+) -> "str | None":
+    """Compute the LIVE freshness state for one resolved target (62640241).
+
+    ``None`` when this selector type has no freshness concept at all (not in
+    :data:`_FRESHNESS_APPLICABLE_TYPES` — the pre-existing range/symbol/
+    node_id/zotero_key/finding_id types are left untouched, matching the
+    module's "preserve existing behavior" guarantee). Otherwise one of the
+    five universal states:
+
+    * ``"unavailable"`` — the target didn't resolve at all (no resolver
+      wired, resolve failed, or — for ``git`` — the requested ref/commit
+      isn't reachable from the repo's current HEAD).
+    * ``"current"`` / ``"stale"`` — ``text_quote`` reuses its own pre-existing
+      ``drift`` flag directly (no live-hash comparison needed — drift
+      already IS the freshness answer for a web/docx quote).
+    * ``"unknown"`` — resolved live, but the target carries no declared
+      ``freshness`` proof (or the proof has neither ``content_hash`` nor
+      ``source_revision``) to compare against — there's nothing to confirm
+      currency AGAINST, so it can't be called "current".
+    * ``"current"`` / ``"stale"`` (directory/git/remote_fs/artifact) — the
+      declared ``content_hash``/``source_revision`` matches (or doesn't)
+      what was JUST resolved live (the directory's ``manifest_hash``, the
+      git ``requested_sha``/``head``, the artifact's ``content_hash``, or
+      whatever a remote_fs resolver's manifest reports under either key).
+
+    Never raises: every lookup is a plain ``dict.get`` with static keys.
+    """
+    if stype not in _FRESHNESS_APPLICABLE_TYPES:
+        return None
+    if not isinstance(outer, dict) or not outer.get("resolved"):
+        return "unavailable"
+    if stype == "text_quote":
+        return "stale" if outer.get("drift") else "current"
+
+    if stype == "git" and not outer.get("reachable", True):
+        return "unavailable"
+
+    manifest = outer.get("manifest") if isinstance(outer.get("manifest"), dict) else {}
+    if stype == "git":
+        live_ref = outer.get("requested_sha") or outer.get("head")
+    else:
+        live_ref = manifest.get("content_hash") or manifest.get("manifest_hash") or manifest.get("source_revision")
+
+    declared_ref = None
+    if isinstance(declared, dict):
+        declared_ref = declared.get("content_hash") or declared.get("source_revision")
+    if not declared_ref:
+        return "unknown"
+    if live_ref is None:
+        return "unavailable"
+    return "current" if declared_ref == live_ref else "stale"
 
 
 async def resolve_pointer(
@@ -889,6 +1383,10 @@ async def resolve_pointer(
     citation_backend: str | None = None,
     web_fetcher: WebFetcher | None = None,
     finding_resolver: FindingResolver | None = None,
+    directory_resolver: DirectoryResolver | None = None,
+    git_resolver: GitResolver | None = None,
+    remote_fs_resolver: RemoteFsResolver | None = None,
+    artifact_resolver: ArtifactResolver | None = None,
 ) -> dict[str, Any]:
     """Resolve every target of a pointer, dispatching by ``selector.type``.
 
@@ -904,7 +1402,22 @@ async def resolve_pointer(
 
     Resolver seams default to the real implementations
     (``db.search_graph_entities`` / doc_store / ``zotero_client``); tests inject
-    stubs so no network / live Zotero is touched.
+    stubs so no network / live Zotero is touched. 62640241 —
+    ``directory_resolver``/``git_resolver``/``artifact_resolver`` default to
+    core-local, local-filesystem-only implementations (no network, no
+    tunnel); ``remote_fs_resolver`` has NO core-local default (mirrors
+    ``verify_target_readiness``'s ``provenance_getter`` seam) and stays
+    ``None`` — a ``remote_fs`` target is reported unresolved, explicitly,
+    unless a caller injects a tunnel-backed resolver. Because this dispatch
+    is the ONE resolver every caller (hosted MCP, stdio MCP, or any other
+    connector surface) invokes — there is no per-connector branch anywhere
+    in this function — the SAME typed status shape comes back regardless of
+    which connector path called it.
+
+    Each resolved target also carries an additive ``freshness_state`` key
+    (one of ``current``/``stale``/``unknown``/``unavailable``/``ambiguous``,
+    or omitted entirely for selector types with no freshness concept) — see
+    :func:`_freshness_state_for_target`.
     """
     # Default resolver seams (lazy imports to avoid import cycles / optional deps).
     if symbol_resolver is None:
@@ -946,6 +1459,15 @@ async def resolve_pointer(
         async def finding_resolver(_id: str):  # type: ignore[misc]
             return await _gn(db, _id)
 
+    # 62640241 — core-local, local-filesystem-only defaults. remote_fs has
+    # deliberately NO default (see the docstring above).
+    if directory_resolver is None:
+        directory_resolver = _default_directory_resolver()
+    if git_resolver is None:
+        git_resolver = _default_git_resolver()
+    if artifact_resolver is None:
+        artifact_resolver = _default_artifact_resolver()
+
     pid = project_id or pointer.get("project_id") or ""
     source_type = pointer.get("source_type")
     targets = pointer.get("targets") or []
@@ -970,11 +1492,23 @@ async def resolve_pointer(
                 citation_resolver=citation_resolver,
                 web_fetcher=web_fetcher,
                 finding_resolver=finding_resolver,
+                directory_resolver=directory_resolver,
+                git_resolver=git_resolver,
+                remote_fs_resolver=remote_fs_resolver,
+                artifact_resolver=artifact_resolver,
             )
         except Exception:  # noqa: BLE001 — belt-and-suspenders: a target never crashes the pass
             _log.debug("resolve_pointer target failed", exc_info=True)
             resolved_targets.append(_unresolved("resolve error", uri=uri))
             continue
+
+        # 62640241 — live freshness state, compared against the target's own
+        # declared proof (if any). Additive; omitted for selector types with
+        # no freshness concept (see _freshness_state_for_target).
+        stype = selector.get("type")
+        fstate = _freshness_state_for_target(stype, target.get("freshness"), outer)
+        if fstate is not None:
+            outer["freshness_state"] = fstate
 
         # subSelector — resolve the outer, then narrow. The subSelector is itself a
         # full selector (W3C hasSubSelector); resolve it against the SAME uri.
@@ -988,6 +1522,10 @@ async def resolve_pointer(
                     citation_resolver=citation_resolver,
                     web_fetcher=web_fetcher,
                     finding_resolver=finding_resolver,
+                    directory_resolver=directory_resolver,
+                    git_resolver=git_resolver,
+                    remote_fs_resolver=remote_fs_resolver,
+                    artifact_resolver=artifact_resolver,
                 )
             except Exception:  # noqa: BLE001
                 sub_resolved = _unresolved("subSelector resolve error", uri=uri)
@@ -1219,6 +1757,33 @@ def _summarize_resolution_source(resolved_targets: "list[dict[str, Any]]") -> st
     return next(iter(sources))
 
 
+def _summarize_target_freshness(
+    resolved_targets: "list[dict[str, Any]]",
+) -> "tuple[bool | None, str | None]":
+    """Aggregate each resolved target's ``freshness_state`` (62640241) for
+    ONE pointer into a tri-state ``(fresh, reason)``, mirroring
+    :func:`_summarize_provenance_verified`'s own shape:
+
+    * ``(None, reason)`` — not applicable: no target in this pointer reports
+      a ``freshness_state`` at all (every target is a selector type with no
+      freshness concept — see :data:`_FRESHNESS_APPLICABLE_TYPES`).
+    * ``(False, reason)`` — applicable, and at least one target's state is
+      ``stale`` / ``unknown`` / ``unavailable`` / ``ambiguous``.
+    * ``(True, None)`` — applicable, every reporting target is ``current``.
+    """
+    applicable = [
+        t for t in resolved_targets
+        if isinstance(t, dict) and t.get("freshness_state") is not None
+    ]
+    if not applicable:
+        return None, "no targets report a freshness state"
+    not_current = [t for t in applicable if t.get("freshness_state") != "current"]
+    if not_current:
+        states = sorted({str(t.get("freshness_state")) for t in not_current})
+        return False, f"{len(not_current)}/{len(applicable)} target(s) not current — {', '.join(states)}"
+    return True, None
+
+
 def _summarize_provenance_verified(
     readiness: "dict[str, Any] | None",
 ) -> "tuple[bool | None, str | None]":
@@ -1284,6 +1849,11 @@ def aggregate_pointer_evidence(
     * ``resolution_source`` — ``"not_applicable"`` when empty or no pointer
       reports one; the single shared value when every reporting pointer
       agrees; ``"mixed"`` otherwise.
+    * ``freshness_verified`` (62640241) — tri-state, same rule as
+      ``provenance_verified``: ``False`` if any pointer's own
+      ``freshness_verified`` is explicitly ``False``; else ``None`` if every
+      pointer's own value is ``None`` (nothing applicable/computed); else
+      ``True``.
 
     Never raises: a malformed (non-dict) entry in ``typed_records`` is
     skipped rather than breaking the rollup.
@@ -1295,6 +1865,7 @@ def aggregate_pointer_evidence(
             "target_resolved": False,
             "provenance_verified": None,
             "resolution_source": "not_applicable",
+            "freshness_verified": None,
         }
     structural = [bool(r.get("structural_valid")) for r in records]
     resolved = [bool(r.get("target_resolved")) for r in records]
@@ -1305,6 +1876,13 @@ def aggregate_pointer_evidence(
     else:
         _non_none = [v for v in prov_values if v is not None]
         prov_verified = True if _non_none else None
+    fresh_values = [r.get("freshness_verified") for r in records]
+    fresh_verified: "bool | None"
+    if any(v is False for v in fresh_values):
+        fresh_verified = False
+    else:
+        _non_none_fresh = [v for v in fresh_values if v is not None]
+        fresh_verified = True if _non_none_fresh else None
     sources = {
         r.get("resolution_source") for r in records
         if r.get("resolution_source") not in (None, "not_applicable")
@@ -1320,6 +1898,7 @@ def aggregate_pointer_evidence(
         "target_resolved": all(resolved),
         "provenance_verified": prov_verified,
         "resolution_source": resolution_source,
+        "freshness_verified": fresh_verified,
     }
 
 
@@ -1362,7 +1941,12 @@ def build_typed_pointer_record(
     vs. a fallback/cache, when the selector type reports it), and
     ``provenance_verified`` (:func:`_summarize_provenance_verified` — tri-state,
     ``None`` when not computed/not applicable). These are purely ADDITIVE
-    keys; no existing key's value or type changes.
+    keys; no existing key's value or type changes. 62640241 adds a fifth,
+    same-shape field: ``freshness_verified`` (:func:`_summarize_target_freshness`
+    — tri-state, ``None`` when no target in this pointer has a freshness
+    concept at all). Each per-target entry also carries the declared
+    ``freshness`` proof (when the stored target had one) and the LIVE
+    ``freshness_state`` :func:`resolve_pointer` computed for it.
 
     Never raises: a malformed stored target is skipped rather than blowing
     up the whole record — this must be safe to call from a mandatory
@@ -1399,6 +1983,13 @@ def build_typed_pointer_record(
         }
         if not rtarget.get("resolved") and rtarget.get("reason"):
             entry["reason"] = rtarget["reason"]
+        # 62640241 — echo the declared freshness proof (if the target had
+        # one) and the LIVE freshness state resolve_pointer computed for it.
+        declared_freshness = raw_target.get("freshness")
+        if isinstance(declared_freshness, dict):
+            entry["freshness"] = declared_freshness
+        if rtarget.get("freshness_state") is not None:
+            entry["freshness_state"] = rtarget["freshness_state"]
         canonical = _extract_canonical_metadata(selector, rtarget)
         if canonical:
             entry["canonical"] = canonical
@@ -1445,6 +2036,12 @@ def build_typed_pointer_record(
     record["provenance_verified"] = _prov_verified
     if _prov_verified is not True:
         record["provenance_reason"] = _prov_reason
+    # 62640241 — pointer-level freshness rollup, same tri-state shape as
+    # provenance_verified above.
+    _fresh_verified, _fresh_reason = _summarize_target_freshness(resolved_targets)
+    record["freshness_verified"] = _fresh_verified
+    if _fresh_verified is not True:
+        record["freshness_reason"] = _fresh_reason
     return record
 
 
@@ -1551,6 +2148,73 @@ def assemble_pointer_entries_from_annotated_items(
             entry["pointers"] = records
         entries.append(entry)
     return sorted(entries, key=lambda e: e["item_id"])
+
+
+# ---------------------------------------------------------------------------
+# 62640241 — strict-handoff freshness gate.
+#
+# A STRICT handoff (``require_strict_evidence``) must not let a receiving
+# executor act on evidence the source has silently drifted out from under —
+# acceptance criterion 4 of 62640241: "strict handoff readiness blocks
+# stale/unknown targets with an actionable reason." This is the ONE gate
+# every strict-evidence caller consults, mirroring the "one shared
+# extraction, many renderers" precedent of :func:`build_typed_pointer_record`
+# / :func:`assemble_pointer_entries_from_annotated_items` above — it never
+# re-derives freshness itself, only reads the ``freshness_state`` values
+# those functions already computed and attached.
+# ---------------------------------------------------------------------------
+
+# States that block a STRICT handoff. "ambiguous" is included even though no
+# resolver in this module currently emits it for the new selector types
+# (directory/git/artifact resolution is always deterministic here) — it is
+# part of the universal five-state vocabulary (module docstring) and a
+# richer injected resolver (e.g. a remote_fs resolver reporting multiple
+# candidate snapshots) may legitimately report it.
+_BLOCKING_FRESHNESS_STATES = frozenset({"stale", "unknown", "unavailable", "ambiguous"})
+
+
+def strict_freshness_gate(
+    typed_records: "list[dict[str, Any]]",
+) -> "tuple[bool, list[str]]":
+    """Fail-closed freshness readiness verdict for a STRICT handoff.
+
+    ``typed_records`` is one item's ``pointer_records`` list — the SAME
+    already-built :func:`build_typed_pointer_record` output
+    :func:`assemble_pointer_entries_from_annotated_items` consumes. Scans
+    every target of every pointer for a ``freshness_state`` in
+    :data:`_BLOCKING_FRESHNESS_STATES`; a target with no freshness concept at
+    all (``freshness_state`` omitted — range/symbol/node_id/zotero_key/
+    finding_id) is never blocking, matching this module's "preserve existing
+    behavior" guarantee for the six original selector types.
+
+    Returns ``(True, [])`` when nothing blocks (including the case where
+    ``typed_records`` is empty or carries no freshness-applicable targets at
+    all — freshness is opt-in; a pointer that never declared or resolved to
+    a freshness concept cannot fail a check that doesn't apply to it).
+    Otherwise ``(False, reasons)`` where ``reasons`` is a sorted, actionable,
+    human-readable list — one entry per blocking target, naming the pointer
+    (its id, else its source_type), the target's uri, and its state — so a
+    receiving executor knows EXACTLY which evidence to re-verify or refresh,
+    not just that "something" is stale.
+
+    Never raises: every field access is a guarded ``dict.get``.
+    """
+    reasons: list[str] = []
+    for rec in typed_records or []:
+        if not isinstance(rec, dict):
+            continue
+        pointer_ref = rec.get("id") or rec.get("source_type") or "pointer"
+        for t in rec.get("targets") or []:
+            if not isinstance(t, dict):
+                continue
+            state = t.get("freshness_state")
+            if state in _BLOCKING_FRESHNESS_STATES:
+                reasons.append(
+                    f"{pointer_ref}: target {t.get('uri')!r} is freshness_state="
+                    f"{state!r} — re-capture or refresh this pointer's evidence "
+                    "before trusting it in a strict handoff"
+                )
+    return (not reasons), sorted(reasons)
 
 
 # ---------------------------------------------------------------------------

@@ -11,10 +11,12 @@ unaffected.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import subprocess
+import time
 from typing import Any
 
 import aiosqlite
@@ -1186,6 +1188,502 @@ async def promote_workspace_proposal(
     }
 
 
+# ---------------------------------------------------------------------------
+# 3f892ea6 — deterministic proposal intake blocks: provenance-preserving
+# block parsing, idempotent ingest, and explicit sprint promotion.
+#
+# Distinct from promote_workspace_proposal above (which promotes the WHOLE
+# proposal body, verbatim, as one sprint item): this pipeline splits a
+# proposal's body into individually-addressable BLOCKS (paragraphs, with
+# fenced/triple-quoted code kept intact as one block), attaches deterministic
+# provenance (exact text, source line range, a sha256 content hash, and a
+# stable per-(proposal, block) intake_key) to each, classifies each block's
+# review route from an explicit marker tag, and lets a human promote
+# individual blocks to sprint items one at a time — never automatically.
+#
+# parse_proposal_intake_blocks is a PURE function (no DB) so its provenance
+# guarantees (exact text, byte-identical hash, deterministic key) are trivial
+# to test in isolation. ingest_proposal_intake/get_proposal_intake_drafts/
+# promote_intake_draft persist and act on its output.
+# ---------------------------------------------------------------------------
+
+# Recognized intake markers -> the review route a block is queued for. A
+# block with no marker prefix (or an unrecognized bracketed tag, e.g.
+# "[TODO]") is deliberately left unresolved (route=None) rather than guessed
+# — an intake block only gets routed when a human/producer explicitly says so.
+_INTAKE_MARKER_ROUTES: dict[str, str] = {
+    "[MERIDIAN-DOCS]": "meridian_docs_review",
+    "[SERENA]": "meridian_code_review",
+    "[MERIDIAN-OUTPUTS]": "meridian_outputs_review",
+    "[HUMAN]": "human_decision_review",
+    "[SPRINT]": "sprint_item_review",
+}
+
+# Fenced/triple-quoted live-code spans (```...``` or '''...''') are excluded
+# from task creation — a block is code and never gets a route or a promoted
+# sprint item, but its exact text/hash/lines are still preserved for provenance.
+_INTAKE_FENCE_OPENERS = ("```", "'''")
+
+_INTAKE_CANDIDATE_ID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+
+
+def parse_proposal_intake_blocks(proposal_id: str, body: str) -> list[dict[str, Any]]:
+    """3f892ea6 — split a proposal body into deterministic, provenance-carrying
+    blocks. Pure function: same (proposal_id, body) always yields identical
+    output, no DB access.
+
+    A block is a run of non-blank lines separated from its neighbours by one
+    or more blank lines, EXCEPT that a fenced (```) or triple-quoted (''')
+    span is treated as ONE block from its opening marker line through its
+    closing marker line even if it contains blank lines internally — never
+    split, and always flagged ``is_code=True`` (excluded from routing and
+    candidate-id extraction downstream by ingest_proposal_intake).
+
+    Each returned dict has:
+      block_id         "b1", "b2", ... — 1-indexed, positional across both
+                        code and non-code blocks.
+      text              Exact block text (original lines rejoined with "\\n",
+                        no leading/trailing blank lines) — the provenance
+                        anchor for source_hash/line_start/line_end below.
+      line_start/line_end  1-indexed, inclusive physical line range in body.
+      source_hash        sha256 hex digest of ``text`` (utf-8).
+      intake_key         sha256 hex digest of ``f"{proposal_id}::{block_id}"``
+                        — deterministic for the SAME (proposal_id, block
+                        position) across repeated parses of the SAME or a
+                        revised body, but distinct across different
+                        proposals. This is the stable identity ingest uses
+                        to detect "same block position, body changed" vs.
+                        "brand new block".
+      route              One of the _INTAKE_MARKER_ROUTES values, or None
+                        when the block has no recognized marker (or is code).
+      candidate_ids       UUID-shaped substrings found in the block text.
+      is_code             True for a fenced/triple-quoted span.
+    """
+    lines = (body or "").split("\n")
+    blocks: list[dict[str, Any]] = []
+    current_lines: list[str] = []
+    current_start = 0
+    in_fence = False
+    fence_close = "```"
+
+    def _finalize(end_line: int, is_code: bool) -> None:
+        nonlocal current_lines
+        if not current_lines:
+            return
+        text = "\n".join(current_lines)
+        block_id = f"b{len(blocks) + 1}"
+        stripped = text.strip()
+        route: str | None = None
+        if not is_code:
+            for marker, route_name in _INTAKE_MARKER_ROUTES.items():
+                if stripped.startswith(marker):
+                    route = route_name
+                    break
+        blocks.append({
+            "block_id": block_id,
+            "text": text,
+            "line_start": current_start,
+            "line_end": end_line,
+            "source_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "intake_key": hashlib.sha256(
+                f"{proposal_id}::{block_id}".encode("utf-8")
+            ).hexdigest(),
+            "route": route,
+            "candidate_ids": _INTAKE_CANDIDATE_ID_RE.findall(text),
+            "is_code": is_code,
+        })
+        current_lines = []
+
+    for idx, raw_line in enumerate(lines):
+        line_no = idx + 1
+        if in_fence:
+            current_lines.append(raw_line)
+            if raw_line.strip() == fence_close:
+                in_fence = False
+                _finalize(line_no, is_code=True)
+            continue
+
+        stripped_line = raw_line.strip()
+        if stripped_line == "":
+            if current_lines:
+                _finalize(line_no - 1, is_code=False)
+            continue
+
+        if not current_lines:
+            current_start = line_no
+            if stripped_line.startswith(_INTAKE_FENCE_OPENERS):
+                in_fence = True
+                fence_close = "```" if stripped_line.startswith("```") else "'''"
+        current_lines.append(raw_line)
+
+    if current_lines:
+        _finalize(len(lines), is_code=in_fence)
+
+    return blocks
+
+
+def _derive_intake_draft_title(text: str) -> str:
+    """Derive a short sprint-item title from a promoted block's raw text:
+    strip a leading marker tag, collapse to a single line, cap length."""
+    stripped = (text or "").strip()
+    for marker in _INTAKE_MARKER_ROUTES:
+        if stripped.startswith(marker):
+            stripped = stripped[len(marker):].strip()
+            break
+    first_line = stripped.splitlines()[0] if stripped else ""
+    single_line = " ".join(first_line.split())
+    return single_line[:200] or "Untitled proposal intake block"
+
+
+async def _migrate_proposal_intake_drafts(db: aiosqlite.Connection) -> None:
+    """3f892ea6 — proposal_intake_drafts: one row per parsed, non-code intake
+    block, keyed on (proposal_id, block_id). Not present in the base
+    CREATE_TABLES literal — this guarded migration is the only creation
+    path, for either a fresh or an existing DB (2026-07-04 inline-index
+    outage rule: no inline CREATE INDEX in the unguarded base schema).
+    Mirrors ``pg_adapter._migrate_pg_proposal_intake_drafts``.
+
+    ``position`` is a plain integer (parsed from the numeric suffix of
+    ``block_id``) used purely for deterministic ORDER BY — block ids are
+    NOT lexicographically sortable ("b10" < "b2" as strings) and row ids
+    are random UUIDs, so neither can be used as an ordering key.
+
+    The UNIQUE index on (proposal_id, block_id) is what makes
+    ingest_proposal_intake's upsert-by-position logic correct: a second
+    ingest of the same body updates the SAME row in place instead of
+    inserting a duplicate.
+    """
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS proposal_intake_drafts (
+            id TEXT PRIMARY KEY,
+            proposal_id TEXT NOT NULL,
+            tenant_id TEXT,
+            block_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            intake_key TEXT NOT NULL,
+            text TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            route TEXT,
+            candidate_ids TEXT NOT NULL DEFAULT '[]',
+            is_code INTEGER NOT NULL DEFAULT 0,
+            is_duplicate INTEGER NOT NULL DEFAULT 0,
+            duplicate_of_block_id TEXT,
+            revision INTEGER NOT NULL DEFAULT 1,
+            history TEXT NOT NULL DEFAULT '[]',
+            status TEXT NOT NULL DEFAULT 'draft',
+            line_start INTEGER,
+            line_end INTEGER,
+            promoted_to_sprint_item_id TEXT,
+            promoted_to_project_id TEXT,
+            promoted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )"""
+    )
+    await db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_intake_drafts_block "
+        "ON proposal_intake_drafts(proposal_id, block_id)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_proposal_intake_drafts_position "
+        "ON proposal_intake_drafts(proposal_id, position)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_proposal_intake_drafts_promoted "
+        "ON proposal_intake_drafts(promoted_to_sprint_item_id)"
+    )
+    await db.commit()
+
+
+async def ingest_proposal_intake(
+    db: aiosqlite.Connection, proposal_id: str,
+) -> dict[str, Any]:
+    """3f892ea6 — parse a proposal's CURRENT body into blocks and upsert one
+    draft row per non-code block. NEVER creates a sprint item — ingest only
+    ever produces drafts; promotion is always a separate, explicit step
+    (see promote_intake_draft).
+
+    Idempotent: re-ingesting an unchanged body updates nothing (block ids
+    land in ``unchanged``). A block whose text changed since the last ingest
+    is updated IN PLACE (same draft id, ``revision`` bumped, prior text
+    appended to ``history``) rather than creating a second row — block
+    identity is (proposal_id, block_id), not source_hash. A code block is
+    parsed for provenance but never persisted as a draft (its block_id lands
+    in ``excluded_code`` instead). Duplicate detection is scoped to this
+    ingest's own non-code blocks: the FIRST occurrence of a given exact text
+    is canonical, later occurrences are flagged ``is_duplicate`` and cannot
+    be promoted (see promote_intake_draft).
+
+    Raises ``ValueError`` if the proposal does not exist.
+
+    Returns ``{"drafts": [...], "created": [...], "updated": [...],
+    "unchanged": [...], "duplicates": [...], "excluded_code": [...]}`` —
+    the block_id lists reflect what THIS call did; ``drafts`` is the full,
+    ordered set of draft rows touched by this ingest.
+    """
+    async with db.execute(
+        "SELECT * FROM workspace_proposals WHERE id = ?", (proposal_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    proposal = _row_to_dict(row)
+    if proposal is None:
+        raise ValueError(f"Proposal '{proposal_id}' not found")
+
+    blocks = parse_proposal_intake_blocks(proposal_id, proposal.get("body") or "")
+
+    # First occurrence of an exact text among this ingest's non-code blocks
+    # is canonical; later ones are duplicates of it.
+    seen_hashes: dict[str, str] = {}
+    duplicate_of: dict[str, str] = {}
+    for block in blocks:
+        if block["is_code"]:
+            continue
+        h = block["source_hash"]
+        if h in seen_hashes:
+            duplicate_of[block["block_id"]] = seen_hashes[h]
+        else:
+            seen_hashes[h] = block["block_id"]
+
+    created: list[str] = []
+    updated: list[str] = []
+    unchanged: list[str] = []
+    duplicates: list[str] = []
+    excluded_code: list[str] = []
+
+    for block in blocks:
+        block_id = block["block_id"]
+        if block["is_code"]:
+            excluded_code.append(block_id)
+            continue
+
+        is_duplicate = block_id in duplicate_of
+        duplicate_of_block_id = duplicate_of.get(block_id)
+        if is_duplicate:
+            duplicates.append(block_id)
+
+        async with db.execute(
+            "SELECT * FROM proposal_intake_drafts "
+            "WHERE proposal_id = ? AND block_id = ?",
+            (proposal_id, block_id),
+        ) as cur:
+            existing_row = await cur.fetchone()
+        existing = _row_to_dict(existing_row)
+
+        candidate_ids_json = json.dumps(block["candidate_ids"])
+        position = int(block_id[1:])
+
+        if existing is None:
+            draft_id = _new_id()
+            await db.execute(
+                "INSERT INTO proposal_intake_drafts "
+                "(id, proposal_id, tenant_id, block_id, position, intake_key, "
+                "text, source_hash, route, candidate_ids, is_code, "
+                "is_duplicate, duplicate_of_block_id, revision, history, "
+                "status, line_start, line_end) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 1, '[]', "
+                "'draft', ?, ?)",
+                (
+                    draft_id, proposal_id, proposal.get("tenant_id"), block_id,
+                    position, block["intake_key"], block["text"],
+                    block["source_hash"], block["route"], candidate_ids_json,
+                    1 if is_duplicate else 0, duplicate_of_block_id,
+                    block["line_start"], block["line_end"],
+                ),
+            )
+            created.append(block_id)
+        elif existing["source_hash"] == block["source_hash"]:
+            await db.execute(
+                "UPDATE proposal_intake_drafts SET route = ?, "
+                "candidate_ids = ?, is_duplicate = ?, "
+                "duplicate_of_block_id = ?, line_start = ?, line_end = ? "
+                "WHERE id = ?",
+                (
+                    block["route"], candidate_ids_json, 1 if is_duplicate else 0,
+                    duplicate_of_block_id, block["line_start"], block["line_end"],
+                    existing["id"],
+                ),
+            )
+            unchanged.append(block_id)
+        else:
+            history = json.loads(existing.get("history") or "[]")
+            history.append({
+                "text": existing["text"],
+                "source_hash": existing["source_hash"],
+                "revision": existing["revision"],
+                "replaced_at": existing.get("updated_at"),
+            })
+            await db.execute(
+                "UPDATE proposal_intake_drafts SET text = ?, source_hash = ?, "
+                "route = ?, candidate_ids = ?, is_duplicate = ?, "
+                "duplicate_of_block_id = ?, line_start = ?, line_end = ?, "
+                "revision = revision + 1, history = ?, "
+                "updated_at = datetime('now') WHERE id = ?",
+                (
+                    block["text"], block["source_hash"], block["route"],
+                    candidate_ids_json, 1 if is_duplicate else 0,
+                    duplicate_of_block_id, block["line_start"], block["line_end"],
+                    json.dumps(history), existing["id"],
+                ),
+            )
+            updated.append(block_id)
+
+    await db.commit()
+
+    all_drafts = await get_proposal_intake_drafts(db, proposal_id)
+    touched = set(created) | set(updated) | set(unchanged)
+    result_drafts = [d for d in all_drafts if d["block_id"] in touched]
+
+    return {
+        "drafts": result_drafts,
+        "created": created,
+        "updated": updated,
+        "unchanged": unchanged,
+        "duplicates": duplicates,
+        "excluded_code": excluded_code,
+    }
+
+
+async def get_proposal_intake_drafts(
+    db: aiosqlite.Connection, proposal_id: str,
+) -> list[dict[str, Any]]:
+    """3f892ea6 — every intake draft for one proposal, in deterministic
+    block-position order (ORDER BY the numeric ``position`` column, NOT the
+    lexicographic ``block_id`` string — "b10" must sort after "b2", not
+    before it). ``candidate_ids``/``history`` are decoded back to Python
+    lists.
+    """
+    async with db.execute(
+        "SELECT * FROM proposal_intake_drafts WHERE proposal_id = ? "
+        "ORDER BY position ASC",
+        (proposal_id,),
+    ) as cur:
+        rows = await cur.fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = _row_to_dict(r)
+        if d is None:
+            continue
+        try:
+            d["candidate_ids"] = json.loads(d.get("candidate_ids") or "[]")
+        except (TypeError, ValueError):
+            d["candidate_ids"] = []
+        try:
+            d["history"] = json.loads(d.get("history") or "[]")
+        except (TypeError, ValueError):
+            d["history"] = []
+        out.append(d)
+    return out
+
+
+async def promote_intake_draft(
+    db: aiosqlite.Connection,
+    draft_id: str,
+    project_id: str,
+    title: str | None = None,
+    version: str | None = None,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """3f892ea6 — explicitly promote ONE intake draft to a real sprint item.
+
+    Never automatic (ingest_proposal_intake never calls this). Raises
+    ``ValueError`` when: the draft does not exist; it was already promoted
+    (message contains "already promoted"); it is flagged ``is_duplicate``
+    (message contains "duplicate" — promote the canonical block instead);
+    or ``project_id`` does not name a real project (message contains "not
+    found").
+
+    Durable backlink: records ``promoted_to_sprint_item_id`` /
+    ``promoted_to_project_id`` / ``promoted_at`` on the draft row AND writes
+    a ``proposal_evidence_links`` row (proposal -> sprint_item, scoped to
+    ``project_id``) via ``link_proposal_evidence`` — mirrors
+    ``promote_workspace_proposal``'s identical evidence-linking step.
+    Evidence-linking failure never blocks the promotion itself (the
+    draft-row backlink above is the single source of truth either way).
+
+    Two DIFFERENT drafts of the SAME proposal may be promoted into two
+    DIFFERENT projects; each lands as a fully separate, correctly-scoped
+    sprint item (project_id is never inferred or shared across calls).
+    """
+    async with db.execute(
+        "SELECT * FROM proposal_intake_drafts WHERE id = ?", (draft_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    draft = _row_to_dict(row)
+    if draft is None:
+        raise ValueError(f"Proposal intake draft '{draft_id}' not found")
+    if draft.get("status") == "promoted":
+        raise ValueError(
+            f"Proposal intake draft '{draft_id}' is already promoted to "
+            f"sprint item '{draft.get('promoted_to_sprint_item_id')}'"
+        )
+    if draft.get("is_duplicate"):
+        raise ValueError(
+            f"Proposal intake draft '{draft_id}' is a duplicate of block "
+            f"'{draft.get('duplicate_of_block_id')}' and cannot be promoted "
+            "directly — promote the canonical block instead."
+        )
+
+    project = await get_project(db, project_id)
+    if project is None:
+        raise ValueError(f"Project '{project_id}' not found")
+
+    item_title = title or _derive_intake_draft_title(draft["text"])
+    item_version = version or "current"
+
+    si_id = _new_id()
+    await db.execute(
+        "INSERT INTO sprint_items "
+        "(id, project_id, version, title, status, notes) "
+        "VALUES (?, ?, ?, ?, 'pending', ?)",
+        (si_id, project_id, item_version, item_title, draft["text"]),
+    )
+
+    # 867317f6-style atomic from-state guard: a concurrent promote of the
+    # SAME draft must not both succeed. A lost race compensates by deleting
+    # the sprint item this call just inserted rather than leaving an orphan.
+    cursor = await db.execute(
+        "UPDATE proposal_intake_drafts SET status = 'promoted', "
+        "promoted_to_sprint_item_id = ?, promoted_to_project_id = ?, "
+        "promoted_at = datetime('now'), updated_at = datetime('now') "
+        "WHERE id = ? AND status != 'promoted'",
+        (si_id, project_id, draft_id),
+    )
+    if cursor.rowcount == 0:
+        await db.execute("DELETE FROM sprint_items WHERE id = ?", (si_id,))
+        await db.commit()
+        raise ValueError(
+            f"Proposal intake draft '{draft_id}' was promoted by another "
+            "caller before this promotion could commit."
+        )
+    await db.commit()
+
+    # Lazy import: link_proposal_evidence lives in meridian.db.proposal_links,
+    # imported onto meridian.db AFTER this module — same pattern as
+    # promote_workspace_proposal's identical lazy import above.
+    evidence_link: dict[str, Any] | None = None
+    try:
+        from meridian.db import link_proposal_evidence  # noqa: PLC0415
+
+        evidence_link = await link_proposal_evidence(
+            db, project_id, draft["proposal_id"], "sprint_item", si_id,
+            label=item_title, actor=actor,
+        )
+    except Exception:  # noqa: BLE001 — promotion itself must never be
+        # blocked by an evidence-linking failure; the draft row's own
+        # promoted_to_sprint_item_id above already recorded the canonical link.
+        evidence_link = None
+
+    return {
+        "sprint_item_id": si_id,
+        "draft_id": draft_id,
+        "project_id": project_id,
+        "sprint_item_title": item_title,
+        "evidence_link": evidence_link,
+    }
+
+
 async def set_proposal_github_issue(
     db: aiosqlite.Connection,
     proposal_id: str,
@@ -1841,6 +2339,335 @@ async def get_action_audit_log(
     ) as cur:
         rows = await cur.fetchall()
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# 0d95003f — generic cross-project quarantine mechanism.
+#
+# move_sprint_item_to_project / move_workspace_note_to_project (this module
+# and sprint_items.py) handle "we know where a record belongs, move it
+# there." Quarantine is the other half of the item's ask: "a record's
+# project association looks WRONG or ambiguous, and no automated system
+# (executor handoff, sprint-item completion, ...) should treat it as
+# legitimately belonging to a project until a human/audited actor resolves
+# it" — e.g. a sprint item whose depends_on crosses into another project
+# (see find_cross_project_dependency_mismatches +
+# audit_and_quarantine_sprint_item_dependency_mismatches in sprint_items.py),
+# or a session/task/note/proposal/pointer surfaced with an unclear origin
+# during a merge.
+#
+# Deliberately event-sourced over action_audit_log rather than a new
+# stateful table: no schema migration required (event_type is free-text —
+# see migrations._migrate_action_audit_log_table's docstring, "extensible to
+# future action-audit entries"), tamper-evident (append-only, same guarantee
+# the rest of the audit log already provides), and directly reuses
+# record_action_audit_event / the action_audit_log table above instead of
+# inventing parallel machinery. "Currently quarantined" for a given
+# (record_type, record_id) key is derived purely by replaying its events in
+# order: an entry is open if its most recent event is a quarantine event
+# with no matching resolve event after it.
+#
+# Ordering note: action_audit_log's created_at has only whole-second
+# precision (SQLite `datetime('now')` — see the postgres now() vs
+# clock_timestamp() gap documented on _TS/_DATETIME_NOW_EXPR), which is not
+# fine-grained enough to order a quarantine event and an immediate resolve
+# of it (a realistic sequence in both tests and real usage). Each event's
+# detail JSON therefore carries its own "_seq": time.monotonic_ns() —
+# strictly increasing within this process, used ONLY as an ordering
+# tiebreaker within one (record_type, record_id) key's own event list, never
+# compared across processes or persisted as a wall-clock claim.
+#
+# Generic across record types by design: record_type is caller-supplied
+# free text ("sprint_item", "session", "task", "note", "proposal",
+# "pointer", "handoff_body", "generated_file", "redis_key", "index_shard",
+# ...). This item's own remaining scope — the six record classes without a
+# dedicated audited move/mismatch-scanner yet (sessions, tasks, notes,
+# proposals/proposal-evidence, pointers, handoff-bodies, generated-files,
+# Redis-keys, index-shards — see the item's own RESCUE-A note) — can each
+# plug into THIS mechanism as soon as their own mismatch-DETECTION logic
+# exists. That per-record-type detection (each record type's own "does this
+# belong to project X" question needs its own schema-aware scan, the way
+# find_cross_project_dependency_mismatches is specific to sprint_items'
+# depends_on column) is the genuinely large remaining follow-up, not the
+# quarantine bookkeeping itself — which is now one shared, tested primitive
+# instead of needing six bespoke ones. Deliberately NOT attempted here for
+# the same reason 4ce87a11 deferred them: each deserves dedicated design,
+# not a rushed bundle.
+# ---------------------------------------------------------------------------
+
+CROSS_PROJECT_QUARANTINE_EVENT_TYPE = "cross_project_quarantine"
+CROSS_PROJECT_QUARANTINE_RESOLVED_EVENT_TYPE = "cross_project_quarantine_resolved"
+
+_VALID_QUARANTINE_RESOLUTIONS = frozenset({
+    "moved", "dismissed_false_positive", "confirmed_correct_project",
+})
+
+
+async def _fetch_quarantine_events_grouped(
+    db: aiosqlite.Connection,
+) -> dict[tuple[str, str], list[tuple[dict[str, Any], dict[str, Any]]]]:
+    """Read every quarantine/resolve action_audit_log row and group by
+    (record_type, record_id), each group's events sorted ascending by the
+    embedded "_seq" tiebreaker (0d95003f). Internal helper shared by the
+    single-key and list-all read paths below."""
+    async with db.execute(
+        "SELECT * FROM action_audit_log WHERE event_type IN (?, ?) ORDER BY created_at ASC",
+        (CROSS_PROJECT_QUARANTINE_EVENT_TYPE, CROSS_PROJECT_QUARANTINE_RESOLVED_EVENT_TYPE),
+    ) as cur:
+        rows = await cur.fetchall()
+    grouped: dict[tuple[str, str], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for row in rows:
+        row_d = _row_to_dict(row)
+        if row_d is None:
+            continue
+        try:
+            detail = json.loads(row_d.get("detail") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        rt, rid = detail.get("record_type"), detail.get("record_id")
+        if not rt or not rid:
+            continue
+        grouped.setdefault((rt, rid), []).append((row_d, detail))
+    for key in grouped:
+        grouped[key].sort(key=lambda pair: pair[1].get("_seq", 0))
+    return grouped
+
+
+def _quarantine_status_from_events(
+    record_type: str,
+    record_id: str,
+    events: list[tuple[dict[str, Any], dict[str, Any]]],
+) -> dict[str, Any]:
+    """Reduce one key's ordered (row, detail) event pairs to a current
+    status dict (0d95003f). See get_cross_project_quarantine_status for the
+    returned shape."""
+    row, detail = events[-1]
+    if row.get("event_type") == CROSS_PROJECT_QUARANTINE_RESOLVED_EVENT_TYPE:
+        quarantine_row: dict[str, Any] | None = None
+        quarantine_detail: dict[str, Any] | None = None
+        for r, d in reversed(events[:-1]):
+            if r.get("event_type") == CROSS_PROJECT_QUARANTINE_EVENT_TYPE:
+                quarantine_row, quarantine_detail = r, d
+                break
+        return {
+            "record_type": record_type,
+            "record_id": record_id,
+            "project_id": (quarantine_row or row).get("project_id"),
+            "status": "resolved",
+            "reason": (quarantine_detail or {}).get("reason"),
+            "suspected_project_id": (quarantine_detail or {}).get("suspected_project_id"),
+            "quarantined_at": quarantine_row.get("created_at") if quarantine_row else None,
+            "quarantined_by": quarantine_row.get("actor") if quarantine_row else None,
+            "resolution": detail.get("resolution"),
+            "resolved_at": row.get("created_at"),
+            "resolved_by": row.get("actor"),
+            "note": detail.get("note"),
+        }
+    return {
+        "record_type": record_type,
+        "record_id": record_id,
+        "project_id": row.get("project_id"),
+        "status": "quarantined",
+        "reason": detail.get("reason"),
+        "suspected_project_id": detail.get("suspected_project_id"),
+        "quarantined_at": row.get("created_at"),
+        "quarantined_by": row.get("actor"),
+        "resolution": None,
+        "resolved_at": None,
+        "resolved_by": None,
+        "note": None,
+    }
+
+
+async def get_cross_project_quarantine_status(
+    db: aiosqlite.Connection, record_type: str, record_id: str,
+) -> dict[str, Any] | None:
+    """Current quarantine status for (record_type, record_id), or None if
+    this key has never been quarantined (0d95003f).
+
+    Returns::
+
+        {
+            "record_type", "record_id", "project_id",
+            "status": "quarantined" | "resolved",
+            "reason", "suspected_project_id",
+            "quarantined_at", "quarantined_by",
+            "resolution", "resolved_at", "resolved_by", "note",
+        }
+
+    "status" is derived purely from replaying this key's own append-only
+    events (see module docstring above) — never from any separate mutable
+    state.
+    """
+    _record_type = (record_type or "").strip()
+    _record_id = (record_id or "").strip()
+    if not _record_type or not _record_id:
+        return None
+    grouped = await _fetch_quarantine_events_grouped(db)
+    events = grouped.get((_record_type, _record_id))
+    if not events:
+        return None
+    return _quarantine_status_from_events(_record_type, _record_id, events)
+
+
+async def is_cross_project_quarantined(
+    db: aiosqlite.Connection, record_type: str, record_id: str,
+) -> bool:
+    """Convenience boolean for callers that just need "should this record be
+    treated as blocked from handoff/completion" (0d95003f) — e.g. a future
+    executor-handoff or sprint-item-completion gate."""
+    status = await get_cross_project_quarantine_status(db, record_type, record_id)
+    return bool(status) and status.get("status") == "quarantined"
+
+
+async def quarantine_cross_project_record(
+    db: aiosqlite.Connection,
+    record_type: str,
+    record_id: str,
+    project_id: str,
+    *,
+    reason: str,
+    actor: str,
+    suspected_project_id: str | None = None,
+    tenant_id: str | None = None,
+) -> dict[str, Any]:
+    """Flag (record_type, record_id) as an ambiguous/foreign cross-project
+    reference for project_id, WITHOUT moving or deleting anything (0d95003f).
+
+    Idempotent: if an OPEN quarantine entry already exists for this exact
+    key, returns it unchanged rather than writing a duplicate event — a
+    detection scan is safe to call this on every run.
+
+    Returns ``{"quarantined": bool, "entry": dict | None, "error": str | None}``.
+    Refuses (quarantined=False, entry=None, non-empty error) on empty
+    record_type / record_id / reason / actor — an unattributed, unexplained
+    quarantine is refused, mirroring move_sprint_item_to_project's identical
+    guard.
+    """
+    _record_type = (record_type or "").strip()
+    _record_id = (record_id or "").strip()
+    _reason = (reason or "").strip()
+    _actor = (actor or "").strip()
+    if not _record_type or not _record_id:
+        return {
+            "quarantined": False, "entry": None,
+            "error": "record_type and record_id are required and must be non-empty.",
+        }
+    if not _reason:
+        return {"quarantined": False, "entry": None, "error": "reason is required and must be non-empty."}
+    if not _actor:
+        return {"quarantined": False, "entry": None, "error": "actor is required and must be non-empty."}
+
+    existing = await get_cross_project_quarantine_status(db, _record_type, _record_id)
+    if existing is not None and existing.get("status") == "quarantined":
+        return {"quarantined": False, "entry": existing, "error": None}
+
+    await record_action_audit_event(
+        db, CROSS_PROJECT_QUARANTINE_EVENT_TYPE,
+        tenant_id=tenant_id,
+        project_id=project_id,
+        actor=_actor,
+        detail=json.dumps({
+            "record_type": _record_type,
+            "record_id": _record_id,
+            "project_id": project_id,
+            "suspected_project_id": suspected_project_id,
+            "reason": _reason,
+            "_seq": time.monotonic_ns(),
+        }),
+    )
+    entry = await get_cross_project_quarantine_status(db, _record_type, _record_id)
+    return {"quarantined": True, "entry": entry, "error": None}
+
+
+async def resolve_cross_project_quarantine(
+    db: aiosqlite.Connection,
+    record_type: str,
+    record_id: str,
+    *,
+    resolution: str,
+    actor: str,
+    note: str | None = None,
+    tenant_id: str | None = None,
+    project_id: str | None = None,
+) -> dict[str, Any]:
+    """Close an OPEN quarantine entry for (record_type, record_id) (0d95003f).
+
+    ``resolution`` must be one of ``_VALID_QUARANTINE_RESOLUTIONS``:
+
+    * ``"moved"`` — an audited move (e.g. move_sprint_item_to_project)
+      resolved the mismatch.
+    * ``"dismissed_false_positive"`` — reviewed; the record's existing
+      project association was actually correct.
+    * ``"confirmed_correct_project"`` — reviewed and re-affirmed without
+      moving anything.
+
+    Returns ``{"resolved": bool, "entry": dict | None, "error": str | None}``.
+    Refuses if there is no currently-open quarantine entry for this key
+    (nothing to resolve), or resolution/actor are invalid/empty — mirrors
+    move_sprint_item_to_project's non-empty-actor guard.
+    """
+    _record_type = (record_type or "").strip()
+    _record_id = (record_id or "").strip()
+    _resolution = (resolution or "").strip()
+    _actor = (actor or "").strip()
+    if _resolution not in _VALID_QUARANTINE_RESOLUTIONS:
+        return {
+            "resolved": False, "entry": None,
+            "error": (
+                f"resolution must be one of {sorted(_VALID_QUARANTINE_RESOLUTIONS)}, "
+                f"got {resolution!r}."
+            ),
+        }
+    if not _actor:
+        return {"resolved": False, "entry": None, "error": "actor is required and must be non-empty."}
+
+    current = await get_cross_project_quarantine_status(db, _record_type, _record_id)
+    if current is None or current.get("status") != "quarantined":
+        return {
+            "resolved": False, "entry": current,
+            "error": "no open quarantine entry found for this record.",
+        }
+
+    await record_action_audit_event(
+        db, CROSS_PROJECT_QUARANTINE_RESOLVED_EVENT_TYPE,
+        tenant_id=tenant_id,
+        project_id=project_id if project_id is not None else current.get("project_id"),
+        actor=_actor,
+        detail=json.dumps({
+            "record_type": _record_type,
+            "record_id": _record_id,
+            "resolution": _resolution,
+            "note": note,
+            "_seq": time.monotonic_ns(),
+        }),
+    )
+    entry = await get_cross_project_quarantine_status(db, _record_type, _record_id)
+    return {"resolved": True, "entry": entry, "error": None}
+
+
+async def list_quarantined_cross_project_records(
+    db: aiosqlite.Connection,
+    *,
+    project_id: str | None = None,
+    record_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read-only: every CURRENTLY-open quarantine entry, optionally filtered
+    to a project and/or record_type (0d95003f). Ordered by quarantined_at
+    then record_type/record_id for determinism. Never mutates anything."""
+    grouped = await _fetch_quarantine_events_grouped(db)
+    results: list[dict[str, Any]] = []
+    for (rt, rid), events in grouped.items():
+        status = _quarantine_status_from_events(rt, rid, events)
+        if status.get("status") != "quarantined":
+            continue
+        if project_id is not None and status.get("project_id") != project_id:
+            continue
+        if record_type is not None and rt != record_type:
+            continue
+        results.append(status)
+    results.sort(key=lambda e: (e.get("quarantined_at") or "", e["record_type"], e["record_id"]))
+    return results
 
 
 class ManualIssueScreeningToggleError(ValueError):

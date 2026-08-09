@@ -1494,6 +1494,59 @@ def _docx_manifest_hash(changed_parts: dict[str, bytes]) -> str:
     return h.hexdigest()
 
 
+def _check_artifact_provenance(artifact_provenance: "dict[str, Any] | None") -> None:
+    """Fail-closed gate on a caller-supplied, pre-computed artifact-provenance
+    binding verdict (sprint item 6d02f343 -- bind figure/table/equation
+    artifacts to per-file provenance and fail closed on mismatched writes).
+
+    ``artifact_provenance`` is the plain dict returned by
+    ``meridian_outputs.provenance.bind_artifact_provenance`` (or an
+    equivalent caller-built dict sharing its ``{"all_clear": bool,
+    "bindings": [...]}`` shape). This module deliberately never imports
+    ``meridian_outputs`` itself -- it is a separate, optionally-installed
+    extension (see that package's own ``provenance_status.py`` docstring for
+    the established pattern: the CALLER computes the provenance verdict and
+    hands the resulting plain dict in here, duck-typed, rather than this
+    module reaching across the package boundary). ``None`` (the default)
+    means the caller did not ask for this check -- zero behavior change for
+    every write path that predates this item.
+
+    Raises :class:`DocxWriteVerificationError` -- BEFORE promotion, so
+    ``dest`` is guaranteed byte-for-byte untouched -- when
+    ``artifact_provenance`` was supplied but is missing/malformed, or is
+    supplied and not cleanly ``all_clear``. Never silently treats "could not
+    check" as "passed": an opt-in caller that asked for this gate gets an
+    explicit reject, not a best-effort skip.
+    """
+    if artifact_provenance is None:
+        return
+    if not isinstance(artifact_provenance, dict) or "all_clear" not in artifact_provenance:
+        raise DocxWriteVerificationError(
+            "post-write verification failed: artifact_provenance was "
+            "supplied but is not a valid binding-verdict dict (missing "
+            "'all_clear') -- refusing to promote a write whose artifact "
+            "provenance this cannot confirm",
+            manifest={"artifact_provenance": artifact_provenance},
+        )
+    if not artifact_provenance.get("all_clear"):
+        rejected = [
+            binding
+            for binding in (artifact_provenance.get("bindings") or [])
+            if binding.get("status") != "resolved"
+        ]
+        raise DocxWriteVerificationError(
+            "post-write verification failed: one or more figure/table/"
+            "equation artifacts failed provenance binding (orphaned, "
+            "hash-mismatched, or unresolved) -- discarding the staged "
+            "artifact instead of promoting a write with unverified "
+            "artifact provenance",
+            manifest={
+                "artifact_provenance": artifact_provenance,
+                "rejected_bindings": rejected,
+            },
+        )
+
+
 def _write_docx_transaction(
     payload: bytes,
     dest: str,
@@ -1501,6 +1554,7 @@ def _write_docx_transaction(
     pre_manifest: dict[str, int],
     protected_keys: tuple[str, ...],
     changed_parts: dict[str, bytes],
+    artifact_provenance: "dict[str, Any] | None" = None,
 ) -> dict[str, Any]:
     """Stage / verify / (serialized) promote a DOCX write transaction (dccc2311).
 
@@ -1537,6 +1591,16 @@ def _write_docx_transaction(
     (safe to restore my own pre-image) from "a different writer's promotion
     has already landed since mine" (restoring would destroy that writer's
     completed work -- see ``update_paragraph`` / ``merge_paragraph_draft``).
+
+    ``artifact_provenance`` (6d02f343, optional) -- when supplied, checked
+    via :func:`_check_artifact_provenance` immediately after step 2's
+    structural manifest passes and before step 3 ever promotes: a
+    caller-computed figure/table/equation provenance-binding verdict
+    (``meridian_outputs.provenance.bind_artifact_provenance``'s return
+    shape) that is not cleanly ``all_clear`` fails the transaction closed
+    exactly like a structural mismatch -- ``dest`` stays untouched. ``None``
+    (the default) skips this check entirely, unchanged behavior for every
+    caller that predates this item.
     """
     parent = os.path.dirname(os.path.abspath(dest)) or "."
     os.makedirs(parent, exist_ok=True)
@@ -1585,6 +1649,12 @@ def _write_docx_transaction(
                 },
             )
 
+        # 6d02f343 -- structural verification passed; only NOW is it safe to
+        # additionally gate on artifact provenance (per this item's own
+        # instruction that provenance checks must run "only after structural
+        # verification succeeds"). Still strictly before promotion below.
+        _check_artifact_provenance(artifact_provenance)
+
         with _docx_promotion_lock(dest):
             if os.path.exists(dest):
                 backup_path = dest + ".bak"
@@ -1612,7 +1682,13 @@ def _write_docx_transaction(
     }
 
 
-def _save_docx_xml(raw: bytes, root: Any, dest: str) -> dict[str, Any]:
+def _save_docx_xml(
+    raw: bytes,
+    root: Any,
+    dest: str,
+    *,
+    artifact_provenance: "dict[str, Any] | None" = None,
+) -> dict[str, Any]:
     """Rewrite ``word/document.xml`` with ``root`` into a copy of the .docx at ``dest``.
 
     Every OTHER zip entry from ``raw`` is copied through unchanged (byte-for-byte,
@@ -1650,6 +1726,14 @@ def _save_docx_xml(raw: bytes, root: Any, dest: str) -> dict[str, Any]:
     5988a5bb) -- callers that don't need it (most existing call sites,
     including every test that pre-dates this change) simply ignore the
     return value, exactly as they did when this returned ``None``.
+
+    ``artifact_provenance`` (6d02f343, optional, keyword-only) -- forwarded
+    unchanged to :func:`_write_docx_transaction`'s own fail-closed gate (see
+    its docstring): a caller-computed figure/table/equation
+    provenance-binding verdict that is supplied and not cleanly
+    ``all_clear`` rejects this write before promotion, same as a structural
+    mismatch. ``None`` (the default) -- unchanged behavior for every
+    existing caller.
     """
     new_document = _LET.tostring(
         root, xml_declaration=True, encoding="UTF-8", standalone=True
@@ -1671,6 +1755,7 @@ def _save_docx_xml(raw: bytes, root: Any, dest: str) -> dict[str, Any]:
         pre_manifest=_docx_structural_manifest(raw),
         protected_keys=("media_count", "style_count", "relationship_count"),
         changed_parts={_DOCX_DOCUMENT_PART: new_document},
+        artifact_provenance=artifact_provenance,
     )
 
 

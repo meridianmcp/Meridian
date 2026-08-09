@@ -79,7 +79,13 @@ Four pieces, matching the sprint item's four asks:
    stored project-wide ``test_cmd``): spawn via argument-list
    ``create_subprocess_exec`` (no shell, no pipe) whenever the caller
    supplies a token list, so ``proc.returncode`` IS the real target-process
-   exit status, never masked by an intermediate pipeline stage.
+   exit status, never masked by an intermediate pipeline stage. e24f2daa
+   additionally routes that real exit code (plus signal/timeout/captured
+   output) through :func:`meridian.test_run_receipt.classify_subprocess_result`
+   before returning, so a thin/empty result (``exit_code=0``, no output, no
+   parsed counts) is never indistinguishable from a genuine pass, and an
+   xdist/pytest infrastructure crash (exit 3/4, a recognized crash-text
+   marker) is never misreported as an ordinary test failure.
 
 Every public function here is fully guarded against unexpected errors from
 its DB-backed dependencies (mirrors the rest of this codebase's
@@ -91,12 +97,23 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import code_intel_receipt as _code_intel_receipt
+from . import test_run_receipt as _test_run_receipt
 from . import tool_requirements as _tool_requirements
 
+if TYPE_CHECKING:  # pragma: no cover - import used for type annotations only
+    # `datetime` is only ever needed at runtime inside validate_discovery_override /
+    # apply_discovery_override (imported there lazily, aliased to `_datetime`, to keep
+    # the module's own lazy-import style — see the module docstring). The two
+    # `now: "datetime | None"` forward-ref annotations below still need the bare
+    # name `datetime` to resolve for static analysis (Ruff F821), hence this
+    # TYPE_CHECKING-only import instead of a real top-level import.
+    from datetime import datetime
+
 TOOL_DISCOVERY_SCHEMA_VERSION = 1
+DISCOVERY_SCOPE_SCHEMA_VERSION = 1
 
 #: Reused verbatim from code_intel_receipt.py -- the canonical set of bare
 #: tool names that count as genuine codebase-memory/Serena prospecting.
@@ -640,12 +657,29 @@ async def run_targeted_tests(
     ``passed``/``failed`` (best-effort parsed counts), ``stdout_tail``/
     ``stderr_tail`` (last :data:`_TAIL_BYTES` bytes each), ``cmd`` (echoed
     back for the caller's own logging).
+
+    e24f2daa — also carries ``classification`` (one of
+    :data:`meridian.test_run_receipt.CLASSIFICATIONS`) and
+    ``classification_reason``: this function's own exit-code/signal safety
+    guarantee (above) only protects against a WRAPPING shell masking the
+    real exit code — it says nothing about whether ``exit_code=0`` with an
+    EMPTY captured log is genuine evidence of a pass (it is not), or whether
+    a nonzero code came from a real assertion failure versus pytest's own
+    INTERNAL_ERROR/USAGE_ERROR exit codes (3/4, an infrastructure crash, not
+    a code regression). ``classify_subprocess_result`` applies that same
+    fail-closed discipline the durable ``TestRunRecord`` consumer applies to
+    a full-suite run — never silently treating a thin/empty result as
+    ``passed``. ``status``/``exit_code``/``passed``/``failed`` above are
+    UNCHANGED (this is a pure addition) for every existing caller.
     """
     if not cmd:
+        _empty_classified = _test_run_receipt.classify_subprocess_result(exit_code=None)
         return {
             "status": "error", "message": "cmd is empty", "exit_code": None,
             "passed": None, "failed": None, "stdout_tail": "", "stderr_tail": "",
             "cmd": cmd,
+            "classification": _empty_classified["classification"],
+            "classification_reason": "cmd is empty -- no command was ever executed",
         }
 
     try:
@@ -680,12 +714,18 @@ async def run_targeted_tests(
                 "message": f"command timed out after {timeout:.0f}s",
                 "exit_code": None, "passed": None, "failed": None,
                 "stdout_tail": "", "stderr_tail": "", "cmd": cmd,
+                "classification": _test_run_receipt.CLASS_TIMEOUT,
+                "classification_reason": f"command timed out after {timeout:.0f}s",
             }
 
         exit_code: int = proc.returncode if proc.returncode is not None else -1
         stdout_str = stdout_b[-_TAIL_BYTES:].decode("utf-8", errors="replace") if stdout_b else ""
         stderr_str = stderr_b[-_TAIL_BYTES:].decode("utf-8", errors="replace") if stderr_b else ""
         passed, failed = _parse_test_counts(stdout_str + "\n" + stderr_str)
+        _classified = _test_run_receipt.classify_subprocess_result(
+            exit_code=exit_code, stdout=stdout_str, stderr=stderr_str,
+            passed=passed, failed=failed,
+        )
 
         return {
             "status": "ok",
@@ -695,10 +735,300 @@ async def run_targeted_tests(
             "stdout_tail": stdout_str,
             "stderr_tail": stderr_str,
             "cmd": cmd,
+            "classification": _classified["classification"],
+            "classification_reason": _classified["reason"],
         }
     except Exception as exc:  # noqa: BLE001 — a broken runner must report, never crash the caller
         return {
             "status": "error", "message": str(exc), "exit_code": None,
             "passed": None, "failed": None, "stdout_tail": "", "stderr_tail": "",
             "cmd": cmd,
+            "classification": _test_run_receipt.CLASS_INFRA_CRASH,
+            "classification_reason": f"failed to spawn/communicate with the target process: {exc}",
         }
+
+
+# ---------------------------------------------------------------------------
+# 5. Domain-neutral discovery-scope contract (7f23cd62).
+#
+# Everything above this section (pieces 1-4, 86b36617) answers "is a
+# REQUIRED TOOL available for this item" — scoped to codebase-memory/Serena
+# tool_requirements specifically. This section answers a related but
+# distinct question that applies to ANY domain (code, DOCX structure,
+# Outputs/provenance, filesystem, tunnel, external MCP): "is this
+# RESOURCE/SCOPE even in bounds for discovery right now, and on what
+# evidence." A tool can be perfectly available while the specific resource
+# it would operate on is explicitly out of scope (an ignored directory, an
+# unfetched remote snapshot, a path outside its declared artifact subtree) —
+# that is QUARANTINE, a distinct outcome from the tool-availability states
+# above, never collapsed into "unavailable" (which would hide the real
+# reason: policy exclusion, not absence).
+#
+# Deliberately generalizes rather than duplicates: this reuses the same
+# fail-closed-for-writes philosophy as capability_availability.py's
+# availability_policy handling and the same non-empty-reason + audited
+# override pattern as code_intel_receipt.record_prospect_receipt_override —
+# extended here with a real, checked EXPIRY, which neither existing override
+# path has (both are one-shot, per-call acknowledgements; this one is
+# usable across multiple calls until it lapses, so it needs a bound).
+# ---------------------------------------------------------------------------
+
+#: The four domain-neutral scope kinds an item/session may declare for a
+#: resource this contract governs. Free text elsewhere in this codebase
+#: (capability manifests, tool_requirements) stays free text; this one small
+#: vocabulary is closed because "resolution" below is defined in terms of it.
+DISCOVERY_SCOPE_TRACKED = "tracked"
+DISCOVERY_SCOPE_ALLOWLISTED_IGNORED = "allowlisted_ignored"
+DISCOVERY_SCOPE_REMOTE_SNAPSHOT = "remote_snapshot"
+DISCOVERY_SCOPE_ARTIFACT_SUBTREE = "artifact_subtree"
+
+DISCOVERY_SCOPES = frozenset({
+    DISCOVERY_SCOPE_TRACKED, DISCOVERY_SCOPE_ALLOWLISTED_IGNORED,
+    DISCOVERY_SCOPE_REMOTE_SNAPSHOT, DISCOVERY_SCOPE_ARTIFACT_SUBTREE,
+})
+
+#: The four resolution outcomes the item's own acceptance criteria name
+#: verbatim ("must return ready, degraded, unavailable, or quarantined").
+RESOLUTION_READY = "ready"
+RESOLUTION_DEGRADED = "degraded"
+RESOLUTION_UNAVAILABLE = "unavailable"
+RESOLUTION_QUARANTINED = "quarantined"
+
+RESOLUTIONS = frozenset({
+    RESOLUTION_READY, RESOLUTION_DEGRADED, RESOLUTION_UNAVAILABLE, RESOLUTION_QUARANTINED,
+})
+
+#: Mutations gated by this contract must fail closed on any resolution other
+#: than READY — DEGRADED is explicitly a read-only "proceed on approved
+#: fallback" state (mirrors tool_discovery's own "degraded_fallback" state
+#: never being treated as unconditionally safe), matching this item's own
+#: "read-only discovery may continue on an approved fallback; writes, claims,
+#: promotion, and completion must fail closed" requirement verbatim.
+_MUTATION_SAFE_RESOLUTIONS = frozenset({RESOLUTION_READY})
+
+DISCOVERY_SCOPE_OVERRIDE_EVENT_TYPE = "discovery_scope_override"
+
+
+def classify_discovery_scope(
+    scope: str, *, evidence: "dict[str, Any] | None" = None,
+) -> dict[str, Any]:
+    """Pure, deterministic resolver: (scope, evidence) -> one of the four
+    named resolutions, with a human-readable reason. No I/O, no model call —
+    mirrors capability_availability.classify_tool's purity discipline.
+
+    ``evidence`` is a plain dict of booleans the CALLER already gathered for
+    this specific resource (this function never fetches anything itself):
+
+    * ``tracked``: ``indexed`` (bool), ``index_stale`` (bool).
+    * ``allowlisted_ignored``: no evidence needed — quarantined by policy,
+      unconditionally, unless a validated override is applied afterward via
+      :func:`apply_discovery_override`.
+    * ``remote_snapshot``: ``snapshot_fetched`` (bool), ``snapshot_stale`` (bool).
+    * ``artifact_subtree``: ``within_declared_subtree`` (bool).
+
+    An unrecognized ``scope`` resolves UNAVAILABLE with an explicit reason
+    (never silently treated as "not applicable" — this item's own explicit
+    non-goal) rather than raising, so a caller iterating heterogeneous
+    resources never has one malformed entry crash the whole pass.
+    """
+    ev = evidence or {}
+    if scope not in DISCOVERY_SCOPES:
+        return {
+            "discovery_scope": scope,
+            "resolution": RESOLUTION_UNAVAILABLE,
+            "reason": f"unrecognized discovery_scope '{scope}' — not one of {sorted(DISCOVERY_SCOPES)}.",
+        }
+
+    if scope == DISCOVERY_SCOPE_ALLOWLISTED_IGNORED:
+        return {
+            "discovery_scope": scope,
+            "resolution": RESOLUTION_QUARANTINED,
+            "reason": (
+                "resource is in an explicitly allowlisted-ignored location — "
+                "excluded by policy, not by absence. Requires an audited "
+                "override (see apply_discovery_override) to proceed."
+            ),
+        }
+
+    if scope == DISCOVERY_SCOPE_TRACKED:
+        if not ev.get("indexed"):
+            return {
+                "discovery_scope": scope,
+                "resolution": RESOLUTION_UNAVAILABLE,
+                "reason": "tracked resource has no index evidence — never seen by discovery.",
+            }
+        if ev.get("index_stale"):
+            return {
+                "discovery_scope": scope,
+                "resolution": RESOLUTION_DEGRADED,
+                "reason": "tracked resource is indexed, but the index is known-stale — read-only use only.",
+            }
+        return {
+            "discovery_scope": scope,
+            "resolution": RESOLUTION_READY,
+            "reason": "tracked resource has a fresh index entry.",
+        }
+
+    if scope == DISCOVERY_SCOPE_REMOTE_SNAPSHOT:
+        if not ev.get("snapshot_fetched"):
+            return {
+                "discovery_scope": scope,
+                "resolution": RESOLUTION_UNAVAILABLE,
+                "reason": "remote_snapshot resource has never been fetched locally.",
+            }
+        if ev.get("snapshot_stale"):
+            return {
+                "discovery_scope": scope,
+                "resolution": RESOLUTION_DEGRADED,
+                "reason": "remote_snapshot was fetched but is known-stale — read-only use only.",
+            }
+        return {
+            "discovery_scope": scope,
+            "resolution": RESOLUTION_READY,
+            "reason": "remote_snapshot is fetched and fresh.",
+        }
+
+    # DISCOVERY_SCOPE_ARTIFACT_SUBTREE
+    if not ev.get("within_declared_subtree"):
+        return {
+            "discovery_scope": scope,
+            "resolution": RESOLUTION_QUARANTINED,
+            "reason": (
+                "resource falls outside its item's declared artifact subtree — "
+                "excluded by scope boundary, not by absence."
+            ),
+        }
+    return {
+        "discovery_scope": scope,
+        "resolution": RESOLUTION_READY,
+        "reason": "resource confirmed within its declared artifact subtree.",
+    }
+
+
+def is_mutation_safe(resolution: str) -> bool:
+    """True only for RESOLUTION_READY — the single fail-closed gate every
+    write/claim/promotion/completion path governed by this contract must
+    consult. DEGRADED is deliberately excluded: read-only discovery may
+    proceed on it, but this function is specifically the mutation gate."""
+    return resolution in _MUTATION_SAFE_RESOLUTIONS
+
+
+def validate_discovery_override(
+    *, actor: "str | None", reason: "str | None", expires_at: "str | None",
+    now: "datetime | None" = None,
+) -> dict[str, Any]:
+    """Pure validation for an audited discovery-scope override — NOT an
+    unbounded bypass (this item's own explicit requirement). Three
+    independent checks, all must pass:
+
+    1. ``reason`` non-empty (mirrors code_intel_receipt.
+       record_prospect_receipt_override's identical requirement).
+    2. ``actor`` non-empty — an override with no attributed human/session is
+       not auditable either.
+    3. ``expires_at`` parses as an ISO-8601 timestamp AND is strictly in the
+       future relative to ``now`` (defaults to real UTC now; injectable for
+       deterministic tests) — an override with no expiry, or one already
+       lapsed, is refused. This is the piece neither existing override path
+       (code_intel_receipt's, sprint_evidence_guard's) has: those are
+       one-shot acknowledgements consumed in the same call, so they don't
+       need a bound. A discovery-scope override is meant to cover repeated
+       resolution calls over some window, so it needs one.
+
+    Returns ``{"valid": bool, "errors": [str, ...]}`` — never raises, so a
+    caller can always inspect ``errors`` for the exact reason(s) rather than
+    catching an exception.
+    """
+    from datetime import datetime as _datetime, timezone as _timezone  # noqa: PLC0415
+
+    errors: list[str] = []
+    if not (reason or "").strip():
+        errors.append("reason is required and must be non-empty.")
+    if not (actor or "").strip():
+        errors.append("actor is required and must be non-empty.")
+
+    if not (expires_at or "").strip():
+        errors.append("expires_at is required — an unbounded override is refused.")
+    else:
+        try:
+            parsed = _datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=_timezone.utc)
+        except (TypeError, ValueError):
+            parsed = None
+            errors.append(f"expires_at '{expires_at}' is not a valid ISO-8601 timestamp.")
+        if parsed is not None:
+            _now = now if now is not None else _datetime.now(_timezone.utc)
+            if _now.tzinfo is None:
+                _now = _now.replace(tzinfo=_timezone.utc)
+            if parsed <= _now:
+                errors.append(
+                    f"expires_at '{expires_at}' has already lapsed (now={_now.isoformat()}) — "
+                    "a lapsed override is refused, not silently extended."
+                )
+
+    return {"valid": not errors, "errors": errors}
+
+
+def apply_discovery_override(
+    classification: dict[str, Any], *, actor: str, reason: str, expires_at: str,
+    now: "datetime | None" = None,
+) -> dict[str, Any]:
+    """Apply a validated override to a :func:`classify_discovery_scope` result.
+
+    Refuses (returns the ORIGINAL classification, unmodified, with
+    ``override_rejected`` set) unless :func:`validate_discovery_override`
+    passes — never silently swaps state on a malformed override. On success,
+    returns a NEW dict (the input is never mutated) with ``resolution``
+    upgraded to READY and an explicit ``override`` block recording exactly
+    who/why/until — auditable, bounded, and visible on the result itself,
+    not just in a side-channel log. Callers that persist overrides durably
+    should ALSO call :func:`record_discovery_scope_override` (this function
+    is pure and does not touch the database).
+    """
+    validation = validate_discovery_override(actor=actor, reason=reason, expires_at=expires_at, now=now)
+    if not validation["valid"]:
+        return {**classification, "override_rejected": validation["errors"]}
+    return {
+        **classification,
+        "resolution": RESOLUTION_READY,
+        "override": {
+            "actor": actor,
+            "reason": reason,
+            "expires_at": expires_at,
+            "prior_resolution": classification.get("resolution"),
+        },
+    }
+
+
+async def record_discovery_scope_override(
+    db: Any, project_id: str, *, actor: "str | None", reason: "str | None",
+    discovery_scope: str, expires_at: "str | None", tenant_id: "str | None" = None,
+) -> dict[str, Any]:
+    """Audit-log an applied discovery-scope override — mirrors
+    code_intel_receipt.record_prospect_receipt_override's exact shape
+    (same underlying action_audit_log table, same non-empty-reason refusal),
+    plus the ``expires_at`` bound this contract adds. Raises ``ValueError``
+    on an empty reason, same as the code-intel precedent — a caller that
+    reaches this point should already have validated via
+    :func:`apply_discovery_override`, so this is a defense-in-depth check,
+    not the primary gate.
+    """
+    _reason = (reason or "").strip()
+    if not _reason:
+        raise ValueError(
+            "reason is required and must be non-empty to record a discovery-scope "
+            "override — an override with no stated reason is not auditable and is refused."
+        )
+    import json as _json  # noqa: PLC0415 — mirrors this module's existing local-import style
+    from . import db as db_module  # noqa: PLC0415 — avoid a top-level cycle with meridian.db
+
+    detail = _json.dumps({
+        "discovery_scope": discovery_scope,
+        "reason": _reason,
+        "expires_at": expires_at,
+    })
+    return await db_module.record_action_audit_event(
+        db, DISCOVERY_SCOPE_OVERRIDE_EVENT_TYPE,
+        tenant_id=tenant_id, project_id=project_id,
+        actor=actor, detail=detail,
+    )

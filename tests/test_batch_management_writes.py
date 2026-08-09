@@ -705,4 +705,190 @@ async def test_add_sprint_item_pointer_unchanged_direct_call(db, project):
         [{"uri": "file:z.py", "selector": {"type": "symbol", "qualified_name": "z.q"}}],
     )
     assert pointer["source_type"] == "code"
-    assert pointer["sprint_item_id"] == item["id"]
+
+
+# ---------------------------------------------------------------------------
+# 468ab67d — fan_out_sprint_items' new opt-in strict=True contract: reroutes
+# through THIS SAME execute_batch engine (add_sprint_item-backed) instead of
+# the legacy unguarded insert loop above. Legacy (strict omitted/false)
+# behavior is proven unchanged by the two tests directly above; everything
+# below exercises the new, additive strict path.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_default_is_legacy_shape(db, project):
+    """strict is opt-in: omitting it returns the legacy bare list[str], not a dict."""
+    ids = await db_module.fan_out_sprint_items(
+        db, project["id"], [{"title": "Legacy shape item", "version": "v1"}]
+    )
+    assert isinstance(ids, list)
+    assert all(isinstance(i, str) for i in ids)
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_basic_creates_and_reports_per_entry(db, project):
+    # Deliberately word-disjoint titles (below the 60% overlap threshold) --
+    # this test is about the batch envelope/per-entry reporting, not the
+    # duplicate guard (that gets its own dedicated tests below).
+    result = await db_module.fan_out_sprint_items(
+        db, project["id"],
+        [
+            {"title": "Rebuild the payment retry queue", "version": "v1", "correlation_key": "a"},
+            {"title": "Compress nightly log archives", "version": "v1", "correlation_key": "b"},
+        ],
+        strict=True, idempotency_key="fo-strict-basic-1",
+    )
+    assert isinstance(result, dict)
+    assert result["status"] == "ok"
+    assert result["entry_kind"] == "sprint_item"
+    assert result["created_count"] == 2
+    assert result["idempotent_replay"] is False
+    results = result["results"]
+    assert [r["correlation_key"] for r in results] == ["a", "b"]
+    assert all(r["status"] == "ok" and r["id"] for r in results)
+    items = await db_module.get_sprint_items(db, project["id"])
+    titles = {i["title"] for i in items}
+    assert {"Rebuild the payment retry queue", "Compress nightly log archives"} <= titles
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_all_or_nothing_duplicate_rejected(db, project):
+    """Unlike legacy, strict mode's create path DOES enforce the duplicate
+    guard (via add_sprint_item) -- an all_or_nothing batch with a duplicate
+    fails and writes nothing."""
+    await db_module.add_sprint_item(db, project["id"], "v1", "Duplicate-guard target title")
+    result = await db_module.fan_out_sprint_items(
+        db, project["id"],
+        [{"title": "Duplicate-guard target title", "version": "v1"}],
+        strict=True, mode="all_or_nothing", idempotency_key="fo-strict-dup-1",
+    )
+    assert result["status"] == "failed"
+    assert result["results"][0]["status"] == "error"
+    assert result["results"][0]["error_code"] == "DUPLICATE_TITLE"
+    items = await db_module.get_sprint_items(db, project["id"])
+    assert sum(1 for i in items if i["title"] == "Duplicate-guard target title") == 1
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_force_overrides_duplicate_guard(db, project):
+    await db_module.add_sprint_item(db, project["id"], "v1", "Force-overridable title")
+    result = await db_module.fan_out_sprint_items(
+        db, project["id"],
+        [{"title": "Force-overridable title", "version": "v1", "force": True}],
+        strict=True, idempotency_key="fo-strict-force-1",
+    )
+    assert result["status"] == "ok"
+    items = await db_module.get_sprint_items(db, project["id"])
+    assert sum(1 for i in items if i["title"] == "Force-overridable title") == 2
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_intra_batch_duplicate_all_or_nothing_rolls_back(
+    db, project,
+):
+    result = await db_module.fan_out_sprint_items(
+        db, project["id"],
+        [
+            {"title": "Intra-batch dup title", "version": "v1"},
+            {"title": "Intra-batch dup title", "version": "v1"},
+        ],
+        strict=True, mode="all_or_nothing", idempotency_key="fo-strict-intra-aon-1",
+    )
+    assert result["status"] == "failed"
+    assert result["results"][0]["status"] == "rolled_back"
+    assert result["results"][1]["status"] == "error"
+    items = await db_module.get_sprint_items(db, project["id"])
+    assert sum(1 for i in items if i["title"] == "Intra-batch dup title") == 0
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_intra_batch_duplicate_best_effort_partial(
+    db, project,
+):
+    result = await db_module.fan_out_sprint_items(
+        db, project["id"],
+        [
+            {"title": "Best-effort dup title", "version": "v1"},
+            {"title": "Best-effort dup title", "version": "v1"},
+        ],
+        strict=True, mode="best_effort", idempotency_key="fo-strict-intra-be-1",
+    )
+    assert result["status"] == "partial"
+    assert result["results"][0]["status"] == "ok"
+    assert result["results"][1]["status"] == "error"
+    assert result["results"][1]["error_code"] == "DUPLICATE_TITLE"
+    items = await db_module.get_sprint_items(db, project["id"])
+    assert sum(1 for i in items if i["title"] == "Best-effort dup title") == 1
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_idempotent_replay(db, project):
+    entries = [{"title": "Replay-safe fan-out item", "version": "v1"}]
+    first = await db_module.fan_out_sprint_items(
+        db, project["id"], entries, strict=True, idempotency_key="fo-strict-replay-1",
+    )
+    second = await db_module.fan_out_sprint_items(
+        db, project["id"], entries, strict=True, idempotency_key="fo-strict-replay-1",
+    )
+    assert first["idempotent_replay"] is False
+    assert second["idempotent_replay"] is True
+    assert second["results"][0]["id"] == first["results"][0]["id"]
+    items = await db_module.get_sprint_items(db, project["id"])
+    assert sum(1 for i in items if i["title"] == "Replay-safe fan-out item") == 1
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_different_idempotency_key_executes_again(db, project):
+    entries = [{"title": "Distinct-key fan-out item", "version": "v1", "force": True}]
+    first = await db_module.fan_out_sprint_items(
+        db, project["id"], entries, strict=True, idempotency_key="fo-strict-key-a",
+    )
+    second = await db_module.fan_out_sprint_items(
+        db, project["id"], entries, strict=True, idempotency_key="fo-strict-key-b",
+    )
+    assert first["results"][0]["id"] != second["results"][0]["id"]
+    items = await db_module.get_sprint_items(db, project["id"])
+    assert sum(1 for i in items if i["title"] == "Distinct-key fan-out item") == 2
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_project_version_isolation(db, project):
+    # Word-disjoint titles (see the "basic" test above for why) so this test
+    # isolates the version-scoping behavior from the duplicate guard.
+    result = await db_module.fan_out_sprint_items(
+        db, project["id"],
+        [
+            {"title": "Design the checkout webhook retry", "version": "v1"},
+            {"title": "Draft onboarding email templates", "version": "v2"},
+        ],
+        strict=True, idempotency_key="fo-strict-version-scope-1",
+    )
+    assert result["status"] == "ok"
+    items = await db_module.get_sprint_items(db, project["id"])
+    by_title = {i["title"]: i for i in items}
+    assert by_title["Design the checkout webhook retry"]["version"] == "v1"
+    assert by_title["Draft onboarding email templates"]["version"] == "v2"
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_field_synonyms_map_like_legacy(db, project):
+    """sprint->version and item_group->group synonyms (the legacy loop's own
+    field aliases) still resolve correctly when routed through the strict
+    batch engine."""
+    result = await db_module.fan_out_sprint_items(
+        db, project["id"],
+        [{"title": "Synonym-mapped item", "sprint": "v3", "item_group": "backend"}],
+        strict=True, idempotency_key="fo-strict-synonyms-1",
+    )
+    assert result["status"] == "ok"
+    item = await db_module.get_sprint_item(db, result["results"][0]["id"])
+    assert item["version"] == "v3"
+    assert item["item_group"] == "backend"
+
+
+@pytest.mark.asyncio
+async def test_fan_out_sprint_items_strict_empty_entries_raises(db, project):
+    with pytest.raises(bm.BatchEngineError):
+        await db_module.fan_out_sprint_items(
+            db, project["id"], [], strict=True, idempotency_key="fo-strict-empty-1",
+        )

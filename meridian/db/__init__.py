@@ -1133,6 +1133,10 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_vector_index_state(db)
     await _migrate_pixi_env_roots(db)
     await _migrate_executor_reports_table(db)
+    await _migrate_wave_run_summaries(db)
+    await _migrate_decision_evidence(db)
+    await _migrate_ai_log_events_table(db)
+    await _migrate_proposal_intake_drafts(db)
     return db
 
 
@@ -2999,6 +3003,103 @@ async def generate_default_session_name(
     return f"{_adj[_h % len(_adj)]}-{_noun[(_h // len(_adj)) % len(_noun)]}-{ts}"
 
 
+# --- worker_context XML prompt-budget contract (bfb18ea2) -----------------
+#
+# WORKER_CONTEXT_XML_BUDGET_CHARS (contract version
+# WORKER_CONTEXT_XML_BUDGET_VERSION): build_worker_context_xml()'s return
+# value is GUARANTEED to never exceed this many CHARACTERS. This block is
+# spliced into every worker's first prompt, so the limit is a deliberate
+# context/latency budget decision — not an artifact of an XML parser or an
+# MCP protocol limit.
+#
+# Unit chosen: characters, not tokens. This codebase has no tokenizer
+# dependency anywhere (no tiktoken / token-count utility exists here), so a
+# token budget would mean adding a new dependency for one call site. A
+# character count is deterministic, dependency-free, and cheap to enforce
+# on every call. As a rough sanity cross-check only (not an exact
+# conversion): ~4 chars/token is typical for English prose, so 700 chars is
+# roughly ~175 tokens — comfortably inside the "~500 tokens" this function
+# has described in prose since v1.2.0. That "~500 tokens" language was
+# never actually checked against a tokenizer; the only enforced number was
+# always this char count, via the test. This constant makes that the
+# explicit, single source of truth instead of a bare literal (`700`) in
+# the test with no named contract behind it.
+#
+# Bump WORKER_CONTEXT_XML_BUDGET_VERSION whenever the number or the unit
+# changes, so callers/tests can tell "the contract changed on purpose"
+# apart from "someone edited a bare literal".
+WORKER_CONTEXT_XML_BUDGET_VERSION = 1
+WORKER_CONTEXT_XML_BUDGET_CHARS = 700
+
+# Visible marker appended when a field had to be compacted to fit the
+# budget above. Never cut silently — a worker (or a test) can always tell
+# truncation happened by looking for this marker.
+_WORKER_CONTEXT_TRUNCATION_MARKER = " …[truncated]"
+
+
+def _worker_context_bounded_field(raw: str, budget_chars: int) -> str:
+    """XML-escape ``raw``, bounded to at most ``budget_chars`` characters.
+
+    If the escaped text already fits, it is returned unchanged — this is
+    the common case and behaves exactly like a plain ``escape(raw)`` call.
+
+    If it doesn't fit, the RAW text (never the escaped text) is cut via
+    binary search to the largest prefix whose ESCAPED form still fits —
+    this is what guarantees an XML entity like ``&amp;`` is never split
+    in half, since we always escape-then-measure instead of slicing
+    already-escaped text. The cut is then backed off to the nearest
+    preceding whitespace boundary so a word is never chopped in the
+    middle either, and an explicit ``"...[truncated]"`` marker is
+    appended so truncation is always visible. The result is always
+    <= ``budget_chars`` (best-effort on the marker only: if
+    ``budget_chars`` is too small to fit the marker at all — not
+    expected for this contract's normal fields, since sub-budgets are
+    hundreds of characters — the marker is dropped, but the entity- and
+    word-boundary safety above still holds).
+    """
+    from xml.sax.saxutils import escape
+
+    escaped = escape(raw)
+    if len(escaped) <= budget_chars:
+        return escaped
+
+    if budget_chars <= 0:
+        return ""
+
+    marker = _WORKER_CONTEXT_TRUNCATION_MARKER
+    use_marker = budget_chars > len(marker)
+    room = (budget_chars - len(marker)) if use_marker else budget_chars
+
+    # Binary-search the largest raw-text prefix whose ESCAPED form fits
+    # in `room`. Escaping can expand length ("&" -> "&amp;"), so we can't
+    # just slice the escaped string directly without risking a split
+    # entity — this holds regardless of whether a marker is being added,
+    # which is what the earlier, buggy degenerate-budget fallback got
+    # wrong (it sliced an already-escaped string directly).
+    lo, hi = 0, len(raw)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len(escape(raw[:mid])) <= room:
+            lo = mid
+        else:
+            hi = mid - 1
+    cut = lo
+
+    # Back off to the nearest preceding whitespace so a word is never
+    # split in half. If there's no whitespace to back off to (one huge
+    # "word"), keep the exact character-accurate cut instead. Only
+    # meaningful when we're about to append a marker — without one,
+    # keep the exact binary-search cut to use the full budget.
+    if use_marker and 0 < cut < len(raw) and not raw[cut].isspace():
+        ws = raw.rfind(" ", 0, cut)
+        if ws > 0:
+            cut = ws
+
+    prefix = raw[:cut].rstrip() if use_marker else raw[:cut]
+    result = escape(prefix)
+    return (result + marker) if use_marker else result
+
+
 def build_worker_context_xml(
     *,
     version_goal: str,
@@ -3007,36 +3108,68 @@ def build_worker_context_xml(
     repo: str,
     test_cmd: str = "pixi run test",
     commit_pattern: str = (
-        "Use commit.py pattern: write commit message to tmp/commit.py, "
-        "run via pixi run python tmp/commit.py, then delete tmp/commit.py "
-        "in the same command. GOAL.md is git-tracked — include it in the "
-        "staged files (git add GOAL.md) when it has been modified."
+        "Write commit message to tmp/commit.py, run via pixi run "
+        "python tmp/commit.py, then delete it in the same command. "
+        "Include GOAL.md in the staged files if it was modified "
+        "(git-tracked)."
     ),
     done_when: str = (
         "log_task done, tests green, committed (no stray .py at repo root)."
     ),
 ) -> str:
-    """v1.2.0 — slim XML for worker sessions.
+    """v1.3.0 — slim XML for worker sessions, under an explicit char budget.
 
     Workers don't need north_star, decisions, or sprint history —
     they need the version goal + the one task they're claiming, plus
     the operational machinery (repo path, test cmd, commit pattern,
-    completion criteria). The resulting block is intentionally short
-    (under ~500 tokens) so it costs nothing to splat into a
-    Claude Code worker's first turn.
+    completion criteria).
+
+    Prompt-budget contract: the returned string never exceeds
+    ``WORKER_CONTEXT_XML_BUDGET_CHARS`` characters — see that constant's
+    comment above for the unit/number rationale and version. When the
+    full, escaped ``version_goal``/``task_description`` wouldn't fit,
+    they (and only they — the operational fields repo/test_cmd/
+    commit_pattern/done_when are never truncated) are compacted at a
+    whole-word boundary with a visible ``"...[truncated]"`` marker rather
+    than being cut silently or mid-word.
     """
     from xml.sax.saxutils import escape, quoteattr
 
-    return "\n".join([
-        "<worker_context>",
-        f"  <version_goal>{escape(version_goal)}</version_goal>",
-        f"  <task id={quoteattr(task_id)}>{escape(task_description)}</task>",
-        f"  <repo>{escape(repo)}</repo>",
-        f"  <test_cmd>{escape(test_cmd)}</test_cmd>",
-        f"  <commit_pattern>{escape(commit_pattern)}</commit_pattern>",
-        f"  <done_when>{escape(done_when)}</done_when>",
-        "</worker_context>",
-    ])
+    def _assemble(goal_xml: str, task_xml: str) -> str:
+        return "\n".join([
+            "<worker_context>",
+            f"  <version_goal>{goal_xml}</version_goal>",
+            f"  <task id={quoteattr(task_id)}>{task_xml}</task>",
+            f"  <repo>{escape(repo)}</repo>",
+            f"  <test_cmd>{escape(test_cmd)}</test_cmd>",
+            f"  <commit_pattern>{escape(commit_pattern)}</commit_pattern>",
+            f"  <done_when>{escape(done_when)}</done_when>",
+            "</worker_context>",
+        ])
+
+    goal_full = escape(version_goal)
+    task_full = escape(task_description)
+    candidate = _assemble(goal_full, task_full)
+    if len(candidate) <= WORKER_CONTEXT_XML_BUDGET_CHARS:
+        return candidate
+
+    # Over budget: the fixed overhead (wrapper tags + repo/test_cmd/
+    # commit_pattern/done_when) is exactly whatever's left once the two
+    # dynamic fields are subtracted back out of the full candidate —
+    # exact regardless of the "\n".join formatting above.
+    fixed_len = len(candidate) - len(goal_full) - len(task_full)
+    dynamic_budget = max(0, WORKER_CONTEXT_XML_BUDGET_CHARS - fixed_len)
+
+    total_raw = len(version_goal) + len(task_description)
+    if total_raw == 0:
+        goal_budget = task_budget = dynamic_budget // 2
+    else:
+        goal_budget = int(dynamic_budget * (len(version_goal) / total_raw))
+        task_budget = dynamic_budget - goal_budget
+
+    goal_bounded = _worker_context_bounded_field(version_goal, goal_budget)
+    task_bounded = _worker_context_bounded_field(task_description, task_budget)
+    return _assemble(goal_bounded, task_bounded)
 
 
 async def start_worker_session(
@@ -4980,6 +5113,16 @@ _PLANNING_SOURCE_SPECS: dict[str, dict[str, Any]] = {
         "title_col": "title", "body_col": "content", "created_col": "created_at",
         "status_col": None, "version_col": None, "scope_col": "project_id",
     },
+    # 9149e132 — typed, code-linked decision evidence (meridian.db.decision_evidence).
+    # No title column (mirrors "task"/"finding": title is derived from the body's
+    # first line via _planning_derive_title). status defaults to active-only, same
+    # convention as "decision" — see the stype == "decision" branches below, both
+    # extended to also cover "decision_evidence".
+    "decision_evidence": {
+        "table": "decision_evidence", "id_col": "id", "text_cols": ("evidence",),
+        "title_col": None, "body_col": "evidence", "created_col": "created_at",
+        "status_col": "status", "version_col": "version", "scope_col": "project_id",
+    },
 }
 _PLANNING_SOURCE_TYPES: "tuple[str, ...]" = tuple(_PLANNING_SOURCE_SPECS.keys())
 
@@ -5279,9 +5422,13 @@ async def _planning_pg_source_results(
         placeholders = ", ".join("?" for _ in status_list)
         where_parts.append(f"{status_col} IN ({placeholders})")
         params.extend(status_list)
-    elif status_list is None and status_col is not None and stype == "decision":
+    elif status_list is None and status_col is not None and stype in (
+        "decision", "decision_evidence",
+    ):
         # Preserve the convention every other read path in this module uses:
-        # decisions default to active-only unless a status is explicitly given.
+        # decisions (and, since 9149e132, decision_evidence links) default to
+        # active-only unless a status is explicitly given — a superseded or
+        # reversed evidence link is excluded by default, not just marked.
         where_parts.append("status = 'active'")
 
     tsq = _planning_pg_tsquery_source(query)
@@ -5363,7 +5510,13 @@ async def _planning_sqlite_source_results(
         placeholders = ", ".join("?" for _ in status_list)
         where_parts.append(f"{status_col} IN ({placeholders})")
         params.extend(status_list)
-    elif status_list is None and status_col is not None and stype == "decision":
+    elif status_list is None and status_col is not None and stype in (
+        "decision", "decision_evidence",
+    ):
+        # 9149e132 — mirrors the Postgres path above: decisions (and
+        # decision_evidence links) default to active-only unless a status is
+        # explicitly given, so a superseded/reversed link is excluded by
+        # default, not just marked.
         where_parts.append("status = 'active'")
     where_sql = " AND ".join(where_parts)
 
@@ -5420,6 +5573,7 @@ async def planning_search(
     status: "str | list[str] | None" = None,
     limit: int = 20,
     cursor: int = 0,
+    rerank_semantic: bool = False,
 ) -> dict[str, Any]:
     """0dc5a35d — ranked, scoped planning search (v1).
 
@@ -5447,16 +5601,42 @@ async def planning_search(
         cursor: zero-based OFFSET into the fully-ranked result list (mirrors
             get_project_notes_page's cursor contract). Pass the previous
             response's ``next_cursor`` to fetch the next page.
+        rerank_semantic: 9149e132 — OPTIONAL, OFF BY DEFAULT. When True (and
+            :func:`meridian.semantic_search.is_available` — itself gated
+            behind ``MERIDIAN_SEMANTIC_ENABLED`` + an importable model2vec,
+            off by default), re-orders the ALREADY-RETRIEVED ``all_results``
+            candidate set by a lexical/semantic FUSED score
+            (:func:`meridian.semantic_search.score_confidence`'s existing
+            0.6/0.4 blend). This is deliberately NOT the same shape as
+            :func:`_maybe_semantic_escalate` (used by :func:`search_all`),
+            which ESCALATES — adds NEW rows semantic search alone found when
+            lexical search found nothing. Reranking here NEVER adds or drops
+            a row: lexical retrieval alone decides the CANDIDATE SET (what
+            can appear at all); semantic scoring only ever decides the
+            ORDER of that already-fixed set, and every row's fused score
+            always includes its own lexical component (rows here all came
+            from lexical retrieval, so a "semantic-only" ranking of a row
+            lexical search never found is structurally impossible). See
+            ``freshness.reranked`` / ``freshness.rerank_backend`` on the
+            response, and each reranked result's additive ``semantic`` field
+            (semantic_score/fused_score/confident/reason). Unavailable or
+            no-op semantic search silently leaves lexical ordering untouched
+            — never an error.
 
     Returns a dict with ``query``, ``filters``, ``results`` (each carrying
     source_type/source_id/title/snippet/score/rank_explanation/status/
-    version/created_at), ``total_matched``, ``has_more``, ``next_cursor``,
-    ``backend``, ``freshness`` (index_type/generated_at/stale/capped/
-    capped_source_types/pool_cap), and ``skipped_source_types`` (a
+    version/created_at, plus an optional additive ``semantic`` breakdown when
+    reranked), ``total_matched``, ``has_more``, ``next_cursor``, ``backend``,
+    ``freshness`` (index_type/generated_at/stale/capped/capped_source_types/
+    pool_cap/reranked/rerank_backend), and ``skipped_source_types`` (a
     type -> reason map for e.g. workspace_proposal when no tenant can be
     resolved for this project).
 
-    No LLM or embedding call anywhere in this function.
+    No LLM call anywhere in this function. The only embedding call possible
+    is the OPTIONAL, off-by-default ``rerank_semantic`` path above, and even
+    then it never authorizes a mutation or expands what lexical search
+    already found — see :mod:`meridian.db.decision_evidence`'s module
+    docstring for the full safety contract this exists to uphold.
     """
     limit = max(1, min(int(limit or 20), 100))
     cursor = max(0, int(cursor or 0))
@@ -5519,6 +5699,60 @@ async def planning_search(
     all_results.sort(key=lambda r: r.get("created_at") or "", reverse=True)
     all_results.sort(key=lambda r: r["score"], reverse=True)
 
+    # 9149e132 — OPTIONAL, READ-ONLY semantic rerank. See the `rerank_semantic`
+    # docstring above for the full contract; in short: this can only re-sort
+    # `all_results` (already fully assembled by lexical retrieval above), it
+    # can never add a row lexical search did not already find, and every
+    # fused score always includes its own lexical component (never
+    # semantic-only), so it can never become the sole ranking signal.
+    reranked = False
+    rerank_backend: str | None = None
+    if rerank_semantic and all_results:
+        from meridian import semantic_search  # noqa: PLC0415 — lazy, mirrors _maybe_semantic_escalate
+
+        if semantic_search.is_available():
+            raw_scores = [r["score"] for r in all_results]
+            lo, hi = min(raw_scores), max(raw_scores)
+            span = (hi - lo) or 1.0
+            # Normalized to [0, 1] purely as fusion/fallback-ordering input —
+            # the authoritative `score` field on each result is never
+            # overwritten by this block.
+            lexical_scores = {
+                f"{r['source_type']}:{r['source_id']}": (r["score"] - lo) / span
+                for r in all_results
+            }
+            candidates = [
+                (f"{r['source_type']}:{r['source_id']}", f"{r['title']} {r['snippet']}")
+                for r in all_results
+            ]
+            matches = semantic_search.rank_confident(
+                query, candidates, lexical_scores=lexical_scores,
+            )
+            if matches:
+                fused_by_id = {m.id: m for m in matches}
+
+                def _rerank_key(r: "dict[str, Any]") -> float:
+                    rid = f"{r['source_type']}:{r['source_id']}"
+                    m = fused_by_id.get(rid)
+                    # A row with no semantic verdict (below the cosine floor,
+                    # or embedding failed) keeps its normalized lexical score
+                    # — it is never dropped, only possibly out-ranked by rows
+                    # whose fused score is higher.
+                    return m.fused_score if m is not None else lexical_scores[rid]
+
+                all_results.sort(key=_rerank_key, reverse=True)  # stable: ties keep lexical order
+                reranked = True
+                rerank_backend = semantic_search.model_name()
+                for r in all_results:
+                    m = fused_by_id.get(f"{r['source_type']}:{r['source_id']}")
+                    if m is not None:
+                        r["semantic"] = {
+                            "semantic_score": m.semantic_score,
+                            "fused_score": m.fused_score,
+                            "confident": m.confident,
+                            "reason": m.reason,
+                        }
+
     total_matched = len(all_results)
     page = all_results[cursor: cursor + limit]
     has_more = (cursor + limit) < total_matched
@@ -5553,6 +5787,11 @@ async def planning_search(
                 "status": r.get("status"),
                 "version": r.get("version"),
                 "created_at": r.get("created_at"),
+                # 9149e132 — additive, only present when rerank_semantic=True
+                # AND semantic search was available AND this row cleared the
+                # cosine floor. Advisory ranking metadata only — never used
+                # to authorize a mutation or to decide what to retrieve.
+                **({"semantic": r["semantic"]} if "semantic" in r else {}),
             }
             for r in page
         ],
@@ -5567,6 +5806,8 @@ async def planning_search(
             "capped": bool(capped_types),
             "capped_source_types": sorted(capped_types),
             "pool_cap": _PLANNING_SEARCH_POOL_CAP,
+            "reranked": reranked,
+            "rerank_backend": rerank_backend,
         },
         "skipped_source_types": skipped_types,
     }
@@ -11850,6 +12091,7 @@ from .sprint_items import (  # noqa: F401
     add_subtask,
     analyze_sprint,
     assign_sprint_waves,
+    audit_and_quarantine_sprint_item_dependency_mismatches,
     build_github_completion_comment,
     build_sprint_items_xml,
     claim_parallel_batch,
@@ -11864,6 +12106,7 @@ from .sprint_items import (  # noqa: F401
     evaluate_board_blockers,
     fail_sprint_item,
     fan_out_sprint_items,
+    find_cross_project_dependency_mismatches,
     get_blocking_dependency_for_sprint_item,
     get_open_task_for_sprint_item,
     get_parallelizable_groups,
@@ -11884,6 +12127,7 @@ from .sprint_items import (  # noqa: F401
     infer_active_sprint_version,
     link_sprint_item_github_issue,
     merge_sprint_items,
+    move_sprint_item_to_project,
     patch_sprint_item,
     provisional_complete_sprint_item,
     push_sprint_item,
@@ -11961,6 +12205,10 @@ from .sprint_items import (  # noqa: F401
     _compute_plan_generation,
     _seconds_until,
     _live_resource_holder,
+    # 6b3b2c0e — canonical single-colon-legacy-shorthand classification,
+    # also called directly by tests.
+    _predict_resource_granularity,
+    _is_legacy_file_symbol_shorthand,
 )
 
 
@@ -12014,6 +12262,23 @@ from .wave_runs import (  # noqa: F401
 from .wave_resume import (  # noqa: F401
     WaveResumeStale,
     check_wave_resume,
+)
+
+
+# bbb447ec — immutable, queryable wave-completion summaries keyed by wave_id.
+# Imported after board_snapshot (needs canonical_json already bound) and after
+# wave_runs (a summary's wave_run_id typically references a wave_runs.id,
+# though this module never enforces that FK — see wave_run_summary.py).
+from .wave_run_summary import (  # noqa: F401
+    WAVE_SUMMARY_ITEM_OUTCOMES,
+    WAVE_SUMMARY_TEST_SCOPES,
+    _migrate_wave_run_summaries,
+    canonical_wave_summary_hash,
+    persist_wave_summary,
+    get_wave_summary,
+    get_wave_summary_by_id,
+    get_wave_summary_history,
+    record_wave_summary_correction,
 )
 
 
@@ -12117,6 +12382,12 @@ from .workspace import (  # noqa: F401
     promote_workspace_proposal,
     set_proposal_github_issue,
     delete_workspace_proposal,
+    # 3f892ea6 — deterministic proposal intake blocks
+    parse_proposal_intake_blocks,
+    _migrate_proposal_intake_drafts,
+    ingest_proposal_intake,
+    get_proposal_intake_drafts,
+    promote_intake_draft,
     # Public workspace sprint-board functions
     add_workspace_sprint_item,
     get_workspace_sprint_items,
@@ -12132,6 +12403,15 @@ from .workspace import (  # noqa: F401
     set_manual_issue_screening_enabled,
     record_action_audit_event,
     get_action_audit_log,
+    # 0d95003f — generic cross-project quarantine mechanism
+    CROSS_PROJECT_QUARANTINE_EVENT_TYPE,
+    CROSS_PROJECT_QUARANTINE_RESOLVED_EVENT_TYPE,
+    _VALID_QUARANTINE_RESOLUTIONS,
+    quarantine_cross_project_record,
+    resolve_cross_project_quarantine,
+    get_cross_project_quarantine_status,
+    is_cross_project_quarantined,
+    list_quarantined_cross_project_records,
     # Public workspace-member / invite functions
     create_workspace_invite,
     get_workspace_invite_by_token_hash,
@@ -12276,4 +12556,36 @@ from .executor_reports import (  # noqa: F401
     list_executor_reports,
     update_executor_report_status,
     mark_executor_report_accepted,
+)
+
+# 9149e132 — typed, code-linked decision evidence + deterministic planning
+# retrieval. Imported last (after everything above) — a single-table,
+# no-state-machine shape, mirroring the vector_index_state import above.
+# Wired into planning_search via the _PLANNING_SOURCE_SPECS["decision_evidence"]
+# entry earlier in this file, not via anything imported here.
+from .decision_evidence import (  # noqa: F401
+    DECISION_EVIDENCE_STATUSES,
+    _migrate_decision_evidence,
+    create_decision_evidence,
+    get_decision_evidence,
+    list_decision_evidence,
+    supersede_decision_evidence,
+    reverse_decision_evidence,
+)
+
+# 9e83be4a (Round 1 proposal e143949d) — canonical, versioned, append-only
+# ExecutionEvent storage scaffold (meridian.db.ai_log). Schema/contract only
+# — see meridian.ai_log's module docstring for scope. Imported last (after
+# everything above), a single-table, no-state-machine shape mirroring the
+# decision_evidence import immediately above. Nothing in this codebase calls
+# append_event yet — no capture/ingestion pipeline is wired to this table.
+# ea972129 additionally adds AiLogStore + purge_events_before (retention) —
+# see meridian.db.ai_log's module docstring's "ea972129 ... RETENTION" note.
+from .ai_log import (  # noqa: F401
+    AiLogStore,
+    _migrate_ai_log_events_table,
+    append_event,
+    get_event,
+    list_events,
+    purge_events_before,
 )

@@ -798,38 +798,49 @@ def _build_synth_id_map(body: ET.Element) -> dict[int, str]:
     paraId.  The synthesized id is a 16-hex-char SHA-1 digest (prefixed ``sp``)
     derived from:
 
-    - The structural path: the heading-text trail leading to this paragraph
-      (insertion-resistant — inserts elsewhere don't rename existing headings).
     - The paragraph's normalised text (lowercased, whitespace collapsed).
-    - An occurrence counter disambiguating duplicate paragraphs at the same
-      structural slot with the same text (e.g. two blank paragraphs under the
-      same heading).
+    - An occurrence counter disambiguating duplicate paragraphs sharing that
+      exact normalised text, scoped across the whole document in document
+      order (0, 1, 2, ... per successive occurrence) so no two paragraphs can
+      ever collide onto the same id.
 
     Using ``hashlib.sha1`` (not Python's built-in ``hash()``) ensures
     reproducibility across processes and Python restarts.
+
+    e21b2ca7 — the ancestor heading TEXT trail this hash previously included
+    (an "insertion-resistant structural path") is no longer part of the
+    input: it made a paragraph's own id drift whenever an ANCESTOR heading
+    was retitled, even though the paragraph itself was never touched. Only
+    this paragraph's own content and its own document-order occurrence count
+    feed the hash now, so retitling a heading no longer perturbs any
+    descendant's id, while distinct paragraphs (and distinct occurrences of
+    duplicated text) still never collide.
+
+    Residual, explicitly accepted limitations (inherent to an id derived
+    purely by re-parsing content on every call, with no persisted state):
+    editing a paragraph's OWN text still changes ITS OWN id (there is
+    nothing else here to hash it from), and inserting/removing an EARLIER
+    paragraph that shares this paragraph's exact normalized text still
+    shifts this paragraph's occurrence index and therefore its id. Both
+    require a real persisted, document-bound identity (minted once and
+    remembered, not recomputed fresh from content on every parse) to fully
+    close — native ``w14:paraId`` already gives real Word-authored
+    paragraphs that guarantee; this fallback does not yet.
     """
     p_tag = _q(_W, "p")
     w14_paraId = _q(_W14, "paraId")
-    heading_path: list[str] = []
-    seen: dict[tuple[str, str], int] = {}
+    seen: dict[str, int] = {}
     result: dict[int, str] = {}
     for child in body:
         if child.tag != p_tag:
             continue
         native_id = child.get(w14_paraId)
-        style = _paragraph_style(child)
-        if _is_heading(style):
-            level = _heading_level(style)
-            text = _paragraph_text(child)
-            heading_path = heading_path[: level - 1] + [text]
         if native_id:
             continue
-        path_str = " > ".join(heading_path) if heading_path else "<root>"
         norm_text = re.sub(r"\s+", " ", _paragraph_text(child).lower()).strip()
-        slot_key = (path_str, norm_text)
-        occ = seen.get(slot_key, 0)
-        seen[slot_key] = occ + 1
-        raw = f"{path_str}\x00{norm_text}\x00{occ}"
+        occ = seen.get(norm_text, 0)
+        seen[norm_text] = occ + 1
+        raw = f"{norm_text}\x00{occ}"
         digest = hashlib.sha1(raw.encode()).hexdigest()[:16]
         result[id(child)] = f"sp{digest}"
     return result

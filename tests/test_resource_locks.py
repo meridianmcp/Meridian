@@ -1868,6 +1868,251 @@ async def test_parallelizable_groups_splits_colon_symbol_suffixed_same_file_item
 
 
 # ---------------------------------------------------------------------------
+# 6b3b2c0e — follow-up to 2a176d6d's "bonus root-cause fix" above. 2a176d6d
+# only wired the legacy single-colon "file:<path>:<symbol>" shorthand into
+# the SCHEDULER's conflict comparison (_resource_file_of /
+# _two_resources_conflict / get_parallelizable_groups' coloring, proven by
+# the two tests immediately above). It explicitly left the CLAIM-TIME path
+# untouched: _live_resource_holder and _claim_batch_resource (which backs
+# claim_parallel_batch) still resolved a "file:" resource via the raw
+# ``resource[len("file:"):]`` suffix instead of the same canonical real-file
+# identity. That meant the scheduler correctly predicted that
+# "file:x.py:funcA" and "file:x.py:funcB" conflict (same real file "x.py"),
+# but nothing enforced that at claim time: each declaration was locked under
+# its own fabricated, per-declaration-unique key ("x.py:funcA" vs
+# "x.py:funcB") that no other claim ever collides with — so two DIFFERENT
+# sessions claiming them via two SEPARATE claim_parallel_batch calls (not one
+# batch containing both, which the internal composition check already
+# catches) could both "succeed" while genuinely racing on the same real file.
+# These tests prove the fix: claim-time now uses the SAME canonical key as
+# scheduler prediction.
+# ---------------------------------------------------------------------------
+
+
+def test_predict_resource_granularity_flags_legacy_file_symbol_shorthand():
+    """6b3b2c0e — the legacy single-colon file:<path>:<symbol> shorthand is
+    now VISIBLY classified as 'file_legacy_symbol_suffix', distinct from a
+    genuine plain 'file:<path>' declaration, so a caller/orchestrator can
+    tell the two apart at planning time (acceptance: "malformed legacy
+    resources have a visible machine-readable classification")."""
+    predict = db_module._predict_resource_granularity
+    assert predict("file:x.py:funcA") == "file_legacy_symbol_suffix"
+    assert predict("file:x.py") == "file"
+    # A genuine Windows drive-letter path is NOT mistaken for the shorthand
+    # (mirrors _resource_file_of's own drive-letter exemption).
+    assert predict("file:C:/repo/x.py") == "file"
+    # symbol:/other classifications are unaffected.
+    assert predict("symbol:x.py::foo") == "symbol"
+    assert predict("db:migrations") == "other"
+
+
+def test_is_legacy_file_symbol_shorthand_matches_resource_file_of():
+    """6b3b2c0e — the new classification helper must never drift from
+    _resource_file_of, the ONE existing function that already knows how to
+    tell a legacy shorthand apart from a genuine file: id."""
+    is_legacy = db_module._is_legacy_file_symbol_shorthand
+    assert is_legacy("file:x.py:funcA") is True
+    assert is_legacy("file:x.py") is False
+    assert is_legacy("file:C:/repo/x.py") is False
+    # Non-file: resources are trivially not this shape.
+    assert is_legacy("symbol:x.py::foo") is False
+    assert is_legacy("db:migrations") is False
+
+
+@pytest.mark.asyncio
+async def test_live_resource_holder_resolves_legacy_file_symbol_shorthand_to_real_file(db):
+    """6b3b2c0e — the CLAIM-TIME live-holder check must resolve
+    'file:<path>:<symbol>' to the SAME real file _resource_file_of already
+    uses for scheduler conflict comparison, not a fabricated per-declaration
+    key nothing else ever locks. Before the fix this returned None (free)
+    even though the real file was genuinely held by another live session."""
+    p = await db_module.create_project(db, "6b3b2c0e-live-holder-legacy")
+    holder = await db_module.register_session(db, p["id"], "holder")
+    claimed = await db_module.claim_file(db, "x.py", holder["id"])
+    assert claimed["claimed"] is True
+
+    result = await db_module._live_resource_holder(db, "file:x.py:funcA")
+    assert result is not None
+    assert result["holder_session_id"] == holder["id"]
+    assert result["claim_granularity"] == "file"
+
+    # A DIFFERENT real file with the same shorthand shape stays free.
+    free = await db_module._live_resource_holder(db, "file:y.py:funcB")
+    assert free is None
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_legacy_file_symbol_shorthand_conflicts_across_separate_batches(db):
+    """6b3b2c0e — the confirmed planning gap, end to end. Two items declare
+    the legacy single-colon shorthand on the SAME real file:
+    'file:x.py:funcA' and 'file:x.py:funcB'. get_parallelizable_groups
+    already correctly refuses to co-schedule them into one group (see
+    test_parallelizable_groups_splits_colon_symbol_suffixed_same_file_items
+    above) — this proves claim time agrees: once the first is genuinely
+    claimed, a SEPARATE claim_parallel_batch call for the second must be
+    refused, not silently "succeed" under a fabricated distinct lock key."""
+    p = await db_module.create_project(db, "6b3b2c0e-legacy-race")
+    pid = p["id"]
+    s1 = await db_module.register_session(db, pid, "w1")
+    s2 = await db_module.register_session(db, pid, "w2")
+    item_a = await db_module.add_sprint_item(
+        db, pid, "v1", "touch funcA",
+        touches_resources=["file:x.py:funcA"], prospect_bypass=True,
+    )
+    item_b = await db_module.add_sprint_item(
+        db, pid, "v1", "touch funcB",
+        touches_resources=["file:x.py:funcB"], prospect_bypass=True, force=True,
+    )
+
+    # Scheduler prediction: same canonical key → must split into 2 groups.
+    groups = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert groups["group_count"] == 2
+
+    # Claim-time enforcement, order 1: item_a claimed first, alone.
+    first = await db_module.claim_parallel_batch(db, pid, s1["id"], [item_a["id"]])
+    assert first["ok"] is True
+    assert first["resource_claims"][0]["resolved_from_legacy_shorthand"] is True
+
+    # The REAL lock landed on the shared real file "x.py", not a fabricated
+    # "x.py:funcA" key nobody else will ever check against.
+    real_claim = await db_module.get_file_claims(db, "x.py")
+    assert real_claim["file_lock"] is not None
+    assert real_claim["file_lock"]["session_id"] == s1["id"]
+
+    # A SEPARATE batch call for item_b (a second session that never saw
+    # item_a's batch) must be refused — the real file is already held.
+    second = await db_module.claim_parallel_batch(db, pid, s2["id"], [item_b["id"]])
+    assert second["ok"] is False
+    assert second["error"] == "BATCH_RESOURCE_CONFLICT"
+    assert second["holder_session_id"] == s1["id"]
+    reread_b = await db_module.get_sprint_item(db, item_b["id"])
+    assert reread_b["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_whole_file_then_legacy_symbol_shorthand_cross_call_conflict(db):
+    """6b3b2c0e — order 1: a genuine whole-file 'file:x.py' claim, taken
+    first, must block a LATER, separate claim_parallel_batch call for
+    'file:x.py:funcA' (the legacy shorthand for the SAME real file) — the
+    file/legacy-shorthand pair must conflict regardless of which form claims
+    first."""
+    p = await db_module.create_project(db, "6b3b2c0e-file-then-legacy")
+    pid = p["id"]
+    s1 = await db_module.register_session(db, pid, "w1")
+    s2 = await db_module.register_session(db, pid, "w2")
+    item_file = await db_module.add_sprint_item(
+        db, pid, "v1", "whole file edit",
+        touches_resources=["file:x.py"], prospect_bypass=True,
+    )
+    item_legacy = await db_module.add_sprint_item(
+        db, pid, "v1", "touch funcA legacy",
+        touches_resources=["file:x.py:funcA"], prospect_bypass=True, force=True,
+    )
+
+    first = await db_module.claim_parallel_batch(db, pid, s1["id"], [item_file["id"]])
+    assert first["ok"] is True
+
+    second = await db_module.claim_parallel_batch(db, pid, s2["id"], [item_legacy["id"]])
+    assert second["ok"] is False
+    assert second["error"] == "BATCH_RESOURCE_CONFLICT"
+    assert second["holder_session_id"] == s1["id"]
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_legacy_symbol_shorthand_then_whole_file_cross_call_conflict(db):
+    """6b3b2c0e — order 2 (reverse of the test above): the legacy shorthand
+    claimed FIRST must block a later genuine whole-file claim on the same
+    real file — proving the conflict is symmetric, not an artifact of claim
+    order."""
+    p = await db_module.create_project(db, "6b3b2c0e-legacy-then-file")
+    pid = p["id"]
+    s1 = await db_module.register_session(db, pid, "w1")
+    s2 = await db_module.register_session(db, pid, "w2")
+    item_legacy = await db_module.add_sprint_item(
+        db, pid, "v1", "touch funcA legacy",
+        touches_resources=["file:x.py:funcA"], prospect_bypass=True,
+    )
+    item_file = await db_module.add_sprint_item(
+        db, pid, "v1", "whole file edit",
+        touches_resources=["file:x.py"], prospect_bypass=True, force=True,
+    )
+
+    first = await db_module.claim_parallel_batch(db, pid, s1["id"], [item_legacy["id"]])
+    assert first["ok"] is True
+
+    second = await db_module.claim_parallel_batch(db, pid, s2["id"], [item_file["id"]])
+    assert second["ok"] is False
+    assert second["error"] == "BATCH_RESOURCE_CONFLICT"
+    assert second["holder_session_id"] == s1["id"]
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_disjoint_symbols_same_file_cross_call_both_succeed(db):
+    """6b3b2c0e — the safety counterpart: two GENUINELY disjoint symbols in
+    the same file, claimed via two SEPARATE claim_parallel_batch calls (not
+    one co-submitted batch), must both succeed — the claim-time fix must not
+    over-widen and start treating every same-file declaration as
+    conflicting."""
+    p = await db_module.create_project(db, "6b3b2c0e-disjoint-cross-call")
+    pid = p["id"]
+    s1 = await db_module.register_session(db, pid, "w1")
+    s2 = await db_module.register_session(db, pid, "w2")
+    item_foo = await db_module.add_sprint_item(
+        db, pid, "v1", "touch foo",
+        touches_resources=["symbol:pkg/mod.py::foo"], prospect_bypass=True,
+    )
+    item_bar = await db_module.add_sprint_item(
+        db, pid, "v1", "touch bar",
+        touches_resources=["symbol:pkg/mod.py::bar"], prospect_bypass=True, force=True,
+    )
+    contents = {"resource_contents": {"pkg/mod.py": _FOO_BAR_SRC}}
+
+    first = await db_module.claim_parallel_batch(
+        db, pid, s1["id"], [item_foo["id"]], **contents,
+    )
+    second = await db_module.claim_parallel_batch(
+        db, pid, s2["id"], [item_bar["id"]], **contents,
+    )
+    assert first["ok"] is True
+    assert second["ok"] is True
+
+    live_symbols = await db_module.get_symbol_claims(db, "pkg/mod.py")
+    names = {s["symbol_name"]: s["session_id"] for s in live_symbols}
+    assert names == {"foo": s1["id"], "bar": s2["id"]}
+    # Neither claim escalated to a whole-file lock.
+    assert (await db_module.get_file_claims(db, "pkg/mod.py"))["file_lock"] is None
+
+
+@pytest.mark.asyncio
+async def test_claim_parallel_batch_resource_claims_marks_legacy_shorthand(db):
+    """6b3b2c0e — the public claim_parallel_batch result surfaces
+    'resolved_from_legacy_shorthand' on resource_claims entries that used the
+    legacy single-colon form, and omits it (never a stray False) for a
+    genuine plain file: declaration — an auditable, machine-readable signal
+    distinguishing the two, per the acceptance bar."""
+    p = await db_module.create_project(db, "6b3b2c0e-batch-granularity-legacy")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "orchestrator")
+    item_legacy = await db_module.add_sprint_item(
+        db, pid, "v1", "legacy shorthand",
+        touches_resources=["file:x.py:funcA"], prospect_bypass=True,
+    )
+    item_plain = await db_module.add_sprint_item(
+        db, pid, "v1", "plain file",
+        touches_resources=["file:other.py"], prospect_bypass=True, force=True,
+    )
+    result = await db_module.claim_parallel_batch(
+        db, pid, sess["id"], [item_legacy["id"], item_plain["id"]],
+    )
+    assert result["ok"] is True
+    by_resource = {c["resource"]: c for c in result["resource_claims"]}
+    assert by_resource["file:x.py:funcA"]["resolved_from_legacy_shorthand"] is True
+    assert by_resource["file:x.py:funcA"]["claim_granularity"] == "file"
+    assert "resolved_from_legacy_shorthand" not in by_resource["file:other.py"]
+    assert by_resource["file:other.py"]["claim_granularity"] == "file"
+
+
+# ---------------------------------------------------------------------------
 # 2a176d6d (finding 3 + 4) — bare symbol:<name> rejection and claim_granularity
 # classification in the ATOMIC BATCH path (claim_parallel_batch /
 # _claim_batch_resource), mirroring the single-item-path coverage above.
@@ -2440,3 +2685,495 @@ async def test_request_hitl_without_blocker_context_unaffected(db):
     pid = p["id"]
     row = await db_module.request_hitl(db, pid, "plain question")
     assert row["payload"] is None
+
+
+# ---------------------------------------------------------------------------
+# 54d2c2af — HARDEN: strict_resource_locking / allow_file_fallback opt-in
+# contract on _sprint_item_resource_claim_gate / claim_sprint_item, plus the
+# durable lock-granularity/fallback receipt (meridian.lock_granularity_receipt).
+#
+# The DEFAULT (strict_resource_locking omitted or False) behavior is byte-for-
+# byte the pre-54d2c2af behavior pinned by the 18c488b6/2a176d6d tests above —
+# these tests only exercise the NEW opt-in surface, never change a default.
+# ---------------------------------------------------------------------------
+
+from meridian import lock_granularity_receipt  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_strict_resource_locking_rejects_missing_source_by_default(db):
+    """54d2c2af — strict_resource_locking=true + no resource_contents for a
+    symbol: resource must be REJECTED (SYMBOL_LOCK_NOT_APPROVED), never
+    silently widened to a whole-file lock. The item stays pending and no lock
+    of any kind is left behind."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "54d2c2af-strict-no-source")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "strict, no content",
+        touches_resources=["symbol:pkg/mod.py::foo"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {
+            "project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+            "strict_resource_locking": True,
+        },
+        db, "/tmp",
+    )
+    assert result.get("ok") is False
+    assert result["error"] == "SYMBOL_LOCK_NOT_APPROVED"
+    assert result["conflicts"][0]["fallback_reason"] == "no_source_supplied"
+    reread = await db_module.get_sprint_item(db, item["id"])
+    assert reread["status"] == "pending"
+    file_claims = await db_module.get_file_claims(db, "pkg/mod.py")
+    assert file_claims["file_lock"] is None
+    assert await db_module.get_symbol_claims(db, "pkg/mod.py") == []
+
+
+@pytest.mark.asyncio
+async def test_strict_resource_locking_rejects_unresolved_symbol_even_with_content(db):
+    """54d2c2af — content IS supplied but the symbol can't be resolved
+    (ambiguous duplicate top-level def): strict mode rejects rather than
+    falling back, same as the no-content case."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "54d2c2af-strict-ambiguous")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "strict, ambiguous symbol",
+        touches_resources=["symbol:dup_strict.py::helper"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {
+            "project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+            "strict_resource_locking": True,
+            "resource_contents": {"dup_strict.py": _DUP_NAME_SRC},
+        },
+        db, "/tmp",
+    )
+    assert result.get("ok") is False
+    assert result["error"] == "SYMBOL_LOCK_NOT_APPROVED"
+    assert result["conflicts"][0]["fallback_reason"] == "ambiguous_symbol"
+    reread = await db_module.get_sprint_item(db, item["id"])
+    assert reread["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_strict_resource_locking_allows_explicit_file_fallback_when_approved(db):
+    """54d2c2af — strict_resource_locking=true + allow_file_fallback=true
+    explicitly approves the exact same whole-file widening that would
+    otherwise be rejected: the claim succeeds, and the lock_scope entry
+    records fallback_approved=true (audited approval, not silent)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "54d2c2af-strict-approved-fallback")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "strict, approved fallback",
+        touches_resources=["symbol:pkg/mod2.py::foo"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {
+            "project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+            "strict_resource_locking": True, "allow_file_fallback": True,
+        },
+        db, "/tmp",
+    )
+    assert "error" not in result and not result.get("blocked")
+    entry = result["resource_lock_scope"][0]
+    assert entry["scope"] == "file"
+    assert entry["acquired"] is True
+    assert entry["fallback_reason"] == "no_source_supplied"
+    assert entry["fallback_approved"] is True
+    assert result["claim_granularity"]["symbol:pkg/mod2.py::foo"] == "coarse"
+
+
+@pytest.mark.asyncio
+async def test_strict_resource_locking_real_symbol_lock_succeeds_without_fallback(db):
+    """54d2c2af — strict mode never blocks a symbol: resource that CAN get a
+    real symbol-range lock; allow_file_fallback isn't even needed since no
+    fallback is attempted."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "54d2c2af-strict-real-symbol")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "strict, real content",
+        touches_resources=["symbol:pkg/mod3.py::foo"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {
+            "project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+            "strict_resource_locking": True,
+            "resource_contents": {"pkg/mod3.py": _FOO_BAR_SRC},
+        },
+        db, "/tmp",
+    )
+    assert "error" not in result and not result.get("blocked")
+    entry = result["resource_lock_scope"][0]
+    assert entry["scope"] == "symbol"
+    assert "fallback_reason" not in entry
+    assert result["claim_granularity"]["symbol:pkg/mod3.py::foo"] == "symbol"
+
+
+@pytest.mark.asyncio
+async def test_gate_strict_resource_locking_requires_session_id(db):
+    """54d2c2af — direct unit check: strict_resource_locking=true promotes a
+    missing session_id (on an item that declares resources) from the gate's
+    default fail-open skip to a hard MISSING_EXECUTION_IDENTITY block."""
+    import meridian.server  # noqa: F401 — avoid handler/server import cycle
+    from meridian.mcp.handler import _sprint_item_resource_claim_gate
+
+    p = await db_module.create_project(db, "54d2c2af-strict-no-identity")
+    pid = p["id"]
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "strict, no session",
+        touches_resources=["symbol:pkg/mod.py::foo"], prospect_bypass=True,
+    )
+    gate = await _sprint_item_resource_claim_gate(
+        db, pid, item["id"], None, strict_resource_locking=True,
+    )
+    assert gate["ok"] is False
+    assert gate["error"] == "MISSING_EXECUTION_IDENTITY"
+
+    # Non-strict (default) call on the SAME item is completely unaffected —
+    # still the pre-54d2c2af fail-open skip.
+    gate_default = await _sprint_item_resource_claim_gate(db, pid, item["id"], None)
+    assert gate_default == {"ok": True, "lock_scope": [], "skipped_reason": "no_session_id"}
+
+
+@pytest.mark.asyncio
+async def test_strict_resource_locking_all_or_nothing_rollback_on_rejection(db):
+    """54d2c2af — an item declares a GOOD file: resource and a symbol:
+    resource that strict mode rejects: the whole claim is refused and the
+    already-acquired file: resource is rolled back too, same all-or-nothing
+    contract a genuine conflict already gets."""
+    import meridian.server  # noqa: F401
+    from meridian.mcp.handler import _sprint_item_resource_claim_gate
+
+    p = await db_module.create_project(db, "54d2c2af-strict-rollback")
+    pid = p["id"]
+    claimant = await db_module.register_session(db, pid, "claimant")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "strict rollback, two resources",
+        touches_resources=["file:strict_a.py", "symbol:strict_b.py::foo"],
+        prospect_bypass=True,
+    )
+    gate = await _sprint_item_resource_claim_gate(
+        db, pid, item["id"], claimant["id"], strict_resource_locking=True,
+    )
+    assert gate["ok"] is False
+    assert gate["error"] == "SYMBOL_LOCK_NOT_APPROVED"
+
+    # strict_a.py must have been rolled back — claimant does not hold it.
+    file_claims = await db_module.get_file_claims(db, "strict_a.py")
+    assert file_claims["file_lock"] is None
+
+
+@pytest.mark.asyncio
+async def test_strict_resource_locking_genuine_conflict_still_reported_as_resource_locked(db):
+    """54d2c2af — a REAL conflict (another live session already holds the
+    symbol) must still surface as RESOURCE_LOCKED, never as
+    SYMBOL_LOCK_NOT_APPROVED — the strict-rejection branch only applies to
+    UNRESOLVED symbols, not genuinely contested ones."""
+    import meridian.server  # noqa: F401
+    from meridian.mcp.handler import _sprint_item_resource_claim_gate
+
+    p = await db_module.create_project(db, "54d2c2af-strict-genuine-conflict")
+    pid = p["id"]
+    holder = await db_module.register_session(db, pid, "holder")
+    claimant = await db_module.register_session(db, pid, "claimant")
+    pre = await db_module.claim_symbol(db, holder["id"], "contested.py", "foo", _FOO_BAR_SRC)
+    assert pre["claimed"] is True
+
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "strict genuine conflict",
+        touches_resources=["symbol:contested.py::foo"], prospect_bypass=True,
+    )
+    gate = await _sprint_item_resource_claim_gate(
+        db, pid, item["id"], claimant["id"], strict_resource_locking=True,
+        resource_contents={"contested.py": _FOO_BAR_SRC},
+    )
+    assert gate["ok"] is False
+    assert gate["error"] == "RESOURCE_LOCKED"
+
+
+@pytest.mark.asyncio
+async def test_lock_granularity_receipt_recorded_for_real_symbol_claim(db):
+    """54d2c2af — a real symbol-range acquisition writes a durable receipt
+    (achieved_granularity='symbol'), retrievable independent of the claim
+    response payload."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "54d2c2af-receipt-symbol")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "receipt for real symbol claim",
+        touches_resources=["symbol:receipt_mod.py::foo"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {
+            "project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+            "resource_contents": {"receipt_mod.py": _FOO_BAR_SRC},
+        },
+        db, "/tmp",
+    )
+    assert "error" not in result
+
+    receipts = await lock_granularity_receipt.get_lock_granularity_receipts(
+        db, project_id=pid, item_id=item["id"],
+    )
+    assert len(receipts) == 1
+    assert receipts[0]["resource"] == "symbol:receipt_mod.py::foo"
+    assert receipts[0]["requested_granularity"] == "symbol"
+    assert receipts[0]["achieved_granularity"] == "symbol"
+    assert receipts[0]["reason"] is None
+    assert receipts[0]["actor"] == sess["id"]
+
+
+@pytest.mark.asyncio
+async def test_lock_granularity_receipt_recorded_for_coarse_fallback(db):
+    """54d2c2af — a non-strict silent fallback still gets a durable receipt:
+    achieved_granularity='coarse', the real fallback_reason, and
+    fallback_approved=None (not a strict-mode call, so 'approved' has no
+    meaning — the fallback was simply the pre-54d2c2af default)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "54d2c2af-receipt-coarse")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "receipt for coarse fallback",
+        touches_resources=["symbol:receipt_mod2.py::foo"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]},
+        db, "/tmp",
+    )
+    assert "error" not in result
+
+    receipts = await lock_granularity_receipt.get_lock_granularity_receipts(
+        db, project_id=pid, item_id=item["id"],
+    )
+    assert len(receipts) == 1
+    assert receipts[0]["achieved_granularity"] == "coarse"
+    assert receipts[0]["reason"] == "no_source_supplied"
+    assert receipts[0]["fallback_approved"] is None
+
+
+@pytest.mark.asyncio
+async def test_lock_granularity_receipt_recorded_for_strict_rejection(db):
+    """54d2c2af — a strict rejection ALSO gets a durable receipt
+    (achieved_granularity='rejected', fallback_approved=False) even though no
+    lock was acquired at all — the audit trail covers rejections, not just
+    successful acquisitions."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "54d2c2af-receipt-rejected")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "receipt for strict rejection",
+        touches_resources=["symbol:receipt_mod3.py::foo"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {
+            "project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+            "strict_resource_locking": True,
+        },
+        db, "/tmp",
+    )
+    assert result.get("error") == "SYMBOL_LOCK_NOT_APPROVED"
+
+    receipts = await lock_granularity_receipt.get_lock_granularity_receipts(
+        db, project_id=pid, item_id=item["id"],
+    )
+    assert len(receipts) == 1
+    assert receipts[0]["achieved_granularity"] == "rejected"
+    assert receipts[0]["reason"] == "no_source_supplied"
+    assert receipts[0]["fallback_approved"] is False
+
+
+@pytest.mark.asyncio
+async def test_lock_granularity_receipt_approved_true_for_strict_explicit_fallback(db):
+    """54d2c2af — strict_resource_locking + allow_file_fallback records the
+    receipt with fallback_approved=True, distinguishing an AUDITED approval
+    from the implicit pre-54d2c2af default (None)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "54d2c2af-receipt-approved")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "receipt for approved fallback",
+        touches_resources=["symbol:receipt_mod4.py::foo"], prospect_bypass=True,
+    )
+    result = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {
+            "project_id": pid, "item_id": item["id"], "session_id": sess["id"],
+            "strict_resource_locking": True, "allow_file_fallback": True,
+        },
+        db, "/tmp",
+    )
+    assert "error" not in result
+
+    receipts = await lock_granularity_receipt.get_lock_granularity_receipts(
+        db, project_id=pid, item_id=item["id"],
+    )
+    assert len(receipts) == 1
+    assert receipts[0]["achieved_granularity"] == "coarse"
+    assert receipts[0]["fallback_approved"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_lock_granularity_receipts_filters_by_item_id(db):
+    """54d2c2af — receipts from two different items in the same project don't
+    bleed into each other's query results."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "54d2c2af-receipt-filter")
+    pid = p["id"]
+    sess = await db_module.register_session(db, pid, "w1")
+    item_a = await db_module.add_sprint_item(
+        db, pid, "v1", "receipt filter alpha",
+        touches_resources=["symbol:receipt_a.py::foo"], prospect_bypass=True,
+    )
+    item_b = await db_module.add_sprint_item(
+        db, pid, "v1", "receipt filter beta",
+        touches_resources=["symbol:receipt_b.py::foo"], prospect_bypass=True,
+        force=True,
+    )
+    for item in (item_a, item_b):
+        r = await srv._dispatch_mcp_tool(
+            "claim_sprint_item",
+            {"project_id": pid, "item_id": item["id"], "session_id": sess["id"]},
+            db, "/tmp",
+        )
+        assert "error" not in r
+
+    receipts_a = await lock_granularity_receipt.get_lock_granularity_receipts(
+        db, project_id=pid, item_id=item_a["id"],
+    )
+    assert len(receipts_a) == 1
+    assert receipts_a[0]["resource"] == "symbol:receipt_a.py::foo"
+
+    receipts_all = await lock_granularity_receipt.get_lock_granularity_receipts(
+        db, project_id=pid,
+    )
+    assert len(receipts_all) == 2
+
+
+@pytest.mark.asyncio
+async def test_shared_read_claims_and_writer_conflict_rules_preserved(db):
+    """54d2c2af — regression: the pre-existing shared-read-claim / exclusive-
+    write-claim rules (ffa03655) are completely untouched by this hardening
+    pass. Multiple readers coexist; a writer is blocked by a live reader; a
+    reader is blocked by a live writer; releasing frees the file up again."""
+    p = await db_module.create_project(db, "54d2c2af-read-write-preserved")
+    pid = p["id"]
+    reader_a = await db_module.register_session(db, pid, "reader-a")
+    reader_b = await db_module.register_session(db, pid, "reader-b")
+    writer = await db_module.register_session(db, pid, "writer")
+
+    ra = await db_module.claim_file(db, "shared.py", reader_a["id"], mode="read")
+    assert ra["claimed"] is True and ra["claim_mode"] == "read"
+    rb = await db_module.claim_file(db, "shared.py", reader_b["id"], mode="read")
+    assert rb["claimed"] is True
+    assert rb["reader_count"] == 2
+
+    blocked_write = await db_module.claim_file(db, "shared.py", writer["id"], mode="write")
+    assert blocked_write["claimed"] is False
+    assert blocked_write["reason"] == "read_locked"
+
+    assert await db_module.release_file(db, "shared.py", reader_a["id"]) is True
+    assert await db_module.release_file(db, "shared.py", reader_b["id"]) is True
+
+    won_write = await db_module.claim_file(db, "shared.py", writer["id"], mode="write")
+    assert won_write["claimed"] is True
+
+    blocked_read = await db_module.claim_file(db, "shared.py", reader_a["id"], mode="read")
+    assert blocked_read["claimed"] is False
+    assert blocked_read["reason"] == "write_locked"
+
+
+@pytest.mark.asyncio
+async def test_claim_sprint_item_resource_lock_contract_is_client_agnostic(db):
+    """54d2c2af — prove the resource-locking contract has no client-specific
+    behavior: claim_sprint_item is called identically (same MCP tool, same
+    args shape) regardless of which MCP client is on the other end (Claude
+    Code, Codex, Cursor, or a bare mcp-remote connection). Passing an
+    arbitrary 'client' hint the tool schema doesn't even declare must have
+    ZERO effect on the resource-lock outcome — the gate branches only on
+    session_id/resource_contents/strict flags, never on caller identity."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "54d2c2af-client-agnostic")
+    pid = p["id"]
+    sess_a = await db_module.register_session(db, pid, "claude-code-like")
+    sess_b = await db_module.register_session(db, pid, "cursor-like")
+    item_a = await db_module.add_sprint_item(
+        db, pid, "v1", "cross tool identity alpha",
+        touches_resources=["symbol:agnostic_a.py::foo"], prospect_bypass=True,
+    )
+    item_b = await db_module.add_sprint_item(
+        db, pid, "v1", "cross tool identity beta",
+        touches_resources=["symbol:agnostic_b.py::foo"], prospect_bypass=True,
+        force=True,
+    )
+
+    result_a = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {
+            "project_id": pid, "item_id": item_a["id"], "session_id": sess_a["id"],
+            "resource_contents": {"agnostic_a.py": _FOO_BAR_SRC},
+            "client": "claude-code",  # not a declared schema property
+        },
+        db, "/tmp",
+    )
+    result_b = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {
+            "project_id": pid, "item_id": item_b["id"], "session_id": sess_b["id"],
+            "resource_contents": {"agnostic_b.py": _FOO_BAR_SRC},
+            "client": "cursor",
+        },
+        db, "/tmp",
+    )
+    for result in (result_a, result_b):
+        assert "error" not in result and not result.get("blocked")
+        assert result["status"] == "in_progress"
+        entry = result["resource_lock_scope"][0]
+        assert entry["scope"] == "symbol"
+        assert entry["acquired"] is True
+
+    # Same for a call that omits 'client' entirely — a third equally valid
+    # caller shape (a bare/self-hosted mcp-remote connection).
+    item_c = await db_module.add_sprint_item(
+        db, pid, "v1", "cross tool identity gamma unspecified",
+        touches_resources=["symbol:agnostic_c.py::foo"], prospect_bypass=True,
+        force=True,
+    )
+    result_c = await srv._dispatch_mcp_tool(
+        "claim_sprint_item",
+        {
+            "project_id": pid, "item_id": item_c["id"], "session_id": sess_a["id"],
+            "resource_contents": {"agnostic_c.py": _FOO_BAR_SRC},
+        },
+        db, "/tmp",
+    )
+    assert "error" not in result_c and not result_c.get("blocked")
+    assert result_c["resource_lock_scope"][0]["scope"] == "symbol"

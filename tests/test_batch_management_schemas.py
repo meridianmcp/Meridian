@@ -109,6 +109,33 @@ def test_update_sprint_item_directs_multi_item_patches_to_batch_tool():
 
 
 # ---------------------------------------------------------------------------
+# 468ab67d — fan_out_sprint_items' new opt-in strict-mode schema fields.
+# ---------------------------------------------------------------------------
+
+def test_fan_out_sprint_items_schema_has_opt_in_strict_fields():
+    tool = _find_tool("fan_out_sprint_items")
+    props = tool["inputSchema"]["properties"]
+    # Legacy contract unaffected: 'items' remains the only required field --
+    # strict/mode/idempotency_key must NOT be required, or every existing
+    # caller's call shape would break.
+    assert tool["inputSchema"]["required"] == ["items"]
+    assert props["strict"]["type"] == "boolean"
+    assert set(props["mode"]["enum"]) == set(bm.BATCH_MODES)
+    assert "idempotency_key" in props
+    item_props = props["items"]["items"]["properties"]
+    assert "force" in item_props
+    assert "correlation_key" in item_props
+
+
+def test_fan_out_sprint_items_description_documents_strict_mode():
+    tool = _find_tool("fan_out_sprint_items")
+    description = tool["description"]
+    assert "strict" in description
+    assert "idempotency_key" in description
+    assert "batch_management" in description
+
+
+# ---------------------------------------------------------------------------
 # 2. stdio transport advertises the IDENTICAL schema
 # ---------------------------------------------------------------------------
 

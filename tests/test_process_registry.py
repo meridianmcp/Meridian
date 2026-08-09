@@ -219,6 +219,127 @@ def test_report_unowned_survivors_degrades_true_without_psutil(broker, clock):
 
 
 # ---------------------------------------------------------------------------
+# acquire_exclusive — single-owner lease + stale-wrapper detection/replacement
+# (39c8cf2c). Liveness is simulated via the same verify_handle_live
+# monkeypatch pattern used above — never a real process.
+# ---------------------------------------------------------------------------
+
+
+def test_acquire_exclusive_cold_start_registers_a_fresh_lease(broker):
+    lease = broker.acquire_exclusive("meridian-tunnel_client", "tunnel-wrapper:/repo", 111)
+    assert lease.owner_key == "tunnel-wrapper:/repo"
+    assert lease.pid == 111
+    assert lease.released is False
+
+
+def test_acquire_exclusive_conflicts_with_a_verified_live_owner(broker, monkeypatch):
+    first = broker.acquire_exclusive(
+        "meridian-tunnel_client", "tunnel-wrapper:/repo", 111, create_time=1.0,
+    )
+    monkeypatch.setattr(
+        process_registry._process_lifecycle, "verify_handle_live", lambda handle: True,
+    )
+    with pytest.raises(process_registry.OwnerConflictError) as excinfo:
+        broker.acquire_exclusive(
+            "meridian-tunnel_client", "tunnel-wrapper:/repo", 222, create_time=2.0,
+        )
+    assert excinfo.value.client == "meridian-tunnel_client"
+    assert excinfo.value.owner_key == "tunnel-wrapper:/repo"
+    assert excinfo.value.lease.run_id == first.run_id
+    # The conflicting attempt must NOT have registered — only the original
+    # live lease is still on file.
+    assert [l.run_id for l in broker.list_leases(client="meridian-tunnel_client")] == [first.run_id]
+
+
+def test_acquire_exclusive_replaces_a_stale_wrapper_without_raising(broker, monkeypatch):
+    """The recorded prior lease's process is verified NO LONGER alive (dead,
+    or the OS reused its pid) — this is the 'old wrapper remained alive'
+    incident's mirror image: here the old wrapper is confirmed gone, so the
+    new one must silently take over, not conflict."""
+    stale = broker.acquire_exclusive(
+        "meridian-tunnel_client", "tunnel-wrapper:/repo", 111, create_time=1.0,
+    )
+    monkeypatch.setattr(
+        process_registry._process_lifecycle, "verify_handle_live", lambda handle: False,
+    )
+    fresh = broker.acquire_exclusive(
+        "meridian-tunnel_client", "tunnel-wrapper:/repo", 222, create_time=2.0,
+    )
+    assert fresh.pid == 222
+    assert fresh.owner_key == "tunnel-wrapper:/repo"
+    # The stale lease was released (auto-replaced), not left dangling.
+    live_ids = {l.run_id for l in broker.list_leases(client="meridian-tunnel_client")}
+    assert live_ids == {fresh.run_id}
+    assert stale.run_id not in live_ids
+
+
+def test_acquire_exclusive_force_takes_over_a_live_owner_without_killing_it(broker, monkeypatch):
+    """force=True explicitly authorizes takeover of a genuinely live prior
+    owner. The broker only ever marks the old lease released — verified here
+    by asserting no process-killing hook of any kind was invoked (there is
+    none to invoke; this broker never kills anything, by design)."""
+    first = broker.acquire_exclusive(
+        "meridian-tunnel_client", "tunnel-wrapper:/repo", 111, create_time=1.0,
+    )
+    monkeypatch.setattr(
+        process_registry._process_lifecycle, "verify_handle_live", lambda handle: True,
+    )
+    second = broker.acquire_exclusive(
+        "meridian-tunnel_client", "tunnel-wrapper:/repo", 222, create_time=2.0, force=True,
+    )
+    assert second.pid == 222
+    live_ids = {l.run_id for l in broker.list_leases(client="meridian-tunnel_client")}
+    assert live_ids == {second.run_id}
+    assert first.run_id not in live_ids
+    # The superseded lease is retrievable as released, not vanished.
+    released_lookup = {
+        l.run_id: l for l in broker.list_leases(client="meridian-tunnel_client", include_released=True)
+    }
+    assert released_lookup[first.run_id].released is True
+
+
+def test_acquire_exclusive_different_owner_keys_never_conflict(broker, monkeypatch):
+    """Two DIFFERENT repos' wrappers (different owner_key) are legitimate
+    concurrent owners under the same client — never a conflict, even when
+    both are verified alive."""
+    monkeypatch.setattr(
+        process_registry._process_lifecycle, "verify_handle_live", lambda handle: True,
+    )
+    a = broker.acquire_exclusive("meridian-tunnel_client", "tunnel-wrapper:/repo-a", 111)
+    b = broker.acquire_exclusive("meridian-tunnel_client", "tunnel-wrapper:/repo-b", 222)
+    live_ids = {l.run_id for l in broker.list_leases(client="meridian-tunnel_client")}
+    assert live_ids == {a.run_id, b.run_id}
+
+
+def test_acquire_exclusive_different_clients_never_conflict(broker, monkeypatch):
+    """Two DIFFERENT clients (e.g. two independently-run tools) sharing the
+    same owner_key string are never compared against each other — exclusivity
+    is scoped to (client, owner_key), matching every other guardrail on this
+    broker (release/heartbeat/cleanup are all client-scoped too)."""
+    monkeypatch.setattr(
+        process_registry._process_lifecycle, "verify_handle_live", lambda handle: True,
+    )
+    a = broker.acquire_exclusive("meridian-tunnel_client", "tunnel-wrapper:/repo", 111)
+    b = broker.acquire_exclusive("codex", "tunnel-wrapper:/repo", 222)
+    assert a.client != b.client
+    assert broker.list_leases(client="meridian-tunnel_client")[0].run_id == a.run_id
+    assert broker.list_leases(client="codex")[0].run_id == b.run_id
+
+
+def test_acquire_exclusive_after_graceful_release_is_a_cold_start(broker):
+    """A lease that was explicitly released (normal shutdown) is gone from
+    the live set entirely — the next acquire_exclusive for the same
+    owner_key is a plain cold start, not a conflict or a stale-replacement,
+    and never even calls is_process_alive for the released lease."""
+    first = broker.acquire_exclusive("meridian-tunnel_client", "tunnel-wrapper:/repo", 111)
+    broker.release("meridian-tunnel_client", first.run_id)
+    second = broker.acquire_exclusive("meridian-tunnel_client", "tunnel-wrapper:/repo", 222)
+    assert second.pid == 222
+    live_ids = {l.run_id for l in broker.list_leases(client="meridian-tunnel_client")}
+    assert live_ids == {second.run_id}
+
+
+# ---------------------------------------------------------------------------
 # Multiple clients
 # ---------------------------------------------------------------------------
 

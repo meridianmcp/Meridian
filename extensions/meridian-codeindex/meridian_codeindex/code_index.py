@@ -1175,8 +1175,9 @@ class CodeIndex:
 
     def _row_to_hit(self, columns: list[str], row: tuple) -> dict[str, Any]:
         rec = dict(zip(columns, row))
+        chunk_id = rec.get("chunk_id")
         return {
-            "chunk_id": rec.get("chunk_id"),
+            "chunk_id": chunk_id,
             "path": rec.get("path"),
             "language": rec.get("language"),
             "kind": rec.get("kind"),
@@ -1184,6 +1185,28 @@ class CodeIndex:
             "line_start": rec.get("line_start"),
             "line_end": rec.get("line_end"),
             "content": rec.get("content"),
+            # -- shared BM25-first + Model2Vec retrieval contract (5044d8eb) --
+            # Additive-only fields conforming to the common hit schema shared
+            # across code/docs/outputs/planning search (see
+            # meridian.retrieval_contract.RETRIEVAL_HIT_FIELDS). This module
+            # is intentionally zero-Meridian-dependency (see the module
+            # docstring's "zero dependency on any host application"), so
+            # these are a plain dict literal here -- matching the contract's
+            # field NAMES/shape by convention, never importing
+            # meridian.retrieval_contract. Every existing flat key above is
+            # unchanged; nothing here removes or renames a field a caller
+            # may already depend on.
+            "id": chunk_id,
+            "source": "code_index",
+            "content_hash": rec.get("content_hash"),
+            "structure": {
+                "path": rec.get("path"),
+                "language": rec.get("language"),
+                "kind": rec.get("kind"),
+                "name": rec.get("name"),
+                "line_start": rec.get("line_start"),
+                "line_end": rec.get("line_end"),
+            },
         }
 
     def _bm25_search(
@@ -1191,7 +1214,7 @@ class CodeIndex:
     ) -> list[dict[str, Any]]:
         sql = (
             "SELECT chunk_id, path, language, kind, name, line_start, "
-            "line_end, content, "
+            "line_end, content, content_hash, "
             "fts_main_code_chunks.match_bm25(chunk_id, ?) AS bm25 "
             "FROM code_chunks"
         )
@@ -1209,6 +1232,34 @@ class CodeIndex:
                 continue
             hit = self._row_to_hit(columns, row)
             hit["bm25"] = float(bm25)
+            # -- shared retrieval contract score fields (5044d8eb) --
+            # This is the BM25-FIRST leg: lexical_score is the raw BM25
+            # score; semantic_score is None (no Model2Vec signal has run at
+            # this stage -- that's a caller-layered second-stage rerank over
+            # THIS leg's bounded candidate set, e.g.
+            # meridian.semantic_search.rank_confident, matching the item
+            # title "BM25-first plus Model2Vec second-stage"); fused_score
+            # falls back to the lexical score alone (mirrors
+            # meridian.semantic_search.score_confidence's own "no other
+            # signal -> fuse to whichever one score exists" rule). The
+            # existing VSS + Reciprocal-Rank-Fusion leg
+            # (_vss_search/_reciprocal_rank_fusion) is a DIFFERENT,
+            # independently-useful architecture -- a full ANN search fused
+            # by rank position, not a rerank of THIS leg's candidates -- and
+            # is deliberately left untouched here.
+            hit["lexical_score"] = hit["bm25"]
+            hit["semantic_score"] = None
+            hit["fused_score"] = hit["bm25"]
+            # BM25 has no partial/stale state of its own to track (see
+            # CodeIndex.get_convergence_state: "the BM25 leg alone has no
+            # partial/stale state to track") -- freshness here is always
+            # "current". codeindex does not track per-hit provenance yet
+            # (that is the "provenance-rich outputs" stage of this same
+            # staged rollout per the sprint item's own notes), so
+            # provenance_status is the explicit "not_tracked" sentinel,
+            # never a fabricated verdict.
+            hit["freshness"] = "current"
+            hit["provenance_status"] = "not_tracked"
             hits.append(hit)
         hits.sort(key=lambda h: h["bm25"], reverse=True)
         return hits
@@ -1223,7 +1274,7 @@ class CodeIndex:
         dim = self._vss_dim or len(qvec)
         sql = (
             "SELECT chunk_id, path, language, kind, name, line_start, "
-            "line_end, content, "
+            "line_end, content, content_hash, "
             f"array_cosine_distance(embedding, ?::FLOAT[{dim}]) AS dist "
             "FROM code_chunks WHERE embedding IS NOT NULL"
         )
