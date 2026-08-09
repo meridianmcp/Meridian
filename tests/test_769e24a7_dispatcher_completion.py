@@ -608,3 +608,331 @@ async def test_restart_fresh_dispatcher_has_no_phantom_capacity(db, project):
     enqueued_b = await disp_b.dispatch_once()
     assert len(enqueued_b) == 1  # full capacity available, unaffected by disp_a
     assert "i2" in disp_b._dispatched
+
+
+# ---------------------------------------------------------------------------
+# PID watchdog — REAL production code path (gap analysis: the watchdog is
+# an inline block inside meridian/server.py's `_auto_summary_loop` closure,
+# itself nested inside the `lifespan()` async context manager, so it cannot
+# be imported/called directly. test_process_death_releases_lease_via_
+# reconciliation above and test_core.py::test_watchdog_marks_dead_pid_
+# failed both only ever hand-copy the same three lines of watchdog logic
+# into the test body — neither drives the real closure, so the
+# dispatcher-wake wiring `getattr(app.state, "dispatcher", None);
+# _dispatcher.trigger()` the watchdog also owns has zero coverage against
+# real code. This section drives the REAL FastAPI lifespan with a short
+# MERIDIAN_AUTO_SUMMARY_INTERVAL so the nested closure actually ticks.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _watchdog_client(tmp_path, monkeypatch):
+    """A real FastAPI TestClient whose lifespan runs with a SHORT
+    ``MERIDIAN_AUTO_SUMMARY_INTERVAL`` so the real PID-watchdog block
+    inside meridian/server.py's ``_auto_summary_loop`` (nested inside the
+    ``lifespan()`` async context manager) actually ticks during a test
+    instead of waiting the production default of 600s.
+
+    Deliberately NOT ``tests/conftest.py``'s shared ``client`` fixture:
+    the interval env var must be set BEFORE ``TestClient``'s lifespan
+    startup runs, and that fixture is shared, unmodified, by hundreds of
+    other tests. Mirrors its SQLite branch, minus the schema-template
+    speed shortcut (irrelevant for the couple of tests using this one).
+    """
+    monkeypatch.setenv("MERIDIAN_DB", ":memory:")
+    monkeypatch.setenv("MERIDIAN_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_DEMO_DB_URL", "")
+    monkeypatch.setenv("MERIDIAN_SKIP_DEMO", "1")
+    monkeypatch.setenv("MERIDIAN_GOAL_MD", str(tmp_path / "GOAL.md"))
+    monkeypatch.setenv("MERIDIAN_MD_ROOT", str(tmp_path))
+    monkeypatch.setenv("MERIDIAN_AUTO_SUMMARY_INTERVAL", "0.2")
+
+    from fastapi.testclient import TestClient
+    import meridian.server as server_module
+
+    server_module._CONNECTED_SESSIONS.clear()
+    from meridian._deps import _reset_limiter_counts
+    _reset_limiter_counts()
+    from meridian.mcp.handler import _recent_commits_cache
+    _recent_commits_cache.clear()
+
+    with TestClient(server_module.app) as c:
+        yield c
+
+
+def test_real_lifespan_pid_watchdog_marks_dead_pid_failed_and_wakes_dispatcher(_watchdog_client):
+    """Closes the gap analysis's headline finding: drives the REAL lifespan
+    end-to-end (not a hand-copied simulation) with a genuine dead PID on an
+    in_progress task, and confirms a real tick of the nested watchdog
+    closure both (1) marks the task failed and (2) calls .trigger() on a
+    REAL (unstarted, never mocked) Dispatcher instance planted on
+    app.state.dispatcher — the actual mechanism connecting a PID-watchdog
+    detection to the dispatcher's own reconciliation loop in production."""
+    c = _watchdog_client
+    proj = c.post("/projects", json={"name": "watchdog-lifespan"}).json()
+    sess = c.post(
+        "/sessions/register", json={"project_id": proj["id"], "name": "s"}
+    ).json()
+    task = c.post(
+        "/tasks",
+        json={
+            "session_id": sess["id"], "project_id": proj["id"],
+            "description": "work", "status": "pending",
+        },
+    ).json()
+
+    dead_pid = 999999999
+
+    async def _set_up():
+        db = c.app.state.db
+        await db_module.update_task(db, task["id"], status="in_progress")
+        await db_module.update_task_worker_pid(db, task["id"], dead_pid)
+
+    asyncio.run(_set_up())
+
+    # Real, UNSTARTED Dispatcher (never .start() — no background loop, no
+    # worker spawning) planted exactly where the production watchdog looks
+    # for it. .trigger() below is the real production method under test.
+    disp = Dispatcher(c.app.state.db, proj["id"])
+    c.app.state.dispatcher = disp
+
+    async def _poll():
+        row = None
+        for _ in range(100):
+            await asyncio.sleep(0.1)
+            row = await db_module.get_task(c.app.state.db, task["id"])
+            if row and row["status"] == "failed" and disp._wake.is_set():
+                return row
+        return row
+
+    final = asyncio.run(_poll())
+
+    assert final is not None, "watchdog never observed the dead PID"
+    assert final["status"] == "failed"
+    assert str(dead_pid) in final["description"]
+    assert disp._wake.is_set(), (
+        "real watchdog dead-PID detection did not call "
+        "app.state.dispatcher.trigger()"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher.stop() / restart safety with a REAL active lease (gap
+# analysis: the closest existing tests — test_restart_fresh_dispatcher_
+# has_no_phantom_capacity above and its 869d6198 analog — construct two
+# independent Dispatcher instances back-to-back WITHOUT ever calling
+# .stop() on the first, which only proves two separate Python objects
+# don't share mutable state, not a real stop-then-restart sequence.)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_does_not_release_active_leases(db, project, session):
+    """stop() only ever cancels self._task (the polling run() loop) — it
+    has no visibility into or control over _active_leases, or any
+    in-flight _run_worker subprocess (those are separate, fire-and-forget
+    asyncio.create_task(...) coroutines spawned by enqueue_claude_task,
+    never tracked by the Dispatcher itself). Documented explicitly against
+    a REAL active lease and a genuinely started/stopped loop, so a future
+    "stop() should also drain leases" change can't silently regress
+    today's real behavior without a test noticing."""
+    task = await db_module.log_task(db, session, project, "work", "pending")
+    disp = Dispatcher(db, project)
+    disp.record_worker_lease("item-live", task=task)
+    assert "item-live" in disp._active_leases
+
+    disp.start()
+    await asyncio.sleep(0.05)  # let the loop task actually run at least once
+    await disp.stop()
+
+    assert disp._task is None
+    assert "item-live" in disp._active_leases  # stop() never touches leases
+
+
+@pytest.mark.asyncio
+async def test_stop_then_restart_orphaned_worker_completion_does_not_corrupt_new_instance_capacity(
+    db, project,
+):
+    """The real stop-then-restart sequence the gap analysis calls for: a
+    REAL subprocess worker is still genuinely running when .stop() is
+    called on the instance that dispatched it; a FRESH instance is then
+    constructed (simulating a process restart) and must have full
+    capacity, completely unaffected by the old, now-orphaned worker still
+    running in the background. The old worker is then allowed to actually
+    finish, proving its late completion cannot corrupt the new instance's
+    capacity accounting — structurally guaranteed because leases are
+    per-instance dicts, but exercised here end-to-end against real
+    dispatch_once()/stop()/_run_worker rather than asserted only in
+    prose."""
+    brief_worker = [sys.executable, "-c", "import time; time.sleep(0.6)"]
+    groups_old = [[{"id": "i1", "title": "I1", "resources": ["file:a"]}]]
+    spy_old = _RealEnqueueSpy(brief_worker, wait=False)
+    disp_old = Dispatcher(
+        db, project, enqueue_fn=spy_old, get_groups_fn=_groups_fn(groups_old), max_in_flight=1,
+    )
+
+    first = await disp_old.dispatch_once()
+    assert len(first) == 1
+    old_task_id = first[0]["id"]
+
+    # Wait for the real subprocess to genuinely be in flight so .stop()
+    # below happens WHILE a worker is running, not before it even starts.
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        row = await db_module.get_task(db, old_task_id)
+        if row and row["status"] == "in_progress":
+            break
+    else:
+        pytest.fail("old worker never reached in_progress")
+
+    assert "i1" in disp_old._active_leases
+
+    await disp_old.stop()
+    assert disp_old._task is None
+    # Confirmed above in isolation too: stop() never touched the lease.
+    assert "i1" in disp_old._active_leases
+
+    # "Restart": a fresh instance, same db/project, constructed WHILE the
+    # OLD worker subprocess is still genuinely running in the background.
+    groups_new = [[{"id": "i2", "title": "I2", "resources": ["file:b"]}]]
+    spy_new = _RealEnqueueSpy(_OK_WORKER, wait=True)
+    disp_new = Dispatcher(
+        db, project, enqueue_fn=spy_new, get_groups_fn=_groups_fn(groups_new), max_in_flight=1,
+    )
+    assert disp_new._active_leases == {}
+
+    second = await disp_new.dispatch_once()
+    assert len(second) == 1  # full capacity — unaffected by disp_old's still-running worker
+    assert set(disp_new._active_leases) == {"i2"}
+
+    # Let the OLD (abandoned) worker actually finish now.
+    for _ in range(100):
+        await asyncio.sleep(0.05)
+        row = await db_module.get_task(db, old_task_id)
+        if row and row["status"] == "done":
+            break
+    else:
+        pytest.fail("old (abandoned) worker never completed")
+
+    # The new instance's capacity accounting never knew "i1" existed, so
+    # there is nothing for the late completion to corrupt.
+    assert set(disp_new._active_leases) == {"i2"}
+    assert "i1" not in disp_new._active_leases
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed guarantee: an unexpected exception inside
+# meridian/enqueue.py::_run_worker's body (the in_progress write,
+# update_task_worker_pid, output decoding, or a terminal _finish call
+# itself) is now caught by the outer `except Exception` clause (alongside
+# the pre-existing `except asyncio.CancelledError`, which stays disjoint —
+# CancelledError is a BaseException subclass, not Exception, since Python
+# 3.8). The task_log row lands on `failed` via the same `_finish` write
+# path every other terminal branch uses, so
+# Dispatcher.reconcile_active_leases can observe it and free the lease —
+# satisfying this item's own hard requirement: "fail closed if any
+# completion path can leave active_leases permanently occupied." These
+# tests inject the exact same fault as before (a transient DB error from
+# `update_task_worker_pid`) against real, unmocked production code, and now
+# assert the CORRECTED (self-healing) outcome instead of the bug.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_worker_unhandled_exception_marks_task_failed_and_lease_reconcilable(
+    db, project, session, monkeypatch,
+):
+    """Unit-level proof: a real (unmocked) `_run_worker` call, with one of
+    its DB writes (`update_task_worker_pid`, the call immediately after the
+    in_progress write) raising an unexpected exception. The exception is
+    NOT `asyncio.CancelledError`, so it is caught by _run_worker's broad
+    `except Exception` clause rather than propagating out — the coroutine
+    returns normally, the task row lands on 'failed' with the error
+    recorded, and a real Dispatcher.reconcile_active_leases call can
+    observe that terminal status and free the lease."""
+    task = await db_module.log_task(db, session, project, "t", "pending")
+
+    async def _boom(db_, task_id, pid):
+        raise RuntimeError("simulated transient DB error")
+
+    monkeypatch.setattr(db_module, "update_task_worker_pid", _boom)
+
+    # No longer raises — the broad except swallows the injected fault and
+    # writes a terminal status instead.
+    await _run_worker(db, task["id"], "hello", _OK_WORKER, timeout=10)
+
+    healed = await db_module.get_task(db, task["id"])
+    assert healed["status"] == "failed"  # reached a real terminal status
+    assert "simulated transient DB error" in healed["description"]
+
+    disp = Dispatcher(db, project)
+    disp.record_worker_lease("item-healed", task=healed)
+
+    released = await disp.reconcile_active_leases()
+    assert released == [
+        {"item_id": "item-healed", "task_id": task["id"], "status": "failed", "seq": 1}
+    ]
+    assert "item-healed" not in disp._active_leases  # released, not permanently occupied
+
+
+@pytest.mark.asyncio
+async def test_dispatch_once_unhandled_run_worker_exception_releases_active_lease(
+    db, project, monkeypatch,
+):
+    """Same fault injection, exercised through the REAL production entry
+    point: Dispatcher.dispatch_once() -> the real
+    enqueue_claude_task(wait=False) -> a real, fire-and-forget
+    asyncio.create_task(_run_worker(...)) — exactly how dispatch_once
+    always invokes it in production (it never passes wait=True). Because
+    _run_worker's broad `except Exception` now catches the injected fault
+    instead of letting it escape the background task unhandled, the task
+    row reaches 'failed' on its own, reconcile_active_leases can free the
+    lease, and dispatch_once can then reuse that freed capacity — proving
+    this failure mode is now self-healing under the ACTUAL fire-and-forget
+    shape production uses, not just a directly-awaited call."""
+    async def _boom(db_, task_id, pid):
+        raise RuntimeError("simulated transient DB error")
+
+    monkeypatch.setattr(db_module, "update_task_worker_pid", _boom)
+
+    groups = [[{"id": "i1", "title": "I1", "resources": ["file:a"]}]]
+    spy = _RealEnqueueSpy(_OK_WORKER, wait=False)
+    disp = Dispatcher(db, project, enqueue_fn=spy, get_groups_fn=_groups_fn(groups), max_in_flight=1)
+
+    enqueued = await disp.dispatch_once()
+    assert len(enqueued) == 1
+    assert "i1" in disp._active_leases
+    task_id = enqueued[0]["id"]
+
+    for _ in range(50):
+        await asyncio.sleep(0.05)
+        row = await db_module.get_task(db, task_id)
+        if row and row["status"] == "failed":
+            break
+    else:
+        pytest.fail("worker never reached failed status after the injected fault")
+
+    healed = await db_module.get_task(db, task_id)
+    assert healed["status"] == "failed"  # self-healed, not stuck at in_progress
+    assert "simulated transient DB error" in healed["description"]
+
+    # The dispatcher's own reconciliation is the mechanism that frees
+    # capacity in production — it now observes the terminal status.
+    released = await disp.reconcile_active_leases()
+    assert len(released) == 1
+    assert released[0]["item_id"] == "i1"
+    assert released[0]["status"] == "failed"
+    assert "i1" not in disp._active_leases  # released, not permanently occupied
+
+    # i1 itself is never re-dispatched (permanent dedup ledger — see
+    # test_item_never_redispatched_after_its_lease_is_released), so prove
+    # capacity was genuinely freed, not just that i1 was skipped, the same
+    # way test_capacity_reuse_after_real_worker_completes does: swap in a
+    # DIFFERENT item and confirm it now fits in the freed slot.
+    groups_round2 = [[{"id": "i2", "title": "I2", "resources": ["file:b"]}]]
+    disp._get_groups = _groups_fn(groups_round2)
+    second = await disp.dispatch_once()
+    assert len(second) == 1  # capacity was freed: a new dispatch can fill this slot
+    assert "i2" in disp._active_leases
+    assert "i1" not in disp._active_leases
