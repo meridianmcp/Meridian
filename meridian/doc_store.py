@@ -76,6 +76,7 @@ synchronous and unit-testable without opening a database.
 """
 from __future__ import annotations
 
+import asyncio
 import difflib
 import io
 import itertools
@@ -4869,6 +4870,20 @@ def resolve_doc_store_target(
 # url_or_path — distinct tenants/pg urls and the local sidecar never collide.
 _doc_store_cache: dict[str, DocStructureStore] = {}
 
+# Per-target provisioning lock — closes the SAME check-then-act race
+# _deps._open_tenant_db_by_id had (confirmed live in production: orphaned
+# AsyncConnectionPool instances leaking up to 10 Postgres connections each,
+# "Task was destroyed but it is pending!" in server logs, pool counter
+# climbing over days). Without this, two concurrent open_doc_store_for()
+# calls for the SAME not-yet-cached target (a tenant's Postgres URL, for
+# pro/admin plans) both pass the cache-miss check below, both reach
+# `await db_module.init_db(target)`, and each opens its own connection/pool.
+# Whichever finishes last wins the cache write; the other is orphaned with
+# no reference anywhere and never closed. Mirrors the fix already applied to
+# _deps._tenant_db_cache and the pre-existing pattern in
+# routes/tunnel.py's _tunnel_mcp_session_locks.
+_doc_store_locks: dict[str, asyncio.Lock] = {}
+
 
 def _reset_doc_store_cache() -> None:
     """Clear the module-level store cache WITHOUT closing (used by tests)."""
@@ -4916,10 +4931,21 @@ async def open_doc_store_for(
     if cached is not None:
         return cached
 
-    from . import db as db_module  # local import: avoid import cycle at module load
+    lock = _doc_store_locks.get(target)
+    if lock is None:
+        lock = asyncio.Lock()
+        _doc_store_locks[target] = lock
+    async with lock:
+        # Double-checked: another waiter may have already provisioned this
+        # target's store while we were blocked on the lock above.
+        cached = _doc_store_cache.get(target)
+        if cached is not None:
+            return cached
 
-    conn = await db_module.init_db(target)
-    store = DocStructureStore(conn)
-    await store.ensure_schema()
-    _doc_store_cache[target] = store
-    return store
+        from . import db as db_module  # local import: avoid import cycle at module load
+
+        conn = await db_module.init_db(target)
+        store = DocStructureStore(conn)
+        await store.ensure_schema()
+        _doc_store_cache[target] = store
+        return store

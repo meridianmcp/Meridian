@@ -8,6 +8,7 @@ Do NOT import from meridian.server here.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import logging
@@ -172,6 +173,24 @@ _DEMO_CONTEXT_COOKIE = "meridian_demo"
 
 _tenant_db_cache: dict[str, Any] = {}
 
+# Per-tenant provisioning lock (confirmed production bug, matches the
+# already-established fix pattern in routes/tunnel.py's
+# _tunnel_mcp_session_locks). Without this, two concurrent requests for the
+# SAME not-yet-cached tenant_id both pass the "if tenant_id in
+# _tenant_db_cache" check below, both reach `await init_pg_db(url)`, and each
+# opens its OWN AsyncConnectionPool (up to 10 live Postgres connections).
+# Whichever finishes last wins the cache write; the other pool is left with
+# no reference anywhere — never closed, its background worker tasks
+# eventually garbage-collected mid-flight. Confirmed live in production
+# server logs: "Task was destroyed but it is pending!" for
+# AsyncConnectionPool.worker, with the pool's internal instance counter
+# climbing (pool-2 through pool-5+) over days, each leaked pool holding up
+# to 10 orphaned Postgres connections. A per-tenant_id lock serializes the
+# check-and-populate section so only ONE request ever provisions a given
+# tenant's pool; every concurrent waiter blocks on the lock and then hits
+# the now-populated cache instead of racing to create its own.
+_tenant_db_locks: dict[str, asyncio.Lock] = {}
+
 
 async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
     """Return the cached DB for tenant_id, opening it if not yet cached.
@@ -182,57 +201,67 @@ async def _open_tenant_db_by_id(request: Request, tenant_id: str) -> Any:
     """
     if tenant_id in _tenant_db_cache:
         return _tenant_db_cache[tenant_id]
-    from . import db as db_module
-    from .pg_adapter import init_pg_db
-    auth_db = request.app.state.db
-    tenant = await db_module.get_tenant_by_id(auth_db, tenant_id)
-    if not tenant:
-        raise HTTPException(status_code=401, detail="tenant not found")
 
-    url: str | None = None
-    if tenant.get("neon_db_url"):
-        from .tenant_crypto import decrypt_tenant_db_url  # noqa: PLC0415
-        try:
-            # Dual-read: per-tenant ("v2:") or legacy global key, transparently.
-            url = decrypt_tenant_db_url(tenant_id, tenant["neon_db_url"]) or None
-        except Exception:
-            _log.warning("Failed to decrypt neon_db_url for tenant %s", tenant_id)
-            url = None
-    # MERIDIAN_AUTH_DB is the admin's project DB — only admin-plan tenants may use it.
-    if not url and tenant.get("plan") == "admin":
-        url = os.environ.get("MERIDIAN_AUTH_DB") or None
-    if not url:
-        # Fallback: admin accounts without a dedicated Neon DB use the auth DB directly.
-        if tenant.get("plan") == "admin":
-            conn = auth_db
-            _tenant_db_cache[tenant_id] = conn
-            return conn
-        raise HTTPException(
-            status_code=503,
-            detail="tenant database not provisioned - please wait or contact support",
-        )
-    # 894f7645 — provisioning can race the first request (the DB URL is written
-    # but Postgres isn't accepting connections yet). Retry a few times before
-    # surfacing the 503 so a freshly-provisioned tenant doesn't hard-fail.
-    import asyncio  # noqa: PLC0415
-    conn = None
-    for _attempt in range(3):
-        try:
-            conn = await init_pg_db(url)
-            break
-        except Exception as exc:  # noqa: BLE001
-            if _attempt == 2:
-                _log.warning(
-                    "tenant %s DB init failed after %d attempts: %s",
-                    tenant_id, _attempt + 1, exc,
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail="tenant database is provisioning — please retry in a moment",
-                )
-            await asyncio.sleep(0.5 * (_attempt + 1))
-    _tenant_db_cache[tenant_id] = conn
-    return conn
+    lock = _tenant_db_locks.get(tenant_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _tenant_db_locks[tenant_id] = lock
+    async with lock:
+        # Double-checked: another waiter may have already provisioned this
+        # tenant's DB while we were blocked on the lock above.
+        if tenant_id in _tenant_db_cache:
+            return _tenant_db_cache[tenant_id]
+
+        from . import db as db_module
+        from .pg_adapter import init_pg_db
+        auth_db = request.app.state.db
+        tenant = await db_module.get_tenant_by_id(auth_db, tenant_id)
+        if not tenant:
+            raise HTTPException(status_code=401, detail="tenant not found")
+
+        url: str | None = None
+        if tenant.get("neon_db_url"):
+            from .tenant_crypto import decrypt_tenant_db_url  # noqa: PLC0415
+            try:
+                # Dual-read: per-tenant ("v2:") or legacy global key, transparently.
+                url = decrypt_tenant_db_url(tenant_id, tenant["neon_db_url"]) or None
+            except Exception:
+                _log.warning("Failed to decrypt neon_db_url for tenant %s", tenant_id)
+                url = None
+        # MERIDIAN_AUTH_DB is the admin's project DB — only admin-plan tenants may use it.
+        if not url and tenant.get("plan") == "admin":
+            url = os.environ.get("MERIDIAN_AUTH_DB") or None
+        if not url:
+            # Fallback: admin accounts without a dedicated Neon DB use the auth DB directly.
+            if tenant.get("plan") == "admin":
+                conn = auth_db
+                _tenant_db_cache[tenant_id] = conn
+                return conn
+            raise HTTPException(
+                status_code=503,
+                detail="tenant database not provisioned - please wait or contact support",
+            )
+        # 894f7645 — provisioning can race the first request (the DB URL is written
+        # but Postgres isn't accepting connections yet). Retry a few times before
+        # surfacing the 503 so a freshly-provisioned tenant doesn't hard-fail.
+        conn = None
+        for _attempt in range(3):
+            try:
+                conn = await init_pg_db(url)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if _attempt == 2:
+                    _log.warning(
+                        "tenant %s DB init failed after %d attempts: %s",
+                        tenant_id, _attempt + 1, exc,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail="tenant database is provisioning — please retry in a moment",
+                    )
+                await asyncio.sleep(0.5 * (_attempt + 1))
+        _tenant_db_cache[tenant_id] = conn
+        return conn
 
 
 # ---------------------------------------------------------------------------

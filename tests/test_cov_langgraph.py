@@ -130,6 +130,50 @@ def test_ensure_session_cached_returns_early_without_http(monkeypatch):
     assert _run(cp._ensure_session()) == "already-here"
 
 
+def test_ensure_session_concurrent_calls_register_exactly_once(monkeypatch):
+    """Regression: two concurrent _ensure_session() calls on the SAME
+    checkpointer instance (e.g. two LangGraph nodes logging around the same
+    time) must not both register a session.
+
+    Before the lock fix, the check ("if self._session_id: return") and the
+    write ("self._session_id = resp.json()['id']") were separated by an
+    `await http.post(...)` with nothing serializing concurrent callers —
+    two callers racing a cold session both registered, and the loser's
+    session_id was silently discarded, leaving an orphaned session row with
+    no reference anywhere to clean it up. Same class of bug as
+    _deps._open_tenant_db_by_id / doc_store.open_doc_store_for.
+    """
+    call_count = {"n": 0}
+
+    async def _slow_post(url, headers=None, json=None):
+        call_count["n"] += 1
+        await asyncio.sleep(0.02)
+        return _MockResponse(json_body={"id": f"sess-{call_count['n']}"})
+
+    class _SlowMockClient(_MockClient):
+        async def post(self, url, headers=None, json=None):
+            self.requests.append({"url": url, "headers": headers or {}, "json": json or {}})
+            return await _slow_post(url, headers, json)
+
+    from meridian.integrations import langgraph as lg
+
+    requests: list[dict] = []
+    monkeypatch.setattr(lg.httpx, "AsyncClient", lambda *a, **k: _SlowMockClient(None, requests))
+
+    cp = MeridianCheckpointer(project_id="pid", api_url="http://x", api_token="tok")
+
+    async def _run_both():
+        return await asyncio.gather(cp._ensure_session(), cp._ensure_session())
+
+    sid1, sid2 = _run(_run_both())
+
+    assert call_count["n"] == 1, (
+        "two concurrent _ensure_session() calls must register exactly once, "
+        "not race to register two sessions"
+    )
+    assert sid1 == sid2 == cp._session_id
+
+
 def test_ensure_session_raises_for_status_on_error(monkeypatch):
     """Line 73 — raise_for_status propagates an HTTP error from register."""
     def handler(url, headers, json):
