@@ -219,3 +219,105 @@ This gives the next session a head-start on knowing which items conflict with wh
 ### Cross-machine awareness
 
 The hosted tier stores file locks in Neon Postgres, so awareness is global — a lock claimed by a Claude Code session on your laptop is visible to a Codex session on a CI runner or another machine. Self-hosted installs achieve the same if all instances share one `MERIDIAN_DB_URL`.
+
+---
+
+## Profile layers (executor/tool configuration)
+
+Meridian resolves executor-facing settings (HITL auto-answer, merge approval,
+tool priority, capability manifests, etc.) through a **layered profile
+contract** — five scopes, least to most specific:
+
+```
+hosted_default → workspace → user → project → session
+```
+
+A more-specific layer overrides a less-specific one field-by-field. This
+generalizes the plain per-project `ProjectSettings` you may already know
+(`max_pinned_decisions`, `hitl_auto_answer`, `auto_worktrees`,
+`require_merge_approval`, `code_intel_enabled`, `execution_mode`, and the
+`executor_config.*` sub-fields) — those 7 fields keep working exactly as
+before and simply become the **project** layer's contribution. Three fields
+are genuinely new to the profile system: `tool_priority_map`,
+`capability_manifest_ref`, and `claim_verification_mode`.
+
+| Layer | scope_id | Typical use |
+|-------|----------|-------------|
+| `hosted_default` | `"global"` (or an admin-chosen id) | Org-wide baseline. The one layer with a **lifecycle**: `draft → active → deprecated → retired`. Only `active`/`deprecated` are live at resolve time — a `draft` hosted_default is authored but not yet in effect. |
+| `workspace` | `"singleton"` (self-hosted default) | Tenant-wide defaults across every project. |
+| `user` | a human/user id | Per-person preferences. |
+| `project` | the project id | Per-project overrides. The 7 legacy fields above still flow through `update_project_settings`; only the 3 new fields are stored as a `profile_layers` row here. |
+| `session` | the session id | Per-run overrides — narrowest scope, highest precedence. |
+
+### Managing a layer
+
+Use the `list_profile_layers` / `get_profile_layer` / `save_profile_layer` /
+`clone_profile_layer` / `activate_profile_layer` / `reset_profile_layer` /
+`get_profile_layer_revisions` MCP tools (also exposed as REST under
+`/profile-layers/...` — see [`api-reference.md`](api-reference.md)), or call
+`get_effective_profile` to see the fully merged result for a project.
+
+```
+save_profile_layer(scope_type="workspace", scope_id="singleton",
+                    fields={"tool_priority_map": {"docs": "meridian-docs"}})
+clone_profile_layer(source_scope_type="hosted_default", source_scope_id="global",
+                     target_scope_type="hosted_default", target_scope_id="global-v2")
+activate_profile_layer(scope_id="global-v2")   # hosted_default only: draft -> active
+reset_profile_layer(scope_type="session", scope_id="session-uuid")  # delete a layer's row entirely
+get_profile_layer_revisions(scope_id="global", limit=10)  # hosted_default audit trail (rollback visibility)
+```
+
+`save_profile_layer` **wholesale-replaces** a scope's stored fields (it is
+not a merge) and supports optimistic concurrency via `expected_revision`: a
+stale write is rejected with a structured `STALE_REVISION` error (or HTTP
+409 over REST) instead of silently clobbering a concurrent change.
+
+### Safety rails
+
+* **Prohibited values.** No layer may ever store a secret-shaped string
+  (API keys, tokens, passwords, connection strings with credentials) or a
+  machine-local absolute path (outside the one field — `executor_config.*`
+  at `project`/`session` — that's explicitly allowed to carry one). Rejected
+  at write time, never silently dropped.
+* **Narrow-only safety dials.** A handful of fields (`hitl_auto_answer`,
+  `require_merge_approval`, `executor_config.test_min`,
+  `claim_verification_mode`) can only be tightened by a more-specific layer,
+  never loosened, without an explicit `override_reason`. This is what stops
+  a compromised or careless session-scoped override from silently
+  re-enabling unattended HITL auto-answers that a hosted default or
+  workspace policy deliberately turned off.
+* **Restart/refresh signals.** Every resolved profile reports
+  `restart_required` and a per-component `restart_report`
+  (`tunnel`/`connector`/`capability`/`general`) so a client knows when a
+  changed field needs more than a hot-reload (e.g. changing
+  `executor_config.repo_path` requires a restart; most fields don't).
+* **Zero-impact rollout.** A project that has never touched any
+  `profile_layers` row resolves exactly as it did before this subsystem
+  existed — `get_effective_profile`, `start_session`, `generate_handoff`,
+  the tunnel/connector routes, and the `batch_read` profile adapter all
+  degrade to sensible legacy defaults (`executable: true`, `degraded:
+  false`) rather than erroring.
+
+### Optional: Redis read-through cache
+
+When `MERIDIAN_REDIS_URL` is configured (see
+[Optional: Redis push augmentation](#optional-redis-push-augmentation)
+above), profile/effective-profile/capability-manifest/tool-manifest/handoff
+projections can be served through a content-addressed read-through cache
+(`meridian/profile_cache.py`) instead of re-resolving from Postgres on every
+read. The cache key embeds the resolution's `generation_key`, so a write is
+automatically a cache-miss-inducing new key — there is no separate
+invalidation ledger to keep in sync. Redis is **never** authoritative for
+anything in the profile system (Postgres/SQLite always is) and a Redis
+outage or per-tenant command-budget exhaustion falls back to a direct
+database read automatically, with no user-visible error.
+
+!!! note "What's measured vs. what isn't"
+    This project's own test suite (`tests/test_profile_contract_matrix.py`)
+    proves the cache's hit/miss/stale/outage behavior and measures exact
+    authority-call counts against a real local database, using an in-memory
+    fake Redis client — that is genuine, reproducible, local verification.
+    It does **not** measure hit-rate or latency against a real production
+    Redis or Neon deployment; treat any specific "X% fewer database calls"
+    figure as scenario-specific measured evidence, not a general guarantee
+    for your deployment's traffic pattern.
