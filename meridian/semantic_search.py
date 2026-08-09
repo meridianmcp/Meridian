@@ -38,6 +38,12 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from meridian.retrieval_contract import (
+    FRESHNESS_DEGRADED,
+    PROVENANCE_NOT_TRACKED,
+    build_retrieval_hit,
+)
+
 if TYPE_CHECKING:  # pragma: no cover - typing only, never imported at runtime
     import numpy as np
 
@@ -392,6 +398,62 @@ def score_confidence(
             reason=reason,
         ))
     return matches
+
+
+# ---------------------------------------------------------------------------
+# Bridge into the shared BM25-first + Model2Vec retrieval contract
+# (5044d8eb, meridian.retrieval_contract). Pure, DB-free — converts a
+# SemanticMatch (this module's existing typed match result) into the common
+# hit-schema dict shared with codeindex/docs/outputs. Does NOT change
+# meridian.db.search_all's own response shape — search_all keeps its
+# existing {tasks, notes, decisions, sprint_items} wire format; this is the
+# reusable building block a future incremental wiring pass would call, kept
+# separately testable in the meantime (see the sprint item's own "start
+# with codeindex, then docs, then outputs" staged rollout — Meridian
+# planning-record wiring end-to-end is intentionally left for that
+# follow-up rather than changing a widely-consumed MCP response shape here).
+# ---------------------------------------------------------------------------
+
+
+def retrieval_hit_from_semantic_match(
+    match: SemanticMatch,
+    *,
+    source: str,
+    structure: "dict[str, object] | None" = None,
+    content_hash: "str | None" = None,
+    freshness: str | None = None,
+    provenance_status: "str | None" = PROVENANCE_NOT_TRACKED,
+) -> "dict[str, object]":
+    """Project a :class:`SemanticMatch` into the shared retrieval-contract hit shape.
+
+    ``source`` identifies which corpus the match came from (e.g. ``"tasks"``,
+    ``"notes"``, ``"sprint_items"`` — mirrors ``search_all``'s own
+    ``match_type`` values). ``match.fused_score`` (already computed by
+    :func:`score_confidence` using the SAME lexical/semantic weights as
+    :func:`meridian.retrieval_contract.fuse_scores`) is passed through
+    verbatim rather than recomputed, so the two callers can never disagree
+    about a given match's fused score. ``freshness`` defaults to
+    :data:`meridian.retrieval_contract.FRESHNESS_DEGRADED` — every real
+    :class:`SemanticMatch` carries a non-optional ``semantic_score``, i.e. it
+    was produced by an actual embed/rank pass, which (per this module's own
+    design — see :func:`is_corpus_capped`) only ever ranks a BOUNDED,
+    capped corpus window and must never be read as an exhaustive answer.
+    Pass ``freshness=FRESHNESS_CURRENT`` explicitly if a caller can prove
+    otherwise for its own corpus.
+    """
+    if freshness is None:
+        freshness = FRESHNESS_DEGRADED
+    return build_retrieval_hit(
+        source=source,
+        id=match.id,
+        lexical_score=match.lexical_score,
+        semantic_score=match.semantic_score,
+        fused_score=match.fused_score,
+        structure=structure,
+        content_hash=content_hash,
+        freshness=freshness,
+        provenance_status=provenance_status,
+    )
 
 
 # ---------------------------------------------------------------------------

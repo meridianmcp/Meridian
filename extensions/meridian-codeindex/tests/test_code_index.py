@@ -305,6 +305,67 @@ def test_reindex_writes_chunks_and_bm25_search_finds_them(tmp_path):
         idx.close()
 
 
+def test_bm25_search_hits_conform_to_shared_retrieval_contract(tmp_path):
+    """5044d8eb — CodeIndex._bm25_search's hits carry the additive fields
+    matching the shared BM25-first + Model2Vec retrieval hit schema (see
+    meridian.retrieval_contract.RETRIEVAL_HIT_FIELDS in the parent repo --
+    this package stays zero-Meridian-dependency, so it conforms by field
+    NAME/shape only, never by importing that module). Every EXISTING flat
+    field (chunk_id/path/language/kind/name/line_start/line_end/content/
+    bm25) must still be present too -- purely additive."""
+    _write(tmp_path / "svc.py", _SAMPLE_PY)
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        idx.reindex()
+        hits = idx.search("parse_token")
+        assert hits
+        top = hits[0]
+        # Pre-existing fields untouched.
+        for legacy_field in (
+            "chunk_id", "path", "language", "kind", "name",
+            "line_start", "line_end", "content", "bm25",
+        ):
+            assert legacy_field in top
+
+        # New shared-contract fields.
+        assert top["id"] == top["chunk_id"]
+        assert top["source"] == "code_index"
+        assert top["lexical_score"] == pytest.approx(top["bm25"])
+        assert top["semantic_score"] is None
+        assert top["fused_score"] == pytest.approx(top["bm25"])
+        assert top["freshness"] == "current"
+        assert top["provenance_status"] == "not_tracked"
+        # content_hash is a real sha256 hex digest already computed by
+        # CodeChunk.__post_init__ -- not a placeholder.
+        assert isinstance(top["content_hash"], str) and len(top["content_hash"]) == 64
+        # structure carries the same values as the legacy flat fields.
+        assert top["structure"]["path"] == top["path"]
+        assert top["structure"]["kind"] == top["kind"]
+        assert top["structure"]["name"] == top["name"]
+        assert top["structure"]["line_start"] == top["line_start"]
+        assert top["structure"]["line_end"] == top["line_end"]
+    finally:
+        idx.close()
+
+
+def test_bm25_search_content_hash_matches_chunk_content_hash(tmp_path):
+    """The hit's content_hash is the SAME sha256 CodeChunk.__post_init__
+    computed at chunk time -- not independently recomputed (and therefore
+    can never silently disagree with it)."""
+    _write(tmp_path / "svc.py", _SAMPLE_PY)
+    idx = ci.CodeIndex(str(tmp_path))
+    try:
+        idx.reindex()
+        chunks = ci.chunk_file(str(tmp_path / "svc.py"), _SAMPLE_PY)
+        by_name = {c.name: c for c in chunks}
+
+        hits = idx.search("parse_token")
+        top = next(h for h in hits if h["name"] == "parse_token")
+        assert top["content_hash"] == by_name["parse_token"].content_hash
+    finally:
+        idx.close()
+
+
 def test_bm25_finds_term_only_in_unnamed_block(tmp_path):
     """A term that appears ONLY in a bare module-level call is findable — the
     gap a named-symbols-only index leaves."""

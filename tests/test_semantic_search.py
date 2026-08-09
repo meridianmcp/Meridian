@@ -1017,6 +1017,94 @@ def test_rank_confident_empty_when_rank_unavailable(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# retrieval_hit_from_semantic_match — bridge into the shared BM25-first plus
+# Model2Vec retrieval contract (5044d8eb, meridian.retrieval_contract).
+# ---------------------------------------------------------------------------
+
+
+def test_retrieval_hit_from_semantic_match_matches_schema_fields():
+    from meridian.retrieval_contract import RETRIEVAL_HIT_FIELDS
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="task-1", lexical_score=0.5, semantic_score=0.9, fused_score=0.66,
+        threshold=0.37, margin=0.1, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(match, source="tasks")
+    assert set(hit.keys()) == set(RETRIEVAL_HIT_FIELDS)
+
+
+def test_retrieval_hit_from_semantic_match_passes_scores_through_verbatim():
+    """The match's own fused_score (already computed by score_confidence with
+    the SAME weights as retrieval_contract.fuse_scores) must be carried
+    through unchanged, never silently recomputed."""
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="note-1", lexical_score=0.2, semantic_score=0.8, fused_score=0.44,
+        threshold=0.37, margin=0.05, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(match, source="notes")
+    assert hit["id"] == "note-1"
+    assert hit["lexical_score"] == pytest.approx(0.2)
+    assert hit["semantic_score"] == pytest.approx(0.8)
+    assert hit["fused_score"] == pytest.approx(0.44)
+    assert hit["source"] == "notes"
+
+
+def test_retrieval_hit_from_semantic_match_defaults_to_degraded_freshness():
+    """A SemanticMatch always came from a real embed/rank pass over a
+    bounded, capped corpus window — it must never be labeled "current"
+    (exhaustive) by default."""
+    from meridian.retrieval_contract import FRESHNESS_DEGRADED
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="x", lexical_score=None, semantic_score=0.5, fused_score=0.5,
+        threshold=0.37, margin=0.5, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(match, source="sprint_items")
+    assert hit["freshness"] == FRESHNESS_DEGRADED
+
+
+def test_retrieval_hit_from_semantic_match_freshness_override_respected():
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="x", lexical_score=None, semantic_score=0.5, fused_score=0.5,
+        threshold=0.37, margin=0.5, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(match, source="sprint_items", freshness="current")
+    assert hit["freshness"] == "current"
+
+
+def test_retrieval_hit_from_semantic_match_carries_structure_and_content_hash():
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="dec-1", lexical_score=0.4, semantic_score=0.6, fused_score=0.48,
+        threshold=0.37, margin=0.2, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(
+        match, source="decisions", structure={"category": "TECHNICAL"}, content_hash="deadbeef",
+    )
+    assert hit["structure"] == {"category": "TECHNICAL"}
+    assert hit["content_hash"] == "deadbeef"
+
+
+def test_retrieval_hit_from_semantic_match_no_provenance_by_default():
+    from meridian.retrieval_contract import PROVENANCE_NOT_TRACKED
+    from meridian.semantic_search import retrieval_hit_from_semantic_match
+
+    match = SemanticMatch(
+        id="x", lexical_score=None, semantic_score=0.5, fused_score=0.5,
+        threshold=0.37, margin=0.5, confident=True, reason="confident_match",
+    )
+    hit = retrieval_hit_from_semantic_match(match, source="tasks")
+    assert hit["provenance_status"] == PROVENANCE_NOT_TRACKED
+
+
+# ---------------------------------------------------------------------------
 # _maybe_semantic_escalate wiring — direct calls with a mocked rank(), on the
 # default SQLite ``db`` fixture. _maybe_semantic_escalate's own SQL helpers
 # (_pure_fts_count_and_trigram_top, _semantic_candidate_corpus) already fail
