@@ -2764,6 +2764,12 @@ async def _handle_project_tools(
     ``meridian.mcp.handlers.project_tools``.  This is a PURELY MECHANICAL
     extraction: zero behaviour change, same tool names, same arguments, same
     return values.
+
+    0bec79a7 (PROFILE-5) additionally wires list_profile_layers,
+    get_profile_layer, save_profile_layer, clone_profile_layer,
+    activate_profile_layer, reset_profile_layer,
+    get_profile_layer_revisions, get_effective_profile — the MCP surface
+    over meridian.db.profile_layers.
     """
     from .handlers.project_tools import (  # noqa: PLC0415
         handle_create_project,
@@ -2786,6 +2792,14 @@ async def _handle_project_tools(
         handle_set_capability_profile,
         handle_clear_capability_profile,
         handle_get_effective_capability_profile,
+        handle_list_profile_layers,
+        handle_get_profile_layer,
+        handle_save_profile_layer,
+        handle_clone_profile_layer,
+        handle_activate_profile_layer,
+        handle_reset_profile_layer,
+        handle_get_profile_layer_revisions,
+        handle_get_effective_profile,
     )
 
     # Tools that need no extra context beyond the standard five parameters.
@@ -2809,6 +2823,14 @@ async def _handle_project_tools(
         "set_capability_profile": handle_set_capability_profile,
         "clear_capability_profile": handle_clear_capability_profile,
         "get_effective_capability_profile": handle_get_effective_capability_profile,
+        "list_profile_layers": handle_list_profile_layers,
+        "get_profile_layer": handle_get_profile_layer,
+        "save_profile_layer": handle_save_profile_layer,
+        "clone_profile_layer": handle_clone_profile_layer,
+        "activate_profile_layer": handle_activate_profile_layer,
+        "reset_profile_layer": handle_reset_profile_layer,
+        "get_profile_layer_revisions": handle_get_profile_layer_revisions,
+        "get_effective_profile": handle_get_effective_profile,
     }
 
     if name in _standard_dispatch:
