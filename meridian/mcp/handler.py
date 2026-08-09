@@ -3123,6 +3123,21 @@ async def _handle_task_tools(
                 "selection_rejected": exc.rejected,
                 "message": str(exc),
             }
+        except handoff_module_local.HandoffScopeNonExecutable as exc:
+            # fb82e51f — selected_item_ids validated cleanly (every id
+            # genuinely pending/in-project/in-version) but every requested id
+            # was independently excluded from the claimable batch by a
+            # separate structural gate (no prospecting evidence, backburner,
+            # manual, or wave-gate pending). Nothing was rendered/written/
+            # persisted for this call — fail CLOSED instead of returning a
+            # handoff that declares a scope with zero executable items in it.
+            return {
+                "error": "HANDOFF_SCOPE_NON_EXECUTABLE",
+                "project_id": args["project_id"],
+                "requested_ids": exc.requested_ids,
+                "excluded_requested": exc.excluded,
+                "message": str(exc),
+            }
         except handoff_module_local.HandoffContinuationRequired as exc:
             # ecc8b280 — strict_continuation=True, this call is NOT
             # checkpoint=True, and actionable pending/in_progress items

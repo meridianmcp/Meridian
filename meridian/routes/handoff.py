@@ -191,6 +191,22 @@ async def generate_handoff_endpoint(
                 "message": str(exc),
             },
         ) from exc
+    except handoff_module.HandoffScopeNonExecutable as exc:
+        # fb82e51f — selected_item_ids validated cleanly but every requested
+        # id was independently excluded from the claimable batch (no
+        # prospecting evidence, backburner, manual, or wave-gate pending):
+        # fail CLOSED rather than persist a handoff that renders successfully
+        # yet has zero executable items for its own declared scope.
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "HANDOFF_SCOPE_NON_EXECUTABLE",
+                "project_id": project_id,
+                "requested_ids": exc.requested_ids,
+                "excluded_requested": exc.excluded,
+                "message": str(exc),
+            },
+        ) from exc
     except handoff_module.HandoffContinuationRequired as exc:
         # ecc8b280 — strict_continuation=True, not checkpoint=True, and
         # actionable work remains: fail CLOSED, mirroring the MCP HTTP

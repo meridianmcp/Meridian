@@ -2853,6 +2853,7 @@ def _build_quick_start_goal(
     execution_policy: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
     selected_scope: "dict[str, Any] | None" = None,
+    selected_scope_outcome: "dict[str, Any] | None" = None,
     full_contract_max_items: "int | None" = None,
     project_id: "str | None" = None,
     project_name: "str | None" = None,
@@ -2891,6 +2892,22 @@ def _build_quick_start_goal(
     mode narrows its own item list BEFORE calling this function), so this
     parameter only controls the DECLARATION rendered alongside whatever items
     were already passed in.
+
+    ``selected_scope_outcome`` (fb82e51f) — optional output dict, same
+    purely-additive out-param shape as ``evidence_status``: when given (any
+    dict, typically ``{}``) AND ``selected_scope`` is also given, populated in
+    place with ``{"requested_ids", "executable_ids", "excluded_requested",
+    "all_excluded"}`` — computed AFTER every exclusion filter below
+    (manual/backburner/unprospected/wave-gate) has run, so it reflects
+    exactly which of the caller's originally-requested ids (not merely the
+    dependency-closure) survived into the rendered ``<sprint_items>`` batch.
+    ``excluded_requested`` carries a machine-readable reason per dropped id
+    (``unprospected``/``backburner``/``manual``/``wave_gate_pending``), and
+    ``all_excluded`` is True when NONE of the requested ids made it through —
+    the signal :class:`HandoffScopeNonExecutable` acts on (see its docstring
+    for the incident this closes). A caller that omits this argument, or
+    never passes ``selected_scope`` in the first place, sees zero functional
+    change to this function's return value.
 
     ``force_included_ids`` (0a65f5cc) — ids exempted from the
     backburner/deferred exclusion below (see ``_is_backburner_sprint_item``)
@@ -3079,6 +3096,13 @@ def _build_quick_start_goal(
     # capability_contract._resolve_pending_items_for_contract and
     # _build_tool_requirements_clause below.
     _all_pending_for_tool_requirements = list(pending_sprint_items)
+    # fb82e51f — track WHY each id ends up excluded from the claimable batch
+    # below, keyed by item id, first-writer-wins (an item is only ever
+    # dropped by the first exclusion filter it hits). Only consulted when
+    # selected_scope_outcome is populated at the very end of this function —
+    # see that out-param's docstring above; zero cost/behavior change for
+    # every caller that doesn't opt in.
+    _scope_exclusion_reason_by_id: dict[str, str] = {}
     # 3a02041a — split MANUAL/human items out of the executable list so they are
     # never named under the "claim and execute" directive; they're surfaced
     # separately as the maintainer's own todo (no completion-pressure language).
@@ -3086,6 +3110,9 @@ def _build_quick_start_goal(
     pending_sprint_items = [
         it for it in pending_sprint_items if not _is_manual_sprint_item(it)
     ]
+    for _it in _manual_items:
+        if _it.get("id"):
+            _scope_exclusion_reason_by_id.setdefault(_it["id"], "manual")
     _manual_note = _build_manual_todo_note(_manual_items)
     # 0a65f5cc — same treatment for track=='backburner'/deferred_until items:
     # keep them out of the claimable batch instead of silently letting them
@@ -3100,6 +3127,9 @@ def _build_quick_start_goal(
         it for it in pending_sprint_items
         if it.get("id") in _force_included or not _is_backburner_sprint_item(it)
     ]
+    for _it in _backburner_items:
+        if _it.get("id"):
+            _scope_exclusion_reason_by_id.setdefault(_it["id"], "backburner")
     _backburner_note = _build_backburner_todo_note(_backburner_items)
     # 94c26322/d5849a67 — STRUCTURAL PROSPECTING GATE: an item that DECLARED
     # real code-touching resources (touches_resources) but has no durable
@@ -3148,6 +3178,9 @@ def _build_quick_start_goal(
         else:
             _excluded_unprospected.append(_it)
     pending_sprint_items = _included_sprint_items
+    for _it in _excluded_unprospected:
+        if _it.get("id"):
+            _scope_exclusion_reason_by_id.setdefault(_it["id"], "unprospected")
     # Build the structured exclusion note — empty string when nothing excluded.
     _excluded_unprospected_note = ""
     if _excluded_unprospected:
@@ -3197,6 +3230,9 @@ def _build_quick_start_goal(
             else:
                 _kept.append(_it)
         pending_sprint_items = _kept
+        for _it in _excluded_wave_gated:
+            if _it.get("id"):
+                _scope_exclusion_reason_by_id.setdefault(_it["id"], "wave_gate_pending")
     _excluded_wave_gate_note = ""
     if _excluded_wave_gated:
         _exc_ids = ", ".join(it["id"] for it in _excluded_wave_gated if it.get("id"))
@@ -3218,6 +3254,35 @@ def _build_quick_start_goal(
             "just this prose note. -->"
         )
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
+    # fb82e51f — record the selected-scope outcome now that every exclusion
+    # filter above (manual/backburner/unprospected/wave-gate) has run and
+    # `item_ids` reflects the FINAL claimable batch. See
+    # `selected_scope_outcome`'s own docstring above for the shape and the
+    # incident this closes; a no-op unless the caller opted into both
+    # `selected_scope` and `selected_scope_outcome`.
+    if selected_scope is not None:
+        _requested_scope_ids = list(selected_scope.get("selected_item_ids") or [])
+        _final_ids_set = set(item_ids)
+        _executable_requested_ids = [
+            rid for rid in _requested_scope_ids if rid in _final_ids_set
+        ]
+        _excluded_requested_ids = [
+            {
+                "id": rid,
+                "reason": _scope_exclusion_reason_by_id.get(rid, "not_in_pending_batch"),
+            }
+            for rid in _requested_scope_ids
+            if rid not in _final_ids_set
+        ]
+        if selected_scope_outcome is not None:
+            selected_scope_outcome.clear()
+            selected_scope_outcome.update({
+                "requested_ids": _requested_scope_ids,
+                "executable_ids": _executable_requested_ids,
+                "excluded_requested": _excluded_requested_ids,
+                "all_excluded": bool(_requested_scope_ids)
+                and not _executable_requested_ids,
+            })
     # 682005f4 — computed against the FINAL filtered pending_sprint_items (after
     # manual/backburner/unprospected/wave-gate exclusion above), so a pointer
     # line never appears for an item that was itself excluded from the batch.
@@ -7673,6 +7738,75 @@ class HandoffSelectionError(ValueError):
         )
 
 
+class HandoffScopeNonExecutable(ValueError):
+    """fb82e51f — raised by generate_handoff when a caller passed a VALID
+    ``selected_item_ids`` scope (every requested id passed
+    :func:`_resolve_selected_item_scope`'s own checks — it is genuinely
+    ``todo``/``pending``, in this project, in this version) but every one of
+    those requested ids was subsequently stripped back out of the claimable
+    batch by a SEPARATE structural gate this function does not override:
+    the unprospected-evidence gate, the backburner/deferred gate, the
+    manual-item split, or a pending wave gate boundary.
+
+    This is the 2026-07-27 gap :class:`HandoffSelectionError` does not close:
+    that error only fires for a *malformed* selection (unknown/foreign/
+    already-claimed/terminal id). A selection can be perfectly well-formed —
+    the item genuinely IS pending — and still end up with zero executable
+    items once ``_build_quick_start_goal``'s independent exclusion filters
+    run, because ``selected_item_ids`` narrows the CANDIDATE pool, it does
+    not exempt anything from those filters. Left unhandled, the caller gets a
+    handoff that renders, persists, and mints a token successfully, declares
+    ``<selected_item_scope requested="...">``, yet has NOTHING in
+    ``<sprint_items>`` for the requested id(s) — silently indistinguishable
+    from "the board is legitimately empty" to a receiving executor. That is
+    exactly the incident this sprint item records: a planner's intended item
+    was emitted only under ``<excluded_unprospected>``, the executable batch
+    was empty, and nothing marked the handoff as non-executable for its own
+    stated scope.
+
+    Fails CLOSED like its siblings (:class:`HandoffSelectionError`,
+    :class:`HandoffStaleReferenceError`): nothing is rendered, written to
+    disk, or persisted for a call that raises this — the check runs
+    immediately after ``_build_quick_start_goal`` returns, before
+    ``_mint_and_embed_goal_token``. A caller that never passes
+    ``selected_item_ids`` (every pre-existing call site) is unaffected; a
+    caller whose selection DOES yield at least one executable item is also
+    unaffected — this only fires when the requested scope collapses to zero.
+
+    ``excluded`` mirrors ``HandoffSelectionError.rejected``'s shape: each
+    entry is ``{"id": ..., "reason": ...}`` with ``reason`` one of
+    ``unprospected`` (no durable pointer evidence and no ``prospect_bypass``),
+    ``backburner`` (deferred/backburner track), ``manual`` (a human-owned
+    item, never part of the auto-run claimable batch), ``wave_gate_pending``
+    (blocked behind a configured-but-unpassed wave gate), or
+    ``not_in_pending_batch`` (present in the validated closure but absent
+    from the exclusion-tracked batch — a defensive fallback that should not
+    occur in practice).
+    """
+
+    def __init__(
+        self,
+        project_id: str,
+        requested_ids: list[str],
+        excluded: list[dict[str, Any]],
+    ):
+        self.project_id = project_id
+        self.requested_ids = list(requested_ids)
+        self.excluded = list(excluded)
+        self.code = "SELECTED_SCOPE_NON_EXECUTABLE"
+        detail = "; ".join(
+            f"{e.get('id')} ({e.get('reason')})" for e in excluded
+        )
+        super().__init__(
+            f"generate_handoff refused for project {project_id!r}: every "
+            f"requested selected_item_ids id was excluded from the "
+            f"executable batch by a separate structural gate — {detail}. "
+            "This handoff would have rendered with zero executable items "
+            "for its own declared scope; refusing rather than silently "
+            "presenting it as a normal executor handoff."
+        )
+
+
 def _finalize_capability_status(
     capability_status: dict[str, Any],
     evidence_status: "dict[str, Any] | None",
@@ -8410,6 +8544,12 @@ async def generate_handoff(
     _selected_scope = await _resolve_selected_item_scope(
         db, project_id, selected_item_ids, effective_version=_effective_version,
     )
+    # fb82e51f — out-param for _build_quick_start_goal's full/delta call below
+    # (the starter/goal-only modes compute their own inside their respective
+    # helper functions, which already receive _selected_scope as an
+    # argument). See HandoffScopeNonExecutable's docstring for the check this
+    # feeds.
+    _selected_scope_outcome: dict[str, Any] = {}
     # 2204ce80 — optional, additive "related planning records" lookup. Runs
     # only when the caller opted in on BOTH arguments; see the docstring above.
     if related_records_query is not None and related_records is not None:
@@ -8996,7 +9136,20 @@ async def generate_handoff(
         # durable pointer row exists but never actually resolved.
         strict_pointer_evidence=strict_pointer_evidence,
         selected_scope=_selected_scope,
+        selected_scope_outcome=_selected_scope_outcome,
     )
+    # fb82e51f — a selected_item_ids scope that validated cleanly (every id
+    # genuinely pending) can still collapse to zero executable items once the
+    # unprospected/backburner/manual/wave-gate filters above have run. Fail
+    # CLOSED here, same placement/contract as HandoffEvidenceRequired/
+    # HandoffContinuationRequired: BEFORE the token is minted or anything is
+    # written/persisted. See HandoffScopeNonExecutable's own docstring.
+    if _selected_scope and _selected_scope_outcome.get("all_excluded"):
+        raise HandoffScopeNonExecutable(
+            project_id,
+            _selected_scope_outcome.get("requested_ids") or [],
+            _selected_scope_outcome.get("excluded_requested") or [],
+        )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
     # _mint_and_embed_goal_token; 4611b9a2 also wires this into the
@@ -9700,6 +9853,10 @@ async def _generate_starter_handoff(
     _s_execution_mode = db_module.normalize_execution_mode(
         project.get("execution_mode")
     )
+    # fb82e51f — see HandoffScopeNonExecutable's docstring: a selected_scope
+    # that validated cleanly can still collapse to zero executable items once
+    # the exclusion filters below run.
+    _s_selected_scope_outcome: dict[str, Any] = {}
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=_s_execution_mode,
@@ -9728,6 +9885,7 @@ async def _generate_starter_handoff(
         execution_policy=_execution_policy_from_settings(settings, _s_execution_mode),
         strict_pointer_evidence=strict_pointer_evidence,
         selected_scope=selected_scope,
+        selected_scope_outcome=_s_selected_scope_outcome,
         # 248c0bb9 — starter/compact stays compact even on a large board: cap
         # the full per-item tool_requirements/sprint_item_pointers/
         # artifact_pointer_findings JSON instead of inlining the entire
@@ -9735,6 +9893,14 @@ async def _generate_starter_handoff(
         # full_contract_max_items docstring for the fetch-on-demand fallback.
         full_contract_max_items=_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
     )
+    # fb82e51f — fail CLOSED before the token is minted or anything is
+    # written/persisted. See HandoffScopeNonExecutable's own docstring.
+    if selected_scope and _s_selected_scope_outcome.get("all_excluded"):
+        raise HandoffScopeNonExecutable(
+            project_id,
+            _s_selected_scope_outcome.get("requested_ids") or [],
+            _s_selected_scope_outcome.get("excluded_requested") or [],
+        )
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the
     # full/delta path was the only caller of this shared helper). Mint one here
@@ -9997,6 +10163,10 @@ async def _generate_goal_only_handoff(
         _pointer_evidence_ids = None
 
     _g_execution_mode = db_module.normalize_execution_mode(project.get("execution_mode"))
+    # fb82e51f — see HandoffScopeNonExecutable's docstring: a selected_scope
+    # that validated cleanly can still collapse to zero executable items once
+    # the exclusion filters below run.
+    _g_selected_scope_outcome: dict[str, Any] = {}
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=_g_execution_mode,
@@ -10028,6 +10198,7 @@ async def _generate_goal_only_handoff(
         execution_policy=_execution_policy_from_settings(proj_settings, _g_execution_mode),
         strict_pointer_evidence=strict_pointer_evidence,
         selected_scope=selected_scope,
+        selected_scope_outcome=_g_selected_scope_outcome,
         # 248c0bb9 — goal-only mode stays a genuinely bounded executable block
         # even on a large board: same cap as starter/compact — see
         # _build_quick_start_goal's own full_contract_max_items docstring.
@@ -10042,6 +10213,14 @@ async def _generate_goal_only_handoff(
         project_id=project_id,
         project_name=project.get("name"),
     )
+    # fb82e51f — fail CLOSED before the token is minted or anything is
+    # written/persisted. See HandoffScopeNonExecutable's own docstring.
+    if selected_scope and _g_selected_scope_outcome.get("all_excluded"):
+        raise HandoffScopeNonExecutable(
+            project_id,
+            _g_selected_scope_outcome.get("requested_ids") or [],
+            _g_selected_scope_outcome.get("excluded_requested") or [],
+        )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.
     quick_start_goal = await _mint_and_embed_goal_token(db, project_id, quick_start_goal)
