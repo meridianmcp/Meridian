@@ -199,7 +199,7 @@ async def set_profile_layer(
     scope_id = _pc.normalize_scope_id(scope_id)
     fields = dict(fields or {})
     reset_fields = _pc.normalize_reset_fields(reset_fields)
-    _pc.validate_layer_fields(scope_type, fields)
+    _pc.validate_layer_fields(scope_type, fields, reset_fields=reset_fields)
     normalized_provenance = _pc.normalize_provenance(provenance)
 
     current = await get_profile_layer(db, scope_type, scope_id)
@@ -448,6 +448,39 @@ async def get_effective_profile(
     (tool_priority_map/capability_manifest_ref/claim_verification_mode) come
     from the real profile_layers row at scope_type="project" — see module
     docstring.
+
+    EXECUTABLE/DEGRADED STATUS (folded in from profile_resolution.py's
+    EffectiveProfile.executable/degraded during the second PROFILE-RECON
+    re-verification pass, 732c113e): ``resolve_effective_profile`` itself
+    only ever sees a LIVE hosted_default layer (or none at all) — the
+    "skip a non-live hosted_default row entirely" filter above means it has
+    no way to distinguish "no hosted_default configured" from "a
+    draft/retired hosted_default exists but doesn't apply". This function
+    reads the raw ``hosted_row`` BEFORE that filter runs, so it computes
+    that half of the signal itself and folds it into the resolved dict:
+
+    * ``hosted_row["revision"] == 0`` (no row ever persisted for this
+      scope_id — the common case for a project that never configured a
+      hosted_default policy at all) contributes nothing; ``executable``/
+      ``degraded`` stay whatever resolve_effective_profile already decided
+      (True/False) from blocked_widens alone. This distinction matters
+      because ``get_profile_layer`` reports a virtual ``lifecycle_state="draft"``
+      for a scope_id with no row at all (see ``_empty_layer_dict``) — treating
+      that the same as a REAL admin-authored draft would incorrectly mark
+      every project that has simply never touched hosted_default as
+      "degraded".
+    * A REAL row (``revision > 0``) with ``lifecycle_state="retired"`` marks
+      the resolution NOT executable (``executable_reasons`` gets
+      ``"hosted_default_retired"``) and degraded.
+    * A REAL row with ``lifecycle_state`` in ``("draft", "deprecated")``
+      marks the resolution degraded but still executable
+      (``degraded_reasons`` gets ``"hosted_default_lifecycle_{state}"``) —
+      "deprecated" still applies its fields (see the live-states filter
+      above) but is flagged so a caller can surface the caveat;
+      "draft" never applies its fields at all, per the filter, but is still
+      flagged so a caller/admin can see a draft exists and hasn't been
+      published yet.
+    * ``lifecycle_state="active"`` contributes nothing (the normal case).
     """
     project = await get_project(db, project_id)
     if project is None:
@@ -489,4 +522,22 @@ async def get_effective_profile(
     result = effective.model_dump()
     result["project_id"] = project_id
     result["session_id"] = session_id
+
+    # hosted_default-lifecycle half of executable/degraded -- see docstring
+    # above. Only a REAL persisted row (revision > 0) counts; the virtual
+    # "draft" _empty_layer_dict reports for a never-configured scope_id must
+    # not make every ordinary project look degraded.
+    if hosted_row["revision"] > 0:
+        hosted_lifecycle = hosted_row["lifecycle_state"]
+        if hosted_lifecycle == "retired":
+            result["executable"] = False
+            result["executable_reasons"] = [*result["executable_reasons"], "hosted_default_retired"]
+            result["degraded"] = True
+            result["degraded_reasons"] = [*result["degraded_reasons"], "hosted_default_retired"]
+        elif hosted_lifecycle in ("draft", "deprecated"):
+            result["degraded"] = True
+            result["degraded_reasons"] = [
+                *result["degraded_reasons"], f"hosted_default_lifecycle_{hosted_lifecycle}",
+            ]
+
     return result

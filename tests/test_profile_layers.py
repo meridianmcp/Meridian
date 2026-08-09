@@ -762,3 +762,179 @@ async def test_profile_layer_cross_backend_parity(anydb):
     layer = await db_module.get_profile_layer(anydb, "hosted_default", "global")
     assert layer["revision"] == 2  # 1 (set_profile_layer) + 1 (activate)
     assert layer["lifecycle_state"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# executable/degraded status (folded in from profile_resolution.py's
+# EffectiveProfile.executable/degraded during the second PROFILE-RECON
+# re-verification pass, 732c113e -- ported from the deleted
+# tests/test_profile_resolution.py's test_retired_hosted_default_is_not_executable,
+# test_draft_hosted_default_is_degraded_but_executable, and
+# test_active_hosted_default_is_neither_degraded_nor_blocked. The
+# hosted_default-lifecycle half of the signal is computed in
+# get_effective_profile (not resolve_effective_profile -- see both
+# functions' docstrings for why), so these are DB-level tests here rather
+# than pure tests in test_profile_contract.py.)
+# ---------------------------------------------------------------------------
+
+async def test_get_effective_profile_no_hosted_default_row_is_not_degraded(db):
+    """A project that never configured a hosted_default at all must not be
+    reported as degraded merely because get_profile_layer's virtual empty
+    dict reports lifecycle_state='draft' for a scope_id with no real row."""
+    project = await db_module.create_project(db, "profile-no-hosted-row")
+    result = await db_module.get_effective_profile(db, project["id"])
+    assert result["executable"] is True
+    assert result["degraded"] is False
+    assert result["degraded_reasons"] == []
+
+
+async def test_get_effective_profile_retired_hosted_default_is_not_executable(db):
+    project = await db_module.create_project(db, "profile-retired-not-executable")
+    await db_module.set_profile_layer(db, "hosted_default", "global", fields={"tool_priority_map": {"a": "b"}})
+    await db_module.transition_hosted_default_lifecycle(db, "global", "retired")
+    result = await db_module.get_effective_profile(db, project["id"])
+    assert result["executable"] is False
+    assert "hosted_default_retired" in result["executable_reasons"]
+    assert result["degraded"] is True
+    assert "hosted_default_retired" in result["degraded_reasons"]
+    # the safety property from the original filter also still holds: a
+    # retired hosted_default's fields never enter the merged output.
+    assert "hosted_default" not in result["layers_applied"]
+    assert "tool_priority_map" not in result["fields"]
+
+
+async def test_get_effective_profile_draft_hosted_default_is_degraded_but_executable(db):
+    project = await db_module.create_project(db, "profile-draft-degraded")
+    await db_module.set_profile_layer(db, "hosted_default", "global", fields={"tool_priority_map": {"a": "b"}})
+    # left in draft -- never transitioned to active.
+    result = await db_module.get_effective_profile(db, project["id"])
+    assert result["executable"] is True
+    assert result["degraded"] is True
+    assert "hosted_default_lifecycle_draft" in result["degraded_reasons"]
+    assert "hosted_default" not in result["layers_applied"]
+
+
+async def test_get_effective_profile_deprecated_hosted_default_is_degraded_but_executable(db):
+    project = await db_module.create_project(db, "profile-deprecated-degraded")
+    await db_module.set_profile_layer(db, "hosted_default", "global", fields={"tool_priority_map": {"a": "b"}})
+    await db_module.transition_hosted_default_lifecycle(db, "global", "active")
+    await db_module.transition_hosted_default_lifecycle(db, "global", "deprecated")
+    result = await db_module.get_effective_profile(db, project["id"])
+    assert result["executable"] is True
+    assert result["degraded"] is True
+    assert "hosted_default_lifecycle_deprecated" in result["degraded_reasons"]
+    # deprecated is still live -- its fields DO apply, unlike draft/retired.
+    assert "hosted_default" in result["layers_applied"]
+    assert result["fields"]["tool_priority_map"] == {"a": "b"}
+
+
+async def test_get_effective_profile_active_hosted_default_is_neither_degraded_nor_blocked(db):
+    project = await db_module.create_project(db, "profile-active-clean")
+    await db_module.set_profile_layer(db, "hosted_default", "global", fields={"tool_priority_map": {"a": "b"}})
+    await db_module.transition_hosted_default_lifecycle(db, "global", "active")
+    result = await db_module.get_effective_profile(db, project["id"])
+    assert result["executable"] is True
+    assert result["degraded"] is False
+    assert result["degraded_reasons"] == []
+
+
+async def test_get_effective_profile_blocked_widen_alone_marks_degraded(db):
+    """The blocked_widens-driven half of the signal (computed by
+    resolve_effective_profile itself) surfaces through get_effective_profile
+    even with no hosted_default row at all. hitl_auto_answer is
+    legacy_source='project_settings' so it can't be declared at
+    scope_type='project' via set_profile_layer (the zero-duplication guard)
+    -- use hosted_default for the baseline declaration instead, same as
+    resolve_effective_profile's own narrow_only tests."""
+    project = await db_module.create_project(db, "profile-blocked-widen-degraded")
+    await db_module.set_profile_layer(db, "hosted_default", "global", fields={"hitl_auto_answer": 0})
+    await db_module.transition_hosted_default_lifecycle(db, "global", "active")
+    await db_module.set_profile_layer(db, "session", "sess-degrade", fields={"hitl_auto_answer": 2})
+    result = await db_module.get_effective_profile(db, project["id"], session_id="sess-degrade")
+    assert result["executable"] is True
+    assert result["degraded"] is True
+    assert "narrow_only_widen_blocked" in result["degraded_reasons"]
+
+
+# ---------------------------------------------------------------------------
+# reset_fields validation against FIELD_REGISTRY (folded in from
+# profile_resolution.py's validate_profile_layer during the second
+# PROFILE-RECON re-verification pass, 732c113e -- ported from the deleted
+# tests/test_profile_resolution.py's test_rejects_unknown_reset_field, which
+# had ZERO equivalent anywhere: reset_fields naming an unknown field
+# previously silently no-opped instead of raising.)
+# ---------------------------------------------------------------------------
+
+def test_validate_layer_fields_rejects_unknown_reset_field():
+    with pytest.raises(pc.ProfileContractError, match="reset_fields.*unknown profile field"):
+        pc.validate_layer_fields("project", {}, reset_fields=["totally_made_up_field"])
+
+
+def test_resolve_effective_profile_rejects_unknown_reset_field():
+    with pytest.raises(pc.ProfileContractError, match="reset_fields.*unknown profile field"):
+        pc.resolve_effective_profile([_layer("project", {}, reset_fields=["totally_made_up_field"], scope_id="p1")])
+
+
+async def test_set_profile_layer_rejects_unknown_reset_field(db):
+    with pytest.raises(pc.ProfileContractError, match="reset_fields"):
+        await db_module.set_profile_layer(db, "workspace", "singleton", reset_fields=["totally_made_up_field"])
+    fetched = await db_module.get_profile_layer(db, "workspace", "singleton")
+    assert fetched["reset_fields"] == []  # rejected write never persisted
+
+
+# ---------------------------------------------------------------------------
+# schema_version / lifecycle_state envelope checks (folded in from
+# profile_resolution.py's validate_profile_layer during the second
+# PROFILE-RECON re-verification pass, 732c113e -- ported from the deleted
+# tests/test_profile_resolution.py's test_rejects_unsupported_schema_version
+# and test_rejects_lifecycle_state_on_non_hosted_default_layer, both of
+# which had ZERO equivalent anywhere in profile_contract.py.)
+# ---------------------------------------------------------------------------
+
+def test_resolve_effective_profile_rejects_unsupported_schema_version():
+    layer = pc.ProfileLayer(
+        scope_type="project", scope_id="p1", schema_version=99, fields={"auto_worktrees": 0},
+    )
+    with pytest.raises(pc.ProfileContractError, match="unsupported profile schema_version"):
+        pc.resolve_effective_profile([layer])
+
+
+def test_resolve_effective_profile_rejects_lifecycle_state_on_non_hosted_default_layer():
+    layer = pc.ProfileLayer(
+        scope_type="project", scope_id="p1", lifecycle_state="active", fields={"auto_worktrees": 0},
+    )
+    with pytest.raises(pc.ProfileContractError, match="lifecycle_state is only valid"):
+        pc.resolve_effective_profile([layer])
+
+
+# ---------------------------------------------------------------------------
+# Additional lifecycle-transition matrix coverage (audit hardening, no
+# behavior change -- closes coverage gaps found while cross-checking every
+# name in the deleted tests/test_profile_resolution.py's parametrized
+# test_lifecycle_valid_transitions / test_lifecycle_invalid_transitions_rejected
+# / test_lifecycle_same_state_is_idempotent_noop against
+# transition_hosted_default_lifecycle, which already implements the same
+# LIFECYCLE_TRANSITIONS matrix but wasn't exercised at every cell.)
+# ---------------------------------------------------------------------------
+
+async def test_hosted_default_lifecycle_active_to_draft_rejected(db):
+    await db_module.set_profile_layer(db, "hosted_default", "global", fields={"max_pinned_decisions": 20})
+    await db_module.transition_hosted_default_lifecycle(db, "global", "active")
+    with pytest.raises(pc.ProfileContractError, match="cannot transition"):
+        await db_module.transition_hosted_default_lifecycle(db, "global", "draft")
+
+
+@pytest.mark.parametrize("state", ["draft", "active", "deprecated", "retired"])
+async def test_hosted_default_lifecycle_idempotent_for_every_state(db, state):
+    await db_module.set_profile_layer(db, "hosted_default", "global", fields={"max_pinned_decisions": 20})
+    # walk to `state` via valid transitions, then re-assert it -- must be a
+    # no-op (unchanged revision) regardless of which state it is.
+    path = {"draft": [], "active": ["active"], "deprecated": ["active", "deprecated"],
+            "retired": ["retired"]}[state]
+    reached = await db_module.get_profile_layer(db, "hosted_default", "global")
+    for step in path:
+        reached = await db_module.transition_hosted_default_lifecycle(db, "global", step)
+    before_revision = reached["revision"]
+    again = await db_module.transition_hosted_default_lifecycle(db, "global", state)
+    assert again["revision"] == before_revision
+    assert again["lifecycle_state"] == state
