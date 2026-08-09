@@ -3440,21 +3440,45 @@ def _build_quick_start_goal(
             # underlying conflict-free batches (never merged together).
             # Presentation only — see the note above; the real safety
             # mechanism is unchanged.
+            # a8c38d18 — the wave/batch numbers below are SCHEDULER GROUPING
+            # LABELS, not a serial execution barrier: get_parallelizable_groups'
+            # greedy first-fit coloring places an item in the earliest group it
+            # fits, so a later-numbered label does not mean "must wait for every
+            # earlier label to finish" — it only means that specific item
+            # conflicted with something already placed. claim_sprint_item (and
+            # claim_parallel_batch) atomically arbitrate every real symbol/file
+            # conflict at claim time, so the correct executor behavior is to
+            # dispatch the WHOLE eligible frontier — every item in every wave and
+            # batch below — concurrently, right now, and retry only the
+            # individual item(s) a claim call actually rejects for a live
+            # dependency/resource conflict.
             items_clause = (
-                f"Complete sprint items in {len(_wave_strs)} resource-conflict-free "
+                f"Complete sprint items across {len(_wave_strs)} resource-conflict-free "
                 f"macro-wave(s) (packed from {len(_pgroups)} conflict-free batches "
                 "for readability — presentation only, not a claim-safety change: "
                 "claim_sprint_item's resource-lock enforcement is unaffected) — "
-                "finish each macro-wave before the next; within a macro-wave, "
-                "finish each numbered batch before the next (a batch's items "
-                "touch disjoint resources and are parallel-safe, fan them out): "
+                "dispatch every item in every wave and batch below CONCURRENTLY, "
+                "right now: these labels are diagnostic groupings, NOT a serial "
+                "execution barrier. claim_sprint_item atomically arbitrates any "
+                "live symbol/file conflict at claim time; if a claim is rejected "
+                "for dependency/resource contention, retry only that one item — "
+                "never wait for an entire wave or batch to finish first: "
                 f"{'; '.join(_wave_strs)}{_left_txt}. "
             )
         else:
+            # a8c38d18 — same anti-barrier guidance as the macro-wave branch
+            # above, for the raw (uncompressed) batch listing: batch numbers are
+            # a resource-conflict-free grouping label, not a required completion
+            # order across batches.
             items_clause = (
-                "Complete sprint items in resource-conflict-free batches — the items "
-                "within a batch touch disjoint resources and are parallel-safe (fan "
-                "them out); finish a batch before starting the next: "
+                "Complete sprint items in resource-conflict-free batches — "
+                "dispatch every item in every batch below CONCURRENTLY, right "
+                "now: these batch numbers are diagnostic groupings (items within "
+                "a batch touch disjoint resources), NOT a serial execution "
+                "barrier. claim_sprint_item atomically arbitrates any live "
+                "symbol/file conflict at claim time; if a claim is rejected for "
+                "dependency/resource contention, retry only that one item — "
+                "never wait for an entire batch to finish first: "
                 f"{'; '.join(_batches)}{_left_txt}. "
             )
     elif len(waves) > 1 and goal_group_style == "waves":
