@@ -150,4 +150,5 @@
 - 2026-08-08 **session-with-tasks** — task one (+1 more)
 - 2026-08-08 **exec-1** — did A (+1 more)
 - 2026-08-09 **exec-1** — did A (+1 more)
+- 2026-08-09 **session-with-tasks** — task one (+1 more)
 <!-- MERIDIAN:ANCHOR:END:devlog -->
