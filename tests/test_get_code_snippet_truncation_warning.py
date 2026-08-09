@@ -150,6 +150,97 @@ def test_warning_just_past_slack_boundary():
 
 
 # --------------------------------------------------------------------------- #
+# 8c6d88c9 — short-function truncation blind spot (the "misselection" bug):
+# the flat _TRUNCATION_SLACK=2 absolute-line grace, applied unchanged to a
+# short declared range, let SEVERE (up to and including total) data loss pass
+# with no warning at all — because 2 lines is a huge fraction of a 2-or-3-line
+# function's total content. _effective_truncation_slack scales the allowed
+# slack down for short ranges while leaving long-function behavior (every
+# test above) unchanged. Short-function repro cases paired with a
+# long-function control below.
+# --------------------------------------------------------------------------- #
+
+def test_short_function_severe_truncation_now_detected():
+    """Repro: a 3-line function control returned with only 1 actual line
+    (2 of 3 lines missing — the exact same ABSOLUTE 2-line gap that the flat
+    slack used to treat as within tolerance) must now be flagged."""
+    result = _snippet_result({
+        "start_line": 10,
+        "end_line": 12,  # 3 lines expected
+        "source": _make_source(1),
+    })
+    out = tunnel._check_code_snippet_truncation(result)
+    assert "truncation_warning" in out
+    warning = out["truncation_warning"]
+    assert "3" in warning
+    assert "1" in warning
+
+
+def test_short_function_totally_empty_source_now_detected():
+    """Repro: a 2-line function returned with a completely empty source field
+    (100% missing) must be flagged — previously the diff (2) was never
+    strictly greater than the flat slack (2), so this silently passed."""
+    result = _snippet_result({
+        "start_line": 5,
+        "end_line": 6,  # 2 lines expected
+        "source": "",
+    })
+    out = tunnel._check_code_snippet_truncation(result)
+    assert "truncation_warning" in out
+
+
+def test_short_function_off_by_one_still_tolerated():
+    """A short function that is only 1 line short (plausible missing-
+    trailing-newline artifact, not real truncation) must still NOT warn —
+    the proportional cap must not make short-function detection trigger-
+    happy on the exact case _TRUNCATION_SLACK exists to tolerate."""
+    result = _snippet_result({
+        "start_line": 1,
+        "end_line": 4,  # 4 lines expected
+        "source": _make_source(3),  # 1 line short
+    })
+    out = tunnel._check_code_snippet_truncation(result)
+    assert "truncation_warning" not in out
+
+
+def test_long_function_control_unaffected_by_proportional_cap():
+    """Control: the long-function case this module already covers (114 vs 70
+    lines) must warn exactly as before — the proportional cap only tightens
+    behavior for short ranges, it must never loosen it for long ones."""
+    result = _snippet_result({
+        "start_line": 5372,
+        "end_line": 5485,  # 114 lines expected
+        "source": _make_source(70),
+    })
+    out = tunnel._check_code_snippet_truncation(result)
+    assert "truncation_warning" in out
+    warning = out["truncation_warning"]
+    assert "114" in warning
+    assert "70" in warning
+
+
+def test_effective_truncation_slack_matches_flat_constant_for_long_ranges():
+    """Direct unit check on the helper: for any range long enough that the
+    flat constant was already small relative to it (>= 5 lines), the
+    effective slack must equal the unmodified _TRUNCATION_SLACK exactly —
+    guards against a future change silently tightening long-function
+    tolerance as a side effect of the short-function fix."""
+    assert tunnel._effective_truncation_slack(5) == tunnel._TRUNCATION_SLACK
+    assert tunnel._effective_truncation_slack(50) == tunnel._TRUNCATION_SLACK
+    assert tunnel._effective_truncation_slack(114) == tunnel._TRUNCATION_SLACK
+
+
+def test_effective_truncation_slack_shrinks_for_short_ranges():
+    """Direct unit check: the effective slack is strictly smaller than the
+    flat constant once the declared range is short enough for the flat
+    constant to dominate it."""
+    assert tunnel._effective_truncation_slack(1) == 0
+    assert tunnel._effective_truncation_slack(2) == 0
+    assert tunnel._effective_truncation_slack(3) == 1
+    assert tunnel._effective_truncation_slack(4) == 1
+
+
+# --------------------------------------------------------------------------- #
 # _check_code_snippet_truncation — fail-open: no exception, no false warning
 # --------------------------------------------------------------------------- #
 
@@ -276,6 +367,46 @@ async def test_call_tunnel_tool_attaches_truncation_warning(monkeypatch):
     assert "truncated" in warning.lower()
     assert "114" in warning
     assert "70" in warning
+
+
+@pytest.mark.asyncio
+async def test_call_tunnel_tool_attaches_warning_for_short_function(monkeypatch):
+    """8c6d88c9 end-to-end: a short function's severely-truncated response
+    (0 of 2 declared lines returned) gets the warning attached through the
+    real call_tunnel_tool path, not just the pure helper — closes the gap
+    the flat slack left open for small declared ranges."""
+    tenant = "tenant-snippet-short"
+    tool = "codebase__get_code_snippet"
+
+    tunnel._tunnel_tool_routes[tenant] = {tool: "code"}
+    tunnel._tunnel_code_sockets[tenant] = object()  # sentinel; never awaited
+
+    snippet_payload = {
+        "start_line": 5,
+        "end_line": 6,  # 2 lines expected
+        "source": "",   # 0 lines returned — totally empty
+    }
+
+    async def _fake_jsonrpc(tenant_id, label, method, params, repo_path=None):
+        assert method == "tools/call"
+        return {
+            "result": {
+                "content": [{"type": "text", "text": json.dumps(snippet_payload)}]
+            }
+        }
+
+    monkeypatch.setattr(tunnel, "_tunnel_jsonrpc", _fake_jsonrpc)
+
+    try:
+        result = await tunnel.call_tunnel_tool(
+            tenant, tool, {"project_id": "my-repo", "qualified_name": "tiny_getter"}
+        )
+    finally:
+        tunnel._tunnel_tool_routes.pop(tenant, None)
+        tunnel._tunnel_code_sockets.pop(tenant, None)
+
+    assert result is not None
+    assert "truncation_warning" in result
 
 
 @pytest.mark.asyncio

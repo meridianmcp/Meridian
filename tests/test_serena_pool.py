@@ -257,6 +257,57 @@ def test_daemon_for_does_not_spawn(tmp_path):
     assert pool.daemon_for(str(tmp_path)) is not None
 
 
+# ── 8c6d88c9: active-project identity across default_repo_path drift ───────
+
+def test_get_or_spawn_identity_unaffected_by_unrelated_default_drift(tmp_path):
+    """get_or_spawn is keyed purely off its explicit repo_path argument, so
+    mutating pool.default_repo_path (what a set_active_repo project-switch
+    control message does — see tunnel_client._run_extract_pool_connection)
+    must never change which daemon an already-in-flight, explicitly-repo'd
+    request is routed to."""
+    pool, procs, _ = _pool()
+    a = tmp_path / "a"; a.mkdir()
+    b = tmp_path / "b"; b.mkdir()
+
+    da_before = pool.get_or_spawn(str(a))
+
+    # Project switch: default flips to repo B (mirrors the set_active_repo
+    # control-message handler in tunnel_client.py).
+    pool.default_repo_path = pool._normalize(str(b))
+
+    # A caller still explicitly asking for repo A (e.g. a request resolved
+    # against a per-request X-Meridian-Repo-Path header before the switch)
+    # must get back the SAME daemon — identity survives the drift.
+    da_after = pool.get_or_spawn(str(a))
+    assert da_after is da_before
+    assert len(procs) == 1  # no duplicate spawned for A just because default moved
+
+
+def test_diagnostics_receipt_correctly_attributed_after_repo_switch(tmp_path):
+    """After spawning daemons for two repos and switching the pool's active
+    default between them, diagnostics() — the durable per-daemon record other
+    code treats as a receipt of what's registered — must still attribute
+    each entry's repo_path/port/pid to the correct repo, never swapped or
+    merged across the switch."""
+    pool, procs, _ = _pool()
+    a = tmp_path / "a"; a.mkdir()
+    b = tmp_path / "b"; b.mkdir()
+
+    da = pool.get_or_spawn(str(a))
+    pool.default_repo_path = pool._normalize(str(b))  # project switch
+    db = pool.get_or_spawn(str(b))
+
+    diag = {entry["repo_path"]: entry for entry in pool.diagnostics()}
+    assert set(diag) == {da.repo_path, db.repo_path}
+    assert diag[da.repo_path]["port"] == da.port
+    assert diag[da.repo_path]["pid"] == da.pid
+    assert diag[db.repo_path]["port"] == db.port
+    assert diag[db.repo_path]["pid"] == db.pid
+    # The two entries must never collide — distinct ports/pids per identity.
+    assert diag[da.repo_path]["port"] != diag[db.repo_path]["port"]
+    assert diag[da.repo_path]["pid"] != diag[db.repo_path]["pid"]
+
+
 # ── structured launch/terminate diagnostics (e99b09e9) ──────────────────────
 
 def test_get_or_spawn_on_launch_reports_new_spawn(tmp_path, monkeypatch):
