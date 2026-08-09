@@ -71,6 +71,8 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "get_workspace_proposals": 'get_workspace_proposals(status="investigating")',
     "advance_proposal_status": 'advance_proposal_status(proposal_id="prop-uuid", status="investigating")',
     "promote_proposal": 'promote_proposal(proposal_id="prop-uuid", project_id="proj-uuid", sprint_item_title="Expose auth as plugin")',
+    "preview_proposal_promotion": 'preview_proposal_promotion(proposal_id="prop-uuid", project_id="proj-uuid", depth="sprint_items")',
+    "commit_proposal_promotion": 'commit_proposal_promotion(proposal_id="prop-uuid", project_id="proj-uuid", depth="sprint_items", preview_hash="sha256:...")',
     "pin_workspace_decision": 'pin_workspace_decision(title="Monorepo", body="One repo for all services", category="ARCHITECTURAL")',
     "get_workspace_decisions": 'get_workspace_decisions()',
     "get_workspace_settings": 'get_workspace_settings()',
@@ -1895,6 +1897,70 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "sprint_item_title": {"type": "string", "description": "Override title for the sprint item; defaults to the proposal title."},
          "sprint_item_version": {"type": "string", "description": "Sprint version for the new item; defaults to 'current'."}},
          "required": ["proposal_id"]}},
+    {"name": "preview_proposal_promotion", "description":
+        "Read-only (ce4883f3): preview what commit_proposal_promotion would do for a proposal at "
+        "a given depth, WITHOUT writing anything. Depths are cumulative, shallow to deep: "
+        "'proposal' (intake/scope only) -> 'investigation' (+ raw->investigating transition) -> "
+        "'pointers' (+ pointer recording) -> 'sprint_items' (+ promote_workspace_proposal) -> "
+        "'executable_handoff' (+ a handoff scoped to the new sprint item). Returns "
+        "{proposal_id, project_id, depth, already_satisfied, contract_status, would_create, "
+        "wave_preview, preview_hash, computed_at}. 'already_satisfied'=true when the proposal's "
+        "current status already reaches this depth (e.g. already 'promoted' and depth='sprint_items') "
+        "— no-op, nothing further to preview. Otherwise 'contract_status' reports each of the 8 "
+        "proposal-to-execution contract parts as present/would_create/optional_at_commit/not_applicable; "
+        "'would_create' shows the synthetic sprint-item preview (title/version/touches_resources) once "
+        "depth>='sprint_items'; 'wave_preview' shows which existing parallel-safe group the item would "
+        "join or conflict with (via get_parallelizable_groups, unmodified). Pass the returned "
+        "'preview_hash' to commit_proposal_promotion — a stale hash (proposal or board changed since) "
+        "is rejected rather than silently committed.",
+     "inputSchema": {"type": "object", "properties": {
+         "proposal_id": {"type": "string"},
+         "project_id": {"type": "string", "description": "Target project — where the sprint item would land."},
+         "project_name": {"type": "string", "description": "Project name — alternative to project_id; resolved to the id internally."},
+         "depth": {"type": "string", "enum": ["proposal", "investigation", "pointers", "sprint_items", "executable_handoff"],
+                   "description": "How far to preview promoting, cumulative over every shallower depth."},
+         "sprint_item_title": {"type": "string", "description": "Override title for the would-be sprint item; defaults to the proposal title."},
+         "sprint_item_version": {"type": "string", "description": "Sprint version for the would-be item; defaults to 'current'."},
+         "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Explicit resource ids for the would-be sprint item; overrides inference."},
+         "infer_touches_resources": {"type": "boolean", "description": "Infer touches_resources from the proposal's title/body via recent git history when touches_resources is omitted. Default true."}},
+         "required": ["proposal_id", "depth"]}},
+    {"name": "commit_proposal_promotion", "description":
+        "Commit a proposal's promotion through 'depth' (ce4883f3), cumulative over every shallower "
+        "depth. Requires 'preview_hash' from a just-called preview_proposal_promotion with the SAME "
+        "arguments — a mismatch (proposal or target project's board changed since) is rejected rather "
+        "than silently committed against stale information, and nothing is written. Committing an "
+        "already-satisfied depth is an idempotent no-op success (matches the preview's "
+        "already_satisfied=true case). A genuine lost race against a concurrent caller (caught by the "
+        "underlying race-safe functions) is reported honestly as a failure with a "
+        "'deviation_auto_resolved' audit trail — never silently retried or swallowed. When the promoted "
+        "sprint item's resources or the proposal's own text match one of 3 narrow deviation heuristics "
+        "(production_deployment / tenant_security_boundary / destructive_behavior), this files a durable "
+        "HITL via request_hitl and returns hitl_pending=true WITHOUT completing remaining steps — pass "
+        "a non-empty 'override_reason' to acknowledge and proceed anyway (audited). "
+        "'investigation_findings' and 'pointers' are recorded via append_proposal_update at the "
+        "matching depth; 'pointers' entries are validated via meridian.pointers.validate_pointer "
+        "(each needs source_type + a non-empty targets array of {uri, selector, target_kind?}). "
+        "depth='executable_handoff' calls generate_handoff(selected_item_ids=[the new/reused sprint "
+        "item id]) — scoped to exactly that item's dependency closure, with project/version/session "
+        "identity. Returns {proposal_id, project_id, depth, already_satisfied, committed, deviation, "
+        "hitl_pending, hitl_request_id}.",
+     "inputSchema": {"type": "object", "properties": {
+         "proposal_id": {"type": "string"},
+         "project_id": {"type": "string", "description": "Target project — where the sprint item lands."},
+         "project_name": {"type": "string", "description": "Project name — alternative to project_id; resolved to the id internally."},
+         "depth": {"type": "string", "enum": ["proposal", "investigation", "pointers", "sprint_items", "executable_handoff"],
+                   "description": "How far to commit promoting, cumulative over every shallower depth."},
+         "preview_hash": {"type": "string", "description": "The 'preview_hash' from a fresh preview_proposal_promotion call with the SAME arguments."},
+         "sprint_item_title": {"type": "string", "description": "Override title for the sprint item; defaults to the proposal title."},
+         "sprint_item_version": {"type": "string", "description": "Sprint version for the new item; defaults to 'current'."},
+         "touches_resources": {"type": "array", "items": {"type": "string"}, "description": "Explicit resource ids for the sprint item; overrides inference."},
+         "infer_touches_resources": {"type": "boolean", "description": "Infer touches_resources from the proposal's title/body via recent git history when touches_resources is omitted. Default true."},
+         "investigation_findings": {"type": "string", "description": "Investigation findings to record (depth>='investigation'); recorded via append_proposal_update."},
+         "pointers": {"type": "array", "items": {"type": "object"}, "description": "Pointer declarations to record (depth>='pointers'); each validated via meridian.pointers.validate_pointer ({source_type, targets: [{uri, selector, target_kind?}], label?})."},
+         "session_id": {"type": "string", "description": "Caller session id; threaded into recorded events and into the depth='executable_handoff' handoff."},
+         "actor": {"type": "string", "description": "Optional actor identity recorded on proposal events."},
+         "override_reason": {"type": "string", "description": "Non-empty reason to acknowledge and proceed past a triggered HITL deviation instead of stopping (audited)."}},
+         "required": ["proposal_id", "depth", "preview_hash"]}},
     {"name": "get_session_brief", "description":
         "Read-only: Call this FIRST for project summaries or to see what a session did — "
         "returns session, tasks, decisions, and recent commits in one call. "
@@ -3301,6 +3367,7 @@ _READ_ONLY_TOOLS = {
     "batch_read",
     "list_profile_layers", "get_profile_layer", "get_profile_layer_revisions",
     "get_effective_profile",
+    "preview_proposal_promotion",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
 
@@ -3449,6 +3516,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "get_workspace_proposals":         "workspace",
     "advance_proposal_status":         "workspace",
     "promote_proposal":                "workspace",
+    "preview_proposal_promotion":      "workspace",
+    "commit_proposal_promotion":       "workspace",
     "save_blog_post":                  "workspace",
     "get_blog_posts":                  "workspace",
     "update_md_section":               "workspace",
@@ -3592,6 +3661,8 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "get_workspace_proposals":   "planner",
     "advance_proposal_status":   "planner",
     "promote_proposal":          "planner",
+    "preview_proposal_promotion": "planner",
+    "commit_proposal_promotion": "planner",
     "update_md_section":         "planner",
     "save_blog_post":            "planner",
     "paper_search":              "planner",
