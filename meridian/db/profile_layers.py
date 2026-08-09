@@ -102,6 +102,39 @@ def _empty_layer_dict(scope_type: str, scope_id: str) -> dict[str, Any]:
     }
 
 
+def _decode_profile_layer_row(row: aiosqlite.Row) -> dict[str, Any]:
+    """Decode one ``profile_layers`` row into the dict shape
+    :func:`get_profile_layer` returns. Shared by :func:`get_profile_layer`
+    and :func:`list_profile_layers` (PROFILE-5, 0bec79a7) so the two never
+    drift on JSON-decode logic."""
+    data = _row_to_dict(row) or {}
+    try:
+        fields = json.loads(data.get("fields") or "{}")
+    except (TypeError, ValueError):
+        fields = {}
+    try:
+        reset_fields = json.loads(data.get("reset_fields") or "[]")
+    except (TypeError, ValueError):
+        reset_fields = []
+    raw_provenance = data.get("provenance")
+    try:
+        provenance = json.loads(raw_provenance) if raw_provenance else None
+    except (TypeError, ValueError):
+        provenance = None
+    return {
+        "scope_type": data.get("scope_type"),
+        "scope_id": data.get("scope_id"),
+        "schema_version": int(data.get("schema_version") or _pc.SCHEMA_VERSION),
+        "revision": int(data.get("revision") or 0),
+        "fields": fields,
+        "reset_fields": reset_fields,
+        "lifecycle_state": data.get("lifecycle_state"),
+        "content_hash": data.get("content_hash"),
+        "provenance": provenance,
+        "updated_at": data.get("updated_at"),
+    }
+
+
 async def get_profile_layer(db: aiosqlite.Connection, scope_type: str, scope_id: str) -> dict[str, Any]:
     """Return the raw, single-layer profile for one scope (d8481276).
 
@@ -121,32 +154,37 @@ async def get_profile_layer(db: aiosqlite.Connection, scope_type: str, scope_id:
         row = await cur.fetchone()
     if row is None:
         return _empty_layer_dict(scope_type, scope_id)
-    data = _row_to_dict(row) or {}
-    try:
-        fields = json.loads(data.get("fields") or "{}")
-    except (TypeError, ValueError):
-        fields = {}
-    try:
-        reset_fields = json.loads(data.get("reset_fields") or "[]")
-    except (TypeError, ValueError):
-        reset_fields = []
-    raw_provenance = data.get("provenance")
-    try:
-        provenance = json.loads(raw_provenance) if raw_provenance else None
-    except (TypeError, ValueError):
-        provenance = None
-    return {
-        "scope_type": scope_type,
-        "scope_id": scope_id,
-        "schema_version": int(data.get("schema_version") or _pc.SCHEMA_VERSION),
-        "revision": int(data.get("revision") or 0),
-        "fields": fields,
-        "reset_fields": reset_fields,
-        "lifecycle_state": data.get("lifecycle_state"),
-        "content_hash": data.get("content_hash"),
-        "provenance": provenance,
-        "updated_at": data.get("updated_at"),
-    }
+    return _decode_profile_layer_row(row)
+
+
+async def list_profile_layers(
+    db: aiosqlite.Connection, scope_type: str | None = None
+) -> list[dict[str, Any]]:
+    """Read-only enumeration of every persisted ``profile_layers`` row
+    (PROFILE-5, 0bec79a7), optionally narrowed to one ``scope_type`` —
+    validated via :func:`profile_contract.normalize_scope_type` the same way
+    every other scope_type-accepting function in this module validates it.
+
+    Ordered by ``(scope_type, scope_id)`` for deterministic output — this is
+    a raw listing, not a resolved/merged view; see :func:`get_effective_profile`
+    for the merged per-project result. Each entry is shaped exactly like
+    :func:`get_profile_layer`'s return dict. An empty table (or an empty
+    scope_type filter) returns ``[]``, never an error.
+    """
+    params: tuple[Any, ...] = ()
+    where_clause = ""
+    if scope_type is not None:
+        scope_type = _pc.normalize_scope_type(scope_type)
+        where_clause = "WHERE scope_type = ?"
+        params = (scope_type,)
+    async with db.execute(
+        "SELECT scope_type, scope_id, schema_version, revision, fields, reset_fields, "
+        "lifecycle_state, content_hash, provenance, updated_at FROM profile_layers "
+        f"{where_clause} ORDER BY scope_type, scope_id",
+        params,
+    ) as cur:
+        rows = await cur.fetchall()
+    return [_decode_profile_layer_row(row) for row in rows]
 
 
 async def set_profile_layer(
@@ -264,6 +302,55 @@ async def reset_profile_layer(db: aiosqlite.Connection, scope_type: str, scope_i
     )
     await db.commit()
     return await get_profile_layer(db, scope_type, scope_id)
+
+
+async def clone_profile_layer(
+    db: aiosqlite.Connection,
+    source_scope_type: str,
+    source_scope_id: str,
+    target_scope_type: str,
+    target_scope_id: str,
+    *,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """Copy one layer's ``fields``/``reset_fields``/``provenance`` onto
+    another scope (PROFILE-5, 0bec79a7).
+
+    Reads the source layer via :func:`get_profile_layer`, then writes it
+    onto the target scope via :func:`set_profile_layer` — NOT a raw SQL
+    copy, so this goes through the exact same validation/hashing path any
+    other write does. This matters because the target scope's
+    ``FIELD_REGISTRY`` ``allowed_layers`` may differ from the source's: a
+    field the source layer legally carries (e.g. an ``executor_config.*``
+    field at ``session``) can still be rejected when cloned onto a target
+    scope_type that doesn't allow it.
+
+    Raises :class:`profile_contract.ProfileContractError` when the source
+    layer does not exist (``revision == 0``, i.e. :func:`_empty_layer_dict`)
+    — cloning nothing is a caller error, not a silent no-op.
+
+    Cloning INTO a ``hosted_default`` target never carries over the
+    source's ``lifecycle_state``: only ``fields``/``reset_fields``/
+    ``provenance`` are copied, so a fresh hosted_default clone always lands
+    in ``draft`` — exactly like any other first-ever write on a
+    hosted_default scope (see :func:`set_profile_layer`). No special-casing
+    needed here; it falls out of only copying those three fields.
+    """
+    source = await get_profile_layer(db, source_scope_type, source_scope_id)
+    if source["revision"] == 0:
+        raise _pc.ProfileContractError(
+            f"cannot clone from ({source_scope_type!r}, {source_scope_id!r}): "
+            "source layer does not exist (nothing to clone)"
+        )
+    return await set_profile_layer(
+        db,
+        target_scope_type,
+        target_scope_id,
+        fields=source["fields"],
+        reset_fields=source["reset_fields"],
+        provenance=source["provenance"],
+        actor=actor,
+    )
 
 
 async def transition_hosted_default_lifecycle(

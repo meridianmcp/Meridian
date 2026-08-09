@@ -916,6 +916,7 @@ from .routes.marketplace import router as _marketplace_router  # noqa: E402
 from .routes.tunnel import router as _tunnel_router          # noqa: E402
 from .routes.oauth import router as _oauth_router            # noqa: E402
 from .routes.a2a import router as _a2a_router                # noqa: E402
+from .routes.settings import router as _settings_router      # noqa: E402
 
 app.include_router(_oauth_router)
 app.include_router(_notes_router)
@@ -939,6 +940,7 @@ app.include_router(_blog_router)
 app.include_router(_marketplace_router)
 app.include_router(_tunnel_router)
 app.include_router(_a2a_router)
+app.include_router(_settings_router)
 
 # ---------------------------------------------------------------------------
 # Password gate middleware

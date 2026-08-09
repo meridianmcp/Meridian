@@ -19,6 +19,7 @@ import meridian.server as _server
 from meridian import capability_availability as _capability_availability
 from meridian import capability_manifest as _capability_manifest
 from meridian import db as db_module
+from meridian import profile_contract as _profile_contract
 from meridian._deps import _hosted_mode
 from meridian.mcp_tools import _select_active_tool_set
 
@@ -828,6 +829,277 @@ async def handle_get_effective_capability_profile(
             user_scope_id=user_scope_id,
         )
     except _capability_manifest.CapabilityManifestError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_list_profile_layers(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: list_profile_layers (0bec79a7, PROFILE-5).
+
+    Read-only enumeration of every persisted profile_layers row across the
+    hosted_default -> workspace -> user -> project -> session contract,
+    optionally narrowed to one scope_type. Ordered by (scope_type,
+    scope_id) for deterministic output — a raw listing, not a resolved/
+    merged view (see handle_get_effective_profile for the merged view).
+    """
+    scope_type = (args.get("scope_type") or "").strip() or None
+    try:
+        return await db_module.list_profile_layers(db, scope_type)
+    except _profile_contract.ProfileContractError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_get_profile_layer(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_profile_layer (0bec79a7, PROFILE-5).
+
+    Read-only: return the raw, single-layer profile for one (scope_type,
+    scope_id) — no merging against any other layer. A scope with no
+    persisted row gets an empty profile back, never an error. See
+    handle_get_effective_profile for the MERGED, multi-layer view.
+    """
+    scope_type = (args.get("scope_type") or "").strip()
+    scope_id = (args.get("scope_id") or "").strip()
+    if not scope_type:
+        return {"error": "scope_type is required"}
+    if not scope_id:
+        return {"error": "scope_id is required"}
+    try:
+        return await db_module.get_profile_layer(db, scope_type, scope_id)
+    except _profile_contract.ProfileContractError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_save_profile_layer(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: save_profile_layer (0bec79a7, PROFILE-5).
+
+    Validates and persists one layer's profile — wholesale-replaces this
+    scope's stored fields/reset_fields (not a merge). expected_revision
+    enables optimistic concurrency: omit it for last-write-wins, or pass the
+    revision you last read to get a structured {error, code:
+    "STALE_REVISION", current_revision} instead of silently clobbering a
+    concurrent write. override_reason is accepted for forward symmetry with
+    resolve_effective_profile's identically-named knob, but this tool never
+    blocks a write on it — narrow_only/safe_direction enforcement is a
+    merge-time (resolve) concern, not a write-time one.
+    """
+    scope_type = (args.get("scope_type") or "").strip()
+    scope_id = (args.get("scope_id") or "").strip()
+    if not scope_type:
+        return {"error": "scope_type is required"}
+    if not scope_id:
+        return {"error": "scope_id is required"}
+    try:
+        return await db_module.set_profile_layer(
+            db,
+            scope_type,
+            scope_id,
+            fields=args.get("fields"),
+            reset_fields=args.get("reset_fields"),
+            provenance=args.get("provenance"),
+            expected_revision=args.get("expected_revision"),
+            override_reason=args.get("override_reason"),
+            actor=args.get("actor"),
+        )
+    except _profile_contract.ProfileStaleRevisionError as exc:
+        return {"error": str(exc), "code": "STALE_REVISION", "current_revision": exc.actual_revision}
+    except _profile_contract.ProfileContractError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_clone_profile_layer(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: clone_profile_layer (0bec79a7, PROFILE-5).
+
+    Copies one layer's fields/reset_fields/provenance onto another scope —
+    through the same validation/hashing path as save_profile_layer (not a
+    raw copy), since the target scope's allowed_layers may differ from the
+    source's. Rejects with {error} when the source layer does not exist
+    (nothing to clone).
+    """
+    source_scope_type = (args.get("source_scope_type") or "").strip()
+    source_scope_id = (args.get("source_scope_id") or "").strip()
+    target_scope_type = (args.get("target_scope_type") or "").strip()
+    target_scope_id = (args.get("target_scope_id") or "").strip()
+    if not source_scope_type:
+        return {"error": "source_scope_type is required"}
+    if not source_scope_id:
+        return {"error": "source_scope_id is required"}
+    if not target_scope_type:
+        return {"error": "target_scope_type is required"}
+    if not target_scope_id:
+        return {"error": "target_scope_id is required"}
+    try:
+        return await db_module.clone_profile_layer(
+            db, source_scope_type, source_scope_id, target_scope_type, target_scope_id,
+            actor=args.get("actor"),
+        )
+    except _profile_contract.ProfileContractError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_activate_profile_layer(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: activate_profile_layer (0bec79a7, PROFILE-5).
+
+    Advances a hosted_default layer's lifecycle to "active" — the single
+    "reach active" operation for the hosted_default floor (pinned decision
+    fae6e882 collapsed "publish" and "activate" into this one tool: a
+    hosted_default layer becomes authoritative the moment it reaches
+    "active", so there is no distinct publish step to expose separately).
+    Idempotent: calling on an already-active scope is a no-op success (same
+    revision, no new audit row). Only a draft -> active or deprecated ->
+    active transition is valid; any other current state (e.g. retired,
+    which is terminal) rejects with {error}.
+    """
+    scope_id = (args.get("scope_id") or "").strip()
+    if not scope_id:
+        return {"error": "scope_id is required"}
+    try:
+        return await db_module.transition_hosted_default_lifecycle(
+            db, scope_id, "active", actor=args.get("actor"),
+        )
+    except _profile_contract.ProfileContractError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_reset_profile_layer(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: reset_profile_layer (0bec79a7, PROFILE-5).
+
+    Deletes a scope's ENTIRE profile-layer row so it reverts to purely
+    inheriting from less-specific layers — mirrors clear_capability_profile's
+    semantics for the profile-layers contract. Idempotent: resetting an
+    already-empty or never-set scope is a no-op, not an error. For
+    hosted_default this clears the row (back to no-row / implicit draft)
+    but is NOT an audited lifecycle transition — the audited path lives in
+    transition_hosted_default_lifecycle (see handle_activate_profile_layer).
+    """
+    scope_type = (args.get("scope_type") or "").strip()
+    scope_id = (args.get("scope_id") or "").strip()
+    if not scope_type:
+        return {"error": "scope_type is required"}
+    if not scope_id:
+        return {"error": "scope_id is required"}
+    try:
+        return await db_module.reset_profile_layer(db, scope_type, scope_id)
+    except _profile_contract.ProfileContractError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_get_profile_layer_revisions(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_profile_layer_revisions (0bec79a7, PROFILE-5).
+
+    Read-only: the hosted_default revision/audit history for one scope_id,
+    newest first — the rollback/audit trail for the one layer that is
+    "immutable once published". A non-hosted_default scope_id always
+    returns [] (only hosted_default writes are ledgered).
+    """
+    scope_id = (args.get("scope_id") or "").strip()
+    if not scope_id:
+        return {"error": "scope_id is required"}
+    limit = args.get("limit")
+    try:
+        if limit is None:
+            return await db_module.get_profile_layer_revisions(db, scope_id)
+        return await db_module.get_profile_layer_revisions(db, scope_id, limit=int(limit))
+    except _profile_contract.ProfileContractError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_get_effective_profile(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_effective_profile (0bec79a7, PROFILE-5).
+
+    Read-only: resolve and return the MERGED profile for a project across
+    every applicable layer — hosted_default -> workspace -> user -> project
+    -> session, least to most specific (see
+    meridian.db.profile_layers.get_effective_profile). The 'project' layer
+    is synthetic: its 7 legacy ProjectSettings/executor_config fields come
+    from the existing get_project_settings authority (zero duplication);
+    its 3 new fields (tool_priority_map, capability_manifest_ref,
+    claim_verification_mode) come from the real profile_layers row. Pass
+    session_id/user_scope_id to also fold in those layers;
+    workspace_scope_id/hosted_default_scope_id default to
+    'singleton'/'global'. Returns {error} for an unknown project_id.
+    """
+    _pid = (args.get("project_id") or "").strip()
+    if not _pid and args.get("project_name"):
+        _p = await db_module.get_project_by_name(db, str(args["project_name"]))
+        _pid = (_p or {}).get("id", "") if _p else ""
+    if not _pid:
+        return {"error": "project_id (or project_name) is required"}
+    session_id = (args.get("session_id") or "").strip() or None
+    user_scope_id = (args.get("user_scope_id") or "").strip() or None
+    workspace_scope_id = (args.get("workspace_scope_id") or "").strip() or "singleton"
+    hosted_default_scope_id = (args.get("hosted_default_scope_id") or "").strip() or "global"
+    try:
+        return await db_module.get_effective_profile(
+            db, _pid,
+            session_id=session_id,
+            user_scope_id=user_scope_id,
+            workspace_scope_id=workspace_scope_id,
+            hosted_default_scope_id=hosted_default_scope_id,
+        )
+    except _profile_contract.ProfileContractError as exc:
         return {"error": str(exc)}
     except ValueError as exc:
         return {"error": str(exc)}

@@ -12624,4 +12624,6 @@ from .profile_layers import (  # noqa: F401
     transition_hosted_default_lifecycle,
     get_profile_layer_revisions,
     get_effective_profile,
+    list_profile_layers,
+    clone_profile_layer,
 )
