@@ -4181,3 +4181,99 @@ def _select_active_tool_set(
 # this block establish the CURRENT deterministic behavior of both existing
 # routers as the baseline that harness must be measured against.
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# INVESTIGATE db7eb0f5 (item_group: proposal:rag-semantic-tool-routing)
+# "compare deterministic sequential/graph orchestration with agentic
+# routing and define Meridian's authoritative execution boundary."
+#
+# THIS BLOCK IS DOCUMENTATION ONLY -- it names and cross-references code that
+# already exists and already behaves this way; nothing below changes runtime
+# behavior. Companion to the f30bbd89 block directly above (same
+# item_group): that block scoped ONE mechanism (MCP tool pre-selection,
+# `_select_active_tool_set`); this one answers the broader question the
+# item_group's title poses -- across the WHOLE session lifecycle, not just
+# tool listing, where does Meridian's own server-side control end and an
+# executing agent's free judgment begin. See pinned decision "db7eb0f5:
+# Meridian's authoritative execution boundary" for the canonical statement;
+# this comment is the code-grounded evidence trail behind it.
+#
+# TWO MECHANISMS THAT LOOK SIMILAR BUT ARE NOT
+# ---------------------------------------------------------------------
+#  1. Deterministic sequential/graph orchestration -- decides WHETHER a
+#     state transition is allowed to happen at all, and CAN say no.
+#     Lives in `meridian/db/sprint_items.py` (`claim_sprint_item`,
+#     `complete_sprint_item`, `get_blocking_dependency_for_sprint_item`
+#     (the `depends_on` graph), `_get_blocking_wave_gate` /
+#     `get_parallelizable_groups` / `assign_sprint_waves` (the wave/
+#     resource-conflict graph)), `meridian/capability_manifest.py` +
+#     `meridian/capability_contract.py` (a `required` capability with no
+#     available fallback makes the session non-executable -- fail closed,
+#     per AGENTS.md's capability-manifest contract), and the completion
+#     evidence gates layered onto `complete_sprint_item` itself
+#     (`required_notes`, `require_verification`/e2e1b682,
+#     `require_strict_evidence`/5fe3502e, the `code_intel_prospecting`
+#     receipt/a8c0f3b7, the claim-ownership check/8693b6a8). Every one of
+#     these can REFUSE the call outright (a typed rejection reason, not
+#     advice) regardless of what the calling agent intended -- that is the
+#     one property that makes this side "authoritative": it is enforced by
+#     the server, not by the agent choosing to comply.
+#
+#  2. Agentic routing -- everything an executing session (Claude Code,
+#     Codex, any MCP client) decides FOR ITSELF once it is inside a
+#     claimed item, and that Meridian can only ever hint at, never compel:
+#     which MCP tool to call and in what order
+#     (`_select_active_tool_set`/a749f87c above -- advisory-only, per the
+#     f30bbd89 block's own finding that `tools/list` ignores it
+#     entirely), which notes/decisions are relevant
+#     (`semantic_search.py`'s Model2Vec recall -- an ADDITIVE recall aid,
+#     never a filter, per decision bbd05ceb), which tool a given item
+#     probably needs first (`executor_contract.build_routing_hint` /
+#     `build_routing_summary` -- explicit `tool_requirements` when
+#     present, else a best-effort keyword-INFERRED default that is always
+#     `required_or_preferred="preferred"`, never a hard block -- see its
+#     own docstring), how many turns to spend planning before acting
+#     (`executor_config.build_execution_policy`'s `max_planning_turns` /
+#     `required_first_action` -- a strong, documented CONVENTION an
+#     executor is expected to follow, but the field itself carries no
+#     server-side enforcement path the way a `claim_sprint_item` rejection
+#     does), and when a blocker is "genuine" enough to escalate via
+#     `request_hitl` (`GENUINE_BLOCKER_ESCALATION_RULE` -- prose guidance
+#     only). None of side (2) can make Meridian actually refuse a
+#     `claim_sprint_item`/`complete_sprint_item` call; it only shapes what
+#     the agent chooses to do on its own before making one.
+#
+# THE BOUNDARY
+# ---------------------------------------------------------------------
+# The authoritative execution boundary is the sprint-item claim/completion
+# gate itself -- not a layer "above" orchestration or "below" it. Anything
+# that determines WHICH items may run, in WHAT order, and WHETHER a given
+# claim/completion is even permitted right now is side (1): deterministic,
+# server-enforced, agent-intent-independent. Anything that determines HOW
+# an already-claimed item gets done -- tool choice, reasoning order, note
+# interpretation, escalation judgment, which routing/search hint to trust
+# -- is side (2): agentic, advisory-only, and Meridian never gates
+# completion on whether those hints were followed. This is precisely why
+# f30bbd89's stage-2 "enforcing" tool-filter proposal was flagged as
+# needing its OWN separate, explicitly HITL-reviewed sprint item rather
+# than folding into that investigation: moving any part of side (2) so
+# that it can refuse an action would be a boundary-crossing change, not an
+# incremental one, and deserves review as exactly that.
+#
+# WHAT THIS INVESTIGATION DELIBERATELY DID NOT BUILD
+# ---------------------------------------------------------------------
+# No new gate, no new advisory mechanism, no change to any of the
+# functions named above. The dependency graph, wave gates, capability
+# fail-closed contract, and evidence gates already behave exactly as
+# described (each already has its own dedicated test coverage --
+# `tests/test_d2430713_complete_wave_gate.py`,
+# `tests/test_capability_contract.py`,
+# `tests/test_a749f87c_tool_preselection.py`, and the sprint-item
+# claim/complete suites in `tests/test_core.py` -- so this block adds no
+# new regression tests of its own; it would only be re-asserting facts
+# those suites already pin). The deliverable is the boundary statement
+# itself, made explicit and citable, so a future item proposing to move
+# ANY mechanism from side (2) to side (1) (e.g. f30bbd89's own stage-2) has
+# a documented line to say it is crossing.
+# ---------------------------------------------------------------------------
