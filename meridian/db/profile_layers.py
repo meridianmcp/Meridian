@@ -628,3 +628,72 @@ async def get_effective_profile(
             ]
 
     return result
+
+
+async def get_workspace_effective_profile(
+    db: aiosqlite.Connection,
+    *,
+    workspace_scope_id: str = "singleton",
+    hosted_default_scope_id: str = "global",
+) -> dict[str, Any]:
+    """Resolve the tenant/workspace-wide profile ONLY — hosted_default +
+    workspace layers, no user/project/session layers (PROFILE-6, 89a06e40).
+
+    Why this exists, distinct from :func:`get_effective_profile`: the
+    tunnel/connector surface (``meridian.routes.tunnel``'s
+    ``/tunnel/status/{tenant_id}`` and ``GET``/``PUT /tunnel/plugins``) is
+    scoped by ``tenant_id`` only — there is no ``project_id`` anywhere in
+    that machinery, and a tenant can plausibly have multiple projects, so
+    calling ``get_effective_profile`` there would require an
+    arbitrary/wrong ``project_id`` choice. See pinned decision ee7bccc9
+    (project 5787cc92-ba7d-4788-b17c-28ab7938b839) for the full
+    investigation this codifies: profile identity attached to the tunnel
+    surface reflects ONLY the two layers that are genuinely tenant/
+    workspace-wide rather than tied to one project. Project- and
+    session-scoped profile identity stays covered by
+    :func:`get_effective_profile` (via ``start_session``/
+    ``generate_handoff``, both inherently ``project_id``-scoped).
+
+    Calls :func:`meridian.profile_contract.resolve_effective_profile`
+    directly (bypassing :func:`get_effective_profile`'s hard
+    ``project_id`` requirement entirely) — this function never raises for
+    an unknown/absent project, unlike ``get_effective_profile``.
+
+    Mirrors ``get_effective_profile``'s own hosted_default-lifecycle
+    handling verbatim: the ``LIVE_HOSTED_DEFAULT_STATES`` filter on which
+    layer to pass into the merge, PLUS the raw-``hosted_row``
+    executable/degraded computation (only a REAL persisted row —
+    ``revision > 0`` — counts; the virtual "draft" ``_empty_layer_dict``
+    report for a scope_id that has simply never configured hosted_default
+    must not make an ordinary tenant look degraded). See
+    :func:`get_effective_profile`'s own docstring for the full
+    "draft never-configured vs real draft" distinction this replicates.
+    """
+    layers: list[_pc.ProfileLayer] = []
+
+    hosted_row = await get_profile_layer(db, "hosted_default", hosted_default_scope_id)
+    if hosted_row["lifecycle_state"] in _pc.LIVE_HOSTED_DEFAULT_STATES:
+        layers.append(_to_profile_layer(hosted_row))
+
+    workspace_row = await get_profile_layer(db, "workspace", workspace_scope_id)
+    layers.append(_to_profile_layer(workspace_row))
+
+    effective = _pc.resolve_effective_profile(layers)
+    result = effective.model_dump()
+    result["project_id"] = None
+    result["session_id"] = None
+
+    if hosted_row["revision"] > 0:
+        hosted_lifecycle = hosted_row["lifecycle_state"]
+        if hosted_lifecycle == "retired":
+            result["executable"] = False
+            result["executable_reasons"] = [*result["executable_reasons"], "hosted_default_retired"]
+            result["degraded"] = True
+            result["degraded_reasons"] = [*result["degraded_reasons"], "hosted_default_retired"]
+        elif hosted_lifecycle in ("draft", "deprecated"):
+            result["degraded"] = True
+            result["degraded_reasons"] = [
+                *result["degraded_reasons"], f"hosted_default_lifecycle_{hosted_lifecycle}",
+            ]
+
+    return result

@@ -938,3 +938,146 @@ async def test_hosted_default_lifecycle_idempotent_for_every_state(db, state):
     again = await db_module.transition_hosted_default_lifecycle(db, "global", state)
     assert again["revision"] == before_revision
     assert again["lifecycle_state"] == state
+
+
+# ---------------------------------------------------------------------------
+# PROFILE-6 (89a06e40) — db.get_workspace_effective_profile: the
+# tenant/workspace-only resolution the tunnel/connector surface uses (no
+# project_id available there — see meridian/routes/tunnel.py and pinned
+# decision ee7bccc9, project 5787cc92-ba7d-4788-b17c-28ab7938b839). Mirrors
+# get_effective_profile's own hosted_default-lifecycle test coverage above,
+# scoped to just the two layers this function resolves.
+# ---------------------------------------------------------------------------
+
+async def test_get_workspace_effective_profile_no_config_at_all(db):
+    """Never raises (unlike get_effective_profile) and never needs a
+    project — a tenant that has configured nothing still resolves cleanly."""
+    result = await db_module.get_workspace_effective_profile(db)
+    assert result["project_id"] is None
+    assert result["session_id"] is None
+    assert result["fields"] == {}
+    assert result["layers_applied"] == []
+    assert result["executable"] is True
+    assert result["degraded"] is False
+    assert result["generation_key"].startswith("sha256:")
+
+
+async def test_get_workspace_effective_profile_applies_workspace_layer(db):
+    await db_module.set_profile_layer(db, "workspace", "singleton", fields={"auto_worktrees": 0})
+    result = await db_module.get_workspace_effective_profile(db)
+    assert result["fields"]["auto_worktrees"] == 0
+    assert result["layers_applied"] == ["workspace"]
+
+
+async def test_get_workspace_effective_profile_hosted_default_draft_does_not_apply(db):
+    await db_module.set_profile_layer(db, "hosted_default", "global", fields={"tool_priority_map": {"a": "b"}})
+    result = await db_module.get_workspace_effective_profile(db)
+    assert "hosted_default" not in result["layers_applied"]
+    assert "tool_priority_map" not in result["fields"]
+    assert result["degraded"] is True
+    assert "hosted_default_lifecycle_draft" in result["degraded_reasons"]
+
+
+async def test_get_workspace_effective_profile_hosted_default_active_applies(db):
+    await db_module.set_profile_layer(db, "hosted_default", "global", fields={"tool_priority_map": {"a": "b"}})
+    await db_module.transition_hosted_default_lifecycle(db, "global", "active")
+    result = await db_module.get_workspace_effective_profile(db)
+    assert "hosted_default" in result["layers_applied"]
+    assert result["fields"]["tool_priority_map"] == {"a": "b"}
+    assert result["executable"] is True
+    assert result["degraded"] is False
+
+
+async def test_get_workspace_effective_profile_hosted_default_retired_not_executable(db):
+    await db_module.set_profile_layer(db, "hosted_default", "global", fields={"tool_priority_map": {"a": "b"}})
+    await db_module.transition_hosted_default_lifecycle(db, "global", "retired")
+    result = await db_module.get_workspace_effective_profile(db)
+    assert result["executable"] is False
+    assert "hosted_default_retired" in result["executable_reasons"]
+    assert result["degraded"] is True
+    assert "hosted_default" not in result["layers_applied"]
+
+
+async def test_get_workspace_effective_profile_never_applies_project_or_session_layers(db):
+    """Even if a project/session layer happens to exist, this function must
+    never resolve or leak it in — it only ever looks at hosted_default +
+    workspace (per pinned decision ee7bccc9)."""
+    project = await db_module.create_project(db, "89a06e40-workspace-only-isolation")
+    await db_module.set_profile_layer(
+        db, "project", project["id"], fields={"claim_verification_mode": "strict"},
+    )
+    await db_module.set_profile_layer(
+        db, "session", "some-session", fields={"claim_verification_mode": "off"},
+    )
+    result = await db_module.get_workspace_effective_profile(db)
+    assert result["layers_applied"] == []
+    assert "claim_verification_mode" not in result["fields"]
+
+
+async def test_get_workspace_effective_profile_matches_get_effective_profile_for_shared_layers(db):
+    """The two layers this function DOES resolve must agree exactly with
+    what get_effective_profile resolves for those same two layers on any
+    project — same merge algorithm, just without the project-specific
+    layers overlaid on top.
+
+    Uses ``tool_priority_map`` (a genuinely-new ``legacy_source="profile_layers"``
+    field, per profile_contract.py's module docstring) for the comparison,
+    NOT a ``legacy_source="project_settings"`` field like ``auto_worktrees``:
+    get_effective_profile's synthetic 'project' layer ALWAYS contributes that
+    field's value (from get_project_settings' own default, even when nothing
+    was ever explicitly set — see _legacy_project_settings_to_fields), so it
+    would legitimately override the workspace layer's value there but not
+    here — that divergence is correct behavior, not something to assert
+    equal.
+    """
+    project = await db_module.create_project(db, "89a06e40-workspace-parity")
+    await db_module.set_profile_layer(db, "hosted_default", "global", fields={"tool_priority_map": {"shared": "yes"}})
+    await db_module.transition_hosted_default_lifecycle(db, "global", "active")
+    await db_module.set_profile_layer(db, "workspace", "singleton", fields={"tool_priority_map": {"ws": "1"}})
+
+    workspace_only = await db_module.get_workspace_effective_profile(db)
+    project_scoped = await db_module.get_effective_profile(db, project["id"])
+    assert workspace_only["fields"]["tool_priority_map"] == project_scoped["fields"]["tool_priority_map"]
+    assert workspace_only["fields"]["tool_priority_map"] == {"shared": "yes", "ws": "1"}
+
+
+# ---------------------------------------------------------------------------
+# PROFILE-6 (89a06e40) — profile_contract.project_profile_binding: the
+# compact projection attached at all 4 integration points (start_session,
+# generate_handoff, the goal-mode inline tag, and the tunnel/connector
+# routes).
+# ---------------------------------------------------------------------------
+
+def test_project_profile_binding_shape():
+    effective = pc.resolve_effective_profile([
+        _layer("workspace", {"auto_worktrees": 0}, scope_id="ws"),
+    ]).model_dump()
+    binding = pc.project_profile_binding(effective)
+    assert set(binding.keys()) == {
+        "generation_key", "executable", "degraded", "restart_required", "restart_report",
+    }
+    assert binding["generation_key"] == effective["generation_key"]
+    assert binding["executable"] == effective["executable"]
+    assert binding["degraded"] == effective["degraded"]
+    assert binding["restart_required"] == effective["restart_required"]
+    assert binding["restart_report"] == effective["restart_report"]
+
+
+def test_project_profile_binding_never_includes_full_fields_dict():
+    effective = pc.resolve_effective_profile([
+        _layer("project", {"max_pinned_decisions": 99}, scope_id="p1"),
+    ]).model_dump()
+    binding = pc.project_profile_binding(effective)
+    assert "fields" not in binding
+    assert "field_sources" not in binding
+    assert "layers_applied" not in binding
+
+
+def test_project_profile_binding_degrades_gracefully_on_partial_input():
+    """A hand-built/partially-shaped dict (e.g. a test fixture, or a future
+    caller that forgot a field) must not raise -- safe defaults throughout."""
+    binding = pc.project_profile_binding({})
+    assert binding == {
+        "generation_key": "", "executable": True, "degraded": False,
+        "restart_required": False, "restart_report": {},
+    }

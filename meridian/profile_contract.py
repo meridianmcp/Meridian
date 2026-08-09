@@ -936,6 +936,35 @@ def resolve_effective_profile(
     )
 
 
+def project_profile_binding(effective: dict[str, Any]) -> dict[str, Any]:
+    """Compact profile identity/generation projection (PROFILE-6, 89a06e40;
+    see pinned decision ee7bccc9 for the tunnel/connector scoping rationale).
+
+    Takes an ``EffectiveProfile``-shaped dict — either
+    ``resolve_effective_profile(...).model_dump()`` directly, or the richer
+    dict :func:`meridian.db.profile_layers.get_effective_profile` /
+    :func:`meridian.db.profile_layers.get_workspace_effective_profile` return
+    (which fold the hosted_default-lifecycle executable/degraded half in on
+    top of the same base shape) — and returns the SMALL, STABLE subset this
+    item attaches at all 4 integration points (``start_session``,
+    ``generate_handoff`` and its ``build_effective_profile_binding``
+    wrapper, the goal-mode ``<profile_generation>`` inline tag, and the
+    tunnel/connector routes). Deliberately NOT the full ``fields`` merged
+    dict — every caller gets the same small shape:
+    ``generation_key``/``executable``/``degraded``/``restart_required``/
+    ``restart_report``. ``.get(...)`` with safe defaults throughout so a
+    partially-shaped input (e.g. a hand-built test dict) degrades gracefully
+    instead of raising.
+    """
+    return {
+        "generation_key": effective.get("generation_key") or "",
+        "executable": bool(effective.get("executable", True)),
+        "degraded": bool(effective.get("degraded", False)),
+        "restart_required": bool(effective.get("restart_required", False)),
+        "restart_report": dict(effective.get("restart_report") or {}),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Contract fixtures — example ProfileLayer instances demonstrating the
 # hosted_default floor, an overlay layer, and the narrow_only blocked-widen

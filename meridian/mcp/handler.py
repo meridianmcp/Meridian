@@ -126,7 +126,11 @@ async def _build_executor_goal_messages(
     returns a clear fill-in template rather than an error, so the slash command
     is always useful even on a cold/empty project.
     """
-    from ..handoff import _build_quick_start_goal, _prepare_pending_sprint_items
+    from ..handoff import (
+        _build_quick_start_goal,
+        _prepare_pending_sprint_items,
+        build_effective_profile_binding,
+    )
 
     project: dict[str, Any] | None = None
     project_id = (args.get("project_id") or "").strip()
@@ -205,6 +209,21 @@ async def _build_executor_goal_messages(
         )
     except Exception:  # noqa: BLE001
         _tpl_pointer_evidence_ids = None
+    # 89a06e40 — best-effort profile identity/generation resolution, threaded
+    # into quick_start_goal's inline <profile_generation> tag below. Per
+    # _build_quick_start_goal's own docstring (see profile_generation_key),
+    # this prompt handler (_build_executor_goal_messages) is one of exactly
+    # two call sites where the rendered /goal text is copied/forwarded
+    # standalone with no sibling profile_binding field to fall back on — the
+    # other is _generate_goal_only_handoff (meridian/handoff.py), which
+    # already threads this. No session_id in scope here (this prompt only
+    # takes project_id/project_name — see _MCP_PROMPTS' "executor-goal"
+    # argument list), so this resolves the project/workspace/hosted_default
+    # layers only, matching _generate_starter_handoff's /
+    # _generate_goal_only_handoff's own session_id-less calls.
+    # build_effective_profile_binding is already fully guarded internally
+    # (returns None on any failure) — no extra try/except needed here.
+    _profile_binding = await build_effective_profile_binding(db, pid)
     quick_start_goal = _build_quick_start_goal(
         pending,
         version=scoped_version,
@@ -224,6 +243,14 @@ async def _build_executor_goal_messages(
         # docstring.
         project_id=pid,
         project_name=pname,
+        # 89a06e40 — inline <profile_generation> tag; None/False (never crash)
+        # when the best-effort resolution above failed.
+        profile_generation_key=(
+            _profile_binding.get("generation_key") if _profile_binding else None
+        ),
+        profile_restart_required=bool(
+            _profile_binding.get("restart_required")
+        ) if _profile_binding else False,
     )
     if pending:
         item_lines = "\n".join(
@@ -3308,6 +3335,17 @@ async def _handle_task_tools(
         _run_timeline = await handoff_module_local.build_run_timeline_for_handoff(
             db, args["project_id"], session_id=session_id,
         )
+        # 89a06e40 — machine-readable effective profile identity/generation
+        # (hosted_default+workspace+user+project+session layers; see
+        # meridian.profile_contract.EffectiveProfile /
+        # db.profile_layers.get_effective_profile), emitted on every
+        # generate_handoff mode alongside the fields above. Fully guarded —
+        # a failure degrades to no field rather than breaking the mandatory
+        # handoff. See pinned decision ee7bccc9 for why the tunnel/connector
+        # routes deliberately do NOT call this same helper.
+        _profile_binding = await handoff_module_local.build_effective_profile_binding(
+            db, args["project_id"], session_id=session_id,
+        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -3365,6 +3403,13 @@ async def _handle_task_tools(
             # this project has no durable execution events for this scope
             # (see build_run_timeline_for_handoff's own docstring).
             "run_timeline": _run_timeline,
+            # 89a06e40 — compact profile identity/generation projection
+            # ({"generation_key", "executable", "degraded",
+            # "restart_required", "restart_report"} — see
+            # profile_contract.project_profile_binding). None only if the
+            # resolution itself failed (best-effort, mirrors
+            # capability_contract above).
+            "profile_binding": _profile_binding,
             # b8f89491 — machine-readable scope: which sprint-version bucket
             # this handoff actually resolved to, and why (explicit argument vs.
             # session-derived vs. unscoped). effective_version is None when the

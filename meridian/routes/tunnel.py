@@ -39,6 +39,7 @@ from fastapi.responses import Response
 
 from .. import db as db_module
 from .. import process_registry as process_registry_module
+from .. import profile_contract as profile_contract_module
 from .._deps import _hosted_mode, _get_tenant_from_request, _db
 from ..tunnel_plugins import (
     normalize_plugins_config, resolve_plugins, resolve_custom_plugins, builtin_names,
@@ -1801,9 +1802,45 @@ async def debug_mcp_proxy_subpath(tenant_id: str, rest: str, request: Request) -
 # GET /tunnel/status/{tenant_id}  — lightweight status check (no auth required)
 # ---------------------------------------------------------------------------
 
+async def _build_tunnel_profile_binding(db: Any) -> "dict[str, Any] | None":
+    """89a06e40 — guarded helper attaching the workspace-only compact profile
+    identity/generation projection to the tunnel/connector surface (GET
+    /tunnel/status/{tenant_id}, GET /tunnel/plugins). See pinned decision
+    ee7bccc9 (project 5787cc92-ba7d-4788-b17c-28ab7938b839): this surface is
+    scoped by tenant_id ONLY (no project_id anywhere in its runtime-config-
+    generation machinery, and a tenant may have multiple projects), so
+    ``db.get_effective_profile`` — which hard-requires a project_id — cannot
+    be called here. Resolves ONLY the hosted_default + workspace layers via
+    ``db.get_workspace_effective_profile`` instead, then projects the SAME
+    compact shape ``handoff.build_effective_profile_binding`` uses for the
+    project-scoped surfaces (``profile_contract.project_profile_binding``).
+    Mirrors that wrapper's guarded style: returns ``None`` on any failure
+    rather than breaking a tunnel/connector-refresh response.
+    """
+    try:
+        effective = await db_module.get_workspace_effective_profile(db)
+        return profile_contract_module.project_profile_binding(effective)
+    except Exception:  # noqa: BLE001 — profile binding is best-effort
+        return None
+
+
 @router.get("/tunnel/status/{tenant_id}")
-async def tunnel_status(tenant_id: str) -> dict:
-    """Return whether the tenant currently has an active tunnel socket."""
+async def tunnel_status(tenant_id: str, request: Request = None) -> dict:  # type: ignore[assignment]
+    """Return whether the tenant currently has an active tunnel socket.
+
+    89a06e40 — ``request`` is a NEW parameter (this route previously took
+    only ``tenant_id``), added to reach ``request.app.state.db`` for the
+    ``profile_binding`` field below. Defaulted to ``None`` rather than made
+    required: several existing tests (``test_slot_reprobe.py``,
+    ``test_tunnel_bridge.py``, ``test_w5_9665538a_meridian_docs_slot.py``)
+    call this function directly as a plain coroutine (``tn.tunnel_status(tid)``),
+    not through FastAPI's HTTP layer — FastAPI still injects the real
+    ``Request`` for actual HTTP calls regardless of the default (it
+    recognizes the ``Request`` type annotation, not the absence of a
+    default), so this stays a non-breaking change for both calling styles.
+    ``profile_binding`` degrades to ``None`` (see below) when ``request`` is
+    ``None``, exactly like every other best-effort field in this response.
+    """
     return {
         "tenant_id": tenant_id,
         "active": tenant_id in _tunnel_sockets,
@@ -1834,6 +1871,18 @@ async def tunnel_status(tenant_id: str) -> dict:
         "config_generation": all_runtime_config_generations(tenant_id),
         "inflight": tenant_inflight_counts(tenant_id),
         "safe_to_restart": not any(tenant_inflight_counts(tenant_id).values()),
+        # 89a06e40 — workspace-only (hosted_default+workspace layers) compact
+        # profile identity/generation, the connector-refresh contract this
+        # route's own config_generation field already documents itself as.
+        # See pinned decision ee7bccc9 for why this is workspace-scoped only
+        # (no project/session layers) rather than db.get_effective_profile.
+        # None when request is None (a direct non-HTTP call — see this
+        # function's own docstring) — same degrade-to-None contract as
+        # every other best-effort field.
+        "profile_binding": (
+            await _build_tunnel_profile_binding(request.app.state.db)
+            if request is not None else None
+        ),
     }
 
 
@@ -2001,6 +2050,11 @@ async def get_tunnel_plugins(request: Request) -> Response:
         # / a restart-required banner without a second call, and a tunnel client
         # can compare what it loaded at startup against this to detect drift.
         "config_generation": get_runtime_config_generation(tid, hostname, parsed),
+        # 89a06e40 — workspace-only (hosted_default+workspace layers) compact
+        # profile identity/generation, the same connector-refresh contract
+        # /tunnel/status/{tenant_id} attaches. See pinned decision ee7bccc9
+        # for why this is workspace-scoped only (no project/session layers).
+        "profile_binding": await _build_tunnel_profile_binding(request.app.state.db),
     })
 
 

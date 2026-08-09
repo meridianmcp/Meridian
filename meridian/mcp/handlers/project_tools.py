@@ -276,6 +276,32 @@ async def handle_start_session(
                     )
         except Exception:  # noqa: BLE001 — orientation must not break
             pass
+    # 89a06e40 — machine-readable effective profile identity/generation
+    # (hosted_default+workspace+user+project+session layers; see
+    # meridian.profile_contract.EffectiveProfile /
+    # db.profile_layers.get_effective_profile), attached alongside every
+    # start_session orientation. SIBLING to the codebase_context enrichment
+    # above but guarded in its OWN try/except — a profile-resolution failure
+    # must never affect codebase_context, and vice versa. Outside the tenant
+    # gate (unlike codebase_context) since get_effective_profile needs only
+    # project_id/session_id, not a tenant — self-hosted sessions get this
+    # field too. See pinned decision ee7bccc9 for why the tunnel/connector
+    # surface deliberately does NOT call this same db.get_effective_profile
+    # path (no project_id is available there).
+    try:
+        if isinstance(result, dict):
+            # Same session_id extraction the bf51b12e block above uses.
+            _sid_for_profile = (
+                result.get("session_id") or result.get("session", {}).get("id")
+            )
+            _effective_profile = await db_module.get_effective_profile(
+                db, _pid, session_id=_sid_for_profile,
+            )
+            result["profile_binding"] = _profile_contract.project_profile_binding(
+                _effective_profile
+            )
+    except Exception:  # noqa: BLE001 — profile binding is best-effort
+        pass
     # 5efe254b / 590dcdd5 — deliver any pending handoff /goal through this
     # trusted tool result (keyed on project_id) rather than as a spoofable
     # copy-pasted chat string. Read-once: pop clears it so it surfaces exactly
