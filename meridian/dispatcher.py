@@ -226,6 +226,92 @@ class Dispatcher:
         # dispatch_once pass finds a promotion-declaring item at all.
         self.last_merger_lock_skips: list[dict[str, Any]] = []
 
+        # 869d6198 — ACTIVE worker lease accounting, deliberately decoupled
+        # from the dedup/frontier ledger above (``self._dispatched``).
+        # ``self._dispatched`` answers "has this item id EVER been handed to
+        # a worker in this process" — permanent membership, read by
+        # dispatch_once's frontier/dedup check ("never re-dispatch the same
+        # item"), and this item does NOT change that check or its meaning.
+        # ``self._active_leases`` answers a different question: "is a
+        # worker for this item id CURRENTLY still running" — transient
+        # membership, meant to back the actual capacity computation
+        # (``in_flight`` vs. ``cap``) instead of ``len(self._dispatched)``.
+        # Before this, capacity was derived from ``len(self._dispatched)``,
+        # which only ever grows: every completed or failed child worker
+        # permanently occupied a capacity slot for the rest of the process's
+        # life, so a long-running dispatcher would silently throttle itself
+        # toward zero new dispatches long after its earlier workers had
+        # already exited. Keyed by item_id -> lease record
+        # ({"item_id", "task", "seq", "status"}); empty until the first
+        # successful enqueue registers one via ``record_worker_lease``.
+        #
+        # Bound as plain instance attributes (closures over this __init__'s
+        # locals) rather than ordinary class methods — the same
+        # injectable-callable pattern this class already uses for
+        # self._enqueue / self._get_groups / self._evaluate_blockers /
+        # self._lease_sweep above. That keeps the entire lease lifecycle
+        # self-contained inside Dispatcher.__init__: dispatch_once (a
+        # DIFFERENT, separately-owned symbol in this same class) can call
+        # self.record_worker_lease(...) after a successful enqueue and
+        # self.release_worker_lease(...) once a child worker's completion is
+        # observed, without either symbol's body needing to know how the
+        # other implements its half of the contract.
+        self._active_leases: dict[str, dict[str, Any]] = {}
+        self._lease_seq: int = 0
+        # Most recent release this dispatcher observed ({"item_id",
+        # "status", "seq"} or None before the first release), mirroring the
+        # existing last_parallelism/last_blocker_decision/last_lease_sweep/
+        # last_merger_lock_skips introspection attributes above — a
+        # caller/dashboard can see the last completed/failed child worker
+        # this dispatcher accounted for without polling _active_leases.
+        self.last_released_lease: "dict[str, Any] | None" = None
+
+        def _record_worker_lease(
+            item_id: str, task: "dict[str, Any] | None" = None,
+        ) -> None:
+            """Register ``item_id`` as an ACTIVE (in-flight) worker lease.
+
+            Intended call site: immediately after a successful enqueue,
+            alongside the existing ``self._dispatched.add(item_id)`` dedup
+            bookkeeping — this call is additive to that, never a
+            replacement for it. Safe to call more than once for the same
+            ``item_id``: re-registers (refreshes ``task``/``seq``) rather
+            than raising, since a retried enqueue path must never be able
+            to corrupt lease state.
+            """
+            self._lease_seq += 1
+            self._active_leases[item_id] = {
+                "item_id": item_id,
+                "task": task,
+                "seq": self._lease_seq,
+                "status": "active",
+            }
+
+        def _release_worker_lease(item_id: str, status: str = "completed") -> None:
+            """Remove ``item_id`` from ACTIVE accounting — capacity release.
+
+            This is the release half of the lease lifecycle: a completed or
+            failed child worker must stop counting against
+            ``max_in_flight`` / ``configured_target`` capacity. Frontier
+            selection is explicitly UNCHANGED by this call — ``item_id``
+            correctly stays in ``self._dispatched`` forever (an item already
+            dispatched is never re-dispatched in this process, regardless of
+            lease status); this method only ever touches
+            ``self._active_leases``. Idempotent and side-effect-free for an
+            ``item_id`` with no active lease (already released, released
+            twice, or never registered) — that is a normal race in an async
+            dispatch loop, never an error condition.
+            """
+            released = self._active_leases.pop(item_id, None)
+            self.last_released_lease = {
+                "item_id": item_id,
+                "status": status,
+                "seq": (released or {}).get("seq"),
+            }
+
+        self.record_worker_lease = _record_worker_lease
+        self.release_worker_lease = _release_worker_lease
+
     # -- lifecycle ---------------------------------------------------------
 
     def start(self) -> asyncio.Task[None]:
