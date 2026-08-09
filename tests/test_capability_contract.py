@@ -134,6 +134,79 @@ async def test_contract_effective_resolver_exception_degrades_to_raw_manifest(db
     assert contract["effective"]["capabilities"] == saved["capabilities"]
 
 
+# ---------------------------------------------------------------------------
+# 137b88a3 — real 02038afe capability_profile resolution actually wired in.
+# Before this fix, _resolve_effective_capabilities looked up a guessed
+# resolve_effective_capabilities/resolve_effective_manifest function on
+# meridian.capability_profile that was never defined there, so
+# effective_source was permanently stuck at "raw_manifest" in production
+# even after profile inheritance (02038afe) shipped.
+# ---------------------------------------------------------------------------
+
+async def test_contract_real_capability_profile_resolves_to_profile_inheritance(db):
+    """A real, persisted capability_profile (02038afe) for this project must
+    actually be used -- effective_source should be "profile_inheritance",
+    not "raw_manifest", once a profile layer contributes something."""
+    project = await db_module.create_project(db, "cap-contract-real-profile")
+    await db_module.set_project_capability_manifest(
+        db, project["id"], [_valid_capability(id="alpha")]
+    )
+    await db_module.set_capability_profile(
+        db, "project", project["id"], capabilities=[_valid_capability(id="beta")],
+    )
+
+    contract = await cc.build_capability_contract(db, project["id"])
+
+    assert contract["effective"]["source"] == "profile_inheritance"
+    # The raw manifest's "alpha" must NOT be silently dropped just because a
+    # profile layer also contributed -- merge_layers folds the two together.
+    assert [c["id"] for c in contract["effective"]["capabilities"]] == ["alpha", "beta"]
+    # requested still mirrors only the raw manifest, untouched by the profile.
+    assert [c["id"] for c in contract["requested"]["capabilities"]] == ["alpha"]
+
+
+async def test_contract_real_capability_profile_overrides_raw_manifest_entry(db):
+    """A profile-layer declaration of the SAME capability id as the raw
+    manifest wins (the more specific/newer source), per merge_layers'
+    documented override semantics -- not silently ignored."""
+    project = await db_module.create_project(db, "cap-contract-profile-override")
+    await db_module.set_project_capability_manifest(
+        db, project["id"],
+        [_valid_capability(id="alpha", required_tools=["ToolA"])],
+    )
+    await db_module.set_capability_profile(
+        db, "project", project["id"],
+        capabilities=[_valid_capability(id="alpha", required_tools=["ToolB"])],
+    )
+
+    contract = await cc.build_capability_contract(db, project["id"])
+
+    assert contract["effective"]["source"] == "profile_inheritance"
+    assert len(contract["effective"]["capabilities"]) == 1
+    assert contract["effective"]["capabilities"][0]["required_tools"] == ["ToolB"]
+
+
+async def test_contract_no_capability_profile_still_degrades_to_raw_manifest(db):
+    """Unchanged behavior for the common case: a project with a raw manifest
+    but NO capability_profile rows at all must still degrade cleanly to
+    "raw_manifest" -- db.get_effective_capability_profile resolves an empty
+    profile for every layer, so there is nothing to layer on top of the
+    manifest, and effective must equal requested exactly (never emptied)."""
+    project = await db_module.create_project(db, "cap-contract-no-profile")
+    saved = await db_module.set_project_capability_manifest(
+        db, project["id"], [_valid_capability(availability_policy="required")]
+    )
+
+    contract = await cc.build_capability_contract(db, project["id"])
+
+    assert contract["effective"]["source"] == "raw_manifest"
+    assert contract["effective"]["capabilities"] == saved["capabilities"]
+    # A "required" capability declared only in the raw manifest must still be
+    # enforced -- effective_capabilities silently coming back empty would
+    # make the executable/missing_required check below a permanent no-op.
+    assert contract["executable"] is True
+
+
 async def test_contract_availability_checker_flags_missing_required(db):
     project = await db_module.create_project(db, "cap-contract-avail-missing")
     await db_module.set_project_capability_manifest(
