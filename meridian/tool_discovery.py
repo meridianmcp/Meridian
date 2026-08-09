@@ -97,11 +97,20 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from . import code_intel_receipt as _code_intel_receipt
 from . import test_run_receipt as _test_run_receipt
 from . import tool_requirements as _tool_requirements
+
+if TYPE_CHECKING:  # pragma: no cover - import used for type annotations only
+    # `datetime` is only ever needed at runtime inside validate_discovery_override /
+    # apply_discovery_override (imported there lazily, aliased to `_datetime`, to keep
+    # the module's own lazy-import style — see the module docstring). The two
+    # `now: "datetime | None"` forward-ref annotations below still need the bare
+    # name `datetime` to resolve for static analysis (Ruff F821), hence this
+    # TYPE_CHECKING-only import instead of a real top-level import.
+    from datetime import datetime
 
 TOOL_DISCOVERY_SCHEMA_VERSION = 1
 DISCOVERY_SCOPE_SCHEMA_VERSION = 1

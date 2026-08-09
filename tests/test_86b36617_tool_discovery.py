@@ -40,6 +40,7 @@ did not exist anywhere in the codebase before this item.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import json as _json
 import sys
@@ -649,3 +650,63 @@ async def test_run_targeted_tests_shell_pipe_can_mask_exit_code_list_form_cannot
     # target's exit code -- demonstrating exactly why the list-exec form is
     # the one this function documents as giving the safety guarantee.
     assert masked["exit_code"] != 3
+
+
+# ---------------------------------------------------------------------------
+# Regression: CI run 31289808800 -- Ruff F821 "undefined name `datetime`" at
+# tool_discovery.py:909 and :965 (validate_discovery_override's and
+# apply_discovery_override's `now: "datetime | None" = None` parameter).
+# Both functions only ever bound `datetime` *locally*, inside their own
+# bodies (`from datetime import datetime as _datetime, timezone as
+# _timezone`), never at module scope -- so the quoted forward-ref annotation
+# genuinely had nothing to resolve against for static analysis, even though
+# `from __future__ import annotations` meant it never broke at runtime. Fix
+# was a `if TYPE_CHECKING: from datetime import datetime` module-level
+# import, which Ruff/mypy resolve annotation forward-refs against without
+# adding a real runtime import. This test parses the module's own source so
+# it fails on the original bug and needs no `ruff` install (not in the
+# default pixi env; see tests/test_w5_736d300e_ruff_blocking.py).
+# ---------------------------------------------------------------------------
+
+def test_tool_discovery_datetime_annotation_resolves_at_module_scope():
+    def _binds_datetime(node: ast.stmt) -> bool:
+        if isinstance(node, ast.Import):
+            return any(
+                alias.name == "datetime" and (alias.asname or alias.name) == "datetime"
+                for alias in node.names
+            )
+        if isinstance(node, ast.ImportFrom):
+            return node.module == "datetime" and any(
+                alias.name == "datetime" and (alias.asname or alias.name) == "datetime"
+                for alias in node.names
+            )
+        return False
+
+    def _is_type_checking_guard(test: ast.expr) -> bool:
+        return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+            isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+        )
+
+    with open(td.__file__, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read(), filename=td.__file__)
+
+    bound_at_module_scope = any(_binds_datetime(node) for node in tree.body)
+    bound_under_type_checking = any(
+        _binds_datetime(inner)
+        for node in tree.body
+        if isinstance(node, ast.If) and _is_type_checking_guard(node.test)
+        for inner in node.body
+    )
+
+    assert bound_at_module_scope or bound_under_type_checking, (
+        "meridian/tool_discovery.py's `now: \"datetime | None\"` forward-ref "
+        "annotations (validate_discovery_override / apply_discovery_override) "
+        "reference `datetime`, but nothing binds that name at module scope or "
+        "inside an `if TYPE_CHECKING:` guard -- this is the exact CI run "
+        "31289808800 Ruff F821 regression (undefined name 'datetime')."
+    )
+
+    # The two annotated call sites themselves still exist and still use the
+    # bare `datetime` forward-ref -- guards against this test silently going
+    # stale if the annotation is later rewritten to something else entirely.
+    assert 'now: "datetime | None" = None' in open(td.__file__, encoding="utf-8").read()
