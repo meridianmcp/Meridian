@@ -12253,6 +12253,21 @@ from .wave_runs import (  # noqa: F401
     get_wave_run_children,
     # Finalization
     finalize_wave_run,
+    # 7d71d6bc — RESCUE-R2: child leases, dispatch provenance, no-op resume
+    # protection.
+    WAVE_RUN_CHILD_DEFAULT_LEASE_TTL_SECONDS,
+    WAVE_RUN_CHILD_LEASE_LIVE,
+    WAVE_RUN_CHILD_LEASE_STALE_ORPHAN,
+    WAVE_RUN_CHILD_LEASE_COMPLETED,
+    WAVE_RUN_CHILD_LEASE_EMPTY_INVALID,
+    WAVE_RUN_CHILD_LEASE_STATES,
+    ForeignWaveRunChildLeaseError,
+    classify_wave_run_child_lease,
+    find_active_wave_run_child_for_item,
+    claim_wave_run_child,
+    heartbeat_wave_run_child,
+    record_wave_run_child_outcome,
+    get_wave_run_recovery_plan,
 )
 
 

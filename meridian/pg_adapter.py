@@ -4070,7 +4070,11 @@ async def _migrate_pg_wave_runs(conn: PostgresConnection) -> None:
     degraded-tool provenance, and write-once finalizer evidence), its strictly
     append-only event history (monotonic per-run seq, corrections expressed by
     superseding rather than mutation), and its per-sprint-item children (whose
-    failure_mode='stop' outcome structurally blocks finalization).
+    failure_mode='stop' outcome structurally blocks finalization). 7d71d6bc
+    (RESCUE-R2) added child-lease/dispatch-provenance columns (agent_id,
+    claimed_at, last_heartbeat_at, lease_ttl_seconds, exit_code, attempt,
+    dispatch_provenance) via idempotent ADD COLUMN IF NOT EXISTS — see
+    meridian.db.wave_runs for the functions that populate/read them.
 
     CREATE_TABLES_CORE covers fresh DBs; this is the upgrade path. Every index
     lives here, never inline in CREATE_TABLES_CORE, to avoid the unguarded-index
@@ -4121,12 +4125,40 @@ async def _migrate_pg_wave_runs(conn: PostgresConnection) -> None:
         "    status TEXT NOT NULL DEFAULT 'running',"
         "    evidence TEXT,"
         "    actor TEXT,"
+        "    agent_id TEXT,"
+        "    claimed_at TEXT,"
+        "    last_heartbeat_at TEXT,"
+        "    lease_ttl_seconds INTEGER,"
+        "    exit_code INTEGER,"
+        "    attempt INTEGER NOT NULL DEFAULT 1,"
+        "    dispatch_provenance TEXT,"
         f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
         f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
         "    UNIQUE(wave_run_id, sprint_item_id)"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_wave_run_children_run "
         "ON wave_run_children(wave_run_id, status);"
+        # 7d71d6bc (RESCUE-R2) — additive lease/dispatch-provenance columns
+        # for a wave_run_children table that may already exist from before
+        # this fix (the CREATE TABLE above only applies to a fresh DB).
+        # IF NOT EXISTS makes every ALTER idempotent, same pattern as the
+        # sibling ADD-COLUMN migrations in this file (e.g.
+        # _migrate_pg_sprint_item_tool_requirements). Mirrors
+        # db.migrations._migrate_wave_runs's _migrate_add_column_if_missing
+        # calls for the SQLite side.
+        "ALTER TABLE wave_run_children ADD COLUMN IF NOT EXISTS agent_id TEXT;"
+        "ALTER TABLE wave_run_children ADD COLUMN IF NOT EXISTS claimed_at TEXT;"
+        "ALTER TABLE wave_run_children "
+        "ADD COLUMN IF NOT EXISTS last_heartbeat_at TEXT;"
+        "ALTER TABLE wave_run_children "
+        "ADD COLUMN IF NOT EXISTS lease_ttl_seconds INTEGER;"
+        "ALTER TABLE wave_run_children ADD COLUMN IF NOT EXISTS exit_code INTEGER;"
+        "ALTER TABLE wave_run_children "
+        "ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 1;"
+        "ALTER TABLE wave_run_children "
+        "ADD COLUMN IF NOT EXISTS dispatch_provenance TEXT;"
+        "CREATE INDEX IF NOT EXISTS idx_wave_run_children_lease "
+        "ON wave_run_children(wave_run_id, status, last_heartbeat_at);"
     )
 
 

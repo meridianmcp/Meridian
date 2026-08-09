@@ -7332,6 +7332,72 @@ async def build_run_timeline_for_handoff(
     }
 
 
+async def log_handoff_correction_event(
+    db: Any,
+    project_id: str,
+    event_type: str,
+    *,
+    session_id: "str | None",
+    correlation_id: "str | None",
+    payload: "dict[str, Any]",
+    payload_schema: str,
+    source: str = "handoff",
+) -> None:
+    """e0b88967 (R2-H contract matrix) — the SHARED, best-effort durable
+    trace for a planner/executor corrective handoff, factored out so every
+    interface that can record one gets the SAME ``handoff.correction_recorded``/
+    ``handoff.correction_regenerated`` ai_log event, not just whichever
+    interface happened to be wired first.
+
+    BACKGROUND / WHY THIS EXISTS: 79491e26 added this durable trace, but only
+    inside ``routes.handoff.record_handoff_correction_endpoint``'s own
+    private ``_log_correction_event`` helper (the REST mirror). The
+    ``record_handoff_correction`` MCP tool -- ``mcp/handler.py``'s
+    ``_handle_task_tools`` dispatch, the interface an executor session
+    actually calls (this codebase is MCP-first; see AGENTS.md) -- called
+    :func:`record_handoff_correction`/:func:`regenerate_handoff_correction`
+    directly and never logged the event, so a correction recorded through the
+    MCP tool was invisible to :func:`build_run_timeline_for_handoff` /
+    :func:`build_run_timeline_for_handoff`'s durable-timeline reconstruction
+    even though the REST-recorded equivalent was not -- an integration gap
+    this item's own "resume/corrective handoff" contract-matrix coverage
+    caught (see ``tests/test_ai_log_contract_matrix.py``). This function is
+    now the single shared implementation ``mcp/handler.py`` calls directly;
+    ``routes.handoff._log_correction_event`` keeps its own (currently
+    identical) body rather than being refactored to delegate here, since
+    ``meridian/routes/handoff.py`` is outside this item's locked
+    touches_resources -- a follow-up cleanup can unify them without changing
+    behavior either caller already relies on.
+
+    Fire-and-forget by design, mirroring
+    ``routes.handoff._log_correction_event``'s exact contract: an ai_log
+    write problem (a pre-9e83be4a DB missing ``ai_log_events``, a transient
+    secret-shaped-payload rejection from
+    :func:`meridian.secret_redaction.check_for_secrets`, anything else) must
+    never make a legitimate correction unrecordable -- the caller's own
+    failure contract is completely unaffected by this function's outcome.
+    ``correlation_id`` should be the correction's ``source_handoff_id`` so
+    every event tied to one source handoff's correction lifecycle (recorded,
+    then regenerated) groups under one correlation id on the reconstructed
+    timeline, exactly like the REST path. ``source`` distinguishes which
+    interface recorded the correction (``"mcp"`` vs. ``"routes.handoff"``)
+    without changing the event_type/payload_schema taxonomy.
+    """
+    try:
+        await ai_log_module.AiLogStore(db, project_id).append(
+            event_type,
+            "session" if session_id else "system",
+            actor_id=session_id,
+            session_id=session_id,
+            correlation_id=correlation_id,
+            source=source,
+            payload=payload,
+            payload_schema=payload_schema,
+        )
+    except Exception:  # noqa: BLE001 — best-effort, never blocks the correction
+        pass
+
+
 async def build_effective_capability_contract(
     db: Any, project_id: str, *, board_stale: bool = False,
     version: "str | None" = None, items: "list[dict[str, Any]] | None" = None,
