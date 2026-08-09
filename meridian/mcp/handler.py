@@ -3458,11 +3458,32 @@ async def _handle_task_tools(
             )
         except handoff_module_local.HandoffCorrectionError as exc:
             return {"error": "HANDOFF_CORRECTION_INVALID", "message": str(exc)}
+        # e0b88967 (R2-H contract matrix) — durable trace, mirroring
+        # routes.handoff.record_handoff_correction_endpoint's own
+        # _log_correction_event so a correction recorded via THIS (the
+        # MCP-first, executor-facing) interface is equally reconstructible
+        # from build_run_timeline_for_handoff, not just the REST mirror.
+        # Best-effort — see log_handoff_correction_event's own docstring;
+        # never affects this dispatch's return value either way.
+        await handoff_module_local.log_handoff_correction_event(
+            db, _pid, "handoff.correction_recorded",
+            session_id=_correction.get("session_id"),
+            correlation_id=_correction.get("source_handoff_id"),
+            payload={
+                "correction_id": _correction.get("id"),
+                "source_handoff_id": _correction.get("source_handoff_id"),
+                "blocker_classification": _correction.get("blocker_classification"),
+                "status": _correction.get("status"),
+                "version": _correction.get("version"),
+            },
+            payload_schema="handoff_correction_recorded@1",
+            source="mcp",
+        )
         if not args.get("regenerate"):
             return {"correction": _correction, "regenerated": False}
         _out_dir = args.get("output_dir") or data_dir
         try:
-            return await handoff_module_local.regenerate_handoff_correction(
+            _regen_result = await handoff_module_local.regenerate_handoff_correction(
                 db, _pid, _correction["id"], _out_dir,
                 session_id=args.get("session_id"),
                 mode=args.get("mode") or "full",
@@ -3473,6 +3494,21 @@ async def _handle_task_tools(
                 "error": "HANDOFF_CORRECTION_REGENERATE_FAILED",
                 "message": str(exc),
             }
+        # e0b88967 — same shared durable trace for the regeneration outcome.
+        await handoff_module_local.log_handoff_correction_event(
+            db, _pid, "handoff.correction_regenerated",
+            session_id=_correction.get("session_id"),
+            correlation_id=_correction.get("source_handoff_id"),
+            payload={
+                "correction_id": _correction.get("id"),
+                "new_handoff_id": _regen_result.get("new_handoff_id"),
+                "amended": _regen_result.get("amended"),
+                "invalidated_source": bool(_regen_result.get("invalidated_source")),
+            },
+            payload_schema="handoff_correction_regenerated@1",
+            source="mcp",
+        )
+        return _regen_result
     if name == "verify_handoff_token":
         # cb8e7c0f — verify a provenance token extracted from a pasted /goal block.
         # Delegates to DB-backed token store in handoff.py (shared across machines).
