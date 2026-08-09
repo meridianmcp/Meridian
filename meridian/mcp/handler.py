@@ -17,6 +17,7 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any
 
 import meridian.server as _server
@@ -6017,6 +6018,87 @@ async def _handle_code_index_tools(
 _COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S = 45.0
 
 
+# ---------------------------------------------------------------------------
+# 394bcbdf — completion-attempt phase registry.
+#
+# a2a027cf gave complete_sprint_item idempotent retries and a dispatch-level
+# timeout response classified into committed / timed_out_before_commit /
+# unknown_outcome. This registry adds the piece that was still missing: a
+# durable-for-the-life-of-this-process record of which PHASE a specific
+# dispatch attempt (keyed by its correlation_id) reached --
+# "accepted" (the dispatcher received the call) -> "pending" (handed off to
+# the underlying tool-group dispatch) -> "committed" | "failed" (the final
+# outcome). This makes a timed-out attempt ASYNCHRONOUSLY RECOVERABLE: a
+# caller (or an unrelated follow-up support/monitoring call) that only has
+# the correlation_id from a timed-out response can call
+# get_completion_attempt(correlation_id) to see what happened to THAT
+# specific attempt, independent of re-deriving it from the item's bare
+# current status.
+#
+# Deliberately process-local and best-effort, exactly like every other
+# in-process cache in this module (_SESSION_REFRESH_STATE, _EXECUTOR_SESSIONS)
+# -- NOT a replacement for the sprint_items row, which remains the one
+# durable source of truth for whether an item is actually done. Bounded FIFO
+# eviction keeps memory flat regardless of call volume.
+# ---------------------------------------------------------------------------
+
+_COMPLETION_ATTEMPT_MAX = 500
+_completion_attempts: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+
+def _record_completion_phase(
+    correlation_id: str, phase: str, **extra: Any,
+) -> None:
+    """Record/advance one completion attempt's phase history.
+
+    Never raises (a diagnostics-only side channel must never break a real
+    tool call): any unexpected failure is swallowed. Bounded FIFO eviction —
+    once more than ``_COMPLETION_ATTEMPT_MAX`` distinct correlation_ids are
+    tracked, the oldest is dropped — so this can never grow unbounded across
+    a long-lived server process.
+    """
+    try:
+        entry = _completion_attempts.get(correlation_id)
+        if entry is None:
+            entry = {"correlation_id": correlation_id, "phases": []}
+            _completion_attempts[correlation_id] = entry
+        entry["phases"].append({"phase": phase, "at": time.time(), **extra})
+        for _k in ("item_id", "project_id"):
+            if extra.get(_k) is not None:
+                entry[_k] = extra[_k]
+        entry["latest_phase"] = phase
+        _completion_attempts.move_to_end(correlation_id)
+        while len(_completion_attempts) > _COMPLETION_ATTEMPT_MAX:
+            _completion_attempts.popitem(last=False)
+    except Exception:  # noqa: BLE001 — diagnostics registry must never break a call
+        pass
+
+
+def get_completion_attempt(correlation_id: str) -> "dict[str, Any] | None":
+    """Look up a completion attempt's recorded phase history by
+    correlation_id.
+
+    This is the "asynchronously recoverable" half of 394bcbdf: a caller (or
+    a later, unrelated call) holding only a correlation_id from a timed-out
+    complete_sprint_item response can recover what phase that SPECIFIC
+    attempt reached, without needing item_id/project_id. Returns ``None``
+    when the correlation_id is unknown -- never recorded, or evicted (this
+    is a best-effort, bounded, process-local registry, not durable
+    storage; a server restart clears it exactly like every other in-process
+    cache in this module).
+    """
+    entry = _completion_attempts.get(correlation_id)
+    if entry is None:
+        return None
+    # Defensive copy: the caller must never be able to mutate the live
+    # registry entry through the returned dict. dict(entry) alone is only a
+    # shallow copy — "phases" is a list of dicts, both of which need their
+    # own copies too.
+    copied = dict(entry)
+    copied["phases"] = [dict(p) for p in entry["phases"]]
+    return copied
+
+
 async def _complete_sprint_item_timeout_response(
     db: Any, args: dict[str, Any], correlation_id: str, elapsed_s: float,
 ) -> dict[str, Any]:
@@ -6040,6 +6122,21 @@ async def _complete_sprint_item_timeout_response(
     * the re-query itself fails (or the item/project can't be resolved) ->
       ``"unknown_outcome"``: genuinely can't tell; the caller must re-query
       via get_sprint_items/get_sprint_item before deciding anything.
+
+    394bcbdf — resource-aware retry-after diagnostics: alongside the outcome
+    classification above, best-effort self-sample THIS server process's own
+    memory/CPU footprint (``meridian.process_budget.sample_server_process``)
+    and fold the resulting report into a ``resource_diagnostics`` field. A
+    45s dispatch-level stall is far more likely explained by host resource
+    pressure than by ordinary latency when the server process is itself over
+    its configured budget (action ``"quiesce"``/``"kill"``) -- in that case
+    ``retry_after_seconds`` reflects the monitor's own sample interval
+    instead of implying an immediate retry is equally likely to help. Never
+    raises and never blocks the timeout response: sampling is itself
+    best-effort (degrades to action ``"none"`` when psutil is unavailable or
+    the self-sample otherwise fails) and this whole block is wrapped so a
+    diagnostics failure can never turn an already-timed-out response into a
+    second failure.
     """
     item_id = args.get("item_id")
     project_id = args.get("project_id")
@@ -6053,6 +6150,30 @@ async def _complete_sprint_item_timeout_response(
                 outcome = "committed" if current_status == "done" else "timed_out_before_commit"
     except Exception:  # noqa: BLE001 — the re-query itself failing IS the unknown case
         outcome = "unknown_outcome"
+
+    resource_diagnostics: dict[str, Any] = {
+        "action": "none", "reason": "unavailable", "retry_after_seconds": 0.0,
+    }
+    try:
+        from .. import process_budget as process_budget_module  # noqa: PLC0415
+        _report = process_budget_module.sample_server_process()
+        resource_diagnostics = {
+            "action": _report.action,
+            "reason": _report.reason,
+            "retry_after_seconds": process_budget_module.retry_after_seconds_for_report(_report),
+        }
+    except Exception:  # noqa: BLE001 — diagnostics are best-effort only
+        pass
+
+    _resource_note = ""
+    if resource_diagnostics.get("action") in ("quiesce", "kill"):
+        _resource_note = (
+            f" Server process itself is currently {resource_diagnostics['action']!r} "
+            f"({resource_diagnostics['reason']}) — this stall is more likely resource "
+            f"pressure than ordinary latency; wait at least "
+            f"~{resource_diagnostics['retry_after_seconds']:.0f}s before retrying."
+        )
+
     return {
         "error": "COMPLETE_SPRINT_ITEM_TIMEOUT",
         "item_id": item_id,
@@ -6060,6 +6181,7 @@ async def _complete_sprint_item_timeout_response(
         "completion_outcome": outcome,
         "current_status": current_status,
         "elapsed_s": round(elapsed_s, 3),
+        "resource_diagnostics": resource_diagnostics,
         "message": (
             f"complete_sprint_item did not respond within the dispatch "
             f"timeout ({elapsed_s:.1f}s elapsed, correlation_id="
@@ -6070,7 +6192,7 @@ async def _complete_sprint_item_timeout_response(
             "complete_sprint_item is idempotent for that case regardless "
             "(a retry against an already-done item returns "
             "completion_outcome='already_committed', never a duplicate "
-            "completion or a misleading failure)."
+            "completion or a misleading failure)." + _resource_note
         ),
     }
 
@@ -6142,6 +6264,18 @@ async def _dispatch_mcp_tool(
         _dispatch_correlation_id = str(args.get("correlation_id") or uuid.uuid4().hex)
         args = {**args, "correlation_id": _dispatch_correlation_id}
         _dispatch_t0 = time.monotonic()
+        # 394bcbdf — phase registry: "accepted" (dispatch received the call
+        # and minted/echoed its correlation_id) then "pending" (about to
+        # hand off to the underlying tool-group dispatch) recorded together,
+        # both before the first await below — see get_completion_attempt.
+        _record_completion_phase(
+            _dispatch_correlation_id, "accepted",
+            item_id=args.get("item_id"), project_id=args.get("project_id"),
+        )
+        _record_completion_phase(
+            _dispatch_correlation_id, "pending",
+            item_id=args.get("item_id"), project_id=args.get("project_id"),
+        )
     for _grp in _groups:
         if _is_complete_sprint_item:
             try:
@@ -6153,6 +6287,28 @@ async def _dispatch_mcp_tool(
                 _result = await _complete_sprint_item_timeout_response(
                     db, args, _dispatch_correlation_id,
                     time.monotonic() - _dispatch_t0,
+                )
+            if _result is not _MISS:
+                # 394bcbdf — final phase: "committed" when the underlying
+                # call (or, on a dispatch timeout, the re-query it triggers)
+                # confirms the item actually reached 'done'; "failed"
+                # otherwise (a structured error dict — STATUS_RACE,
+                # CI_FAILING, etc. — or a genuine timed_out_before_commit /
+                # unknown_outcome). Only the sprint-tools group ever returns
+                # non-_MISS for this tool name, so this fires exactly once
+                # per call.
+                _committed = (
+                    isinstance(_result, dict)
+                    and _result.get("completion_outcome") in ("committed", "already_committed")
+                )
+                _record_completion_phase(
+                    _dispatch_correlation_id,
+                    "committed" if _committed else "failed",
+                    item_id=args.get("item_id"), project_id=args.get("project_id"),
+                    completion_outcome=(
+                        _result.get("completion_outcome") if isinstance(_result, dict) else None
+                    ),
+                    error=_result.get("error") if isinstance(_result, dict) else None,
                 )
         else:
             _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)

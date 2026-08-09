@@ -403,3 +403,104 @@ class ProcessBudgetMonitor:
             ),
         )
         self._next_eligible_time = when + self._backoff_seconds
+
+
+# ---------------------------------------------------------------------------
+# Server-self monitoring (394bcbdf) — resource-aware completion-timeout
+# diagnostics.
+#
+# The rest of this module only ever evaluates a pid a CALLER already proved
+# it owns (see the module docstring). The server process's own pid
+# (``os.getpid()``) is the one trivial exception: a process always owns
+# itself, so self-sampling never violates the "only proven-owned processes"
+# contract above -- there is no discovery step, just ``os.getpid()``.
+#
+# This singleton exists so completion-timeout diagnostics
+# (meridian.mcp.handler's dispatch-level timeout response) and
+# complete_sprint_item's own advisory-work-deferred reporting
+# (meridian.db.sprint_items) can ask "is THIS server process itself under
+# memory/CPU pressure right now?" without each call site re-implementing
+# sampling or re-inventing the graceful-quiesce-then-kill escalation the
+# monitor above already provides. A single shared monitor (rather than a
+# fresh one per call) is what makes the "second consecutive breach"
+# escalation logic meaningful across repeated diagnostic samples.
+# ---------------------------------------------------------------------------
+
+_SERVER_PROCESS_MONITOR: "ProcessBudgetMonitor | None" = None
+
+
+def reset_server_process_monitor(
+    budget: "ProcessBudget | None" = None,
+) -> ProcessBudgetMonitor:
+    """(Re)create the process-wide server-self :class:`ProcessBudgetMonitor`.
+
+    Called once at server startup (``meridian.server.lifespan``) so the
+    monitor's consecutive-breach/backoff state is scoped to ONE server
+    process lifetime -- a fresh monitor per boot, never stale state left
+    over from a previous run in the same interpreter (relevant for the test
+    suite, where many independent ``TestClient`` lifespans can share one
+    process). Also directly callable by tests that need a known-clean
+    monitor. Returns the new singleton.
+    """
+    global _SERVER_PROCESS_MONITOR
+    _SERVER_PROCESS_MONITOR = ProcessBudgetMonitor("server-self", budget)
+    return _SERVER_PROCESS_MONITOR
+
+
+def get_server_process_monitor() -> ProcessBudgetMonitor:
+    """Return the process-wide server-self monitor, lazily creating it with
+    defaults on first access if ``reset_server_process_monitor`` (normally
+    called by ``meridian.server.lifespan`` at startup) never ran -- e.g. the
+    stdio/CLI MCP entry point, which never goes through the FastAPI
+    lifespan."""
+    global _SERVER_PROCESS_MONITOR
+    if _SERVER_PROCESS_MONITOR is None:
+        _SERVER_PROCESS_MONITOR = ProcessBudgetMonitor("server-self")
+    return _SERVER_PROCESS_MONITOR
+
+
+def sample_server_process(
+    proc_factory: "Callable[[int], Any] | None" = None,
+) -> BudgetReport:
+    """Best-effort self-sample + evaluate for the CURRENT process
+    (``os.getpid()``) against the server-self singleton monitor.
+
+    Never raises: :func:`sample_process` already swallows psutil-missing /
+    process-gone / access-denied errors (returning ``None``), and
+    :meth:`ProcessBudgetMonitor.evaluate` never raises on a ``None`` sample
+    (it returns action ``"none"`` reason ``"no_sample"``). This is the
+    resource-aware diagnostic primitive completion-timeout responses use to
+    decide whether the process delivering the response is itself under
+    memory/CPU pressure right now (394bcbdf) -- distinguishing "the server
+    is slow because it's over its own configured budget, a retry needs to
+    wait" from "the server is healthy, this was ordinary latency."
+    """
+    monitor = get_server_process_monitor()
+    pid = os.getpid()
+    sample = sample_process(pid, proc_factory=proc_factory)
+    return monitor.evaluate(pid, sample)
+
+
+def retry_after_seconds_for_report(report: BudgetReport) -> float:
+    """Map a :class:`BudgetReport` to a resource-aware retry-after
+    recommendation, in seconds, for diagnostics surfaced to a caller whose
+    completion call timed out (394bcbdf). Pure function of the report;
+    never raises.
+
+    * ``"quiesce"``/``"kill"`` (a real breach) -> the monitor's own
+      ``sample_interval_seconds`` -- how long until the monitor would next
+      re-evaluate this process, i.e. the earliest point at which "is it
+      still breaching" could even change.
+    * ``reason == "backoff_cooldown"`` (a prior kill's survivor is still
+      cooling down) -> the same ``sample_interval_seconds`` floor, since the
+      monitor's own remaining-cooldown value is private state not exposed
+      on the report.
+    * Anything else (``"none"``/``"within_budget"``/``"no_sample"``/
+      ``"budget_disabled"``) -> ``0.0``: no resource-pressure reason to
+      recommend waiting any longer than the caller otherwise would.
+    """
+    if report.action in ("quiesce", "kill"):
+        return report.budget.sample_interval_seconds
+    if report.reason == "backoff_cooldown":
+        return report.budget.sample_interval_seconds
+    return 0.0
