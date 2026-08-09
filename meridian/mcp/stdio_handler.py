@@ -594,6 +594,18 @@ def build_mcp_server():
             # divergent schemas for these tools going forward.
             _shared_tool("load_handoff"),
             _shared_tool("verify_handoff_token"),
+            # d0854621 — record_handoff_correction had the exact same gap
+            # f46372e8 fixed for load_handoff/verify_handoff_token above: it
+            # is fully implemented and dispatched on the HTTP MCP transport
+            # (meridian/mcp/handler.py's _handle_task_tools) and as its own
+            # REST route (meridian/routes/handoff.py's
+            # record_handoff_correction_endpoint), but was never advertised
+            # OR dispatched on the stdio transport, so a self-hosted stdio
+            # client had no way to record a corrective handoff or invoke its
+            # regenerate=true new-revision path — every call fell through to
+            # call_tool()'s final "unknown tool" branch. Same _shared_tool()
+            # schema-parity guarantee as load_handoff/verify_handoff_token.
+            _shared_tool("record_handoff_correction"),
             Tool(
                 name="get_context_block",
                 description=(
@@ -2512,13 +2524,20 @@ def build_mcp_server():
                 result = await _dispatch_mcp_tool(
                     "get_context_block", arguments, db, state["data_dir"]
                 )
-            elif name in ("load_handoff", "verify_handoff_token"):
-                # f46372e8 — these two were advertised nowhere and dispatched
-                # nowhere on the stdio transport (see the list_tools() comment
-                # above _shared_tool("load_handoff")); route through the same
-                # _dispatch_mcp_tool -> _handle_task_tools path the HTTP MCP
-                # transport uses so all three transports share one
-                # implementation and can't drift out of sync with each other.
+            elif name in (
+                "load_handoff", "verify_handoff_token",
+                "record_handoff_correction",
+            ):
+                # f46372e8 (load_handoff/verify_handoff_token) + d0854621
+                # (record_handoff_correction) — these were advertised nowhere
+                # and dispatched nowhere on the stdio transport (see the
+                # list_tools() comment above _shared_tool("load_handoff"));
+                # route through the same _dispatch_mcp_tool -> _handle_task_tools
+                # path the HTTP MCP transport uses so all three transports
+                # share one implementation and can't drift out of sync with
+                # each other. This also covers record_handoff_correction's
+                # regenerate=true path (delegates internally to
+                # regenerate_handoff_correction) with zero extra wiring here.
                 result = await _dispatch_mcp_tool(
                     name, arguments, db, state["data_dir"]
                 )

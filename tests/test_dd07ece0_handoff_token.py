@@ -1485,6 +1485,157 @@ async def test_load_handoff_content_byte_identical_between_mcp_and_stdio_transpo
 
 
 # ---------------------------------------------------------------------------
+# d0854621 — record_handoff_correction had the exact same stdio transport
+# gap f46372e8 fixed above for load_handoff/verify_handoff_token: it was
+# fully implemented and dispatched on the HTTP MCP transport
+# (meridian/mcp/handler.py's _handle_task_tools) and as its own REST route
+# (meridian/routes/handoff.py's record_handoff_correction_endpoint), but
+# never advertised OR dispatched on the stdio transport
+# (meridian/mcp/stdio_handler.py) — every stdio call fell through to
+# call_tool()'s final "unknown tool" branch, so a self-hosted stdio client
+# had no way to record a corrective handoff for a blocked executor session
+# or invoke its regenerate=true new-revision path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stdio_transport_advertises_record_handoff_correction(monkeypatch, db):
+    import mcp.types as mcp_types
+    from meridian.mcp_tools import _MCP_TOOLS_LIST
+
+    import meridian.server  # noqa: F401
+
+    server = _build_stdio_server(monkeypatch, db)
+    list_handler = server.request_handlers[mcp_types.ListToolsRequest]
+    listed = await list_handler(mcp_types.ListToolsRequest(method="tools/list"))
+    names = {t.name for t in listed.root.tools}
+    assert "record_handoff_correction" in names, (
+        "record_handoff_correction must be advertised on the stdio transport"
+    )
+
+    # Schema parity: the stdio Tool object must match the canonical HTTP/MCP
+    # schema in mcp_tools.py exactly (_shared_tool()).
+    canonical = {item["name"]: item for item in _MCP_TOOLS_LIST}
+    tool = next(t for t in listed.root.tools if t.name == "record_handoff_correction")
+    assert tool.description == canonical["record_handoff_correction"]["description"]
+    assert tool.inputSchema == canonical["record_handoff_correction"]["inputSchema"]
+
+
+@pytest.mark.asyncio
+async def test_stdio_transport_dispatches_record_handoff_correction_record_only(
+    monkeypatch, db, tmp_path,
+):
+    """regenerate defaults to false: the call must record a correction
+    without invalidating/regenerating the source handoff."""
+    import mcp.types as mcp_types
+
+    import meridian.server  # noqa: F401
+
+    p = await db_module.create_project(
+        db, "stdio-record-handoff-correction-record-only",
+    )
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    _path, _content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+    )
+    rows = await db_module.get_handoffs(db, p["id"], limit=1)
+    source_handoff_id = rows[0]["id"]
+
+    server = _build_stdio_server(monkeypatch, db)
+    call_handler = server.request_handlers[mcp_types.CallToolRequest]
+    called = await call_handler(
+        mcp_types.CallToolRequest(
+            params=mcp_types.CallToolRequestParams(
+                name="record_handoff_correction",
+                arguments={
+                    "project_id": p["id"],
+                    "source_handoff_id": source_handoff_id,
+                    "blocker_classification": "scope_stale",
+                },
+            )
+        )
+    )
+    result = json.loads(called.root.content[0].text)
+    assert "error" not in result, (
+        f"record_handoff_correction must be dispatchable over stdio, got: {result}"
+    )
+    assert result["regenerated"] is False
+    assert result["correction"]["source_handoff_id"] == source_handoff_id
+    assert result["correction"]["blocker_classification"] == "scope_stale"
+
+    # A record-only (non-material) correction must not invalidate the source.
+    refreshed = await db_module.get_handoffs(db, p["id"], limit=1)
+    assert refreshed[0]["invalidated"] in (False, 0, None)
+
+
+@pytest.mark.asyncio
+async def test_stdio_transport_dispatches_record_handoff_correction_with_regenerate(
+    monkeypatch, db, tmp_path,
+):
+    """regenerate=true must invalidate the source handoff and produce a new
+    revision, dispatchable end-to-end over the stdio transport."""
+    import mcp.types as mcp_types
+
+    import meridian.server  # noqa: F401
+
+    p = await db_module.create_project(
+        db, "stdio-record-handoff-correction-regenerate",
+    )
+    await db_module.set_goal(db, p["id"], "ship it", sprint="s1")
+    _path, _content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True,
+    )
+    rows = await db_module.get_handoffs(db, p["id"], limit=1)
+    source_handoff_id = rows[0]["id"]
+
+    server = _build_stdio_server(monkeypatch, db)
+    call_handler = server.request_handlers[mcp_types.CallToolRequest]
+    called = await call_handler(
+        mcp_types.CallToolRequest(
+            params=mcp_types.CallToolRequestParams(
+                name="record_handoff_correction",
+                arguments={
+                    "project_id": p["id"],
+                    "source_handoff_id": source_handoff_id,
+                    "blocker_classification": "pointer_unresolved",
+                    "regenerate": True,
+                    "output_dir": str(tmp_path),
+                },
+            )
+        )
+    )
+    result = json.loads(called.root.content[0].text)
+    assert "error" not in result, (
+        f"record_handoff_correction regenerate=true must be dispatchable "
+        f"over stdio, got: {result}"
+    )
+    assert result["regenerated"] is True
+    assert result["new_handoff_id"]
+    assert result["new_handoff_content"], (
+        "regenerate=true must render a new handoff body"
+    )
+    assert result["invalidated_source"]["invalidated"] in (True, 1)
+
+    # The source row is now invalidated (audit trail preserved, body untouched)
+    # and load_handoff's correction surface reflects the new revision.
+    source_row = await db_module.get_handoff(db, source_handoff_id)
+    assert source_row["invalidated"] in (True, 1)
+
+    load_result = await call_handler(
+        mcp_types.CallToolRequest(
+            params=mcp_types.CallToolRequestParams(
+                name="load_handoff", arguments={"project_id": p["id"]},
+            )
+        )
+    )
+    load_payload = json.loads(load_result.root.content[0].text)
+    assert load_payload["correction"] is not None, (
+        "load_handoff's correction field must surface the regenerated "
+        "correction over the stdio transport"
+    )
+
+
+# ---------------------------------------------------------------------------
 # ffd7269c — cross-mode determinism + token/body-integrity hardening.
 #
 # test_repeated_generate_handoff_calls_differ_only_by_token above only ever
