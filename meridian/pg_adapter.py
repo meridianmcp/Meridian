@@ -4561,7 +4561,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_proposal_evidence_links,
     _migrate_pg_wave_base_manifests,
     _migrate_pg_sprint_batch_claims,
-    _migrate_pg_sprint_batch_claims_reservation_fields,
     _migrate_pg_verification_runs,
     _migrate_pg_sprint_item_require_strict_evidence,
     _migrate_pg_handoffs_invalidation,
@@ -4573,4 +4572,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_decision_evidence,
     _migrate_pg_ai_log_events,
     _migrate_pg_proposal_intake_drafts,
+    _migrate_pg_sprint_batch_claims_reservation_fields,
 )

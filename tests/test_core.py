@@ -7927,10 +7927,11 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_decision_evidence",
         "_migrate_pg_ai_log_events",
         "_migrate_pg_proposal_intake_drafts",
+        "_migrate_pg_sprint_batch_claims_reservation_fields",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 148
+    assert len(allnames) == len(set(allnames)) == 149
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
