@@ -17344,3 +17344,158 @@ def read_document_snapshot(
     result["total"] = len(scoped_paragraphs)
     result["section_anchor"] = section_anchor
     return result
+
+
+# ---------------------------------------------------------------------------
+# INVESTIGATE 1c547624 (item_group: proposal:rag-semantic-tool-routing)
+# "design structure-aware RAG for OOXML, code graphs, captions, sections, and
+# provenance instead of generic blind chunking"
+#
+# THIS BLOCK IS DESIGN ONLY -- nothing below is wired up or imported by
+# anything. Mirrors how the sibling investigation in this same proposal
+# (f30bbd89, "define offline routing benchmarks...") landed its own
+# design-only write-up as a docstring-style comment in the file most central
+# to the question, rather than an ad hoc root-level markdown file.
+#
+# WHAT EXISTS TODAY (read this before building anything new) -- the premise
+# in the item title ("instead of generic blind chunking") does NOT hold for
+# any of the three domains named. All three already chunk on real structure:
+# ---------------------------------------------------------------------
+#  1. OOXML docs (THIS file). Two independent, already-shipped structure-
+#     aware layers, not one:
+#       - Chunk-level: :func:`_build_chunks_from_paras` (c84ca127) groups
+#         paragraphs at HEADING BOUNDARIES, not fixed windows -- each chunk
+#         carries a ``heading_path`` breadcrumb (ancestor heading texts,
+#         root first) via a level-tracking stack, with a synthetic
+#         "preamble" chunk for pre-first-heading content. Indexed into
+#         ``docx_chunks`` + an FTS5 ``docx_chunks_fts`` virtual table
+#         (:func:`index_docx_chunks`), searched via BM25 with heading text
+#         weighted above body text (:func:`fts5_search_chunks`,
+#         ``_CHUNK_WEIGHT_HEADING`` > ``_CHUNK_WEIGHT_BODY``) -- so a heading
+#         match ranks a chunk higher than an equal-count body match. Well
+#         covered today: ``test_build_chunks_from_paras_*`` (boundaries,
+#         nested heading_path, sibling-level reset, preamble, empty doc,
+#         sequential ids) in both ``tests/test_docs_intel.py`` and
+#         ``extensions/meridian-docs/tests/test_docs_intel_chunks.py``.
+#       - Element-level: :func:`index_docx_structure` /
+#         :func:`get_local_structure_elements` index headings/figures/tables
+#         as typed structural elements (separately from prose chunks);
+#         captions get their own real-Word-Caption-paragraph write-back
+#         (:func:`insert_caption` / :func:`link_figure_caption` /
+#         :func:`link_table_caption` / :func:`retrofit_plaintext_captions`),
+#         equations their own OMML extraction/index
+#         (:func:`index_docx_equations` / :func:`parse_docx_equations_local`),
+#         and sections their own anchor-scoped read/write surface
+#         (:func:`get_section_content` / :func:`_locate_section_bounds` /
+#         :func:`write_section` / :func:`move_section` / :func:`copy_section`).
+#       Neither layer does fixed-size/blind windowing anywhere in this file.
+#
+#  2. Code graphs (``extensions/meridian-codeindex/meridian_codeindex/
+#     code_index.py``, re-exported host-side by ``meridian/code_index.py``).
+#     :func:`chunk_file` is tree-sitter/AST semantic chunking at
+#     function/class/method granularity (per its own module docstring),
+#     with gap-filling "module" chunks covering the un-named lines between
+#     symbols so every line lands in exactly one chunk (coverage a
+#     named-symbols-only index would lack) -- never a fixed-token sliding
+#     window. Hybrid search layers DuckDB native FTS with an OPTIONAL vector
+#     leg behind a backend-neutral, evidence-gated contract
+#     (``meridian_codeindex.vector_index``: ``DuckDBVSSBackend`` /
+#     ``PgVectorBackend`` / ``LexicalBM25Backend``, the pgvector leg gated by
+#     measured recall/latency/memory/cost evidence via
+#     ``meridian/db/vector_index_state.py``'s ``pgvector_enabled`` flag --
+#     "do not introduce it merely because it exists"). Well covered:
+#     ``test_chunk_python_named_symbols`` /
+#     ``test_chunk_python_unnamed_blocks_fill_the_gap`` /
+#     ``test_chunk_python_lines_are_covered_exactly_once`` /
+#     ``test_chunk_syntactically_broken_file_still_yields_one_module_chunk``
+#     in ``extensions/meridian-codeindex/tests/test_code_index.py``.
+#
+#  3. Provenance (``extensions/meridian-outputs/meridian_outputs/``).
+#     Not a text-chunk corpus at all -- a structured, bidirectional
+#     path/fingerprint lineage graph. ``provenance.py``'s
+#     :func:`resolve_figure_output` / :func:`find_outputs_by_source` trace
+#     figure<->source-script relationships (relocation-tolerant, not the
+#     exact-path-only lookup that predated it -- see the module's own
+#     e422de44 history note); ``search.py``'s :func:`search_outputs`
+#     layers a literal-filename-match boost on top of ``outputs_local``'s
+#     BM25 so an exact-match canonical file outranks a decoy/archival
+#     twin. This is metadata/lineage search, not prose retrieval, and
+#     should stay that way (see (c) below).
+#
+# THE REAL GAP -- these three domains are each already structure-aware in
+# isolation, but there is no FEDERATION across them. Each has its own scoring
+# scale (FTS5 BM25 weighted-column rank for docs chunks; hybrid BM25+VSS
+# cosine for code chunks; BM25+literal-boost for outputs) and its own tool
+# entry point (``fts5_search_chunks`` / ``search_code_semantic`` /
+# ``search_outputs``) with no common ranking, no shared relevance scale, and
+# no fused ordering. ``meridian/semantic_search.py`` -- the one module in this
+# codebase that already has real embeddings AND a deterministic
+# floor+margin abstention gate (``score_confidence``, the same mechanism
+# f30bbd89 grounded for tool-routing) -- is wired TODAY only to
+# notes/decisions/sprint-items (``meridian/db/__init__.py``,
+# ``meridian/db/decision_evidence.py``); none of the three domains above
+# route through it. A query spanning "everything related to X" today needs
+# 3 separate tool calls with no way to compare or merge their results.
+#
+# DESIGN -- a federated retrieval layer over the existing structure-aware
+# indexes (additive; replaces none of the three native entry points above)
+# ---------------------------------------------------------------------
+# (a) Common candidate contract. A thin per-domain adapter yielding
+#     ``(id, text, structural_path, source_domain, source_ref)`` tuples --
+#     ``heading_path`` for docs chunks, dotted symbol path
+#     (module.Class.method) for code chunks, path+tag hierarchy for outputs
+#     -- reusing ``vector_index.py``'s backend-neutral contract, which its
+#     OWN docstring already states is meant for "callers other than
+#     CodeIndex (e.g. a host application's notes/handoffs/sprint-item
+#     search)". Building a 4th bespoke embedding pipeline here would ignore
+#     that the extension point already exists and is already documented as
+#     reusable.
+#
+# (b) Fusion ranking. Port ``score_confidence``'s floor+margin contract
+#     verbatim as the cross-domain tie-break/abstention layer over each
+#     domain's OWN native top-k (never re-score raw text with a foreign
+#     model -- that would silently regress each domain's already-tuned
+#     ranking, e.g. docs' heading-weighted BM25 or outputs' literal-match
+#     boost). Per-domain scores are min-max normalized to [0, 1] over THAT
+#     CALL's own candidate set (never a fixed constant -- a hardcoded scale
+#     would let one domain's typical score range silently dominate fusion
+#     regardless of relevance) before cross-domain merge. Each domain's
+#     native top-1 is always kept as a deterministic fallback slot, so
+#     fusion can never make a domain-legitimate direct hit disappear behind
+#     a cross-domain abstention.
+#
+# (c) Provenance-aware surfacing, not flattening. Every fused hit keeps its
+#     originating domain, structural path, and -- for a hit sourced from
+#     ``meridian-outputs`` -- its lineage fields (source file,
+#     content-hash) verbatim, so a caller can distinguish "this doc chunk
+#     CITES this code symbol" from "this figure output was PRODUCED BY this
+#     code symbol." This is why (a) explicitly does NOT propose chunking
+#     provenance records into embeddable prose -- collapsing a structured
+#     lineage edge into a text blob for embedding would destroy exactly the
+#     bidirectional relocation-tolerant signal ``provenance.py`` was built
+#     (e422de44) to preserve.
+#
+# (d) Evidence-gated rollout. Extend, don't replace,
+#     ``vector_index_state.py``'s existing ``(project_id, scope)`` shape --
+#     a per-domain ``scope`` value (e.g. ``"docs_chunks"``,
+#     ``"code_chunks"``) already fits its existing unique key with NO schema
+#     change, and a new ``scope="federated"`` row records the fused layer's
+#     own backend/benchmark state using the exact same
+#     :func:`record_vector_backend_benchmark`-gated-flip pattern (evidence
+#     in, decision reason recorded, never hand-flipped) already enforced
+#     for ``pgvector_enabled``.
+#
+# WHAT THIS INVESTIGATION DELIBERATELY DID NOT BUILD
+# ---------------------------------------------------------------------
+# No new embedding model, no new DB table or migration (scope (d) fits the
+# existing ``vector_index_state`` schema), no change to any of the three
+# domains' existing native search entry points, and no code wiring
+# semantic_search.py to any of the three domains. The baseline structure-
+# aware chunking behavior in all three domains is already locked in by the
+# existing test suites cited above; this investigation adds no new tests
+# because it changes no runtime behavior. The lowest-risk, highest-signal
+# next step is (a) -- the per-domain candidate adapter -- since it requires
+# no scoring change and no persistence, and would make (b)'s fusion
+# benchmark possible to build without first deciding anything about (d)'s
+# rollout gate.
+# ---------------------------------------------------------------------------
