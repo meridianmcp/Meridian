@@ -2968,14 +2968,24 @@ def test_serena_pool_spawn_records_pid(tmp_path, monkeypatch):
 
 def test_serena_daemon_pool_wired_via_serena_pool_spawn_in_run_tunnel():
     """6c29d144: run_tunnel must wire SerenaDaemonPool's spawn callable to
-    _serena_pool_spawn (not a bare subprocess.Popen lambda) so every Serena
-    daemon it spawns is recorded in the all-spawned PID registry. Guards
-    against a future regression silently reverting to the unrecorded lambda."""
+    a function that ultimately calls _serena_pool_spawn (not a bare
+    subprocess.Popen lambda) so every Serena daemon it spawns is recorded in
+    the all-spawned PID registry. Guards against a future regression
+    silently reverting to the unrecorded lambda.
+
+    42a320dd: the wired callable is now _owned_serena_pool_spawn (which
+    calls _serena_pool_spawn internally — see its docstring), additionally
+    tracking the daemon via the portable owned-process lifecycle backend so
+    SerenaDaemonPool's teardown tears down the whole owned tree instead of
+    leaving a Serena grandchild orphaned."""
     import inspect
 
     source = inspect.getsource(tc.run_tunnel)
-    assert "spawn=_serena_pool_spawn" in source
+    assert "spawn=_owned_serena_pool_spawn" in source
     assert "spawn=lambda cmd: subprocess.Popen(cmd" not in source
+
+    owned_source = inspect.getsource(tc._owned_serena_pool_spawn)
+    assert "_serena_pool_spawn(cmd)" in owned_source
 
 
 def test_serena_daemon_pool_wired_with_host_local_broker_in_run_tunnel():
@@ -6015,6 +6025,271 @@ def test_close_owned_process_releases_lease_when_enabled(monkeypatch):
     ok = tc._close_owned_process(handle)
     assert ok is True
     assert fake_broker.released == [(tc._LEASE_CLIENT_NAME, "close-me")]
+
+
+# ---------------------------------------------------------------------------
+# 42a320dd — Serena pool daemons wired into the owned-process lifecycle
+# (_owned_serena_pool_spawn / _OwnedServiceProcess). Every test here follows
+# the same "monkeypatch tc._owned_process_backend, never let the real
+# backend touch a fake pid" discipline as the _spawn_owned_with_cache_retry
+# tests above — a real WindowsJobObjectBackend assigning an arbitrary test
+# pid (which may coincide with an unrelated real process) to a
+# KILL_ON_JOB_CLOSE job would be genuinely dangerous, not just wrong.
+# ---------------------------------------------------------------------------
+
+
+def test_serena_pool_spawn_requests_new_session_on_posix(monkeypatch):
+    """42a320dd — _serena_pool_spawn itself (unwrapped) must ask for its own
+    session on POSIX so a LATER adopt() into the owned-process lifecycle
+    backend builds a group_id that corresponds to a real process group."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tc.Path.cwd()))
+    captured = {}
+
+    class _FakeProc:
+        pid = 5151
+
+    def fake_popen(cmd, **kw):
+        captured.update(kw)
+        return _FakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc.sys, "platform", "linux")
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+
+    result = tc._serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert result.pid == 5151
+    assert captured.get("start_new_session") is True
+
+
+def test_serena_pool_spawn_omits_new_session_on_windows(monkeypatch):
+    """The POSIX-only kwarg must never reach Popen on win32 (subprocess
+    rejects mixing start_new_session with creationflags in some Python
+    versions, and it is meaningless there anyway — CREATE_NEW_PROCESS_GROUP
+    already covers the Job Object adoption need)."""
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tc.Path.cwd()))
+    captured = {}
+
+    class _FakeProc:
+        pid = 5152
+
+    def fake_popen(cmd, **kw):
+        captured.update(kw)
+        return _FakeProc()
+
+    monkeypatch.setattr(tc.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tc.sys, "platform", "win32")
+    monkeypatch.setattr(tc, "_record_spawned_pid", lambda *a, **kw: None)
+
+    tc._serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert "start_new_session" not in captured
+
+
+def test_owned_serena_pool_spawn_wraps_when_adopt_succeeds(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    monkeypatch.setattr(tc, "_serena_pool_spawn", lambda cmd: _OwnedFakeProc(pid=6001))
+    monkeypatch.delenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, raising=False)
+
+    class _FakeBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            return pl.OwnedProcessHandle(
+                run_id="serena-r1", pid=proc.pid, executable=cmd[0],
+                cwd=cwd, cmdline=list(cmd), group_id=proc.pid,
+            )
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+
+    result = tc._owned_serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert isinstance(result, tc._OwnedServiceProcess)
+    assert result.pid == 6001
+    assert result.poll() is None  # delegates to the wrapped FakeProc
+
+
+def test_owned_serena_pool_spawn_disabled_via_env_returns_plain_proc(monkeypatch):
+    monkeypatch.setattr(tc, "_serena_pool_spawn", lambda cmd: _OwnedFakeProc(pid=6002))
+    monkeypatch.setenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, "1")
+
+    class _ShouldNeverBeCalledBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            raise AssertionError("adopt() must not run when the opt-out is set")
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _ShouldNeverBeCalledBackend())
+
+    result = tc._owned_serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert result.pid == 6002
+    assert not isinstance(result, tc._OwnedServiceProcess)
+
+
+def test_owned_serena_pool_spawn_degrades_to_plain_proc_on_adopt_failure(monkeypatch):
+    monkeypatch.setattr(tc, "_serena_pool_spawn", lambda cmd: _OwnedFakeProc(pid=6003))
+    monkeypatch.delenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, raising=False)
+
+    class _BoomBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _BoomBackend())
+
+    result = tc._owned_serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert result.pid == 6003
+    assert not isinstance(result, tc._OwnedServiceProcess)
+
+
+def test_owned_serena_pool_spawn_degrades_when_adopt_returns_none(monkeypatch):
+    monkeypatch.setattr(tc, "_serena_pool_spawn", lambda cmd: _OwnedFakeProc(pid=6004))
+    monkeypatch.delenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, raising=False)
+
+    class _NoneBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            return None
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _NoneBackend())
+
+    result = tc._owned_serena_pool_spawn(["uvx", "--from", "serena-agent", "serena"])
+    assert result.pid == 6004
+    assert not isinstance(result, tc._OwnedServiceProcess)
+
+
+def test_owned_service_process_terminate_closes_whole_tree(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    proc = _OwnedFakeProc(pid=6100)
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=6100, executable="uvx", cwd=None, cmdline=["uvx"], group_id=6100,
+    )
+    calls = []
+
+    class _FakeBackend:
+        def close(self, h, *, grace_seconds=5.0):
+            calls.append((h, grace_seconds))
+            h.closed = True  # mirrors the real backends' own close() contract
+            return True
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+    wrapper = tc._OwnedServiceProcess(proc, handle)
+
+    wrapper.terminate()
+    assert calls == [(handle, 5.0)]
+    assert handle.closed is True
+
+
+def test_owned_service_process_terminate_reports_survivor(monkeypatch, capsys):
+    from meridian import process_lifecycle as pl
+
+    proc = _OwnedFakeProc(pid=6101)
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=6101, executable="uvx", cwd=None, cmdline=["uvx"],
+        group_id=6101, create_time=12345.0,
+    )
+
+    class _SurvivorBackend:
+        def close(self, h, *, grace_seconds=5.0):
+            return False  # confirmed survivor
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _SurvivorBackend())
+    wrapper = tc._OwnedServiceProcess(proc, handle)
+
+    wrapper.terminate()
+    err = capsys.readouterr().err
+    assert "pid=6101" in err
+    assert "create_time=12345.0" in err
+    assert "survived" in err
+
+
+def test_owned_service_process_kill_is_idempotent_after_terminate(monkeypatch):
+    from meridian import process_lifecycle as pl
+
+    proc = _OwnedFakeProc(pid=6102)
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=6102, executable="uvx", cwd=None, cmdline=["uvx"], group_id=6102,
+    )
+    calls = []
+
+    class _FakeBackend:
+        def close(self, h, *, grace_seconds=5.0):
+            calls.append(h)
+            if not h.closed:
+                h.closed = True
+                return True
+            return True  # idempotent — a repeat close() is still a success no-op
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+    wrapper = tc._OwnedServiceProcess(proc, handle)
+
+    wrapper.terminate()
+    wrapper.kill()  # serena_pool._default_terminate's escalation path
+    assert len(calls) == 2  # both calls reach the backend; the SECOND is a confirmed no-op
+    assert handle.closed is True
+
+
+def test_owned_service_process_pid_and_poll_delegate_to_wrapped_proc():
+    from meridian import process_lifecycle as pl
+
+    proc = _OwnedFakeProc(pid=6103)
+    handle = pl.OwnedProcessHandle(
+        run_id="r", pid=6103, executable="uvx", cwd=None, cmdline=["uvx"], group_id=6103,
+    )
+    wrapper = tc._OwnedServiceProcess(proc, handle)
+    assert wrapper.pid == 6103
+    assert wrapper.poll() is None  # _OwnedFakeProc.poll() always reports alive
+
+
+def test_owned_serena_lifecycle_disabled_reads_env(monkeypatch):
+    monkeypatch.delenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, raising=False)
+    assert tc._owned_serena_lifecycle_disabled() is False
+    monkeypatch.setenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, "1")
+    assert tc._owned_serena_lifecycle_disabled() is True
+    monkeypatch.setenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, "0")
+    assert tc._owned_serena_lifecycle_disabled() is False
+
+
+def test_serena_pool_wired_with_owned_serena_pool_spawn_end_to_end(monkeypatch, tmp_path):
+    """End-to-end: a SerenaDaemonPool constructed exactly like run_tunnel
+    constructs it (spawn=_owned_serena_pool_spawn) spawns a daemon whose
+    teardown goes through the tree-aware wrapper, not a bare Popen."""
+    from meridian import process_lifecycle as pl
+    from meridian.serena_pool import SerenaDaemonPool
+
+    class _FakeUvxProc:
+        """Popen stand-in exposing .pid/.poll()/.wait() — the full surface
+        serena_pool._default_terminate touches (unlike the module-level
+        _OwnedFakeProc, which other tests here never exercise .wait() on)."""
+
+        def __init__(self, pid):
+            self.pid = pid
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(tc, "_serena_pool_spawn", lambda cmd: _FakeUvxProc(pid=6200))
+    monkeypatch.delenv(tc._SERENA_OWNED_LIFECYCLE_DISABLE_ENV, raising=False)
+
+    closed = []
+
+    class _FakeBackend:
+        def adopt(self, proc, *, cmd, cwd=None):
+            return pl.OwnedProcessHandle(
+                run_id="e2e", pid=proc.pid, executable=cmd[0],
+                cwd=cwd, cmdline=list(cmd), group_id=proc.pid,
+            )
+
+        def close(self, handle, *, grace_seconds=5.0):
+            closed.append(handle.pid)
+            return True
+
+    monkeypatch.setattr(tc, "_owned_process_backend", lambda: _FakeBackend())
+
+    pool = SerenaDaemonPool(
+        default_repo_path=str(tmp_path), spawn=tc._owned_serena_pool_spawn,
+    )
+    daemon = pool.get_or_spawn(str(tmp_path))
+    assert isinstance(daemon.proc, tc._OwnedServiceProcess)
+
+    pool.shutdown()
+    assert closed == [6200]
 
 
 # ---------------------------------------------------------------------------

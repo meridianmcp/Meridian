@@ -3464,6 +3464,122 @@ def _close_owned_process(
     return result
 
 
+# ---------------------------------------------------------------------------
+# 42a320dd — Serena pool daemons wired into the SAME ownership-bound
+# lifecycle (job-object on Windows / process-group on POSIX) the tunnel
+# proxy slots already have via _spawn_owned_with_cache_retry /
+# _close_owned_process. Confirmed gap: SerenaDaemonPool's default teardown
+# (serena_pool._default_terminate) only ever signals the ONE pid it holds a
+# Popen for. Serena's own launch command is `uvx --from serena-agent serena
+# start-mcp-server ...`, so a plain proc.terminate()/kill() only reaches the
+# uvx wrapper — the actual Serena grandchild uvx execs into is left
+# orphaned once the wrapper dies.
+#
+# Wired in as a NEW function (_owned_serena_pool_spawn) rather than changing
+# _serena_pool_spawn itself, so that function's own existing tests (uvx
+# resolution, PID recording) keep exercising a bare, unwrapped Popen — zero
+# behaviour change for them, and zero real Win32/psutil syscalls sneak into
+# any test that monkeypatches subprocess.Popen without also monkeypatching
+# _owned_process_backend (the established pattern every existing
+# _spawn_owned_with_cache_retry test already follows — see
+# test_spawn_owned_with_cache_retry_* in tests/test_tunnel_client.py).
+#
+# serena_pool.py itself needs ZERO changes: SerenaDaemon / _default_terminate
+# only ever touch .pid / .poll() / .terminate() / .wait() / .kill() on
+# whatever `spawn` returns (see serena_pool.SerenaDaemon.is_alive and
+# serena_pool._default_terminate) — _OwnedServiceProcess below duck-types
+# exactly those five members, so this wrapper is the ENTIRE integration
+# surface.
+# ---------------------------------------------------------------------------
+
+_SERENA_OWNED_LIFECYCLE_DISABLE_ENV = "MERIDIAN_DISABLE_OWNED_SERENA_LIFECYCLE"
+
+
+def _owned_serena_lifecycle_disabled() -> bool:
+    """Opt-out escape hatch (42a320dd): set to ``"1"`` to restore the exact
+    pre-existing behaviour (bare Popen, single-pid teardown, no job-object/
+    process-group tracking) — e.g. a host where Job Object creation is
+    blocked by policy, or while ruling out a suspected regression in the new
+    path. Checked fresh on every spawn, never cached, so it can be flipped
+    between tunnel restarts without a code change."""
+    return os.environ.get(_SERENA_OWNED_LIFECYCLE_DISABLE_ENV, "").strip() == "1"
+
+
+class _OwnedServiceProcess:
+    """Popen-duck-typed wrapper (42a320dd) fronting a Serena daemon's real
+    ``Popen`` handle but tearing down the WHOLE owned process tree via
+    :func:`_close_owned_process` instead of signalling only the root pid.
+
+    Only ``.pid`` / ``.poll()`` / ``.terminate()`` / ``.wait()`` / ``.kill()``
+    are ever touched by :mod:`meridian.serena_pool` (see the module comment
+    above) — exactly what this class provides.
+    """
+
+    def __init__(
+        self, proc: "subprocess.Popen", handle: "_process_lifecycle.OwnedProcessHandle"
+    ) -> None:
+        self._proc = proc
+        self._handle = handle
+        self.pid = proc.pid
+
+    def poll(self) -> "int | None":
+        return self._proc.poll()
+
+    def wait(self, timeout: "float | None" = None) -> "int | None":
+        return self._proc.wait(timeout=timeout)
+
+    def terminate(self) -> None:
+        """Tree-aware close (job-object/process-group + grace-then-force
+        escalation, all handled inside :func:`_close_owned_process`).
+        Reports a confirmed survivor to stderr with PID/create_time evidence
+        — the sprint's "report survivors" acceptance criterion — instead of
+        silently swallowing a failed teardown."""
+        confirmed_gone = _close_owned_process(self._handle)
+        if not confirmed_gone:
+            _ct = self._handle.create_time
+            print(
+                f"tunnel:extract: Serena daemon pid={self._handle.pid}"
+                + (f" create_time={_ct}" if _ct is not None else "")
+                + " survived owned-tree teardown (job-object/process-group "
+                "close reported a possible survivor) — may need manual cleanup",
+                file=sys.stderr, flush=True,
+            )
+
+    def kill(self) -> None:
+        """``_default_terminate``'s escalation-after-timeout call. The owned
+        handle's close is idempotent (:func:`_close_owned_process` no-ops
+        once already closed), so this either performs the one real close
+        (if :meth:`terminate` was somehow never called first) or is a
+        confirmed no-op."""
+        _close_owned_process(self._handle)
+
+
+def _owned_serena_pool_spawn(cmd: "list[str]") -> "subprocess.Popen":
+    """Spawn one Serena daemon via :func:`_serena_pool_spawn`, additionally
+    tracked by the portable owned-process lifecycle backend (3c4ed79d) so
+    :class:`serena_pool.SerenaDaemonPool`'s teardown tears down the WHOLE
+    owned tree instead of leaving a Serena grandchild orphaned (42a320dd —
+    see the module comment above). This is what gets wired into
+    ``SerenaDaemonPool(spawn=...)`` in :func:`run_tunnel`; ``_serena_pool_spawn``
+    itself is unchanged and stays independently tested.
+
+    Best-effort at every step: an adopt failure (or the opt-out env var)
+    degrades to returning the plain ``proc`` — today's exact behaviour —
+    rather than failing the spawn.
+    """
+    proc = _serena_pool_spawn(cmd)
+    if _owned_serena_lifecycle_disabled():
+        return proc
+    try:
+        handle = _owned_process_backend().adopt(proc, cmd=cmd)
+    except Exception:  # noqa: BLE001 — best-effort; the spawn itself already succeeded
+        handle = None
+    if handle is None:
+        return proc
+    _register_owned_process_lease(handle)
+    return _OwnedServiceProcess(proc, handle)
+
+
 def _plugin_spawn_env(env: object) -> "dict[str, str] | None":
     """Merge a plugin's optional ``env`` overrides over the parent process env
     for ``subprocess.Popen``. Returns ``None`` (inherit the parent env) when
@@ -3730,12 +3846,31 @@ def _serena_pool_spawn(cmd: "list[str]") -> "subprocess.Popen":
     a busy tunnel with several projects open re-hits this path repeatedly —
     memoizing avoids re-probing PATH/the filesystem for the same answer
     every time.
+
+    42a320dd — on POSIX, also requests ``start_new_session=True`` (the same
+    flag :func:`_spawn_owned_with_cache_retry` already uses), so the spawned
+    ``uvx`` process becomes its own session/process-group leader from the
+    moment it starts. This is additive/inert on its own (nothing here reads
+    the resulting group) but is a PREREQUISITE for
+    :func:`_owned_serena_pool_spawn` to later adopt this process into the
+    portable owned-process lifecycle backend correctly: adopting a process
+    that was NOT actually spawned as its own session leader would build an
+    ``OwnedProcessHandle`` whose ``group_id`` does not correspond to any
+    real process group, and a later ``os.killpg`` on it would raise
+    ``ProcessLookupError`` — silently treated as "already gone" while the
+    process (and Serena's own grandchild it launches) is still running.
+    Windows is unaffected: ``_spawn_kwargs()`` already applies
+    ``CREATE_NEW_PROCESS_GROUP`` unconditionally, which is what Job Object
+    adoption needs.
     """
     if cmd and cmd[0] == "uvx":
         _resolved_uvx = _cached_uvx()
         if _resolved_uvx:
             cmd = [_resolved_uvx, *cmd[1:]]
-    proc = subprocess.Popen(cmd, **_spawn_kwargs())
+    kwargs = _spawn_kwargs()
+    if sys.platform != "win32":
+        kwargs["start_new_session"] = True
+    proc = subprocess.Popen(cmd, **kwargs)
     _record_spawned_pid(proc, "extract")
     return proc
 
@@ -7145,7 +7280,13 @@ async def run_tunnel(
                 # _record_spawned_pid so orphaned Serena daemons are covered
                 # by _kill_all_previously_spawned_pids on the next startup
                 # (see _serena_pool_spawn's docstring for the full gap).
-                spawn=_serena_pool_spawn,
+                # 42a320dd — _owned_serena_pool_spawn additionally tracks the
+                # spawned daemon via the portable owned-process lifecycle
+                # backend (job-object on Windows / process-group on POSIX),
+                # calling _serena_pool_spawn internally so the PID-recording
+                # behaviour above is unchanged (see _owned_serena_pool_spawn's
+                # docstring for the full gap this closes).
+                spawn=_owned_serena_pool_spawn,
                 # 92aaedb7 — host-local broker: share a repo's Serena daemon
                 # with sibling tunnel_client processes on this machine instead
                 # of each spawning its own duplicate. owner_id=_client_id ties
