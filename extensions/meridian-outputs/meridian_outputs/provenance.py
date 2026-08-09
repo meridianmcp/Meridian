@@ -58,13 +58,28 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from . import outputs_local
+from . import outputs_local, provenance_status
 
 __all__ = [
     "resolve_figure_output",
     "find_outputs_by_source",
     "classify_temp_output_ownership",
+    "bind_artifact_provenance",
+    "RESOLVED",
+    "ORPHANED",
+    "HASH_MISMATCH",
+    "UNRESOLVED",
 ]
+
+# Binding statuses returned by bind_artifact_provenance (sprint item
+# 6d02f343). Ranked from strongest to weakest evidence; ARTIFACT_STATUSES
+# fixes the canonical set so a caller can validate an unexpected status
+# string instead of silently treating a typo as "some other status".
+RESOLVED = "resolved"
+ORPHANED = "orphaned"
+HASH_MISMATCH = "hash_mismatch"
+UNRESOLVED = "unresolved"
+ARTIFACT_STATUSES = (RESOLVED, ORPHANED, HASH_MISMATCH, UNRESOLVED)
 
 
 def _basename_key(path: Any) -> str:
@@ -303,3 +318,269 @@ def classify_temp_output_ownership(outputs_dir: str, path: str) -> dict[str, Any
         "eligible": True,
         "reason": "confirmed Meridian-owned temporary output (archival copy, known to the outputs index)",
     }
+
+
+# ---------------------------------------------------------------------------
+# 6d02f343 -- artifact manifest: bind structural docx figure/table/equation
+# artifacts to per-file meridian-outputs provenance, fail-closed.
+#
+# A docx-editing caller (meridian-docs' docs_intel.py, or any other writer)
+# knows the STRUCTURAL identity of an artifact -- a figure index, a table's
+# w14:paraId, an equation's element id -- and, when the artifact was
+# originally produced by a script, the CANONICAL output path it was inserted
+# from. It has no reason to know anything about meridian-outputs' own
+# index/ledger internals. This module already has everything needed to turn
+# that canonical path into an authoritative provenance verdict
+# (resolve_figure_output's exact+basename tiers, provenance_status's
+# directory-level fallback) -- bind_artifact_provenance is the single join
+# point that composes those into one fail-closed classification per
+# artifact, so a caller can reject/quarantine a write instead of silently
+# promoting an orphaned or hash-mismatched replacement.
+#
+# Deliberately duck-typed, no cross-package import in the other direction:
+# per the established pattern in this file (see provenance_status.
+# get_manifest_backed_provenance_status's own docstring), a docx-writing
+# caller in a SEPARATE package (meridian-docs, meridian core) is expected to
+# call bind_artifact_provenance itself and pass the resulting plain dict
+# into its own write-gating code -- never the reverse (this module never
+# imports docx-aware code).
+# ---------------------------------------------------------------------------
+
+
+def _bind_one_artifact(
+    outputs_dir: str,
+    artifact: dict[str, Any],
+    *,
+    fuzzy_limit: int,
+) -> dict[str, Any]:
+    artifact_id = artifact.get("artifact_id")
+    kind = artifact.get("kind")
+    canonical_path = artifact.get("canonical_path")
+    expected_sha256 = artifact.get("expected_sha256")
+    base = {
+        "artifact_id": artifact_id,
+        "kind": kind,
+        "canonical_path": canonical_path,
+    }
+
+    if not canonical_path or not str(canonical_path).strip():
+        return {
+            **base,
+            "status": UNRESOLVED,
+            "match_type": None,
+            "evidence": "none",
+            "resolved_sha256": None,
+            "reason": (
+                "artifact has no recorded canonical_path -- there is nothing "
+                "to resolve against meridian-outputs provenance"
+            ),
+        }
+
+    resolved = resolve_figure_output(
+        outputs_dir, canonical_path, fuzzy_limit=fuzzy_limit,
+    )
+    if resolved is not None:
+        match_type = resolved.get("match_type")
+        resolved_sha256 = resolved.get("sha256")
+
+        if match_type == "exact":
+            if expected_sha256:
+                if resolved_sha256 is None:
+                    # A hash was explicitly requested, but the exact-match
+                    # index record has none on file (e.g. a lightweight walk
+                    # that discovered the path without hashing it) -- this
+                    # is exactly the "could not check" case that must never
+                    # be silently promoted to "passed".
+                    return {
+                        **base,
+                        "status": UNRESOLVED,
+                        "match_type": match_type,
+                        "evidence": "meridian_outputs_exact",
+                        "resolved_sha256": None,
+                        "reason": (
+                            f"canonical_path {canonical_path!r} resolves to "
+                            "an exact meridian-outputs record, but that "
+                            "record has no hash on file -- this artifact's "
+                            "expected hash cannot be confirmed"
+                        ),
+                    }
+                if str(expected_sha256) != str(resolved_sha256):
+                    return {
+                        **base,
+                        "status": HASH_MISMATCH,
+                        "match_type": match_type,
+                        "evidence": "meridian_outputs_exact",
+                        "resolved_sha256": resolved_sha256,
+                        "reason": (
+                            f"canonical_path {canonical_path!r} resolves to "
+                            "an exact meridian-outputs record, but its "
+                            "recorded hash does not match this artifact's "
+                            "expected hash -- the replacement content "
+                            "differs from the authoritative output"
+                        ),
+                    }
+            return {
+                **base,
+                "status": RESOLVED,
+                "match_type": match_type,
+                "evidence": "meridian_outputs_exact",
+                "resolved_sha256": resolved_sha256,
+                "reason": None,
+            }
+
+        # Basename tier: relocation-tolerant, but resolve_figure_output never
+        # attaches a hash for this tier (see its own docstring) -- an
+        # ambiguous or hash-unconfirmable basename match can never be
+        # promoted to RESOLVED when the caller asked for a hash check.
+        candidate_count = resolved.get("candidate_count") or 0
+        if candidate_count > 1:
+            return {
+                **base,
+                "status": UNRESOLVED,
+                "match_type": match_type,
+                "evidence": "meridian_outputs_basename_ambiguous",
+                "resolved_sha256": None,
+                "reason": (
+                    f"{candidate_count} same-basename candidates found for "
+                    f"{canonical_path!r} in meridian-outputs -- ambiguous "
+                    "match, cannot bind with confidence"
+                ),
+            }
+        if expected_sha256:
+            return {
+                **base,
+                "status": UNRESOLVED,
+                "match_type": match_type,
+                "evidence": "meridian_outputs_basename",
+                "resolved_sha256": None,
+                "reason": (
+                    "matched by relocated basename only -- meridian-outputs "
+                    "has no hash on file for this tier, so this artifact's "
+                    "expected hash cannot be confirmed"
+                ),
+            }
+        return {
+            **base,
+            "status": RESOLVED,
+            "match_type": match_type,
+            "evidence": "meridian_outputs_basename",
+            "resolved_sha256": None,
+            "reason": None,
+        }
+
+    # Nothing in meridian-outputs' authoritative index at all -- per this
+    # item's spec, fall back to directory-level evidence ONLY as a weaker,
+    # non-authoritative signal (never enough on its own to call an artifact
+    # RESOLVED).
+    status_row = provenance_status.get_provenance_status(outputs_dir, canonical_path)
+    if "error" in status_row:
+        return {
+            **base,
+            "status": ORPHANED,
+            "match_type": None,
+            "evidence": "lookup_error",
+            "resolved_sha256": None,
+            "reason": status_row["error"],
+        }
+
+    if status_row.get("provenance_type") == provenance_status.DIRECTORY_FALLBACK:
+        return {
+            **base,
+            "status": UNRESOLVED,
+            "match_type": None,
+            "evidence": "directory_fallback",
+            "resolved_sha256": None,
+            "reason": (
+                f"no authoritative meridian-outputs record for "
+                f"{canonical_path!r} -- only directory-level "
+                f"{outputs_local.MERIDIAN_NOTES_FILENAME} evidence is "
+                "available, which this item's spec treats as fallback "
+                "evidence only, never authoritative"
+            ),
+        }
+
+    return {
+        **base,
+        "status": ORPHANED,
+        "match_type": None,
+        "evidence": "none",
+        "resolved_sha256": None,
+        "reason": (
+            f"canonical_path {canonical_path!r} is not resolvable by "
+            "meridian-outputs (no exact or basename match) and has no "
+            "directory-level fallback evidence either -- this artifact is "
+            "orphaned from any known provenance"
+        ),
+    }
+
+
+def bind_artifact_provenance(
+    outputs_dir: str,
+    artifacts: "list[dict[str, Any]]",
+    *,
+    fuzzy_limit: int = 25,
+) -> dict[str, Any]:
+    """Join structural figure/table/equation artifacts to authoritative
+    per-file provenance, and classify each fail-closed (sprint item 6d02f343).
+
+    This is the "artifact manifest" join point: given a document's own
+    structural artifact list (one entry per figure/table/equation the
+    document currently embeds), resolve each against meridian-outputs'
+    per-file provenance and classify it so a caller can reject or quarantine
+    anything that isn't cleanly RESOLVED, instead of silently promoting an
+    orphaned or hash-mismatched replacement.
+
+    Args:
+      outputs_dir: Absolute path to the outputs directory.
+      artifacts:   One dict per structural artifact, each
+                   ``{"artifact_id": <str>, "kind": <"figure"|"table"|
+                   "equation">, "canonical_path": <str|None>,
+                   "expected_sha256": <str|None>}``. ``artifact_id`` and
+                   ``kind`` are carried through unchanged for the caller's
+                   own bookkeeping (never interpreted here). Any extra keys
+                   are ignored.
+      fuzzy_limit: Forwarded to :func:`resolve_figure_output`'s basename tier.
+
+    Returns:
+      ``{"bindings": [...], "counts": {...}, "all_clear": bool}`` where each
+      binding is
+      ``{"artifact_id", "kind", "canonical_path", "status", "match_type",
+      "evidence", "resolved_sha256", "reason"}`` and ``status`` is one of:
+
+        - ``"resolved"``      -- authoritatively confirmed: an exact
+          meridian-outputs record (hash match, when ``expected_sha256`` was
+          requested AND the record has a hash on file), or an unambiguous
+          relocation-tolerant basename match with no hash to contradict it.
+        - ``"hash_mismatch"`` -- an exact meridian-outputs record exists for
+          ``canonical_path`` and DOES have a hash on file, but it does not
+          match ``expected_sha256``.
+        - ``"orphaned"``      -- no meridian-outputs record at all (exact,
+          basename, or directory-level) covers ``canonical_path``.
+        - ``"unresolved"``    -- some evidence exists but is not strong
+          enough to confirm: no ``canonical_path`` recorded on the artifact,
+          an exact match whose record has no hash on file when
+          ``expected_sha256`` was requested (the outputs walker's own
+          size-prefilter can legitimately skip hashing a uniquely-sized
+          file -- "no hash to compare" is never silently treated as "hash
+          matches"), an ambiguous multi-candidate basename match, a basename
+          match that cannot confirm a requested hash (that tier never
+          carries one at all), or ONLY non-authoritative directory-level
+          fallback evidence.
+
+      ``counts`` tallies each status across ``bindings`` (always all four
+      keys, zero-filled). ``all_clear`` is ``True`` only when every artifact
+      is ``"resolved"`` -- ``False`` whenever anything should be rejected or
+      quarantined. Never raises: an artifact this function cannot resolve at
+      all still gets a binding entry (``"orphaned"``/``"unresolved"``), never
+      an exception -- fail-closed means an explicit reject verdict, not a
+      crash.
+    """
+    bindings = [
+        _bind_one_artifact(outputs_dir, artifact, fuzzy_limit=fuzzy_limit)
+        for artifact in (artifacts or [])
+    ]
+    counts = {status: 0 for status in ARTIFACT_STATUSES}
+    for binding in bindings:
+        counts[binding["status"]] = counts.get(binding["status"], 0) + 1
+    all_clear = counts[RESOLVED] == len(bindings)
+    return {"bindings": bindings, "counts": counts, "all_clear": all_clear}

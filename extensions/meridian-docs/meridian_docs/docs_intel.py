@@ -2889,6 +2889,63 @@ def _enforce_render_verification(
     return error, None
 
 
+def _check_artifact_provenance_binding(
+    artifact_provenance: "dict[str, Any] | None",
+) -> "dict[str, Any] | None":
+    """Fail-closed gate on a caller-supplied, pre-computed artifact-provenance
+    binding verdict (sprint item 6d02f343 -- bind figure/table/equation
+    artifacts to per-file provenance and fail closed on mismatched writes).
+
+    ``artifact_provenance`` is the plain dict returned by
+    ``meridian_outputs.provenance.bind_artifact_provenance`` (or an
+    equivalent caller-built dict sharing its ``{"all_clear": bool,
+    "bindings": [...]}`` shape). This module deliberately never imports
+    ``meridian_outputs`` itself -- it is a separate, optionally-installed
+    extension package. The CALLER computes the provenance verdict and hands
+    the resulting plain dict in here, duck-typed -- the same pattern
+    ``meridian_outputs.provenance_status.get_manifest_backed_provenance_status``
+    already established for consuming an externally-computed verdict without
+    a cross-package import. ``None`` (the default everywhere this is called
+    from) means the caller did not ask for this check -- zero behavior
+    change for every write path that predates this item.
+
+    Returns ``None`` when ``artifact_provenance`` is ``None``, or is
+    supplied and cleanly ``all_clear``. Otherwise returns an error dict in
+    the same ``{"error": ...}`` shape every other verification failure in
+    this module already uses, with an additive
+    ``artifact_provenance_mismatches`` key listing the offending bindings --
+    never silently treats "could not check" as "passed".
+    """
+    if artifact_provenance is None:
+        return None
+    if not isinstance(artifact_provenance, dict) or "all_clear" not in artifact_provenance:
+        return {
+            "error": (
+                "post-write verification failed: artifact_provenance was "
+                "supplied but is not a valid binding-verdict dict (missing "
+                "'all_clear') -- refusing to treat an unconfirmed artifact "
+                "provenance state as a success"
+            ),
+            "artifact_provenance_mismatches": None,
+        }
+    if not artifact_provenance.get("all_clear"):
+        rejected = [
+            binding
+            for binding in (artifact_provenance.get("bindings") or [])
+            if binding.get("status") != "resolved"
+        ]
+        return {
+            "error": (
+                "post-write verification failed: one or more figure/table/"
+                "equation artifacts failed provenance binding (orphaned, "
+                "hash-mismatched, or unresolved) -- returning an error "
+                "instead of a false success payload"
+            ),
+            "artifact_provenance_mismatches": rejected,
+        }
+    return None
+
+
 def _verify_docx_write(
     docx_path: str,
     *,
@@ -2897,6 +2954,7 @@ def _verify_docx_write(
     expected_range: tuple[int, int] | None = None,
     locate_by_paraid: str | None = None,
     expected_len: int = 1,
+    artifact_provenance: "dict[str, Any] | None" = None,
 ) -> dict[str, Any] | None:
     """Mandatory post-write verification (9907df44). Returns ``None`` when the
     on-disk document matches expectations, or an error dict when it doesn't.
@@ -2911,6 +2969,12 @@ def _verify_docx_write(
     ``w14:paraId`` (``locate_by_paraid`` -- used by copy_section, whose final
     position can shift again if the caller also trims the original section
     after inserting the copy).
+
+    ``artifact_provenance`` (6d02f343, optional) -- checked via
+    :func:`_check_artifact_provenance_binding` ONLY after every structural
+    check above has already passed (this item's own instruction: provenance
+    gating runs "only after structural verification succeeds"). ``None``
+    (the default) skips this check entirely.
     """
     try:
         raw2, root2 = _load_docx_xml_stdlib(docx_path)
@@ -2983,7 +3047,8 @@ def _verify_docx_write(
             "count_mismatches": count_mismatches,
             "content_hash_mismatch": hash_mismatch,
         }
-    return None
+
+    return _check_artifact_provenance_binding(artifact_provenance)
 
 
 # ---------------------------------------------------------------------------
@@ -5923,6 +5988,7 @@ def insert_caption(
     style_policy: dict[str, Any] | None = None,
     allow_degraded_render: bool = False,
     degraded_render_reason: str | None = None,
+    artifact_provenance: "dict[str, Any] | None" = None,
 ) -> dict[str, Any]:
     """9d749639 — Insert a real Word Caption paragraph into a .docx file.
 
@@ -5985,6 +6051,14 @@ def insert_caption(
                          extension does not persist it itself — a caller with
                          DB access, e.g. Meridian core, is responsible for
                          logging/pinning it).
+        artifact_provenance: 6d02f343 — a caller-precomputed figure/table
+                         provenance-binding verdict (see
+                         :func:`_check_artifact_provenance_binding`),
+                         checked only AFTER structural and render
+                         verification above both succeed. Not cleanly
+                         ``all_clear`` fails the write closed with the same
+                         restore-if-safe handling as a structural or render
+                         failure. ``None`` (the default) skips this check.
 
     Returns:
         ``{status, kind, seq_number, label_text, section_heading, ref_bookmark,
@@ -6132,6 +6206,47 @@ def insert_caption(
             render_error["kind"] = kind
             render_error["docx_path"] = docx_path
             return render_error
+
+        # 6d02f343 -- structural AND render verification have both already
+        # succeeded above; only now is it safe to additionally gate on
+        # artifact provenance (this item's own instruction: caption edits
+        # "update provenance only after structural verification succeeds").
+        # Still inside the promotion lock, so a fail-closed restore gets the
+        # same CAS safety every other verification failure here gets.
+        artifact_provenance_error = _check_artifact_provenance_binding(
+            artifact_provenance
+        )
+        if artifact_provenance_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(docx_path, promoted_sha256)
+            )
+            artifact_provenance_error["file_restored"] = restored
+            artifact_provenance_error["concurrent_write_detected"] = (
+                concurrent_write_detected
+            )
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    artifact_provenance_error["error"] = (
+                        artifact_provenance_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    artifact_provenance_error["error"] = (
+                        artifact_provenance_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            artifact_provenance_error["kind"] = kind
+            artifact_provenance_error["docx_path"] = docx_path
+            return artifact_provenance_error
 
     _invalidate_sidecar_mtime(index_db_path)
 
@@ -12936,6 +13051,7 @@ def relocate_figure(
     allow_bookmark_split: bool = False,
     draft_output_path: str | None = None,
     wave_run_id: str | None = None,
+    artifact_provenance: "dict[str, Any] | None" = None,
 ) -> dict[str, Any]:
     """Relocate one image paragraph together with its immediately following Figure caption.
 
@@ -12970,6 +13086,15 @@ def relocate_figure(
     ``draft_output_path`` when given (fe989980; requires ``wave_run_id`` too
     -- see :func:`move_section`), else the input ``docx_path`` (unchanged
     legacy behavior).
+
+    ``artifact_provenance`` (6d02f343, optional) -- a caller-precomputed
+    figure/table/equation provenance-binding verdict (see
+    :func:`_check_artifact_provenance_binding`), forwarded to
+    :func:`_verify_docx_write` and checked only after this call's own
+    structural/hash/image-ownership checks all pass. Not cleanly
+    ``all_clear`` fails the write exactly like any other post-write
+    verification failure above (same restore-if-safe handling). ``None``
+    (the default) skips this check entirely -- unchanged behavior.
     """
     if destination_position not in ("before", "after"):
         return {
@@ -13145,6 +13270,7 @@ def relocate_figure(
             expected_counts=baseline_counts,
             expected_hash=expected_hash,
             expected_range=(insert_at, insert_at + removed_count),
+            artifact_provenance=artifact_provenance,
         )
         if verify_error is not None:
             # 5988a5bb -- do NOT blindly restore: a different (concurrent)

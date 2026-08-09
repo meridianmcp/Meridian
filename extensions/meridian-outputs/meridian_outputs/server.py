@@ -539,6 +539,45 @@ def find_outputs_by_source(
 
 
 @mcp.tool()
+def bind_artifact_provenance(
+    outputs_dir: str,
+    artifacts: "list[dict[str, Any]]",
+    fuzzy_limit: int = 25,
+) -> dict[str, Any]:
+    """Join structural document artifacts (figures/tables/equations) to
+    authoritative per-file provenance, fail-closed (item 6d02f343).
+
+    Given a document's own list of structural artifacts -- one entry per
+    figure/table/equation it currently embeds, each carrying whatever
+    ``canonical_path``/``expected_sha256`` the document-writing tool already
+    knows -- resolves each against meridian-outputs' per-file provenance
+    (:func:`resolve_figure_output`'s exact + basename tiers, authoritative;
+    :func:`get_provenance_status`'s directory-level note, fallback evidence
+    only) and classifies it so a caller can reject or quarantine a write
+    instead of silently promoting an orphaned or hash-mismatched artifact.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      artifacts:    One dict per structural artifact: ``{"artifact_id": <str>,
+                    "kind": <"figure"|"table"|"equation">,
+                    "canonical_path": <str|None>, "expected_sha256":
+                    <str|None>}``. ``artifact_id``/``kind`` are carried
+                    through unchanged for the caller's own bookkeeping.
+      fuzzy_limit:  Forwarded to the basename-fallback tier (default 25).
+
+    Returns:
+      ``{"bindings": [...], "counts": {...}, "all_clear": bool}`` -- see
+      :func:`meridian_outputs.provenance.bind_artifact_provenance` for the
+      full per-binding shape and status semantics (``resolved``/
+      ``hash_mismatch``/``orphaned``/``unresolved``). ``all_clear`` is
+      ``True`` only when every artifact is ``resolved``.
+    """
+    return provenance.bind_artifact_provenance(
+        outputs_dir, artifacts, fuzzy_limit=fuzzy_limit,
+    )
+
+
+@mcp.tool()
 def npy_metadata(path: str) -> dict[str, Any]:
     """Read metadata from a .npy file WITHOUT loading the full array.
 
