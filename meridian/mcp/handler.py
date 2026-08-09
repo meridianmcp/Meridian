@@ -3286,6 +3286,17 @@ async def _handle_task_tools(
         _run_timeline = await handoff_module_local.build_run_timeline_for_handoff(
             db, args["project_id"], session_id=session_id,
         )
+        # 89a06e40 — machine-readable effective profile identity/generation
+        # (hosted_default+workspace+user+project+session layers; see
+        # meridian.profile_contract.EffectiveProfile /
+        # db.profile_layers.get_effective_profile), emitted on every
+        # generate_handoff mode alongside the fields above. Fully guarded —
+        # a failure degrades to no field rather than breaking the mandatory
+        # handoff. See pinned decision ee7bccc9 for why the tunnel/connector
+        # routes deliberately do NOT call this same helper.
+        _profile_binding = await handoff_module_local.build_effective_profile_binding(
+            db, args["project_id"], session_id=session_id,
+        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -3343,6 +3354,13 @@ async def _handle_task_tools(
             # this project has no durable execution events for this scope
             # (see build_run_timeline_for_handoff's own docstring).
             "run_timeline": _run_timeline,
+            # 89a06e40 — compact profile identity/generation projection
+            # ({"generation_key", "executable", "degraded",
+            # "restart_required", "restart_report"} — see
+            # profile_contract.project_profile_binding). None only if the
+            # resolution itself failed (best-effort, mirrors
+            # capability_contract above).
+            "profile_binding": _profile_binding,
             # b8f89491 — machine-readable scope: which sprint-version bucket
             # this handoff actually resolved to, and why (explicit argument vs.
             # session-derived vs. unscoped). effective_version is None when the

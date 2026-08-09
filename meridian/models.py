@@ -336,6 +336,13 @@ class HandoffResult(BaseModel):
     # the 02038afe/ac80aaaf sibling items land) without a models.py migration
     # each time. None only if contract-building itself failed (best-effort).
     capability_contract: dict[str, Any] | None = None
+    # 89a06e40 — compact effective profile identity/generation projection
+    # (see meridian.profile_contract.project_profile_binding):
+    # {"generation_key", "executable", "degraded", "restart_required",
+    # "restart_report"}. dict, not a typed submodel, for the same
+    # forward-compat reason as capability_contract above. None only if the
+    # resolution itself failed (best-effort).
+    profile_binding: dict[str, Any] | None = None
     # 6cdc5df3 — machine-readable proposal-to-evidence linkage (see
     # meridian.db.proposal_links): one hydrated entry per proposal id with
     # evidence linked in this project. list, not a typed submodel, for the

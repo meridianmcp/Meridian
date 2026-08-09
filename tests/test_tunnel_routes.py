@@ -430,6 +430,80 @@ def test_tunnel_plugins_config_generation_isolated_per_tenant_over_http(monkeypa
 
 
 # ---------------------------------------------------------------------------
+# PROFILE-6 (89a06e40) — profile_binding: workspace-only (hosted_default +
+# workspace layers, no project/session layers) compact profile identity/
+# generation attached to the tunnel/connector-refresh contract. See pinned
+# decision ee7bccc9 (project 5787cc92-ba7d-4788-b17c-28ab7938b839): this
+# surface is scoped by tenant_id only, so it deliberately does NOT call
+# db.get_effective_profile (which hard-requires a project_id) — it calls
+# db.get_workspace_effective_profile instead (see tests/test_profile_layers.py
+# for that function's own coverage). This item's declared touches_resources
+# named tests/test_tunnel_client.py for this half, but that file covers only
+# the LOCAL tunnel *client* (meridian/tunnel_client.py), not these
+# server-side HTTP routes — this file is the actual existing test file for
+# routes/tunnel.py's HTTP routes (see its own module docstring), so these
+# tests live here instead.
+# ---------------------------------------------------------------------------
+
+_PROFILE_BINDING_KEYS = {
+    "generation_key", "executable", "degraded", "restart_required", "restart_report",
+}
+
+
+def test_get_tunnel_plugins_includes_profile_binding(monkeypatch, tmp_path):
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        raw_token = _run(_new_tenant_token(client.app.state.db, "profile-binding-plugins@example.com"))
+        r = client.get("/tunnel/plugins", headers={"Authorization": f"Bearer {raw_token}"})
+        assert r.status_code == 200
+        binding = r.json()["profile_binding"]
+        assert binding is not None
+        assert set(binding.keys()) == _PROFILE_BINDING_KEYS
+        assert binding["executable"] is True
+
+
+def test_tunnel_status_includes_profile_binding(monkeypatch, tmp_path):
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        raw_token = _run(_new_tenant_token(client.app.state.db, "profile-binding-status@example.com"))
+        hdr = {"Authorization": f"Bearer {raw_token}"}
+        me = client.get("/me", headers=hdr)
+        tenant_id = me.json()["tenant_id"]
+
+        status = client.get(f"/tunnel/status/{tenant_id}")
+        assert status.status_code == 200
+        binding = status.json()["profile_binding"]
+        assert binding is not None
+        assert set(binding.keys()) == _PROFILE_BINDING_KEYS
+
+
+def test_tunnel_status_profile_binding_reflects_configured_workspace_layer(monkeypatch, tmp_path):
+    with _make_hosted_client(monkeypatch, tmp_path) as client:
+        raw_token = _run(_new_tenant_token(client.app.state.db, "profile-binding-configured@example.com"))
+        hdr = {"Authorization": f"Bearer {raw_token}"}
+        me = client.get("/me", headers=hdr)
+        tenant_id = me.json()["tenant_id"]
+
+        before = client.get(f"/tunnel/status/{tenant_id}").json()["profile_binding"]
+
+        from meridian import db as db_module
+        _run(db_module.set_profile_layer(
+            client.app.state.db, "workspace", "singleton", fields={"auto_worktrees": 0},
+        ))
+
+        after = client.get(f"/tunnel/status/{tenant_id}").json()["profile_binding"]
+        assert before["generation_key"] != after["generation_key"]
+
+
+def test_tunnel_status_direct_call_without_request_degrades_profile_binding_to_none():
+    """Backward compat: existing direct-call tests (test_slot_reprobe.py,
+    test_tunnel_bridge.py, test_w5_9665538a_meridian_docs_slot.py) invoke
+    tunnel_status(tid) as a plain coroutine with no Request object. That must
+    keep working — profile_binding degrades to None rather than raising."""
+    result = asyncio.run(tn.tunnel_status("direct-call-no-request"))
+    assert result["profile_binding"] is None
+    assert result["tenant_id"] == "direct-call-no-request"
+
+
+# ---------------------------------------------------------------------------
 # Generation-aware tools/list manifest — sprint item 49d8244d
 #
 # Builds on the config-generation registry above (02dbd8b4). Covers:

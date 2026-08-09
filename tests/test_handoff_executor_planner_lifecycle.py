@@ -21,6 +21,7 @@ recompute via get_parallelizable_groups instead of repeating that mistake.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -325,3 +326,220 @@ async def test_generate_handoff_goal_mode_super_wave_no_batch_barrier(db, tmp_pa
     assert "serial execution barrier" in content.lower()
     assert a["id"] in content
     assert c["id"] in content
+
+
+# ---------------------------------------------------------------------------
+# PROFILE-6 (89a06e40) — bind effective profile identity/generation into
+# start_session, generate_handoff, and the goal-mode inline /goal text.
+# Pinned decision ee7bccc9 (project 5787cc92-ba7d-4788-b17c-28ab7938b839)
+# covers the tunnel/connector half of this item — see tests/test_tunnel_routes.py
+# for that coverage. This item's declared touches_resources named
+# tests/test_tunnel_client.py for the tunnel half, but that file turned out
+# to cover only the LOCAL tunnel *client* (meridian/tunnel_client.py), not
+# the server-side meridian/routes/tunnel.py HTTP routes this item also
+# touches — tests/test_tunnel_routes.py is the actual existing test file for
+# those routes (confirmed by its own module docstring and end-to-end
+# TestClient coverage of GET /tunnel/status/{tenant_id} and GET/PUT
+# /tunnel/plugins), so the tunnel-route tests below live there instead.
+# ---------------------------------------------------------------------------
+
+_PROFILE_BINDING_KEYS = {
+    "generation_key", "executable", "degraded", "restart_required", "restart_report",
+}
+
+
+def _mcp_call(client, name, arguments):
+    r = client.post("/mcp/sse", json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    })
+    assert r.status_code == 200
+    return r.json()
+
+
+def _result(resp):
+    assert resp.get("result") is not None, resp
+    return json.loads(resp["result"]["content"][0]["text"])
+
+
+# --- handoff.build_effective_profile_binding — the guarded wrapper ------
+
+
+async def test_build_effective_profile_binding_wrapper_no_config(db):
+    """A project with zero profile_layers config still resolves cleanly —
+    no error, a sensible default projection (nothing degraded/blocked)."""
+    project = await db_module.create_project(db, "89a06e40-binding-wrapper-empty")
+    binding = await handoff_module.build_effective_profile_binding(db, project["id"])
+    assert binding is not None
+    assert set(binding.keys()) == _PROFILE_BINDING_KEYS
+    assert binding["generation_key"].startswith("sha256:")
+    assert binding["executable"] is True
+    assert binding["degraded"] is False
+    assert binding["restart_required"] is False
+    assert binding["restart_report"] == {
+        "tunnel": "none", "connector": "none", "capability": "none", "general": "none",
+    }
+
+
+async def test_build_effective_profile_binding_wrapper_reflects_configured_layers(db):
+    project = await db_module.create_project(db, "89a06e40-binding-wrapper-configured")
+    await db_module.set_profile_layer(
+        db, "hosted_default", "global", fields={"tool_priority_map": {"a": "b"}},
+    )
+    await db_module.transition_hosted_default_lifecycle(db, "global", "active")
+    before = await handoff_module.build_effective_profile_binding(db, project["id"])
+    await db_module.set_profile_layer(
+        db, "project", project["id"], fields={"claim_verification_mode": "strict"},
+    )
+    after = await handoff_module.build_effective_profile_binding(db, project["id"])
+    assert before["generation_key"] != after["generation_key"]
+
+
+async def test_build_effective_profile_binding_wrapper_never_raises(db, monkeypatch):
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(handoff_module.db_module, "get_effective_profile", _boom)
+    project = await db_module.create_project(db, "89a06e40-binding-wrapper-boom")
+    binding = await handoff_module.build_effective_profile_binding(db, project["id"])
+    assert binding is None
+
+
+# --- _build_quick_start_goal — inline <profile_generation> tag ----------
+
+
+def test_build_quick_start_goal_profile_generation_tag_rendered_when_key_given():
+    items = [{"id": "i1", "version": None}]
+    goal = handoff_module._build_quick_start_goal(
+        items, profile_generation_key="sha256:deadbeef", profile_restart_required=True,
+    )
+    assert '<profile_generation key="sha256:deadbeef" restart_required="true"/>' in goal
+
+
+def test_build_quick_start_goal_profile_generation_tag_absent_by_default():
+    """Backward compat: every existing caller not yet updated (both kwargs
+    default to None/False) must render byte-identical output — no tag."""
+    items = [{"id": "i1", "version": None}]
+    goal = handoff_module._build_quick_start_goal(items)
+    assert "<profile_generation" not in goal
+
+
+def test_build_quick_start_goal_profile_generation_omitted_matches_explicit_none():
+    items = [{"id": "i1", "version": None}]
+    default_call = handoff_module._build_quick_start_goal(items)
+    explicit_none = handoff_module._build_quick_start_goal(
+        items, profile_generation_key=None, profile_restart_required=False,
+    )
+    assert default_call == explicit_none
+
+
+def test_build_quick_start_goal_profile_generation_tag_absent_on_empty_board_by_default():
+    assert "<profile_generation" not in handoff_module._build_quick_start_goal([])
+
+
+def test_build_quick_start_goal_profile_generation_tag_rendered_on_empty_board():
+    goal = handoff_module._build_quick_start_goal(
+        [], profile_generation_key="sha256:abc123", profile_restart_required=False,
+    )
+    assert '<profile_generation key="sha256:abc123" restart_required="false"/>' in goal
+
+
+def test_build_quick_start_goal_profile_generation_key_is_xml_escaped():
+    items = [{"id": "i1", "version": None}]
+    goal = handoff_module._build_quick_start_goal(
+        items, profile_generation_key='a"b<c>',
+    )
+    tag_start = goal.index('<profile_generation key="') + len('<profile_generation key="')
+    tag_value = goal[tag_start:goal.index('"', tag_start)]
+    assert '"' not in tag_value.replace("&quot;", "")
+    assert "&quot;" in tag_value
+
+
+# --- generate_handoff end-to-end — sibling field + inline goal-mode tag -
+
+
+@pytest.mark.parametrize("mode", ["full", "delta"])
+def test_mcp_generate_handoff_includes_profile_binding(client, mode):
+    pid = client.post("/projects", json={"name": f"mcp-89a06e40-binding-{mode}"}).json()["id"]
+    sess = _result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": f"89a06e40-binding-{mode}",
+    }))
+    session_id = sess.get("session_id")
+    result = _result(_mcp_call(client, "generate_handoff", {
+        "project_id": pid, "mode": mode, "session_id": session_id,
+    }))
+    assert "profile_binding" in result
+    binding = result["profile_binding"]
+    assert binding is not None
+    assert set(binding.keys()) == _PROFILE_BINDING_KEYS
+
+
+def test_http_handoff_endpoint_includes_profile_binding(client):
+    pid = client.post("/projects", json={"name": "http-89a06e40-binding"}).json()["id"]
+    r = client.post(f"/projects/{pid}/handoff")
+    assert r.status_code == 200
+    body = r.json()
+    assert "profile_binding" in body
+    assert body["profile_binding"] is not None
+    assert set(body["profile_binding"].keys()) == _PROFILE_BINDING_KEYS
+
+
+def test_http_planner_handoff_includes_profile_binding(client):
+    pid = client.post("/projects", json={"name": "http-89a06e40-binding-planner"}).json()["id"]
+    r = client.get(f"/projects/{pid}/handoff/planner")
+    assert r.status_code == 200
+    body = r.json()
+    assert "profile_binding" in body
+    assert body["profile_binding"] is not None
+
+
+async def test_generate_handoff_goal_mode_includes_profile_generation_tag(db, tmp_path):
+    """mode='goal' returns ONLY the rendered /goal text (no sibling fields
+    — see generate_handoff's own docstring), so the inline tag is this
+    mode's sole profile-identity signal."""
+    p = await db_module.create_project(db, "89a06e40-goal-profile-tag")
+    await db_module.add_sprint_item(db, p["id"], "v1", "solo item", prospect_bypass=True)
+    _path, content, _amended = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    assert "<profile_generation key=" in content
+    assert 'restart_required="false"' in content
+
+
+# --- handle_start_session — profile_binding orientation field -----------
+
+
+def test_mcp_start_session_includes_profile_binding_no_config(client):
+    pid = client.post(
+        "/projects", json={"name": "mcp-89a06e40-start-binding-empty"}
+    ).json()["id"]
+    result = _result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "89a06e40-start-binding-empty",
+    }))
+    assert "profile_binding" in result
+    binding = result["profile_binding"]
+    assert binding is not None
+    assert set(binding.keys()) == _PROFILE_BINDING_KEYS
+    assert binding["executable"] is True
+    assert binding["degraded"] is False
+
+
+def test_mcp_start_session_includes_profile_binding_with_configured_layers(client):
+    pid = client.post(
+        "/projects", json={"name": "mcp-89a06e40-start-binding-configured"}
+    ).json()["id"]
+
+    async def _configure():
+        db = client.app.state.db
+        await db_module.set_profile_layer(
+            db, "workspace", "singleton", fields={"auto_worktrees": 0},
+        )
+
+    asyncio.run(_configure())
+
+    result = _result(_mcp_call(client, "start_session", {
+        "project_id": pid, "session_name": "89a06e40-start-binding-configured",
+    }))
+    binding = result["profile_binding"]
+    assert binding is not None
+    assert binding["generation_key"].startswith("sha256:")

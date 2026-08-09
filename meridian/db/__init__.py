@@ -12624,4 +12624,8 @@ from .profile_layers import (  # noqa: F401
     transition_hosted_default_lifecycle,
     get_profile_layer_revisions,
     get_effective_profile,
+    # 89a06e40 — tenant/workspace-only resolution for the tunnel/connector
+    # surface (no project_id available there); see profile_layers.py's
+    # docstring and pinned decision ee7bccc9.
+    get_workspace_effective_profile,
 )
