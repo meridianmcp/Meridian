@@ -9,6 +9,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 from .._deps import _hosted_mode
+from .. import hook_paths as hook_paths_module
 
 router = APIRouter()
 
@@ -18,7 +19,26 @@ router = APIRouter()
 # ---------------------------------------------------------------------------
 
 def _hook_script_path(filename: str) -> Path:
-    return Path(__file__).parent.parent.parent / filename
+    """Locate a Meridian-owned installer script (hooks.ps1, hooks.sh, ...).
+
+    e5eec33b — the naive ``__file__``-relative candidate breaks the same way
+    a non-editable/site-packages install already breaks ``_watcher_script_path``
+    below: it resolves to the install directory, not necessarily a real,
+    writable checkout. Mirrors that function's existing fallback shape, but
+    goes through ``hook_paths.resolve_active_repo_root`` for the fallback
+    candidate so both this route module and the active-repository hook
+    resolver agree on what "the repo" means (never a bare, unresolved
+    fragment) when the primary candidate doesn't exist.
+    """
+    primary = Path(__file__).parent.parent.parent / filename
+    if primary.exists():
+        return primary
+    fallback_root = hook_paths_module.resolve_active_repo_root(cwd=str(Path.cwd()))
+    if fallback_root is not None:
+        candidate = fallback_root / filename
+        if candidate.exists():
+            return candidate
+    return primary
 
 
 def _watcher_script_path(filename: str) -> Path:

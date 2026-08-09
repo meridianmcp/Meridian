@@ -31,12 +31,14 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import sys
 
 import pytest
 
 from meridian import claim_verify
 from meridian import db as db_module
 from meridian import handoff as handoff_module
+from meridian import hook_paths
 
 
 # ---------------------------------------------------------------------------
@@ -599,3 +601,88 @@ def test_write_sprint_guard_hooks_switching_to_off_removes_previously_written_ho
 
     hooks = asyncio.run(_run())
     assert not any(h["slug"] == claim_verify.HOOK_NAME for h in hooks)
+
+
+# ---------------------------------------------------------------------------
+# 8. _write_sprint_guard_hooks production path (root=None) -- e5eec33b
+#
+# repo_path resolution now goes through hook_paths.resolve_repo_root_for_handoff
+# instead of a bare Path(repo_path).exists() check, so a repo_path recorded
+# from a WSL/Linux session still resolves when the handoff runs on native
+# Windows. This is the same production (root=None) codepath the
+# claim-verification hook seeding above (section 5/7) rides on, so a broken
+# repo_path resolution here would silently strand claim-verification-hook
+# projects with no repo-local hooks at all.
+# ---------------------------------------------------------------------------
+
+
+def test_write_sprint_guard_hooks_production_path_seeds_claim_verification_hook(tmp_path, monkeypatch):
+    # Simulate "production" by lifting the PYTEST_CURRENT_TEST short-circuit
+    # (see tests/test_sprint_guard.py for the established pattern).
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    (tmp_path / ".claude").mkdir()
+
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "cvm-prod-path")
+        await db_module.update_workspace_settings(db, claim_verification_mode="strict")
+        await db_module.set_executor_config(db, p["id"], {"repo_path": str(tmp_path)})
+        await handoff_module._write_sprint_guard_hooks(db, p["id"])
+        return p["id"]
+
+    project_id = asyncio.run(_run())
+    hooks_dir = tmp_path / ".claude" / "hooks"
+    assert (hooks_dir / "sprint_guard.sh").exists()
+    sh = (hooks_dir / "claim_verification_guard.sh").read_text(encoding="utf-8")
+    assert project_id in sh
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="WSL drive-letter round-trip is Windows-specific")
+def test_write_sprint_guard_hooks_production_path_normalizes_wsl_repo_path(tmp_path, monkeypatch):
+    """A repo_path recorded from a WSL/Linux session (/mnt/c/...) must still
+    resolve when this handoff runs on native Windows -- previously a bare
+    Path(repo_path) check meant this project's hooks (including the
+    claim-verification guard) silently never got written."""
+    (tmp_path / ".claude").mkdir()
+    drive = str(tmp_path)[0].lower()
+    rest = str(tmp_path)[2:].replace("\\", "/").strip("/")
+    wsl_style = f"/mnt/{drive}/{rest}"
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "cvm-prod-wsl")
+        await db_module.set_executor_config(db, p["id"], {"repo_path": wsl_style})
+        await handoff_module._write_sprint_guard_hooks(db, p["id"])
+
+    asyncio.run(_run())
+    assert (tmp_path / ".claude" / "hooks" / "sprint_guard.sh").exists()
+
+
+def test_write_sprint_guard_hooks_production_path_skips_when_repo_path_unresolvable(tmp_path, monkeypatch):
+    # A repo_path that resolves to nowhere real (no .claude dir) must skip
+    # the write entirely -- hook_paths.resolve_repo_root_for_handoff returns
+    # None, matching the pre-existing "no repo of its own" contract.
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    bogus = tmp_path / "nope"
+
+    async def _run():
+        db = await db_module.init_db(":memory:")
+        p = await db_module.create_project(db, "cvm-prod-bogus")
+        await db_module.set_executor_config(db, p["id"], {"repo_path": str(bogus)})
+        await handoff_module._write_sprint_guard_hooks(db, p["id"])
+
+    asyncio.run(_run())
+    assert not bogus.exists()
+
+
+def test_resolve_repo_root_for_handoff_used_directly_matches_write_sprint_guard_hooks_contract(tmp_path):
+    # hook_paths.resolve_repo_root_for_handoff is the exact function
+    # _write_sprint_guard_hooks now delegates to for its root=None path --
+    # assert its contract directly (valid repo -> Path, no .claude -> None).
+    (tmp_path / ".claude").mkdir()
+    assert hook_paths.resolve_repo_root_for_handoff(str(tmp_path)) == tmp_path
+
+    no_claude = tmp_path.parent / "no-claude-here"
+    no_claude.mkdir(exist_ok=True)
+    assert hook_paths.resolve_repo_root_for_handoff(str(no_claude)) is None
