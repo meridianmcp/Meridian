@@ -21,11 +21,22 @@ discipline):
     artifact (vs. inlined, vs. never captured at all) is sibling item
     4d113dcb's job (capture-boundary mapping,
     tests/test_ai_log_capture_boundaries.py).
-  * No export format / MCP tool — sibling item 4d113dcb also owns
-    ``export_ai_log`` / tests/test_ai_log_export.py.
   * No Redis (or any other) read-acceleration layer — see the "REDIS READ
     ACCELERATION" note below for the design contract a future item must
     honor if it adds one.
+
+c0168425 (implementation follow-up to this design item) — EXPORT
+--------------------------------------------------------------------
+:func:`export_artifacts` is this module's one addition beyond the design
+above: a read-only, receipted, project-scoped bulk export (content +
+metadata, base64-encoded for JSON-safety) — for a local-first backup or a
+retention sweep's pre-purge archive. It never deletes anything
+(:func:`purge_artifacts_before` remains the only deletion path) and adds no
+new dependency (still zero-DB, filesystem-only). The MCP-facing surface
+(``export_ai_log_artifacts`` / ``purge_ai_log``) is wired in
+``meridian/mcp/handler.py``'s ``_handle_task_tools`` — see that function for
+how this module's export is combined with ``db.ai_log``'s own event export
+at the integration layer.
 
 DESIGN DECISIONS
 -----------------
@@ -98,6 +109,7 @@ Redis, not Langfuse) remains the system of record.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -350,3 +362,87 @@ def purge_artifacts_before(data_dir: str, project_id: str, cutoff_iso: str) -> i
             if delete_artifact(data_dir, project_id, meta["content_hash"]):
                 deleted += 1
     return deleted
+
+
+def export_artifacts(
+    data_dir: str,
+    project_id: str,
+    *,
+    content_hashes: "list[str] | None" = None,
+) -> dict[str, Any]:
+    """Project-scoped, receipted bulk export of stored artifacts — content
+    AND metadata, content base64-encoded for JSON-safety — for a
+    local-first backup or a retention sweep's pre-purge archive. Read-only:
+    never deletes anything (:func:`purge_artifacts_before` remains the only
+    deletion path).
+
+    *content_hashes*: an explicit subset of ``sha256:...`` values to
+    export. Omit (``None``) to export EVERY artifact currently stored for
+    *project_id* — mirrors :func:`list_artifacts`/
+    :func:`purge_artifacts_before`'s "no filter = whole project" convention.
+    Raises :class:`ArtifactStoreError` if an explicitly requested hash has
+    no stored artifact for this project — an explicit request is
+    all-or-nothing, never a silent partial result (a caller who didn't ask
+    for "everything currently stored" gets an error, not a shorter list, if
+    something it named is missing).
+
+    Returns a receipted bundle: ``{project_id, exported_at, artifact_count,
+    total_size, artifacts, export_hash}``. Each entry in ``artifacts`` is
+    the stored sidecar metadata plus ``content_base64``. ``export_hash`` is
+    a ``sha256:<hex>`` over the canonical (sorted-key) JSON of the
+    artifacts list with EACH entry's ``content_base64`` excluded —
+    deliberately: hashing the bookkeeping fields alone keeps ``export_hash``
+    cheap to recompute/verify without re-encoding every blob, and each
+    artifact's own ``content_hash`` is already itself a cryptographic
+    commitment to its bytes, so nothing is lost by excluding the base64
+    payload from the outer hash.
+    """
+    _safe_component(project_id, label="project_id")
+    if content_hashes is not None:
+        selected_metas: list[dict[str, Any]] = []
+        for content_hash_value in content_hashes:
+            meta = get_artifact_metadata(data_dir, project_id, content_hash_value)
+            if meta is None:
+                raise ArtifactStoreError(
+                    f"content_hash {content_hash_value!r} has no stored artifact "
+                    f"for project_id {project_id!r}"
+                )
+            selected_metas.append(meta)
+    else:
+        selected_metas = list_artifacts(data_dir, project_id)
+
+    exported: list[dict[str, Any]] = []
+    total_size = 0
+    for meta in selected_metas:
+        content = get_artifact(data_dir, project_id, meta["content_hash"])
+        if content is None:
+            # Sidecar existed (found via list_artifacts/get_artifact_metadata
+            # above) but the content file is gone. store_artifact always
+            # writes content BEFORE its sidecar (see module docstring), so
+            # this specific ordering never happens from a normal write; it
+            # can only mean a concurrent delete_artifact raced this export
+            # between the metadata read and the content read. Skip this one
+            # artifact rather than failing the whole export over a benign
+            # concurrent-delete race.
+            continue
+        exported.append({
+            **meta,
+            "content_base64": base64.b64encode(content).decode("ascii"),
+        })
+        total_size += meta.get("size") or 0
+
+    hashable = [
+        {k: v for k, v in artifact.items() if k != "content_base64"}
+        for artifact in exported
+    ]
+    canonical = json.dumps(hashable, sort_keys=True, separators=(",", ":"), default=str)
+    export_hash = "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    return {
+        "project_id": project_id,
+        "exported_at": _utc_now_iso(),
+        "artifact_count": len(exported),
+        "total_size": total_size,
+        "artifacts": exported,
+        "export_hash": export_hash,
+    }

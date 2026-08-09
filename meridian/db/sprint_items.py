@@ -2269,6 +2269,28 @@ async def complete_sprint_item(
         result = dict(result)
         if _advisory_deferred:
             result["advisory_work_deferred"] = True
+            # 394bcbdf — resource-aware diagnostic: best-effort self-sample
+            # of THIS server process's own memory/CPU footprint so a
+            # deferred advisory phase can be explained ("the process itself
+            # is over its configured budget right now, that's why the
+            # rollup/chain-advance step didn't finish in time") instead of
+            # leaving the caller to guess whether a retry is likely to help.
+            # Never raises and never adds meaningful latency (sampling is
+            # itself best-effort and near-instant); only present when
+            # advisory work was actually deferred, keeping the common-case
+            # payload unchanged.
+            try:
+                from .. import process_budget as _process_budget_mod  # noqa: PLC0415
+                _budget_report = _process_budget_mod.sample_server_process()
+                result["resource_diagnostics"] = {
+                    "action": _budget_report.action,
+                    "reason": _budget_report.reason,
+                    "retry_after_seconds": _process_budget_mod.retry_after_seconds_for_report(
+                        _budget_report
+                    ),
+                }
+            except Exception:  # noqa: BLE001 — diagnostics are best-effort only
+                pass
         result["completion_outcome"] = _completion_outcome
         result["correlation_id"] = _correlation_id
         result["phase_timings_ms"] = dict(_phase_ms)

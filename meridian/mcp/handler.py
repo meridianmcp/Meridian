@@ -17,6 +17,7 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any
 
 import meridian.server as _server
@@ -2925,7 +2926,7 @@ async def _handle_task_tools(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token."""
+    """Dispatch group: log_task, get_tasks, search_tasks, generate_handoff, load_handoff, record_handoff_correction, verify_handoff_token, export_ai_log, export_ai_log_artifacts, purge_ai_log."""
     if name == "log_task":
         validate_input_size(args.get("description"), "description", 50_000)
         _log_sid = args.get("session_id", "")
@@ -3277,6 +3278,14 @@ async def _handle_task_tools(
         _blocker_policy_decision = await handoff_module_local.build_blocker_policy_for_handoff(
             db, args["project_id"], version=_effective_version,
         )
+        # 79491e26 — deterministic run timeline reconstructed from durable
+        # ai_log_events state, emitted on every generate_handoff mode
+        # alongside the fields above. Fully guarded — a failure degrades to
+        # no field rather than breaking the mandatory handoff (see
+        # build_run_timeline_for_handoff's own docstring).
+        _run_timeline = await handoff_module_local.build_run_timeline_for_handoff(
+            db, args["project_id"], session_id=session_id,
+        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -3325,6 +3334,15 @@ async def _handle_task_tools(
             # whether the whole run must fail closed (see
             # meridian.blocker_policy / db.evaluate_board_blockers).
             "blocker_policy": _blocker_policy_decision,
+            # 79491e26 — durable, deterministic run-timeline reconstruction
+            # (compact projection of ai_log_events — event_type/occurred_at/
+            # actor/source/correlation, no raw payload) — includes any
+            # planner/executor corrective handoff recorded against this
+            # project's handoffs (see
+            # routes.handoff.record_handoff_correction_endpoint). None when
+            # this project has no durable execution events for this scope
+            # (see build_run_timeline_for_handoff's own docstring).
+            "run_timeline": _run_timeline,
             # b8f89491 — machine-readable scope: which sprint-version bucket
             # this handoff actually resolved to, and why (explicit argument vs.
             # session-derived vs. unscoped). effective_version is None when the
@@ -3477,6 +3495,83 @@ async def _handle_task_tools(
         return await handoff_module_local.verify_handoff_token(
             db, _token, _pid, body=_body_for_check
         )
+    if name == "export_ai_log":
+        # c0168425 — implementation follow-up to ea972129's design: read-only,
+        # receipted export of ai_log_events. See db.ai_log.export_events for
+        # the full contract (filter semantics, bounded limit, export_hash).
+        _limit_raw = args.get("limit")
+        return await db_module.export_events(
+            db, args["project_id"],
+            session_id=args.get("session_id"),
+            event_type=args.get("event_type"),
+            correlation_id=args.get("correlation_id"),
+            parent_event_id=args.get("parent_event_id"),
+            limit=int(_limit_raw) if _limit_raw is not None else 5000,
+        )
+    if name == "export_ai_log_artifacts":
+        # c0168425 — read-only, receipted export of stored ai_log artifacts
+        # (meridian.artifact_store — filesystem-only, no DB dependency by
+        # design; see that module's docstring). Pass content_hashes for an
+        # explicit subset, or omit to export every artifact stored for the
+        # project.
+        from .. import artifact_store as artifact_store_module  # noqa: PLC0415
+        _hashes = args.get("content_hashes")
+        if _hashes is not None and not isinstance(_hashes, list):
+            raise ValueError("content_hashes must be a list of 'sha256:...' strings")
+        try:
+            return artifact_store_module.export_artifacts(
+                data_dir, args["project_id"],
+                content_hashes=[str(h) for h in _hashes] if _hashes else None,
+            )
+        except artifact_store_module.ArtifactStoreError as exc:
+            return {"error": "ARTIFACT_EXPORT_INVALID", "message": str(exc)}
+    if name == "purge_ai_log":
+        # c0168425 — project-scoped, cutoff-based retention sweep spanning
+        # BOTH ai_log_events (db.ai_log.purge_events_before) and their
+        # stored artifacts (artifact_store.purge_artifacts_before) in one
+        # call, with a single structured receipt. Assembled HERE, at the
+        # integration layer, rather than inside either module:
+        # artifact_store is intentionally DB-free (see its module
+        # docstring) and db.ai_log is intentionally filesystem-free, so a
+        # combined sweep belongs to neither module individually.
+        from .. import artifact_store as artifact_store_module  # noqa: PLC0415
+        from datetime import datetime as _dt_cls, timezone as _tz  # noqa: PLC0415
+        _cutoff_raw = str(args.get("cutoff") or "").strip()
+        if not _cutoff_raw:
+            raise ValueError(
+                "cutoff is required (an ISO-8601 UTC datetime, e.g. "
+                "'2025-01-01T00:00:00Z')"
+            )
+        try:
+            _parsed_cutoff = _dt_cls.fromisoformat(_cutoff_raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(
+                f"cutoff {_cutoff_raw!r} must be an ISO-8601 UTC datetime, "
+                "e.g. '2025-01-01T00:00:00Z'"
+            ) from exc
+        # ai_log_events.recorded_at is written in the space-separated
+        # "YYYY-MM-DD HH:MM:SS[.ffffff]" shape on BOTH backends (SQLite's
+        # datetime('now') / Postgres's _TS — see meridian/pg_adapter.py's
+        # _TS constant), distinct from the artifact store's ISO-8601-with-
+        # 'Z' created_at shape (meridian.artifact_store._utc_now_iso) —
+        # convert once here rather than inside purge_events_before, which
+        # already has its own tested cutoff contract (see
+        # tests/test_ai_log_retention.py) that this call must not disturb.
+        _events_cutoff = _parsed_cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        _pid = args["project_id"]
+        _events_deleted = await db_module.purge_events_before(db, _pid, _events_cutoff)
+        _artifacts_deleted = artifact_store_module.purge_artifacts_before(
+            data_dir, _pid, _cutoff_raw,
+        )
+        return {
+            "project_id": _pid,
+            "cutoff": _cutoff_raw,
+            "events_deleted": _events_deleted,
+            "artifacts_deleted": _artifacts_deleted,
+            "purged_at": (
+                _dt_cls.now(_tz.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            ),
+        }
     return _MISS
 
 
@@ -5940,6 +6035,87 @@ async def _handle_code_index_tools(
 _COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S = 45.0
 
 
+# ---------------------------------------------------------------------------
+# 394bcbdf — completion-attempt phase registry.
+#
+# a2a027cf gave complete_sprint_item idempotent retries and a dispatch-level
+# timeout response classified into committed / timed_out_before_commit /
+# unknown_outcome. This registry adds the piece that was still missing: a
+# durable-for-the-life-of-this-process record of which PHASE a specific
+# dispatch attempt (keyed by its correlation_id) reached --
+# "accepted" (the dispatcher received the call) -> "pending" (handed off to
+# the underlying tool-group dispatch) -> "committed" | "failed" (the final
+# outcome). This makes a timed-out attempt ASYNCHRONOUSLY RECOVERABLE: a
+# caller (or an unrelated follow-up support/monitoring call) that only has
+# the correlation_id from a timed-out response can call
+# get_completion_attempt(correlation_id) to see what happened to THAT
+# specific attempt, independent of re-deriving it from the item's bare
+# current status.
+#
+# Deliberately process-local and best-effort, exactly like every other
+# in-process cache in this module (_SESSION_REFRESH_STATE, _EXECUTOR_SESSIONS)
+# -- NOT a replacement for the sprint_items row, which remains the one
+# durable source of truth for whether an item is actually done. Bounded FIFO
+# eviction keeps memory flat regardless of call volume.
+# ---------------------------------------------------------------------------
+
+_COMPLETION_ATTEMPT_MAX = 500
+_completion_attempts: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+
+def _record_completion_phase(
+    correlation_id: str, phase: str, **extra: Any,
+) -> None:
+    """Record/advance one completion attempt's phase history.
+
+    Never raises (a diagnostics-only side channel must never break a real
+    tool call): any unexpected failure is swallowed. Bounded FIFO eviction —
+    once more than ``_COMPLETION_ATTEMPT_MAX`` distinct correlation_ids are
+    tracked, the oldest is dropped — so this can never grow unbounded across
+    a long-lived server process.
+    """
+    try:
+        entry = _completion_attempts.get(correlation_id)
+        if entry is None:
+            entry = {"correlation_id": correlation_id, "phases": []}
+            _completion_attempts[correlation_id] = entry
+        entry["phases"].append({"phase": phase, "at": time.time(), **extra})
+        for _k in ("item_id", "project_id"):
+            if extra.get(_k) is not None:
+                entry[_k] = extra[_k]
+        entry["latest_phase"] = phase
+        _completion_attempts.move_to_end(correlation_id)
+        while len(_completion_attempts) > _COMPLETION_ATTEMPT_MAX:
+            _completion_attempts.popitem(last=False)
+    except Exception:  # noqa: BLE001 — diagnostics registry must never break a call
+        pass
+
+
+def get_completion_attempt(correlation_id: str) -> "dict[str, Any] | None":
+    """Look up a completion attempt's recorded phase history by
+    correlation_id.
+
+    This is the "asynchronously recoverable" half of 394bcbdf: a caller (or
+    a later, unrelated call) holding only a correlation_id from a timed-out
+    complete_sprint_item response can recover what phase that SPECIFIC
+    attempt reached, without needing item_id/project_id. Returns ``None``
+    when the correlation_id is unknown -- never recorded, or evicted (this
+    is a best-effort, bounded, process-local registry, not durable
+    storage; a server restart clears it exactly like every other in-process
+    cache in this module).
+    """
+    entry = _completion_attempts.get(correlation_id)
+    if entry is None:
+        return None
+    # Defensive copy: the caller must never be able to mutate the live
+    # registry entry through the returned dict. dict(entry) alone is only a
+    # shallow copy — "phases" is a list of dicts, both of which need their
+    # own copies too.
+    copied = dict(entry)
+    copied["phases"] = [dict(p) for p in entry["phases"]]
+    return copied
+
+
 async def _complete_sprint_item_timeout_response(
     db: Any, args: dict[str, Any], correlation_id: str, elapsed_s: float,
 ) -> dict[str, Any]:
@@ -5963,6 +6139,21 @@ async def _complete_sprint_item_timeout_response(
     * the re-query itself fails (or the item/project can't be resolved) ->
       ``"unknown_outcome"``: genuinely can't tell; the caller must re-query
       via get_sprint_items/get_sprint_item before deciding anything.
+
+    394bcbdf — resource-aware retry-after diagnostics: alongside the outcome
+    classification above, best-effort self-sample THIS server process's own
+    memory/CPU footprint (``meridian.process_budget.sample_server_process``)
+    and fold the resulting report into a ``resource_diagnostics`` field. A
+    45s dispatch-level stall is far more likely explained by host resource
+    pressure than by ordinary latency when the server process is itself over
+    its configured budget (action ``"quiesce"``/``"kill"``) -- in that case
+    ``retry_after_seconds`` reflects the monitor's own sample interval
+    instead of implying an immediate retry is equally likely to help. Never
+    raises and never blocks the timeout response: sampling is itself
+    best-effort (degrades to action ``"none"`` when psutil is unavailable or
+    the self-sample otherwise fails) and this whole block is wrapped so a
+    diagnostics failure can never turn an already-timed-out response into a
+    second failure.
     """
     item_id = args.get("item_id")
     project_id = args.get("project_id")
@@ -5976,6 +6167,30 @@ async def _complete_sprint_item_timeout_response(
                 outcome = "committed" if current_status == "done" else "timed_out_before_commit"
     except Exception:  # noqa: BLE001 — the re-query itself failing IS the unknown case
         outcome = "unknown_outcome"
+
+    resource_diagnostics: dict[str, Any] = {
+        "action": "none", "reason": "unavailable", "retry_after_seconds": 0.0,
+    }
+    try:
+        from .. import process_budget as process_budget_module  # noqa: PLC0415
+        _report = process_budget_module.sample_server_process()
+        resource_diagnostics = {
+            "action": _report.action,
+            "reason": _report.reason,
+            "retry_after_seconds": process_budget_module.retry_after_seconds_for_report(_report),
+        }
+    except Exception:  # noqa: BLE001 — diagnostics are best-effort only
+        pass
+
+    _resource_note = ""
+    if resource_diagnostics.get("action") in ("quiesce", "kill"):
+        _resource_note = (
+            f" Server process itself is currently {resource_diagnostics['action']!r} "
+            f"({resource_diagnostics['reason']}) — this stall is more likely resource "
+            f"pressure than ordinary latency; wait at least "
+            f"~{resource_diagnostics['retry_after_seconds']:.0f}s before retrying."
+        )
+
     return {
         "error": "COMPLETE_SPRINT_ITEM_TIMEOUT",
         "item_id": item_id,
@@ -5983,6 +6198,7 @@ async def _complete_sprint_item_timeout_response(
         "completion_outcome": outcome,
         "current_status": current_status,
         "elapsed_s": round(elapsed_s, 3),
+        "resource_diagnostics": resource_diagnostics,
         "message": (
             f"complete_sprint_item did not respond within the dispatch "
             f"timeout ({elapsed_s:.1f}s elapsed, correlation_id="
@@ -5993,7 +6209,7 @@ async def _complete_sprint_item_timeout_response(
             "complete_sprint_item is idempotent for that case regardless "
             "(a retry against an already-done item returns "
             "completion_outcome='already_committed', never a duplicate "
-            "completion or a misleading failure)."
+            "completion or a misleading failure)." + _resource_note
         ),
     }
 
@@ -6009,6 +6225,14 @@ async def _dispatch_mcp_tool(
     # Tenant scope for the workspace layer (notes/decisions/settings). None for
     # self-host / unauthenticated; the db functions then skip isolation.
     _mcp_tenant_id = tenant.get("id") if tenant else None
+    # c5c3fc5f — tool-boundary execution-event capture: t0 + a per-dispatch
+    # correlation id, both unconditional (unlike _dispatch_t0/
+    # _dispatch_correlation_id below, which only exist for the
+    # complete_sprint_item special case). See the capture_tool_completed()
+    # call further down, right beside the pre-existing activity-heartbeat
+    # side channel it deliberately mirrors.
+    _capture_t0 = time.monotonic()
+    _capture_correlation_id = uuid.uuid4().hex
     # b6ab6e83 — project_name resolver: accept project_name as alternative to
     # project_id, and resolve non-UUID project_id values as human-readable names.
     _pid_raw = args.get("project_id", "")
@@ -6057,6 +6281,18 @@ async def _dispatch_mcp_tool(
         _dispatch_correlation_id = str(args.get("correlation_id") or uuid.uuid4().hex)
         args = {**args, "correlation_id": _dispatch_correlation_id}
         _dispatch_t0 = time.monotonic()
+        # 394bcbdf — phase registry: "accepted" (dispatch received the call
+        # and minted/echoed its correlation_id) then "pending" (about to
+        # hand off to the underlying tool-group dispatch) recorded together,
+        # both before the first await below — see get_completion_attempt.
+        _record_completion_phase(
+            _dispatch_correlation_id, "accepted",
+            item_id=args.get("item_id"), project_id=args.get("project_id"),
+        )
+        _record_completion_phase(
+            _dispatch_correlation_id, "pending",
+            item_id=args.get("item_id"), project_id=args.get("project_id"),
+        )
     for _grp in _groups:
         if _is_complete_sprint_item:
             try:
@@ -6068,6 +6304,28 @@ async def _dispatch_mcp_tool(
                 _result = await _complete_sprint_item_timeout_response(
                     db, args, _dispatch_correlation_id,
                     time.monotonic() - _dispatch_t0,
+                )
+            if _result is not _MISS:
+                # 394bcbdf — final phase: "committed" when the underlying
+                # call (or, on a dispatch timeout, the re-query it triggers)
+                # confirms the item actually reached 'done'; "failed"
+                # otherwise (a structured error dict — STATUS_RACE,
+                # CI_FAILING, etc. — or a genuine timed_out_before_commit /
+                # unknown_outcome). Only the sprint-tools group ever returns
+                # non-_MISS for this tool name, so this fires exactly once
+                # per call.
+                _committed = (
+                    isinstance(_result, dict)
+                    and _result.get("completion_outcome") in ("committed", "already_committed")
+                )
+                _record_completion_phase(
+                    _dispatch_correlation_id,
+                    "committed" if _committed else "failed",
+                    item_id=args.get("item_id"), project_id=args.get("project_id"),
+                    completion_outcome=(
+                        _result.get("completion_outcome") if isinstance(_result, dict) else None
+                    ),
+                    error=_result.get("error") if isinstance(_result, dict) else None,
                 )
         else:
             _result = await _grp(name, args, db, data_dir, tenant, _mcp_tenant_id)
@@ -6103,6 +6361,79 @@ async def _dispatch_mcp_tool(
                         db, _act_sid, name, _act_summary
                     )
             except Exception:  # noqa: BLE001 — activity recording must never fail a call
+                pass
+            # c5c3fc5f — session + tool boundary execution-event capture (the
+            # canonical ExecutionEvent contract defined in meridian.ai_log,
+            # wired for real via meridian.session_tools). Fully guarded,
+            # exactly like the activity-heartbeat block immediately above:
+            # a capture failure must never affect `_result`. Two boundaries:
+            #   * session.started — only for start_session/register_session,
+            #     the only explicit session-CREATION tool this codebase has
+            #     (see session_tools.py's docstring for why session.ended has
+            #     no symmetric wiring: no explicit end-session tool exists).
+            #   * tool.completed — for every OTHER executor-session tool
+            #     call, reusing the exact same _EXECUTOR_SESSIONS +
+            #     _ACTIVITY_SKIP_TOOLS gate as the activity heartbeat above
+            #     (established precedent for "which tool calls are signal,
+            #     not polling noise" — not a new policy invented here).
+            # Success-path only (mirrors the heartbeat/nudge side channels
+            # around it) — see session_tools.capture_tool_completed's own
+            # docstring for why the exception path is intentionally not
+            # covered by this dispatcher.
+            try:
+                from .. import session_tools as _session_tools  # noqa: PLC0415
+                _cap_pid = args.get("project_id")
+                if (
+                    name in ("start_session", "register_session")
+                    and isinstance(_result, dict)
+                    and not _result.get("error")
+                ):
+                    _cap_started_sid = (
+                        _result.get("session_id")
+                        or (_result.get("session") or {}).get("id")
+                        or _result.get("id")
+                    )
+                    if _cap_started_sid:
+                        await _session_tools.capture_session_started(
+                            db,
+                            # b6ab6e83's project_name resolver already folds a
+                            # resolved id back into `args` above; the one
+                            # remaining gap is start_session's OWN toml/env
+                            # default-project fallback (64b9907a), which
+                            # resolves inside handle_start_session without
+                            # echoing back into this outer `args` — capture_event
+                            # degrades that case to a soft skip (see its
+                            # docstring), never a broken start_session call.
+                            project_id=_cap_pid,
+                            session_id=_cap_started_sid,
+                            actor_id=name,
+                            human_id=args.get("human_id"),
+                            client=args.get("client"),
+                            role=args.get("role"),
+                            tenant_id=_mcp_tenant_id,
+                        )
+                elif (
+                    _act_sid
+                    and _act_sid in _EXECUTOR_SESSIONS
+                    and name not in _ACTIVITY_SKIP_TOOLS
+                ):
+                    _cap_error = (
+                        _result.get("error")
+                        if isinstance(_result, dict) and _result.get("error")
+                        else None
+                    )
+                    await _session_tools.capture_tool_completed(
+                        db,
+                        project_id=_cap_pid,
+                        tool_name=name,
+                        ok=_cap_error is None,
+                        duration_ms=(time.monotonic() - _capture_t0) * 1000.0,
+                        correlation_id=_capture_correlation_id,
+                        session_id=_act_sid,
+                        tenant_id=_mcp_tenant_id,
+                        error_type=(str(_cap_error)[:120] if _cap_error else None),
+                    )
+            except Exception:  # noqa: BLE001 — capture must never break a tool call
                 pass
             # bf51b12e — planner context-refresh nudge. Fully defensive: any error
             # falls through to the untouched _result. In-memory turn tracking +

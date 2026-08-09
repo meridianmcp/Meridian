@@ -516,6 +516,21 @@ async def lifespan(app: FastAPI):
     app.state.db_is_remote = bool(db_url)
     app.state.data_dir = str(data_dir)
     app.state.ws_broadcaster = dashboard_module.WebSocketBroadcaster()
+
+    # 394bcbdf — server-self process budget monitor: resource-aware
+    # diagnostics for complete_sprint_item's dispatch-level timeout handling
+    # (meridian.mcp.handler's _complete_sprint_item_timeout_response) and for
+    # complete_sprint_item's own advisory-work-deferred reporting
+    # (meridian.db.sprint_items). RESET (not lazily created) here so every
+    # server boot -- including a fresh TestClient lifespan in the test suite
+    # -- gets a clean monitor: consecutive-breach/backoff state must never
+    # leak across restarts or across independent lifespans sharing one
+    # interpreter. Self-sampling the server's own pid never blocks startup
+    # (no I/O beyond constructing the dataclass); stored on app.state too in
+    # case a future diagnostics surface wants to read it directly.
+    from . import process_budget as process_budget_module  # noqa: PLC0415
+    app.state.process_budget_monitor = process_budget_module.reset_server_process_monitor()
+
     from .routes.oauth import _hydrate_oauth_cache as _hydrate_oa  # noqa: PLC0415 — c5f8ac43
     await _hydrate_oa(db)
 

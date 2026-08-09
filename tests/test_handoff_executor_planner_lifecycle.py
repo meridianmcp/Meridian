@@ -196,3 +196,132 @@ async def test_scheduler_blocker_hitl_round_trips_resource_blocked_entry(db):
     # Visible via the listing API too, not just the immediate return value.
     pending = await db_module.list_hitl_requests(db, pid, status="pending")
     assert any(r["id"] == row["id"] for r in pending)
+
+
+# ---------------------------------------------------------------------------
+# a8c38d18 — HARDEN: run the eligible symbol-disjoint frontier as one
+# super-wave, not artificial serial batch/macro-wave barriers.
+#
+# get_parallelizable_groups' "groups"/"macro_waves" are, per its own
+# docstring, a presentation/diagnostic partition -- claim_sprint_item's
+# atomic per-resource locking (18c488b6) is the actual concurrency-safety
+# mechanism, not batch/wave completion order. The /goal text built by
+# _build_quick_start_goal previously told the executor to "finish a batch
+# before starting the next" / "finish each macro-wave before the next",
+# which is an artificial barrier: a later-numbered batch/wave only means the
+# greedy first-fit colorer found A conflict with something already placed,
+# not that the WHOLE earlier group must finish first. These tests pin the
+# corrected wording (dispatch the whole eligible frontier concurrently;
+# retry only a claim that is actually rejected) both at the unit level
+# (direct _build_quick_start_goal calls, mirroring test_2a654cb0_wave_runs.py
+# / test_core.py's existing framing coverage) and end-to-end through a real
+# generate_handoff(mode="goal") call.
+# ---------------------------------------------------------------------------
+
+
+def test_build_quick_start_goal_flat_batches_have_no_serial_barrier_directive():
+    """e20db0be's flat batch listing must not tell the executor to finish a
+    batch before starting the next."""
+    items = [
+        {"id": "a1", "version": None}, {"id": "b2", "version": None},
+        {"id": "c3", "version": None},
+    ]
+    groups = {
+        "group_count": 2,
+        "groups": [
+            [{"id": "a1", "title": "x"}, {"id": "b2", "title": "y"}],
+            [{"id": "c3", "title": "z"}],
+        ],
+    }
+    goal = handoff_module._build_quick_start_goal(items, parallel_groups=groups)
+    # The old artificial-barrier phrasing must be gone.
+    assert "finish a batch before starting the next" not in goal
+    assert "finish each numbered batch before the next" not in goal
+    assert "finish each macro-wave before the next" not in goal
+    # The corrected guidance: dispatch concurrently, retry only rejections.
+    assert "CONCURRENTLY" in goal
+    assert "serial execution barrier" in goal.lower()
+    assert "retry only that one item" in goal
+    assert "claim_sprint_item atomically arbitrates" in goal
+    # Existing batch listing/label content is preserved verbatim (test_core.py
+    # / test_2a654cb0_wave_runs.py's own coverage of this framing).
+    assert "resource-conflict-free batches" in goal
+    assert "batch 1: a1, b2" in goal
+    assert "batch 2: c3" in goal
+
+
+def test_build_quick_start_goal_macro_waves_have_no_serial_barrier_directive():
+    """dcfbe55c's macro-wave-compressed listing must carry the same
+    anti-barrier guidance as the flat batch listing -- a macro-wave label is
+    a presentation-only packing of the real conflict-free groups, never a
+    claim-safety boundary."""
+    items = [{"id": f"i{n}", "version": None} for n in range(6)]
+    groups = [
+        [{"id": "i0"}, {"id": "i1"}], [{"id": "i2"}], [{"id": "i3"}],
+        [{"id": "i4"}], [{"id": "i5"}],
+    ]
+    macro_waves = [
+        {"batches": groups[0:2], "batch_count": 2, "item_count": 3},
+        {"batches": groups[2:4], "batch_count": 2, "item_count": 2},
+        {"batches": groups[4:5], "batch_count": 1, "item_count": 1},
+    ]
+    parallel_groups = {
+        "group_count": 5, "groups": groups, "macro_waves": macro_waves,
+        "requested_macro_wave_count": 3, "macro_wave_count": 3, "blocked": [],
+    }
+    goal = handoff_module._build_quick_start_goal(items, parallel_groups=parallel_groups)
+    assert "finish each macro-wave before the next" not in goal
+    assert "finish each numbered batch before the next" not in goal
+    assert "finish a batch before starting the next" not in goal
+    assert "CONCURRENTLY" in goal
+    assert "serial execution barrier" in goal.lower()
+    assert "retry only that one item" in goal
+    assert "claim_sprint_item atomically arbitrates" in goal
+    # Wave/macro-wave framing itself is preserved verbatim (2a654cb0 coverage).
+    assert "macro-wave" in goal
+    assert "presentation only" in goal
+    assert "Wave 1 [batch 1: i0, i1; batch 2: i2]" in goal
+    assert "Wave 2 [batch 3: i3; batch 4: i4]" in goal
+    assert "Wave 3 [batch 5: i5]" in goal
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_super_wave_no_batch_barrier(db, tmp_path):
+    """End-to-end acceptance check from the item's own notes: a real board
+    with a genuinely parallel-safe frontier (one group ends up with 2+
+    items) must render a /goal with no artificial batch-barrier directive,
+    and must still list every item (nothing dropped by the reword).
+
+    A and B share ``file:shared.py`` so they land in DIFFERENT groups; C is
+    disjoint from both and first-fits into A's group, giving group 0 two
+    items -- the exact shape ``_has_parallel`` requires (group_count > 1 AND
+    at least one group with >1 item) to engage the flat-batch items_clause.
+    """
+    p = await db_module.create_project(db, "a8c38d18-super-wave-no-barrier")
+    pid = p["id"]
+    a = await db_module.add_sprint_item(
+        db, pid, "v1", "touch shared file A",
+        touches_resources=["file:shared.py"], prospect_bypass=True,
+    )
+    await db_module.add_sprint_item(
+        db, pid, "v1", "touch shared file B",
+        touches_resources=["file:shared.py"], prospect_bypass=True, force=True,
+    )
+    c = await db_module.add_sprint_item(
+        db, pid, "v1", "touch disjoint file C",
+        touches_resources=["file:disjoint.py"], prospect_bypass=True, force=True,
+    )
+    groups = await db_module.get_parallelizable_groups(db, pid, version="v1")
+    assert groups["group_count"] > 1
+    assert any(len(g) > 1 for g in groups["groups"])  # sanity: _has_parallel gate is met
+
+    _path, content, _amended = await handoff_module.generate_handoff(
+        db, pid, str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    assert "finish a batch before starting the next" not in content
+    assert "finish each numbered batch before the next" not in content
+    assert "finish each macro-wave before the next" not in content
+    assert "CONCURRENTLY" in content
+    assert "serial execution barrier" in content.lower()
+    assert a["id"] in content
+    assert c["id"] in content

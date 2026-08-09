@@ -10,9 +10,52 @@ from fastapi import APIRouter, HTTPException, Request
 from .._deps import _db, _data_dir
 from .. import db as db_module
 from .. import handoff as handoff_module
+from ..db import ai_log as ai_log_module
 from ..models import HandoffResult
 
 router = APIRouter()
+
+
+async def _log_correction_event(
+    db: Any,
+    project_id: str,
+    event_type: str,
+    *,
+    session_id: "str | None",
+    correlation_id: "str | None",
+    payload: dict[str, Any],
+    payload_schema: str,
+) -> None:
+    """79491e26 — best-effort durable trace for a planner/executor
+    corrective handoff, so :func:`meridian.handoff.build_run_timeline_for_handoff`
+    can reconstruct it alongside every other execution event this project
+    has captured, instead of a correction being visible ONLY via a separate
+    ``handoff_corrections`` lookup.
+
+    Fire-and-forget by design, matching every other enrichment step in the
+    handoff pipeline: an ai_log write problem (a pre-9e83be4a DB missing the
+    ``ai_log_events`` table, a transient secret-shaped-payload rejection
+    from :func:`meridian.secret_redaction.check_for_secrets`, anything else)
+    must never make a legitimate correction unrecordable — this endpoint's
+    own failure contract stays exactly what it was before this function
+    existed (``HandoffCorrectionError`` only). ``correlation_id`` is set to
+    the correction's ``source_handoff_id`` so every event tied to one source
+    handoff's correction lifecycle (recorded, then regenerated) groups under
+    one correlation id on the reconstructed timeline.
+    """
+    try:
+        await ai_log_module.AiLogStore(db, project_id).append(
+            event_type,
+            "session" if session_id else "system",
+            actor_id=session_id,
+            session_id=session_id,
+            correlation_id=correlation_id,
+            source="routes.handoff",
+            payload=payload,
+            payload_schema=payload_schema,
+        )
+    except Exception:  # noqa: BLE001 — best-effort, never blocks the correction
+        pass
 
 
 @router.get("/projects/{project_id}/handoff/planner")
@@ -313,17 +356,46 @@ async def record_handoff_correction_endpoint(
         )
     except handoff_module.HandoffCorrectionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # 79491e26 — see _log_correction_event's docstring: best-effort, never
+    # blocks a legitimate correction on an ai_log write problem.
+    await _log_correction_event(
+        db, project_id, "handoff.correction_recorded",
+        session_id=correction.get("session_id"),
+        correlation_id=correction.get("source_handoff_id"),
+        payload={
+            "correction_id": correction.get("id"),
+            "source_handoff_id": correction.get("source_handoff_id"),
+            "blocker_classification": correction.get("blocker_classification"),
+            "status": correction.get("status"),
+            "version": correction.get("version"),
+        },
+        payload_schema="handoff_correction_recorded@1",
+    )
     if not body.get("regenerate"):
         return {"correction": correction, "regenerated": False}
     data_dir = _data_dir(request)
     try:
-        return await handoff_module.regenerate_handoff_correction(
+        result = await handoff_module.regenerate_handoff_correction(
             db, project_id, correction["id"], body.get("output_dir") or data_dir,
             session_id=body.get("session_id"),
             mode=body.get("mode") or "full",
         )
     except handoff_module.HandoffCorrectionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # 79491e26 — same best-effort durable trace for the regeneration outcome.
+    await _log_correction_event(
+        db, project_id, "handoff.correction_regenerated",
+        session_id=correction.get("session_id"),
+        correlation_id=correction.get("source_handoff_id"),
+        payload={
+            "correction_id": correction.get("id"),
+            "new_handoff_id": result.get("new_handoff_id"),
+            "amended": result.get("amended"),
+            "invalidated_source": bool(result.get("invalidated_source")),
+        },
+        payload_schema="handoff_correction_regenerated@1",
+    )
+    return result
 
 
 @router.get("/projects/{project_id}/handoff/corrections/latest")
