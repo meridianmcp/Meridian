@@ -91,11 +91,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from meridian.capability_manifest import CapabilityManifestError, _ABSOLUTE_PATH_RE, _SECRET_LIKE_RE
+from meridian import capability_profile as _capability_profile
+from meridian.capability_manifest import (
+    CapabilityManifestError,
+    _ABSOLUTE_PATH_RE,
+    _SECRET_LIKE_RE,
+    normalize_manifest as _normalize_capability_manifest,
+)
 
 #: Envelope schema version this module writes — breaking-only, mirrors
 #: meridian.ai_log.EVENT_SCHEMA_VERSION's discipline.
@@ -111,6 +118,11 @@ MergeStrategy = Literal["scalar_override", "dict_merge_by_key", "list_replace_vi
 RestartClass = Literal["hot_reload", "explicit_refresh_required", "restart_required"]
 LifecycleState = Literal["draft", "active", "deprecated", "retired"]
 SafeDirection = Literal["increase", "decrease"]
+#: Restart/refresh-report bucket a field's changes are classified under.
+#: Folded in from profile_resolution.py (ac95d206) during the
+#: PROFILE-RECON reconciliation (732c113e) — see ProfileFieldSpec.component
+#: and _compute_restart_report below.
+RestartComponent = Literal["tunnel", "connector", "capability", "general"]
 
 LIFECYCLE_STATES: tuple[str, ...] = ("draft", "active", "deprecated", "retired")
 
@@ -195,6 +207,63 @@ def _check_value_safety(value: Any, *, path: str, allow_absolute_path: bool) -> 
             _check_value_safety(sub, path=f"{path}[{idx}]", allow_absolute_path=allow_absolute_path)
 
 
+#: Fields whose string value is a shell/deploy command -- subject to the
+#: unsafe-command heuristic below. Folded in from profile_resolution.py
+#: (ac95d206) during the PROFILE-RECON reconciliation (732c113e): a
+#: conservative, documented deny-list, defense in depth only -- same spirit
+#: as the secret-shaped/absolute-path checks above.
+_COMMAND_SHAPED_FIELDS = frozenset({"executor_config.test_cmd", "executor_config.deploy_cmd"})
+
+_UNSAFE_COMMAND_RE = re.compile(
+    r"(?i)("
+    r"rm\s+-rf\s+[/~]|"
+    r"del\s+/[fsq]{1,3}\s|"
+    r"remove-item\s+-recurse\s+-force\s+[a-z]:\\|"
+    r"format\s+[a-z]:|"
+    r"mkfs\.|"
+    r"dd\s+if=.*of=/dev/|"
+    r">\s*/dev/sd|"
+    r"shutdown\b|reboot\b|"
+    r"sudo\s+rm\b|"
+    r"curl[^|]*\|\s*(sh|bash)\b|"
+    r"wget[^|]*\|\s*(sh|bash)\b|"
+    r"drop\s+(database|table)\b|"
+    r":\(\)\s*\{\s*:\|\s*:&\s*\}\s*;\s*:|"
+    r"git\s+push\s+--force\b"
+    r")"
+)
+
+
+def _check_unsafe_command(value: Any, *, path: str) -> None:
+    """Reject a shell/deploy-command-shaped field value matching a
+    conservative destructive-command deny-list. Folded in from
+    profile_resolution.py (ac95d206) verbatim during the PROFILE-RECON
+    reconciliation (732c113e)."""
+    if isinstance(value, str) and _UNSAFE_COMMAND_RE.search(value):
+        raise ProfileContractError(f"{path}: unsafe/destructive command pattern not allowed")
+
+
+#: Python types backing each FIELD_REGISTRY "type" string -- used by
+#: _check_field_type. Folded in from profile_resolution.py (ac95d206)
+#: during the PROFILE-RECON reconciliation (732c113e): profile_contract.py
+#: previously only recorded ``type`` as an informational string and never
+#: actually checked a written value against it.
+_PY_TYPES: dict[str, type] = {"int": int, "str": str, "dict": dict, "list": list}
+
+
+def _check_field_type(spec: ProfileFieldSpec, value: Any, *, path: str) -> None:
+    """Reject a value whose Python type doesn't match its field's registry
+    ``type``. ``bool`` is explicitly rejected for an ``int`` field (Python's
+    ``bool`` is an ``int`` subclass, which would otherwise silently pass)."""
+    py_type = _PY_TYPES.get(spec.type)
+    if py_type is None:
+        return  # unrecognized/informational type string -- nothing to check
+    if spec.type == "int" and isinstance(value, bool):
+        raise ProfileContractError(f"{path}: expected int, got bool")
+    if not isinstance(value, py_type):
+        raise ProfileContractError(f"{path}: expected {spec.type}, got {type(value).__name__}")
+
+
 def normalize_provenance(raw: Any) -> dict[str, Any] | None:
     """Validate the layer-level provenance blob — same non-secret,
     non-machine-local-path contract as capability_profile.normalize_provenance
@@ -217,6 +286,14 @@ class ProfileFieldSpec(BaseModel):
     merge_strategy: MergeStrategy = "scalar_override"
     default: Any = None
     restart_class: RestartClass = "hot_reload"
+    #: Which restart/refresh-report bucket (tunnel/connector/capability/
+    #: general) this field's changes are classified under. Folded in from
+    #: profile_resolution.py (ac95d206) during the PROFILE-RECON
+    #: reconciliation (732c113e) — see _compute_restart_report. "tunnel" is
+    #: not used by any field today (reserved for when tunnel.py's
+    #: has_active_tunnel()-gated fields land) but still appears in every
+    #: restart_report so callers never special-case its absence.
+    component: RestartComponent = "general"
     narrow_only: bool = False
     safe_direction: SafeDirection | None = None
     #: Layers at which an absolute machine-local path is permitted in this
@@ -262,89 +339,100 @@ FIELD_REGISTRY: dict[str, ProfileFieldSpec] = {
     "max_pinned_decisions": _spec(
         name="max_pinned_decisions", type="int", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default=20, restart_class="hot_reload",
-        legacy_source="project_settings",
+        component="general", legacy_source="project_settings",
     ),
     "hitl_auto_answer": _spec(
         name="hitl_auto_answer", type="int", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default=0, restart_class="hot_reload",
-        narrow_only=True, safe_direction="decrease", legacy_source="project_settings",
+        component="general", narrow_only=True, safe_direction="decrease",
+        legacy_source="project_settings",
     ),
     "auto_worktrees": _spec(
         name="auto_worktrees", type="int", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default=1, restart_class="hot_reload",
-        legacy_source="project_settings",
+        component="general", legacy_source="project_settings",
     ),
     "require_merge_approval": _spec(
         name="require_merge_approval", type="int", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default=1, restart_class="hot_reload",
-        narrow_only=True, safe_direction="increase", legacy_source="project_settings",
+        component="general", narrow_only=True, safe_direction="increase",
+        legacy_source="project_settings",
     ),
     "code_intel_enabled": _spec(
         name="code_intel_enabled", type="int", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default=0, restart_class="hot_reload",
-        legacy_source="project_settings",
+        component="general", legacy_source="project_settings",
     ),
     "execution_mode": _spec(
         name="execution_mode", type="str", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default="autonomous",
-        restart_class="explicit_refresh_required", legacy_source="project_settings",
+        restart_class="explicit_refresh_required", component="general",
+        legacy_source="project_settings",
     ),
     # --- executor_config.* sub-fields (the 7th ProjectSettings field) ------
     "executor_config.repo_path": _spec(
         name="executor_config.repo_path", type="str", allowed_layers=["project", "session"],
         merge_strategy="scalar_override", default=None, restart_class="restart_required",
-        path_allowed_from_layer=_EXEC_CFG_PATH_LAYERS, legacy_source="project_settings",
+        component="connector", path_allowed_from_layer=_EXEC_CFG_PATH_LAYERS,
+        legacy_source="project_settings",
     ),
     "executor_config.repo_paths": _spec(
         name="executor_config.repo_paths", type="list", allowed_layers=["project", "session"],
         merge_strategy="scalar_override", default=None, restart_class="restart_required",
-        path_allowed_from_layer=_EXEC_CFG_PATH_LAYERS, legacy_source="project_settings",
+        component="connector", path_allowed_from_layer=_EXEC_CFG_PATH_LAYERS,
+        legacy_source="project_settings",
     ),
     "executor_config.env_file": _spec(
         name="executor_config.env_file", type="str", allowed_layers=["project", "session"],
         merge_strategy="scalar_override", default=None, restart_class="restart_required",
-        path_allowed_from_layer=_EXEC_CFG_PATH_LAYERS, legacy_source="project_settings",
+        component="connector", path_allowed_from_layer=_EXEC_CFG_PATH_LAYERS,
+        legacy_source="project_settings",
     ),
     "executor_config.test_cmd": _spec(
         name="executor_config.test_cmd", type="str", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default=None, restart_class="hot_reload",
-        path_allowed_from_layer=_EXEC_CFG_PATH_LAYERS, legacy_source="project_settings",
+        component="connector", path_allowed_from_layer=_EXEC_CFG_PATH_LAYERS,
+        legacy_source="project_settings",
     ),
     "executor_config.test_min": _spec(
         name="executor_config.test_min", type="int", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default=None, restart_class="hot_reload",
-        narrow_only=True, safe_direction="increase", legacy_source="project_settings",
+        component="connector", narrow_only=True, safe_direction="increase",
+        legacy_source="project_settings",
     ),
     "executor_config.deploy_cmd": _spec(
         name="executor_config.deploy_cmd", type="str", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default=None, restart_class="hot_reload",
-        path_allowed_from_layer=_EXEC_CFG_PATH_LAYERS, legacy_source="project_settings",
+        component="connector", path_allowed_from_layer=_EXEC_CFG_PATH_LAYERS,
+        legacy_source="project_settings",
     ),
     "executor_config.shell_type": _spec(
         name="executor_config.shell_type", type="str", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default=None, restart_class="hot_reload",
-        legacy_source="project_settings",
+        component="connector", legacy_source="project_settings",
     ),
     "executor_config.branch": _spec(
         name="executor_config.branch", type="str", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default=None, restart_class="hot_reload",
-        legacy_source="project_settings",
+        component="connector", legacy_source="project_settings",
     ),
     # --- 3 genuinely-new PROFILE-1 fields ------------------------------------
     "claim_verification_mode": _spec(
         name="claim_verification_mode", type="str", allowed_layers=_ALL_LAYERS,
         merge_strategy="scalar_override", default="advisory", restart_class="hot_reload",
-        narrow_only=True, safe_direction="increase", legacy_source="profile_layers",
+        component="connector", narrow_only=True, safe_direction="increase",
+        legacy_source="profile_layers",
     ),
     "tool_priority_map": _spec(
         name="tool_priority_map", type="dict", allowed_layers=_ALL_LAYERS,
         merge_strategy="dict_merge_by_key", default=None, restart_class="hot_reload",
-        legacy_source="profile_layers",
+        component="capability", legacy_source="profile_layers",
     ),
     "capability_manifest_ref": _spec(
         name="capability_manifest_ref", type="list", allowed_layers=_ALL_LAYERS,
         merge_strategy="list_replace_via_capability_profile", default=None,
-        restart_class="explicit_refresh_required", legacy_source="profile_layers",
+        restart_class="explicit_refresh_required", component="capability",
+        legacy_source="profile_layers",
     ),
 }
 
@@ -359,9 +447,18 @@ def validate_layer_fields(
     """Validate a layer write BEFORE persistence — raise, never silent drop.
 
     Checks: scope_type is valid, every field name exists in the registry,
-    the layer's scope_type is in that field's ``allowed_layers``, and the
-    value carries no secret-shaped string or (outside
-    ``path_allowed_from_layer``) machine-local absolute path.
+    the layer's scope_type is in that field's ``allowed_layers``, the value
+    is not ``None`` (use ``reset_fields`` instead), the value's Python type
+    matches the field's registry ``type``, the value carries no
+    secret-shaped string or (outside ``path_allowed_from_layer``)
+    machine-local absolute path, no unsafe/destructive shell command (for
+    ``executor_config.test_cmd``/``deploy_cmd``), and -- for
+    ``capability_manifest_ref`` -- a structurally valid capability contract
+    (delegates to ``capability_manifest.normalize_manifest``). The null,
+    type, unsafe-command, and capability-contract checks were folded in from
+    profile_resolution.py (ac95d206) during the PROFILE-RECON reconciliation
+    (732c113e) — profile_contract.py previously only checked field/layer
+    existence, the legacy-authority guard, and secret/path safety.
     """
     registry = field_registry or FIELD_REGISTRY
     scope_type = normalize_scope_type(scope_type)
@@ -390,8 +487,22 @@ def validate_layer_fields(
                 "at scope_type='project' may only carry genuinely-new fields "
                 "(legacy_source='profile_layers')."
             )
+        if value is None:
+            raise ProfileContractError(
+                f"field {field_name!r}: null is not a valid override value -- use "
+                "reset_fields to clear a field back to its default"
+            )
+        path = f"profile.{field_name}"
+        _check_field_type(spec, value, path=path)
         allow_path = scope_type in spec.path_allowed_from_layer
-        _check_value_safety(value, path=f"profile.{field_name}", allow_absolute_path=allow_path)
+        _check_value_safety(value, path=path, allow_absolute_path=allow_path)
+        if field_name in _COMMAND_SHAPED_FIELDS:
+            _check_unsafe_command(value, path=path)
+        if field_name == "capability_manifest_ref" and value:
+            try:
+                _normalize_capability_manifest(value)
+            except CapabilityManifestError as exc:
+                raise ProfileContractError(f"{path}: invalid capability contract: {exc}") from exc
 
 
 class ProfileLayer(BaseModel):
@@ -428,6 +539,17 @@ class EffectiveProfile(BaseModel):
     layers_applied: list[str] = Field(default_factory=list)
     generation_key: str = ""
     refresh_required: bool = False
+    #: Per-component (tunnel/connector/capability/general) restart/refresh
+    #: severity among CHANGED fields — "none" | "hot_reload" |
+    #: "explicit_refresh_required" | "restart_required". Folded in from
+    #: profile_resolution.py (ac95d206) during the PROFILE-RECON
+    #: reconciliation (732c113e); see _compute_restart_report. Only
+    #: meaningful when ``previous_fields`` was supplied to
+    #: resolve_effective_profile — otherwise every component reports "none"
+    #: and ``restart_required`` is False, mirroring ``refresh_required``'s
+    #: own "nothing to diff without a baseline" contract.
+    restart_report: dict[str, str] = Field(default_factory=dict)
+    restart_required: bool = False
 
 
 def _direction_is_safe(old: Any, new: Any, safe_direction: str, field_name: str) -> bool:
@@ -461,6 +583,38 @@ def _compute_generation_key(contributing: list[tuple[str, str, int]]) -> str:
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+_RESTART_SEVERITY: dict[str, int] = {"hot_reload": 1, "explicit_refresh_required": 2, "restart_required": 3}
+_SEVERITY_LABEL: dict[int, str] = {0: "none", 1: "hot_reload", 2: "explicit_refresh_required", 3: "restart_required"}
+_RESTART_COMPONENTS: tuple[str, ...] = ("tunnel", "connector", "capability", "general")
+
+
+def _compute_restart_report(
+    changed_field_names: set[str], registry: dict[str, ProfileFieldSpec]
+) -> tuple[dict[str, str], bool]:
+    """Per-component (tunnel/connector/capability/general) classification of
+    the most severe ``restart_class`` among ``changed_field_names``. Folded
+    in from profile_resolution.py's ``_compute_restart_report`` (ac95d206)
+    during the PROFILE-RECON reconciliation (732c113e).
+
+    ``tunnel`` is always "none" in today's registry — no field is currently
+    classified tunnel-component; reserved for when routes/tunnel.py's
+    ``has_active_tunnel()``-gated fields land. The component still appears
+    in the report (not omitted) so a caller's shape never has to
+    special-case its absence.
+    """
+    severities: dict[str, int] = {c: 0 for c in _RESTART_COMPONENTS}
+    for field_name in changed_field_names:
+        spec = registry.get(field_name)
+        if spec is None:
+            continue
+        sev = _RESTART_SEVERITY[spec.restart_class]
+        if sev > severities[spec.component]:
+            severities[spec.component] = sev
+    report = {component: _SEVERITY_LABEL[sev] for component, sev in severities.items()}
+    restart_required = any(v == "restart_required" for v in report.values())
+    return report, restart_required
+
+
 def resolve_effective_profile(
     layers: list[ProfileLayer],
     *,
@@ -474,7 +628,13 @@ def resolve_effective_profile(
     this resolution (e.g. a session layer only when a session_id was given) —
     a layer with no fields and no reset_fields is skipped and does not appear
     in ``layers_applied``, mirroring capability_profile's own "no applicable
-    scope_id -> skip" convention.
+    scope_id -> skip" convention. ``layers`` may be passed in any order —
+    they are re-sorted here to ``SCOPE_TYPES`` order (least -> most
+    specific) before merging, so an out-of-order caller can never
+    accidentally let a less-specific layer win by list position. (Folded in
+    from profile_resolution.py during the PROFILE-RECON reconciliation,
+    732c113e; every existing caller already passes layers in scope order, so
+    this is purely additive robustness.)
 
     ``override_reason``, when given, allows every narrow_only widen in this
     resolution through (still logged in ``blocked_widens`` with
@@ -488,9 +648,14 @@ def resolve_effective_profile(
     ``refresh_required`` (per PROFILE-1: "refresh_required = generation_key
     changed AND diff touches an explicit_refresh_required field"). Omitted
     (the common case — a first resolution, or a caller not tracking history)
-    -> ``refresh_required`` is always False; there is nothing to diff.
+    -> ``refresh_required`` is always False; there is nothing to diff. The
+    same ``previous_fields`` diff also feeds ``restart_report``/
+    ``restart_required`` (see :func:`_compute_restart_report`) — folded in
+    from profile_resolution.py during the PROFILE-RECON reconciliation
+    (732c113e).
     """
     registry = field_registry or FIELD_REGISTRY
+    ordered_layers = sorted(layers, key=lambda layer: SCOPE_TYPES.index(layer.scope_type))
     effective: dict[str, Any] = {}
     sources: dict[str, str] = {}
     overrides: list[dict[str, Any]] = []
@@ -499,7 +664,7 @@ def resolve_effective_profile(
     layers_applied: list[str] = []
     contributing: list[tuple[str, str, int]] = []
 
-    for layer in layers:
+    for layer in ordered_layers:
         if not layer.fields and not layer.reset_fields:
             continue
         layers_applied.append(layer.scope_type)
@@ -550,13 +715,29 @@ def resolve_effective_profile(
                     continue  # rejected: value not applied, prior value (or default) stands
                 blocked_widens.append({**entry, "overridden": True, "override_reason": override_reason})
 
+            conflict = False
             if spec.merge_strategy == "dict_merge_by_key" and isinstance(value, dict):
                 merged_value: Any = {**(previous_value or {}), **value}
+            elif spec.merge_strategy == "list_replace_via_capability_profile" and isinstance(value, list):
+                # DELEGATES actual capability-list merging to
+                # capability_profile.merge_layers, treating the accumulated
+                # value and this layer's value as two capability-list layers
+                # — so a genuine required_tools/availability_policy conflict
+                # is detected the exact same way capability_profile.py
+                # already detects one. Folded in from profile_resolution.py
+                # during the PROFILE-RECON reconciliation (732c113e): this
+                # module previously only tracked which ref was active per
+                # layer wholesale (last-write-wins), losing earlier layers'
+                # capabilities instead of merging them.
+                merged_list, _cap_sources, cap_overrides, _cap_disabled = _capability_profile.merge_layers([
+                    {"layer": sources.get(field_name, "default"), "capabilities": previous_value or [],
+                     "disabled_capability_ids": []},
+                    {"layer": layer.scope_type, "capabilities": value, "disabled_capability_ids": []},
+                ])
+                merged_value = merged_list
+                conflict = any(o.get("conflict") for o in cap_overrides)
             else:
-                # scalar_override, and list_replace_via_capability_profile
-                # (which DELEGATES actual capability-list merging to
-                # capability_profile.merge_layers elsewhere — this module
-                # only tracks which ref is active per layer, wholesale).
+                # scalar_override.
                 merged_value = value
 
             if had_previous:
@@ -566,6 +747,7 @@ def resolve_effective_profile(
                     "to_layer": layer.scope_type,
                     "previous": previous_value,
                     "new": merged_value,
+                    "conflict": conflict,
                 })
 
             effective[field_name] = merged_value
@@ -574,15 +756,17 @@ def resolve_effective_profile(
     generation_key = _compute_generation_key(contributing)
 
     refresh_required = False
+    changed_field_names: set[str] = set()
     if previous_fields is not None:
         touched_field_names = set(effective) | set(previous_fields)
         for field_name in touched_field_names:
-            spec = registry.get(field_name)
-            if spec is None or spec.restart_class != "explicit_refresh_required":
-                continue
             if effective.get(field_name) != previous_fields.get(field_name):
-                refresh_required = True
-                break
+                changed_field_names.add(field_name)
+                spec = registry.get(field_name)
+                if spec is not None and spec.restart_class == "explicit_refresh_required":
+                    refresh_required = True
+
+    restart_report, restart_required = _compute_restart_report(changed_field_names, registry)
 
     return EffectiveProfile(
         fields=effective,
@@ -593,6 +777,8 @@ def resolve_effective_profile(
         layers_applied=layers_applied,
         generation_key=generation_key,
         refresh_required=refresh_required,
+        restart_report=restart_report,
+        restart_required=restart_required,
     )
 
 
