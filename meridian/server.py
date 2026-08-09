@@ -916,6 +916,7 @@ from .routes.marketplace import router as _marketplace_router  # noqa: E402
 from .routes.tunnel import router as _tunnel_router          # noqa: E402
 from .routes.oauth import router as _oauth_router            # noqa: E402
 from .routes.a2a import router as _a2a_router                # noqa: E402
+from .routes.settings import router as _settings_router      # noqa: E402
 
 app.include_router(_oauth_router)
 app.include_router(_notes_router)
@@ -939,6 +940,7 @@ app.include_router(_blog_router)
 app.include_router(_marketplace_router)
 app.include_router(_tunnel_router)
 app.include_router(_a2a_router)
+app.include_router(_settings_router)
 
 # ---------------------------------------------------------------------------
 # Password gate middleware
@@ -5098,6 +5100,18 @@ async def _build_continue_payload(
     # get_effective_capability_profile) or a follow-up
     # generate_handoff(mode='full') call, exactly like the 248c0bb9
     # starter/goal fix's own fallback story.
+    # 89a06e40 — best-effort profile identity/generation resolution, threaded
+    # into goal_string's inline <profile_generation> tag below, the same
+    # pattern generate_handoff's three call sites use (meridian/handoff.py).
+    # build_effective_profile_binding is fully guarded internally (returns
+    # None on any failure) — no extra try/except needed here. This is a
+    # verification follow-up (89a06e40): the original PROFILE-6 commit wired
+    # generate_handoff's three modes and the executor-goal MCP prompt but
+    # missed this "just continue" resume payload, whose goal_string is
+    # copied/forwarded the same way a goal-only handoff's body is.
+    _profile_binding = await handoff_module.build_effective_profile_binding(
+        db, project_id, session_id=session.get("id"),
+    )
     goal_string = handoff_module._build_quick_start_goal(
         pending,
         version=scoped_version,
@@ -5107,6 +5121,12 @@ async def _build_continue_payload(
         pointer_evidence_ids=_continue_pointer_evidence_ids,
         execution_policy=_exec_policy,
         full_contract_max_items=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+        profile_generation_key=(
+            _profile_binding.get("generation_key") if _profile_binding else None
+        ),
+        profile_restart_required=bool(
+            _profile_binding.get("restart_required")
+        ) if _profile_binding else False,
     )
     # 60eed526 — full_contract_max_items above only caps how many pending
     # items' tool_requirements get inlined; it does not bound how large a
@@ -6086,14 +6106,24 @@ async def start_session_endpoint(
     Registers the caller, fetches goal + ambient tasks, fetches the last 10
     tasks, lists active sessions, and reports whether a handoff file already
     exists on disk. Replaces 4 separate MCP calls at session cold-start.
+
+    89a06e40 (PROFILE-6 verification follow-up) — this route returns
+    ``_start_session_composite``'s payload directly, bypassing the MCP
+    ``start_session`` tool's ``handle_start_session`` handler
+    (``meridian/mcp/handlers/project_tools.py``) entirely, so it does not
+    automatically inherit that handler's ``profile_binding`` enrichment
+    block. The block below mirrors it for this REST surface (both the
+    fresh-session and continue-mode payload shapes) so a REST caller gets
+    the same sibling field an MCP caller does.
     """
-    project = await db_module.get_project(await _db(request), project_id)
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     validate_input_size(body.session_name, "session name", 200)
     try:
-        return await _start_session_composite(
-            await _db(request),
+        result = await _start_session_composite(
+            db,
             project_id,
             body.session_name,
             _data_dir(request),
@@ -6104,6 +6134,20 @@ async def start_session_endpoint(
         )
     except ValueError as _ve:
         raise HTTPException(status_code=400, detail=str(_ve)) from _ve
+    # 89a06e40 — best-effort profile_binding sibling field, mirroring
+    # handle_start_session's own enrichment block exactly (same lookup, same
+    # guard). A resolution failure must never break start-session.
+    try:
+        if isinstance(result, dict):
+            _sid_for_profile = (
+                result.get("session_id") or result.get("session", {}).get("id")
+            )
+            result["profile_binding"] = await handoff_module.build_effective_profile_binding(
+                db, project_id, session_id=_sid_for_profile,
+            )
+    except Exception:  # noqa: BLE001 — profile binding is best-effort
+        pass
+    return result
 
 
 # ---------------------------------------------------------------------------

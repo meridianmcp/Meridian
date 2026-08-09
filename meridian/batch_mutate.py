@@ -8,8 +8,10 @@ place so a future second transport (HTTP route, stdio) can share it
 verbatim rather than re-deriving slightly different wording.
 
 Unlike ``execute_batch``, ``batch_mutate`` has no ``operation`` concept --
-each entry names its own ``"kind"`` (``"sprint_item_pointer"`` or
-``"sprint_item_update"``), enforced by
+each entry names its own ``"kind"`` (``"sprint_item_pointer"``,
+``"sprint_item_update"``, or -- PROFILE-7 77369699 -- ``"profile_layer"``,
+an upsert of one ``(scope_type, scope_id)`` layer in the PROFILE-1/PROFILE-2
+layered profile contract), enforced by
 :func:`meridian.db.batch_management.execute_mixed_mutation_batch` itself
 (see :data:`meridian.db.batch_management.MIXED_MUTATION_ENTRY_KINDS`).
 """

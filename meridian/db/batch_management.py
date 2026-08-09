@@ -206,6 +206,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable
 
 from meridian import db as db_module
+from meridian import profile_contract as _profile_contract
 from meridian.pointers import validate_pointer
 
 # ---------------------------------------------------------------------------
@@ -223,10 +224,13 @@ BATCH_MODES: tuple[str, ...] = ("all_or_nothing", "best_effort")
 #: Entry kinds accepted by :func:`execute_mixed_mutation_batch` (133bfff6's
 #: ``batch_mutate`` engine) -- a deliberately narrow, MIXED-kind sibling of
 #: :func:`execute_batch`. Excludes plain sprint-item CREATE and sprint_note
-#: entirely; only pointer-attach and sprint-item UPDATE are exposed here. See
+#: entirely; only pointer-attach, sprint-item UPDATE, and (PROFILE-7
+#: 77369699) profile-layer upsert are exposed here. See
 #: :func:`execute_mixed_mutation_batch`'s own docstring for why this is a
 #: separate engine rather than a mode of :func:`execute_batch`.
-MIXED_MUTATION_ENTRY_KINDS: tuple[str, ...] = ("sprint_item_pointer", "sprint_item_update")
+MIXED_MUTATION_ENTRY_KINDS: tuple[str, ...] = (
+    "sprint_item_pointer", "sprint_item_update", "profile_layer",
+)
 
 #: ``entry_kind`` label :func:`execute_mixed_mutation_batch` stamps on its own
 #: idempotency receipts -- distinct from :func:`execute_batch`'s own
@@ -246,6 +250,12 @@ ERROR_VALIDATION = "VALIDATION_ERROR"
 ERROR_DUPLICATE = "DUPLICATE_TITLE"
 ERROR_NOT_FOUND = "NOT_FOUND"
 ERROR_INTERNAL = "INTERNAL_ERROR"
+#: PROFILE-7 77369699 -- a genuine optimistic-concurrency conflict (a
+#: profile_layer entry's ``expected_revision`` no longer matches the stored
+#: row's actual revision), distinct from a malformed request
+#: (``ERROR_VALIDATION``). See ``_apply_profile_layer_entry``, which raises
+#: this for ``profile_contract.ProfileStaleRevisionError``.
+ERROR_CONFLICT = "CONFLICT"
 
 #: event_type recorded in action_audit_log for a durable idempotency receipt.
 BATCH_RECEIPT_EVENT_TYPE = "batch_management_write"
@@ -668,6 +678,130 @@ async def _compensate_note_entry(
         pass
 
 
+# ---------------------------------------------------------------------------
+# Entry-kind adapter: profile_layer (PROFILE-7 77369699 -- upsert via
+# meridian.db.profile_layers.set_profile_layer, as-is)
+# ---------------------------------------------------------------------------
+
+async def _validate_profile_layer_entry(
+    db: Any, project_id: str, raw: Any, ctx: _EntryContext,
+) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise _EntryError(ERROR_VALIDATION, "entry must be an object")
+    scope_type = raw.get("scope_type")
+    if not isinstance(scope_type, str) or not scope_type.strip():
+        raise _EntryError(ERROR_VALIDATION, "profile_layer entry requires a non-empty 'scope_type'")
+    scope_id = raw.get("scope_id")
+    if not isinstance(scope_id, str) or not scope_id.strip():
+        raise _EntryError(ERROR_VALIDATION, "profile_layer entry requires a non-empty 'scope_id'")
+    # Deliberately NOT validating scope_type against the allowed SCOPE_TYPES
+    # set here -- that's profile_contract.normalize_scope_type's job, called
+    # both by get_profile_layer (the snapshot fetch just below -- a
+    # ProfileContractError there is a ValueError subclass, so it is already
+    # caught and reported as VALIDATION_ERROR by this engine's generic
+    # phase-1 exception mapping) and again by set_profile_layer at apply
+    # time.
+    fields = raw.get("fields") if raw.get("fields") is not None else {}
+    if not isinstance(fields, dict):
+        raise _EntryError(ERROR_VALIDATION, "profile_layer entry 'fields' must be an object")
+    reset_fields = raw.get("reset_fields") if raw.get("reset_fields") is not None else []
+    if not isinstance(reset_fields, list):
+        raise _EntryError(ERROR_VALIDATION, "profile_layer entry 'reset_fields' must be a list")
+    expected_revision = raw.get("expected_revision")
+    if expected_revision is not None and not isinstance(expected_revision, int):
+        raise _EntryError(ERROR_VALIDATION, "profile_layer entry 'expected_revision' must be an integer")
+    # Snapshot the prior layer state BEFORE any write -- mirrors
+    # _validate_sprint_item_entry's update-branch snapshot -- so
+    # _compensate_profile_layer_entry can tell "did this batch CREATE this
+    # row (prior revision 0) or UPDATE an existing one" and restore/roll
+    # back accordingly.
+    prior = await db_module.get_profile_layer(db, scope_type, scope_id)
+    return {
+        "scope_type": scope_type,
+        "scope_id": scope_id,
+        "fields": fields,
+        "reset_fields": reset_fields,
+        "provenance": raw.get("provenance"),
+        "expected_revision": expected_revision,
+        "prior": prior,
+    }
+
+
+async def _apply_profile_layer_entry(
+    db: Any, project_id: str, normalized: dict[str, Any], ctx: _EntryContext,
+) -> tuple[str, dict[str, Any], tuple[Any, ...]]:
+    scope_type = normalized["scope_type"]
+    scope_id = normalized["scope_id"]
+    try:
+        result = await db_module.set_profile_layer(
+            db, scope_type, scope_id,
+            fields=normalized["fields"], reset_fields=normalized["reset_fields"],
+            provenance=normalized.get("provenance"),
+            expected_revision=normalized.get("expected_revision"),
+            actor=ctx.actor,
+        )
+    except _profile_contract.ProfileStaleRevisionError as exc:
+        # Subclass of ProfileContractError -- must be caught FIRST. Surfaces
+        # actual_revision so a caller can retry with the right value without
+        # a second round-trip (the item's own "generation-aware conflict
+        # handling" acceptance criterion).
+        raise _EntryError(
+            ERROR_CONFLICT, str(exc), retryable=True,
+            payload={
+                "scope_type": exc.scope_type, "scope_id": exc.scope_id,
+                "expected_revision": exc.expected_revision,
+                "actual_revision": exc.actual_revision,
+            },
+        ) from exc
+    except _profile_contract.ProfileContractError as exc:
+        raise _EntryError(ERROR_VALIDATION, str(exc)) from exc
+    except ValueError as exc:
+        raise _EntryError(ERROR_VALIDATION, str(exc)) from exc
+    entry_id = f"{scope_type}:{scope_id}"
+    prior = normalized["prior"]
+    comp_state = (
+        "profile_layer", scope_type, scope_id, prior.get("revision", 0),
+        prior.get("fields") or {}, prior.get("reset_fields") or [], prior.get("provenance"),
+        prior.get("lifecycle_state"),
+    )
+    return entry_id, {"profile_layer": result}, comp_state
+
+
+async def _compensate_profile_layer_entry(
+    db: Any, project_id: str, comp_state: tuple[Any, ...], ctx: _EntryContext,
+) -> None:
+    try:
+        (
+            _, scope_type, scope_id, prior_revision, prior_fields, prior_reset_fields,
+            prior_provenance, prior_lifecycle_state,
+        ) = comp_state
+        if prior_revision == 0:
+            # This batch call CREATED the row -- revert to the
+            # never-configured state, exactly like sprint_item's own
+            # "create" compensation deletes the row it created.
+            await db_module.reset_profile_layer(db, scope_type, scope_id)
+        else:
+            # An existing row was UPDATED -- restore its exact prior
+            # content AND revision. No expected_revision check here:
+            # compensation must succeed regardless of what revision the
+            # failed/aborted batch left behind, mirroring sprint_item's own
+            # compensate, which does not re-check the item's current state
+            # before restoring. Restoring via set_profile_layer would BUMP
+            # revision again (apply already bumped it once), leaving the
+            # row two revisions higher than before the batch ran even
+            # though its content matches -- use the exact-restore helper
+            # instead so a caller's pre-batch expected_revision still
+            # matches after a rollback (see _restore_profile_layer_row's
+            # own docstring for the full rationale).
+            await db_module._restore_profile_layer_row(
+                db, scope_type, scope_id,
+                revision=prior_revision, fields=prior_fields, reset_fields=prior_reset_fields,
+                lifecycle_state=prior_lifecycle_state, provenance=prior_provenance,
+            )
+    except Exception:  # noqa: BLE001 -- compensation must never mask the original abort
+        pass
+
+
 @dataclass(frozen=True)
 class _EntryAdapter:
     validate: Callable[[Any, str, Any, _EntryContext], Awaitable[dict[str, Any]]]
@@ -687,6 +821,9 @@ _ADAPTERS: dict[str, _EntryAdapter] = {
     ),
     "sprint_note": _EntryAdapter(
         _validate_note_entry, _apply_note_entry, _compensate_note_entry,
+    ),
+    "profile_layer": _EntryAdapter(
+        _validate_profile_layer_entry, _apply_profile_layer_entry, _compensate_profile_layer_entry,
     ),
 }
 
@@ -1004,24 +1141,35 @@ async def execute_mixed_mutation_batch(
     """133bfff6 -- ``batch_mutate``'s core engine.
 
     A MIXED-kind sibling of :func:`execute_batch`: a single call may combine
-    ``sprint_item_pointer`` entries (attach a pointer) and
-    ``sprint_item_update`` entries (patch an EXISTING sprint item --
-    creation is deliberately not offered here; only ``execute_batch``'s
-    ``entry_kind="sprint_item"`` with ``action="create"`` creates) in ONE
-    call, each entry selecting its own adapter via a required ``"kind"``
-    field. That per-entry kind selection is the one structural difference
-    from :func:`execute_batch`, which requires every entry in a call to
-    share the SAME ``entry_kind`` (see that function's own "homogeneous"
-    framing). Everything else -- validate-before-mutate, all_or_nothing
-    compensation, best_effort partial commit, deterministic input-order
-    results, idempotency-replay receipts -- is the identical contract, and
-    this function reuses :func:`execute_batch`'s own adapters
-    (``_ADAPTERS["sprint_item_pointer"]`` -> :func:`_apply_pointer_entry` /
-    :func:`_validate_pointer_entry` / :func:`_compensate_pointer_entry`, and
-    ``_ADAPTERS["sprint_item"]`` -> :func:`_apply_sprint_item_entry` /
-    :func:`_validate_sprint_item_entry` / :func:`_compensate_sprint_item_entry`)
-    AS-IS -- no duplicated validation/mutation/compensation logic, per this
-    item's acceptance criteria.
+    ``sprint_item_pointer`` entries (attach a pointer), ``sprint_item_update``
+    entries (patch an EXISTING sprint item -- creation is deliberately not
+    offered here; only ``execute_batch``'s ``entry_kind="sprint_item"`` with
+    ``action="create"`` creates), and (PROFILE-7 77369699) ``profile_layer``
+    entries (upsert one ``(scope_type, scope_id)`` profile layer -- see
+    :func:`_apply_profile_layer_entry`) in ONE call, each entry selecting its
+    own adapter via a required ``"kind"`` field. That per-entry kind
+    selection is the one structural difference from :func:`execute_batch`,
+    which requires every entry in a call to share the SAME ``entry_kind``
+    (see that function's own "homogeneous" framing). Everything else --
+    validate-before-mutate, all_or_nothing compensation, best_effort partial
+    commit, deterministic input-order results, idempotency-replay receipts --
+    is the identical contract, and this function reuses :func:`execute_batch`'s
+    own adapters (``_ADAPTERS["sprint_item_pointer"]`` ->
+    :func:`_apply_pointer_entry` / :func:`_validate_pointer_entry` /
+    :func:`_compensate_pointer_entry`, and ``_ADAPTERS["sprint_item"]`` ->
+    :func:`_apply_sprint_item_entry` / :func:`_validate_sprint_item_entry` /
+    :func:`_compensate_sprint_item_entry`) AS-IS -- no duplicated
+    validation/mutation/compensation logic, per this item's acceptance
+    criteria. The ``profile_layer`` adapter (``_ADAPTERS["profile_layer"]``)
+    is new to THIS engine (there is no equivalent ``execute_batch``
+    ``entry_kind`` to reuse) but is built the same way: it wraps
+    :func:`meridian.db.profile_layers.set_profile_layer` /
+    :func:`~meridian.db.profile_layers.get_profile_layer` /
+    :func:`~meridian.db.profile_layers.reset_profile_layer` AS-IS, with zero
+    reimplemented validation/merge logic -- a ``profile_contract.ProfileStaleRevisionError``
+    (a real optimistic-concurrency conflict on ``expected_revision``) is
+    surfaced as the new :data:`ERROR_CONFLICT` error code, distinct from
+    :data:`ERROR_VALIDATION`.
 
     A ``sprint_item_update`` entry's ``action`` is force-set to ``"update"``
     before validation (mirroring ``meridian.batch_ops``'s
@@ -1105,6 +1253,12 @@ async def execute_mixed_mutation_batch(
             continue
         if kind == "sprint_item_pointer":
             resolved_adapter[i] = _ADAPTERS["sprint_item_pointer"]
+            resolved_entries[i] = raw
+        elif kind == "profile_layer":
+            # No "action" concept for profile_layer entries (it's a plain
+            # upsert) -- mirrors the simpler sprint_item_pointer branch
+            # above, not sprint_item_update's extra action-restriction logic.
+            resolved_adapter[i] = _ADAPTERS["profile_layer"]
             resolved_entries[i] = raw
         else:  # "sprint_item_update"
             action = raw.get("action") or "update"
