@@ -2358,3 +2358,79 @@ async def handle_promote_proposal(
         # of an unhandled exception or a silently-duplicated sprint item.
         return {"error": str(exc)}
     return result
+
+
+# ---------------------------------------------------------------------------
+# Section 15: Configurable proposal-to-handoff promotion (ce4883f3)
+# ---------------------------------------------------------------------------
+
+async def handle_preview_proposal_promotion(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: preview_proposal_promotion (ce4883f3). Read-only."""
+    from meridian import proposal_promotion  # noqa: PLC0415
+
+    _project_id = args.get("project_id") or ""
+    if not _project_id:
+        return {"error": "project_id (or project_name) is required for preview_proposal_promotion"}
+    _depth = args.get("depth") or ""
+    try:
+        return await proposal_promotion.preview_proposal_promotion(
+            db, args["proposal_id"], _project_id, _depth,
+            tenant_id=_mcp_tenant_id,
+            sprint_item_title=args.get("sprint_item_title"),
+            sprint_item_version=args.get("sprint_item_version"),
+            touches_resources=args.get("touches_resources"),
+            infer_touches_resources=args.get("infer_touches_resources", True),
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_commit_proposal_promotion(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: commit_proposal_promotion (ce4883f3).
+
+    Requires a fresh ``preview_hash`` from ``preview_proposal_promotion``
+    (called with the SAME arguments) — a stale/mismatched hash is reported
+    as ``{"error": ...}`` (StalePreviewError) rather than silently committed.
+    """
+    from meridian import proposal_promotion  # noqa: PLC0415
+
+    _project_id = args.get("project_id") or ""
+    if not _project_id:
+        return {"error": "project_id (or project_name) is required for commit_proposal_promotion"}
+    _depth = args.get("depth") or ""
+    _preview_hash = args.get("preview_hash") or ""
+    if not _preview_hash:
+        return {"error": "preview_hash is required — call preview_proposal_promotion first"}
+    try:
+        return await proposal_promotion.commit_proposal_promotion(
+            db, args["proposal_id"], _project_id, _depth, _preview_hash,
+            tenant_id=_mcp_tenant_id,
+            actor=args.get("actor"),
+            session_id=args.get("session_id"),
+            sprint_item_title=args.get("sprint_item_title"),
+            sprint_item_version=args.get("sprint_item_version"),
+            touches_resources=args.get("touches_resources"),
+            infer_touches_resources=args.get("infer_touches_resources", True),
+            investigation_findings=args.get("investigation_findings"),
+            pointers=args.get("pointers"),
+            data_dir=data_dir,
+            override_reason=args.get("override_reason"),
+        )
+    except (ValueError, proposal_promotion.StalePreviewError) as exc:
+        # StalePreviewError is itself a ValueError subclass; listed
+        # explicitly for readability. Covers stale hash, unknown depth,
+        # not-found proposal/project, and malformed pointer shapes — all
+        # deterministic {"error": ...} responses instead of a raw exception.
+        return {"error": str(exc)}
