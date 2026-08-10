@@ -7925,6 +7925,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_item_artifact_declaration",
         "_migrate_pg_docx_merge_manifests",
         "_migrate_pg_proposal_evidence_links",
+        "_migrate_pg_proposal_lineage",
         "_migrate_pg_wave_base_manifests",
         "_migrate_pg_sprint_batch_claims",
         "_migrate_pg_verification_runs",
@@ -7944,7 +7945,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 151
+    assert len(allnames) == len(set(allnames)) == 152
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

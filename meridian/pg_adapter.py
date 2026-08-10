@@ -2713,6 +2713,45 @@ async def _migrate_pg_proposal_evidence_links(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_proposal_lineage(conn: PostgresConnection) -> None:
+    """5a744f81 — proposal_lineage: durable, typed proposal-to-proposal
+    lineage (supersedes/refines/forks/continues/duplicates/responds_to).
+    Mirrors db.proposal_lineage._migrate_proposal_lineage exactly. Not
+    present in the base CREATE_TABLES_CORE literal — this guarded migration
+    is the only creation path on Postgres, matching
+    _migrate_pg_proposal_evidence_links immediately above.
+
+    The COALESCE-normalized UNIQUE index is what makes
+    link_proposal_lineage's idempotent-insert (pre-check, insert, catch a
+    UniqueViolation on a lost race) pattern work, and gives self-host rows
+    (tenant_id always NULL) a real duplicate-prevention guarantee — a plain
+    multi-column UNIQUE index never treats two NULLs as equal on Postgres
+    either.
+    """
+    await conn.executescript(
+        f"CREATE TABLE IF NOT EXISTS proposal_lineage ("
+        f"    id TEXT PRIMARY KEY,"
+        f"    tenant_id TEXT,"
+        f"    from_proposal_id TEXT NOT NULL,"
+        f"    to_proposal_id TEXT NOT NULL,"
+        f"    relation_type TEXT NOT NULL CHECK (relation_type IN ("
+        f"        'supersedes', 'refines', 'forks', 'continues',"
+        f"        'duplicates', 'responds_to')),"
+        f"    sequence INTEGER NOT NULL DEFAULT 1,"
+        f"    label TEXT,"
+        f"    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        f");"
+        f"CREATE UNIQUE INDEX IF NOT EXISTS idx_proposal_lineage_unique "
+        f"ON proposal_lineage(COALESCE(tenant_id, ''), from_proposal_id, "
+        f"to_proposal_id, relation_type);"
+        f"CREATE INDEX IF NOT EXISTS idx_proposal_lineage_from "
+        f"ON proposal_lineage(from_proposal_id);"
+        f"CREATE INDEX IF NOT EXISTS idx_proposal_lineage_to "
+        f"ON proposal_lineage(to_proposal_id);"
+    )
+
+
 async def _migrate_pg_wave_base_manifests(conn: PostgresConnection) -> None:
     """eb2e44f8 — immutable wave_base_manifests + active_worktrees.pid.
 
@@ -4658,6 +4697,7 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_item_artifact_declaration,
     _migrate_pg_docx_merge_manifests,
     _migrate_pg_proposal_evidence_links,
+    _migrate_pg_proposal_lineage,
     _migrate_pg_wave_base_manifests,
     _migrate_pg_sprint_batch_claims,
     _migrate_pg_verification_runs,
