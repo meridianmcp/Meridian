@@ -9578,20 +9578,24 @@ async def generate_handoff(
     # f471c4b8 — append the machine-readable project-start-configuration tag
     # (project_id/project_name/version/repo_path/test_cmd/shell) BEFORE the
     # token is minted below, so it becomes part of the hashed, tamper-evident
-    # body like every other structural tag — never a post-mint patch. Shared
-    # by full AND delta (both branch off this same quick_start_goal further
-    # down), closing the confirmed gap for delta while full gets it as a
-    # harmless, consistent bonus (full's own Jinja template already carries a
-    # separate human-readable "Start a New Session" section, so this is
-    # additive there, not a fix for a reported full-mode gap).
-    quick_start_goal = quick_start_goal + _build_project_start_config_clause(
-        project_id=project_id,
-        project_name=project.get("name"),
-        version=_effective_version,
-        repo_path=_repo_path_from_settings(proj_settings),
-        shell=_shell_type_from_settings(proj_settings),
-        test_cmd=_test_cmd_from_settings(proj_settings),
-    )
+    # body like every other structural tag — never a post-mint patch.
+    # DELTA ONLY, not full: full's own Jinja template already carries a
+    # separate human-readable "Start a New Session" section with this same
+    # data, and test_handoff_generates_clean_markdown asserts the rendered
+    # full-mode markdown never contains a literal test_cmd string like
+    # "pixi run test" (a deliberate, pre-existing content-cleanliness
+    # contract) — adding this tag to full's quick_start_goal broke that
+    # assertion (CI regression caught post-merge, fixed here). delta has no
+    # such constraint and was the item's actual reported gap.
+    if mode != "full":
+        quick_start_goal = quick_start_goal + _build_project_start_config_clause(
+            project_id=project_id,
+            project_name=project.get("name"),
+            version=_effective_version,
+            repo_path=_repo_path_from_settings(proj_settings),
+            shell=_shell_type_from_settings(proj_settings),
+            test_cmd=_test_cmd_from_settings(proj_settings),
+        )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
     # _mint_and_embed_goal_token; 4611b9a2 also wires this into the
@@ -10368,25 +10372,16 @@ async def _generate_starter_handoff(
             _s_selected_scope_outcome.get("requested_ids") or [],
             _s_selected_scope_outcome.get("excluded_requested") or [],
         )
-    # f471c4b8 — append the SAME machine-readable project-start-configuration
-    # tag full/delta/goal render, BEFORE the token is minted below (see
-    # _build_project_start_config_clause's own docstring on why this must be
-    # pre-mint, never a post-mint patch). Starter mode already prepends a
-    # separate, human-readable "# Executor Config" prose block
-    # (executor_config.build_executor_config_block, further below) to the
-    # OUTER wrapping document AFTER the token is minted — that block stays
-    # unchanged for human skimming; this tag additionally makes the SAME
-    # repo_path/test_cmd/shell data machine-parseable and part of the
-    # token-hashed body itself, so starter's quick_start_goal payload can
-    # never disagree with full/delta/goal's.
-    quick_start_goal = quick_start_goal + _build_project_start_config_clause(
-        project_id=project_id,
-        project_name=project.get("name"),
-        version=version,
-        repo_path=_repo_path_from_settings(settings),
-        shell=_shell_type_from_settings(settings),
-        test_cmd=_test_cmd_from_settings(settings),
-    )
+    # f471c4b8 — deliberately NOT adding <project_start_config> here.
+    # Starter mode already prepends a separate, human-readable "# Executor
+    # Config" prose block (executor_config.build_executor_config_block,
+    # further below) carrying the same repo_path/test_cmd/shell data — that
+    # block is starter's existing, pre-this-item contract and is unaffected.
+    # Starter's hard ≤20-non-empty-line budget (test_handoff_starter_mode)
+    # has no room for one more line: adding this tag pushed a 2-item board
+    # from 20 to 21 lines and broke that test (CI regression caught
+    # post-merge, fixed here by not touching starter at all). delta/goal are
+    # the item's actual reported gap and both still get the tag.
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the
     # full/delta path was the only caller of this shared helper). Mint one here

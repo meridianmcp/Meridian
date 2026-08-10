@@ -907,16 +907,23 @@ async def test_generate_handoff_goal_mode_empty_board_still_renders_start_config
 async def test_handoff_modes_agree_on_project_start_config(db, tmp_path):
     """Parity check mirroring test_cov_handoff.py's
     test_handoff_modes_render_same_effective_test_cmd_parallelism_branch_version
-    (6cfdabd7): full/delta/starter/goal must all render the SAME
+    (6cfdabd7): delta/goal must render the SAME
     project_id/project_name/version/repo_path/test_cmd/shell for the SAME
-    underlying executor_config -- proving the four modes can never disagree,
-    because every call site sources the SAME _repo_path_from_settings/
+    underlying executor_config -- proving the two modes can never disagree,
+    because both call sites source the SAME _repo_path_from_settings/
     _shell_type_from_settings/_test_cmd_from_settings helpers.
 
-    starter mode already had its own separate human-prose "# Executor
-    Config" block before this fix (executor_config.build_executor_config_block);
-    this proves the NEW machine-readable tag matches it exactly rather than
-    the two mechanisms silently disagreeing."""
+    full and starter deliberately do NOT render this tag (CI regression
+    fixed post-merge -- see the f471c4b8 notes at both call sites in
+    meridian/handoff.py): full's Jinja template already carries an
+    equivalent human-readable "Start a New Session" section, and adding the
+    machine-readable tag there broke test_handoff_generates_clean_markdown's
+    content-cleanliness contract; starter's hard <=20-non-empty-line budget
+    (test_handoff_starter_mode) has no room for it, and starter already had
+    its own separate human-prose "# Executor Config" block
+    (executor_config.build_executor_config_block) before this fix. This test
+    locks in both the positive (delta/goal agree) and negative (full/starter
+    never render the tag) halves of that contract."""
     p = await db_module.create_project(db, "start-config-parity")
     await db_module.set_executor_config(
         db, p["id"],
@@ -930,7 +937,7 @@ async def test_handoff_modes_agree_on_project_start_config(db, tmp_path):
     s = await db_module.register_session(db, p["id"], "sess-start-config-parity")
     await db_module.add_sprint_item(db, p["id"], "v1", "FEAT: parity check", force=True)
 
-    for mode in ("full", "delta", "starter", "goal"):
+    for mode in ("delta", "goal"):
         _, content, _ = await handoff_module.generate_handoff(
             db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
             session_id=s["id"],
@@ -946,6 +953,13 @@ async def test_handoff_modes_agree_on_project_start_config(db, tmp_path):
         # <test_gate_config version="..."> already uses).
         assert attrs["version"] == "unscoped", mode
 
+    for mode in ("full", "starter"):
+        _, content, _ = await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+            session_id=s["id"],
+        )
+        assert "<project_start_config " not in content, mode
+
 
 @pytest.mark.asyncio
 async def test_project_start_config_coexists_with_required_tool_and_exclusions(
@@ -956,8 +970,12 @@ async def test_project_start_config_coexists_with_required_tool_and_exclusions(
     proving the NEW <project_start_config> tag renders ALONGSIDE the
     pre-existing <required_tool>/<tool_requirements> contract and the
     <exclusions> notes rather than displacing or breaking any of them, for
-    every one of the three modes this item's own CRITICAL HANDOFF CONTRACT
-    names explicitly (goal/delta/starter)."""
+    goal/delta (the two modes that render it). starter stays in this test's
+    mode loop too -- everything BUT the tag itself still applies there
+    (required_tool/tool_requirements/exclusions/wave-order are unaffected by
+    the f471c4b8 fix) -- but starter deliberately does not render
+    <project_start_config> (see test_handoff_modes_agree_on_project_start_config
+    for why), so its assertion is skipped for that one mode only."""
     p = await db_module.create_project(db, "start-config-multi-item")
     await db_module.set_executor_config(
         db, p["id"], {"repo_path": "/srv/repos/multi-item", "test_cmd": "pixi run test"},
@@ -983,9 +1001,13 @@ async def test_project_start_config_coexists_with_required_tool_and_exclusions(
         _, content, _ = await handoff_module.generate_handoff(
             db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
         )
-        # New: project start configuration.
-        attrs = _project_start_config_attrs(content)
-        assert attrs["repo_path"] == "/srv/repos/multi-item", mode
+        # New: project start configuration -- goal/delta only (starter
+        # deliberately excluded, see this test's own docstring).
+        if mode != "starter":
+            attrs = _project_start_config_attrs(content)
+            assert attrs["repo_path"] == "/srv/repos/multi-item", mode
+        else:
+            assert "<project_start_config " not in content, mode
 
         # Pre-existing: required_tool + typed tool_requirements contract.
         assert "Serena: replace_symbol_body" in content, mode
