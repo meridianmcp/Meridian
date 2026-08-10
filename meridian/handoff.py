@@ -2029,6 +2029,32 @@ def _branch_from_settings(proj_settings: dict[str, Any] | None) -> str | None:
     return raw.strip() if isinstance(raw, str) and raw.strip() else None
 
 
+def _repo_path_from_settings(proj_settings: dict[str, Any] | None) -> str | None:
+    """Extract executor_config.repo_path (f471c4b8). Sibling of
+    _branch_from_settings — same two-input read pattern, same fail-safe
+    convention: a missing/non-dict executor_config or a blank repo_path
+    returns None so callers render an explicit "unset" fallback instead of
+    guessing a filesystem path."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    if not isinstance(cfg, dict):
+        return None
+    raw = cfg.get("repo_path")
+    return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+
+def _shell_type_from_settings(proj_settings: dict[str, Any] | None) -> str | None:
+    """Extract executor_config.shell_type (f471c4b8). Sibling of
+    _branch_from_settings — same two-input read pattern, same fail-safe
+    convention: a missing/non-dict executor_config or a blank shell_type
+    returns None so callers render an explicit "unset" fallback instead of
+    guessing which shell the receiving repo actually uses."""
+    cfg = (proj_settings or {}).get("executor_config") or {}
+    if not isinstance(cfg, dict):
+        return None
+    raw = cfg.get("shell_type")
+    return raw.strip() if isinstance(raw, str) and raw.strip() else None
+
+
 # 6cfdabd7 — matches a pytest-xdist worker-count flag in either `-n VALUE` or
 # `--numprocesses VALUE`/`--numprocesses=VALUE` form, so the parallelism
 # policy displayed in a /goal is read off whatever the project's actual
@@ -2829,6 +2855,89 @@ def _build_self_start_bootstrap_clause(
         "from a cold context with zero other framing. If a session_id already "
         "exists (e.g. this block arrived via start_session's own pending_goal "
         "field, or load_handoff()), skip straight to the next call. "
+    )
+
+
+def _build_project_start_config_clause(
+    *,
+    project_id: "str | None",
+    project_name: "str | None",
+    version: "str | None",
+    repo_path: "str | None",
+    shell: "str | None",
+    test_cmd: str,
+) -> str:
+    """f471c4b8 — render project_id/project_name/version/repo_path/test_cmd/
+    shell as ONE compact, machine-readable ``<project_start_config>`` tag.
+
+    Confirmed gap this closes: ``_build_quick_start_goal`` already renders
+    the per-item executor-tool contract unconditionally (``<required_tool>``/
+    ``<tool_requirements>`` via ``_build_required_tool_clause``/
+    ``_build_tool_requirements_clause`` — both shipped in 76dde31f, well
+    before this item's own 2026-08-09 failure report), but NONE of the four
+    handoff modes embedded the receiving executor's PROJECT-level start
+    configuration (repo_path / effective test_cmd / configured shell) inside
+    the token-hashed /goal body itself. ``starter`` mode alone rendered a
+    human-prose "# Executor Config" block (see
+    ``executor_config.build_executor_config_block``) — and only OUTSIDE the
+    goal-token-hashed body, prepended to the wrapping starter document after
+    ``_mint_and_embed_goal_token`` had already run. ``goal``/``delta`` (and
+    ``full``, which shares the same ``quick_start_goal`` build call as
+    ``delta``) never rendered it at all: a goal-only /goal block handed to a
+    fresh sub-agent with zero other framing (this mode's own documented use
+    case) named sprint items and required tools but not WHERE the repo lives
+    or WHICH shell/test command to use — "no executor should start a
+    megasprint from an under-specified handoff," per this item's own notes.
+
+    Deliberately independent of ``_build_self_start_bootstrap_clause`` above
+    (no shared trigger/parameter): that function's ``<first_step>`` bootstrap
+    text is gated on ``project_id`` being threaded into
+    ``_build_quick_start_goal`` itself, which only the goal-only and
+    executor-goal MCP-prompt call sites opt into today (see that function's
+    own docstring for why). Coupling this tag to the same parameter would
+    have silently changed full/delta's ``<first_step>`` wording the moment
+    this tag was wired into their shared call site. Every call site instead
+    invokes this function directly and string-concatenates its result onto
+    the ``quick_start_goal`` return value it already has in hand.
+
+    Returns ``""`` when ``project_id`` is falsy (no caller should ever pass a
+    blank one, but this mirrors ``_build_self_start_bootstrap_clause``'s own
+    fail-safe gate rather than emitting a tag with a blank ``project_id``
+    attribute). ``project_name``/``version``/``repo_path``/``shell`` each
+    fall back to an explicit ``"unset"``/``"unscoped"`` attribute rather than
+    being silently omitted or guessing a value — the same fail-safe
+    convention ``_build_test_gate_config_clause`` already uses for its own
+    ``branch``/``version`` attributes. ``test_cmd`` is REQUIRED (every
+    caller already resolves it via ``_test_cmd_from_settings``, which itself
+    never returns a blank string — see that function's own fallback to
+    ``_DEFAULT_GOAL_TEST_CMD``).
+
+    CRITICAL (token/body integrity): every call site appends this clause's
+    output onto ``quick_start_goal`` BEFORE calling
+    ``_mint_and_embed_goal_token`` — never after. ``mint_handoff_token``
+    hashes ``quick_start_goal`` exactly as it stands at the moment it is
+    called, and that hash is what a later ``verify_handoff_token(body=...)``
+    check re-derives; appending this tag pre-mint makes it part of the
+    hashed, tamper-evident body like every other structural tag
+    (``<sprint_items>``, ``<required_tool>``, ...), rather than an
+    unprotected post-mint patch a receiver's token verification would never
+    catch if altered.
+    """
+    if not project_id:
+        return ""
+    _attr_escape = {chr(34): "&quot;"}
+    _pid = _xml_escape(str(project_id), _attr_escape)
+    _pname = (
+        _xml_escape(str(project_name), _attr_escape) if project_name else "unset"
+    )
+    _version_attr = _xml_escape(str(version), _attr_escape) if version else "unscoped"
+    _repo_attr = _xml_escape(str(repo_path), _attr_escape) if repo_path else "unset"
+    _shell_attr = _xml_escape(str(shell), _attr_escape) if shell else "unset"
+    _test_cmd_attr = _xml_escape(str(test_cmd or ""), _attr_escape)
+    return (
+        f'\n<project_start_config project_id="{_pid}" project_name="{_pname}" '
+        f'version="{_version_attr}" repo_path="{_repo_attr}" '
+        f'test_cmd="{_test_cmd_attr}" shell="{_shell_attr}" />'
     )
 
 
@@ -9466,6 +9575,23 @@ async def generate_handoff(
             _selected_scope_outcome.get("requested_ids") or [],
             _selected_scope_outcome.get("excluded_requested") or [],
         )
+    # f471c4b8 — append the machine-readable project-start-configuration tag
+    # (project_id/project_name/version/repo_path/test_cmd/shell) BEFORE the
+    # token is minted below, so it becomes part of the hashed, tamper-evident
+    # body like every other structural tag — never a post-mint patch. Shared
+    # by full AND delta (both branch off this same quick_start_goal further
+    # down), closing the confirmed gap for delta while full gets it as a
+    # harmless, consistent bonus (full's own Jinja template already carries a
+    # separate human-readable "Start a New Session" section, so this is
+    # additive there, not a fix for a reported full-mode gap).
+    quick_start_goal = quick_start_goal + _build_project_start_config_clause(
+        project_id=project_id,
+        project_name=project.get("name"),
+        version=_effective_version,
+        repo_path=_repo_path_from_settings(proj_settings),
+        shell=_shell_type_from_settings(proj_settings),
+        test_cmd=_test_cmd_from_settings(proj_settings),
+    )
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
     # _mint_and_embed_goal_token; 4611b9a2 also wires this into the
@@ -10242,6 +10368,25 @@ async def _generate_starter_handoff(
             _s_selected_scope_outcome.get("requested_ids") or [],
             _s_selected_scope_outcome.get("excluded_requested") or [],
         )
+    # f471c4b8 — append the SAME machine-readable project-start-configuration
+    # tag full/delta/goal render, BEFORE the token is minted below (see
+    # _build_project_start_config_clause's own docstring on why this must be
+    # pre-mint, never a post-mint patch). Starter mode already prepends a
+    # separate, human-readable "# Executor Config" prose block
+    # (executor_config.build_executor_config_block, further below) to the
+    # OUTER wrapping document AFTER the token is minted — that block stays
+    # unchanged for human skimming; this tag additionally makes the SAME
+    # repo_path/test_cmd/shell data machine-parseable and part of the
+    # token-hashed body itself, so starter's quick_start_goal payload can
+    # never disagree with full/delta/goal's.
+    quick_start_goal = quick_start_goal + _build_project_start_config_clause(
+        project_id=project_id,
+        project_name=project.get("name"),
+        version=version,
+        repo_path=_repo_path_from_settings(settings),
+        shell=_shell_type_from_settings(settings),
+        test_cmd=_test_cmd_from_settings(settings),
+    )
     # 4611b9a2 — starter/compact previously returned this quick_start_goal
     # straight to the renderer with no <goal_token>/SECURITY banner at all (the
     # full/delta path was the only caller of this shared helper). Mint one here
@@ -10578,6 +10723,23 @@ async def _generate_goal_only_handoff(
             _g_selected_scope_outcome.get("requested_ids") or [],
             _g_selected_scope_outcome.get("excluded_requested") or [],
         )
+    # f471c4b8 — append the SAME machine-readable project-start-configuration
+    # tag full/delta/starter render, BEFORE the token is minted below. This
+    # is the mode explicitly documented as "hand straight to a fresh
+    # sub-agent with zero framing" (c1ec3517) — the confirmed gap this item
+    # closes: previously this mode named sprint items and required tools but
+    # never said where the repo lives, which effective test_cmd to run, or
+    # which shell to use, forcing a cold receiver to guess. See
+    # _build_project_start_config_clause's own docstring for why this must
+    # be pre-mint (part of the hashed body), never a post-mint patch.
+    quick_start_goal = quick_start_goal + _build_project_start_config_clause(
+        project_id=project_id,
+        project_name=project.get("name"),
+        version=version,
+        repo_path=_repo_path_from_settings(proj_settings),
+        shell=_shell_type_from_settings(proj_settings),
+        test_cmd=_test_cmd_from_settings(proj_settings),
+    )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.
     quick_start_goal = await _mint_and_embed_goal_token(db, project_id, quick_start_goal)
