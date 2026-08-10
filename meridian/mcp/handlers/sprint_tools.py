@@ -1971,9 +1971,14 @@ async def handle_complete_sprint_item(
     except Exception:  # noqa: BLE001 — advisory must never affect completion
         pass
     # Notify only when the sprint is fully complete.
+    # f291bb24 — this used to be an unfiltered, untimed
+    # `SELECT * FROM sprint_items WHERE project_id=?` fetching every column
+    # of every item in the project just to check "is anything still active" —
+    # the only fully-unbounded query in this whole handler (every other
+    # advisory phase has an asyncio.wait_for budget). Replaced with an
+    # indexed existence check; same three statuses, same semantics.
     active_statuses = {"pending", "todo", "in_progress"}
-    remaining_items = await db_module.get_sprint_items(db, args["project_id"])
-    if not any((it.get("status") or "") in active_statuses for it in remaining_items):
+    if not await db_module.has_active_sprint_items(db, args["project_id"], active_statuses):
         await _server._maybe_notify(
             db, args["project_id"],
             "Sprint done ✓",

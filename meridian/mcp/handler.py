@@ -2103,15 +2103,15 @@ async def _board_change_for_session(
         if not _curr or not _curr.get("created_at"):
             return None
         started = str(_curr["created_at"])
-        items = await db_module.get_sprint_items(db, project_id)
-        new_items = [it for it in items if (it.get("added_at") or "") > started]
-        new_count = len(new_items)
+        # f291bb24 — this used to fetch EVERY item in the project (uncached,
+        # every column) just to count how many were added after `started`
+        # and how many of those are urgent. A single aggregate query returns
+        # exactly those two numbers instead.
+        new_count, urgent_count = await db_module.count_new_sprint_items_since(
+            db, project_id, started,
+        )
         if new_count <= 0:
             return None
-        urgent_new = [
-            it for it in new_items if (it.get("priority") or "normal") == "urgent"
-        ]
-        urgent_count = len(urgent_new)
         if urgent_count > 0:
             return {
                 "new_items_since_session_start": new_count,
