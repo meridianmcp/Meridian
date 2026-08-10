@@ -1181,6 +1181,14 @@ async def open_pg_connection(url: str) -> PostgresConnection:
     connections when idle so Neon can hibernate cleanly, rather than keeping
     one connection alive that will receive AdminShutdown after the 5-min
     idle-shutdown boundary.
+
+    f291bb24 — max_size raised 5 -> 15 (2026-08-10). Connection-log evidence
+    during repeated complete_sprint_item timeouts showed 3+ concurrent
+    clients (this session, another Claude Code session, an OpenAI Codex
+    session) genuinely competing for this pool at once -- this project's own
+    AGENTS.md explicitly supports concurrent multi-tool (Claude Code + Codex)
+    executor sessions against the same tenant, so this isn't transient
+    overload, it's normal operating conditions the pool was undersized for.
     """
     try:
         import psycopg  # noqa: F401
@@ -1196,7 +1204,7 @@ async def open_pg_connection(url: str) -> PostgresConnection:
     pool = AsyncConnectionPool(
         clean_url,
         min_size=0,          # allow all connections to close on idle (Neon hibernation)
-        max_size=5,
+        max_size=15,
         open=False,
         max_idle=60.0,       # proactively close before Neon's 5-min idle-shutdown
         max_lifetime=240.0,  # recycle before Neon's 300 s idle-timeout boundary
@@ -1252,10 +1260,15 @@ async def init_pg_db(url: str) -> PostgresConnection:
     #                  silently drop backends at its idle timeout boundary.
     #   reconnect_timeout=30 — if a borrowed connection fails, the pool
     #                  retries establishing a fresh one for up to 30 s.
+    #
+    # f291bb24 — max_size raised 10 -> 25 (2026-08-10). See the matching note
+    # in open_pg_connection above: connection-log evidence during repeated
+    # complete_sprint_item timeouts showed 3+ concurrent multi-tool sessions
+    # (Claude Code x2 + Codex) genuinely competing for this pool at once.
     pool = AsyncConnectionPool(
         clean_url,
         min_size=0,
-        max_size=10,
+        max_size=25,
         open=False,
         max_idle=60.0,
         max_lifetime=240.0,  # recycle before Neon 300s idle timeout
