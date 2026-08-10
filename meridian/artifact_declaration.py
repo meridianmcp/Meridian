@@ -52,6 +52,22 @@ lives in ``meridian.db.sprint_items`` (``sprint_items.artifact_kind`` /
 ``planned_output`` / ``artifact_policy`` columns); rendering lives in
 ``meridian.handoff`` (``build_item_briefing``'s ``<artifact_declaration>``
 clause).
+
+A FOURTH, independently-optional field — ``artifact_recipe`` (f6912e2d) —
+was added later, closing the remaining gaps against that item's acceptance
+criteria (exact MCP tool names / local-vs-hosted path / structural checks /
+Word-COM render checks / Outputs hash-provenance checks / fallback-degraded
+semantics / rollback policy / exact focused tests / "no ambiguous filename-
+label match authorizes promotion"). Most of that criteria list turned out to
+already be covered by this module's original three fields plus
+``meridian.tool_requirements`` — see the constants block near
+``_MERGER_LOCK_PREFIX`` and :func:`check_artifact_recipe_completeness` for
+exactly what ``artifact_recipe`` adds vs. what was already there.
+``artifact_recipe`` follows the SAME normalize_X/serialize_X/parse_X/
+effective_X shape as the original three, but (unlike them) is NOT yet wired
+into a ``sprint_items`` DB column or ``meridian.handoff``'s rendering —
+both are outside f6912e2d's touches_resources scope; a follow-up item wires
+persistence + rendering.
 """
 from __future__ import annotations
 
@@ -144,6 +160,70 @@ _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 # merger_lock_key_for_target() below -- never a hand-rolled string -- so two
 # call sites can never accidentally pick different keys for the same target.
 _MERGER_LOCK_PREFIX = "docx-merger-lock::"
+
+# ---------------------------------------------------------------------------
+# f6912e2d -- artifact_recipe: an OPTIONAL, independently-declared sibling
+# field closing the remaining acceptance-criteria gaps the pre-existing
+# artifact_kind / planned_output / policy / promotion fields did not already
+# cover. (Confirmed already covered, so deliberately NOT duplicated here:
+# existing-vs-planned_new -- planned_output.targets[].target_kind; source
+# module/symbol or DOCX node pointer -- planned_output.targets[].selector's
+# "symbol"/"node_id" types via meridian.pointers; exact MCP namespace/tool
+# names -- meridian.tool_requirements's server_or_namespace+name, already
+# rendered into handoffs; fallback/degraded semantics -- tool_requirements'
+# per-tool fallback chain plus this module's own artifact_pointer_check
+# off/warn/strict.) Four genuinely new fields:
+#
+#   * execution_path  -- "local" | "hosted": WHICH deployment path (a
+#     self-hosted pixi/from-source MCP connection vs. the hosted
+#     usemeridian.us tier -- see AGENTS.md's two connection blocks) this
+#     item's recipe runs against. Never inferred: an item mixing local-only
+#     tooling (Word COM automation, a local outputs_dir) with a hosted
+#     assumption is exactly the kind of silent mismatch this field exists to
+#     surface explicitly.
+#   * rollback_policy -- one of ROLLBACK_POLICIES: what an executor must do
+#     if this recipe's write/promotion fails partway. "transactional_atomic"
+#     names the EXISTING tools/meridian_fallbacks/transactional_merge.py
+#     all-or-nothing apply (reused, never reimplemented, by
+#     check_promotion_preconditions's sibling apply path); "manual_restore"
+#     and "none" are honest, explicit declarations for a recipe that does
+#     NOT go through that pipeline -- never silently assumed atomic.
+#   * checks -- which of the three verification classes the acceptance
+#     criteria name (structural / Word-COM render / Outputs hash-provenance)
+#     this item's recipe requires. Each is a plain bool, default False --
+#     absent means "not required", never silently "yes". See
+#     meridian.docx_integrity_gate.RECIPE_CHECK_REGISTRY for the EXACT
+#     function/tool each flag names.
+#   * focused_tests -- a non-empty list of exact pytest node ids / file
+#     paths an executor must run to verify this item. "No ambiguous
+#     filename/label match" applies here too: this module does not
+#     normalize a bare module name into a guessed node id.
+#
+# Persistence/handoff-rendering note: this field mirrors the SAME
+# normalize_X/serialize_X/parse_X/effective_X shape as artifact_kind /
+# planned_output / policy, but (unlike those three) is NOT yet wired into a
+# sprint_items DB column or meridian.handoff's <artifact_declaration> clause
+# -- both live outside this item's touches_resources scope. A follow-up item
+# wires persistence + rendering, mirroring how those three fields were
+# originally introduced.
+# ---------------------------------------------------------------------------
+
+EXECUTION_PATHS = frozenset({"local", "hosted"})
+ROLLBACK_POLICIES = frozenset({"transactional_atomic", "manual_restore", "none"})
+
+_RECIPE_CHECK_FIELDS = (
+    "structural_check_required",
+    "word_com_render_check_required",
+    "outputs_provenance_check_required",
+)
+_RECIPE_CHECKS_ALLOWED_FIELDS = frozenset(_RECIPE_CHECK_FIELDS)
+_RECIPE_ALLOWED_FIELDS = frozenset(
+    {"execution_path", "rollback_policy", "checks", "focused_tests"}
+)
+
+# A recipe's focused_tests is a small, reviewable, EXACT list -- not an
+# unbounded dump. Mirrors _MAX_FOOTPRINT_ENTRIES's bounding discipline above.
+_MAX_FOCUSED_TESTS = 50
 
 
 class ArtifactDeclarationError(ValueError):
@@ -477,6 +557,141 @@ def default_artifact_policy() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# f6912e2d — artifact_recipe: execution_path / rollback_policy / checks /
+# focused_tests. See the constants block above (near _MERGER_LOCK_PREFIX) for
+# the full rationale of why each field exists and what it deliberately does
+# NOT duplicate from artifact_kind/planned_output/policy/promotion.
+# ---------------------------------------------------------------------------
+
+def normalize_artifact_recipe(raw: Any) -> "dict[str, Any] | None":
+    """Validate + normalize an ``artifact_recipe`` declaration.
+
+    ``None`` passes through as ``None`` (no declaration — see
+    :func:`check_artifact_recipe_completeness` for how an artifact-sensitive
+    item without one is reported). Otherwise ``raw`` is an object with:
+
+    * ``execution_path`` — required, one of :data:`EXECUTION_PATHS`
+      (``"local" | "hosted"``).
+    * ``rollback_policy`` — required, one of :data:`ROLLBACK_POLICIES`.
+    * ``checks`` — optional object with up to the three
+      :data:`_RECIPE_CHECK_FIELDS` bool flags, each defaulting to ``False``
+      when the ``checks`` object itself is present but a given flag is
+      omitted, and all ``False`` when ``checks`` is omitted entirely.
+    * ``focused_tests`` — required, a non-empty list of non-empty strings
+      (exact pytest node ids / file paths), bounded to
+      :data:`_MAX_FOCUSED_TESTS`, de-duplicated while preserving first-seen
+      order.
+
+    Raises :class:`ArtifactDeclarationError` on any schema violation —
+    required fields missing/malformed, an unknown top-level or ``checks``
+    field, or a ``focused_tests`` entry that is not a real string. Never
+    guesses a value for a required field: an item that wants an
+    ``artifact_recipe`` at all must supply ``execution_path``,
+    ``rollback_policy``, and ``focused_tests`` explicitly.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ArtifactDeclarationError("artifact_recipe must be an object")
+    unknown = set(raw) - _RECIPE_ALLOWED_FIELDS
+    if unknown:
+        raise ArtifactDeclarationError(
+            f"unknown artifact_recipe field(s): {sorted(unknown)}"
+        )
+
+    execution_path = raw.get("execution_path")
+    if not isinstance(execution_path, str) or execution_path.strip().lower() not in EXECUTION_PATHS:
+        raise ArtifactDeclarationError(
+            f"artifact_recipe.execution_path must be one of {sorted(EXECUTION_PATHS)}, "
+            f"got {execution_path!r}"
+        )
+    execution_path = execution_path.strip().lower()
+
+    rollback_policy = raw.get("rollback_policy")
+    if not isinstance(rollback_policy, str) or rollback_policy.strip().lower() not in ROLLBACK_POLICIES:
+        raise ArtifactDeclarationError(
+            f"artifact_recipe.rollback_policy must be one of {sorted(ROLLBACK_POLICIES)}, "
+            f"got {rollback_policy!r}"
+        )
+    rollback_policy = rollback_policy.strip().lower()
+
+    checks_raw = raw.get("checks") or {}
+    if not isinstance(checks_raw, dict):
+        raise ArtifactDeclarationError("artifact_recipe.checks must be an object")
+    unknown_checks = set(checks_raw) - _RECIPE_CHECKS_ALLOWED_FIELDS
+    if unknown_checks:
+        raise ArtifactDeclarationError(
+            f"unknown artifact_recipe.checks field(s): {sorted(unknown_checks)}"
+        )
+    checks: dict[str, Any] = {}
+    for field in _RECIPE_CHECK_FIELDS:
+        val = checks_raw.get(field, False)
+        if not isinstance(val, bool):
+            raise ArtifactDeclarationError(f"artifact_recipe.checks.{field} must be a boolean")
+        checks[field] = val
+
+    focused_tests_raw = raw.get("focused_tests")
+    if not isinstance(focused_tests_raw, list) or not focused_tests_raw:
+        raise ArtifactDeclarationError(
+            "artifact_recipe.focused_tests must be a non-empty list of strings"
+        )
+    if len(focused_tests_raw) > _MAX_FOCUSED_TESTS:
+        raise ArtifactDeclarationError(
+            f"artifact_recipe.focused_tests has {len(focused_tests_raw)} entries, "
+            f"exceeding the cap of {_MAX_FOCUSED_TESTS}"
+        )
+    focused_tests: list[str] = []
+    seen: set[str] = set()
+    for idx, entry in enumerate(focused_tests_raw):
+        if not isinstance(entry, str) or not entry.strip():
+            raise ArtifactDeclarationError(
+                f"artifact_recipe.focused_tests[{idx}] must be a non-empty string"
+            )
+        entry = entry.strip()
+        if entry not in seen:
+            seen.add(entry)
+            focused_tests.append(entry)
+
+    normalized: dict[str, Any] = {
+        "execution_path": execution_path,
+        "rollback_policy": rollback_policy,
+        "checks": checks,
+        "focused_tests": focused_tests,
+    }
+    try:
+        _cm._check_no_secrets_or_local_paths(normalized, path="artifact_recipe")
+    except _cm.CapabilityManifestError as exc:
+        raise ArtifactDeclarationError(str(exc)) from exc
+    return normalized
+
+
+def serialize_artifact_recipe(raw: Any) -> "str | None":
+    """Validate, normalize, and JSON-encode an ``artifact_recipe`` input for
+    storage. Returns ``None`` when there is nothing declared. Raises
+    :class:`ArtifactDeclarationError` on malformed input."""
+    normalized = normalize_artifact_recipe(raw)
+    return json.dumps(normalized, sort_keys=True) if normalized else None
+
+
+def parse_artifact_recipe(raw: Any) -> "dict[str, Any] | None":
+    """Decode a sprint item's ``artifact_recipe`` field. Best-effort on read,
+    mirrors :func:`parse_planned_output` — degrades to ``None`` on any
+    malformed/foreign value rather than raising."""
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+# ---------------------------------------------------------------------------
 # Effective accessors — the CLEAN access path a caller (e.g. the 5fd9d2fd
 # classifier) reads. Each takes a sprint_item row dict (as returned by
 # db.get_sprint_item / db.get_sprint_items) and never raises.
@@ -519,10 +734,27 @@ def effective_artifact_policy(item: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def effective_artifact_recipe(item: dict[str, Any]) -> "dict[str, Any] | None":
+    """The item's declared ``artifact_recipe`` (``execution_path`` /
+    ``rollback_policy`` / ``checks`` / ``focused_tests``), or ``None`` when
+    absent — never guessed. See :func:`check_artifact_recipe_completeness`
+    for the composed "is this item's recipe genuinely executable" verdict
+    across this field AND the pre-existing artifact_kind/planned_output/
+    tool_requirements fields."""
+    return parse_artifact_recipe(item.get("artifact_recipe"))
+
+
 def has_artifact_declaration(item: dict[str, Any]) -> bool:
-    """True when the item carries ANY of the three declarations — used by
-    callers that want to distinguish "nothing declared at all" from "some
-    fields declared, defaults filling the rest"."""
+    """True when the item carries ANY of the three ORIGINAL declarations
+    (artifact_kind / planned_output / artifact_policy) — used by callers
+    that want to distinguish "nothing declared at all" from "some fields
+    declared, defaults filling the rest". Deliberately does NOT fold in
+    ``artifact_recipe`` (f6912e2d): that field is not yet wired into
+    ``meridian.handoff``'s ``<artifact_declaration>`` clause (see this
+    module's own docstring history above), so folding it in here would flip
+    this predicate to ``True`` for an item whose recipe would then render as
+    an empty/default JSON body — silently misleading, not informative. Use
+    :func:`effective_artifact_recipe` directly to check for a recipe."""
     return bool(
         item.get("artifact_kind")
         or item.get("planned_output")
@@ -589,8 +821,83 @@ def compute_base_sha256(target_docx_path: "str | Path") -> "str | None":
     return _compute_sha256(data)
 
 
+# ---------------------------------------------------------------------------
+# f6912e2d — "no ambiguous filename/label match authorizes promotion."
+#
+# check_promotion_preconditions (below) answers "is the base hash still
+# fresh" — a real, necessary check, but one a promotion can satisfy while its
+# ONLY declared identity is a bare target uri (a filename) plus that hash.
+# A hash match proves the BYTES are the ones expected; it says nothing about
+# WHICH structural element inside those bytes this promotion is entitled to
+# touch — that is exactly the "ambiguous filename/label match" the
+# acceptance criteria calls out. ``resource_footprint`` (24f5146d, see the
+# constants block near _FOOTPRINT_PREFIXES above) already carries typed,
+# unambiguous structural anchors (``paraId:``/``table:``/``figure:``/
+# ``media:``/``part:``) for exactly this purpose — this function is the
+# missing piece that actually REQUIRES at least one such anchor before a
+# promotion counts as unambiguous, rather than leaving resource_footprint an
+# optional field nothing ever checks for non-emptiness.
+# ---------------------------------------------------------------------------
+
+def check_no_ambiguous_promotion_match(item: dict[str, Any]) -> dict[str, Any]:
+    """True (``ok``) iff this item's declared promotion (if any) identifies
+    its target via a typed structural anchor, never a bare filename/label
+    match alone.
+
+    Returns ``{"ok": bool, "reason": str, "resource_footprint_count": int}``.
+
+    * No ``promotion`` declared at all → ``ok=True`` (nothing to check —
+      this function only judges promotions that exist).
+    * ``promotion.resource_footprint`` has at least one entry → ``ok=True``
+      (a base_sha256 match — or its absence — is not, by itself, judged
+      here; this function only judges anchor SPECIFICITY).
+    * ``promotion`` declared with an EMPTY ``resource_footprint`` →
+      ``ok=False``: the promotion's only declared identity is a base hash
+      against a bare target uri, which is exactly the ambiguous filename/
+      label match this check exists to refuse.
+
+    Never raises: a malformed/missing ``item`` or ``planned_output``
+    degrades to ``ok=True`` via :func:`effective_promotion`'s own
+    never-guessed ``None`` semantics (nothing declared, nothing to refuse).
+    """
+    promotion = effective_promotion(item)
+    if promotion is None:
+        return {
+            "ok": True,
+            "reason": "no promotion declared for this item — nothing to check",
+            "resource_footprint_count": 0,
+        }
+    footprint = promotion.get("resource_footprint") or []
+    count = len(footprint)
+    if count:
+        return {
+            "ok": True,
+            "reason": (
+                f"promotion declares {count} typed structural anchor(s) "
+                "(paraId:/table:/figure:/media:/part:) — not a bare "
+                "filename/label match"
+            ),
+            "resource_footprint_count": count,
+        }
+    return {
+        "ok": False,
+        "reason": (
+            "promotion declares no resource_footprint — its only declared "
+            "identity is a base_sha256 hash against a bare target uri, "
+            "which is exactly the ambiguous filename/label match this "
+            "check exists to refuse. Add at least one typed "
+            "resource_footprint anchor (paraId:/table:/figure:/media:/"
+            "part:) before this promotion may be treated as unambiguous."
+        ),
+        "resource_footprint_count": 0,
+    }
+
+
 def check_promotion_preconditions(
-    item: dict[str, Any], target_docx_path: "str | Path",
+    item: dict[str, Any],
+    target_docx_path: "str | Path",
+    *,
+    require_resource_footprint: bool = False,
 ) -> dict[str, Any]:
     """Deterministic base-hash precondition check for a script->artifact->
     document promotion.
@@ -600,7 +907,8 @@ def check_promotion_preconditions(
     hash (:func:`compute_base_sha256`). Returns::
 
         {"ok": bool, "reason": str, "declared_base_sha256", "current_base_sha256",
-         "target_exists": bool, "target_docx_path": str}
+         "target_exists": bool, "target_docx_path": str,
+         "no_ambiguous_match_check": {...}}
 
     ``ok=True`` when either (a) no ``base_sha256`` was declared at all — an
     "unknown base" is trivially unchanged, the SAME deliberate rule
@@ -611,14 +919,24 @@ def check_promotion_preconditions(
     before enqueueing the real ``apply_patch_manifest`` call) needs before
     attempting to promote. This function never raises on a missing/garbled
     declaration and never touches disk beyond reading ``target_docx_path``.
+
+    ``no_ambiguous_match_check`` (f6912e2d) — :func:`check_no_ambiguous_promotion_match`'s
+    verdict is ALWAYS computed and attached (surface, never silently skip —
+    the same convention ``artifact_policy``'s default "warn" level uses),
+    but only FLIPS ``ok``/extends ``reason`` when
+    ``require_resource_footprint=True`` is explicitly passed. Default
+    ``False`` is fully backward compatible with every existing caller —
+    this is an ADDITIVE, opt-in stricter gate, never a silent behavior
+    change to the base-hash check that shipped in 24f5146d.
     """
     promotion = effective_promotion(item)
     declared = (promotion or {}).get("base_sha256")
     current = compute_base_sha256(target_docx_path)
     target_exists = current is not None
+    match_check = check_no_ambiguous_promotion_match(item)
 
     if declared is None:
-        return {
+        result = {
             "ok": True,
             "reason": (
                 "no base_sha256 declared for this promotion — an unknown "
@@ -629,28 +947,34 @@ def check_promotion_preconditions(
             "target_exists": target_exists,
             "target_docx_path": str(target_docx_path),
         }
-
-    ok = declared == current
-    reason = (
-        "base hash matches the current on-disk target — safe to promote"
-        if ok
-        else (
-            f"base hash mismatch: promotion was declared against "
-            f"{declared!r}, but the target's current hash is {current!r} "
-            "— the file changed since this promotion was planned. Re-plan "
-            "the promotion against the current file, or apply with "
-            "allow_stale_base=True (transactional_merge.apply_patch_manifest) "
-            "only if the change is understood and acceptable."
+    else:
+        ok = declared == current
+        reason = (
+            "base hash matches the current on-disk target — safe to promote"
+            if ok
+            else (
+                f"base hash mismatch: promotion was declared against "
+                f"{declared!r}, but the target's current hash is {current!r} "
+                "— the file changed since this promotion was planned. Re-plan "
+                "the promotion against the current file, or apply with "
+                "allow_stale_base=True (transactional_merge.apply_patch_manifest) "
+                "only if the change is understood and acceptable."
+            )
         )
-    )
-    return {
-        "ok": ok,
-        "reason": reason,
-        "declared_base_sha256": declared,
-        "current_base_sha256": current,
-        "target_exists": target_exists,
-        "target_docx_path": str(target_docx_path),
-    }
+        result = {
+            "ok": ok,
+            "reason": reason,
+            "declared_base_sha256": declared,
+            "current_base_sha256": current,
+            "target_exists": target_exists,
+            "target_docx_path": str(target_docx_path),
+        }
+
+    result["no_ambiguous_match_check"] = match_check
+    if require_resource_footprint and not match_check["ok"]:
+        result["ok"] = False
+        result["reason"] = f"{result['reason']} ALSO: {match_check['reason']}"
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -717,3 +1041,94 @@ async def get_promotion_merger_lock(
     from meridian.db import locks as _locks  # noqa: PLC0415
     key = merger_lock_key_for_target(str(target_docx_path))
     return await _locks.get_file_claims(db, key, project_id)
+
+
+# ---------------------------------------------------------------------------
+# f6912e2d — "every document/Outputs sprint item must carry an executable
+# artifact recipe": the ONE composed completeness verdict tying together
+# every field this module (and meridian.tool_requirements) already
+# validates independently. Pure/sync, never raises — mirrors every other
+# check_* function in this module.
+# ---------------------------------------------------------------------------
+
+def check_artifact_recipe_completeness(item: dict[str, Any]) -> dict[str, Any]:
+    """Is ``item``'s artifact recipe genuinely EXECUTABLE, per the f6912e2d
+    acceptance criteria — exact MCP tool names, an output pointer (existing
+    vs. planned_new), a declared execution path / rollback policy / focused
+    tests, and (when a promotion is declared) an unambiguous structural
+    anchor?
+
+    Only applies to items that declare an ``artifact_kind`` at all —
+    :func:`effective_artifact_kind` is authoritative, mirroring
+    ``artifact_classification.classify_artifact_work``'s own "declared kind
+    wins" rule; an item with no declared kind gets ``applicable=False`` and
+    ``complete=True`` (this check has nothing to say about it, and must
+    never manufacture a finding for ordinary non-artifact work).
+
+    Composes, without re-deriving any of them:
+
+    * :func:`effective_planned_output` — the output pointer (its own
+      ``target_kind`` already distinguishes existing vs. planned_new; its
+      selector already carries a source module/symbol or DOCX node pointer
+      for ``"symbol"``/``"node_id"`` selector types — see
+      ``meridian.pointers``).
+    * :func:`effective_artifact_recipe` — ``execution_path`` /
+      ``rollback_policy`` / ``checks`` / ``focused_tests`` (f6912e2d, this
+      module).
+    * ``meridian.tool_requirements.effective_tool_requirements`` — exact MCP
+      ``server_or_namespace``/``name`` (76dde31f; lazily imported to avoid a
+      cycle, mirroring this module's other lazy DB/pointers imports).
+    * :func:`check_no_ambiguous_promotion_match` — a declared promotion (if
+      any) is judged for a real structural anchor, never a bare filename/
+      label match.
+
+    Returns::
+
+        {"complete": bool, "applicable": bool, "artifact_kind": str | None,
+         "missing": [str, ...], "reason": str | None}
+
+    ``missing`` lists every absent/insufficient piece by name (never just
+    the first one found) so a caller sees the whole gap in one call.
+    ``reason`` is ``None`` exactly when ``complete`` is ``True``.
+    """
+    kind = effective_artifact_kind(item)
+    if kind is None:
+        return {
+            "complete": True,
+            "applicable": False,
+            "artifact_kind": None,
+            "missing": [],
+            "reason": None,
+        }
+
+    missing: list[str] = []
+
+    if not effective_planned_output(item):
+        missing.append("planned_output")
+
+    if not effective_artifact_recipe(item):
+        missing.append("artifact_recipe")
+
+    try:
+        from . import tool_requirements as _tool_requirements  # noqa: PLC0415 — avoid import cycle
+        tool_reqs = _tool_requirements.effective_tool_requirements(item)
+    except Exception:  # noqa: BLE001 — a completeness check must never raise
+        tool_reqs = []
+    if not tool_reqs:
+        missing.append("tool_requirements")
+
+    match_check = check_no_ambiguous_promotion_match(item)
+    if not match_check["ok"]:
+        missing.append("promotion.resource_footprint (ambiguous filename/label match)")
+
+    complete = not missing
+    return {
+        "complete": complete,
+        "applicable": True,
+        "artifact_kind": kind,
+        "missing": missing,
+        "reason": (
+            None if complete
+            else f"artifact recipe incomplete for a {kind!r} item — missing: " + ", ".join(missing)
+        ),
+    }
