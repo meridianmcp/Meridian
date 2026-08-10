@@ -20,11 +20,14 @@ BEHAVIOR:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -605,6 +608,141 @@ async def test_validate_worktree_merge_hosted_skips_git_checks_but_checks_manife
     result = await _merge_guard_mod.validate_worktree_merge(db, None, wt["id"])
     assert result["ok"] is True
     assert result["head_sha"] is None
+
+
+# ---------------------------------------------------------------------------
+# 3b. f291bb24 investigation -- git subprocess calls must not block the
+# event loop. Before this fix, _git() called subprocess.run() directly
+# inline on the event loop thread: a single validate_worktree_merge call
+# (up to 3 sequential git invocations) froze EVERY concurrently-scheduled
+# coroutine server-wide for the duration, not just the caller's own request
+# -- the structural reason concurrent-load timeouts were reproducible while
+# solo/serial testing looked fine.
+#
+# Both tests below patch the underlying (synchronous) subprocess.run with a
+# real, fixed-duration sleep so the discrimination between "blocked" and
+# "not blocked" is deterministic rather than dependent on how fast a real
+# `git` happens to run on the machine. Each was confirmed, during review, to
+# actually FAIL when _git() is reverted to a plain synchronous
+# subprocess.run() call (i.e. these are real regression tests, not
+# placebos that would pass either way).
+# ---------------------------------------------------------------------------
+
+
+def _blocking_subprocess_run_stub(*, delay: float):
+    """Stand-in for subprocess.run: sleeps `delay` seconds (a REAL, blocking
+    time.sleep -- this is what a slow git invocation looks like from the
+    caller's perspective) then returns a plausible CompletedProcess."""
+
+    def _stub(cmd, **kwargs):
+        time.sleep(delay)
+        args = list(cmd[1:]) if cmd and cmd[0] == "git" else list(cmd)
+        if args[:2] == ["rev-parse", "HEAD"]:
+            stdout = ("b" * 40) + "\n"
+        else:
+            stdout = ""  # clean `status --porcelain`; ancestor `merge-base`
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
+
+    return _stub
+
+
+@pytest.mark.asyncio
+async def test_git_helper_does_not_block_event_loop(tmp_path):
+    """A slow git invocation must not stall an unrelated concurrent task.
+
+    Patches subprocess.run with a real, deterministic 0.3s delay and races
+    it against a concurrent asyncio.sleep(0.05) task. If _git() blocks the
+    event loop (the pre-fix behavior), NOTHING else can run until the
+    blocking call returns, so the sleep task's timer cannot fire until
+    AFTER the git call finishes. With the fix (asyncio.to_thread moving the
+    blocking call to a worker thread), the sleep task fires on its own
+    schedule, well before the slower git call completes.
+    """
+    delay = 0.3
+    sleep_fired_at = None
+    git_finished_at = None
+
+    async def _mark_sleep():
+        nonlocal sleep_fired_at
+        await asyncio.sleep(0.05)
+        sleep_fired_at = time.monotonic()
+
+    async def _timed_git_call():
+        nonlocal git_finished_at
+        await _merge_guard_mod._git(tmp_path, ["status"], timeout=20)
+        git_finished_at = time.monotonic()
+
+    with patch(
+        "meridian.worktree_merge_guard.subprocess.run",
+        side_effect=_blocking_subprocess_run_stub(delay=delay),
+    ):
+        start = time.monotonic()
+        git_task = asyncio.create_task(_timed_git_call())
+        sleep_task = asyncio.create_task(_mark_sleep())
+        await asyncio.gather(git_task, sleep_task)
+
+    assert sleep_fired_at is not None
+    assert git_finished_at is not None
+    assert sleep_fired_at < git_finished_at, (
+        f"sleep fired at {sleep_fired_at - start:.3f}s but the 0.3s git call "
+        f"didn't finish until {git_finished_at - start:.3f}s later -- the "
+        "event loop was blocked (sleep couldn't run until git returned)"
+    )
+    assert sleep_fired_at - start < delay / 2
+
+
+@pytest.mark.asyncio
+async def test_validate_worktree_merge_runs_concurrently_with_other_coroutines(db, tmp_path):
+    """End-to-end proof at the validate_worktree_merge level: a concurrent,
+    unrelated coroutine must make MEASURABLE progress WHILE
+    validate_worktree_merge (which internally awaits _git up to three
+    times) is still running -- not merely complete afterward without
+    deadlocking, which a fully-blocking implementation would also do."""
+    repo = tmp_path / "repo-concurrent"
+    repo.mkdir()
+    _init_git_repo(str(repo))
+    sha1 = _git_commit(str(repo), "a.txt", "one")
+    _git_commit(str(repo), "b.txt", "two")
+
+    p = await db_module.create_project(db, "wt-merge-concurrent")
+    session = await db_module.register_session(db, p["id"], "wt-merge-concurrent-sess")
+    wt = await db_module.register_worktree(
+        db, session["id"], p["id"], "worktree/concurrent1", ".",
+    )
+    await db_module.persist_worktree_manifest(
+        db, wt["id"], p["id"], session["id"], None, "repo", "dev", sha1,
+    )
+
+    delay = 0.3  # x3 sequential _git() calls inside validate_worktree_merge
+    ticks_during_validate = 0
+    validate_done = asyncio.Event()
+
+    async def _ticker():
+        nonlocal ticks_during_validate
+        while not validate_done.is_set():
+            await asyncio.sleep(0.02)
+            if not validate_done.is_set():
+                ticks_during_validate += 1
+
+    with patch(
+        "meridian.worktree_merge_guard.subprocess.run",
+        side_effect=_blocking_subprocess_run_stub(delay=delay),
+    ):
+        ticker_task = asyncio.create_task(_ticker())
+        result = await _merge_guard_mod.validate_worktree_merge(db, repo, wt["id"])
+        validate_done.set()
+        await ticker_task
+
+    assert result["ok"] is True
+    # ~0.9s of wall-clock git-call time at a 20ms ticker interval means a
+    # non-blocking implementation should rack up ~40+ ticks DURING the
+    # call. A blocking implementation starves the ticker entirely until
+    # validate_worktree_merge returns and validate_done is set on the very
+    # next line -- landing at (or near) zero ticks during the call.
+    assert ticks_during_validate >= 5, (
+        f"only {ticks_during_validate} ticker ticks landed while "
+        "validate_worktree_merge was in flight -- event loop was likely blocked"
+    )
 
 
 # ---------------------------------------------------------------------------
