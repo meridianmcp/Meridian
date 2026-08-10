@@ -44,6 +44,7 @@ Design choices, made explicit per this sprint item's spec:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import subprocess
@@ -62,8 +63,14 @@ DEFAULT_STALE_AFTER_HOURS = 24.0
 MERGE_APPROVAL_OVERRIDE_EVENT_TYPE = "sprint_item_merge_approval_override"
 
 
-def _git(cwd: Path, args: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess:
-    return subprocess.run(
+async def _git(cwd: Path, args: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess:
+    # f291bb24 investigation — subprocess.run() is a blocking call; running it
+    # inline on the event loop thread (the original shape here) freezes the
+    # ENTIRE server for every concurrently-handled session, not just this
+    # request, for up to `timeout` seconds per invocation. asyncio.to_thread
+    # moves the blocking call to a worker thread so the event loop stays free.
+    return await asyncio.to_thread(
+        subprocess.run,
         ["git", *args],
         cwd=str(cwd),
         capture_output=True,
@@ -72,7 +79,7 @@ def _git(cwd: Path, args: list[str], *, timeout: int = 20) -> subprocess.Complet
     )
 
 
-def get_worktree_head(repo_root: Path, wt_path: str) -> str | None:
+async def get_worktree_head(repo_root: Path, wt_path: str) -> str | None:
     """Current HEAD commit SHA of the worktree, or None if it can't be
     determined (missing directory, not a git checkout, git failure). Never
     raises."""
@@ -84,7 +91,7 @@ def get_worktree_head(repo_root: Path, wt_path: str) -> str | None:
     if not abs_path.exists():
         return None
     try:
-        result = _git(abs_path, ["rev-parse", "HEAD"])
+        result = await _git(abs_path, ["rev-parse", "HEAD"])
     except Exception as exc:  # noqa: BLE001 — subprocess failures must not propagate
         logger.warning("worktree_merge_guard: rev-parse HEAD failed for %s: %s", abs_path, exc)
         return None
@@ -94,7 +101,7 @@ def get_worktree_head(repo_root: Path, wt_path: str) -> str | None:
     return sha or None
 
 
-def is_worktree_dirty(repo_root: Path, wt_path: str) -> bool | None:
+async def is_worktree_dirty(repo_root: Path, wt_path: str) -> bool | None:
     """True if the worktree has uncommitted changes, False if clean, None if
     it can't be determined. Callers must treat None as "fail closed" — see
     validate_worktree_merge."""
@@ -106,7 +113,7 @@ def is_worktree_dirty(repo_root: Path, wt_path: str) -> bool | None:
     if not abs_path.exists():
         return None
     try:
-        result = _git(abs_path, ["status", "--porcelain"])
+        result = await _git(abs_path, ["status", "--porcelain"])
     except Exception as exc:  # noqa: BLE001
         logger.warning("worktree_merge_guard: status --porcelain failed for %s: %s", abs_path, exc)
         return None
@@ -115,13 +122,13 @@ def is_worktree_dirty(repo_root: Path, wt_path: str) -> bool | None:
     return bool((result.stdout or "").strip())
 
 
-def is_ancestor(repo_root: Path, ancestor_sha: str, descendant_sha: str) -> bool | None:
+async def is_ancestor(repo_root: Path, ancestor_sha: str, descendant_sha: str) -> bool | None:
     """True if ancestor_sha is an ancestor of (or equal to) descendant_sha,
     False if it definitively is not (rebase/reset/divergence), None if it
     can't be determined (e.g. one of the SHAs isn't reachable in this
     checkout)."""
     try:
-        result = _git(repo_root, ["merge-base", "--is-ancestor", ancestor_sha, descendant_sha])
+        result = await _git(repo_root, ["merge-base", "--is-ancestor", ancestor_sha, descendant_sha])
     except Exception as exc:  # noqa: BLE001
         logger.warning("worktree_merge_guard: merge-base --is-ancestor failed: %s", exc)
         return None
@@ -217,7 +224,7 @@ async def validate_worktree_merge(
 
     head_sha: str | None = None
     if repo_root is not None:
-        head_sha = get_worktree_head(repo_root, wt["path"])
+        head_sha = await get_worktree_head(repo_root, wt["path"])
         if head_sha is None:
             errors.append(
                 {
@@ -226,7 +233,7 @@ async def validate_worktree_merge(
                 }
             )
         else:
-            dirty = is_worktree_dirty(repo_root, wt["path"])
+            dirty = await is_worktree_dirty(repo_root, wt["path"])
             if dirty is None:
                 errors.append(
                     {
@@ -242,7 +249,7 @@ async def validate_worktree_merge(
                     }
                 )
 
-            ancestor_ok = is_ancestor(repo_root, manifest["base_sha"], head_sha)
+            ancestor_ok = await is_ancestor(repo_root, manifest["base_sha"], head_sha)
             if ancestor_ok is None:
                 errors.append(
                     {
