@@ -799,3 +799,314 @@ async def test_generate_handoff_goal_mode_artifact_pointer_findings_respect_vers
     ids_v2 = {f["item_id"] for f in findings_v2}
     assert item_v2["id"] in ids_v2
     assert item_v1["id"] not in ids_v2
+
+
+# ---------------------------------------------------------------------------
+# f471c4b8 — "render executor tool requirements and project start
+# configuration in goal handoffs".
+#
+# Prior investigation confirmed <required_tool>/<tool_requirements> (76dde31f,
+# shipped 2026-07-28 -- well before this item's own 2026-08-09 failure
+# report) were ALREADY rendered unconditionally by _build_quick_start_goal
+# for every mode. The ONE genuinely missing piece was the project's own
+# START configuration -- repo_path / effective test_cmd / configured shell --
+# which only "starter" mode rendered (as human prose, OUTSIDE the
+# goal-token-hashed body) via executor_config.build_executor_config_block.
+# mode="goal" and mode="delta" (and mode="full", which shares delta's build
+# call) never rendered it at all. These tests cover the new
+# <project_start_config> tag that closes that gap.
+# ---------------------------------------------------------------------------
+
+
+def _project_start_config_attrs(content: str) -> dict[str, str]:
+    """Parse the <project_start_config .../> tag's attributes out of a
+    rendered handoff body."""
+    import xml.etree.ElementTree as ET
+
+    start = content.index("<project_start_config ")
+    end = content.index("/>", start) + len("/>")
+    el = ET.fromstring(content[start:end])
+    return dict(el.attrib)
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_renders_project_start_config(db, tmp_path):
+    """The confirmed gap: mode="goal" must carry project_id/project_name/
+    version/repo_path/test_cmd/shell inline, not just sprint-item ids --
+    this is the item's own CRITICAL HANDOFF CONTRACT list verbatim."""
+    p = await db_module.create_project(db, "goal-mode-start-config")
+    await db_module.set_executor_config(
+        db, p["id"],
+        {
+            "repo_path": "/home/adam/projects/widget-app",
+            "test_cmd": "pixi run test -n 3",
+            "shell_type": "bash",
+            "branch": "dev",
+        },
+    )
+    await db_module.add_sprint_item(db, p["id"], "v7", "Ship the start config fix")
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal", version="v7",
+    )
+
+    attrs = _project_start_config_attrs(content)
+    assert attrs["project_id"] == p["id"]
+    assert attrs["project_name"] == "goal-mode-start-config"
+    assert attrs["version"] == "v7"
+    assert attrs["repo_path"] == "/home/adam/projects/widget-app"
+    assert attrs["test_cmd"] == "pixi run test -n 3"
+    assert attrs["shell"] == "bash"
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_start_config_unset_fallbacks(db, tmp_path):
+    """No executor_config configured at all: project_id/project_name/
+    test_cmd must still be present and honest (never omitted, never a
+    guessed value) -- repo_path/shell/version fall back to an explicit
+    "unset"/"unscoped" label, mirroring _build_test_gate_config_clause's own
+    branch/version fallback convention."""
+    p = await db_module.create_project(db, "goal-mode-start-config-unset")
+    await db_module.add_sprint_item(db, p["id"], "v1", "Do the thing")
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+
+    attrs = _project_start_config_attrs(content)
+    assert attrs["project_id"] == p["id"]
+    assert attrs["project_name"] == "goal-mode-start-config-unset"
+    assert attrs["version"] == "unscoped"
+    assert attrs["repo_path"] == "unset"
+    assert attrs["shell"] == "unset"
+    # test_cmd always has a real default (_DEFAULT_GOAL_TEST_CMD) -- never
+    # blank even when unconfigured.
+    assert attrs["test_cmd"]
+
+
+@pytest.mark.asyncio
+async def test_generate_handoff_goal_mode_empty_board_still_renders_start_config(
+    db, tmp_path,
+):
+    """The empty-pending-board branch of _build_quick_start_goal is a
+    SEPARATE early return; the new tag is appended at the call site (outside
+    that function) so it must show up on an empty board too -- a cold
+    executor landing on a just-created, item-less project still needs to
+    know where the repo lives."""
+    p = await db_module.create_project(db, "goal-mode-empty-start-config")
+    await db_module.set_executor_config(db, p["id"], {"repo_path": "/srv/app"})
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    attrs = _project_start_config_attrs(content)
+    assert attrs["repo_path"] == "/srv/app"
+
+
+@pytest.mark.asyncio
+async def test_handoff_modes_agree_on_project_start_config(db, tmp_path):
+    """Parity check mirroring test_cov_handoff.py's
+    test_handoff_modes_render_same_effective_test_cmd_parallelism_branch_version
+    (6cfdabd7): delta/goal must render the SAME
+    project_id/project_name/version/repo_path/test_cmd/shell for the SAME
+    underlying executor_config -- proving the two modes can never disagree,
+    because both call sites source the SAME _repo_path_from_settings/
+    _shell_type_from_settings/_test_cmd_from_settings helpers.
+
+    full and starter deliberately do NOT render this tag (CI regression
+    fixed post-merge -- see the f471c4b8 notes at both call sites in
+    meridian/handoff.py): full's Jinja template already carries an
+    equivalent human-readable "Start a New Session" section, and adding the
+    machine-readable tag there broke test_handoff_generates_clean_markdown's
+    content-cleanliness contract; starter's hard <=20-non-empty-line budget
+    (test_handoff_starter_mode) has no room for it, and starter already had
+    its own separate human-prose "# Executor Config" block
+    (executor_config.build_executor_config_block) before this fix. This test
+    locks in both the positive (delta/goal agree) and negative (full/starter
+    never render the tag) halves of that contract."""
+    p = await db_module.create_project(db, "start-config-parity")
+    await db_module.set_executor_config(
+        db, p["id"],
+        {
+            "repo_path": "/srv/repos/parity-app",
+            "test_cmd": "pixi run test -n auto",
+            "shell_type": "powershell",
+            "branch": "dev",
+        },
+    )
+    s = await db_module.register_session(db, p["id"], "sess-start-config-parity")
+    await db_module.add_sprint_item(db, p["id"], "v1", "FEAT: parity check", force=True)
+
+    for mode in ("delta", "goal"):
+        _, content, _ = await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+            session_id=s["id"],
+        )
+        attrs = _project_start_config_attrs(content)
+        assert attrs["project_id"] == p["id"], mode
+        assert attrs["project_name"] == "start-config-parity", mode
+        assert attrs["repo_path"] == "/srv/repos/parity-app", mode
+        assert attrs["test_cmd"] == "pixi run test -n auto", mode
+        assert attrs["shell"] == "powershell", mode
+        # No explicit version scope was requested, so every mode must agree
+        # on the same unscoped fallback label too (same convention
+        # <test_gate_config version="..."> already uses).
+        assert attrs["version"] == "unscoped", mode
+
+    for mode in ("full", "starter"):
+        _, content, _ = await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+            session_id=s["id"],
+        )
+        assert "<project_start_config " not in content, mode
+
+
+@pytest.mark.asyncio
+async def test_project_start_config_coexists_with_required_tool_and_exclusions(
+    db, tmp_path,
+):
+    """Realistic multi-item board: a required_tool pin, a dependency chain
+    (wave order), a MANUAL item, and a backburnered item all together --
+    proving the NEW <project_start_config> tag renders ALONGSIDE the
+    pre-existing <required_tool>/<tool_requirements> contract and the
+    <exclusions> notes rather than displacing or breaking any of them, for
+    goal/delta (the two modes that render it). starter stays in this test's
+    mode loop too -- everything BUT the tag itself still applies there
+    (required_tool/tool_requirements/exclusions/wave-order are unaffected by
+    the f471c4b8 fix) -- but starter deliberately does not render
+    <project_start_config> (see test_handoff_modes_agree_on_project_start_config
+    for why), so its assertion is skipped for that one mode only."""
+    p = await db_module.create_project(db, "start-config-multi-item")
+    await db_module.set_executor_config(
+        db, p["id"], {"repo_path": "/srv/repos/multi-item", "test_cmd": "pixi run test"},
+    )
+    first = await db_module.add_sprint_item(
+        db, p["id"], "v1", "FEAT: base symbol rename",
+        required_tool="Serena: replace_symbol_body",
+    )
+    second = await db_module.add_sprint_item(
+        db, p["id"], "v1", "FEAT: build on the rename",
+        depends_on=first["id"], force=True,
+    )
+    manual = await db_module.add_sprint_item(
+        db, p["id"], "v1", "MANUAL: rotate the staging credential",
+        blocker_kind="manual", force=True,
+    )
+    backburner = await db_module.add_sprint_item(
+        db, p["id"], "v1", "Nice-to-have cleanup",
+        track="backburner", force=True,
+    )
+
+    for mode in ("goal", "delta", "starter"):
+        _, content, _ = await handoff_module.generate_handoff(
+            db, p["id"], str(tmp_path), skip_ai_summary=True, mode=mode,
+        )
+        # New: project start configuration -- goal/delta only (starter
+        # deliberately excluded, see this test's own docstring).
+        if mode != "starter":
+            attrs = _project_start_config_attrs(content)
+            assert attrs["repo_path"] == "/srv/repos/multi-item", mode
+        else:
+            assert "<project_start_config " not in content, mode
+
+        # Pre-existing: required_tool + typed tool_requirements contract.
+        assert "Serena: replace_symbol_body" in content, mode
+        assert "<required_tool>" in content, mode
+        assert "<tool_requirements>" in content, mode
+        assert first["id"] in content, mode
+        assert second["id"] in content, mode
+
+        # Pre-existing: dependency order (both ids listed, first before
+        # second) -- proves the wave/dependency plan is untouched.
+        assert content.index(first["id"]) < content.rindex(second["id"]), mode
+
+        # Pre-existing: the backburnered item is excluded from the claimable
+        # <sprint_items> batch and surfaced as a visible <exclusions> note,
+        # not silently dropped -- this filter lives inside the shared
+        # _build_quick_start_goal (all three modes agree).
+        assert "<exclusions>" in content, mode
+        assert backburner["id"] in content, mode
+
+        # Pre-existing (and mode-dependent BY DESIGN, unrelated to this
+        # item's fix): "starter" fetches sprint items with the default
+        # include_human=True, so _build_quick_start_goal's own MANUAL filter
+        # sees the item and surfaces it via the same <exclusions> note.
+        # "goal"/"delta" instead fetch with include_human=False (see
+        # generate_handoff/_generate_goal_only_handoff), which excludes a
+        # MANUAL-blocker item at the DB layer before it ever reaches
+        # _build_quick_start_goal -- it never appears in the executor-facing
+        # quick_start_goal text for those two modes (checked precisely
+        # below, since "delta" separately embeds a <continuation_manifest>
+        # board-snapshot JSON blob that legitimately lists EVERY sprint item
+        # id in the project, manual ones included -- an unrelated mechanism
+        # this test must not conflate with the executor-facing goal text).
+        _goal_start = content.index("/goal")
+        _goal_end = len(content)
+        for _marker in ("<continuation_manifest>", "<run_timeline>"):
+            _marker_idx = content.find(_marker, _goal_start)
+            if _marker_idx != -1:
+                _goal_end = min(_goal_end, _marker_idx)
+        _goal_text = content[_goal_start:_goal_end]
+        if mode == "starter":
+            assert manual["id"] in _goal_text, mode
+        else:
+            assert manual["id"] not in _goal_text, mode
+
+
+@pytest.mark.asyncio
+async def test_project_start_config_is_part_of_token_hashed_body(db, tmp_path):
+    """CRITICAL token/body-integrity proof: mint_handoff_token(body=...) runs
+    BEFORE the <goal_token>/SECURITY banner is spliced in, over whatever
+    quick_start_goal holds AT THAT POINT (see _mint_and_embed_goal_token's
+    docstring). This proves the new <project_start_config> tag was appended
+    BEFORE minting -- i.e. it is part of the hashed body, not a post-mint
+    patch a tampered copy could slip past token verification.
+
+    Mirrors test_force_include_foreign_project_id_never_reaches_token_bound_body
+    (tests/test_dd07ece0_handoff_token.py) exactly: extract the token,
+    reconstruct the presented body via strip_goal_token_banner, and confirm
+    verify_handoff_token(body=...) reports valid=True for the real body and
+    body_mismatch for a copy with the new tag's repo_path attribute altered."""
+    p = await db_module.create_project(db, "start-config-token-integrity")
+    await db_module.set_executor_config(db, p["id"], {"repo_path": "/srv/real-repo"})
+    await db_module.add_sprint_item(db, p["id"], "v1", "Ship it")
+
+    _, content, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    assert 'repo_path="/srv/real-repo"' in content
+
+    token_match = re.search(r"<goal_token>([^<]+)</goal_token>", content)
+    assert token_match is not None
+    token = token_match.group(1).strip()
+
+    presented_body = handoff_module.strip_goal_token_banner(content)
+
+    # The genuine, unaltered body verifies cleanly -- proving the tag was
+    # hashed in at mint time (not appended after, which would still verify
+    # even with a garbage tag since it was never part of the hash).
+    ok = await handoff_module.verify_handoff_token(
+        db, token, p["id"], body=presented_body,
+    )
+    assert ok == {"valid": True, "reason": "ok"}
+
+    # Re-mint a second token (the first is now consumed) so we can prove
+    # the NEGATIVE side: a body with the new tag's repo_path tampered after
+    # generation must fail verification.
+    _, content2, _ = await handoff_module.generate_handoff(
+        db, p["id"], str(tmp_path), skip_ai_summary=True, mode="goal",
+    )
+    token2_match = re.search(r"<goal_token>([^<]+)</goal_token>", content2)
+    assert token2_match is not None
+    token2 = token2_match.group(1).strip()
+    presented_body2 = handoff_module.strip_goal_token_banner(content2)
+    tampered_body = presented_body2.replace(
+        'repo_path="/srv/real-repo"', 'repo_path="/srv/attacker-controlled"',
+    )
+    assert tampered_body != presented_body2  # sanity: the replace matched something
+
+    bad = await handoff_module.verify_handoff_token(
+        db, token2, p["id"], body=tampered_body,
+    )
+    assert bad["valid"] is False
+    assert bad["reason"] == "body_mismatch"
