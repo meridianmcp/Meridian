@@ -22,6 +22,21 @@ Covers:
     quick_start_goal BEFORE the provenance token is minted, so it is bound
     into the same body-hash mechanism (efaa918a) as the rest of the /goal —
     verify_handoff_token still succeeds on a scoped handoff.
+
+7a373f41 adds connector-schema parity coverage: everything above only
+exercised the core generate_handoff function directly. The hosted HTTP MCP
+dispatch (meridian/mcp/handler.py) and REST route (meridian/routes/handoff.py)
+already threaded selected_item_ids through and handled both
+HandoffSelectionError (HANDOFF_SELECTION_BLOCKED) and
+HandoffScopeNonExecutable (HANDOFF_SCOPE_NON_EXECUTABLE) with structured
+refusals, but had ZERO test coverage proving it; the stdio transport
+(meridian/mcp/stdio_handler.py, covered separately in
+tests/test_stdio_handoff_arg_parity.py) was missing the
+HandoffScopeNonExecutable except clause entirely — a real parity gap, fixed
+alongside this sprint item. The tests below mirror
+test_ee8a6af1_handoff_stale_references.py's own
+"Transport-layer structured refusals" section for the same two exception
+types, through both the MCP dispatch and REST surfaces.
 """
 from __future__ import annotations
 
@@ -33,6 +48,8 @@ import pytest
 
 from meridian import db as db_module
 from meridian import handoff as handoff_module
+import meridian.server  # noqa: F401 — load the server before handler to avoid its import cycle
+from meridian.mcp import handler as mcp_handler
 
 
 _TOKEN_RE = re.compile(r"<goal_token>([^<]+)</goal_token>")
@@ -508,3 +525,101 @@ async def test_scope_stays_executable_when_only_some_requested_ids_excluded(db, 
     assert token, "a partially-executable scope must still mint a genuine token"
     verify = await handoff_module.verify_handoff_token(db, token, pid)
     assert verify == {"valid": True, "reason": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# 7a373f41 — connector-schema parity: the hosted HTTP MCP dispatch
+# (meridian/mcp/handler.py) and REST route (meridian/routes/handoff.py) must
+# return the SAME structured refusal shape as the core function raises,
+# mirroring test_ee8a6af1_handoff_stale_references.py's own
+# "Transport-layer structured refusals" section. The stdio transport gets
+# its own dedicated coverage in tests/test_stdio_handoff_arg_parity.py
+# (that is where the actual missing-except-clause bug lived and was fixed).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mcp_dispatch_selection_error_returns_structured_error(db, tmp_path):
+    pid = await _project(db, "selection-mcp-dispatch-error")
+    await db_module.add_sprint_item(db, pid, "v1", "real pending item", force=True)
+
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff",
+        {
+            "project_id": pid, "mode": "goal",
+            "selected_item_ids": ["totally-made-up-item-id"],
+        },
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert result["error"] == "HANDOFF_SELECTION_BLOCKED"
+    assert result["project_id"] == pid
+    assert result["selection_rejected"] == [
+        {"id": "totally-made-up-item-id", "reason": "not_found"}
+    ]
+    assert "content" not in result
+    assert "path" not in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_dispatch_scope_non_executable_returns_structured_error(db, tmp_path):
+    pid = await _project(db, "selection-mcp-dispatch-non-executable")
+    manual_item = await db_module.add_sprint_item(
+        db, pid, "v1", "configure PyPI trusted publisher",
+        blocker_kind="manual", force=True,
+    )
+
+    result = await mcp_handler._handle_task_tools(
+        "generate_handoff",
+        {
+            "project_id": pid, "mode": "goal",
+            "selected_item_ids": [manual_item["id"]],
+        },
+        db, str(tmp_path), tenant=None, _mcp_tenant_id=None,
+    )
+    assert result["error"] == "HANDOFF_SCOPE_NON_EXECUTABLE"
+    assert result["project_id"] == pid
+    assert result["requested_ids"] == [manual_item["id"]]
+    assert result["excluded_requested"] == [
+        {"id": manual_item["id"], "reason": "not_in_pending_batch"}
+    ]
+    assert "content" not in result
+    assert "path" not in result
+
+
+def test_routes_handoff_endpoint_selection_error_returns_structured_422(client):
+    project = client.post(
+        "/projects", json={"name": "selection-http-error"}
+    ).json()
+    pid = project["id"]
+    client.post(
+        f"/projects/{pid}/sprint-items",
+        json={"version": "v1", "title": "real pending item"},
+    )
+
+    r = client.post(
+        f"/projects/{pid}/handoff",
+        json={"mode": "goal", "selected_item_ids": ["totally-made-up-item-id"]},
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["error"] == "HANDOFF_SELECTION_BLOCKED"
+    assert detail["project_id"] == pid
+    assert detail["selection_rejected"] == [
+        {"id": "totally-made-up-item-id", "reason": "not_found"}
+    ]
+
+
+# Note: there is no REST-level HandoffScopeNonExecutable test alongside the
+# HandoffSelectionError one above — the public sprint-items REST creation
+# endpoint (routes/sprint.py's add_sprint_item_endpoint) does not accept
+# blocker_kind/track, so a "manual"/"backburner" item (the only way to
+# reliably trigger HandoffScopeNonExecutable) cannot be constructed through
+# REST-only calls without expanding that unrelated endpoint's schema, which
+# is out of scope for this sprint item. routes/handoff.py's
+# HandoffScopeNonExecutable except-block is structurally identical to (and
+# directly adjacent to) the HandoffSelectionError block just exercised above,
+# and the same exception is independently covered end-to-end at the core
+# function (test_scope_non_executable_when_sole_requested_item_is_manual
+# etc. above) and the hosted MCP dispatch
+# (test_mcp_dispatch_scope_non_executable_returns_structured_error above)
+# and stdio transport (tests/test_stdio_handoff_arg_parity.py) layers.
