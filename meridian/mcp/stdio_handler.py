@@ -531,7 +531,14 @@ def build_mcp_server():
                                 "project, cross-version, or non-pending id refuses "
                                 "the whole call with error=HANDOFF_SELECTION_BLOCKED "
                                 "and a selection_rejected list instead of silently "
-                                "narrowing/widening the scope."
+                                "narrowing/widening the scope. (7a373f41) A "
+                                "selection that validates cleanly but collapses to "
+                                "zero executable items once the manual/backburner/"
+                                "unprospected/wave-gate exclusion filters run "
+                                "instead refuses with "
+                                "error=HANDOFF_SCOPE_NON_EXECUTABLE, requested_ids, "
+                                "and an excluded_requested reason list -- mirrors "
+                                "the HTTP MCP dispatch and REST route exactly."
                             ),
                         },
                         "strict_evidence": {
@@ -2379,6 +2386,7 @@ def build_mcp_server():
                 _handoff_continuation_blocked = False
                 _handoff_stale_reference_blocked = False
                 _handoff_selection_blocked = False
+                _handoff_scope_non_executable_blocked = False
                 try:
                     path, content, _ = await asyncio.wait_for(
                         handoff_module.generate_handoff(
@@ -2448,11 +2456,36 @@ def build_mcp_server():
                         "message": str(exc),
                     }
                     _handoff_selection_blocked = True
+                except handoff_module.HandoffScopeNonExecutable as exc:
+                    # 7a373f41 — mirror handler.py's/routes/handoff.py's structured
+                    # refusal: selected_item_ids validated cleanly (every id was
+                    # genuinely pending/in-project/in-version) but every requested
+                    # id was independently excluded from the claimable batch by a
+                    # separate structural gate (no prospecting evidence, backburner,
+                    # manual, or wave-gate pending). Nothing was rendered/written/
+                    # persisted for this call. Before this fix the stdio transport
+                    # had no except clause for this exception at all, so it fell
+                    # through to the generic `except Exception` handler further up
+                    # the call stack and returned an unstructured
+                    # {"error": "HandoffScopeNonExecutable: ..."} string instead of
+                    # this same machine-readable shape the HTTP MCP dispatch
+                    # (meridian/mcp/handler.py) and the REST route
+                    # (meridian/routes/handoff.py) already returned — a genuine
+                    # connector-parity gap for the selected_item_ids feature.
+                    result = {
+                        "error": "HANDOFF_SCOPE_NON_EXECUTABLE",
+                        "project_id": arguments["project_id"],
+                        "requested_ids": exc.requested_ids,
+                        "excluded_requested": exc.excluded,
+                        "message": str(exc),
+                    }
+                    _handoff_scope_non_executable_blocked = True
                 if (
                     not _handoff_evidence_blocked
                     and not _handoff_continuation_blocked
                     and not _handoff_stale_reference_blocked
                     and not _handoff_selection_blocked
+                    and not _handoff_scope_non_executable_blocked
                 ):
                     # a5e8aa74 — return content EXACTLY as generate_handoff rendered
                     # it, via the shared helper meridian/mcp/handler.py and
