@@ -51,13 +51,16 @@ from __future__ import annotations
 
 import hashlib
 import io
+import multiprocessing
 import os
+import queue
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
@@ -332,6 +335,11 @@ def _word_com_unavailable_reason() -> str | None:
 # c44d245d -- module-level so tests can shrink the bound instead of waiting
 # out a real 60s hang to exercise the timeout-classification/cleanup path.
 _WORD_COM_TIMEOUT_SECONDS = 60.0
+# Give the COM worker a short grace period after its owned process is
+# terminated.  The thread is deliberately never allowed to hold up the
+# caller indefinitely: Word can block inside an overlapped COM call even after
+# the process has been signalled.
+_WORD_COM_CLEANUP_JOIN_SECONDS = 1.0
 
 # Word COM errors surface as a broad pywintypes.com_error whose message text
 # is the only signal available (no structured error code Python can reliably
@@ -396,36 +404,66 @@ def _terminate_owned_process(pid: int) -> bool:
         return False
 
 
-def _word_com_render(docx_path: str) -> dict[str, Any]:
+def _word_com_render_thread(docx_path: str) -> dict[str, Any]:
     import win32com.client  # local import: optional dependency, only touched when available
 
     with tempfile.TemporaryDirectory(prefix="meridian_render_gate_") as out_dir:
         pdf_path = os.path.join(out_dir, "render_probe.pdf")
         outcome: dict[str, Any] = {}
         owned: dict[str, int | None] = {"pid": None}
+        timeout_requested = threading.Event()
 
         def _worker() -> None:
             word = None
             doc = None
             try:
+                # COM apartments are thread-local.  The watchdog worker is a
+                # new thread, so relying on the host thread's initialization
+                # is incorrect and can make Documents.Open hang or fail
+                # nondeterministically on Windows.
+                import pythoncom
+
+                pythoncom.CoInitialize()
                 word = win32com.client.DispatchEx("Word.Application")
                 word.Visible = False
+                # Prevent modal prompts from turning a bounded render into an
+                # unbounded worker wait.
+                word.DisplayAlerts = 0  # wdAlertsNone
                 owned["pid"] = _word_application_pid(word)
-                doc = word.Documents.Open(os.path.abspath(docx_path), ReadOnly=True)
+                doc = word.Documents.Open(
+                    os.path.abspath(docx_path),
+                    ConfirmConversions=False,
+                    ReadOnly=True,
+                    AddToRecentFiles=False,
+                    Revert=False,
+                    OpenAndRepair=False,
+                    NoEncodingDialog=True,
+                )
                 doc.SaveAs(pdf_path, FileFormat=_WD_FORMAT_PDF)
             except Exception as exc:  # COM errors surface as broad pywintypes.com_error
                 outcome["exc"] = exc
             finally:
-                try:
-                    if doc is not None:
-                        doc.Close(False)
-                except Exception:
-                    pass
-                try:
-                    if word is not None:
-                        word.Quit()
-                except Exception:
-                    pass
+                # Once the watchdog has terminated Word, calling back into
+                # the invalid COM proxy can raise an uncatchable Windows RPC
+                # fault (0x800706BE). The worker thread is about to exit, so
+                # let the OS tear down that apartment instead of attempting
+                # cleanup against a dead server.
+                if not timeout_requested.is_set():
+                    try:
+                        if doc is not None:
+                            doc.Close(False)
+                    except Exception:
+                        pass
+                    try:
+                        if word is not None:
+                            word.Quit()
+                    except Exception:
+                        pass
+                # Do not call CoUninitialize here. Word may already have
+                # exited (or been terminated by the watchdog) while COM is
+                # unwinding; on Windows that call can raise an uncatchable
+                # RPC fault. This worker is short-lived and its thread exit
+                # releases the apartment safely.
 
         # c44d245d -- Word COM automation has no native call-level timeout
         # (a modal "keep changes?"/repair prompt can block Documents.Open
@@ -439,11 +477,14 @@ def _word_com_render(docx_path: str) -> dict[str, Any]:
         worker_thread.join(_WORD_COM_TIMEOUT_SECONDS)
 
         if worker_thread.is_alive():
+            timeout_requested.set()
             pid = owned.get("pid")
             terminated = _terminate_owned_process(pid) if pid is not None else False
+            worker_thread.join(_WORD_COM_CLEANUP_JOIN_SECONDS)
             raise RenderCapabilityError(
                 f"Word COM render exceeded its {_WORD_COM_TIMEOUT_SECONDS:.0f}s bound "
-                f"and was terminated (owned pid={pid!r}, terminated={terminated})",
+                f"and was terminated (owned pid={pid!r}, terminated={terminated}, "
+                f"cleanup_pending={worker_thread.is_alive()})",
                 error_class=TIMEOUT_ERROR,
                 timed_out=True,
                 retryable=False,
@@ -465,6 +506,152 @@ def _word_com_render(docx_path: str) -> dict[str, Any]:
                 retryable=False,
             )
         return {"converted_via": "word-com", "output_filename": os.path.basename(pdf_path)}
+
+
+def _word_com_process_worker(docx_path: str, pdf_path: str, result_queue: Any) -> None:
+    """Run real Word COM in a killable child process.
+
+    A blocked COM call can raise a Windows RPC fault outside Python's
+    exception machinery when it runs in a thread inside the test/server
+    process. Keeping the automation in a spawned child makes the timeout
+    boundary real: the parent can terminate the child without taking down
+    the MCP server or pytest interpreter.
+    """
+    word = None
+    doc = None
+    try:
+        import pythoncom
+
+        pythoncom.CoInitialize()
+        import win32com.client
+
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0  # wdAlertsNone
+        result_queue.put({"kind": "pid", "pid": _word_application_pid(word)})
+        doc = word.Documents.Open(
+            os.path.abspath(docx_path),
+            ConfirmConversions=False,
+            ReadOnly=True,
+            AddToRecentFiles=False,
+            Revert=False,
+            OpenAndRepair=False,
+            NoEncodingDialog=True,
+        )
+        doc.SaveAs(pdf_path, FileFormat=_WD_FORMAT_PDF)
+        result_queue.put({"kind": "result", "ok": True})
+    except BaseException as exc:  # child must report all failures to parent
+        try:
+            result_queue.put({
+                "kind": "result",
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+        except Exception:
+            pass
+    finally:
+        # Do not call CoUninitialize in a process whose Word server may have
+        # already gone away. Process exit releases this apartment safely.
+        try:
+            if doc is not None:
+                doc.Close(False)
+        except Exception:
+            pass
+        try:
+            if word is not None:
+                word.Quit()
+        except Exception:
+            pass
+
+
+def _word_com_render_isolated(docx_path: str) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="meridian_render_gate_") as out_dir:
+        pdf_path = os.path.join(out_dir, "render_probe.pdf")
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        worker = context.Process(
+            target=_word_com_process_worker,
+            args=(os.path.abspath(docx_path), pdf_path, result_queue),
+        )
+        worker.start()
+        word_pid: int | None = None
+        result: dict[str, Any] | None = None
+        deadline = time.monotonic() + _WORD_COM_TIMEOUT_SECONDS
+        try:
+            while worker.is_alive() and time.monotonic() < deadline:
+                try:
+                    message = result_queue.get(
+                        timeout=min(0.1, max(0.01, deadline - time.monotonic())),
+                    )
+                except queue.Empty:
+                    continue
+                if message.get("kind") == "pid":
+                    word_pid = message.get("pid")
+                elif message.get("kind") == "result":
+                    result = message
+
+            if worker.is_alive():
+                terminated_word = (
+                    _terminate_owned_process(word_pid)
+                    if word_pid is not None else False
+                )
+                worker.terminate()
+                worker.join(_WORD_COM_CLEANUP_JOIN_SECONDS)
+                if worker.is_alive() and hasattr(worker, "kill"):
+                    worker.kill()
+                    worker.join(_WORD_COM_CLEANUP_JOIN_SECONDS)
+                raise RenderCapabilityError(
+                    f"Word COM render exceeded its {_WORD_COM_TIMEOUT_SECONDS:.0f}s "
+                    f"bound (worker_pid={worker.pid!r}, owned_word_pid={word_pid!r}, "
+                    f"word_terminated={terminated_word}, "
+                    f"worker_alive={worker.is_alive()})",
+                    error_class=TIMEOUT_ERROR,
+                    timed_out=True,
+                    retryable=False,
+                )
+
+            worker.join(_WORD_COM_CLEANUP_JOIN_SECONDS)
+            # A result can still be in the feeder pipe immediately after the
+            # child exits; drain briefly before treating it as a crash.
+            while True:
+                try:
+                    message = result_queue.get(timeout=0.1)
+                except queue.Empty:
+                    break
+                if message.get("kind") == "pid":
+                    word_pid = message.get("pid")
+                elif message.get("kind") == "result":
+                    result = message
+        finally:
+            result_queue.close()
+            result_queue.join_thread()
+
+        if not result or not result.get("ok"):
+            error = RuntimeError(
+                (result or {}).get("error", f"worker exited with code {worker.exitcode}"),
+            )
+            error_class, retryable = _classify_word_com_exception(error)
+            raise RenderCapabilityError(
+                f"Word COM render failed: {error}",
+                error_class=error_class,
+                retryable=retryable,
+            ) from error
+        if not os.path.exists(pdf_path):
+            raise RenderCapabilityError(
+                "Word COM reported success but no PDF was written to disk",
+                error_class=UNKNOWN_ERROR,
+                retryable=False,
+            )
+        return {"converted_via": "word-com", "output_filename": os.path.basename(pdf_path)}
+
+
+def _word_com_render(docx_path: str) -> dict[str, Any]:
+    """Render with a real child process; keep injected fakes in-process."""
+    import win32com.client
+
+    if getattr(win32com.client, "__file__", None):
+        return _word_com_render_isolated(docx_path)
+    return _word_com_render_thread(docx_path)
 
 
 _WORD_COM_BACKEND = RenderBackend(

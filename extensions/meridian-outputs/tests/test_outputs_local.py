@@ -2296,6 +2296,73 @@ class TestParallelRebuildCorrectness:
         assert count == 1, f"Expected 1 row, got {count} (duplicate rows introduced)"
         idx.close()
 
+    @duckdb_required
+    def test_absolute_and_relative_roots_share_canonical_rows(self, tmp_path: Path) -> None:
+        """Restarting with a relative spelling of the same root must not
+        duplicate the persisted row keys."""
+        f = tmp_path / "data.csv"
+        f.write_text("x\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-index.duckdb")
+        absolute_root = str(tmp_path.resolve())
+        relative_root = os.path.relpath(absolute_root, start=os.getcwd())
+
+        first = OL.OutputsFtsIndex(absolute_root, db_path=db_path)
+        try:
+            assert first.rebuild() == 1
+        finally:
+            first.close()
+
+        second = OL.OutputsFtsIndex(relative_root, db_path=db_path)
+        try:
+            second.rebuild()
+            rows = second._con.execute("SELECT path FROM outputs_index").fetchall()
+            assert len(rows) == 1
+            assert rows[0][0] == os.path.abspath(os.path.normpath(str(f)))
+        finally:
+            second.close()
+
+    @duckdb_required
+    def test_rebuild_repairs_legacy_duplicate_path_rows(self, tmp_path: Path) -> None:
+        """A rebuild repairs duplicate rows left by the old path-spelling bug."""
+        import duckdb
+
+        f = tmp_path / "data.csv"
+        f.write_text("x\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-legacy.duckdb")
+        absolute_path = os.path.abspath(os.path.normpath(str(f)))
+        legacy_path = os.path.relpath(absolute_path, start=os.getcwd())
+
+        first = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            assert first.rebuild() == 1
+        finally:
+            first.close()
+
+        con = duckdb.connect(db_path)
+        try:
+            con.execute(
+                "INSERT INTO outputs_index (path, content, mtime, sha256, size, "
+                "generating_script, kind, is_archival, canonical_path, "
+                "csv_columns, json_keys) "
+                "SELECT ?, content, mtime, sha256, size, generating_script, kind, "
+                "is_archival, canonical_path, csv_columns, json_keys "
+                "FROM outputs_index WHERE path = ?",
+                [legacy_path, absolute_path],
+            )
+        finally:
+            con.close()
+
+        repaired = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            assert repaired.rebuild() == 1
+            rows = repaired._con.execute(
+                "SELECT path FROM outputs_index"
+            ).fetchall()
+            assert rows == [(absolute_path,)]
+            assert len(repaired.search("x")) == 1
+        finally:
+            repaired.close()
+
     def test_worker_failure_falls_back_gracefully(self, tmp_path: Path) -> None:
         """If a worker raises, the file is re-analysed synchronously and indexed."""
         f = tmp_path / "ok.csv"

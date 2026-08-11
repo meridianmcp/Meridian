@@ -1307,6 +1307,25 @@ def _normalize_output_path(path: Any) -> str:
     return os.path.normcase(os.path.normpath(s)).replace("\\", "/")
 
 
+def _canonical_storage_path(path: Any) -> str:
+    """Return one absolute storage spelling without case-folding it.
+
+    The equality normalizer is intentionally case/slash insensitive. Persisted
+    rows and public result paths must retain the established Windows display
+    spelling, so those concerns stay separate.
+    """
+    if not isinstance(path, str):
+        return ""
+    s = path.strip()
+    if not s:
+        return ""
+    try:
+        s = os.path.abspath(s)
+    except (OSError, ValueError):
+        pass
+    return os.path.normpath(s)
+
+
 def _classify_suffix(path: str) -> str:
     suffix = os.path.splitext(path)[1].lower()
     if suffix in _TEXT_CONTENT_SUFFIXES:
@@ -2139,8 +2158,16 @@ class OutputsFtsIndex:
         write_chunk: int | None = None,
         session_id: str | None = None,
     ) -> None:
-        self.outputs_dir = outputs_dir
-        self._db_path = db_path
+        # Persist one canonical spelling for the tree and its cache.  Without
+        # this, a process that first indexes an absolute root and a later
+        # process that indexes the same root relatively writes two different
+        # path keys into the same DuckDB cache.
+        self.outputs_dir = _canonical_storage_path(outputs_dir) or os.path.normpath(str(outputs_dir))
+        self._db_path = (
+            db_path
+            if db_path == ":memory:"
+            else _canonical_storage_path(db_path) or os.path.normpath(str(db_path))
+        )
         self._hasher = hasher
         # a52216e2 -- optional caller-supplied identity (e.g. a Meridian
         # session_id) attributed to this instance's write-lock lease, purely
@@ -2176,7 +2203,7 @@ class OutputsFtsIndex:
             tuple(exclude_patterns) if exclude_patterns is not None
             else _default_exclude_patterns()
         )
-        self._write_lock = IndexFileLock(db_path, session_id=session_id)
+        self._write_lock = IndexFileLock(self._db_path, session_id=session_id)
         self._read_lock = threading.RLock()  # in-process query serialisation
         # a52216e2 -- set when the write lock could not be acquired this
         # call (IndexLockAcquireError). Reset at the top of every rebuild(),
@@ -2981,6 +3008,154 @@ class OutputsFtsIndex:
             "key VARCHAR PRIMARY KEY, value VARCHAR)"
         )
 
+    def _migrate_legacy_storage_paths_locked(self, con: Any) -> bool:
+        """Repair rows written before persisted paths were canonicalized.
+
+        Older versions stored whatever spelling the caller supplied.  A
+        restart or a second caller could therefore persist both a relative
+        and an absolute spelling of the same file.  Repair this in one
+        transaction while the index write lease is held, retaining the
+        richest row in each canonical-path group and staging the corresponding
+        Tantivy delete/upsert delta.
+
+        The migration is deliberately limited to path identity.  It does not
+        re-walk or re-hash files, and it preserves the established display
+        spelling by using :func:`_canonical_storage_path` for the winner.
+        """
+        self._ensure_schema(con)
+        relation = con.execute(
+            "SELECT path, content, mtime, sha256, size, generating_script, "
+            "kind, is_archival, canonical_path, csv_columns, json_keys "
+            "FROM outputs_index"
+        )
+        columns = [c[0] for c in relation.description]
+        raw_rows = [dict(zip(columns, row)) for row in relation.fetchall()]
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in raw_rows:
+            raw_path = row.get("path")
+            canonical = _canonical_storage_path(raw_path)
+            if not canonical:
+                continue
+            row["_canonical_storage_path"] = canonical
+            groups.setdefault(_normalize_output_path(canonical), []).append(row)
+
+        affected: list[tuple[list[dict[str, Any]], dict[str, Any]]] = []
+        for group in groups.values():
+            canonical = min(
+                row["_canonical_storage_path"] for row in group
+            )
+            winner = max(
+                group,
+                key=lambda row: (
+                    row.get("path") == canonical,
+                    row.get("content") is not None,
+                    row.get("sha256") is not None,
+                    row.get("mtime") or 0,
+                    row.get("size") or 0,
+                    str(row.get("path") or ""),
+                ),
+            )
+            if len(group) > 1 or winner.get("path") != canonical:
+                winner = dict(winner)
+                winner["path"] = canonical
+                affected.append((group, winner))
+
+        if not affected:
+            return False
+
+        old_paths = [
+            row["path"]
+            for group, _winner in affected
+            for row in group
+            if row.get("path")
+        ]
+        winners = [winner for _group, winner in affected]
+        con.execute("BEGIN TRANSACTION")
+        try:
+            for path in old_paths:
+                con.execute("DELETE FROM outputs_index WHERE path = ?", [path])
+            for row in winners:
+                con.execute(
+                    "INSERT INTO outputs_index (path, content, mtime, sha256, "
+                    "size, generating_script, kind, is_archival, canonical_path, "
+                    "csv_columns, json_keys) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        row["path"], row.get("content"), row.get("mtime"),
+                        row.get("sha256"), row.get("size"),
+                        row.get("generating_script"), row.get("kind"),
+                        row.get("is_archival"), row.get("canonical_path"),
+                        row.get("csv_columns"), row.get("json_keys"),
+                    ],
+                )
+        except BaseException:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex: legacy path migration rollback failed",
+                    exc_info=True,
+                )
+            raise
+        else:
+            con.execute("COMMIT")
+
+        # Reconcile this process's metadata cache as well as the durable table.
+        # _connect() may have rehydrated the old duplicate spellings before
+        # rebuild() acquired the write lease.
+        affected_old = set(old_paths)
+        for path in affected_old:
+            self._row_cache.pop(path, None)
+            self._manifest.pop(path, None)
+            self._pending_stale.pop(path, None)
+        for row in winners:
+            parsed = OutputRow(
+                path=row["path"],
+                content=None,
+                mtime=row.get("mtime"),
+                sha256=row.get("sha256"),
+                size=row.get("size"),
+                generating_script=row.get("generating_script"),
+                kind=row.get("kind") or "",
+                is_archival=bool(row.get("is_archival")),
+                canonical_path=row.get("canonical_path"),
+                csv_columns=(
+                    json.loads(row["csv_columns"])
+                    if row.get("csv_columns") else None
+                ),
+                json_keys=(
+                    json.loads(row["json_keys"])
+                    if row.get("json_keys") else None
+                ),
+            )
+            self._row_cache[parsed.path] = parsed
+            self._manifest[parsed.path] = (parsed.mtime, parsed.size)
+
+        # Remove every legacy spelling from Tantivy, then insert the canonical
+        # winner. _rebuild_fts() commits this delta in one small transaction.
+        self._pending_tantivy_deletes.update(affected_old)
+        for row in winners:
+            parsed = OutputRow(
+                path=row["path"],
+                content=row.get("content"),
+                mtime=row.get("mtime"),
+                sha256=row.get("sha256"),
+                size=row.get("size"),
+                generating_script=row.get("generating_script"),
+                kind=row.get("kind") or "",
+                is_archival=bool(row.get("is_archival")),
+                canonical_path=row.get("canonical_path"),
+                csv_columns=(
+                    json.loads(row["csv_columns"])
+                    if row.get("csv_columns") else None
+                ),
+                json_keys=(
+                    json.loads(row["json_keys"])
+                    if row.get("json_keys") else None
+                ),
+            )
+            self._pending_tantivy_upserts[parsed.path] = parsed
+        return True
+
     def add_annotation(
         self,
         path: str,
@@ -3603,6 +3778,23 @@ class OutputsFtsIndex:
             })
             return len(self._row_cache)
         try:
+            # Repair caches written by pre-canonicalization versions before
+            # the normal staleness pass. This runs under the write lease so a
+            # repair cannot race another process's row update.
+            try:
+                legacy_paths_migrated = (
+                    self._migrate_legacy_storage_paths_locked(self._connect())
+                )
+            except Exception as _path_migration_exc:  # noqa: BLE001
+                legacy_paths_migrated = False
+                self.last_db_write_error = (
+                    f"{type(_path_migration_exc).__name__}: "
+                    f"{_path_migration_exc}"
+                )
+                _log.warning(
+                    "OutputsFtsIndex.rebuild: legacy path migration failed",
+                    exc_info=True,
+                )
             self._ingest_meridian_notes(all_paths)
             rows, changed, paths_to_delete, new_rows = (
                 self._apply_precomputed(
@@ -3638,7 +3830,7 @@ class OutputsFtsIndex:
             # unconditionally right here -- see the note at its new location
             # for why that was a real bug, not just a comment inaccuracy.
             write_confirmed = True
-            if changed:
+            if changed or legacy_paths_migrated:
                 try:
                     con = self._connect()
                     self._ensure_schema(con)
@@ -4467,10 +4659,13 @@ class OutputsFtsIndex:
         for p in paths:
             if not p:
                 continue
-            pp = os.path.normpath(p)
+            pp = _canonical_storage_path(p)
+            if not pp:
+                continue
             if is_secret_path(pp):
                 continue
-            norm_paths.append(pp)
+            if pp not in norm_paths:
+                norm_paths.append(pp)
         if not norm_paths:
             return {"indexed": 0, "queued": 0, "paths": []}
 
@@ -4542,7 +4737,9 @@ class OutputsFtsIndex:
         provenance-triggered registration" even though the underlying
         primitive is generic.
         """
-        self._priority_registered.add(os.path.normpath(path))
+        normalized = _canonical_storage_path(path)
+        if normalized:
+            self._priority_registered.add(normalized)
         return self.index_paths([path])
 
     # ------------------------------------------------------------------
@@ -4813,7 +5010,8 @@ def _resolve_index_db_path(outputs_dir: str) -> str:
     single bad outputs_dir degrades to the old (non-persistent) behaviour
     instead of raising.
     """
-    cache_dir = os.path.join(outputs_dir, ".meridian-outputs-cache")
+    canonical_outputs_dir = _canonical_storage_path(outputs_dir) or os.path.normpath(str(outputs_dir))
+    cache_dir = os.path.join(canonical_outputs_dir, ".meridian-outputs-cache")
     try:
         os.makedirs(cache_dir, exist_ok=True)
         ensure_gitignored(cache_dir)
