@@ -404,6 +404,30 @@ def has_executor_config(raw: dict[str, Any] | None) -> bool:
     return bool(normalize_executor_config(raw))
 
 
+def resolve_origin_identity(project: dict[str, Any] | None) -> dict[str, Any]:
+    """acf6f51a — minimal "origin tenant/endpoint identity" for a
+    HandoffManifest: which tenant/project a handoff was minted from.
+
+    Deliberately excludes executor_config fields like repo_path/
+    filesystem_roots/hostnames/env_file — those are machine-local paths or
+    hostnames, and this project's capability_manifest.py already establishes
+    the rule reused here: never put a machine-local absolute path (or a
+    secret) into project-shared, multi-machine state. A HandoffManifest can
+    travel to a different machine/session than the one that generated it, so
+    the same rule applies here.
+    """
+    if not isinstance(project, dict):
+        return {}
+    identity: dict[str, Any] = {}
+    if project.get("id"):
+        identity["project_id"] = project["id"]
+    if project.get("name"):
+        identity["project_name"] = project["name"]
+    if project.get("tenant_id"):
+        identity["tenant_id"] = project["tenant_id"]
+    return identity
+
+
 def build_executor_config_block(raw: dict[str, Any] | None) -> str:
     """Render a compact starter/handoff block for executor sessions."""
     config = executor_config_for_output(raw)

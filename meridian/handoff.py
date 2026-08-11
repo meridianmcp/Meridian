@@ -56,6 +56,7 @@ from .executor_config import (
     build_executor_config_block,
     build_execution_policy,
     has_executor_config,
+    resolve_origin_identity,
 )
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -8458,6 +8459,518 @@ def _build_selected_scope_clause(selected_scope: "dict[str, Any] | None") -> str
     )
 
 
+# ---------------------------------------------------------------------------
+# acf6f51a — canonical XML HandoffManifest.
+#
+# A machine envelope that a receiving session (or an auditor) can check
+# WITHOUT re-parsing the prose /goal block: exactly which board snapshot a
+# handoff was generated against (``board_revision``), the exact item/status/
+# dependency list it claims, and the tenant/project it came from. It is
+# never independently authored — every field below is data the caller
+# (``generate_handoff``) already computed for its own human-readable render
+# (``pending_sprint_items``, ``_selected_scope``, ``_parallel_groups``, the
+# project record) — see ``_generate_goal_only_handoff``'s ``emit_manifest``
+# wiring, the concrete integration point for this first pass.
+#
+# Body-hash binding reuses the EXISTING ``mint_handoff_token(body=...)`` /
+# ``verify_handoff_token(presented_body=...)`` mechanism (see
+# ``_hash_goal_body`` / ``_mint_and_embed_goal_token`` above) rather than
+# inventing a second token scheme: the caller splices
+# ``serialize_handoff_manifest_xml(...)``'s output into ``quick_start_goal``
+# BEFORE the existing mint call, exactly the way ``_build_selected_scope_
+# clause``'s output already is (see that function's own docstring) — so the
+# manifest is covered by the SAME ``body_hash``/``body_mismatch`` check every
+# other part of the /goal block already relies on. ``mint_manifest_bound_
+# token`` below additionally exposes a manifest-only token for a receiver
+# (1bd5e810) that wants to verify the manifest independent of the full
+# rendered body.
+# ---------------------------------------------------------------------------
+
+_MANIFEST_SCHEMA_VERSION = "1.0"
+# Hard backstop on the serialized canonical manifest. Per 248c0bb9/b6510123
+# precedent elsewhere in this module: a size problem on a token-bound body
+# is solved by making the content small BY CONSTRUCTION (build_handoff_
+# manifest already bounds its item list to max_items), never by truncating a
+# body about to be hashed into a goal token — a truncated-but-still-parses
+# manifest would be worse than no manifest at all, so this raises instead.
+_MANIFEST_MAX_BYTES = 65536
+
+
+class HandoffManifestTooLarge(ValueError):
+    """acf6f51a — raised by serialize_handoff_manifest_xml when the canonical
+    manifest exceeds _MANIFEST_MAX_BYTES. Fails closed like
+    HandoffStaleReferenceError/HandoffSelectionError above: nothing is
+    minted or persisted for a call that raises this. build_handoff_manifest
+    already bounds its own item list to max_items (default
+    _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS), so this should be unreachable in
+    practice; it exists as a hard backstop, not the primary size control.
+    """
+
+    def __init__(self, project_id: str, size_bytes: int):
+        self.project_id = project_id
+        self.size_bytes = size_bytes
+        self.code = "MANIFEST_TOO_LARGE"
+        super().__init__(
+            f"handoff manifest for project {project_id!r} serialized to "
+            f"{size_bytes} bytes, exceeding the {_MANIFEST_MAX_BYTES}-byte "
+            "bound. Refusing to truncate a body about to be hashed into a "
+            "goal token -- narrow the selected scope instead."
+        )
+
+
+def compute_board_revision(items: "list[dict[str, Any]]") -> str:
+    """acf6f51a — deterministic digest of the live board's identity as far
+    as a manifest is concerned: sorted ``(id, status, depends_on)`` triples,
+    hashed via the same ``_hash_goal_body``/canonical-JSON pattern
+    ``_resolve_selected_item_scope`` already uses for ``closure_hash``.
+    Deliberately narrow (not every column) so an unrelated field edit (e.g.
+    a note) doesn't spuriously invalidate a manifest a receiver is about to
+    compare against — only fields that change whether this handoff's item
+    list is still accurate are included.
+    """
+    rows = sorted(
+        (
+            str(it.get("id") or ""),
+            str(it.get("status") or ""),
+            str(it.get("depends_on") or ""),
+        )
+        for it in items
+    )
+    return _hash_goal_body(json.dumps(rows, sort_keys=True, separators=(",", ":")))
+
+
+def verify_board_revision(
+    current_items: "list[dict[str, Any]]", expected_revision: str,
+) -> bool:
+    """acf6f51a — pure equality check: does a live board (re-fetched by the
+    caller) still match the ``board_revision`` a manifest declared at
+    generation time? Used by a receiver to detect drift before acting on a
+    manifest-bound handoff; this function only computes the comparison — it
+    never fetches state or blocks anything itself.
+    """
+    return compute_board_revision(current_items) == expected_revision
+
+
+def _manifest_item_entry(item: "dict[str, Any]") -> "dict[str, Any]":
+    return {
+        "id": item.get("id"),
+        "title": item.get("title"),
+        "status": item.get("status"),
+        "depends_on": item.get("depends_on"),
+        "wave": item.get("wave"),
+        "resources": db_module.parse_touches_resources(item.get("touches_resources")),
+    }
+
+
+def build_handoff_manifest(
+    *,
+    handoff_mode: str,
+    project_id: str,
+    items: "list[dict[str, Any]]",
+    project_name: "str | None" = None,
+    sprint_version: "str | None" = None,
+    session_id: "str | None" = None,
+    origin_identity: "dict[str, Any] | None" = None,
+    generated_at: "str | None" = None,
+    selected_item_ids: "list[str] | None" = None,
+    closure_item_ids: "list[str] | None" = None,
+    waves: "list[list[dict[str, Any]]] | None" = None,
+    stop_conditions: "list[str] | None" = None,
+    deploy_policy: "dict[str, Any] | None" = None,
+    max_items: int = _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+) -> "dict[str, Any]":
+    """acf6f51a — assemble the canonical HandoffManifest as a plain dict with
+    a FIXED field order (mirrored exactly by serialize_handoff_manifest_xml).
+    Never independently authored from prose: every argument here is data the
+    caller already computed for its own human-readable render — see this
+    module's ``emit_manifest`` call site for the source of each one.
+
+    ``items`` is bounded to ``max_items`` (default
+    ``_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS`` — the same cap
+    ``_build_quick_start_goal`` already applies to the rendered /goal block):
+    the manifest never carries more items than the block it accompanies, and
+    truncation here is COUNTED (``items_truncated``/``items_total``), never
+    silent. ``board_revision`` is always computed over the FULL, unbounded
+    ``items`` list (never the truncated view) — a receiver comparing
+    ``board_revision`` against a fresh board fetch must see the same digest
+    a caller with the full board would compute.
+    """
+    ordered_items = list(items)
+    truncated = len(ordered_items) > max_items
+    if truncated:
+        ordered_items = ordered_items[:max_items]
+    return {
+        "schema_version": _MANIFEST_SCHEMA_VERSION,
+        "handoff_mode": handoff_mode,
+        "project_id": project_id,
+        "project_name": project_name,
+        "sprint_version": sprint_version,
+        "session_id": session_id,
+        "origin_identity": dict(origin_identity or {}),
+        "generated_at": generated_at
+        or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "board_revision": compute_board_revision(items),
+        "selected_item_ids": list(selected_item_ids or []),
+        "closure_item_ids": list(closure_item_ids or []),
+        "items": [_manifest_item_entry(it) for it in ordered_items],
+        "items_truncated": truncated,
+        "items_total": len(items),
+        "waves": waves or [],
+        "stop_conditions": list(stop_conditions or []),
+        "deploy_policy": dict(deploy_policy or {}),
+    }
+
+
+def serialize_handoff_manifest_xml(manifest: "dict[str, Any]") -> str:
+    """acf6f51a — deterministic canonical XML serialization of a manifest
+    dict built by ``build_handoff_manifest``. Fixed element order (mirrors
+    the dict's own construction order exactly); every text value passed
+    through ``_xml_escape``, matching every other XML-emitting helper in
+    this module. Raises ``HandoffManifestTooLarge`` instead of truncating —
+    see that class's docstring.
+    """
+
+    def esc(value: "Any") -> str:
+        # 75de5905 (adversarial gate) — must escape `"` too, not just
+        # &/</>: esc() is reused for BOTH element text AND attribute values
+        # below (item id=/status=/depends_on=/wave=, board_revision=,
+        # project_id=, etc.). A bare _xml_escape(str(value)) (the default
+        # entity map, &/</> only) left a literal `"` in an item's id/status/
+        # depends_on/wave free to break out of an attribute and inject an
+        # arbitrary forged attribute into the manifest — confirmed exploit:
+        # an id of 'item-0" evil="injected' serialized to
+        # `<item id="item-0" evil="injected" status="...">`. Every other
+        # attribute-emitting site in this file already passes this same
+        # {chr(34): "&quot;"} extra map (e.g. _build_execution_policy_clause,
+        # the plan_generation/profile_generation/sprint_type clauses) —
+        # &quot; in element text is equally valid XML, so using the same
+        # escape everywhere here (rather than a second attribute-only
+        # helper) is strictly safer with no behavioral cost.
+        return _xml_escape(str(value if value is not None else ""), {chr(34): "&quot;"})
+
+    parts: list[str] = [
+        "<handoff_manifest"
+        f' schema_version="{esc(manifest.get("schema_version"))}"'
+        f' handoff_mode="{esc(manifest.get("handoff_mode"))}"'
+        f' project_id="{esc(manifest.get("project_id"))}"'
+        f' board_revision="{esc(manifest.get("board_revision"))}"'
+        f' generated_at="{esc(manifest.get("generated_at"))}">',
+        f"<project_name>{esc(manifest.get('project_name'))}</project_name>",
+        f"<sprint_version>{esc(manifest.get('sprint_version'))}</sprint_version>",
+        f"<session_id>{esc(manifest.get('session_id'))}</session_id>",
+    ]
+    origin = manifest.get("origin_identity") or {}
+    parts.append("<origin_identity>")
+    for key in sorted(origin):
+        parts.append(f'<field name="{esc(key)}">{esc(origin[key])}</field>')
+    parts.append("</origin_identity>")
+    parts.append(
+        "<selected_item_ids>"
+        f'{esc(",".join(manifest.get("selected_item_ids") or []))}'
+        "</selected_item_ids>"
+    )
+    parts.append(
+        "<closure_item_ids>"
+        f'{esc(",".join(manifest.get("closure_item_ids") or []))}'
+        "</closure_item_ids>"
+    )
+    parts.append(
+        f'<items total="{esc(manifest.get("items_total"))}" '
+        f'truncated="{esc(bool(manifest.get("items_truncated")))}">'
+    )
+    for entry in manifest.get("items") or []:
+        parts.append(
+            f'<item id="{esc(entry.get("id"))}" status="{esc(entry.get("status"))}" '
+            f'depends_on="{esc(entry.get("depends_on"))}" wave="{esc(entry.get("wave"))}">'
+            f"<title>{esc(entry.get('title'))}</title>"
+            "<resources>"
+            + "".join(f"<resource>{esc(r)}</resource>" for r in entry.get("resources") or [])
+            + "</resources></item>"
+        )
+    parts.append("</items>")
+    parts.append("<waves>")
+    for wave_index, wave in enumerate(manifest.get("waves") or []):
+        wave_ids = (
+            [w.get("id") for w in wave if isinstance(w, dict)]
+            if isinstance(wave, list) else []
+        )
+        parts.append(
+            f'<wave index="{esc(wave_index)}" '
+            f'items="{esc(",".join(str(i) for i in wave_ids))}"/>'
+        )
+    parts.append("</waves>")
+    parts.append("<stop_conditions>")
+    for condition in manifest.get("stop_conditions") or []:
+        parts.append(f"<condition>{esc(condition)}</condition>")
+    parts.append("</stop_conditions>")
+    deploy = manifest.get("deploy_policy") or {}
+    parts.append("<deploy_policy>")
+    for key in sorted(deploy):
+        parts.append(f'<field name="{esc(key)}">{esc(deploy[key])}</field>')
+    parts.append("</deploy_policy>")
+    parts.append("</handoff_manifest>")
+
+    xml = "".join(parts)
+    size_bytes = len(xml.encode("utf-8"))
+    if size_bytes > _MANIFEST_MAX_BYTES:
+        raise HandoffManifestTooLarge(str(manifest.get("project_id")), size_bytes)
+    return xml
+
+
+async def mint_manifest_bound_token(
+    db: Any, project_id: str, manifest_xml: str,
+) -> str:
+    """acf6f51a — bind a genuine, verifiable goal token to the canonical
+    manifest XML's own hash, reusing the EXACT SAME body-hash mechanism
+    (``mint_handoff_token(body=...)`` / ``verify_handoff_token(presented_
+    body=...)``) already relied on throughout this module for every other
+    /goal token — no new token schema, no new verification path. A receiver
+    that has the raw manifest XML (e.g. extracted from the ``<handoff_
+    manifest>`` block a manifest-emitting handoff embeds) can verify it
+    independent of the full rendered /goal body.
+    """
+    return await mint_handoff_token(db, project_id, body=manifest_xml)
+
+
+# ---------------------------------------------------------------------------
+# 1bd5e810 — receiver-side manifest acceptance, connector parity, and
+# board-divergence diagnostics.
+#
+# accept_handoff_envelope() is the ONE canonical check every transport (MCP,
+# stdio, HTTP) calls — see the accept_handoff tool wiring in mcp_tools.py /
+# mcp/handler.py / mcp/stdio_handler.py / routes/handoff.py, all of which
+# route to this exact function so they cannot drift out of agreement (the
+# same "one shared implementation" contract load_handoff/verify_handoff_
+# token/record_handoff_correction already established — see f46372e8/
+# d0854621's comments in mcp/stdio_handler.py).
+#
+# Deliberately reuses existing, already-tested primitives instead of
+# reinventing board-staleness detection:
+#   - verify_handoff_token (dd07ece0/efaa918a) for token genuineness + the
+#     manifest/body's own hash binding.
+#   - compute_board_revision/verify_board_revision (acf6f51a) for the
+#     manifest's own narrower (id/status/depends_on) board_revision — NOT
+#     meridian.db.board_snapshot's richer 4-field revision_hash, which is a
+#     DIFFERENT hash over a different tracked-field set and would never
+#     match even on an unchanged board. board_snapshot.build_board_snapshot/
+#     diff_board_snapshots remains the right tool for a full human-readable
+#     resume delta (resume_wave, generate_handoff mode='delta') — this
+#     module intentionally does not duplicate that richer mechanism, only
+#     the manifest-specific one acf6f51a introduced.
+# ---------------------------------------------------------------------------
+
+ACCEPT_RESULT_OK = "ok"
+ACCEPT_RESULT_STALE_HANDOFF = "STALE_HANDOFF"
+ACCEPT_RESULT_BOARD_DIVERGENCE = "BOARD_DIVERGENCE"
+ACCEPT_RESULT_TOOL_MANIFEST_DRIFT = "TOOL_MANIFEST_DRIFT"
+ACCEPT_RESULT_BODY_HASH_MISMATCH = "BODY_HASH_MISMATCH"
+ACCEPT_RESULT_CAPABILITY_UNAVAILABLE = "CAPABILITY_UNAVAILABLE"
+
+# Token-check failure reasons that indicate simple staleness/a sibling
+# already having acted, per AGENTS.md's b763d2ba/ed71ef9b distinction —
+# bucketed under STALE_HANDOFF. `body_mismatch` is handled separately (maps
+# to ACCEPT_RESULT_BODY_HASH_MISMATCH, the one genuinely distinct code the
+# 5-way contract calls out). Every other reason (not_found/wrong_project —
+# REAL spoofing signals) is ALSO bucketed under STALE_HANDOFF here because
+# accept_handoff_envelope's 5-code contract has no separate "spoofed" bucket
+# — the raw token_check.reason sub-field is always preserved so a caller can
+# still recover the not_found/wrong_project-vs-already_consumed/expired
+# distinction AGENTS.md documents, even though the top-level `result` groups
+# them together as "do not execute this envelope".
+_STALE_TOKEN_REASONS = frozenset({"not_found", "wrong_project", "already_consumed", "expired"})
+
+
+def compute_required_tools_hash(items: "list[dict[str, Any]]") -> str:
+    """1bd5e810 — deterministic digest of the UNION of required tool names
+    across ``items``' own ``tool_requirements`` field (already present on
+    every sprint item — see the ``tool_requirements`` column/JSON shape used
+    throughout this project's sprint items). Mirrors compute_board_revision's
+    pattern exactly: sorted canonical JSON, hashed via _hash_goal_body.
+
+    Used to detect TOOL_MANIFEST_DRIFT: a handoff minted when item X required
+    tools {A, B} is no longer accurately described if X's tool_requirements
+    were edited to {A, C} before a receiver acts on it — even though every
+    individual tool might still independently resolve, the DECLARED
+    contract drifted. A caller captures this hash at generation time and
+    compares it against a fresh call at acceptance time via
+    accept_handoff_envelope's expected_required_tools_hash parameter.
+    """
+    names: set[str] = set()
+    for item in items:
+        raw = item.get("tool_requirements")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001 — malformed stored JSON degrades to "no requirements"
+                raw = None
+        if isinstance(raw, list):
+            for entry in raw:
+                if isinstance(entry, dict) and entry.get("name"):
+                    names.add(str(entry["name"]))
+    return _hash_goal_body(json.dumps(sorted(names), sort_keys=True, separators=(",", ":")))
+
+
+async def accept_handoff_envelope(
+    db: Any,
+    project_id: str,
+    *,
+    goal_token: "str | None" = None,
+    presented_body: "str | None" = None,
+    live_items: "list[dict[str, Any]] | None" = None,
+    expected_board_revision: "str | None" = None,
+    expected_required_tools_hash: "str | None" = None,
+    required_tools: "list[str] | None" = None,
+    available_tools: "list[str] | None" = None,
+) -> "dict[str, Any]":
+    """1bd5e810 — canonical receiver-side acceptance check for a handoff
+    envelope (a pasted /goal block, a manifest-bound token, or both).
+
+    Every parameter is optional and independently gated — a caller supplies
+    whatever it has; a check is skipped (never fails) when its inputs are
+    absent, matching this module's established best-effort/purely-additive
+    convention. Checks run in this fixed precedence order, short-circuiting
+    on the first failure (mirrors handle_resume_wave's own "token check
+    BEFORE board check" ordering — no point reporting board divergence for
+    an envelope whose provenance doesn't even check out):
+
+    1. **Token genuineness** (``goal_token``/``presented_body``) — delegates
+       to :func:`verify_handoff_token`. A ``body_mismatch`` maps to
+       ``ACCEPT_RESULT_BODY_HASH_MISMATCH``; every other invalid reason
+       (``not_found``/``wrong_project``/``already_consumed``/``expired``)
+       maps to ``ACCEPT_RESULT_STALE_HANDOFF`` — see ``_STALE_TOKEN_REASONS``
+       for why these are grouped despite AGENTS.md drawing a real
+       spoofing-vs-staleness distinction between them (the raw
+       ``token_check.reason`` is always preserved in the response).
+    2. **Capability availability** (``required_tools``/``available_tools``)
+       — any name in ``required_tools`` absent from ``available_tools``
+       (when both are given) is ``ACCEPT_RESULT_CAPABILITY_UNAVAILABLE``.
+    3. **Tool-manifest drift** (``expected_required_tools_hash`` vs a hash
+       computed from ``live_items``) — see :func:`compute_required_tools_hash`.
+       Mismatch is ``ACCEPT_RESULT_TOOL_MANIFEST_DRIFT``.
+    4. **Board revision** (``expected_board_revision`` vs
+       :func:`compute_board_revision` of ``live_items``) — mismatch is
+       ``ACCEPT_RESULT_BOARD_DIVERGENCE``.
+
+    Returns ``ACCEPT_RESULT_OK`` (``accepted: True``) when every supplied
+    check passes (or every check was skipped because its inputs were
+    absent — an envelope with NO checkable inputs at all is accepted, same
+    as calling this function with everything omitted being a no-op; callers
+    that want a hard guarantee must supply the corresponding inputs).
+
+    ``live_items`` is a caller-fetched ``get_sprint_items(...)`` result — this
+    function never queries the DB for board state itself, so a caller
+    controls exactly which project/version/status filter "live" means (the
+    same filter used when the compared handoff/manifest was generated).
+    This mirrors :func:`verify_board_revision`'s own "pure comparison, no
+    fetch" contract.
+
+    Deliberately does NOT compare tenant/project identity as a separate
+    check: when ``goal_token`` is supplied, ``verify_handoff_token``'s own
+    ``project_id`` scoping already fails closed (``wrong_project``, bucketed
+    into ``ACCEPT_RESULT_STALE_HANDOFF`` above) — a caller always passes its
+    OWN receiving project_id here, so a mismatch is inherently caught by
+    that existing check rather than needing a second, redundant comparison.
+
+    Scope note: this function VALIDATES and REPORTS; it is deliberately NOT
+    wired as a hard gate inside claim_sprint_item in this pass (that would
+    be a materially larger, riskier change to a heavily-used claim path) —
+    see this item's completion evidence for the explicit scope decision.
+    """
+    token_check: "dict[str, Any] | None" = None
+    if goal_token:
+        token_check = await verify_handoff_token(
+            db, goal_token, project_id, body=presented_body,
+        )
+        if not token_check.get("valid"):
+            reason = token_check.get("reason", "")
+            result = (
+                ACCEPT_RESULT_BODY_HASH_MISMATCH if reason == "body_mismatch"
+                else ACCEPT_RESULT_STALE_HANDOFF
+            )
+            return {
+                "accepted": False,
+                "result": result,
+                "reasons": [f"handoff token verification failed: reason={reason!r}"],
+                "token_check": token_check,
+                "capability_check": None,
+                "tool_manifest_check": None,
+                "board_check": None,
+            }
+
+    capability_check: "dict[str, Any] | None" = None
+    if required_tools and available_tools is not None:
+        missing = sorted(set(required_tools) - set(available_tools))
+        capability_check = {
+            "required_tools": sorted(set(required_tools)),
+            "available_tools": sorted(set(available_tools)),
+            "missing_tools": missing,
+        }
+        if missing:
+            return {
+                "accepted": False,
+                "result": ACCEPT_RESULT_CAPABILITY_UNAVAILABLE,
+                "reasons": [f"required tool(s) unavailable: {', '.join(missing)}"],
+                "token_check": token_check,
+                "capability_check": capability_check,
+                "tool_manifest_check": None,
+                "board_check": None,
+            }
+
+    tool_manifest_check: "dict[str, Any] | None" = None
+    if expected_required_tools_hash and live_items is not None:
+        live_hash = compute_required_tools_hash(live_items)
+        tool_manifest_check = {
+            "expected_required_tools_hash": expected_required_tools_hash,
+            "live_required_tools_hash": live_hash,
+            "matches": live_hash == expected_required_tools_hash,
+        }
+        if not tool_manifest_check["matches"]:
+            return {
+                "accepted": False,
+                "result": ACCEPT_RESULT_TOOL_MANIFEST_DRIFT,
+                "reasons": [
+                    "declared tool_requirements across the handoff's items "
+                    "changed since this envelope was generated"
+                ],
+                "token_check": token_check,
+                "capability_check": capability_check,
+                "tool_manifest_check": tool_manifest_check,
+                "board_check": None,
+            }
+
+    board_check: "dict[str, Any] | None" = None
+    if expected_board_revision and live_items is not None:
+        live_revision = compute_board_revision(live_items)
+        board_check = {
+            "expected_board_revision": expected_board_revision,
+            "live_board_revision": live_revision,
+            "matches": live_revision == expected_board_revision,
+        }
+        if not board_check["matches"]:
+            return {
+                "accepted": False,
+                "result": ACCEPT_RESULT_BOARD_DIVERGENCE,
+                "reasons": [
+                    "the live board's item id/status/depends_on state no "
+                    "longer matches this envelope's declared board_revision"
+                ],
+                "token_check": token_check,
+                "capability_check": capability_check,
+                "tool_manifest_check": tool_manifest_check,
+                "board_check": board_check,
+            }
+
+    return {
+        "accepted": True,
+        "result": ACCEPT_RESULT_OK,
+        "reasons": [],
+        "token_check": token_check,
+        "capability_check": capability_check,
+        "tool_manifest_check": tool_manifest_check,
+        "board_check": board_check,
+    }
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -8489,8 +9002,22 @@ async def generate_handoff(
     strict_test_evidence: bool = False,
     test_run_evidence: dict[str, Any] | None = None,
     test_run_repo_root: "str | None" = None,
+    emit_manifest: bool = False,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
+
+    ``emit_manifest`` (acf6f51a) — opt-in, defaults to False (zero behaviour
+    change for every existing caller). Currently wired for ``mode="goal"``
+    only: when True, a canonical ``<handoff_manifest>`` XML block (see
+    ``build_handoff_manifest``/``serialize_handoff_manifest_xml`` above) is
+    spliced into the rendered ``quick_start_goal`` BEFORE the existing
+    ``_mint_and_embed_goal_token`` call, so the manifest is covered by the
+    same ``body_hash``/``verify_handoff_token(presented_body=...)`` check
+    every other part of the /goal block already relies on — no new
+    verification path for a receiver to learn. A caller wanting the same
+    guarantee for ``full``/``delta``/``starter``/``compact`` should build on
+    the same primitives directly; this first pass intentionally covers one
+    mode end-to-end rather than four modes partially.
 
     Returns ``(path, content, amended)`` where ``path`` is the absolute path to
     the rendered file on disk and ``amended`` is True when the prior handoff was
@@ -8902,6 +9429,7 @@ async def generate_handoff(
             strict_pointer_evidence=strict_pointer_evidence,
             force_include_rejected=force_include_rejected,
             selected_scope=_selected_scope,
+            emit_manifest=emit_manifest,
         )
         return (
             _g_path,
@@ -10286,6 +10814,7 @@ async def _generate_goal_only_handoff(
     strict_pointer_evidence: bool = False,
     force_include_rejected: "list[dict[str, Any]] | None" = None,
     selected_scope: "dict[str, Any] | None" = None,
+    emit_manifest: bool = False,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
 
@@ -10577,6 +11106,28 @@ async def _generate_goal_only_handoff(
             project_id,
             _g_selected_scope_outcome.get("requested_ids") or [],
             _g_selected_scope_outcome.get("excluded_requested") or [],
+        )
+    # acf6f51a — opt-in canonical manifest. Built entirely from data this
+    # function already computed for its own render (pending_sprint_items,
+    # selected_scope, _parallel_groups, project) — never independently
+    # authored. Spliced into quick_start_goal BEFORE the token mint below so
+    # the existing body_hash mechanism covers it too; raises
+    # HandoffManifestTooLarge (fail closed, same convention as
+    # HandoffScopeNonExecutable just above) rather than truncating.
+    if emit_manifest:
+        _g_manifest = build_handoff_manifest(
+            handoff_mode="goal",
+            project_id=project_id,
+            items=pending_sprint_items,
+            project_name=project.get("name"),
+            sprint_version=version,
+            origin_identity=resolve_origin_identity(project),
+            selected_item_ids=(selected_scope or {}).get("selected_item_ids"),
+            closure_item_ids=(selected_scope or {}).get("closure_item_ids"),
+            waves=(_parallel_groups or {}).get("groups"),
+        )
+        quick_start_goal = (
+            f"{quick_start_goal}\n{serialize_handoff_manifest_xml(_g_manifest)}"
         )
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.

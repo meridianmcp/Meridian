@@ -431,7 +431,8 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "strict_evidence": {"type": "boolean", "description": "(8a883f60) Opt-in, off by default — mirrors complete_sprint_item's strict_evidence shape exactly. When true, a failed/degraded pointer-enrichment/freshness/wave-gate/graph-search capability makes this call refuse to render or persist a handoff at all, returning {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, evidence_errors, message} instead. Leave false/omitted for today's graceful-degrade behavior (handoff_evidence_status is still returned either way)."},
          "strict_pointer_evidence": {"type": "boolean", "description": "(eb8b6894) Opt-in, off by default, separate from strict_evidence above. When true, the claimable/goal batch's UNPROSPECTED exclusion requires a pending item's durable pointer(s) to have actually RESOLVED (resolve_pointer succeeded), not merely be PRESENT as a row — a structurally-valid-but-unresolved pointer no longer silently satisfies the gate. Never raises/blocks the whole handoff (unlike strict_evidence): an affected item is simply excluded from the claimable batch, the same way today's presence-only UNPROSPECTED gate already excludes items. Every pending item's pointer_resolution_status (structural_valid/target_resolved/provenance_verified/resolution_source/strict_satisfied) is always returned regardless of this flag — it only changes which items make the claimable cut."},
          "checkpoint": {"type": "boolean", "description": "(ecc8b280) Mark THIS call as a mid-run progress report rather than a final, session-ending handoff. Applies to full/delta modes only. A checkpoint=true call is never refused by strict_continuation below, regardless of how much actionable work remains — it changes nothing about what gets rendered, only whether the continuation gate can engage."},
-         "strict_continuation": {"type": "boolean", "description": "(ecc8b280) Opt-in, off by default — mirrors strict_evidence's shape. When true and checkpoint is not set, refuses to render/persist this handoff (full/delta modes only) if actionable pending/in_progress items remain on the live board with no recorded blocker_kind while execution_mode=autonomous, returning {error: HANDOFF_CONTINUATION_BLOCKED, continuation_status, message} instead. Leave false/omitted for today's behavior (continuation_status is still always returned either way)."}},
+         "strict_continuation": {"type": "boolean", "description": "(ecc8b280) Opt-in, off by default — mirrors strict_evidence's shape. When true and checkpoint is not set, refuses to render/persist this handoff (full/delta modes only) if actionable pending/in_progress items remain on the live board with no recorded blocker_kind while execution_mode=autonomous, returning {error: HANDOFF_CONTINUATION_BLOCKED, continuation_status, message} instead. Leave false/omitted for today's behavior (continuation_status is still always returned either way)."},
+         "emit_manifest": {"type": "boolean", "description": "(acf6f51a) Opt-in, off by default. mode='goal' only (for now): when true, embeds a canonical <handoff_manifest> XML block — schema_version, board_revision (a deterministic digest of every item's id/status/depends_on), project/tenant origin identity, generated_at, the selected/closure item ids, the full item id/status/depends_on/resources list, and the wave plan — into the rendered /goal text BEFORE the goal token is minted, so verify_handoff_token's existing body_hash check also covers the manifest; no separate verification path. A receiver re-fetches the live board and compares against board_revision (see handoff.verify_board_revision) to detect drift before acting. Other modes are unaffected by this flag for now."}},
          "required": []}},
     {"name": "load_handoff", "description":
         "Read-only: Return the latest stored handoff for a project as an MCP tool "
@@ -477,6 +478,51 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "presented_body": {"type": "string",
              "description": "Optional: the full pasted /goal block (token + SECURITY banner included) to check against the token's stored body_hash, if any. Closes the 2ee0000c body-integrity gap — see description."}},
          "required": ["token"]}},
+    {"name": "accept_handoff", "description":
+        "Read-only: (1bd5e810) Canonical receiver-side acceptance check for a handoff "
+        "envelope — composes token verification, capability/tool availability, "
+        "tool-manifest drift, and board-revision divergence into ONE structured "
+        "verdict, so MCP/HTTP/stdio all produce identical results for identical "
+        "input (same underlying meridian.handoff.accept_handoff_envelope every "
+        "transport calls). Every input is optional and independently gated — supply "
+        "whatever you have; an omitted check is skipped, never failed. "
+        "Returns {accepted: bool, result: 'ok'|'STALE_HANDOFF'|'BOARD_DIVERGENCE'|"
+        "'TOOL_MANIFEST_DRIFT'|'BODY_HASH_MISMATCH'|'CAPABILITY_UNAVAILABLE', "
+        "reasons: [str], token_check, capability_check, tool_manifest_check, "
+        "board_check}. Checks run in this order, short-circuiting on first failure: "
+        "(1) token — token/presented_body via the same verify_handoff_token check; "
+        "a body_mismatch reason maps to BODY_HASH_MISMATCH, every other invalid "
+        "reason (not_found/wrong_project/already_consumed/expired) maps to "
+        "STALE_HANDOFF — the raw token_check.reason sub-field always preserves "
+        "which one, since AGENTS.md treats not_found/wrong_project as real spoofing "
+        "signals and already_consumed/expired as usually just a sibling session "
+        "having already acted. (2) capability — required_tools vs available_tools: "
+        "any required name missing from available_tools is CAPABILITY_UNAVAILABLE. "
+        "(3) tool-manifest drift — expected_required_tools_hash vs a hash computed "
+        "live from live_items' own tool_requirements fields (see "
+        "meridian.handoff.compute_required_tools_hash): mismatch is "
+        "TOOL_MANIFEST_DRIFT. (4) board revision — expected_board_revision "
+        "(acf6f51a's manifest <handoff_manifest board_revision=...>) vs a hash "
+        "computed live from live_items via meridian.handoff.compute_board_revision: "
+        "mismatch is BOARD_DIVERGENCE. live_items is YOUR OWN get_sprint_items(...) "
+        "result — this tool never queries the board itself, so you control exactly "
+        "which project/version/status filter \"live\" means; pass the same filter "
+        "used when the compared handoff/manifest was generated. "
+        "Deliberately does not check project/tenant identity separately: when "
+        "token is supplied, verify_handoff_token's own project_id scoping already "
+        "fails closed into STALE_HANDOFF on a mismatch. "
+        "Scope note: this is a validation/report tool, not a hard gate — it is not "
+        "wired into claim_sprint_item in this pass.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "goal_token": {"type": "string", "description": "Optional: the token value from the <goal_token>…</goal_token> line in the /goal block being accepted."},
+         "presented_body": {"type": "string", "description": "Optional: the full pasted /goal block (token + SECURITY banner included), checked against the token's stored body_hash — same contract as verify_handoff_token's presented_body."},
+         "live_items": {"type": "array", "items": {"type": "object"}, "description": "Optional: your own get_sprint_items(...) result (the exact items/filter the compared handoff/manifest was generated from) — required for the tool-manifest-drift and board-revision checks; omit to skip both."},
+         "expected_board_revision": {"type": "string", "description": "Optional: the board_revision value from a manifest's <handoff_manifest board_revision=\"...\"> attribute, or any prior meridian.handoff.compute_board_revision(...) result to compare live_items against."},
+         "expected_required_tools_hash": {"type": "string", "description": "Optional: a prior meridian.handoff.compute_required_tools_hash(...) result to compare against live_items' current tool_requirements."},
+         "required_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names the handoff declared as required. Paired with available_tools to detect CAPABILITY_UNAVAILABLE."},
+         "available_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names actually available to you right now (e.g. from a live tools/list). Paired with required_tools."}},
+         "required": []}},
     {"name": "record_handoff_correction", "description":
         "3af86d28 — record a corrective handoff when a blocked executor session "
         "reaches a wall after receiving a handoff (its evidence/scope no longer "

@@ -3110,6 +3110,9 @@ async def _handle_task_tools(
         _checkpoint = bool(args.get("checkpoint"))
         _strict_continuation = bool(args.get("strict_continuation"))
         _continuation_status: dict[str, Any] = {}
+        # acf6f51a — opt-in, off by default; see generate_handoff's own
+        # emit_manifest docstring. Currently only mode="goal" acts on this.
+        _emit_manifest = bool(args.get("emit_manifest"))
         try:
             path, content, _handoff_amended = await asyncio.wait_for(
                 handoff_module_local.generate_handoff(
@@ -3133,6 +3136,7 @@ async def _handle_task_tools(
                     checkpoint=_checkpoint,
                     strict_continuation=_strict_continuation,
                     continuation_status=_continuation_status,
+                    emit_manifest=_emit_manifest,
                 ),
                 # 65c8b426 — Part 2: raised from 90s to 180s as a secondary safety
                 # margin. The real fix (skip_ai_summary=True default) eliminates the
@@ -3222,6 +3226,17 @@ async def _handle_task_tools(
                     "Resolve each stale depends_on (retarget or clear it via "
                     "update_sprint_item) and retry."
                 ),
+            }
+        except handoff_module_local.HandoffManifestTooLarge as exc:
+            # acf6f51a — emit_manifest=True and the canonical manifest
+            # exceeded its byte bound: fail CLOSED rather than truncate a
+            # body about to be hashed into a goal token. Nothing was
+            # rendered/written/persisted for this call.
+            return {
+                "error": "MANIFEST_TOO_LARGE",
+                "project_id": exc.project_id,
+                "size_bytes": exc.size_bytes,
+                "message": str(exc),
             }
         except asyncio.TimeoutError:
             path, content = await handoff_module_local._generate_handoff_l0(
@@ -3597,6 +3612,30 @@ async def _handle_task_tools(
         )
         return await handoff_module_local.verify_handoff_token(
             db, _token, _pid, body=_body_for_check
+        )
+    if name == "accept_handoff":
+        # 1bd5e810 — canonical receiver-side acceptance check, shared by
+        # MCP/stdio/HTTP (see meridian.handoff.accept_handoff_envelope's own
+        # docstring for the full precedence contract). Every input is
+        # optional; this handler just forwards args through unchanged.
+        from .. import handoff as handoff_module_local  # noqa: PLC0415
+        _ah_presented_body = args.get("presented_body")
+        _ah_body_for_check = (
+            handoff_module_local.strip_goal_token_banner(_ah_presented_body)
+            if isinstance(_ah_presented_body, str)
+            else None
+        )
+        _ah_live_items = args.get("live_items")
+        return await handoff_module_local.accept_handoff_envelope(
+            db,
+            args.get("project_id") or "",
+            goal_token=args.get("goal_token"),
+            presented_body=_ah_body_for_check,
+            live_items=_ah_live_items if isinstance(_ah_live_items, list) else None,
+            expected_board_revision=args.get("expected_board_revision"),
+            expected_required_tools_hash=args.get("expected_required_tools_hash"),
+            required_tools=args.get("required_tools"),
+            available_tools=args.get("available_tools"),
         )
     if name == "export_ai_log":
         # c0168425 — implementation follow-up to ea972129's design: read-only,

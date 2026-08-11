@@ -838,3 +838,40 @@ def test_describe_required_checks_resolves_only_true_flags():
     assert result["declared"] is True
     assert set(result["required"]) == {"outputs_provenance_check_required"}
     assert "meridian-outputs" in result["required"]["outputs_provenance_check_required"]
+
+
+def test_word_com_render_check_reference_is_real_and_timeout_aware(tmp_path):
+    """75de5905 (adversarial gate) — RECIPE_CHECK_REGISTRY's
+    word_com_render_check_required entry names render_gate.
+    check_word_com_render_receipt by string; this proves that reference is
+    not just a string but a REAL, importable, callable function whose
+    result genuinely distinguishes a Word/COM TIMEOUT from other failure
+    classes (detail.timed_out), rather than collapsing every failure into
+    one undifferentiated bucket. Robust across platforms/CI runners:
+    asserts the three-state contract and the timed_out diagnostic's
+    presence, never a fixed outcome (a real Word/COM environment and a
+    Word-less Linux CI runner legitimately produce different statuses)."""
+    # Same guarded sys.path pattern tests/test_meridian_docs_equations.py
+    # already establishes for importing the extension package directly.
+    import os as _os
+    import sys as _sys
+
+    _ext_path = _os.path.abspath(
+        _os.path.join(_os.path.dirname(__file__), "..", "extensions", "meridian-docs")
+    )
+    if _ext_path not in _sys.path:
+        _sys.path.insert(0, _ext_path)
+    from meridian_docs.render_gate import check_word_com_render_receipt  # noqa: PLC0415
+
+    target = tmp_path / "not-a-real-docx.docx"
+    target.write_bytes(b"stub content, not a real OOXML package")
+
+    result = check_word_com_render_receipt(str(target))
+    assert result["status"] in ("rendered", "unavailable-with-reason", "failed")
+    if result["status"] == "failed":
+        # The exact field describe_required_checks's registry entry implies
+        # exists: a receiver can tell "this specific attempt timed out" from
+        # "this failed for some other reason" without guessing.
+        detail = result.get("detail") or {}
+        assert "timed_out" in detail
+        assert isinstance(detail["timed_out"], bool)

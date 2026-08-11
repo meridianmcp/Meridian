@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Meridian exposes **175 tools** over MCP.
+Meridian exposes **176 tools** over MCP.
 
 They fall into two usage patterns:
 
@@ -472,6 +472,7 @@ Read-only: Generate a context handoff document. `mode='full'` writes the complet
 | `strict_pointer_evidence` | boolean | optional | (eb8b6894) Opt-in, off by default, separate from strict_evidence above. When true, the claimable/goal batch's UNPROSPECTED exclusion requires a pending item's durable pointer(s) to have actually RESOLVED (resolve_pointer succeeded), not merely be PRESENT as a row — a structurally-valid-but-unresolved pointer no longer silently satisfies the gate. Never raises/blocks the whole handoff (unlike strict_evidence): an affected item is simply excluded from the claimable batch, the same way today's presence-only UNPROSPECTED gate already excludes items. Every pending item's pointer_resolution_status (structural_valid/target_resolved/provenance_verified/resolution_source/strict_satisfied) is always returned regardless of this flag — it only changes which items make the claimable cut. |
 | `checkpoint` | boolean | optional | (ecc8b280) Mark THIS call as a mid-run progress report rather than a final, session-ending handoff. Applies to full/delta modes only. A checkpoint=true call is never refused by strict_continuation below, regardless of how much actionable work remains — it changes nothing about what gets rendered, only whether the continuation gate can engage. |
 | `strict_continuation` | boolean | optional | (ecc8b280) Opt-in, off by default — mirrors strict_evidence's shape. When true and checkpoint is not set, refuses to render/persist this handoff (full/delta modes only) if actionable pending/in_progress items remain on the live board with no recorded blocker_kind while execution_mode=autonomous, returning {error: HANDOFF_CONTINUATION_BLOCKED, continuation_status, message} instead. Leave false/omitted for today's behavior (continuation_status is still always returned either way). |
+| `emit_manifest` | boolean | optional | (acf6f51a) Opt-in, off by default. mode='goal' only (for now): when true, embeds a canonical <handoff_manifest> XML block — schema_version, board_revision (a deterministic digest of every item's id/status/depends_on), project/tenant origin identity, generated_at, the selected/closure item ids, the full item id/status/depends_on/resources list, and the wave plan — into the rendered /goal text BEFORE the goal token is minted, so verify_handoff_token's existing body_hash check also covers the manifest; no separate verification path. A receiver re-fetches the live board and compares against board_revision (see handoff.verify_board_revision) to detect drift before acting. Other modes are unaffected by this flag for now. |
 
 **Example:**
 ```

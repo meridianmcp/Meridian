@@ -605,6 +605,14 @@ def build_mcp_server():
             # call_tool()'s final "unknown tool" branch. Same _shared_tool()
             # schema-parity guarantee as load_handoff/verify_handoff_token.
             _shared_tool("record_handoff_correction"),
+            # 1bd5e810 — same _shared_tool() schema-parity guarantee as the
+            # three tools above: accept_handoff is implemented once
+            # (meridian.handoff.accept_handoff_envelope, dispatched from
+            # mcp/handler.py's _handle_task_tools) and routed through
+            # _dispatch_mcp_tool below, exactly like verify_handoff_token, so
+            # this transport can never advertise or execute a divergent
+            # implementation.
+            _shared_tool("accept_handoff"),
             Tool(
                 name="get_context_block",
                 description=(
@@ -2477,12 +2485,13 @@ def build_mcp_server():
                 )
             elif name in (
                 "load_handoff", "verify_handoff_token",
-                "record_handoff_correction",
+                "record_handoff_correction", "accept_handoff",
             ):
                 # f46372e8 (load_handoff/verify_handoff_token) + d0854621
-                # (record_handoff_correction) — these were advertised nowhere
-                # and dispatched nowhere on the stdio transport (see the
-                # list_tools() comment above _shared_tool("load_handoff"));
+                # (record_handoff_correction) + 1bd5e810 (accept_handoff) —
+                # these were advertised nowhere and dispatched nowhere on the
+                # stdio transport (see the list_tools() comment above
+                # _shared_tool("load_handoff"));
                 # route through the same _dispatch_mcp_tool -> _handle_task_tools
                 # path the HTTP MCP transport uses so all three transports
                 # share one implementation and can't drift out of sync with
