@@ -916,6 +916,38 @@ async def test_complete_sprint_item_handler_direct(db, project, session):
 
 
 @pytest.mark.asyncio
+async def test_complete_sprint_item_handler_bounds_post_commit_advisories(
+    db, project, session, monkeypatch
+):
+    """A slow post-commit advisory cannot hold completion past its budget."""
+    pid = project["id"]
+    sid = session["id"]
+    item = await db_module.add_sprint_item(
+        db, pid, "v1", "Bounded completion advisory"
+    )
+    await db_module.claim_sprint_item(db, pid, item["id"])
+
+    async def _slow_board_change(*_args, **_kwargs):
+        await asyncio.sleep(1.0)
+
+    monkeypatch.setattr(mh, "_board_change_for_session", _slow_board_change)
+    monkeypatch.setattr(st_mod, "_COMPLETION_ADVISORY_TIMEOUT_S", 0.05)
+
+    result = await asyncio.wait_for(
+        st_mod.handle_complete_sprint_item(
+            {"project_id": pid, "item_id": item["id"], "session_id": sid},
+            db, _DATA_DIR, None, None,
+        ),
+        timeout=0.5,
+    )
+
+    assert result["status"] == "done"
+    assert result["advisory_work_deferred"] is True
+    deferred = {d["name"] for d in result["advisory_diagnostics"]}
+    assert "board_change" in deferred
+
+
+@pytest.mark.asyncio
 async def test_complete_sprint_item_evidence_required(db, project):
     """complete_sprint_item with required_notes set must return EVIDENCE_REQUIRED."""
     pid = project["id"]
