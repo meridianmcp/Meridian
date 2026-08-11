@@ -1698,13 +1698,14 @@ async def handle_audit_figure_table_provenance(
                 entry["generating_script"] = resolved.get("generating_script")
                 entry["sha256"] = resolved.get("sha256")
                 candidate_count = resolved.get("candidate_count", 1)
-                authoritative = resolved.get("match_type") == "exact" or (
-                    resolved.get("match_type") == "basename" and candidate_count <= 1
-                )
-                if not authoritative:
-                    entry["status"] = "ambiguous"
-                    entry["reason"] = "ambiguous-basename-match"
+                if resolved.get("match_type") != "exact":
                     entry["candidate_count"] = candidate_count
+                    if candidate_count > 1:
+                        entry["status"] = "ambiguous"
+                        entry["reason"] = "ambiguous-basename-match"
+                    else:
+                        entry["status"] = "unresolved"
+                        entry["reason"] = "basename-match-not-authoritative"
                 else:
                     staleness = check_embedded_staleness(
                         "figure", source_path=file_path, embed_sha256=resolved.get("sha256"),

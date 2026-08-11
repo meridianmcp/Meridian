@@ -186,7 +186,7 @@ class TestExactTier:
 
 class TestBasenameTier:
     @duckdb_required
-    def test_relocated_unambiguous_basename_match_is_resolved(
+    def test_relocated_unambiguous_basename_match_is_not_authoritative(
         self, tmp_path: Path,
     ) -> None:
         real_dir = tmp_path / "outputs_run_17"
@@ -201,11 +201,12 @@ class TestBasenameTier:
                 "canonical_path": relocated_path,
             }],
         )
-        assert result["all_clear"] is True
+        assert result["all_clear"] is False
         binding = result["bindings"][0]
-        assert binding["status"] == PV.RESOLVED
+        assert binding["status"] == PV.UNRESOLVED
         assert binding["match_type"] == "basename"
-        assert binding["evidence"] == "meridian_outputs_basename"
+        assert binding["evidence"] == "meridian_outputs_basename_non_authoritative"
+        assert binding["reason"]
         assert binding["resolved_sha256"] is None
 
     @duckdb_required
@@ -248,7 +249,7 @@ class TestBasenameTier:
         assert result["all_clear"] is False
         binding = result["bindings"][0]
         assert binding["status"] == PV.UNRESOLVED
-        assert binding["evidence"] == "meridian_outputs_basename"
+        assert binding["evidence"] == "meridian_outputs_basename_non_authoritative"
 
 
 # ---------------------------------------------------------------------------

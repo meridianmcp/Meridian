@@ -374,6 +374,24 @@ def test_check_promotion_source_freshness_unresolved_when_not_indexed(tmp_path):
     assert result["fresh"] is None
 
 
+def test_check_promotion_source_freshness_basename_fallback_is_not_authoritative(tmp_path):
+    """A relocated source may be a useful hint, but cannot authorize promotion."""
+    outputs_dir = tmp_path / "outputs"
+    outputs_dir.mkdir()
+    actual = outputs_dir / "run" / "figure.png"
+    actual.parent.mkdir()
+    actual.write_bytes(b"figure bytes")
+    relocated = tmp_path / "docs_media" / "figure.png"
+
+    result = outputs_indexer_module.check_promotion_source_freshness(
+        str(outputs_dir), str(relocated), expected_sha256="a" * 64,
+    )
+    assert result["resolved"] is False
+    assert result["match_type"] == "basename"
+    assert result["fresh"] is None
+    assert "basename" in result["reason"]
+
+
 def test_check_promotion_source_freshness_no_expected_hash_is_unconfirmed(tmp_path):
     """Resolving with no expected_sha256 supplied is 'cannot confirm', never
     silently treated as fresh."""

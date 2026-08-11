@@ -1672,6 +1672,19 @@ def check_promotion_source_freshness(
                 "freshness cannot be verified"
             ),
         }
+    if resolved.get("match_type") != "exact":
+        return {
+            "resolved": False,
+            "match_type": resolved.get("match_type"),
+            "fresh": None,
+            "expected_sha256": expected_sha256,
+            "current_sha256": None,
+            "reason": (
+                "source output was found only by basename/label fallback -- "
+                "that diagnostic match cannot establish exact provenance "
+                "for a promotion"
+            ),
+        }
     current_sha256 = _sha256_file(resolved.get("path") or source_output_path)
     if expected_sha256 is None:
         return {
