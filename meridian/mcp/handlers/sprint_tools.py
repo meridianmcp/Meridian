@@ -750,12 +750,27 @@ async def handle_get_parallelizable_groups(
     # sequential group now, but the orchestrator should know parallel safety
     # couldn't be proven for them.
     _und = _grp.get("undeclared_count", 0)
+    _warnings: list[str] = []
     if _und:
-        _grp["warning"] = (
+        _warnings.append(
             f"{_und} item(s) lack resource declarations — parallel safety not "
             "guaranteed; each is scheduled in its own sequential group. Add "
             "touches_resources to let them parallelize."
         )
+    # b4102313 — resource_blocked items are already excluded from `groups`
+    # (see get_parallelizable_groups' own docstring); surface a summary here
+    # too so a caller reading just this tool's warning field, not the full
+    # resource_blocked list, still learns capacity is temporarily reduced by
+    # live locks rather than genuine lack of work.
+    _res_blocked = _grp.get("resource_blocked_count", 0)
+    if _res_blocked:
+        _warnings.append(
+            f"{_res_blocked} item(s) excluded from groups: a live, non-stale "
+            "session already holds a resource they declare. See "
+            "resource_blocked for holder/retry details."
+        )
+    if _warnings:
+        _grp["warning"] = " ".join(_warnings)
     return _grp
 
 

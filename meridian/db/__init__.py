@@ -12216,6 +12216,11 @@ from .sprint_items import (  # noqa: F401
     # also called directly by tests.
     _predict_resource_granularity,
     _is_legacy_file_symbol_shorthand,
+    # 1b264ce3 — coarse resource-declaration audit + safe repair, also
+    # called directly by tests.
+    _self_contradictory_file_resources,
+    diagnose_resource_coarseness,
+    repair_resource_granularity,
     # 704edefe — reservation/integration-queue manifest helpers, also called
     # directly by tests.
     _classify_verifier_class,

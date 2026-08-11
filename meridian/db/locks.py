@@ -930,7 +930,7 @@ def _ranges_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
 async def _live_symbol_claims_for_file(
     db: aiosqlite.Connection,
     file_path: str,
-    exclude_session_id: str,
+    exclude_session_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Symbol claims on ``file_path`` held by *other* still-live sessions.
 
@@ -938,18 +938,31 @@ async def _live_symbol_claims_for_file(
     staleness cutoff instead of a hardcoded 10-minute window, so both expiry
     mechanisms share the same constant. A crashed session's claims time out after
     _CLAIM_LIVE_HOURS just like a whole-file lock does.
+
+    b4102313 — ``exclude_session_id`` is optional: pass ``None`` (the default)
+    when there is no asking session to exclude and every live claimant should
+    be considered, e.g. planning-time queries in sprint_items.py that check
+    liveness from a project-wide perspective rather than "does anyone ELSE
+    hold this." Existing callers that pass a real session id are unaffected.
     """
     cutoff = _cutoff_dt(_CLAIM_LIVE_HOURS)
+    exclude_clause = ""
+    params: list[Any] = [file_path]
+    if exclude_session_id is not None:
+        exclude_clause = "AND fsc.session_id != ? "
+        params.append(exclude_session_id)
+    params.append(cutoff)
     async with db.execute(
         "SELECT fsc.symbol_name, fsc.symbol_type, fsc.line_start, fsc.line_end, "
         "       fsc.session_id, s.name AS session_name "
         "FROM file_symbol_claims fsc "
         "JOIN sessions s ON s.id = fsc.session_id "
-        "WHERE fsc.file_path = ? AND fsc.session_id != ? "
+        "WHERE fsc.file_path = ? "
+        f"{exclude_clause}"
         "AND fsc.released_at IS NULL "
         "AND s.status IN ('active', 'live') "
         "AND (s.last_seen IS NULL OR s.last_seen > ?)",
-        (file_path, exclude_session_id, cutoff),
+        tuple(params),
     ) as cur:
         rows = await cur.fetchall()
     return [r for r in (_row_to_dict(row) for row in rows) if r]

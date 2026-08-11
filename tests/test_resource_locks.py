@@ -2275,11 +2275,18 @@ async def test_parallelizable_groups_plan_generation_changes_when_item_claimed(d
 
 @pytest.mark.asyncio
 async def test_parallelizable_groups_resource_blocked_flags_external_file_lock(db):
-    """An item can be dependency-satisfied and land in a 'safe' group while
-    STILL being unclaimable right now because an unrelated live session
-    already holds its declared file — this is exactly what the 2026-08-05
-    incident's executor had no visibility into. resource_blocked must
-    surface it with the full wait_reason/holder/lease/retry contract."""
+    """An item can be dependency-satisfied while STILL being unclaimable
+    right now because an unrelated live session already holds its declared
+    file — this is exactly what the 2026-08-05 incident's executor had no
+    visibility into. resource_blocked must surface it with the full
+    wait_reason/holder/lease/retry contract.
+
+    b4102313 — this used to also assert the item still landed in a "safe"
+    group (the coloring never cross-checked external locks, so it was
+    advertised as eligible AND flagged blocked at the same time). Fixed:
+    a live-locked item is now excluded from groups entirely, not merely
+    footnoted — it would deterministically fail claim_sprint_item's own
+    resource gate a moment later, so this planner never advertises it."""
     p = await db_module.create_project(db, "0d0cada7-resource-blocked-file")
     pid = p["id"]
     holder = await db_module.register_session(db, pid, "holder")
@@ -2290,11 +2297,11 @@ async def test_parallelizable_groups_resource_blocked_flags_external_file_lock(d
     assert pre["claimed"] is True
 
     res = await db_module.get_parallelizable_groups(db, pid, version="v1")
-    # Still reported as a normal, disjoint, "safe" group (the coloring never
-    # cross-checks external locks) ...
+    # b4102313 — excluded from groups/eligible_count, not merely flagged.
     all_ids = {it["id"] for grp in res["groups"] for it in grp}
-    assert item["id"] in all_ids
-    # ... but resource_blocked makes the REAL contention explicit.
+    assert item["id"] not in all_ids
+    assert res["eligible_count"] == 0
+    # resource_blocked makes the REAL contention explicit.
     assert res["resource_blocked_count"] == 1
     entry = res["resource_blocked"][0]
     assert entry["id"] == item["id"]

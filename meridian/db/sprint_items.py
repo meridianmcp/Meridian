@@ -5055,6 +5055,223 @@ def _predict_resource_granularity(resource: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 1b264ce3 — coarse-declaration audit and repair.
+#
+# _predict_resource_granularity (above) classifies one resource STRING's
+# shape; it has no opinion on whether a well-formed `file:X` declaration was
+# the RIGHT choice for the item that made it. Two items can both declare
+# `file:sprint_items.py` legitimately: one because it really does need
+# cross-cutting, module-wide safety (many symbols, module-level state);
+# another purely because nobody narrowed it, quietly serializing it against
+# every other item that only wants a disjoint symbol in the same file. This
+# section distinguishes the two WITHOUT guessing intent from prose — only
+# from a mechanically checkable signal — and offers a safe, opt-in repair
+# for exactly that checkable case.
+# ---------------------------------------------------------------------------
+
+
+def _self_contradictory_file_resources(resources: list[str]) -> dict[str, list[str]]:
+    """Resources in ``resources`` where a `file:X` entry co-occurs with one
+    or more `symbol:X::name` entries for the SAME real file X, declared by
+    the SAME item.
+
+    This is the one coarseness signal this module treats as mechanically
+    safe rather than a guess: the item's own declaration already names the
+    exact symbol(s) it touches in X, so the blanket `file:X` entry is
+    provably redundant FOR THAT ITEM'S OWN DECLARED SCOPE — narrowing to
+    just the symbol entries cannot make the item's true footprint any
+    different from what it already told the scheduler. It says nothing
+    about whether OTHER items should also narrow; a lone `file:X` with no
+    matching `symbol:X::*` sibling is left alone (could well be intentional
+    whole-file scope, and there is no in-item evidence either way).
+
+    Returns ``{real_file_path: [symbol_resource, ...]}`` for every file this
+    applies to; empty dict when nothing is self-contradictory.
+    """
+    by_file_symbols: dict[str, list[str]] = {}
+    file_entries: set[str] = set()
+    for res in resources:
+        kind = _predict_resource_granularity(res)
+        if kind == "symbol":
+            value = res[len("symbol:"):]
+            path, _, _sym = value.partition("::")
+            by_file_symbols.setdefault(path, []).append(res)
+        elif kind in ("file", "file_legacy_symbol_suffix"):
+            file_entries.add(_resource_file_of(res) or res[len("file:"):])
+    return {
+        path: syms
+        for path, syms in by_file_symbols.items()
+        if path in file_entries
+    }
+
+
+async def diagnose_resource_coarseness(
+    db: aiosqlite.Connection,
+    project_id: str,
+    version: str | None = None,
+) -> dict[str, Any]:
+    """Read-only audit: which non-done items declare a `file:` resource that
+    looks unnecessarily coarse, and how much real parallelism it costs.
+
+    Scans every non-done (not done/failed/skipped) item in scope so a
+    currently in_progress item's coarse declaration is visible too — the
+    audit is informational for those (see :func:`repair_resource_granularity`
+    for why a live claim is never rewritten), not just for pending ones.
+
+    For each item with at least one well-formed `file:` resource, reports:
+      * ``self_contradictory`` — {real_file: [symbol_resource, ...]} per
+        :func:`_self_contradictory_file_resources`: THIS item also declares
+        specific symbols in the same file, making the file: entry provably
+        redundant for its own scope (see :func:`repair_resource_granularity`).
+      * ``contended_by`` — count of OTHER non-done items that declare a
+        `symbol:` resource in that same real file. A `file:` entry with a
+        high contended_by is expensive to leave coarse even when it isn't
+        self-contradictory (it serializes real, disjoint, currently-pending
+        work) — surfaced as context for a human/planner to judge intentional
+        scope, never auto-acted on.
+
+    Returns ``{"version", "candidates": [{"id", "title", "status", "file",
+    "self_contradictory_symbols": [...], "contended_by": int}, ...],
+    "candidate_count", "self_contradictory_count"}``. ``candidates`` is
+    sorted by (self-contradictory first, then contended_by descending, then
+    id) so the safest, highest-impact repair opportunities sort first.
+    """
+    items = await get_sprint_items(db, project_id, include_manual_blocker=True)
+    if version is not None:
+        items = [it for it in items if it.get("version") == version]
+    items = [it for it in items if (it.get("status") or "pending") != "done"
+              and it.get("status") not in ("failed", "skipped")]
+
+    parsed: list[tuple[dict[str, Any], list[str]]] = []
+    file_owners: dict[str, list[str]] = {}  # real_file -> [item_id declaring symbol: there, ...]
+    for it in items:
+        res = parse_touches_resources(it.get("touches_resources"))
+        parsed.append((it, res))
+        for r in res:
+            if _predict_resource_granularity(r) == "symbol":
+                value = r[len("symbol:"):]
+                path, _, _sym = value.partition("::")
+                file_owners.setdefault(path, []).append(it["id"])
+
+    candidates: list[dict[str, Any]] = []
+    for it, res in parsed:
+        file_paths = {
+            _resource_file_of(r) or r[len("file:"):]
+            for r in res
+            if _predict_resource_granularity(r) in ("file", "file_legacy_symbol_suffix")
+        }
+        if not file_paths:
+            continue
+        contradictory = _self_contradictory_file_resources(res)
+        for fp in sorted(file_paths):
+            other_owners = {
+                oid for oid in file_owners.get(fp, []) if oid != it["id"]
+            }
+            if fp not in contradictory and not other_owners:
+                continue  # plain, uncontested file: — nothing to report
+            candidates.append({
+                "id": it["id"],
+                "title": it.get("title", ""),
+                "status": it.get("status"),
+                "file": fp,
+                "self_contradictory_symbols": contradictory.get(fp, []),
+                "contended_by": len(other_owners),
+            })
+    candidates.sort(
+        key=lambda c: (
+            0 if c["self_contradictory_symbols"] else 1,
+            -c["contended_by"],
+            c["id"],
+        )
+    )
+    return {
+        "version": version,
+        "candidates": candidates,
+        "candidate_count": len(candidates),
+        "self_contradictory_count": sum(
+            1 for c in candidates if c["self_contradictory_symbols"]
+        ),
+    }
+
+
+async def repair_resource_granularity(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Narrow ONE item's self-contradictory `file:X` resources (see
+    :func:`_self_contradictory_file_resources`) down to just the `symbol:`
+    entries it already declares for that same file.
+
+    Only ever acts on the mechanically-safe case: a `file:X` entry is
+    removed ONLY when the same item's OWN touches_resources also names a
+    specific `symbol:X::*` for that same real file X — the item already
+    told the scheduler exactly what it touches there, so nothing about its
+    true footprint changes. Never guesses a narrower scope from title/notes
+    text, and never touches a `file:` entry with no same-item symbol sibling
+    (that is either genuinely whole-file work or simply unproven either
+    way — either way, not this function's call to make).
+
+    1b264ce3 — do not rewrite or force-release an active claim: refuses
+    (``repaired: False, reason: "item_claimed"``) when the item is currently
+    ``in_progress`` or otherwise holds a live ``claimed_at``, exactly like
+    this item's own acceptance criterion requires. A pending/todo item with
+    nothing claimed is the only thing ever mutated.
+
+    ``dry_run=True`` computes and returns the would-be new resource list
+    without calling :func:`patch_sprint_item` — the diagnostic half of
+    "repair/split diagnostics" without a required mutation, so a caller can
+    preview before committing.
+
+    Returns ``{"item_id", "repaired": bool, "reason": str | None,
+    "removed_file_resources": [...], "kept_resources": [...] | None}``.
+    ``reason`` is one of ``None`` (repaired, or nothing to do),
+    ``"item_claimed"``, or ``"nothing_self_contradictory"``.
+    """
+    item = await get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return {
+            "item_id": item_id, "repaired": False, "reason": "item_not_found",
+            "removed_file_resources": [], "kept_resources": None,
+        }
+    res = parse_touches_resources(item.get("touches_resources"))
+    contradictory = _self_contradictory_file_resources(res)
+    if not contradictory:
+        return {
+            "item_id": item_id, "repaired": False,
+            "reason": "nothing_self_contradictory",
+            "removed_file_resources": [], "kept_resources": None,
+        }
+    removed = [
+        r for r in res
+        if _predict_resource_granularity(r) in ("file", "file_legacy_symbol_suffix")
+        and (_resource_file_of(r) or r[len("file:"):]) in contradictory
+    ]
+    kept = [r for r in res if r not in removed]
+    is_claimed = (
+        (item.get("status") or "pending") == "in_progress"
+        or bool(item.get("claimed_at"))
+    )
+    if is_claimed:
+        return {
+            "item_id": item_id, "repaired": False, "reason": "item_claimed",
+            "removed_file_resources": removed, "kept_resources": kept,
+        }
+    if dry_run:
+        return {
+            "item_id": item_id, "repaired": False, "reason": None,
+            "removed_file_resources": removed, "kept_resources": kept,
+        }
+    await patch_sprint_item(db, project_id, item_id, touches_resources=kept)
+    return {
+        "item_id": item_id, "repaired": True, "reason": None,
+        "removed_file_resources": removed, "kept_resources": kept,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 0d0cada7 — lease-local scheduler diagnostics.
 #
 # get_parallelizable_groups already recomputes ``groups``/``blocked``/``running``
@@ -5146,7 +5363,9 @@ async def _live_resource_holder(
     gap: scheduler prediction and claim-time enforcement disagreed on what
     the resource actually was).
     """
-    from meridian.db import get_file_claims, get_symbol_claims, get_resource_claims  # noqa: PLC0415
+    from meridian.db import (  # noqa: PLC0415
+        get_file_claims, get_resource_claims, _live_symbol_claims_for_file,
+    )
 
     if resource.startswith("file:"):
         file_path = _resource_file_of(resource) or resource[len("file:"):]
@@ -5174,8 +5393,17 @@ async def _live_resource_holder(
                 "lease_expiry": lock.get("expires_at"),
                 "claim_granularity": "file",
             }
-        for c in await get_symbol_claims(db, file_path):
-            if c.get("symbol_name") == symbol_name and c.get("session_id"):
+        # b4102313 — was get_symbol_claims(), which has NO liveness/staleness
+        # filter at all (just released_at IS NULL): a crashed session's symbol
+        # claim would show as held forever and, now that this function's
+        # result actively excludes items from get_parallelizable_groups'
+        # `groups` (not just an ignored diagnostic), that would permanently
+        # starve an item instead of merely mislabeling it. Use the same
+        # heartbeat/TTL-aware query claim_symbol itself already uses for live
+        # conflict checks. exclude_session_id=None: there is no asking
+        # session here, every live claimant counts.
+        for c in await _live_symbol_claims_for_file(db, file_path, None):
+            if c.get("symbol_name") == symbol_name:
                 return {
                     "holder_session_id": c.get("session_id"),
                     # file_symbol_claims carries no TTL column (heartbeat-bound
@@ -5267,8 +5495,26 @@ async def get_parallelizable_groups(
     "eligible_count", "blocked": [...], "undeclared_count", "requested_parallelism",
     "effective_parallelism", "host_limit", "configured_target",
     "resource_safe_capacity", "limiting_reason", "macro_waves",
-    "macro_wave_count", "requested_macro_wave_count"}``. ``groups`` items
-    are full sprint-item dicts with a derived ``resources`` list attached.
+    "macro_wave_count", "requested_macro_wave_count", "resource_blocked": [...],
+    "resource_blocked_count"}``. ``groups`` items are full sprint-item dicts
+    with a derived ``resources`` list attached.
+
+    b4102313 — an item whose declared resources are ALREADY held by a live,
+    non-stale session right now (e.g. an in_progress item's whole-file claim,
+    or another symbol claim) is excluded from ``eligible``/``declared``/
+    ``groups`` entirely — it would deterministically fail
+    claim_sprint_item's own resource-lock gate a moment later, so this
+    planner never advertises it as runnable. It is reported instead in
+    ``resource_blocked`` (one entry per blocked item: ``resource``,
+    ``holder_session_id``, ``lease_expiry``, ``claim_granularity``,
+    ``retry_after``) so a caller can poll with bounded backoff instead of
+    fanning out into a guaranteed claim failure. This check is per-resource
+    LIVE state, not a static property of the item, so it composes cleanly
+    with the coloring below: two candidates whose resources are disjoint
+    from every live lock right now (even if they'd conflict with each
+    other) still get colored normally by the conflict graph; only a
+    resource that is ACTUALLY held elsewhere right now removes its item
+    from consideration.
 
     2282a636 — items with ``blocker_kind='manual'`` (blocked on a real-world
     action outside Meridian) are excluded here: they are not executor-claimable,
@@ -5314,7 +5560,7 @@ async def get_parallelizable_groups(
     if version is not None:
         items = [it for it in items if it.get("version") == version]
     claimable_statuses = {"pending", "todo"}
-    eligible: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     # df573218 — surface currently-claimed work so an orchestrator sees the live
     # parallelism state (and knows an item it planned was grabbed by another).
@@ -5358,7 +5604,51 @@ async def get_parallelizable_groups(
             # the conflict graph below still colors purely on `resources`.
             "predicted_granularity": {r: _predict_resource_granularity(r) for r in _res},
         }
-        eligible.append(enriched)
+        candidates.append(enriched)
+
+    # b4102313 — cross-check every candidate's declared resources against REAL
+    # live locks BEFORE coloring, not after (see _live_resource_holder's
+    # docstring: the coloring only proves the batch THIS call returns is
+    # internally disjoint — it has no visibility into a lock already held by
+    # work outside that batch, e.g. an in_progress item from an earlier wave).
+    # Previously this cross-check ran AFTER `groups` was already computed and
+    # only recorded a diagnostic (resource_blocked) — group_count/eligible_count
+    # still advertised an item that would deterministically fail
+    # claim_sprint_item's own resource-lock gate a moment later. Moving the
+    # check here so a live-locked candidate is filtered OUT of `eligible`
+    # (and therefore out of `declared`/`groups`) closes that gap: "safe on
+    # paper, but a live session holds the resource right now" is now excluded
+    # from fan-out, not merely footnoted. Shared cache: at most one live-lock
+    # lookup per DISTINCT resource declared across the whole candidate set,
+    # reused below by the plan_generation digest too.
+    _holder_cache: dict[str, "dict[str, Any] | None"] = {}
+    resource_blocked: list[dict[str, Any]] = []
+    eligible: list[dict[str, Any]] = []
+    for it in candidates:
+        _blocking_res: str | None = None
+        _blocking_holder: dict[str, Any] | None = None
+        for res in it["resources"]:
+            if res not in _holder_cache:
+                _holder_cache[res] = await _live_resource_holder(db, res)
+            holder = _holder_cache[res]
+            if holder is not None:
+                _blocking_res = res
+                _blocking_holder = holder
+                break  # one blocking resource is enough to explain the wait
+        if _blocking_holder is not None:
+            resource_blocked.append({
+                "id": it["id"],
+                "title": it.get("title", ""),
+                "resource": _blocking_res,
+                "wait_reason": "resource_locked",
+                "holder_session_id": _blocking_holder.get("holder_session_id"),
+                "lease_expiry": _blocking_holder.get("lease_expiry"),
+                "claim_granularity": _blocking_holder.get("claim_granularity"),
+                "retry_after": _seconds_until(_blocking_holder.get("lease_expiry")),
+            })
+            continue  # excluded: would deterministically fail claim right now
+        eligible.append(it)
+
     # Stable order: highest-priority first (e08fee30), then oldest, then id, so
     # coloring is deterministic AND urgent work colors into the earliest groups.
     eligible.sort(
@@ -5431,42 +5721,13 @@ async def get_parallelizable_groups(
     _macro_wave_cap = _clamp_macro_wave_count(requested_macro_wave_count)
     macro_waves = pack_groups_into_macro_waves(groups, _macro_wave_cap)
 
-    # 0d0cada7 — cross-check every eligible item's declared resources against
-    # REAL live locks, not just this call's own conflict-graph coloring (see
-    # _live_resource_holder's docstring: the coloring only proves the batch
-    # THIS call returns is internally disjoint — it has no visibility into a
-    # lock already held by work outside that batch, e.g. an in_progress item
-    # from an earlier wave). This is what lets a caller tell "genuinely
-    # nothing to do yet" apart from "safe on paper, but a live session holds
-    # the resource right now" — the latter is exactly the case where an
-    # executor should poll with bounded backoff instead of escalating.
-    # Shared cache: at most one live-lock lookup per DISTINCT resource
-    # declared across the whole eligible set, reused below by BOTH the
-    # resource_blocked diagnostic (which short-circuits at the first
-    # blocking resource per item, for a readable one-line-per-item summary)
-    # and the plan_generation digest (which needs EVERY resource's holder,
-    # not just the first, so the digest can't miss a change to a
-    # non-first resource).
-    _holder_cache: dict[str, "dict[str, Any] | None"] = {}
-    resource_blocked: list[dict[str, Any]] = []
-    for it in eligible:
-        for res in it["resources"]:
-            if res not in _holder_cache:
-                _holder_cache[res] = await _live_resource_holder(db, res)
-            holder = _holder_cache[res]
-            if holder is None:
-                continue
-            resource_blocked.append({
-                "id": it["id"],
-                "title": it.get("title", ""),
-                "resource": res,
-                "wait_reason": "resource_locked",
-                "holder_session_id": holder.get("holder_session_id"),
-                "lease_expiry": holder.get("lease_expiry"),
-                "claim_granularity": holder.get("claim_granularity"),
-                "retry_after": _seconds_until(holder.get("lease_expiry")),
-            })
-            break  # one blocking resource is enough to explain the wait
+    # b4102313 — resource_blocked / _holder_cache were already computed above,
+    # BEFORE coloring, so a live-locked candidate never enters `eligible` in
+    # the first place (see the comment on that pass). Recomputing them here
+    # from the post-filter `eligible` list would silently rediscover nothing
+    # (the blocked items are gone by construction) and wipe out the real
+    # result — so this used to be a second pass; it no longer is. Both names
+    # are reused as-is by the plan_generation digest below.
 
     # Deterministic digest of the state THIS call actually observed — lets a
     # caller (claim_parallel_batch's plan_generation staleness check below, or
@@ -5486,6 +5747,14 @@ async def get_parallelizable_groups(
     ) + [
         (r["id"], str(r.get("status") or ""), str(r.get("claimed_at") or ""), "")
         for r in running
+    ] + [
+        # b4102313 — fold resource_blocked candidates in too: without this, a
+        # candidate moving from "live-locked" to "eligible" (or back) between
+        # two calls would go undetected by the digest, since it now lives
+        # entirely outside `eligible` while blocked instead of merely being
+        # annotated inside it.
+        (rb["id"], "resource_blocked", str(rb.get("holder_session_id") or ""), rb.get("resource") or "")
+        for rb in resource_blocked
     ]
     plan_generation = _compute_plan_generation(_gen_entries)
     # Index-aligned with "groups" — the digest of exactly one group's items,
