@@ -50,6 +50,7 @@ import threading
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -2954,6 +2955,7 @@ def _verify_docx_write(
     expected_range: tuple[int, int] | None = None,
     locate_by_paraid: str | None = None,
     expected_len: int = 1,
+    expected_equation_manifest: dict[str, Any] | None = None,
     artifact_provenance: "dict[str, Any] | None" = None,
 ) -> dict[str, Any] | None:
     """Mandatory post-write verification (9907df44). Returns ``None`` when the
@@ -3036,7 +3038,14 @@ def _verify_docx_write(
             if actual_hash != expected_hash:
                 hash_mismatch = {"expected": expected_hash, "actual": actual_hash}
 
-    if count_mismatches or hash_mismatch or position_error:
+    semantic_equation_mismatches = None
+    if expected_equation_manifest is not None:
+        actual_equation_manifest = _equation_semantic_manifest([body2])
+        semantic_equation_mismatches = _compare_equation_manifests(
+            expected_equation_manifest, actual_equation_manifest
+        )
+
+    if count_mismatches or hash_mismatch or position_error or semantic_equation_mismatches:
         return {
             "error": (
                 "post-write verification failed: the on-disk document does "
@@ -3046,6 +3055,7 @@ def _verify_docx_write(
             ),
             "count_mismatches": count_mismatches,
             "content_hash_mismatch": hash_mismatch,
+            "semantic_equation_mismatches": semantic_equation_mismatches,
         }
 
     return _check_artifact_provenance_binding(artifact_provenance)
@@ -7649,6 +7659,113 @@ def _validate_omml_structure(omml_raw: str) -> ET.Element:
         if marker in flat and not names.intersection(structural_names):
             raise ValueError(f"OMML contains flattened fallback text {marker!r} without its structural element")
     return root
+
+
+def _omml_semantic_record(omath: ET.Element) -> dict[str, Any]:
+    """Return a stable, renderer-independent record for one ``m:oMath``.
+
+    Equation counts are not sufficient for section replacement: a flattened
+    run can preserve the count while losing subscripts, hats, functions, or
+    cases.  Keep both the human-readable flattened text and a hash of the
+    actual OMML tree so a visually plausible but structurally different
+    equation cannot pass a preservation gate.
+    """
+    raw = ET.tostring(omath, encoding="unicode")
+    flat_text = re.sub(r"\s+", "", _omml_flatten_text_local(raw))
+    tag_counts = Counter(
+        element.tag.rsplit("}", 1)[-1]
+        for element in omath.iter()
+        if "}" in element.tag
+    )
+    structural_tags = {
+        name: count
+        for name, count in sorted(tag_counts.items())
+        if name in {
+            "f", "eqArr", "sSub", "sSup", "sSubSup", "rad", "acc", "d",
+            "func", "limLow", "limUpp", "nary", "borderBox", "groupChr",
+        }
+    }
+    issues: list[str] = []
+    try:
+        _validate_omml_structure(raw)
+    except ValueError as exc:
+        issues.append(str(exc))
+
+    # These markers are meaningful in the source notation.  If none of the
+    # corresponding OMML structures survived, the result is a flattened
+    # fallback even when its m:oMath count is unchanged.
+    flattened_markers = (
+        r"\\(?:hat|bar|vec|tilde|overline|underline)\b",
+        r"[_^](?:\{|[A-Za-z0-9])",
+        r"\|\|.+\|\|",
+        r"\b(?:argmin|argmax|min|max|lim|sum)\b",
+    )
+    if not structural_tags and any(re.search(pattern, flat_text, re.IGNORECASE) for pattern in flattened_markers):
+        issues.append(
+            "flattened OMML text contains a structural equation marker without "
+            "a corresponding OMML operator/subscript/fence structure"
+        )
+
+    return {
+        "fingerprint": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "flat_text": flat_text,
+        "structural_tags": structural_tags,
+        "issues": issues,
+    }
+
+
+def _equation_semantic_manifest(elements: list[ET.Element] | tuple[ET.Element, ...]) -> dict[str, Any]:
+    """Build a semantic inventory for all equations below ``elements``.
+
+    The inventory deliberately includes inline, unnumbered, and numbered
+    equations alike.  ``m:oMathPara`` is treated as a display container and
+    its child ``m:oMath`` is inventoried; the insertion validator still
+    rejects that wrapper when callers supply it as the payload root.
+    """
+    entries: list[dict[str, Any]] = []
+    for element in elements:
+        for omath in element.iter(_qm("oMath")):
+            entries.append(_omml_semantic_record(omath))
+    return {"count": len(entries), "entries": entries}
+
+
+def _equation_manifest_counter(manifest: dict[str, Any]) -> Counter[str]:
+    return Counter(entry.get("fingerprint") for entry in manifest.get("entries", []))
+
+
+def _compare_equation_manifests(
+    expected: dict[str, Any], actual: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Compare semantic equation inventories as multisets, not counts only."""
+    expected_counter = _equation_manifest_counter(expected)
+    actual_counter = _equation_manifest_counter(actual)
+    missing = list((expected_counter - actual_counter).elements())
+    extra = list((actual_counter - expected_counter).elements())
+    invalid = [entry for entry in actual.get("entries", []) if entry.get("issues")]
+    if not missing and not extra and not invalid:
+        return None
+    return {
+        "missing_fingerprints": missing,
+        "unexpected_fingerprints": extra,
+        "invalid_entries": invalid,
+        "expected_count": sum(expected_counter.values()),
+        "actual_count": sum(actual_counter.values()),
+    }
+
+
+def _subtract_equation_manifest(
+    source: dict[str, Any], removed: dict[str, Any]
+) -> dict[str, Any]:
+    """Remove the copied-out range's equations from a document inventory."""
+    remaining = list(source.get("entries", []))
+    for fingerprint in _equation_manifest_counter(removed):
+        count = _equation_manifest_counter(removed)[fingerprint]
+        for _ in range(count):
+            for index, entry in enumerate(remaining):
+                if entry.get("fingerprint") == fingerprint:
+                    remaining.pop(index)
+                    break
+    return {"count": len(remaining), "entries": remaining}
 
 
 def latex_to_omml_local(latex: str | None) -> str | None:
@@ -12489,6 +12606,18 @@ def move_section(
     # one of these totals unchanged -- nothing is added or removed).
     baseline_counts = _structural_counts([body])
     baseline_counts["image_count"] = _docx_media_count(raw)
+    baseline_equation_manifest = _equation_semantic_manifest([body])
+    baseline_equation_errors = [
+        entry for entry in baseline_equation_manifest["entries"] if entry.get("issues")
+    ]
+    if baseline_equation_errors:
+        return {
+            "error": (
+                "aborting move_section: source document contains malformed or "
+                "flattened semantic OMML; repair the equations before moving a section"
+            ),
+            "semantic_equation_errors": baseline_equation_errors,
+        }
 
     bounds = _locate_section_bounds(body, section_id)
     if bounds is None:
@@ -12617,6 +12746,7 @@ def move_section(
             expected_counts=baseline_counts,
             expected_hash=expected_hash,
             expected_range=(insert_at, insert_at + len(moved_elements)),
+            expected_equation_manifest=baseline_equation_manifest,
         )
         if verify_error is not None:
             # 5988a5bb -- do NOT blindly restore: a different (concurrent)
@@ -12868,6 +12998,18 @@ def copy_section(
     # intent, to compare against).
     baseline_counts = _structural_counts([body])
     baseline_counts["image_count"] = _docx_media_count(raw)
+    baseline_equation_manifest = _equation_semantic_manifest([body])
+    baseline_equation_errors = [
+        entry for entry in baseline_equation_manifest["entries"] if entry.get("issues")
+    ]
+    if baseline_equation_errors:
+        return {
+            "error": (
+                "aborting copy_section: source document contains malformed or "
+                "flattened semantic OMML; repair the equations before copying a section"
+            ),
+            "semantic_equation_errors": baseline_equation_errors,
+        }
 
     bounds = _locate_section_bounds(body, section_id)
     if bounds is None:
@@ -12997,6 +13139,7 @@ def copy_section(
     # instead of trusting copied_block_count blindly.
     expected_hash = _hash_elements(copied_elements)
     copied_counts = _structural_counts(copied_elements)
+    copied_equation_manifest = _equation_semantic_manifest(copied_elements)
     expected_counts = {
         key: baseline_counts[key] + copied_counts[key] for key in copied_counts
     }
@@ -13021,6 +13164,7 @@ def copy_section(
     # arithmetic-shift reasoning move_section's own post-cut _shift relies on,
     # just for an insert instead of a removal.
     trimmed = False
+    removed_equation_manifest = {"count": 0, "entries": []}
     if trim_original_to is not None:
         inserted_count = len(copied_elements)
         shift = inserted_count if insert_at <= start_idx else 0
@@ -13028,6 +13172,7 @@ def copy_section(
         trim_end = end_idx + shift
         body_list_now = list(body)
         to_remove = body_list_now[trim_start:trim_end]
+        removed_equation_manifest = _equation_semantic_manifest(to_remove)
         # 9907df44 -- adjust expected counts for the trim: whatever's removed
         # here no longer counts toward the post-write total, and a truthy
         # trim_original_to adds back exactly one (non-heading, non-table)
@@ -13074,6 +13219,19 @@ def copy_section(
             expected_hash=expected_hash if new_heading_para_id is not None else None,
             locate_by_paraid=new_heading_para_id,
             expected_len=len(copied_elements),
+            expected_equation_manifest={
+                "count": (
+                    len(baseline_equation_manifest["entries"])
+                    + len(copied_equation_manifest["entries"])
+                    - len(removed_equation_manifest["entries"])
+                ),
+                "entries": (
+                    _subtract_equation_manifest(
+                        baseline_equation_manifest, removed_equation_manifest
+                    )["entries"]
+                    + copied_equation_manifest["entries"]
+                ),
+            },
         )
         if verify_error is not None:
             # 5988a5bb -- do NOT blindly restore: a different (concurrent)
