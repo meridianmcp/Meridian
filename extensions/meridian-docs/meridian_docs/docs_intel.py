@@ -7439,6 +7439,16 @@ def _stdlib_append_mathml(node: ET.Element, parent: ET.Element) -> None:
     if tag in _MATHML_TEXT_TAGS:
         text = node.text or ""
         if text:
+            # Keep common mathematical operators semantic instead of flattening
+            # them into an ordinary run.  A function node is the OMML shape Word
+            # expects for min/max/argmin-style operators.
+            if text.strip().casefold() in {"min", "max", "argmin", "argmax", "sup", "inf"}:
+                func = ET.SubElement(parent, _qm("func"))
+                f_name = ET.SubElement(func, _qm("fName"))
+                run = ET.SubElement(f_name, _qm("r"))
+                ET.SubElement(run, _qm("t")).text = text
+                ET.SubElement(func, _qm("e"))
+                return
             run = ET.SubElement(parent, _qm("r"))
             ET.SubElement(run, _qm("t")).text = text
         return
@@ -7492,11 +7502,13 @@ def _stdlib_append_mathml(node: ET.Element, parent: ET.Element) -> None:
         den = kids[1] if len(kids) > 1 else None
         f = ET.SubElement(parent, _qm("f"))
         n_el = ET.SubElement(f, _qm("num"))
+        n_expr = ET.SubElement(n_el, _qm("e"))
         if num is not None:
-            _stdlib_append_mathml(num, n_el)
+            _stdlib_append_mathml(num, n_expr)
         d_el = ET.SubElement(f, _qm("den"))
+        d_expr = ET.SubElement(d_el, _qm("e"))
         if den is not None:
-            _stdlib_append_mathml(den, d_el)
+            _stdlib_append_mathml(den, d_expr)
         return
 
     if tag == "msqrt":
@@ -7525,8 +7537,53 @@ def _stdlib_append_mathml(node: ET.Element, parent: ET.Element) -> None:
 
     if tag == "mfenced":
         d = ET.SubElement(parent, _qm("d"))
+        expr = ET.SubElement(d, _qm("e"))
         for child in node:
-            _stdlib_append_mathml(child, d)
+            _stdlib_append_mathml(child, expr)
+        return
+
+    if tag == "mtable":
+        # MathML cases/aligned systems become a real OMML equation array.  A
+        # flattened m:r here is visually plausible but semantically unusable.
+        arr = ET.SubElement(parent, _qm("eqArr"))
+        for row in node:
+            if (row.tag.rsplit("}", 1)[-1] if "}" in row.tag else row.tag) != "mtr":
+                continue
+            row_expr = ET.SubElement(arr, _qm("e"))
+            for cell in row:
+                cell_expr = ET.SubElement(row_expr, _qm("e"))
+                for child in cell:
+                    _stdlib_append_mathml(child, cell_expr)
+        return
+
+    if tag in {"munder", "mover", "munderover"}:
+        kids = list(node)
+        base = kids[0] if kids else None
+        lower = kids[1] if tag == "munder" and len(kids) > 1 else None
+        upper = kids[1] if tag == "mover" and len(kids) > 1 else None
+        if tag == "munderover":
+            lower = kids[1] if len(kids) > 1 else None
+            upper = kids[2] if len(kids) > 2 else None
+        # A one-character mover such as ^ or ~ is an accent, not a limit.
+        upper_text = "".join(upper.itertext()).strip() if upper is not None else ""
+        if tag == "mover" and len(upper_text) == 1 and upper_text in {"^", "~", "¯", "ˉ", "→", "⃗", "ˆ"}:
+            acc = ET.SubElement(parent, _qm("acc"))
+            acc_pr = ET.SubElement(acc, _qm("accPr"))
+            ET.SubElement(acc_pr, _qm("chr"), {_qm("val"): upper_text})
+            expr = ET.SubElement(acc, _qm("e"))
+            if base is not None:
+                _stdlib_append_mathml(base, expr)
+            return
+        container = ET.SubElement(parent, _qm("nary" if tag == "munderover" else ("limLow" if tag == "munder" else "limUpp")))
+        expr = ET.SubElement(container, _qm("e"))
+        if base is not None:
+            _stdlib_append_mathml(base, expr)
+        if lower is not None:
+            target = ET.SubElement(container, _qm("sub" if tag == "munderover" else "lim"))
+            _stdlib_append_mathml(lower, target)
+        if upper is not None:
+            target = ET.SubElement(container, _qm("sup" if tag == "munderover" else "lim"))
+            _stdlib_append_mathml(upper, target)
         return
 
     # Unrecognized construct (mtable, mmultiscripts, menclose, ...) — degrade
@@ -7535,6 +7592,63 @@ def _stdlib_append_mathml(node: ET.Element, parent: ET.Element) -> None:
     if flat:
         run = ET.SubElement(parent, _qm("r"))
         ET.SubElement(run, _qm("t")).text = flat
+
+
+_OMML_REQUIRED_CHILDREN: dict[str, tuple[str, ...]] = {
+    "f": ("num", "den"),
+    "sSub": ("e", "sub"),
+    "sSup": ("e", "sup"),
+    "sSubSup": ("e", "sub", "sup"),
+    "rad": ("e",),
+    "acc": ("accPr", "e"),
+    "d": ("e",),
+    "eqArr": ("e",),
+    "func": ("fName", "e"),
+    "limLow": ("e", "lim"),
+    "limUpp": ("e", "lim"),
+    "nary": ("e",),
+}
+_OMML_FALLBACK_MARKERS = {
+    "fraction": {"f"}, "cases": {"eqArr"}, "matrix": {"eqArr"},
+    "summation": {"nary", "limLow", "limUpp"}, "subscript": {"sSub", "sSubSup"},
+    "superscript": {"sSup", "sSubSup"}, "argmin": {"func", "nary", "limLow", "limUpp"},
+}
+
+
+def _validate_omml_structure(omml_raw: str) -> ET.Element:
+    """Validate a single semantic ``m:oMath`` before any DOCX mutation.
+
+    Counting ``m:oMath`` elements or flattening ``m:t`` text is insufficient:
+    malformed fractions and fallback prose can still open as a visually
+    plausible but non-editable equation.  This validator deliberately covers
+    the structural subset emitted by our converter and rejects the ambiguous
+    ``m:oMathPara`` wrapper used by a different insertion contract.
+    """
+    try:
+        root = ET.fromstring(omml_raw)
+    except ET.ParseError as exc:
+        raise ValueError(f"OMML payload is not valid XML: {exc}") from exc
+    if root.tag == _qm("oMathPara"):
+        raise ValueError("OMML m:oMath root required; m:oMathPara is not accepted for insertion")
+    if root.tag != _qm("oMath"):
+        got = root.tag.rsplit("}", 1)[-1]
+        raise ValueError(f"OMML m:oMath root required; got m:{got}")
+    for element in root.iter():
+        name = element.tag.rsplit("}", 1)[-1] if "}" in element.tag else element.tag
+        required = _OMML_REQUIRED_CHILDREN.get(name)
+        if required:
+            children = {child.tag.rsplit("}", 1)[-1] for child in element}
+            missing = [child for child in required if child not in children]
+            if missing:
+                raise ValueError(f"OMML <m:{name}> is missing required child element(s): {', '.join(missing)}")
+        if name in {"num", "den"} and element.find(_qm("e")) is None:
+            raise ValueError(f"OMML <m:{name}> must contain <m:e>")
+    flat = _omml_flatten_text_local(omml_raw).casefold()
+    names = {el.tag.rsplit("}", 1)[-1] for el in root.iter() if "}" in el.tag}
+    for marker, structural_names in _OMML_FALLBACK_MARKERS.items():
+        if marker in flat and not names.intersection(structural_names):
+            raise ValueError(f"OMML contains flattened fallback text {marker!r} without its structural element")
+    return root
 
 
 def latex_to_omml_local(latex: str | None) -> str | None:
@@ -7560,7 +7674,9 @@ def latex_to_omml_local(latex: str | None) -> str | None:
         # Build the <m:oMath> root element.
         omath = ET.Element(_qm("oMath"))
         _stdlib_append_mathml(mathml_root, omath)
-        return ET.tostring(omath, encoding="unicode")
+        raw = ET.tostring(omath, encoding="unicode")
+        _validate_omml_structure(raw)
+        return raw
     except Exception:  # noqa: BLE001 — conversion is best-effort
         return None
 
@@ -7581,12 +7697,12 @@ def _resolve_omml(payload: str) -> str | None:
     stripped = payload.strip()
     if stripped.startswith("<"):
         # Validate: must be parseable XML.
-        try:
-            ET.fromstring(stripped)
-        except ET.ParseError as exc:
-            raise ValueError(f"payload starts with '<' but is not valid XML: {exc}") from exc
+        _validate_omml_structure(stripped)
         return stripped
-    return latex_to_omml_local(stripped)
+    converted = latex_to_omml_local(stripped)
+    if converted is not None:
+        _validate_omml_structure(converted)
+    return converted
 
 
 # ---------------------------------------------------------------------------
@@ -8185,12 +8301,14 @@ def _build_omath_paragraph(
     omml_raw: str,
     alignment: str | None = None,
     indent_twips: int = 0,
+    para_id: str | None = None,
+    text_id: str | None = None,
 ) -> ET.Element:
     """Wrap a raw OMML string in a new <w:p> for display-mode insertion.
 
     Produces::
 
-        <w:p>
+        <w:p w14:paraId="..." w14:textId="...">
           <w:pPr>
             <w:jc w:val="..."/>        <!-- only when alignment is given -->
             <w:ind w:left="..."/>      <!-- only when indent_twips > 0 -->
@@ -8203,9 +8321,15 @@ def _build_omath_paragraph(
     omitted entirely when neither is set -- matching this function's
     original (pre-4efc63fd) output exactly.
 
+    New display paragraphs always receive fresh Word identity attributes.  The
+    caller should mint collision-free values from the document; direct unit
+    callers may omit them and receive UUID-derived values.
+
     The oMath element is parsed from ``omml_raw`` and appended as a child.
     """
     p = ET.Element(_q(_W, "p"))
+    p.set(_q(_W14, "paraId"), para_id or uuid.uuid4().hex[:8].upper())
+    p.set(_q(_W14, "textId"), text_id or uuid.uuid4().hex[:8].upper())
     if alignment or indent_twips:
         pPr = ET.SubElement(p, _q(_W, "pPr"))
         if alignment:
@@ -8224,6 +8348,8 @@ def _verify_equation_write(
     anchor_para_id: str,
     insert_at: int | None,
     expected_flat_text: str,
+    expected_para_id: str | None = None,
+    expected_text_id: str | None = None,
 ) -> dict[str, Any] | None:
     """a80af3a0 follow-up (ddd79188) — post-write verification for
     :func:`insert_equation_local`, mirroring :func:`_verify_figure_block_write`'s
@@ -8315,6 +8441,23 @@ def _verify_equation_write(
                 f"{expected_flat_text!r}, got {actual_flat_text!r})"
             )
         }
+    if position != "append":
+        actual_para_id = para_elem.get(_q(_W14, "paraId"))
+        actual_text_id = para_elem.get(_q(_W14, "textId"))
+        if expected_para_id and actual_para_id != expected_para_id:
+            return {
+                "error": (
+                    f"post-write verification failed: new equation paragraph at "
+                    f"{where} has paraId {actual_para_id!r}, expected {expected_para_id!r}"
+                )
+            }
+        if expected_text_id and actual_text_id != expected_text_id:
+            return {
+                "error": (
+                    f"post-write verification failed: new equation paragraph at "
+                    f"{where} has textId {actual_text_id!r}, expected {expected_text_id!r}"
+                )
+            }
     return None
 
 
@@ -8430,16 +8573,28 @@ def insert_equation_local(
     body, anchor_elem, child_idx = result
 
     insert_at: int | None = None
+    inserted_para_id: str | None = None
+    inserted_text_id: str | None = None
     if position == "append":
         # Inline: append <m:oMath> directly to the anchor paragraph.
         omath_el = ET.fromstring(omml)
         anchor_elem.append(omath_el)
     else:
         # Display: insert a new <w:p> wrapping the equation.
+        taken_para_ids = _existing_para_ids(root)
+        taken_text_ids = {
+            value
+            for paragraph in root.iter(_q(_W, "p"))
+            if (value := paragraph.get(_q(_W14, "textId")))
+        }
+        inserted_para_id = _new_para_id(taken_para_ids)
+        inserted_text_id = _new_para_id(taken_text_ids)
         new_p = _build_omath_paragraph(
             omml,
             alignment=policy["equation_alignment"],
             indent_twips=policy["body_indent_twips"],
+            para_id=inserted_para_id,
+            text_id=inserted_text_id,
         )
         insert_at = child_idx if position == "before" else child_idx + 1
         body.insert(insert_at, new_p)
@@ -8466,6 +8621,8 @@ def insert_equation_local(
             anchor_para_id=anchor_para_id,
             insert_at=insert_at,
             expected_flat_text=expected_flat_text,
+            expected_para_id=inserted_para_id,
+            expected_text_id=inserted_text_id,
         )
         if verify_error is not None:
             # 5988a5bb -- do NOT blindly restore: a different (concurrent)
@@ -8527,6 +8684,8 @@ def insert_equation_local(
         "status": "inserted",
         "position": position,
         "para_id": anchor_para_id,
+        "inserted_para_id": inserted_para_id,
+        "inserted_text_id": inserted_text_id,
         "omml": omml,
         "docx_path": docx_path,
         **render_info,
