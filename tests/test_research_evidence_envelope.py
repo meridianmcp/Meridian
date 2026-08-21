@@ -19,16 +19,24 @@ Covers:
   - compute_content_hash / make_hash consistency with hashlib directly.
   - build_envelope's ergonomic auto-id/auto-timestamp construction.
 
-Note (session 19477436-02d7-439f-a1dd-110b03e616f5, 2026-08-21): this item's
-touches_resources also lists provenance_status.py/outputs_local.py/
-handoff.py for a planned bridge (converting get_provenance_status() output
-into a typed EvidenceRecord). That integration was deliberately NOT added in
-this pass -- meridian/handoff.py stayed locked by a live sibling session
-(research-os-resilience-investigation) through 6 retry attempts, and per
-this repo's lock-contention protocol no file outside a landed claim gets
-edited. research_evidence.py itself has zero dependency on any of those
-three files, so it is fully self-contained and testable on its own; the
-provenance_status bridge is left for a follow-up pass once the lock clears.
+Note (session 19477436-02d7-439f-a1dd-110b03e616f5, 2026-08-21): the
+provenance_status.py bridge (converting get_provenance_status() output into
+a typed EvidenceRecord) and the handoff.py bridge (rendering a caller-
+supplied envelope as an additive markdown section) that this note originally
+deferred (the handoff.py lock was held by a live sibling session at the
+time) have now landed, once the lock cleared:
+
+  - extensions/meridian-outputs/meridian_outputs/provenance_status.py:
+    evidence_record_from_provenance_status() / build_provenance_envelope() --
+    tested in extensions/meridian-outputs/tests/test_provenance_status.py.
+  - meridian/handoff.py: _render_research_evidence_block() (pure, duck-typed
+    rendering helper) + generate_handoff(research_evidence_envelope=...)
+    (purely additive, mode in {"full", "delta"} only) -- the rendering
+    helper is exercised directly below (TestHandoffResearchEvidenceBlock);
+    meridian core never imports research_evidence.py (mirrors the existing
+    no-hard-dependency contract get_manifest_backed_provenance_status
+    already established for the opposite direction), so this file's own
+    coverage is the DIRECT test for that duck-typed contract.
 """
 from __future__ import annotations
 
@@ -41,6 +49,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "extensions" / "meridian-outputs"))
 
 from meridian_outputs import research_evidence as RE
+from meridian import handoff as handoff_module
 
 
 # ---------------------------------------------------------------------------
@@ -349,3 +358,115 @@ class TestBuildEnvelope:
         )
         assert good.is_authoritative is True
         assert bad.is_authoritative is False
+
+
+# ---------------------------------------------------------------------------
+# meridian/handoff.py bridge: _render_research_evidence_block (item 0ea8fd3c)
+#
+# Duck-typed, pure, synchronous -- exercised DIRECTLY rather than through the
+# full async generate_handoff() DB flow, since this helper is the entire
+# contract surface: meridian core never imports research_evidence.py itself
+# (see the helper's own docstring for why), so a real ProvenanceEnvelope
+# instance built here stands in for what a caller would actually pass.
+# ---------------------------------------------------------------------------
+
+class TestHandoffResearchEvidenceBlock:
+    def test_none_renders_empty(self):
+        assert handoff_module._render_research_evidence_block(None) == ""
+
+    def test_empty_dict_renders_empty(self):
+        assert handoff_module._render_research_evidence_block({}) == ""
+
+    def test_real_envelope_instance_delegates_to_to_markdown(self):
+        rec = _record(RE.EvidenceKind.OUTPUT, "clean-output")
+        env = RE.build_envelope(
+            records=[rec], envelope_id="env-1", generated_at="2026-08-21T00:00:00+00:00",
+        )
+        block = handoff_module._render_research_evidence_block(env)
+        assert block == env.to_markdown().strip()
+        assert "clean-output" in block
+        assert "never parsed back" in block.lower()
+
+    def test_real_envelope_partial_record_caveat_survives_into_handoff(self):
+        rec = _record(
+            RE.EvidenceKind.SOURCE, "shaky-source", partial=True,
+            partial_reason="DOI resolution still pending",
+            resolver=RE.ResolverState(status=RE.ResolverStatus.AMBIGUOUS, confidence=0.3),
+        )
+        env = RE.build_envelope(records=[rec], envelope_id="e", generated_at="t")
+        block = handoff_module._render_research_evidence_block(env)
+        line = [l for l in block.splitlines() if "shaky-source" in l][0]
+        assert "PARTIAL" in line
+        assert "AMBIGUOUS" in line
+        assert "DOI resolution still pending" in line
+
+    def test_canonical_dict_shape_renders_records_and_links(self):
+        claim = _record(RE.EvidenceKind.CLAIM, "claim-1")
+        source = _record(
+            RE.EvidenceKind.SOURCE, "source-1", partial=True,
+            partial_reason="not yet cross-checked",
+            resolver=RE.ResolverState(status=RE.ResolverStatus.HELD, confidence=0.2),
+        )
+        link = RE.EvidenceLink(
+            id="link-1", relation="cites", source_id="claim-1", target_id="source-1",
+            resolver=_verified_resolver(),
+        )
+        env = RE.build_envelope(
+            records=[claim, source], links=[link],
+            envelope_id="env-dict", generated_at="2026-08-21T00:00:00+00:00",
+        )
+        payload = RE.envelope_to_dict(env)
+
+        block = handoff_module._render_research_evidence_block(payload)
+        assert "## Research Evidence" in block
+        assert "env-dict" in block
+        assert "claim-1" in block
+        assert "source-1" in block
+        source_line = [l for l in block.splitlines() if "source-1" in l][0]
+        assert "PARTIAL" in source_line
+        assert "HELD" in source_line
+        assert "not yet cross-checked" in source_line
+        link_line = [l for l in block.splitlines() if "--[cites]-->" in l][0]
+        assert "claim-1" in link_line and "source-1" in link_line
+
+    def test_canonical_dict_verified_non_partial_record_has_no_caveat(self):
+        rec = _record(RE.EvidenceKind.CLAIM, "clean-claim")
+        env = RE.build_envelope(records=[rec], envelope_id="e", generated_at="t")
+        payload = RE.envelope_to_dict(env)
+        block = handoff_module._render_research_evidence_block(payload)
+        line = [l for l in block.splitlines() if "clean-claim" in l][0]
+        assert "PARTIAL" not in line
+        assert "VERIFIED" not in line
+        assert line.strip().endswith(")")  # no trailing " -- STATUS" caveat
+
+    def test_partial_envelope_flag_surfaced(self):
+        rec = _record(RE.EvidenceKind.OUTPUT, "r1")
+        env = RE.build_envelope(
+            records=[rec], envelope_id="e", generated_at="t",
+            partial=True, partial_reason="index still converging",
+        )
+        payload = RE.envelope_to_dict(env)
+        block = handoff_module._render_research_evidence_block(payload)
+        assert "PARTIAL ENVELOPE" in block
+        assert "index still converging" in block
+
+    def test_malformed_shape_degrades_to_empty_not_raise(self):
+        assert handoff_module._render_research_evidence_block("not a dict or envelope") == ""
+        assert handoff_module._render_research_evidence_block(123) == ""
+        assert handoff_module._render_research_evidence_block({"records": "not-a-list", "links": []}) == ""
+
+    def test_object_with_broken_to_markdown_degrades_to_empty(self):
+        class _Broken:
+            def to_markdown(self):
+                raise RuntimeError("boom")
+        assert handoff_module._render_research_evidence_block(_Broken()) == ""
+
+    def test_generate_handoff_accepts_research_evidence_envelope_kwarg(self):
+        """Purely a signature/wiring check (no DB round-trip needed here --
+        that's covered by this repo's existing handoff test suite for every
+        other optional parameter): the new kwarg must exist and default to
+        None so every pre-existing call site is unaffected."""
+        import inspect
+        sig = inspect.signature(handoff_module.generate_handoff)
+        assert "research_evidence_envelope" in sig.parameters
+        assert sig.parameters["research_evidence_envelope"].default is None

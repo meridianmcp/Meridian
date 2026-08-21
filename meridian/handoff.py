@@ -7093,6 +7093,110 @@ def _render_workspace_handoff_block(
     return "\n".join(lines).rstrip()
 
 
+def _render_research_evidence_block(envelope: Any) -> str:
+    """0ea8fd3c — render an optional, caller-supplied research-evidence
+    provenance envelope as an additive markdown block for the handoff body.
+
+    Duck-typed on purpose: meridian core never imports
+    ``extensions/meridian-outputs``'s ``research_evidence`` module — that
+    package is a separate, optionally-installed extension (its own
+    pyproject.toml/pixi.toml; see pixi.toml's 52cbe5d8 note) that this repo's
+    own ``pixi.toml`` does NOT declare as a pypi-dependency of meridian core,
+    mirroring the exact no-hard-dependency contract
+    ``meridian_outputs.provenance_status.get_manifest_backed_provenance_status``
+    already established for the opposite direction (that function consumes a
+    plain dict built by ``meridian.executor_contract`` without ever importing
+    meridian core). Accepts either:
+
+      - An object exposing a callable ``to_markdown()`` — e.g. a real
+        ``research_evidence.ProvenanceEnvelope`` instance — delegated to
+        directly, since that method already implements the "partial/
+        unresolved records must never look authoritative" caveat contract.
+      - A plain dict in the canonical ``envelope_to_dict()`` shape
+        (``envelope_id``, ``generated_at``, ``records``, ``links``,
+        ``partial``, ``partial_reason``) — e.g. round-tripped across a
+        process boundary via ``serialize_provenance_envelope(..., "json")``
+        + ``json.loads`` — rendered here with the SAME caveat contract,
+        reimplemented independently rather than imported.
+
+    Returns "" for ``None``/falsy input, or anything that is neither of the
+    above shapes, so a caller that never supplies an envelope sees zero
+    change to the rendered handoff — matches every other optional
+    ``_render_*_block`` helper in this module. Never raises: a malformed
+    envelope degrades to "" (best-effort, matches this module's own
+    established convention for enrichment blocks).
+    """
+    if not envelope:
+        return ""
+    to_markdown = getattr(envelope, "to_markdown", None)
+    if callable(to_markdown):
+        try:
+            rendered = to_markdown()
+        except Exception:  # noqa: BLE001 — rendering is best-effort, never fatal
+            return ""
+        return rendered.strip() if isinstance(rendered, str) else ""
+
+    if not isinstance(envelope, dict):
+        return ""
+    records = envelope.get("records")
+    links = envelope.get("links")
+    if not isinstance(records, list) or not isinstance(links, list):
+        return ""
+
+    def _caveat(item: dict[str, Any]) -> str:
+        resolver = item.get("resolver") or {}
+        status = str(resolver.get("status") or "unknown").upper()
+        is_partial = bool(item.get("partial"))
+        if status == "VERIFIED" and not is_partial:
+            return ""
+        caveat = f" — **{status}**"
+        if is_partial:
+            caveat += ", **PARTIAL**"
+            reason = item.get("partial_reason")
+            if reason:
+                caveat += f" ({reason})"
+        return caveat
+
+    try:
+        lines = [
+            "## Research Evidence",
+            "",
+            "_Read-only projection of a typed provenance envelope — partial "
+            "or unresolved records/links are always marked below, never "
+            "presented as authoritative._",
+            "",
+            f"- envelope_id: `{envelope.get('envelope_id', '?')}`",
+            f"- generated_at: `{envelope.get('generated_at', '?')}`",
+        ]
+        if envelope.get("partial"):
+            lines.append(
+                f"- **PARTIAL ENVELOPE** — {envelope.get('partial_reason') or 'reason not given'}"
+            )
+        lines.append("")
+        lines.append(f"### Records ({len(records)})")
+        if not records:
+            lines.append("_none_")
+        for rec in records:
+            identity = rec.get("identity") or {}
+            lines.append(
+                f"- `{identity.get('kind', '?')}` **{identity.get('id', '?')}** "
+                f"({identity.get('locator', '?')}){_caveat(rec)}"
+            )
+        lines.append("")
+        lines.append(f"### Links ({len(links)})")
+        if not links:
+            lines.append("_none_")
+        for link in links:
+            lines.append(
+                f"- `{link.get('source_id', '?')}` "
+                f"--[{link.get('relation', '?')}]--> `{link.get('target_id', '?')}`"
+                f"{_caveat(link)}"
+            )
+        return "\n".join(lines).rstrip()
+    except Exception:  # noqa: BLE001 — a malformed envelope must never break handoff generation
+        return ""
+
+
 def _render_custom_handoff(
     template: str,
     *,
@@ -9112,6 +9216,7 @@ async def generate_handoff(
     test_run_evidence: dict[str, Any] | None = None,
     test_run_repo_root: "str | None" = None,
     emit_manifest: bool = False,
+    research_evidence_envelope: Any = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -9425,6 +9530,24 @@ async def generate_handoff(
     the modes where the full pending-item list is resolved; other modes
     leave the passed dict untouched (documented gap, not silent — see the
     module's own KNOWN LIMITATIONS note near ``build_promotion_readiness_for_handoff``).
+
+    ``research_evidence_envelope`` (0ea8fd3c) — optional, ``None`` by
+    default. A caller-supplied typed research-evidence provenance envelope
+    (see ``extensions/meridian-outputs/meridian_outputs/research_evidence
+    .ProvenanceEnvelope`` / ``provenance_status.build_provenance_envelope``)
+    to render as an ADDITIVE "## Research Evidence" section in the handoff
+    body, via :func:`_render_research_evidence_block`. Accepts either a real
+    ``ProvenanceEnvelope`` instance (duck-typed via its ``to_markdown()``
+    method) or its canonical dict shape (``envelope_to_dict()``'s output,
+    e.g. round-tripped through JSON from another process) — meridian core
+    never imports the extension package itself, mirroring the same no-hard-
+    dependency contract ``get_manifest_backed_provenance_status`` already
+    established for the opposite direction. Rendered for ``mode in {"full",
+    "delta"}`` only (the same two modes ``promotion_readiness`` above
+    populates) — ``starter``/``compact``/``goal`` return earlier in this
+    function, before this section would be appended. A caller that passes
+    ``None`` (the default — every pre-existing call site) sees ZERO
+    functional change to the returned ``(path, content, amended)``.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -10399,6 +10522,17 @@ async def generate_handoff(
             f"{content}\n\n## Session narrative (from transcript)\n\n"
             f"{extra_narrative.strip()}\n"
         )
+
+    # 0ea8fd3c — optional, caller-supplied research-evidence provenance
+    # envelope (see _render_research_evidence_block's own docstring and the
+    # research_evidence_envelope parameter doc above). Purely additive: a
+    # caller that never passes this argument sees zero change to the
+    # rendered/persisted/returned content.
+    _research_evidence_block = _render_research_evidence_block(
+        research_evidence_envelope
+    )
+    if _research_evidence_block:
+        content = f"{content}\n\n{_research_evidence_block}"
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
