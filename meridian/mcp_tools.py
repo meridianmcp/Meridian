@@ -418,7 +418,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "the SAME body-hash/token-integrity mechanism (efaa918a) as the rest of the /goal "
         "block. Fails CLOSED, not silently widened: a missing/foreign/wrong-version/"
         "already-in_progress/otherwise-non-pending requested id raises a structured "
-        "refusal (HandoffSelectionError) — nothing is rendered or persisted for that call.",
+        "refusal (error=HANDOFF_SELECTION_BLOCKED, selection_rejected) — nothing is "
+        "rendered or persisted for that call. (7a373f41) A selection that validates "
+        "cleanly but collapses to zero executable items once the manual/backburner/"
+        "unprospected/wave-gate exclusion filters run instead refuses with "
+        "error=HANDOFF_SCOPE_NON_EXECUTABLE, requested_ids, and an excluded_requested "
+        "reason list — this same contract is identical across every connector surface "
+        "(hosted HTTP MCP, stdio, and the REST /handoff route).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"]},

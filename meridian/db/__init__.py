@@ -1124,6 +1124,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_sprint_item_artifact_declaration(db)
     await _migrate_docx_merge_manifests(db)
     await _migrate_proposal_evidence_links(db)
+    await _migrate_proposal_lineage(db)
     await _migrate_wave_base_manifests(db)
     await _migrate_sprint_batch_claims(db)
     await _migrate_sprint_batch_claims_reservation_fields(db)
@@ -12502,6 +12503,23 @@ from .proposal_links import (  # noqa: F401
     get_proposal_links,
     get_proposal_evidence,
     get_proposal_ids_for_project,
+)
+
+
+# 5a744f81 — first-class proposal-to-proposal lineage (typed parent/successor
+# links: supersedes/refines/forks/continues/duplicates/responds_to), distinct
+# from proposal_links' proposal-to-EVIDENCE linkage above. Imported
+# immediately after proposal_links since both sit on top of
+# workspace_proposals / _ws_tenant_clause (workspace.py, imported earlier)
+# and neither depends on the other.
+from .proposal_lineage import (  # noqa: F401
+    VALID_RELATION_TYPES,
+    _migrate_proposal_lineage,
+    link_proposal_lineage,
+    unlink_proposal_lineage,
+    get_proposal_lineage_links,
+    get_proposal_successors,
+    get_proposal_ancestors,
 )
 
 

@@ -221,3 +221,176 @@ async def test_stdio_generate_handoff_omitting_new_args_is_backward_compatible(
     assert "error" not in result
     assert "compat item" in result["content"]
     assert result["mode"] == "full"
+
+
+# ---------------------------------------------------------------------------
+# 6. 7a373f41 — selected_item_ids connector parity.
+#
+# meridian/handoff.py's generate_handoff(selected_item_ids=...) (cffb9323)
+# and its two structured refusals (HandoffSelectionError -> b6510123 fixed:
+# HANDOFF_SELECTION_BLOCKED; HandoffScopeNonExecutable -> fb82e51f:
+# HANDOFF_SCOPE_NON_EXECUTABLE) were already fully wired through the hosted
+# HTTP MCP dispatch (meridian/mcp/handler.py) and the REST route
+# (meridian/routes/handoff.py) before this sprint item, but had NO test
+# coverage proving parity through any connector surface, and the stdio
+# transport (this file's target) was missing the HandoffScopeNonExecutable
+# except clause entirely — an uncaught exception fell through to the generic
+# `except Exception` handler and returned an unstructured
+# {"error": "HandoffScopeNonExecutable: ..."} string instead of the same
+# {error: HANDOFF_SCOPE_NON_EXECUTABLE, project_id, requested_ids,
+# excluded_requested, message} shape the other two transports return. That
+# gap is fixed alongside these tests — see the new `except
+# handoff_module.HandoffScopeNonExecutable` clause in
+# meridian/mcp/stdio_handler.py's generate_handoff dispatch branch.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stdio_generate_handoff_schema_exposes_selected_item_ids(db, monkeypatch):
+    import mcp.types as mcp_types
+
+    server = _build_stdio_server(monkeypatch, db)
+    list_handler = server.request_handlers[mcp_types.ListToolsRequest]
+    listed = await list_handler(mcp_types.ListToolsRequest())
+    tool = next(t for t in listed.root.tools if t.name == "generate_handoff")
+    props = tool.inputSchema["properties"]
+
+    assert "selected_item_ids" in props
+    assert props["selected_item_ids"]["type"] == "array"
+    assert props["selected_item_ids"]["items"] == {"type": "string"}
+
+
+@pytest.mark.asyncio
+async def test_stdio_generate_handoff_selected_item_ids_excludes_unrelated(
+    db, monkeypatch
+):
+    """The exact acceptance criterion from the sprint item, exercised through
+    the stdio transport (not just the core generate_handoff function, which
+    already has thorough coverage in tests/test_handoff_item_selection.py):
+    a scoped handoff must contain the selected items and must NOT leak an
+    unrelated eligible item into the claimable /goal scope."""
+    project = await db_module.create_project(db, "stdio-selection-excludes")
+    a = await db_module.add_sprint_item(
+        db, project["id"], "v1", "stdio follow-up item A", force=True
+    )
+    b = await db_module.add_sprint_item(
+        db, project["id"], "v1", "stdio follow-up item B", force=True
+    )
+    unrelated = await db_module.add_sprint_item(
+        db, project["id"], "v1", "stdio unrelated batch item", force=True
+    )
+
+    server = _build_stdio_server(monkeypatch, db)
+    result = await _call_generate_handoff(
+        server,
+        {
+            "project_id": project["id"],
+            "mode": "goal",
+            "selected_item_ids": [a["id"], b["id"]],
+        },
+    )
+
+    assert "error" not in result
+    assert a["id"] in result["content"]
+    assert b["id"] in result["content"]
+    assert unrelated["id"] not in result["content"]
+    assert '<selected_item_scope requested="' in result["content"]
+
+
+@pytest.mark.asyncio
+async def test_stdio_generate_handoff_selection_error_returns_structured_error(
+    db, monkeypatch
+):
+    """An invalid selected_item_ids id (unknown/foreign/not-pending) must fail
+    CLOSED with the same structured shape the hosted HTTP MCP dispatch
+    (meridian/mcp/handler.py) and REST route (meridian/routes/handoff.py)
+    already return — mirrors this file's strict_evidence coverage above."""
+    project = await db_module.create_project(db, "stdio-selection-error")
+    await db_module.add_sprint_item(db, project["id"], "v1", "real pending item")
+
+    server = _build_stdio_server(monkeypatch, db)
+    result = await _call_generate_handoff(
+        server,
+        {
+            "project_id": project["id"],
+            "mode": "goal",
+            "selected_item_ids": ["totally-made-up-item-id"],
+        },
+    )
+
+    assert result["error"] == "HANDOFF_SELECTION_BLOCKED"
+    assert result["project_id"] == project["id"]
+    assert result["selection_rejected"] == [
+        {"id": "totally-made-up-item-id", "reason": "not_found"}
+    ]
+    assert "content" not in result
+    assert "path" not in result
+
+
+@pytest.mark.asyncio
+async def test_stdio_generate_handoff_scope_non_executable_returns_structured_error(
+    db, monkeypatch
+):
+    """Regression test for the stdio-transport parity gap this sprint item
+    fixes: a selected_item_ids scope that validates cleanly (the item is
+    genuinely pending, in this project/version) but collapses to zero
+    executable items once the manual/backburner/unprospected/wave-gate
+    exclusion filters run must refuse with the SAME structured
+    HANDOFF_SCOPE_NON_EXECUTABLE shape handler.py/routes/handoff.py already
+    returned — not an unstructured "HandoffScopeNonExecutable: ..." string
+    falling through to the generic exception handler."""
+    project = await db_module.create_project(db, "stdio-scope-non-executable")
+    manual_item = await db_module.add_sprint_item(
+        db, project["id"], "v1", "configure PyPI trusted publisher",
+        blocker_kind="manual", force=True,
+    )
+
+    server = _build_stdio_server(monkeypatch, db)
+    result = await _call_generate_handoff(
+        server,
+        {
+            "project_id": project["id"],
+            "mode": "goal",
+            "selected_item_ids": [manual_item["id"]],
+        },
+    )
+
+    assert result["error"] == "HANDOFF_SCOPE_NON_EXECUTABLE"
+    assert result["project_id"] == project["id"]
+    assert result["requested_ids"] == [manual_item["id"]]
+    assert result["excluded_requested"] == [
+        {"id": manual_item["id"], "reason": "not_in_pending_batch"}
+    ]
+    assert "content" not in result
+    assert "path" not in result
+
+
+@pytest.mark.asyncio
+async def test_stdio_generate_handoff_selected_item_ids_dependency_closure(
+    db, monkeypatch
+):
+    """Dependency closure (a selected item's still-pending depends_on ancestor
+    is pulled in automatically) must hold through the stdio transport too,
+    not just the core function."""
+    project = await db_module.create_project(db, "stdio-selection-closure")
+    parent = await db_module.add_sprint_item(
+        db, project["id"], "v1", "stdio prerequisite, still pending", force=True,
+    )
+    child = await db_module.add_sprint_item(
+        db, project["id"], "v1", "stdio follow-up item",
+        depends_on=parent["id"], force=True,
+    )
+
+    server = _build_stdio_server(monkeypatch, db)
+    result = await _call_generate_handoff(
+        server,
+        {
+            "project_id": project["id"],
+            "mode": "goal",
+            "selected_item_ids": [child["id"]],
+        },
+    )
+
+    assert "error" not in result
+    assert parent["id"] in result["content"]
+    assert child["id"] in result["content"]
