@@ -1137,6 +1137,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_executor_reports_table(db)
     await _migrate_wave_run_summaries(db)
     await _migrate_decision_evidence(db)
+    await _migrate_proposal_gates(db)
     await _migrate_ai_log_events_table(db)
     await _migrate_proposal_intake_drafts(db)
     await _migrate_profile_layers(db)
@@ -12114,6 +12115,7 @@ from .sprint_items import (  # noqa: F401
     fan_out_sprint_items,
     find_cross_project_dependency_mismatches,
     get_blocking_dependency_for_sprint_item,
+    get_sprint_item_blocking_gates,
     get_open_task_for_sprint_item,
     get_parallelizable_groups,
     get_project_blocker_policy,
@@ -12623,6 +12625,31 @@ from .decision_evidence import (  # noqa: F401
     list_decision_evidence,
     supersede_decision_evidence,
     reverse_decision_evidence,
+)
+
+# c6d13571 — typed proposal HITL gates (legal/IP, product scope, destructive
+# ops, production deploy, contradiction acceptance, other materially
+# ambiguous decisions): a durable, lane-blocking record distinct from both
+# decisions_pinned (informational "constitution") and decision_evidence (a
+# typed pointer backing one decision). Lives at the top-level
+# meridian.proposal_gates (not meridian/db/) mirroring meridian.handoff's
+# convention of a top-level module owning its own table's direct db.execute
+# calls; imported here last (after decision_evidence) purely for import
+# ordering, same as every import in this trailing block.
+from meridian.proposal_gates import (  # noqa: F401
+    GATE_CATEGORIES,
+    GATE_CATEGORY_LABELS,
+    GATE_STATES,
+    REOPEN_POLICIES,
+    ProposalGateError,
+    _migrate_proposal_gates,
+    create_gate as create_proposal_gate,
+    get_gate as get_proposal_gate,
+    list_gates as list_proposal_gates,
+    resolve_gate as resolve_proposal_gate,
+    reopen_gate as reopen_proposal_gate,
+    blocking_gates_for_sprint_item,
+    effective_state as proposal_gate_effective_state,
 )
 
 # 9e83be4a (Round 1 proposal e143949d) — canonical, versioned, append-only

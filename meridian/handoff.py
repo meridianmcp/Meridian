@@ -7919,6 +7919,62 @@ async def build_docx_integrity_gate_for_handoff(
         return None
 
 
+async def build_proposal_gate_readiness_for_handoff(
+    db: Any, project_id: str, *,
+    pending_items: "list[dict[str, Any]] | None" = None,
+) -> "dict[str, Any] | None":
+    """c6d13571 — thin, best-effort wrapper surfacing open typed proposal
+    HITL gates (see :mod:`meridian.proposal_gates`) for a handoff, mirroring
+    :func:`build_docx_integrity_gate_for_handoff` /
+    :func:`build_proposal_evidence_for_handoff`'s own wrapper convention so
+    all three "best-effort structured field" emissions follow one pattern.
+
+    An "open" gate is one whose :func:`meridian.proposal_gates.effective_state`
+    is NOT ``'allowed'`` — i.e. still ``blocked`` or ``quarantined`` (this
+    also picks up a ``manual``/``on_new_evidence`` decided gate that has
+    since expired-but-not-reopened, since ``effective_state`` only auto-flips
+    to ``blocked`` for ``reopen_policy='auto_on_expiry'`` — an expired
+    ``manual`` gate keeps reporting its last decided state here, which is
+    correct: nothing auto-reverted it).
+
+    When ``pending_items`` is given (the SAME list a handoff already
+    resolved), each open gate's ``affected`` sprint_item_id entries are
+    cross-referenced against those ids so the caller can see, at a glance,
+    which open gates actually bear on THIS handoff's pending work (returned
+    as ``blocking_pending_item_gate_ids``) as opposed to gates sitting open
+    against items not currently pending.
+
+    Returns ``None`` on any failure (e.g. the proposal_gates table/migration
+    is unavailable on this backend) so a caller can simply skip attaching
+    the field — never breaks the mandatory handoff, exactly like the two
+    sibling wrappers above.
+    """
+    try:
+        from meridian import proposal_gates as _gates_module  # noqa: PLC0415
+
+        all_gates = await _gates_module.list_gates(db, project_id)
+        open_gates = [
+            g for g in all_gates if _gates_module.effective_state(g) != "allowed"
+        ]
+        item_ids = {
+            it["id"] for it in (pending_items or [])
+            if isinstance(it, dict) and it.get("id")
+        }
+        blocking_ids: set[str] = set()
+        for gate in open_gates:
+            for entry in gate.get("affected") or []:
+                if isinstance(entry, dict) and entry.get("sprint_item_id") in item_ids:
+                    blocking_ids.add(gate["id"])
+                    break
+        return {
+            "open_gate_count": len(open_gates),
+            "gates": open_gates,
+            "blocking_pending_item_gate_ids": sorted(blocking_ids),
+        }
+    except Exception:  # noqa: BLE001 — proposal gate readiness is best-effort
+        return None
+
+
 # ---------------------------------------------------------------------------
 # 24f5146d — docx promotion base-hash readiness for generate_handoff.
 #

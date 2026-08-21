@@ -3209,6 +3209,53 @@ async def _migrate_pg_decision_evidence(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_proposal_gates(conn: PostgresConnection) -> None:
+    """c6d13571 — proposal_gates: typed proposal HITL gates (mirrors
+    meridian.proposal_gates._migrate_proposal_gates).
+
+    One row per lane-blocking gate: category (legal_ip / product_scope /
+    destructive_ops / production_deploy / contradiction_acceptance /
+    other_ambiguous), state (blocked / quarantined / allowed, defaulting to
+    'blocked' — fail-safe), the named question/affected/evidence fields, the
+    decision/actor/decided_at receipt (NULL until resolve_proposal_gate is
+    called), a one-hop previous_* snapshot for reopen_proposal_gate's audit
+    trail, and an expiry/reopen_policy pair. CREATE TABLE / INDEX IF NOT
+    EXISTS so re-running is a no-op.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS proposal_gates ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    category TEXT NOT NULL,"
+        "    state TEXT NOT NULL DEFAULT 'blocked',"
+        "    question TEXT NOT NULL,"
+        "    affected TEXT NOT NULL,"
+        "    evidence TEXT NOT NULL,"
+        "    decision TEXT,"
+        "    actor TEXT,"
+        "    decided_at TEXT,"
+        "    previous_decision TEXT,"
+        "    previous_actor TEXT,"
+        "    previous_decided_at TEXT,"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    updated_at TEXT,"
+        "    expires_at TEXT,"
+        "    reopen_policy TEXT NOT NULL DEFAULT 'manual',"
+        "    reopen_count INTEGER NOT NULL DEFAULT 0,"
+        "    reopened_at TEXT,"
+        "    reopen_reason TEXT,"
+        "    reopened_by TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_proposal_gates_project "
+        "ON proposal_gates(project_id);"
+        "CREATE INDEX IF NOT EXISTS idx_proposal_gates_project_state "
+        "ON proposal_gates(project_id, state);"
+        "CREATE INDEX IF NOT EXISTS idx_proposal_gates_project_category "
+        "ON proposal_gates(project_id, category);"
+    )
+
+
 async def _migrate_pg_ai_log_events(conn: PostgresConnection) -> None:
     """9e83be4a (Round 1 proposal e143949d) — ai_log_events: canonical,
     versioned, append-only ExecutionEvent storage (mirrors
@@ -4727,4 +4774,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_batch_claims_reservation_fields,
     _migrate_pg_profile_layers,
     _migrate_pg_wave_gate_version_unique_constraints,
+    _migrate_pg_proposal_gates,
 )

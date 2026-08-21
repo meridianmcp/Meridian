@@ -29,6 +29,10 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "generate_handoff": 'generate_handoff(project_id="abc-123", mode="delta", session_id="session-uuid")',
     "get_session_brief": 'get_session_brief(project_id="abc-123")',
     "archive_decision": 'archive_decision(decision_id="decision-uuid")',
+    "add_proposal_gate": 'add_proposal_gate(project_id="abc-123", category="destructive_ops", question="Drop the legacy table?", affected=["item-uuid"], evidence="no backup confirmed yet")',
+    "resolve_proposal_gate": 'resolve_proposal_gate(project_id="abc-123", gate_id="gate-uuid", state="allowed", decision="backup confirmed", actor="adam")',
+    "reopen_proposal_gate": 'reopen_proposal_gate(project_id="abc-123", gate_id="gate-uuid", actor="adam", reason="new evidence surfaced")',
+    "get_proposal_gates": 'get_proposal_gates(project_id="abc-123", sprint_item_id="item-uuid")',
     "checkpoint": 'checkpoint(session_id="session-uuid", project_id="abc-123")',
     "request_hitl": 'request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")',
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
@@ -693,6 +697,68 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
      "inputSchema": {"type": "object", "properties": {
          "decision_id": {"type": "string"}},
          "required": ["decision_id"]}},
+    {"name": "add_proposal_gate", "description":
+        "Raise a typed, lane-blocking HITL gate for a materially ambiguous decision — "
+        "legal/IP, product scope, destructive operations, production deployment, human "
+        "acceptance of a contradiction, or other materially ambiguous decisions "
+        "(category must be one of: legal_ip, product_scope, destructive_ops, "
+        "production_deploy, contradiction_acceptance, other_ambiguous). Always starts "
+        "state='blocked' (fail-safe) with no decision yet — routine read-only "
+        "decomposition and bounded fallback work never needs a gate. affected is a "
+        "non-empty list of sprint_item_id strings and/or generic pointer objects "
+        "({source_type, targets:[...]})  naming exactly what this gate blocks. Resolve "
+        "with resolve_proposal_gate once a human decides.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "category": {"type": "string", "enum": ["legal_ip", "product_scope", "destructive_ops", "production_deploy", "contradiction_acceptance", "other_ambiguous"]},
+         "question": {"type": "string", "description": "The materially ambiguous question this gate raises for human judgment."},
+         "affected": {"type": "array", "items": {}, "description": "Non-empty list of sprint_item_id strings and/or generic pointer objects naming what this gate blocks."},
+         "evidence": {"type": "string", "description": "Why this is ambiguous — the evidence that triggered raising the gate."},
+         "created_by": {"type": "string", "description": "Who/what raised this gate. Defaults to session_id when omitted."},
+         "session_id": {"type": "string"},
+         "expires_at": {"type": "string", "description": "Optional ISO timestamp after which the decision lapses (see reopen_policy)."},
+         "reopen_policy": {"type": "string", "enum": ["manual", "auto_on_expiry", "on_new_evidence"], "description": "manual (default): a decided gate stays decided until reopen_proposal_gate is called explicitly. auto_on_expiry: once expires_at passes, the gate reports 'blocked' again regardless of the last decision. on_new_evidence: same as manual, just a policy label for UIs."}},
+         "required": ["category", "question", "affected", "evidence"]}},
+    {"name": "resolve_proposal_gate", "description":
+        "Record a human decision on a proposal gate: the lane's new state "
+        "(blocked | quarantined | allowed), the free-text decision, and the actor who "
+        "decided (decided_at is auto-stamped). Refuses with {error} if the gate was "
+        "already decided and has not yet expired — call reopen_proposal_gate first. "
+        "An expired prior decision is treated as lapsed and a fresh decision is "
+        "accepted directly.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "gate_id": {"type": "string"},
+         "state": {"type": "string", "enum": ["blocked", "quarantined", "allowed"]},
+         "decision": {"type": "string", "description": "Free-text explanation of the decision."},
+         "actor": {"type": "string", "description": "Who made this decision."},
+         "expires_at": {"type": "string", "description": "Optionally update the expiry; omit to leave unchanged."},
+         "reopen_policy": {"type": "string", "enum": ["manual", "auto_on_expiry", "on_new_evidence"], "description": "Optionally update the reopen policy; omit to leave unchanged."}},
+         "required": ["gate_id", "state", "decision", "actor"]}},
+    {"name": "reopen_proposal_gate", "description":
+        "Invalidate a still-standing proposal gate decision (e.g. new evidence "
+        "surfaced) so resolve_proposal_gate can be called again. Resets the lane to "
+        "'blocked' (fail-safe), snapshots the prior decision into previous_decision / "
+        "previous_actor / previous_decided_at, and increments reopen_count. Refuses "
+        "with {error} if the gate was never decided.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "gate_id": {"type": "string"},
+         "actor": {"type": "string"},
+         "reason": {"type": "string"}},
+         "required": ["gate_id", "actor", "reason"]}},
+    {"name": "get_proposal_gates", "description":
+        "Read-only: list proposal HITL gates for a project, optionally filtered by "
+        "category and/or (raw, stored) state. Pass sprint_item_id to instead list only "
+        "the gates currently blocking/quarantining that one item (an effective-state-"
+        "aware view — an expired auto_on_expiry gate is included even if its stored "
+        "state says 'allowed').",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "category": {"type": "string", "enum": ["legal_ip", "product_scope", "destructive_ops", "production_deploy", "contradiction_acceptance", "other_ambiguous"]},
+         "state": {"type": "string", "enum": ["blocked", "quarantined", "allowed"]},
+         "sprint_item_id": {"type": "string", "description": "When given, returns only gates currently blocking/quarantining this sprint item (ignores category/state filters)."}},
+         "required": []}},
     {"name": "checkpoint", "description":
         "Save progress mid-session. Runs auto_capture (buckets done tasks into a note), "
         "generates a delta handoff, and returns a compact summary with what was done, "
@@ -3386,7 +3452,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
 
 _READ_ONLY_TOOLS = {
     "list_projects", "get_project_by_name", "get_goal", "get_notes", "read_note",
-    "get_pinned_decisions", "get_tasks", "search_tasks", "search_all", "search_synthesis",
+    "get_pinned_decisions", "get_proposal_gates", "get_tasks", "search_tasks", "search_all", "search_synthesis",
     "paper_search", "social_search", "github_search",
     "get_session_brief", "get_context_block", "get_hitl_request",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
@@ -3547,6 +3613,10 @@ _TOOL_CATEGORY: dict[str, str] = {
     "validate_assumption": "decisions",
     "get_pinned_decisions": "decisions",
     "archive_decision":    "decisions",
+    "add_proposal_gate":   "decisions",
+    "resolve_proposal_gate": "decisions",
+    "reopen_proposal_gate": "decisions",
+    "get_proposal_gates":  "decisions",
     # hitl
     "request_hitl":     "hitl",
     "get_hitl_request": "hitl",
@@ -3790,6 +3860,10 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "search_all":                "both",
     "search_synthesis":          "both",
     "get_pinned_decisions":      "both",
+    "add_proposal_gate":         "both",
+    "resolve_proposal_gate":     "both",
+    "reopen_proposal_gate":      "both",
+    "get_proposal_gates":        "both",
     "get_workspace_decisions":   "both",
     "get_workspace_notes":       "both",
     "add_workspace_note":        "both",
@@ -3915,6 +3989,10 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "get_pinned_decisions":       "common-support",
     "update_decision":            "common-support",
     "archive_decision":           "common-support",
+    "add_proposal_gate":          "common-support",
+    "resolve_proposal_gate":      "common-support",
+    "reopen_proposal_gate":       "common-support",
+    "get_proposal_gates":         "common-support",
     # goal / sprint read
     "get_goal":                   "common-support",
     "get_sprint_progress":        "common-support",
@@ -4090,6 +4168,10 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "pin_decision": "Pin Decision",
     "update_decision": "Update Decision",
     "archive_decision": "Archive Decision",
+    "add_proposal_gate": "Add Proposal Gate",
+    "resolve_proposal_gate": "Resolve Proposal Gate",
+    "reopen_proposal_gate": "Reopen Proposal Gate",
+    "get_proposal_gates": "Get Proposal Gates",
     "get_workspace_decisions": "Get Workspace Decisions",
     "pin_workspace_decision": "Pin Workspace Decision",
     "get_workspace_notes": "Get Workspace Notes",
