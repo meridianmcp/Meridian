@@ -7943,6 +7943,7 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_profile_layers",
         "_migrate_pg_wave_gate_version_unique_constraints",
         "_migrate_pg_proposal_gates",
+        "_migrate_pg_research_graph",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late

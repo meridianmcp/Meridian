@@ -18018,3 +18018,56 @@ def read_document_snapshot(
 # benchmark possible to build without first deciding anything about (d)'s
 # rollout gate.
 # ---------------------------------------------------------------------------
+
+
+def research_graph_document_identity(
+    source_path: str,
+    *,
+    element_id: str | None = None,
+    content_hash: str | None = None,
+) -> dict[str, Any]:
+    """b558892a -- a plain, dependency-free ``{node_type, identity_key,
+    revision, external_ref}`` shape describing one DOCX/XML document (or one
+    structural element within it) for Meridian's research artifact graph
+    (``meridian.research_graph`` / ``meridian.db.research_graph``, core
+    repo only).
+
+    This package is a standalone, ``uvx``-installable extension with NO
+    dependency on the core ``meridian`` distribution (see this package's
+    pyproject.toml and its own module docstrings noting the deliberately
+    vendored, decoupled parser) -- it must never import ``meridian.*``.
+    This function exists so a caller that DOES have both installed (the
+    core executor, or a future ingestion bridge) can build an identity
+    reference in the exact shape ``meridian.research_graph``'s
+    ``document_identity_key``/``create_node`` expect, without this package
+    taking on that dependency itself. Pure, synchronous, no I/O.
+
+    ``source_path`` is the document's path/uri (mirrors ``doc_documents.source``
+    and ``read_document_snapshot``'s ``docx_path``). ``element_id`` optionally
+    narrows the identity to one structural element within it (a ``doc_store``
+    element id / paraId -- the same value a ``node_id`` pointer selector in
+    ``meridian.pointers`` would carry). ``content_hash`` is the freshness/
+    revision proof -- pass the SAME ``source_sha256`` value
+    ``read_document_snapshot``/``index_docx_structure`` already compute for
+    this document, so the research graph's revision history and this
+    package's own staleness checks agree on what "changed" means.
+
+    Raises ``ValueError`` when ``source_path`` is blank -- mirrors
+    ``meridian.research_graph.document_identity_key``'s own validation
+    (duplicated here rather than imported, per this package's no-core-
+    dependency rule).
+    """
+    source_path = (source_path or "").strip()
+    if not source_path:
+        raise ValueError("research_graph_document_identity requires a non-empty source_path")
+    element_id = (element_id or "").strip() if isinstance(element_id, str) else ""
+    identity_key = f"{source_path}::{element_id}" if element_id else source_path
+    external_ref: dict[str, Any] = {"source": source_path}
+    if element_id:
+        external_ref["element_id"] = element_id
+    return {
+        "node_type": "document",
+        "identity_key": identity_key,
+        "revision": (content_hash or "").strip() or None,
+        "external_ref": external_ref,
+    }
