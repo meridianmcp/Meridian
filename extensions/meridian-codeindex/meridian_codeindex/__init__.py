@@ -25,6 +25,12 @@ call, not a Meridian feature wearing a native-sounding name.
 """
 from __future__ import annotations
 
+from .bm25_index import (
+    bm25_fallback_search,
+    lookup_exact,
+    refresh_subtree,
+    resolve_canonical_root,
+)
 from .code_index import (
     CodeChunk,
     CodeIndex,
@@ -60,6 +66,11 @@ from .vector_index import (
 __version__ = "0.1.0"
 
 __all__ = [
+    # 58e64c86 -- hardened local BM25 secondary path (bm25_index.py)
+    "bm25_fallback_search",
+    "lookup_exact",
+    "refresh_subtree",
+    "resolve_canonical_root",
     "CodeChunk",
     "CodeIndex",
     "MerkleDiff",
