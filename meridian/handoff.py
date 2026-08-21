@@ -2973,6 +2973,10 @@ def _build_quick_start_goal(
     identity: "str | None" = None,
     profile_generation_key: "str | None" = None,
     profile_restart_required: bool = False,
+    capability_status: "dict[str, Any] | None" = None,
+    hitl_gates: "list[dict[str, Any]] | None" = None,
+    proposal_scope_out: "dict[str, Any] | None" = None,
+    handoff_mode: str = "goal",
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -3023,6 +3027,22 @@ def _build_quick_start_goal(
     for the incident this closes). A caller that omits this argument, or
     never passes ``selected_scope`` in the first place, sees zero functional
     change to this function's return value.
+
+    ``capability_status``/``hitl_gates``/``proposal_scope_out``/
+    ``handoff_mode`` (7479e427) — purely additive, out-param-only inputs: when
+    ``proposal_scope_out`` is given (any dict, typically ``{}``), it is
+    populated in place with the unified proposal-run scope contract (see
+    :func:`build_proposal_run_scope`), built from the FINAL claimable batch
+    this function already computed (after the manual/backburner/unprospected/
+    wave-gate exclusions above) plus whatever ``capability_status``/
+    ``hitl_gates`` the caller passed through. This function's own RETURNED
+    STRING is completely unaffected by these three arguments — rendering the
+    ``<proposal_scope>`` tag into a /goal body is the caller's job (via
+    :func:`_build_proposal_scope_clause`, appended post-hoc the same way
+    ``_build_project_start_config_clause`` already is), so every existing
+    caller that omits these arguments sees zero behaviour change here.
+    ``handoff_mode`` is informational only (tags the built scope's own
+    ``mode`` field) and defaults to ``"goal"``.
 
     ``force_included_ids`` (0a65f5cc) — ids exempted from the
     backburner/deferred exclusion below (see ``_is_backburner_sprint_item``)
@@ -3427,6 +3447,58 @@ def _build_quick_start_goal(
                 "all_excluded": bool(_requested_scope_ids)
                 and not _executable_requested_ids,
             })
+    # 7479e427 — cheap, side, read-only recomputation of whether the three
+    # deterministic per-item contract clauses further below (tool_requirements/
+    # sprint_item_pointers/artifact_pointer_findings) will hit their
+    # full_contract_max_items cap for THIS render. Never mutates or replaces
+    # those clauses (computed independently, unchanged, further down) — used
+    # only to set the proposal-run scope's own `truncated` flag below. Safe
+    # even when the pending inventory is empty/short (pure in-memory list
+    # comprehensions, no DB/IO, mirrors the extraction those clauses already
+    # do on the SAME _all_pending_for_tool_requirements list).
+    _contract_truncated = False
+    if full_contract_max_items is not None and full_contract_max_items >= 0:
+        from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
+        _tr_n = len(capability_contract_module.extract_tool_requirements(
+            _all_pending_for_tool_requirements
+        ))
+        _pr_n = len(pointers_module.assemble_pointer_entries_from_annotated_items(
+            _all_pending_for_tool_requirements
+        ))
+        _af_n = len(pointers_module.assemble_artifact_pointer_findings_from_annotated_items(
+            _all_pending_for_tool_requirements
+        ))
+        _contract_truncated = (
+            _tr_n > full_contract_max_items
+            or _pr_n > full_contract_max_items
+            or _af_n > full_contract_max_items
+        )
+    # 7479e427 — unified proposal-run scope, built from the FINAL claimable
+    # batch (pending_sprint_items, after every exclusion filter above) plus
+    # the omitted-items-with-reason map already tracked for
+    # selected_scope_outcome (_scope_exclusion_reason_by_id). Populated
+    # regardless of whether selected_scope was ever passed for THIS call —
+    # see build_proposal_run_scope's own docstring. No-op (this function's
+    # return value is unaffected either way) unless the caller passed a
+    # non-None proposal_scope_out.
+    if proposal_scope_out is not None:
+        _omitted_for_scope = [
+            {"id": _oid, "reason": _oreason}
+            for _oid, _oreason in _scope_exclusion_reason_by_id.items()
+        ]
+        _proposal_run_scope = build_proposal_run_scope(
+            pending_sprint_items,
+            project_id=project_id,
+            effective_version=version,
+            omitted_items=_omitted_for_scope,
+            capability_status=capability_status,
+            hitl_gates=hitl_gates,
+            selected_scope=selected_scope,
+            truncated=_contract_truncated,
+            mode=handoff_mode,
+        )
+        proposal_scope_out.clear()
+        proposal_scope_out.update(_proposal_run_scope)
     # 682005f4 — computed against the FINAL filtered pending_sprint_items (after
     # manual/backburner/unprospected/wave-gate exclusion above), so a pointer
     # line never appears for an item that was itself excluded from the batch.
@@ -9184,6 +9256,306 @@ async def accept_handoff_envelope(
     }
 
 
+# 7479e427 — unified proposal-run scope: one immutable, structurally-validated
+# contract object shared by starter/goal/delta/full so the four handoff modes
+# can never disagree about what is in scope, what was omitted and why, what
+# capabilities/HITL gates are live, and whether the resulting handoff is safe
+# to treat as executable. Built ONCE per generate_handoff call (see
+# ``build_proposal_run_scope``/``_build_quick_start_goal``'s own
+# ``proposal_scope_out`` out-param) from data every mode ALREADY computes
+# (the final claimable batch + ``_scope_exclusion_reason_by_id``,
+# ``capability_status``, and pending HITL requests) -- this does not
+# re-derive any of that classification, it only assembles and validates it.
+#
+# Design note: prior to this item, HITL gates were only ever surfaced in
+# planner-mode prose (see ``_generate_planner_handoff``'s "Open decisions"
+# section) -- the four executor-facing modes (starter/goal/delta/full) had no
+# live-HITL signal at all, and the per-mode "omitted/excluded" reasoning
+# (manual/backburner/unprospected/wave_gate_pending) was rendered as prose
+# tags but never exposed as one structured, cross-mode-comparable object. A
+# caller could not tell, without re-deriving it from the rendered XML,
+# whether two different generate_handoff calls (or two different modes for
+# the SAME call) agreed on what was actually executable.
+# ---------------------------------------------------------------------------
+
+
+def _hash_proposal_scope_payload(payload: Any) -> str:
+    """Stable content hash for a proposal-run scope payload.
+
+    Canonical (sorted-key, compact-separator) JSON, hashed via the SAME
+    ``_hash_goal_body`` primitive ``closure_hash``/goal-token hashing already
+    uses elsewhere in this module -- one hashing convention, not two.
+    """
+    return _hash_goal_body(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    )
+
+
+def _validate_proposal_run_scope_integrity(
+    items: list[dict[str, Any]],
+    *,
+    dependencies: dict[str, str],
+    omitted_ids: "set[str]",
+    capability_status: dict[str, Any],
+    hitl_gates: list[dict[str, Any]],
+    truncated: bool,
+) -> list[str]:
+    """7479e427 -- "a syntactically incomplete or contradictory handoff must
+    never be emitted as executable."
+
+    Pure, synchronous, structural validation over an already-assembled scope
+    (no DB/IO) so it can run unconditionally every time a scope is built and
+    unit-test cleanly in isolation. Returns ``[]`` (consistent, safe to call
+    executable) or a list of machine-readable reason codes -- the SAME
+    ``executable_reasons`` vocabulary style ``capability_contract.py``/
+    ``executor_contract.py`` already use elsewhere in this codebase.
+
+    Checks, each chosen to be a GENUINE contradiction rather than an
+    ordinary/expected state (a legitimately-``done`` dependency that is
+    absent from both ``items`` and ``omitted_ids`` is normal and never
+    flagged -- only a dependency this SAME render explicitly excluded is a
+    real contradiction):
+
+    - ``duplicate_item_id`` -- the same item id appears twice in ``items``
+      (structural corruption of the scope itself).
+    - ``depends_on_omitted_item`` -- an in-scope item declares ``depends_on``
+      an id THIS SAME render put in ``omitted_items`` (manual/backburner/
+      unprospected/wave_gate_pending) -- i.e. the scope names an item as
+      executable-now while also declaring its own prerequisite blocked.
+    - ``required_capability_failed`` -- any ``capability_status`` entry is
+      ``status == "failed"`` (a genuinely broken capability, as opposed to
+      ``degraded``, which must stay VISIBLE -- see the ``build_proposal_run_scope``
+      docstring -- but does not by itself make the scope non-executable).
+    - ``content_truncated`` -- the deterministic per-item contract clauses
+      (tool_requirements/sprint_item_pointers/artifact_pointer_findings) hit
+      their bounded-profile cap for this render. Per the canonical receiver
+      contract: "Any TRUNCATED marker makes the compact handoff non-ready/
+      non-executable."
+    """
+    reasons: list[str] = []
+    seen_ids: set[str] = set()
+    for _it in items:
+        _iid = _it.get("id")
+        if _iid and _iid in seen_ids:
+            reasons.append(f"duplicate_item_id:{_iid}")
+        elif _iid:
+            seen_ids.add(_iid)
+    for _iid, _dep in dependencies.items():
+        if _dep in omitted_ids:
+            reasons.append(f"depends_on_omitted_item:{_iid}->{_dep}")
+    for _cap_id, _info in (capability_status or {}).items():
+        if isinstance(_info, dict) and _info.get("status") == "failed":
+            reasons.append(f"required_capability_failed:{_cap_id}")
+    if truncated:
+        reasons.append("content_truncated")
+    return reasons
+
+
+def build_proposal_run_scope(
+    pending_items: list[dict[str, Any]],
+    *,
+    project_id: "str | None",
+    effective_version: "str | None",
+    omitted_items: "list[dict[str, Any]] | None" = None,
+    capability_status: "dict[str, Any] | None" = None,
+    hitl_gates: "list[dict[str, Any]] | None" = None,
+    selected_scope: "dict[str, Any] | None" = None,
+    truncated: bool = False,
+    mode: str = "goal",
+) -> dict[str, Any]:
+    """7479e427 -- assemble ONE immutable proposal-run scope contract.
+
+    ``pending_items`` must already be the FINAL, fully-filtered executable
+    batch for this render (after manual/backburner/unprospected/wave-gate
+    exclusion -- exactly what ``_build_quick_start_goal`` renders under
+    ``<sprint_items>``), so ``items``/``waves``/``dependencies`` below
+    describe what THIS handoff actually proposes to execute, not the raw
+    pending inventory.
+
+    Returns a dict with:
+      - ``proposal_id`` -- short, stable identifier for this exact scope
+        (derived from ``content_hash``); two calls with the same project,
+        version, executable items and omissions always get the SAME id.
+      - ``mode`` / ``project_id`` / ``version``.
+      - ``items`` -- ``[{"id", "status", "parent_id", "depends_on", "wave"}]``
+        for every item in scope.
+      - ``waves`` -- ``{wave_label: [item_id, ...]}``, derived FROM ``items``
+        (so it can never reference an id outside the scope by construction).
+      - ``dependencies`` -- ``{item_id: depends_on_id}`` for items that
+        declare one.
+      - ``pointer_resolution_states`` -- ``{item_id: status}``, sourced from
+        each item's own ``pointer_resolution_status`` when
+        ``_annotate_resolved_pointers`` already ran (full/delta/goal), or
+        ``"unknown"`` when it didn't (starter/compact never resolves
+        pointers -- an honest, non-contradictory value, not an error).
+      - ``required_capabilities`` -- the SAME per-mode ``capability_status``
+        dict (``_CAP_*`` keys, ``verified``/``skipped``/``degraded``/
+        ``failed``) every mode already computes; degraded entries stay
+        visible here even when they do not flip ``executable`` (e.g. a
+        degraded code-intel/graph-search signal must remain visible in
+        executable status per the 2026-08-21 investigation note, not be
+        silently dropped).
+      - ``hitl_gates`` -- live pending HITL requests (bounded by the caller
+        for compact modes), so an executor-facing handoff finally carries
+        the same "open human decisions" signal planner-mode always had.
+      - ``omitted_items`` -- ``[{"id", "reason"}]`` for every item this
+        render excluded from the executable batch (manual/backburner/
+        unprospected/wave_gate_pending), independent of whether an explicit
+        ``selected_item_ids`` scope was ever passed.
+      - ``content_hash`` -- canonical hash of the scope's own identity
+        (project/version/items/omitted), stable across re-renders of the
+        identical underlying board state.
+      - ``truncated`` -- whether the bounded per-item contract clauses hit
+        their deterministic cap for this render.
+      - ``selected_scope_ids`` -- the explicit dependency-closure id list
+        when the caller passed ``selected_item_ids`` (mirrors
+        ``_build_selected_scope_clause``'s own data), else ``None``.
+      - ``executable`` / ``degraded`` / ``executable_reasons`` -- see
+        :func:`_validate_proposal_run_scope_integrity`. ``executable`` is
+        ALWAYS derived by that validator, never set directly by a caller --
+        this is what makes "never emitted as executable when contradictory"
+        a property of construction rather than something each call site
+        must remember to check.
+    """
+    items: list[dict[str, Any]] = []
+    waves: dict[str, list[str]] = {}
+    dependencies: dict[str, str] = {}
+    pointer_states: dict[str, str] = {}
+    for _it in pending_items:
+        _iid = _it.get("id")
+        if not _iid:
+            continue
+        _wave = _it.get("wave")
+        _dep = _it.get("depends_on")
+        items.append({
+            "id": _iid,
+            "status": _it.get("status"),
+            "parent_id": _it.get("parent_id"),
+            "depends_on": _dep,
+            "wave": _wave,
+        })
+        if _wave:
+            waves.setdefault(str(_wave), []).append(_iid)
+        if _dep:
+            dependencies[_iid] = _dep
+        _prs = _it.get("pointer_resolution_status")
+        if isinstance(_prs, dict):
+            if _prs.get("strict_satisfied"):
+                pointer_states[_iid] = "resolved"
+            elif _prs.get("target_resolved"):
+                pointer_states[_iid] = "target_resolved"
+            elif _prs.get("structural_valid"):
+                pointer_states[_iid] = "structural_only"
+            else:
+                pointer_states[_iid] = "unresolved"
+        else:
+            # starter/compact never runs _annotate_resolved_pointers — an
+            # honest, non-contradictory "unknown", not an error.
+            pointer_states[_iid] = "unknown"
+
+    omitted = [dict(o) for o in (omitted_items or []) if o.get("id")]
+    omitted_ids = {o["id"] for o in omitted}
+    capability_status = dict(capability_status or {})
+    hitl_gates = [dict(h) for h in (hitl_gates or [])]
+
+    _hash_payload = {
+        "project_id": project_id,
+        "version": effective_version,
+        "items": sorted(
+            ({"id": i["id"], "depends_on": i["depends_on"], "wave": i["wave"]} for i in items),
+            key=lambda r: r["id"],
+        ),
+        "omitted": sorted(omitted, key=lambda r: r.get("id", "")),
+    }
+    content_hash = _hash_proposal_scope_payload(_hash_payload)
+
+    reasons = _validate_proposal_run_scope_integrity(
+        items,
+        dependencies=dependencies,
+        omitted_ids=omitted_ids,
+        capability_status=capability_status,
+        hitl_gates=hitl_gates,
+        truncated=truncated,
+    )
+    return {
+        "proposal_id": content_hash[:16],
+        "mode": mode,
+        "project_id": project_id,
+        "version": effective_version,
+        "items": items,
+        "waves": waves,
+        "dependencies": dependencies,
+        "pointer_resolution_states": pointer_states,
+        "required_capabilities": capability_status,
+        "hitl_gates": hitl_gates,
+        "omitted_items": omitted,
+        "content_hash": content_hash,
+        "truncated": bool(truncated),
+        "selected_scope_ids": (
+            list(selected_scope.get("closure_item_ids") or [])
+            if selected_scope else None
+        ),
+        "executable": not reasons,
+        "degraded": bool(reasons),
+        "executable_reasons": reasons,
+    }
+
+
+def _build_proposal_scope_clause(
+    scope: "dict[str, Any] | None", *, compact: bool = True,
+) -> str:
+    """7479e427 -- render ``scope`` (see :func:`build_proposal_run_scope`) as
+    a ``<proposal_scope>`` tag, appended to a /goal body the SAME way
+    ``_build_project_start_config_clause``'s output is (post-``_build_quick_start_goal``,
+    pre-token-mint -- see that clause's own docstring for why it must never
+    be a post-mint patch). Returns ``""`` when ``scope`` is falsy so an
+    un-opted-in caller sees zero change.
+
+    ``compact=True`` (goal/starter) renders a small, deterministically-bounded
+    summary -- counts, not full per-item detail -- consistent with the
+    248c0bb9 bounded-profile convention (never re-introduce unbounded
+    serialization into a compact mode). ``compact=False`` (full/delta) also
+    includes the full omitted-items and HITL-gate detail.
+    """
+    if not scope:
+        return ""
+    _exec = "true" if scope.get("executable") else "false"
+    _deg = "true" if scope.get("degraded") else "false"
+    _trunc = "true" if scope.get("truncated") else "false"
+    _reasons = ", ".join(scope.get("executable_reasons") or []) or "none"
+    _n_items = len(scope.get("items") or [])
+    _n_omitted = len(scope.get("omitted_items") or [])
+    _n_hitl = len(scope.get("hitl_gates") or [])
+    _attrs = (
+        f'proposal_id="{_xml_escape(str(scope.get("proposal_id")))}" '
+        f'content_hash="{_xml_escape(str(scope.get("content_hash")))}" '
+        f'executable="{_exec}" degraded="{_deg}" truncated="{_trunc}" '
+        f'executable_reasons="{_xml_escape(_reasons)}"'
+    )
+    if compact:
+        body = (
+            f"{_n_items} item(s) in scope, {_n_omitted} omitted, "
+            f"{_n_hitl} HITL gate(s) open."
+        )
+        return f'\n<proposal_scope {_attrs}>{_xml_escape(body)}</proposal_scope>'
+    _hitl_lines = "\n".join(
+        f'  - [{(h.get("urgency") or "normal").upper()}] '
+        f'{(h.get("id") or "")[:8]} -- {(h.get("question") or "")[:200]}'
+        for h in (scope.get("hitl_gates") or [])
+    ) or "  - none"
+    _omitted_lines = "\n".join(
+        f'  - {o.get("id", "")[:8]} ({o.get("reason", "")})'
+        for o in (scope.get("omitted_items") or [])
+    ) or "  - none"
+    body = (
+        f"items_in_scope: {_n_items}\n"
+        f"waves: {json.dumps(scope.get('waves') or {}, sort_keys=True)}\n"
+        f"hitl_gates:\n{_hitl_lines}\n"
+        f"omitted_items:\n{_omitted_lines}"
+    )
+    return f'\n<proposal_scope {_attrs}>\n{_xml_escape(body)}\n</proposal_scope>'
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -9217,6 +9589,7 @@ async def generate_handoff(
     test_run_repo_root: "str | None" = None,
     emit_manifest: bool = False,
     research_evidence_envelope: Any = None,
+    proposal_scope: "dict[str, Any] | None" = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -9548,6 +9921,19 @@ async def generate_handoff(
     function, before this section would be appended. A caller that passes
     ``None`` (the default — every pre-existing call site) sees ZERO
     functional change to the returned ``(path, content, amended)``.
+
+    ``proposal_scope`` (7479e427) — optional output dict, same purely-additive
+    out-param shape as ``evidence_status``: when given (any dict, typically
+    ``{}``), populated in place with the SAME unified proposal-run scope
+    contract (see :func:`build_proposal_run_scope`) embedded in the rendered
+    ``<proposal_scope>`` tag for this call's mode — proposal id, in-scope
+    items (parent/child, dependencies, waves), pointer resolution states,
+    required capabilities, live HITL gates, omitted/deferred items, a content
+    hash, truncation state, and executable/degraded/executable_reasons. Built
+    for every executor-facing mode (``starter``/``compact``, ``goal``,
+    ``delta``, ``full``) — ``planner`` leaves this untouched, matching
+    ``evidence_status``'s own documented mode gap above. A caller that never
+    passes ``proposal_scope`` sees zero functional change.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -9637,6 +10023,7 @@ async def generate_handoff(
             evidence_status=evidence_status,
             strict_pointer_evidence=strict_pointer_evidence,
             selected_scope=_selected_scope,
+            proposal_scope=proposal_scope,
         )
         return (
             _st_path,
@@ -9662,6 +10049,7 @@ async def generate_handoff(
             force_include_rejected=force_include_rejected,
             selected_scope=_selected_scope,
             emit_manifest=emit_manifest,
+            proposal_scope=proposal_scope,
         )
         return (
             _g_path,
@@ -10084,6 +10472,17 @@ async def generate_handoff(
     _finalize_capability_status(
         _capability_status, evidence_status, strict_evidence=strict_evidence,
     )
+    # 7479e427 — live pending HITL gates for the unified proposal-run scope
+    # (see build_proposal_run_scope); guarded, fail-open, never breaks the
+    # mandatory handoff. full/delta carry full detail elsewhere, so this is
+    # bounded more generously than starter/goal's own 10-row cap.
+    _hitl_gates: list[dict[str, Any]] = []
+    try:
+        _hitl_gates = (
+            await db_module.list_hitl_requests(db, project_id, status="pending")
+        )[:20]
+    except Exception:  # noqa: BLE001
+        _hitl_gates = []
     # ecc8b280 — machine-readable continuation_required/terminal_ready state
     # over the SAME freshly re-queried, version-scoped board the pending list
     # above was just finalized against (falls back to the pre-freshness
@@ -10149,6 +10548,10 @@ async def generate_handoff(
     _profile_binding = await build_effective_profile_binding(
         db, project_id, session_id=session_id,
     )
+    # 7479e427 — always built locally so full/delta can render the
+    # <proposal_scope> tag below regardless of whether the caller opted into
+    # the proposal_scope out-param (mirrored into it afterward when given).
+    _full_proposal_scope: dict[str, Any] = {}
     # 60eed526 — deliberately NOT passing full_contract_max_items here even
     # when checkpoint=True: capping construction would also shrink what gets
     # WRITTEN to disk / the handoffs table / pending_goal (this same
@@ -10213,6 +10616,14 @@ async def generate_handoff(
         profile_restart_required=bool(
             _profile_binding.get("restart_required")
         ) if _profile_binding else False,
+        # 7479e427 — unified proposal-run scope; always built into a local
+        # dict (below) so full/delta can render the <proposal_scope> tag
+        # regardless of whether the top-level caller opted into the
+        # proposal_scope out-param.
+        capability_status=_capability_status,
+        hitl_gates=_hitl_gates,
+        proposal_scope_out=_full_proposal_scope,
+        handoff_mode=mode,
     )
     # fb82e51f — a selected_item_ids scope that validated cleanly (every id
     # genuinely pending) can still collapse to zero executable items once the
@@ -10247,6 +10658,21 @@ async def generate_handoff(
             shell=_shell_type_from_settings(proj_settings),
             test_cmd=_test_cmd_from_settings(proj_settings),
         )
+    # 7479e427 — append the unified proposal-run scope tag, same pre-mint
+    # placement as project_start_config above (part of the hashed body).
+    # Full detail (compact=False) for BOTH full and delta: neither passes a
+    # full_contract_max_items cap (see 60eed526's comment above), so this is
+    # where "detailed records stay in full/delta" (per the canonical
+    # receiver contract) actually lives — unlike project_start_config, this
+    # tag carries no literal test_cmd/shell string, so it does not trip
+    # test_handoff_generates_clean_markdown's content-cleanliness assertion
+    # and is safe to render for full mode too.
+    quick_start_goal = quick_start_goal + _build_proposal_scope_clause(
+        _full_proposal_scope, compact=False,
+    )
+    if proposal_scope is not None:
+        proposal_scope.clear()
+        proposal_scope.update(_full_proposal_scope)
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
     # _mint_and_embed_goal_token; 4611b9a2 also wires this into the
@@ -10840,6 +11266,7 @@ async def _generate_starter_handoff(
     evidence_status: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
     selected_scope: "dict[str, Any] | None" = None,
+    proposal_scope: "dict[str, Any] | None" = None,
 ) -> tuple[str, str]:
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
@@ -10959,6 +11386,16 @@ async def _generate_starter_handoff(
     _finalize_capability_status(
         _s_capability_status, evidence_status, strict_evidence=strict_evidence,
     )
+    # 7479e427 — live pending HITL gates for the unified proposal-run scope
+    # (see build_proposal_run_scope); guarded, fail-open, never breaks the
+    # mandatory handoff. Bounded to keep starter's compact profile small.
+    _s_hitl_gates: list[dict[str, Any]] = []
+    try:
+        _s_hitl_gates = (
+            await db_module.list_hitl_requests(db, project_id, status="pending")
+        )[:10]
+    except Exception:  # noqa: BLE001
+        _s_hitl_gates = []
     # d5849a67 — see the twin comment in generate_handoff: batch-resolve durable
     # pointer evidence so the starter handoff's excluded_unprospected list also
     # agrees with claim_sprint_item's own gate. Guarded, fail-open.
@@ -11025,6 +11462,16 @@ async def _generate_starter_handoff(
         profile_restart_required=bool(
             _s_profile_binding.get("restart_required")
         ) if _s_profile_binding else False,
+        # 7479e427 — unified proposal-run scope out-param; see
+        # build_proposal_run_scope's own docstring. Starter's rendered TEXT
+        # deliberately does NOT gain a new <proposal_scope> tag (its hard
+        # <=20-non-empty-line budget has no room — see the twin
+        # <project_start_config> precedent a few lines below), but the
+        # structured object is still exposed here for a programmatic caller.
+        capability_status=_s_capability_status,
+        hitl_gates=_s_hitl_gates,
+        proposal_scope_out=proposal_scope,
+        handoff_mode="starter",
     )
     # fb82e51f — fail CLOSED before the token is minted or anything is
     # written/persisted. See HandoffScopeNonExecutable's own docstring.
@@ -11089,6 +11536,7 @@ async def _generate_goal_only_handoff(
     force_include_rejected: "list[dict[str, Any]] | None" = None,
     selected_scope: "dict[str, Any] | None" = None,
     emit_manifest: bool = False,
+    proposal_scope: "dict[str, Any] | None" = None,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
 
@@ -11298,6 +11746,16 @@ async def _generate_goal_only_handoff(
     _finalize_capability_status(
         _g_capability_status, evidence_status, strict_evidence=strict_evidence,
     )
+    # 7479e427 — live pending HITL gates for the unified proposal-run scope
+    # (see build_proposal_run_scope); guarded, fail-open, never breaks the
+    # mandatory handoff. Bounded to keep the goal-only profile small.
+    _g_hitl_gates: list[dict[str, Any]] = []
+    try:
+        _g_hitl_gates = (
+            await db_module.list_hitl_requests(db, project_id, status="pending")
+        )[:10]
+    except Exception:  # noqa: BLE001
+        _g_hitl_gates = []
     _pointer_evidence_ids = None
     try:
         _pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
@@ -11319,6 +11777,10 @@ async def _generate_goal_only_handoff(
     # profile-identity signal. No session_id in scope for this mode (see
     # this function's own signature). Best-effort: None on any failure.
     _g_profile_binding = await build_effective_profile_binding(db, project_id)
+    # 7479e427 — always built locally so the <proposal_scope> tag can render
+    # below regardless of whether the caller opted into the proposal_scope
+    # out-param (mirrored into it afterward when given).
+    _g_proposal_scope: dict[str, Any] = {}
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=_g_execution_mode,
@@ -11372,6 +11834,14 @@ async def _generate_goal_only_handoff(
         profile_restart_required=bool(
             _g_profile_binding.get("restart_required")
         ) if _g_profile_binding else False,
+        # 7479e427 — unified proposal-run scope; always built into a local
+        # dict (below) so goal mode can render the <proposal_scope> tag
+        # regardless of whether the top-level generate_handoff caller opted
+        # into the proposal_scope out-param.
+        capability_status=_g_capability_status,
+        hitl_gates=_g_hitl_gates,
+        proposal_scope_out=_g_proposal_scope,
+        handoff_mode="goal",
     )
     # fb82e51f — fail CLOSED before the token is minted or anything is
     # written/persisted. See HandoffScopeNonExecutable's own docstring.
@@ -11420,6 +11890,15 @@ async def _generate_goal_only_handoff(
         shell=_shell_type_from_settings(proj_settings),
         test_cmd=_test_cmd_from_settings(proj_settings),
     )
+    # 7479e427 — append the unified proposal-run scope tag, same pre-mint
+    # placement as project_start_config above (part of the hashed body).
+    # Compact form: goal is one of the two bounded profiles (with starter).
+    quick_start_goal = quick_start_goal + _build_proposal_scope_clause(
+        _g_proposal_scope, compact=True,
+    )
+    if proposal_scope is not None:
+        proposal_scope.clear()
+        proposal_scope.update(_g_proposal_scope)
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.
     quick_start_goal = await _mint_and_embed_goal_token(db, project_id, quick_start_goal)
