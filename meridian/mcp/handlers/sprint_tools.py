@@ -690,6 +690,32 @@ async def handle_get_sprint_progress(
         )
     except Exception:  # noqa: BLE001
         pass
+    # 7479e427 — surface live pending HITL gates so a polling executor sees
+    # the SAME "open human decisions blocking progress" signal
+    # generate_handoff's own unified proposal-run scope carries
+    # (build_proposal_run_scope's `hitl_gates` field) — previously ONLY
+    # planner-mode prose (_generate_planner_handoff's "Open decisions"
+    # section) surfaced pending HITL requests at all; an executor polling
+    # get_sprint_progress mid-run had no way to learn one existed short of a
+    # separate list_hitl_requests call. Guarded: never break the progress poll.
+    try:
+        _pending_hitl = await db_module.list_hitl_requests(
+            db, args["project_id"], status="pending"
+        )
+        if _pending_hitl:
+            _resp_progress["hitl_gates"] = {
+                "count": len(_pending_hitl),
+                "items": [
+                    {
+                        "id": h.get("id"),
+                        "urgency": h.get("urgency"),
+                        "question": (h.get("question") or "")[:200],
+                    }
+                    for h in _pending_hitl[:10]
+                ],
+            }
+    except Exception:  # noqa: BLE001
+        pass
     return _resp_progress
 
 
