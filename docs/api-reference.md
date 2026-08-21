@@ -1035,6 +1035,7 @@ No auth required.
 | `POST` | `/projects/{project_id}/goal/north-star` | v0.5.2 — update only the north star field |
 | `POST` | `/projects/{project_id}/goal/sprint` | v0.5.2 — update only the sprint field |
 | `POST` | `/projects/{project_id}/handoff` | Render and write the handoff file for a project |
+| `POST` | `/projects/{project_id}/handoff/accept` | 1bd5e810 — REST mirror of the MCP ``accept_handoff`` tool — see |
 | `POST` | `/projects/{project_id}/handoff/corrections` | 3af86d28 — record a corrective handoff for a blocked executor session |
 | `GET` | `/projects/{project_id}/handoff/corrections/latest` | 3af86d28 — load a corrective handoff directly (never reconstruct from notes) |
 | `GET` | `/projects/{project_id}/handoff/planner` | GET the planner-optimised handoff for a project |

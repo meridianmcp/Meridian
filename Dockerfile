@@ -18,6 +18,18 @@ RUN uv pip install --system .
 # Copy the rest of the app
 COPY . .
 
+# 746f5244 -- explicitly install the detachable meridian-codeindex extension
+# (extensions/meridian-codeindex, its own standalone pyproject.toml) so
+# `import meridian_codeindex` resolves via normal site-packages in this image,
+# not only via meridian/code_index.py's vendored-sys.path fallback (d5e60791).
+# That fallback is a correct safety net for a stale/pre-existing process whose
+# env predates this wiring, but a freshly built image should install the
+# package properly rather than relying on it as the only path. meridian-outputs
+# is intentionally NOT installed here -- it runs as its own separate `uvx`
+# subprocess (see extensions/meridian-outputs), never imported into the main
+# server process.
+RUN uv pip install --system ./extensions/meridian-codeindex
+
 EXPOSE 8000
 
 # Cache-bust query param for static assets. git is not installed in this

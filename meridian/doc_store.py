@@ -927,7 +927,14 @@ def _append_mathml(node: Any, parent: Any) -> None:
             _append_mathml(child, parent)
         return
     if tag in _MATHML_TEXT_TAGS:
-        _append_run(parent, node.text or "")
+        text = node.text or ""
+        if text.strip().casefold() in {"min", "max", "argmin", "argmax", "sup", "inf"}:
+            func = _LET.SubElement(parent, _om("func"))
+            f_name = _LET.SubElement(func, _om("fName"))
+            _append_run(f_name, text)
+            _LET.SubElement(func, _om("e"))
+        else:
+            _append_run(parent, text)
         return
     if tag == "msup":
         kids = list(node)
@@ -975,11 +982,13 @@ def _append_mathml(node: Any, parent: Any) -> None:
         den = kids[1] if len(kids) > 1 else None
         f = _LET.SubElement(parent, _om("f"))
         n_el = _LET.SubElement(f, _om("num"))
+        n_expr = _LET.SubElement(n_el, _om("e"))
         if num is not None:
-            _append_mathml(num, n_el)
+            _append_mathml(num, n_expr)
         d_el = _LET.SubElement(f, _om("den"))
+        d_expr = _LET.SubElement(d_el, _om("e"))
         if den is not None:
-            _append_mathml(den, d_el)
+            _append_mathml(den, d_expr)
         return
     if tag == "msqrt":
         rad = _LET.SubElement(parent, _om("rad"))
@@ -1005,8 +1014,48 @@ def _append_mathml(node: Any, parent: Any) -> None:
         return
     if tag == "mfenced":
         d = _LET.SubElement(parent, _om("d"))
+        expr = _LET.SubElement(d, _om("e"))
         for child in node:
-            _append_mathml(child, d)
+            _append_mathml(child, expr)
+        return
+    if tag == "mtable":
+        arr = _LET.SubElement(parent, _om("eqArr"))
+        for row in node:
+            if _local_tag(row) != "mtr":
+                continue
+            row_expr = _LET.SubElement(arr, _om("e"))
+            for cell in row:
+                cell_expr = _LET.SubElement(row_expr, _om("e"))
+                for child in cell:
+                    _append_mathml(child, cell_expr)
+        return
+    if tag in {"munder", "mover", "munderover"}:
+        kids = list(node)
+        base = kids[0] if kids else None
+        lower = kids[1] if tag == "munder" and len(kids) > 1 else None
+        upper = kids[1] if tag == "mover" and len(kids) > 1 else None
+        if tag == "munderover":
+            lower = kids[1] if len(kids) > 1 else None
+            upper = kids[2] if len(kids) > 2 else None
+        upper_text = _node_text(upper).strip() if upper is not None else ""
+        if tag == "mover" and len(upper_text) == 1 and upper_text in {"^", "~", "¯", "ˉ", "→", "⃗", "ˆ"}:
+            acc = _LET.SubElement(parent, _om("acc"))
+            acc_pr = _LET.SubElement(acc, _om("accPr"))
+            _LET.SubElement(acc_pr, _om("chr"), {_om("val"): upper_text})
+            expr = _LET.SubElement(acc, _om("e"))
+            if base is not None:
+                _append_mathml(base, expr)
+            return
+        container = _LET.SubElement(parent, _om("nary" if tag == "munderover" else ("limLow" if tag == "munder" else "limUpp")))
+        expr = _LET.SubElement(container, _om("e"))
+        if base is not None:
+            _append_mathml(base, expr)
+        if lower is not None:
+            target = _LET.SubElement(container, _om("sub" if tag == "munderover" else "lim"))
+            _append_mathml(lower, target)
+        if upper is not None:
+            target = _LET.SubElement(container, _om("sup" if tag == "munderover" else "lim"))
+            _append_mathml(upper, target)
         return
     # Unrecognized construct (mtable/mmultiscripts/menclose/...) — degrade to a
     # literal flattened text run so the rest of the expression still converts.
@@ -1039,7 +1088,9 @@ def latex_to_omml(latex: str | None) -> str | None:
         mathml = _l2m.convert(latex)
         mathml_root = _LET.fromstring(mathml.encode("utf-8"))
         omath = _mathml_to_omml(mathml_root)
-        return _LET.tostring(omath, encoding="unicode")
+        raw = _LET.tostring(omath, encoding="unicode")
+        _validate_omml_structure(raw)
+        return raw
     except Exception:  # noqa: BLE001 — conversion is best-effort, never raises
         _log.debug("latex_to_omml failed for %r", latex, exc_info=True)
         return None
@@ -1062,6 +1113,47 @@ def _omml_flatten_text(omml_raw: str | None) -> str:
     except Exception:  # noqa: BLE001
         return ""
     return "".join(t.text or "" for t in el.iter(_om("t")))
+
+
+_OMML_REQUIRED_CHILDREN: dict[str, tuple[str, ...]] = {
+    "f": ("num", "den"), "sSub": ("e", "sub"), "sSup": ("e", "sup"),
+    "sSubSup": ("e", "sub", "sup"), "rad": ("e",), "acc": ("accPr", "e"),
+    "d": ("e",), "eqArr": ("e",), "func": ("fName", "e"),
+    "limLow": ("e", "lim"), "limUpp": ("e", "lim"), "nary": ("e",),
+}
+_OMML_FALLBACK_MARKERS = {
+    "fraction": {"f"}, "cases": {"eqArr"}, "matrix": {"eqArr"},
+    "summation": {"nary", "limLow", "limUpp"}, "subscript": {"sSub", "sSubSup"},
+    "superscript": {"sSup", "sSubSup"}, "argmin": {"func", "nary", "limLow", "limUpp"},
+}
+
+
+def _validate_omml_structure(omml_raw: str) -> Any:
+    """Validate one semantic ``m:oMath`` before a source DOCX is mutated."""
+    try:
+        root = _LET.fromstring(omml_raw.encode("utf-8") if isinstance(omml_raw, str) else bytes(omml_raw))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"OMML payload is not valid XML: {exc}") from exc
+    if root.tag == _om("oMathPara"):
+        raise ValueError("OMML m:oMath root required; m:oMathPara is not accepted for insertion")
+    if root.tag != _om("oMath"):
+        raise ValueError(f"OMML m:oMath root required; got m:{_local_tag(root)}")
+    for element in root.iter():
+        name = _local_tag(element)
+        required = _OMML_REQUIRED_CHILDREN.get(name)
+        if required:
+            children = {_local_tag(child) for child in element}
+            missing = [child for child in required if child not in children]
+            if missing:
+                raise ValueError(f"OMML <m:{name}> is missing required child element(s): {', '.join(missing)}")
+        if name in {"num", "den"} and element.find(_om("e")) is None:
+            raise ValueError(f"OMML <m:{name}> must contain <m:e>")
+    flat = _omml_flatten_text(omml_raw).casefold()
+    names = {_local_tag(element) for element in root.iter()}
+    for marker, structural_names in _OMML_FALLBACK_MARKERS.items():
+        if marker in flat and not names.intersection(structural_names):
+            raise ValueError(f"OMML contains flattened fallback text {marker!r} without its structural element")
+    return root
 
 
 def parse_docx_equations(source: str | bytes | bytearray) -> list[dict[str, Any]]:
@@ -2092,7 +2184,7 @@ def _resolve_docx_draft_dest(
 
 def _insert_omath_at_position(
     paragraph: Any, omath_el: Any, position: str
-) -> None:
+) -> tuple[str | None, str | None]:
     """Insert a parsed ``<m:oMath>`` element relative to ``paragraph`` in place.
 
     * ``append``  -- append the ``<m:oMath>`` as the last child *inside* the
@@ -2108,21 +2200,43 @@ def _insert_omath_at_position(
     """
     if position == "append":
         paragraph.append(omath_el)
-        return
+        return None, None
     # before / after -- build a standalone paragraph carrying the equation.
     new_p = _LET.Element(f"{{{_DOCX_W_NS}}}p")
+    root = paragraph.getroottree().getroot() if hasattr(paragraph, "getroottree") else None
+    w14_para_id = f"{{{_DOCX_W14_NS}}}paraId"
+    w14_text_id = f"{{{_DOCX_W14_NS}}}textId"
+    taken_para_ids = {
+        value for p in (root.iter(f"{{{_DOCX_W_NS}}}p") if root is not None else ())
+        if (value := p.get(w14_para_id))
+    }
+    taken_text_ids = {
+        value for p in (root.iter(f"{{{_DOCX_W_NS}}}p") if root is not None else ())
+        if (value := p.get(w14_text_id))
+    }
+    para_id = _mint_para_id(taken_para_ids)
+    text_id = _mint_para_id(taken_text_ids)
+    new_p.set(w14_para_id, para_id)
+    new_p.set(w14_text_id, text_id)
+    p_pr = _LET.SubElement(new_p, f"{{{_DOCX_W_NS}}}pPr")
+    _LET.SubElement(
+        p_pr,
+        f"{{{_DOCX_W_NS}}}jc",
+        {f"{{{_DOCX_W_NS}}}val": "center"},
+    )
     new_p.append(omath_el)
     parent = paragraph.getparent()
     if parent is None:
         # No parent to splice into (a detached paragraph) -- degrade to an inline
         # append so the equation is never silently dropped.
         paragraph.append(omath_el)
-        return
+        return None, None
     index = list(parent).index(paragraph)
     if position == "before":
         parent.insert(index, new_p)
     else:  # after
         parent.insert(index + 1, new_p)
+    return para_id, text_id
 
 
 def _paragraph_plain_text(p: Any) -> str:
@@ -3454,7 +3568,10 @@ class DocStructureStore:
         stale_warning = await _docx_staleness_check(doc_row, docx_path)
 
         # --- resolve the OMML to insert (fail before touching the file) --------
-        omml_raw = await self._resolve_omml_payload(document_id, equation_id_or_omml)
+        try:
+            omml_raw = await self._resolve_omml_payload(document_id, equation_id_or_omml)
+        except ValueError as exc:
+            return {"error": str(exc)}
         if omml_raw is None:
             return {
                 "error": (
@@ -3484,7 +3601,7 @@ class DocStructureStore:
             )
         except Exception as exc:  # noqa: BLE001 — payload wasn't valid XML after all
             return {"error": f"resolved OMML is not valid XML: {exc}"}
-        _insert_omath_at_position(paragraph, omath_el, pos)
+        inserted_para_id, inserted_text_id = _insert_omath_at_position(paragraph, omath_el, pos)
         try:
             transaction = _save_docx_xml(raw, root, docx_path)
         except Exception as exc:  # noqa: BLE001 — write failure (perms/disk)
@@ -3498,6 +3615,8 @@ class DocStructureStore:
             "para_id": para_id,
             "position": pos,
             "omml": _LET.tostring(omath_el, encoding="unicode"),
+            "inserted_para_id": inserted_para_id,
+            "inserted_text_id": inserted_text_id,
             "resync": resync,
             # dccc2311 — deterministic identifier of exactly what this write
             # transaction changed (see _docx_manifest_hash).
@@ -3527,12 +3646,17 @@ class DocStructureStore:
         existing = await self.get_equations(document_id)
         for eq in existing:
             if eq.get("id") == raw and eq.get("omml_raw"):
+                _validate_omml_structure(eq["omml_raw"])
                 return eq["omml_raw"]
         # (2) raw OMML XML.
         if raw.startswith("<"):
+            _validate_omml_structure(raw)
             return raw
         # (3) LaTeX source.
-        return latex_to_omml(raw)
+        converted = latex_to_omml(raw)
+        if converted is not None:
+            _validate_omml_structure(converted)
+        return converted
 
     # -- figures (semantic index) — c623e648 ---------------------------------
 

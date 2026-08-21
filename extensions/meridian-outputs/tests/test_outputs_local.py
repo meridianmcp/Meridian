@@ -2296,6 +2296,73 @@ class TestParallelRebuildCorrectness:
         assert count == 1, f"Expected 1 row, got {count} (duplicate rows introduced)"
         idx.close()
 
+    @duckdb_required
+    def test_absolute_and_relative_roots_share_canonical_rows(self, tmp_path: Path) -> None:
+        """Restarting with a relative spelling of the same root must not
+        duplicate the persisted row keys."""
+        f = tmp_path / "data.csv"
+        f.write_text("x\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-index.duckdb")
+        absolute_root = str(tmp_path.resolve())
+        relative_root = os.path.relpath(absolute_root, start=os.getcwd())
+
+        first = OL.OutputsFtsIndex(absolute_root, db_path=db_path)
+        try:
+            assert first.rebuild() == 1
+        finally:
+            first.close()
+
+        second = OL.OutputsFtsIndex(relative_root, db_path=db_path)
+        try:
+            second.rebuild()
+            rows = second._con.execute("SELECT path FROM outputs_index").fetchall()
+            assert len(rows) == 1
+            assert rows[0][0] == os.path.abspath(os.path.normpath(str(f)))
+        finally:
+            second.close()
+
+    @duckdb_required
+    def test_rebuild_repairs_legacy_duplicate_path_rows(self, tmp_path: Path) -> None:
+        """A rebuild repairs duplicate rows left by the old path-spelling bug."""
+        import duckdb
+
+        f = tmp_path / "data.csv"
+        f.write_text("x\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-legacy.duckdb")
+        absolute_path = os.path.abspath(os.path.normpath(str(f)))
+        legacy_path = os.path.relpath(absolute_path, start=os.getcwd())
+
+        first = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            assert first.rebuild() == 1
+        finally:
+            first.close()
+
+        con = duckdb.connect(db_path)
+        try:
+            con.execute(
+                "INSERT INTO outputs_index (path, content, mtime, sha256, size, "
+                "generating_script, kind, is_archival, canonical_path, "
+                "csv_columns, json_keys) "
+                "SELECT ?, content, mtime, sha256, size, generating_script, kind, "
+                "is_archival, canonical_path, csv_columns, json_keys "
+                "FROM outputs_index WHERE path = ?",
+                [legacy_path, absolute_path],
+            )
+        finally:
+            con.close()
+
+        repaired = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            assert repaired.rebuild() == 1
+            rows = repaired._con.execute(
+                "SELECT path FROM outputs_index"
+            ).fetchall()
+            assert rows == [(absolute_path,)]
+            assert len(repaired.search("x")) == 1
+        finally:
+            repaired.close()
+
     def test_worker_failure_falls_back_gracefully(self, tmp_path: Path) -> None:
         """If a worker raises, the file is re-analysed synchronously and indexed."""
         f = tmp_path / "ok.csv"
@@ -5673,3 +5740,67 @@ class TestAncestorDiskCacheRedirect:
 
         status_via_parent = OL.get_indexed_output_status(str(parent), str(f))
         assert status_via_parent["row"] is not None
+
+
+# ---------------------------------------------------------------------------
+# research_graph_output_identity (ce2f3750 regression)
+# ---------------------------------------------------------------------------
+
+class TestResearchGraphOutputIdentity:
+    """Regression coverage for research_graph_output_identity.
+
+    ce2f3750: CI's blocking ruff pass (F821, undefined-name) failed on a
+    stray, unreachable ``return result`` line that followed the function's
+    real ``return {...}`` statement -- ``result`` was never assigned
+    anywhere in the function. The dead line was removed; nothing else about
+    the function changed. This function previously had zero test coverage,
+    so these tests both lock in its documented return shape and would flag
+    a future edit that reintroduces an incremental result-building pattern
+    (e.g. ``result = {}; ...; return result``) with a missing assignment."""
+
+    def test_prefers_sha256_over_path_when_both_given(self) -> None:
+        out = OL.research_graph_output_identity(path="/tmp/fig.png", sha256="abc123")
+        assert out == {
+            "node_type": "output",
+            "identity_key": "sha256:abc123",
+            "revision": "abc123",
+            "external_ref": {"path": "/tmp/fig.png", "sha256": "abc123"},
+        }
+
+    def test_falls_back_to_path_when_no_sha256(self) -> None:
+        out = OL.research_graph_output_identity(path="/tmp/fig.png")
+        assert out["node_type"] == "output"
+        assert out["identity_key"] == "/tmp/fig.png"
+        assert out["revision"] is None
+        assert out["external_ref"] == {"path": "/tmp/fig.png"}
+
+    def test_reads_from_row_argument(self) -> None:
+        row = {"canonical_path": "/tmp/fig.png", "sha256": "deadbeef"}
+        out = OL.research_graph_output_identity(row=row)
+        assert out["identity_key"] == "sha256:deadbeef"
+        assert out["external_ref"] == {"path": "/tmp/fig.png", "sha256": "deadbeef"}
+
+    def test_row_falls_back_to_path_key_when_no_canonical_path(self) -> None:
+        row = {"path": "/tmp/other.png"}
+        out = OL.research_graph_output_identity(row=row)
+        assert out["identity_key"] == "/tmp/other.png"
+
+    def test_explicit_kwargs_take_precedence_over_row(self) -> None:
+        row = {"canonical_path": "/tmp/row_path.png", "sha256": "row_sha"}
+        out = OL.research_graph_output_identity(path="/tmp/explicit.png", row=row)
+        # Explicit kwargs win over row values (`path or row.get(...)` only
+        # falls back to row when the explicit kwarg is falsy).
+        assert out["external_ref"]["path"] == "/tmp/explicit.png"
+        assert out["identity_key"] == "sha256:row_sha"
+
+    def test_raises_value_error_with_neither_path_nor_sha256(self) -> None:
+        with pytest.raises(ValueError, match="requires at least one of"):
+            OL.research_graph_output_identity()
+
+    def test_raises_value_error_with_empty_row(self) -> None:
+        with pytest.raises(ValueError, match="requires at least one of"):
+            OL.research_graph_output_identity(row={})
+
+    def test_return_shape_has_exactly_the_documented_keys(self) -> None:
+        out = OL.research_graph_output_identity(path="/tmp/x.png")
+        assert set(out.keys()) == {"node_type", "identity_key", "revision", "external_ref"}

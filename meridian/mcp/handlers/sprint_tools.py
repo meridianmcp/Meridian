@@ -35,6 +35,29 @@ from meridian import test_run_receipt as test_run_receipt_module
 from meridian._deps import validate_input_size, _hosted_mode
 
 
+# Completion is committed before these advisory/notification operations run.
+# Keep the post-commit tail bounded so a slow GitHub, filesystem, or database
+# advisory cannot make the caller wait until the outer MCP dispatch timeout.
+# The result remains complete even when one of these best-effort operations is
+# deferred; the response records that fact below.
+_COMPLETION_ADVISORY_TIMEOUT_S = 5.0
+
+
+async def _run_bounded_completion_advisory(
+    name: str,
+    operation: Any,
+) -> tuple[str, Any, str | None]:
+    """Run one post-commit advisory without holding up completion forever."""
+    try:
+        return name, await asyncio.wait_for(
+            operation(), timeout=_COMPLETION_ADVISORY_TIMEOUT_S
+        ), None
+    except asyncio.TimeoutError:
+        return name, None, "timeout"
+    except Exception:  # noqa: BLE001 - advisories must never undo a commit
+        return name, None, "error"
+
+
 async def handle_add_sprint_note(
     args: dict[str, Any],
     db: Any,
@@ -690,6 +713,32 @@ async def handle_get_sprint_progress(
         )
     except Exception:  # noqa: BLE001
         pass
+    # 7479e427 — surface live pending HITL gates so a polling executor sees
+    # the SAME "open human decisions blocking progress" signal
+    # generate_handoff's own unified proposal-run scope carries
+    # (build_proposal_run_scope's `hitl_gates` field) — previously ONLY
+    # planner-mode prose (_generate_planner_handoff's "Open decisions"
+    # section) surfaced pending HITL requests at all; an executor polling
+    # get_sprint_progress mid-run had no way to learn one existed short of a
+    # separate list_hitl_requests call. Guarded: never break the progress poll.
+    try:
+        _pending_hitl = await db_module.list_hitl_requests(
+            db, args["project_id"], status="pending"
+        )
+        if _pending_hitl:
+            _resp_progress["hitl_gates"] = {
+                "count": len(_pending_hitl),
+                "items": [
+                    {
+                        "id": h.get("id"),
+                        "urgency": h.get("urgency"),
+                        "question": (h.get("question") or "")[:200],
+                    }
+                    for h in _pending_hitl[:10]
+                ],
+            }
+    except Exception:  # noqa: BLE001
+        pass
     return _resp_progress
 
 
@@ -750,12 +799,27 @@ async def handle_get_parallelizable_groups(
     # sequential group now, but the orchestrator should know parallel safety
     # couldn't be proven for them.
     _und = _grp.get("undeclared_count", 0)
+    _warnings: list[str] = []
     if _und:
-        _grp["warning"] = (
+        _warnings.append(
             f"{_und} item(s) lack resource declarations — parallel safety not "
             "guaranteed; each is scheduled in its own sequential group. Add "
             "touches_resources to let them parallelize."
         )
+    # b4102313 — resource_blocked items are already excluded from `groups`
+    # (see get_parallelizable_groups' own docstring); surface a summary here
+    # too so a caller reading just this tool's warning field, not the full
+    # resource_blocked list, still learns capacity is temporarily reduced by
+    # live locks rather than genuine lack of work.
+    _res_blocked = _grp.get("resource_blocked_count", 0)
+    if _res_blocked:
+        _warnings.append(
+            f"{_res_blocked} item(s) excluded from groups: a live, non-stale "
+            "session already holds a resource they declare. See "
+            "resource_blocked for holder/retry details."
+        )
+    if _warnings:
+        _grp["warning"] = " ".join(_warnings)
     return _grp
 
 
@@ -1875,118 +1939,129 @@ async def handle_complete_sprint_item(
         item["test_run_receipt"] = _test_run_evidence
         if _test_run_receipt_override:
             item["test_run_receipt_override"] = _test_run_receipt_override
-    # fdaa5b55 — item has a linked GitHub issue: auto-close (meridian_auto)
-    # or post a proposed-closure comment + non-blocking HITL (manual/unset).
-    # Never lets a GitHub failure undo the completion that already succeeded
-    # above — any error is captured in github_issue_action["error"], not
-    # raised. See _close_or_propose_github_issue for the trust-boundary and
-    # single-issue-blast-radius guarantees.
-    if item.get("github_issue_number"):
-        try:
-            _gh_action = await _close_or_propose_github_issue(
-                db, args["project_id"], item, tenant,
-            )
-            if _gh_action:
-                item = dict(item)
-                item["github_issue_action"] = _gh_action
-        except Exception:  # noqa: BLE001 — advisory/side-effect only
-            pass
-    # 02cd3992 — unclaimed-file warning: flag files modified without a lock.
-    # Non-blocking; surfaces the open-door problem so the executor can act.
-    if _complete_session_id:
-        try:
-            _unclaimed_warnings = await _unclaimed_file_warnings(
-                db, _complete_session_id
-            )
-            if _unclaimed_warnings:
-                item = dict(item)
-                item["unclaimed_file_warnings"] = _unclaimed_warnings
-        except Exception:  # noqa: BLE001
-            pass
-    # d01a74bf — surface board additions at the item boundary so a planner's
-    # mid-run injections get picked up before the next claim.
-    _bc_complete = await _board_change_for_session(
-        db, args["project_id"], args.get("session_id")
-    )
-    if _bc_complete:
-        item = dict(item)
-        item["board_change"] = _bc_complete
-    # b121348e / 427b7902 — INDEPENDENT CI verification. The 427b7902 hard gate
-    # above already looked this up (and REFUSED completion on a real failing
-    # state unless override_ci=true), so reuse that result — no second GitHub
-    # round-trip. Attach ``ci_verification`` for transparency, and when CI is
-    # genuinely FAILING (i.e. this was an acknowledged override_ci completion),
-    # attach a ``ci_warning`` so the closed-on-red item stays visible.
-    try:
-        _ci = _ci_pre if _ci_checked else await _verify_item_ci(
+    # All remaining work is advisory or notification-only.  Run independent
+    # operations concurrently, each with its own short budget.  This preserves
+    # the old response fields while preventing one slow operation from holding
+    # the completion request open behind every other operation.
+    async def _github_advisory() -> Any:
+        if not item.get("github_issue_number"):
+            return None
+        return await _close_or_propose_github_issue(
+            db, args["project_id"], item, tenant,
+        )
+
+    async def _unclaimed_advisory() -> Any:
+        if not _complete_session_id:
+            return None
+        return await _unclaimed_file_warnings(db, _complete_session_id)
+
+    async def _board_advisory() -> Any:
+        return await _board_change_for_session(
+            db, args["project_id"], args.get("session_id")
+        )
+
+    async def _ci_advisory() -> Any:
+        return _ci_pre if _ci_checked else await _verify_item_ci(
             db, args["project_id"], tenant,
             f"{args.get('notes') or ''} {item.get('notes') or ''}",
         )
-        if _ci is not None:
-            item = dict(item)
-            item["ci_verification"] = _ci
-            if _ci.get("state") == "failure":
-                item["ci_warning"] = (
-                    f"⚠ GitHub Actions CI is FAILING for commit {_ci.get('sha')} "
-                    f"({_ci.get('failed')}/{_ci.get('total')} checks) — this item "
-                    f"was closed on a commit whose CI did not pass"
-                    + (" (override_ci=true)." if _override_ci else ".")
-                    + " Verify before trusting 'done'."
-                )
-    except Exception:  # noqa: BLE001 — advisory only; completion already succeeded
-        pass
-    # bb29a06f — ADVISORY completion sanity-check. Extends the required_notes
-    # gate (evidence EXISTS) with a check that evidence is PLAUSIBLE: when the
-    # completion looks weakly-supported (no linked task, no notes anywhere) and
-    # no recent commit/migration shares keywords with the title, add a soft
-    # nudge. NEVER blocks, never raises — the completion already succeeded. The
-    # drift heuristic is noisy, so this is a hint, not a gate.
-    try:
+
+    async def _weak_support_advisory() -> Any:
+        # bb29a06f — this is deliberately a soft, post-commit nudge.  Keep the
+        # commit-fetch fallback local to this operation so a transient GitHub
+        # failure retains the old "skip the hint" behavior rather than becoming
+        # a visible completion failure.
         _weakly_supported = not (
             args.get("task_id")
             or (args.get("notes") or "").strip()
             or (item.get("notes") or "").strip()
             or item.get("task_id")
         )
-        if _weakly_supported:
-            from ... import handoff as _handoff_advisory  # noqa: PLC0415
-            try:
-                _adv_project = await db_module.get_project(db, args["project_id"])
-                _adv_commits = (
-                    await _fetch_recent_commits(_adv_project, tenant)
-                    if _adv_project else []
-                )
-            except Exception:  # noqa: BLE001 — never let commit-fetch break completion
-                _adv_commits = []
-            _adv_matches = _handoff_advisory.detect_sprint_item_drift(
-                item.get("title") or "", _adv_commits,
+        if not _weakly_supported:
+            return None
+        from ... import handoff as _handoff_advisory  # noqa: PLC0415
+        try:
+            _adv_project = await db_module.get_project(db, args["project_id"])
+            _adv_commits = (
+                await _fetch_recent_commits(_adv_project, tenant)
+                if _adv_project else []
             )
-            if not _adv_matches:
-                item = dict(item)
-                item["completion_advisory"] = (
-                    "No recent commit or linked evidence appears to reference "
-                    "this item — double-check it actually shipped (this is a "
-                    "heuristic; ignore if you completed it via docs/config/decision)."
-                )
-    except Exception:  # noqa: BLE001 — advisory must never affect completion
-        pass
-    # Notify only when the sprint is fully complete.
-    # f291bb24 — this used to be an unfiltered, untimed
-    # `SELECT * FROM sprint_items WHERE project_id=?` fetching every column
-    # of every item in the project just to check "is anything still active" —
-    # the only fully-unbounded query in this whole handler (every other
-    # advisory phase has an asyncio.wait_for budget). Replaced with an
-    # indexed existence check; same three statuses, same semantics.
-    active_statuses = {"pending", "todo", "in_progress"}
-    if not await db_module.has_active_sprint_items(db, args["project_id"], active_statuses):
-        await _server._maybe_notify(
-            db, args["project_id"],
-            "Sprint done ✓",
-            "All sprint items are complete.",
-            event="sprint_done",
-            tenant=tenant,
-            pref_key="sprint",
+        except Exception:  # noqa: BLE001 — never let commit-fetch break completion
+            _adv_commits = []
+        _adv_matches = _handoff_advisory.detect_sprint_item_drift(
+            item.get("title") or "", _adv_commits,
         )
+        if not _adv_matches:
+            return (
+                "No recent commit or linked evidence appears to reference "
+                "this item — double-check it actually shipped (this is a "
+                "heuristic; ignore if you completed it via docs/config/decision)."
+            )
+        return None
+
+    async def _sprint_done_advisory() -> Any:
+        active_statuses = {"pending", "todo", "in_progress"}
+        if not await db_module.has_active_sprint_items(
+            db, args["project_id"], active_statuses
+        ):
+            await _server._maybe_notify(
+                db, args["project_id"],
+                "Sprint done ✓",
+                "All sprint items are complete.",
+                event="sprint_done",
+                tenant=tenant,
+                pref_key="sprint",
+            )
+        return None
+
+    _advisory_results = await asyncio.gather(
+        *(
+            _run_bounded_completion_advisory(name, operation)
+            for name, operation in (
+                ("github_issue", _github_advisory),
+                ("unclaimed_files", _unclaimed_advisory),
+                ("board_change", _board_advisory),
+                ("ci", _ci_advisory),
+                ("completion_support", _weak_support_advisory),
+                ("sprint_done_notification", _sprint_done_advisory),
+            )
+        )
+    )
+    _advisory_deferred = [
+        {"name": name, "reason": reason}
+        for name, _value, reason in _advisory_results
+        if reason is not None
+    ]
+    for _name, _value, _reason in _advisory_results:
+        if _reason is not None or _value is None:
+            continue
+        if _name == "github_issue":
+            item = dict(item)
+            item["github_issue_action"] = _value
+        elif _name == "unclaimed_files" and _value:
+            item = dict(item)
+            item["unclaimed_file_warnings"] = _value
+        elif _name == "board_change" and _value:
+            item = dict(item)
+            item["board_change"] = _value
+        elif _name == "ci":
+            item = dict(item)
+            item["ci_verification"] = _value
+            if _value.get("state") == "failure":
+                item["ci_warning"] = (
+                    f"⚠ GitHub Actions CI is FAILING for commit {_value.get('sha')} "
+                    f"({_value.get('failed')}/{_value.get('total')} checks) — this item "
+                    f"was closed on a commit whose CI did not pass"
+                    + (" (override_ci=true)." if _override_ci else ".")
+                    + " Verify before trusting 'done'."
+                )
+        elif _name == "completion_support":
+            item = dict(item)
+            item["completion_advisory"] = _value
+    if _advisory_deferred:
+        item = dict(item)
+        item["advisory_work_deferred"] = True
+        item["advisory_diagnostics"] = _advisory_deferred
     return item
 
 

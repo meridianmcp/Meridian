@@ -2500,6 +2500,15 @@ async def verify_target_readiness(
             "reason": "resolved output is flagged archival/stale by meridian-outputs",
             "resolved": resolved,
         }
+    if resolved.get("match_type") == "basename" and int(resolved.get("candidate_count") or 0) <= 1:
+        return {
+            **base, "ready": True, "status": "unresolved",
+            "reason": (
+                "basename/label fallback found a candidate, but it is only "
+                "diagnostic evidence and cannot prove exact output provenance"
+            ),
+            "resolved": resolved,
+        }
     if resolved.get("match_type") == "basename" and int(resolved.get("candidate_count") or 0) > 1:
         return {
             **base, "ready": True, "status": "ambiguous",

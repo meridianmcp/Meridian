@@ -7942,10 +7942,12 @@ def test_pg_migration_registry_matches_historical_order():
         "_migrate_pg_sprint_batch_claims_reservation_fields",
         "_migrate_pg_profile_layers",
         "_migrate_pg_wave_gate_version_unique_constraints",
+        "_migrate_pg_proposal_gates",
+        "_migrate_pg_research_graph",
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 152
+    assert len(allnames) == len(set(allnames)) == 154
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():

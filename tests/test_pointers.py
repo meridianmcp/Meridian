@@ -1681,6 +1681,24 @@ async def test_readiness_existing_ambiguous_basename_resolution(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_readiness_existing_single_basename_is_not_canonical(tmp_path):
+    """One basename candidate is still a relocation hint, not exact provenance."""
+    figure = tmp_path / "plot.png"
+    figure.write_bytes(b"\x89PNG\r\n")
+
+    async def _resolver_relocated(_outputs_dir, file_path):
+        return {"path": file_path, "is_archival": False,
+                "match_type": "basename", "candidate_count": 1}
+
+    out = await verify_target_readiness(
+        {"uri": str(figure), "target_kind": "existing"}, figure_resolver=_resolver_relocated,
+    )
+    assert out["ready"] is True
+    assert out["status"] == "unresolved"
+    assert "diagnostic" in out["reason"]
+
+
+@pytest.mark.asyncio
 async def test_readiness_existing_meridian_outputs_unavailable_no_resolver(tmp_path):
     """No figure_resolver at all — the tool genuinely unavailable. File
     presence still satisfies readiness, but status must say 'unresolved',

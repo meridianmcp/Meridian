@@ -593,7 +593,9 @@ existing package readmes or other tool conventions.
 """
 
 
-def _iter_output_files(outputs_dir: str) -> list[str]:
+def _iter_output_files(
+    outputs_dir: str, *, errors_out: list[str] | None = None,
+) -> list[str]:
     """Every regular file under ``outputs_dir`` (recursive), sorted for stability.
 
     ``MERIDIAN_NOTES.md`` files are included in the walk (they are real
@@ -602,9 +604,25 @@ def _iter_output_files(outputs_dir: str) -> list[str]:
     FTS content rows (which would pollute search results with annotation text).
     The caller (:meth:`OutputsFtsIndex.rebuild`) is responsible for calling
     ``_ingest_meridian_notes`` so the pickup is a guaranteed, tested step.
+
+    58e64c86 -- ``os.walk`` with no ``onerror`` callback (the previous
+    behavior here) silently PRUNES a directory it can't enter (permission
+    denied, a vanished mount, ...) — the resulting file list looks identical
+    to "that subdirectory is genuinely empty". Passing ``errors_out`` (a list)
+    captures every such per-directory error message instead of losing it, so
+    a caller (:meth:`OutputsFtsIndex.rebuild` /
+    :meth:`OutputsFtsIndex.refresh_subtree`) can mark its result
+    ``inconclusive`` rather than silently treating a partial walk as an
+    authoritative file list. Omitting ``errors_out`` (the default) preserves
+    the EXACT previous behavior — best-effort, no raise, nothing captured.
     """
     found: list[str] = []
-    for root, _dirs, files in os.walk(outputs_dir):
+
+    def _onerror(exc: OSError) -> None:
+        if errors_out is not None:
+            errors_out.append(str(exc))
+
+    for root, _dirs, files in os.walk(outputs_dir, onerror=_onerror):
         for fn in files:
             found.append(os.path.join(root, fn))
     found.sort()
@@ -750,6 +768,24 @@ class OutputsFtsIndex:
         # (None when the last call's write, if any, succeeded).
         self.last_pending_count = 0
         self.last_db_write_error: str | None = None
+        # 58e64c86 -- explicit index-health vocabulary (index_revision /
+        # freshness / partial_index / inconclusive / degraded), ADDITIVE to
+        # last_rebuild_partial/last_pending_count/last_db_write_error above
+        # (see :meth:`get_convergence_state`). index_revision is a monotonic
+        # counter bumped ONLY on a rebuild()/refresh_subtree() pass that
+        # actually persisted a content change — mirrors
+        # meridian_codeindex.code_index.CodeIndex.reindex's index_revision —
+        # never bumped by a no-op pass, so a caller can tell "confirmed same
+        # content" from "content changed". last_rebuilt_at is the wall-clock
+        # time of the most recent rebuild()/refresh_subtree() call that
+        # completed without raising, whether or not anything changed — the
+        # "freshness" checkpoint. last_walk_errors collects any per-directory
+        # walk failure from the MOST RECENT such call; non-empty means that
+        # call's result must be treated as inconclusive, never as an
+        # authoritative "these are all the files" answer.
+        self.index_revision: int = 0
+        self.last_rebuilt_at: float | None = None
+        self.last_walk_errors: list[str] = []
 
     # -- connection / schema --------------------------------------------------
 
@@ -941,6 +977,13 @@ class OutputsFtsIndex:
         """
         with self._lock:
             self.last_db_write_error = None
+            # 58e64c86 -- reset per-call, same pattern as last_db_write_error
+            # above; repopulated below from BOTH walks this call performs
+            # (the guaranteed all_paths walk for MERIDIAN_NOTES.md pickup,
+            # and _compute_rows_incremental's own internal walk) so a
+            # permission-denied (or similarly failing) subdirectory is never
+            # silently absent from the result.
+            self.last_walk_errors = []
             deadline = None if max_seconds is None else time.monotonic() + max_seconds
             # 9e02e448 — MERIDIAN_NOTES.md auto-ingest: a GUARANTEED step on
             # every rebuild so human-authored annotations are never silently
@@ -948,7 +991,10 @@ class OutputsFtsIndex:
             # via RLock so this is safe). We walk inside _compute_rows_incremental
             # too, but the notes pickup must happen even on a partial/unchanged
             # rebuild so tests can assert it unconditionally.
-            all_paths = _iter_output_files(self.outputs_dir) if os.path.isdir(self.outputs_dir) else []
+            all_paths = (
+                _iter_output_files(self.outputs_dir, errors_out=self.last_walk_errors)
+                if os.path.isdir(self.outputs_dir) else []
+            )
             self._ingest_meridian_notes(all_paths)
             rows, changed = self._compute_rows_incremental(deadline)
             if changed:
@@ -969,6 +1015,10 @@ class OutputsFtsIndex:
                             ],
                         )
                     self._rebuild_fts(con)
+                    # 58e64c86 -- bump ONLY on a pass that actually persisted a
+                    # content change, mirroring CodeIndex.reindex's
+                    # index_revision semantics (a no-op pass never bumps it).
+                    self.index_revision += 1
                 except Exception as exc:  # noqa: BLE001 — never crash the watcher/run
                     _log.debug("OutputsFtsIndex.rebuild failed", exc_info=True)
                     # 5b897ad3 — surface the failure instead of only logging
@@ -981,6 +1031,10 @@ class OutputsFtsIndex:
                     # (and search_outputs()'s db_write_error field) exists to
                     # make visible.
                     self.last_db_write_error = str(exc)
+            # 58e64c86 -- "freshness" checkpoint: the wall-clock time of the
+            # most recent rebuild() call that completed without raising,
+            # regardless of whether anything actually changed.
+            self.last_rebuilt_at = time.time()
             return len(rows)
 
     def _compute_rows_incremental(
@@ -999,7 +1053,10 @@ class OutputsFtsIndex:
         # that fully catches up (or finds nothing stale) always reports 0,
         # never a stale count left over from an EARLIER partial call.
         self.last_pending_count = 0
-        paths = _iter_output_files(self.outputs_dir)
+        # 58e64c86 — captured into the SAME list rebuild() already reset at
+        # the top of its call (not re-reset here) so both walks this rebuild()
+        # pass performs contribute to one combined error list.
+        paths = _iter_output_files(self.outputs_dir, errors_out=self.last_walk_errors)
         path_set = set(paths)
         changed = False
 
@@ -1305,6 +1362,256 @@ class OutputsFtsIndex:
         matches.sort(key=lambda h: (h.get("mtime") or 0), reverse=True)
         return matches
 
+    # -- exact content-hash lookup (58e64c86) --------------------------------
+
+    def find_by_hash(self, content_hash: str) -> list[dict[str, Any]]:
+        """Exact reverse lookup: every indexed row whose ``sha256`` equals
+        ``content_hash`` (case-insensitive hex compare) — the content-identity
+        counterpart of :meth:`resolve_output`'s exact-PATH lookup. Useful for
+        "has this exact byte content already been indexed anywhere in this
+        tree" (e.g. detecting a relocated/renamed duplicate of a known
+        output) without depending on path or filename at all. Returns every
+        matching row (same shape as :meth:`resolve_output`), most-recently-
+        modified first. Never raises: a blank hash, an empty index, or a
+        query error all yield ``[]``.
+        """
+        target = (content_hash or "").strip().lower()
+        if not target:
+            return []
+        with self._lock:
+            try:
+                con = self._connect()
+                self._ensure_schema(con)
+                relation = con.execute(
+                    "SELECT path, content, mtime, sha256, size, generating_script, "
+                    "kind, is_archival, canonical_path, csv_columns, json_keys "
+                    "FROM outputs_index"
+                )
+                columns = [c[0] for c in relation.description]
+                fetched = relation.fetchall()
+            except Exception:  # noqa: BLE001 — a bad/empty index resolves to []
+                _log.debug("OutputsFtsIndex.find_by_hash failed", exc_info=True)
+                return []
+        matches: list[dict[str, Any]] = []
+        for row in fetched:
+            rec = dict(zip(columns, row))
+            sha = (rec.get("sha256") or "").strip().lower()
+            if not sha or sha != target:
+                continue
+            matches.append({
+                "path": rec["path"],
+                "generating_script": rec.get("generating_script"),
+                "is_archival": bool(rec.get("is_archival")),
+                "canonical_path": rec.get("canonical_path"),
+                "sha256": rec.get("sha256"),
+                "kind": rec.get("kind"),
+                "size": rec.get("size"),
+                "mtime": rec.get("mtime"),
+                "csv_columns": (
+                    json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
+                ),
+                "json_keys": (
+                    json.loads(rec["json_keys"]) if rec.get("json_keys") else None
+                ),
+            })
+        matches.sort(key=lambda h: (h.get("mtime") or 0), reverse=True)
+        return matches
+
+    # -- explicit index-health snapshot (58e64c86) ---------------------------
+
+    def get_convergence_state(self) -> dict[str, Any]:
+        """Explicit, structured index-health snapshot.
+
+        Unifies this class's existing partial/pending/db-write signals
+        (``last_rebuild_partial`` / ``last_pending_count`` /
+        ``last_db_write_error``, all pre-existing) with the vocabulary the
+        local-BM25-fallback contract standardizes on: ``index_revision`` /
+        freshness (``last_rebuilt_at``) / ``partial_index`` / ``inconclusive``
+        / ``degraded``. Never raises.
+
+        ``inconclusive`` is True when the MOST RECENT ``rebuild()`` /
+        ``refresh_subtree()`` call hit a real error it could not route
+        around — a directory-walk failure (permission denied, a vanished
+        mount) or a DB-write failure. In that state, an empty/absent result
+        from ``search()`` / ``resolve_output()`` / ``find_by_hash()`` must
+        NOT be read as a confirmed "nothing here" — something on this pass
+        could not be examined.
+
+        ``partial_index`` is True when the last rebuild's wall-clock budget
+        was exceeded before every stale file was reprocessed
+        (``last_rebuild_partial``) — the index reflects SOME but not
+        necessarily ALL of what's on disk right now.
+
+        ``degraded`` is the umbrella flag: True whenever a caller should not
+        treat this index's answers as fully authoritative (``partial_index``
+        OR ``inconclusive`` OR a nonzero pending backlog).
+        """
+        with self._lock:
+            walk_errors = sorted(set(self.last_walk_errors))
+            inconclusive = bool(walk_errors) or bool(self.last_db_write_error)
+            partial_index = bool(self.last_rebuild_partial)
+            degraded = bool(inconclusive or partial_index or self.last_pending_count)
+            return {
+                "outputs_dir": self.outputs_dir,
+                "index_revision": self.index_revision,
+                "last_rebuilt_at": self.last_rebuilt_at,
+                "total_indexed": len(self._row_cache),
+                "pending_count": self.last_pending_count,
+                "partial_index": partial_index,
+                "walk_errors": walk_errors,
+                "db_write_error": self.last_db_write_error,
+                "inconclusive": inconclusive,
+                "degraded": degraded,
+                "never_rebuilt": self.last_rebuilt_at is None,
+            }
+
+    # -- refresh-selected-subtree command (58e64c86) -------------------------
+
+    def refresh_subtree(
+        self, subtree: str,
+        *, max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
+    ) -> dict[str, Any]:
+        """Bounded refresh of ONE subdirectory of ``outputs_dir``.
+
+        :meth:`rebuild` always walks the WHOLE tree — cheap when unchanged
+        (5116078b's incremental diff), but still an O(tree) stat pass every
+        call. When a caller already knows only one subdirectory changed
+        (e.g. a single run just finished writing into
+        ``outputs/2026-08-21-run3/``), this walks and re-analyses ONLY files
+        under that subtree, bounding cost to the subtree's size instead of
+        the whole tree — the outputs-side counterpart of
+        ``meridian_codeindex.code_index.CodeIndex.index_paths`` /
+        ``meridian_codeindex.bm25_index.refresh_subtree``.
+
+        Unlike :meth:`rebuild`, this is deliberately EAGER within the
+        subtree: every file currently under it is re-fingerprinted/re-hashed
+        regardless of the mtime/size signature (the caller has already told
+        us this subtree needs refreshing — e.g. a run just finished writing
+        into it — so this does not rely on the same-size-in-place-edit
+        heuristic that a stateless diff could miss). Deletions WITHIN the
+        subtree are still detected (any previously-cached path under this
+        subtree that the fresh walk no longer sees is dropped), but paths
+        outside the subtree are left completely untouched.
+
+        ``subtree`` may be absolute or relative to ``outputs_dir``; it must
+        resolve to a real directory INSIDE ``outputs_dir`` (or
+        ``outputs_dir`` itself) — an out-of-tree or missing subtree returns
+        ``{"error": ...}`` without touching the index. Persists the same way
+        :meth:`rebuild` does (whole-table rewrite when anything changed) and
+        bumps :attr:`index_revision` on a successful persisted change,
+        exactly like :meth:`rebuild`. Returns
+        ``{"outputs_dir", "subtree", "indexed", "skipped", "partial",
+        "walk_errors"}``. Never raises.
+        """
+        with self._lock:
+            abs_subtree = (
+                subtree if os.path.isabs(subtree)
+                else os.path.join(self.outputs_dir, subtree)
+            )
+            abs_subtree = os.path.normpath(abs_subtree)
+            abs_root = os.path.normpath(self.outputs_dir)
+            try:
+                within = os.path.commonpath([abs_subtree, abs_root]) == abs_root
+            except ValueError:  # different drive on Windows
+                within = False
+            if not within or not os.path.isdir(abs_subtree):
+                return {
+                    "outputs_dir": self.outputs_dir, "subtree": subtree,
+                    "indexed": 0, "skipped": 0, "partial": False,
+                    "walk_errors": [],
+                    "error": f"subtree does not exist under outputs_dir: {subtree}",
+                }
+            walk_errors: list[str] = []
+            sub_paths = _iter_output_files(abs_subtree, errors_out=walk_errors)
+            self.last_walk_errors = list(walk_errors)
+            self._ingest_meridian_notes(sub_paths)
+
+            # Removal detection scoped to just this subtree — a path
+            # previously cached under it that the fresh walk no longer sees
+            # has been deleted (or moved out); paths outside the subtree are
+            # never touched by this diff.
+            subtree_prefix = abs_subtree.rstrip(os.sep) + os.sep
+            prior_in_subtree = {
+                p for p in self._manifest
+                if p == abs_subtree or p.startswith(subtree_prefix)
+            }
+            sub_path_set = set(sub_paths)
+            changed = False
+            for p in prior_in_subtree - sub_path_set:
+                self._manifest.pop(p, None)
+                self._row_cache.pop(p, None)
+                changed = True
+
+            deadline = (
+                None if max_seconds is None else time.monotonic() + max_seconds
+            )
+            classifications = classify_canonical_archival(sub_paths, hasher=self._hasher)
+            processed = 0
+            partial = False
+            for p in sub_paths:
+                if deadline is not None and time.monotonic() > deadline:
+                    partial = True
+                    break
+                fp = file_fingerprint(p)
+                try:
+                    st = os.stat(p)
+                    size: int | None = st.st_size
+                    mtime: float | None = st.st_mtime
+                except OSError:
+                    size = mtime = None
+                cls = classifications.get(p)
+                row = OutputRow(
+                    path=p,
+                    content=_content_for_fts(p, fp),
+                    mtime=mtime,
+                    sha256=self._hasher(p),
+                    size=size,
+                    generating_script=fp.generating_script,
+                    kind=fp.kind,
+                    is_archival=bool(cls and cls.is_archival),
+                    canonical_path=(cls.canonical_path if cls else None),
+                    csv_columns=fp.csv_columns,
+                    json_keys=fp.json_keys,
+                )
+                self._row_cache[p] = row
+                self._manifest[p] = (mtime, size)
+                changed = True
+                processed += 1
+            self.last_rebuild_partial = bool(self.last_rebuild_partial or partial)
+
+            if changed:
+                try:
+                    con = self._connect()
+                    self._ensure_schema(con)
+                    con.execute("DELETE FROM outputs_index")
+                    for r in self._row_cache.values():
+                        con.execute(
+                            "INSERT INTO outputs_index VALUES "
+                            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            [
+                                r.path, r.content, r.mtime, r.sha256, r.size,
+                                r.generating_script, r.kind, r.is_archival,
+                                r.canonical_path,
+                                json.dumps(r.csv_columns) if r.csv_columns else None,
+                                json.dumps(r.json_keys) if r.json_keys else None,
+                            ],
+                        )
+                    self._rebuild_fts(con)
+                    self.index_revision += 1
+                    self.last_db_write_error = None
+                except Exception as exc:  # noqa: BLE001 — never crash the caller
+                    _log.debug("OutputsFtsIndex.refresh_subtree failed", exc_info=True)
+                    self.last_db_write_error = str(exc)
+            self.last_rebuilt_at = time.time()
+            return {
+                "outputs_dir": self.outputs_dir,
+                "subtree": subtree,
+                "indexed": processed,
+                "skipped": len(sub_paths) - processed,
+                "partial": partial,
+                "walk_errors": list(walk_errors),
+            }
+
     def close(self) -> None:
         """Close the owned DuckDB connection (no-op for an injected one)."""
         with self._lock:
@@ -1437,6 +1744,15 @@ def search_outputs(
             query, outputs_dir, result.get("partial"), result.get("pending_count"),
             result.get("db_write_error"),
         )
+    # 58e64c86 — a single, explicit `degraded` flag + the full structured
+    # snapshot, additive alongside the existing partial/pending_count/
+    # db_write_error/zero_hits_warning fields above (kept unchanged for
+    # back-compat). Mirrors extensions/meridian-outputs's own
+    # `result["degraded"] = not result["convergence"]["converged"]` pattern
+    # (e631d54f) so both outputs implementations expose the same vocabulary.
+    convergence = index.get_convergence_state()
+    result["convergence"] = convergence
+    result["degraded"] = convergence["degraded"]
     return result
 
 
@@ -1620,6 +1936,106 @@ def find_outputs_by_source(
     }
 
 
+def _degraded_convergence_stub(outputs_dir: str, error: str) -> dict[str, Any]:
+    """A synthetic, ``inconclusive=True``/``degraded=True`` convergence
+    snapshot for the "outputs_dir doesn't exist" guard shared by the
+    module-level wrappers below — so a caller can't mistake "the directory
+    is absent" for "confirmed no match" just because ``convergence`` is
+    missing entirely (58e64c86).
+    """
+    return {
+        "outputs_dir": outputs_dir, "index_revision": 0,
+        "last_rebuilt_at": None, "total_indexed": 0,
+        "pending_count": 0, "partial_index": False,
+        "walk_errors": [], "db_write_error": None,
+        "inconclusive": True, "degraded": True, "never_rebuilt": True,
+        "error": error,
+    }
+
+
+def get_indexed_output_by_hash(
+    outputs_dir: str, content_hash: str, *,
+    max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
+) -> dict[str, Any]:
+    """Stateless module-level counterpart of
+    :meth:`OutputsFtsIndex.find_by_hash` (58e64c86) — exact content-hash
+    lookup across an outputs tree, mirroring :func:`find_outputs_by_source`'s
+    "reuse the cached incremental index" shape. Rebuilds (bounded by
+    ``max_seconds``) before searching so a cold cache still gets one real
+    pass.
+
+    Returns ``{outputs_dir, content_hash, matches: [...], total,
+    convergence: {...}, degraded: bool}`` — ``degraded`` mirrors
+    ``convergence["degraded"]``: a ``matches == []`` result while
+    ``degraded`` is True must NOT be read as "this content is confirmed
+    absent" (see :meth:`OutputsFtsIndex.get_convergence_state`). A blank
+    ``content_hash`` yields ``matches: []`` with a non-degraded convergence
+    (a genuinely empty query, not a walk failure); a missing ``outputs_dir``
+    yields a synthetic ``inconclusive=True`` convergence instead. Never
+    raises.
+    """
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        error = f"outputs_dir does not exist: {outputs_dir}"
+        return {
+            "outputs_dir": outputs_dir, "content_hash": content_hash,
+            "matches": [], "total": 0,
+            "convergence": _degraded_convergence_stub(outputs_dir, error),
+            "degraded": True, "error": error,
+        }
+    index = _get_cached_index(outputs_dir)
+    index.rebuild(max_seconds=max_seconds)
+    matches = index.find_by_hash(content_hash)
+    convergence = index.get_convergence_state()
+    return {
+        "outputs_dir": outputs_dir,
+        "content_hash": content_hash,
+        "matches": matches,
+        "total": len(matches),
+        "convergence": convergence,
+        "degraded": convergence["degraded"],
+    }
+
+
+def refresh_outputs_subtree(
+    outputs_dir: str, subtree: str, *,
+    max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
+) -> dict[str, Any]:
+    """Stateless module-level counterpart of
+    :meth:`OutputsFtsIndex.refresh_subtree` (58e64c86) — the
+    "refresh-selected-subtree" command the local BM25 fallback contract
+    requires, reusing the same cached index as :func:`search_outputs`. A
+    missing ``outputs_dir`` returns ``{"error": ...}`` without creating a
+    cache entry. Never raises.
+    """
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        return {
+            "outputs_dir": outputs_dir, "subtree": subtree,
+            "indexed": 0, "skipped": 0, "partial": False, "walk_errors": [],
+            "error": f"outputs_dir does not exist: {outputs_dir}",
+        }
+    index = _get_cached_index(outputs_dir)
+    return index.refresh_subtree(subtree, max_seconds=max_seconds)
+
+
+def get_outputs_convergence_state(outputs_dir: str) -> dict[str, Any]:
+    """Module-level read of :meth:`OutputsFtsIndex.get_convergence_state`
+    for the cached index of ``outputs_dir``, WITHOUT forcing a rebuild
+    (58e64c86) — lets a caller check "is the last known state of this index
+    degraded/inconclusive" before deciding whether to pay for a fresh
+    :func:`search_outputs` call. A missing ``outputs_dir`` returns a
+    synthetic ``inconclusive=True``/``degraded=True`` snapshot rather than
+    raising. A directory that has never been rebuilt (no cache entry yet)
+    reports ``never_rebuilt=True``, ``degraded=False`` — an untouched index
+    is not itself a degraded one, it simply has nothing to report yet.
+    """
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        return _degraded_convergence_stub(
+            outputs_dir, f"outputs_dir does not exist: {outputs_dir}",
+        )
+    index = _get_cached_index(outputs_dir)
+    return index.get_convergence_state()
+
+
 def check_promotion_source_freshness(
     outputs_dir: str, source_output_path: str, *, expected_sha256: "str | None" = None,
 ) -> dict[str, Any]:
@@ -1670,6 +2086,19 @@ def check_promotion_source_freshness(
             "reason": (
                 "source output not found in the outputs index — provenance "
                 "freshness cannot be verified"
+            ),
+        }
+    if resolved.get("match_type") != "exact":
+        return {
+            "resolved": False,
+            "match_type": resolved.get("match_type"),
+            "fresh": None,
+            "expected_sha256": expected_sha256,
+            "current_sha256": None,
+            "reason": (
+                "source output was found only by basename/label fallback -- "
+                "that diagnostic match cannot establish exact provenance "
+                "for a promotion"
             ),
         }
     current_sha256 = _sha256_file(resolved.get("path") or source_output_path)

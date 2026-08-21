@@ -56,6 +56,7 @@ from .executor_config import (
     build_executor_config_block,
     build_execution_policy,
     has_executor_config,
+    resolve_origin_identity,
 )
 
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -2972,6 +2973,10 @@ def _build_quick_start_goal(
     identity: "str | None" = None,
     profile_generation_key: "str | None" = None,
     profile_restart_required: bool = False,
+    capability_status: "dict[str, Any] | None" = None,
+    hitl_gates: "list[dict[str, Any]] | None" = None,
+    proposal_scope_out: "dict[str, Any] | None" = None,
+    handoff_mode: str = "goal",
 ) -> str:
     """Build the handoff /goal template from the live pending sprint item ids.
 
@@ -3022,6 +3027,22 @@ def _build_quick_start_goal(
     for the incident this closes). A caller that omits this argument, or
     never passes ``selected_scope`` in the first place, sees zero functional
     change to this function's return value.
+
+    ``capability_status``/``hitl_gates``/``proposal_scope_out``/
+    ``handoff_mode`` (7479e427) — purely additive, out-param-only inputs: when
+    ``proposal_scope_out`` is given (any dict, typically ``{}``), it is
+    populated in place with the unified proposal-run scope contract (see
+    :func:`build_proposal_run_scope`), built from the FINAL claimable batch
+    this function already computed (after the manual/backburner/unprospected/
+    wave-gate exclusions above) plus whatever ``capability_status``/
+    ``hitl_gates`` the caller passed through. This function's own RETURNED
+    STRING is completely unaffected by these three arguments — rendering the
+    ``<proposal_scope>`` tag into a /goal body is the caller's job (via
+    :func:`_build_proposal_scope_clause`, appended post-hoc the same way
+    ``_build_project_start_config_clause`` already is), so every existing
+    caller that omits these arguments sees zero behaviour change here.
+    ``handoff_mode`` is informational only (tags the built scope's own
+    ``mode`` field) and defaults to ``"goal"``.
 
     ``force_included_ids`` (0a65f5cc) — ids exempted from the
     backburner/deferred exclusion below (see ``_is_backburner_sprint_item``)
@@ -3426,6 +3447,58 @@ def _build_quick_start_goal(
                 "all_excluded": bool(_requested_scope_ids)
                 and not _executable_requested_ids,
             })
+    # 7479e427 — cheap, side, read-only recomputation of whether the three
+    # deterministic per-item contract clauses further below (tool_requirements/
+    # sprint_item_pointers/artifact_pointer_findings) will hit their
+    # full_contract_max_items cap for THIS render. Never mutates or replaces
+    # those clauses (computed independently, unchanged, further down) — used
+    # only to set the proposal-run scope's own `truncated` flag below. Safe
+    # even when the pending inventory is empty/short (pure in-memory list
+    # comprehensions, no DB/IO, mirrors the extraction those clauses already
+    # do on the SAME _all_pending_for_tool_requirements list).
+    _contract_truncated = False
+    if full_contract_max_items is not None and full_contract_max_items >= 0:
+        from . import pointers as pointers_module  # noqa: PLC0415 — avoid import cycle
+        _tr_n = len(capability_contract_module.extract_tool_requirements(
+            _all_pending_for_tool_requirements
+        ))
+        _pr_n = len(pointers_module.assemble_pointer_entries_from_annotated_items(
+            _all_pending_for_tool_requirements
+        ))
+        _af_n = len(pointers_module.assemble_artifact_pointer_findings_from_annotated_items(
+            _all_pending_for_tool_requirements
+        ))
+        _contract_truncated = (
+            _tr_n > full_contract_max_items
+            or _pr_n > full_contract_max_items
+            or _af_n > full_contract_max_items
+        )
+    # 7479e427 — unified proposal-run scope, built from the FINAL claimable
+    # batch (pending_sprint_items, after every exclusion filter above) plus
+    # the omitted-items-with-reason map already tracked for
+    # selected_scope_outcome (_scope_exclusion_reason_by_id). Populated
+    # regardless of whether selected_scope was ever passed for THIS call —
+    # see build_proposal_run_scope's own docstring. No-op (this function's
+    # return value is unaffected either way) unless the caller passed a
+    # non-None proposal_scope_out.
+    if proposal_scope_out is not None:
+        _omitted_for_scope = [
+            {"id": _oid, "reason": _oreason}
+            for _oid, _oreason in _scope_exclusion_reason_by_id.items()
+        ]
+        _proposal_run_scope = build_proposal_run_scope(
+            pending_sprint_items,
+            project_id=project_id,
+            effective_version=version,
+            omitted_items=_omitted_for_scope,
+            capability_status=capability_status,
+            hitl_gates=hitl_gates,
+            selected_scope=selected_scope,
+            truncated=_contract_truncated,
+            mode=handoff_mode,
+        )
+        proposal_scope_out.clear()
+        proposal_scope_out.update(_proposal_run_scope)
     # 682005f4 — computed against the FINAL filtered pending_sprint_items (after
     # manual/backburner/unprospected/wave-gate exclusion above), so a pointer
     # line never appears for an item that was itself excluded from the batch.
@@ -7092,6 +7165,110 @@ def _render_workspace_handoff_block(
     return "\n".join(lines).rstrip()
 
 
+def _render_research_evidence_block(envelope: Any) -> str:
+    """0ea8fd3c — render an optional, caller-supplied research-evidence
+    provenance envelope as an additive markdown block for the handoff body.
+
+    Duck-typed on purpose: meridian core never imports
+    ``extensions/meridian-outputs``'s ``research_evidence`` module — that
+    package is a separate, optionally-installed extension (its own
+    pyproject.toml/pixi.toml; see pixi.toml's 52cbe5d8 note) that this repo's
+    own ``pixi.toml`` does NOT declare as a pypi-dependency of meridian core,
+    mirroring the exact no-hard-dependency contract
+    ``meridian_outputs.provenance_status.get_manifest_backed_provenance_status``
+    already established for the opposite direction (that function consumes a
+    plain dict built by ``meridian.executor_contract`` without ever importing
+    meridian core). Accepts either:
+
+      - An object exposing a callable ``to_markdown()`` — e.g. a real
+        ``research_evidence.ProvenanceEnvelope`` instance — delegated to
+        directly, since that method already implements the "partial/
+        unresolved records must never look authoritative" caveat contract.
+      - A plain dict in the canonical ``envelope_to_dict()`` shape
+        (``envelope_id``, ``generated_at``, ``records``, ``links``,
+        ``partial``, ``partial_reason``) — e.g. round-tripped across a
+        process boundary via ``serialize_provenance_envelope(..., "json")``
+        + ``json.loads`` — rendered here with the SAME caveat contract,
+        reimplemented independently rather than imported.
+
+    Returns "" for ``None``/falsy input, or anything that is neither of the
+    above shapes, so a caller that never supplies an envelope sees zero
+    change to the rendered handoff — matches every other optional
+    ``_render_*_block`` helper in this module. Never raises: a malformed
+    envelope degrades to "" (best-effort, matches this module's own
+    established convention for enrichment blocks).
+    """
+    if not envelope:
+        return ""
+    to_markdown = getattr(envelope, "to_markdown", None)
+    if callable(to_markdown):
+        try:
+            rendered = to_markdown()
+        except Exception:  # noqa: BLE001 — rendering is best-effort, never fatal
+            return ""
+        return rendered.strip() if isinstance(rendered, str) else ""
+
+    if not isinstance(envelope, dict):
+        return ""
+    records = envelope.get("records")
+    links = envelope.get("links")
+    if not isinstance(records, list) or not isinstance(links, list):
+        return ""
+
+    def _caveat(item: dict[str, Any]) -> str:
+        resolver = item.get("resolver") or {}
+        status = str(resolver.get("status") or "unknown").upper()
+        is_partial = bool(item.get("partial"))
+        if status == "VERIFIED" and not is_partial:
+            return ""
+        caveat = f" — **{status}**"
+        if is_partial:
+            caveat += ", **PARTIAL**"
+            reason = item.get("partial_reason")
+            if reason:
+                caveat += f" ({reason})"
+        return caveat
+
+    try:
+        lines = [
+            "## Research Evidence",
+            "",
+            "_Read-only projection of a typed provenance envelope — partial "
+            "or unresolved records/links are always marked below, never "
+            "presented as authoritative._",
+            "",
+            f"- envelope_id: `{envelope.get('envelope_id', '?')}`",
+            f"- generated_at: `{envelope.get('generated_at', '?')}`",
+        ]
+        if envelope.get("partial"):
+            lines.append(
+                f"- **PARTIAL ENVELOPE** — {envelope.get('partial_reason') or 'reason not given'}"
+            )
+        lines.append("")
+        lines.append(f"### Records ({len(records)})")
+        if not records:
+            lines.append("_none_")
+        for rec in records:
+            identity = rec.get("identity") or {}
+            lines.append(
+                f"- `{identity.get('kind', '?')}` **{identity.get('id', '?')}** "
+                f"({identity.get('locator', '?')}){_caveat(rec)}"
+            )
+        lines.append("")
+        lines.append(f"### Links ({len(links)})")
+        if not links:
+            lines.append("_none_")
+        for link in links:
+            lines.append(
+                f"- `{link.get('source_id', '?')}` "
+                f"--[{link.get('relation', '?')}]--> `{link.get('target_id', '?')}`"
+                f"{_caveat(link)}"
+            )
+        return "\n".join(lines).rstrip()
+    except Exception:  # noqa: BLE001 — a malformed envelope must never break handoff generation
+        return ""
+
+
 def _render_custom_handoff(
     template: str,
     *,
@@ -7739,6 +7916,62 @@ async def build_docx_integrity_gate_for_handoff(
             proposal_evidence=proposal_evidence,
         )
     except Exception:  # noqa: BLE001 — docx integrity gate is best-effort
+        return None
+
+
+async def build_proposal_gate_readiness_for_handoff(
+    db: Any, project_id: str, *,
+    pending_items: "list[dict[str, Any]] | None" = None,
+) -> "dict[str, Any] | None":
+    """c6d13571 — thin, best-effort wrapper surfacing open typed proposal
+    HITL gates (see :mod:`meridian.proposal_gates`) for a handoff, mirroring
+    :func:`build_docx_integrity_gate_for_handoff` /
+    :func:`build_proposal_evidence_for_handoff`'s own wrapper convention so
+    all three "best-effort structured field" emissions follow one pattern.
+
+    An "open" gate is one whose :func:`meridian.proposal_gates.effective_state`
+    is NOT ``'allowed'`` — i.e. still ``blocked`` or ``quarantined`` (this
+    also picks up a ``manual``/``on_new_evidence`` decided gate that has
+    since expired-but-not-reopened, since ``effective_state`` only auto-flips
+    to ``blocked`` for ``reopen_policy='auto_on_expiry'`` — an expired
+    ``manual`` gate keeps reporting its last decided state here, which is
+    correct: nothing auto-reverted it).
+
+    When ``pending_items`` is given (the SAME list a handoff already
+    resolved), each open gate's ``affected`` sprint_item_id entries are
+    cross-referenced against those ids so the caller can see, at a glance,
+    which open gates actually bear on THIS handoff's pending work (returned
+    as ``blocking_pending_item_gate_ids``) as opposed to gates sitting open
+    against items not currently pending.
+
+    Returns ``None`` on any failure (e.g. the proposal_gates table/migration
+    is unavailable on this backend) so a caller can simply skip attaching
+    the field — never breaks the mandatory handoff, exactly like the two
+    sibling wrappers above.
+    """
+    try:
+        from meridian import proposal_gates as _gates_module  # noqa: PLC0415
+
+        all_gates = await _gates_module.list_gates(db, project_id)
+        open_gates = [
+            g for g in all_gates if _gates_module.effective_state(g) != "allowed"
+        ]
+        item_ids = {
+            it["id"] for it in (pending_items or [])
+            if isinstance(it, dict) and it.get("id")
+        }
+        blocking_ids: set[str] = set()
+        for gate in open_gates:
+            for entry in gate.get("affected") or []:
+                if isinstance(entry, dict) and entry.get("sprint_item_id") in item_ids:
+                    blocking_ids.add(gate["id"])
+                    break
+        return {
+            "open_gate_count": len(open_gates),
+            "gates": open_gates,
+            "blocking_pending_item_gate_ids": sorted(blocking_ids),
+        }
+    except Exception:  # noqa: BLE001 — proposal gate readiness is best-effort
         return None
 
 
@@ -8567,6 +8800,818 @@ def _build_selected_scope_clause(selected_scope: "dict[str, Any] | None") -> str
     )
 
 
+# ---------------------------------------------------------------------------
+# acf6f51a — canonical XML HandoffManifest.
+#
+# A machine envelope that a receiving session (or an auditor) can check
+# WITHOUT re-parsing the prose /goal block: exactly which board snapshot a
+# handoff was generated against (``board_revision``), the exact item/status/
+# dependency list it claims, and the tenant/project it came from. It is
+# never independently authored — every field below is data the caller
+# (``generate_handoff``) already computed for its own human-readable render
+# (``pending_sprint_items``, ``_selected_scope``, ``_parallel_groups``, the
+# project record) — see ``_generate_goal_only_handoff``'s ``emit_manifest``
+# wiring, the concrete integration point for this first pass.
+#
+# Body-hash binding reuses the EXISTING ``mint_handoff_token(body=...)`` /
+# ``verify_handoff_token(presented_body=...)`` mechanism (see
+# ``_hash_goal_body`` / ``_mint_and_embed_goal_token`` above) rather than
+# inventing a second token scheme: the caller splices
+# ``serialize_handoff_manifest_xml(...)``'s output into ``quick_start_goal``
+# BEFORE the existing mint call, exactly the way ``_build_selected_scope_
+# clause``'s output already is (see that function's own docstring) — so the
+# manifest is covered by the SAME ``body_hash``/``body_mismatch`` check every
+# other part of the /goal block already relies on. ``mint_manifest_bound_
+# token`` below additionally exposes a manifest-only token for a receiver
+# (1bd5e810) that wants to verify the manifest independent of the full
+# rendered body.
+# ---------------------------------------------------------------------------
+
+_MANIFEST_SCHEMA_VERSION = "1.0"
+# Hard backstop on the serialized canonical manifest. Per 248c0bb9/b6510123
+# precedent elsewhere in this module: a size problem on a token-bound body
+# is solved by making the content small BY CONSTRUCTION (build_handoff_
+# manifest already bounds its item list to max_items), never by truncating a
+# body about to be hashed into a goal token — a truncated-but-still-parses
+# manifest would be worse than no manifest at all, so this raises instead.
+_MANIFEST_MAX_BYTES = 65536
+
+
+class HandoffManifestTooLarge(ValueError):
+    """acf6f51a — raised by serialize_handoff_manifest_xml when the canonical
+    manifest exceeds _MANIFEST_MAX_BYTES. Fails closed like
+    HandoffStaleReferenceError/HandoffSelectionError above: nothing is
+    minted or persisted for a call that raises this. build_handoff_manifest
+    already bounds its own item list to max_items (default
+    _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS), so this should be unreachable in
+    practice; it exists as a hard backstop, not the primary size control.
+    """
+
+    def __init__(self, project_id: str, size_bytes: int):
+        self.project_id = project_id
+        self.size_bytes = size_bytes
+        self.code = "MANIFEST_TOO_LARGE"
+        super().__init__(
+            f"handoff manifest for project {project_id!r} serialized to "
+            f"{size_bytes} bytes, exceeding the {_MANIFEST_MAX_BYTES}-byte "
+            "bound. Refusing to truncate a body about to be hashed into a "
+            "goal token -- narrow the selected scope instead."
+        )
+
+
+def compute_board_revision(items: "list[dict[str, Any]]") -> str:
+    """acf6f51a — deterministic digest of the live board's identity as far
+    as a manifest is concerned: sorted ``(id, status, depends_on)`` triples,
+    hashed via the same ``_hash_goal_body``/canonical-JSON pattern
+    ``_resolve_selected_item_scope`` already uses for ``closure_hash``.
+    Deliberately narrow (not every column) so an unrelated field edit (e.g.
+    a note) doesn't spuriously invalidate a manifest a receiver is about to
+    compare against — only fields that change whether this handoff's item
+    list is still accurate are included.
+    """
+    rows = sorted(
+        (
+            str(it.get("id") or ""),
+            str(it.get("status") or ""),
+            str(it.get("depends_on") or ""),
+        )
+        for it in items
+    )
+    return _hash_goal_body(json.dumps(rows, sort_keys=True, separators=(",", ":")))
+
+
+def verify_board_revision(
+    current_items: "list[dict[str, Any]]", expected_revision: str,
+) -> bool:
+    """acf6f51a — pure equality check: does a live board (re-fetched by the
+    caller) still match the ``board_revision`` a manifest declared at
+    generation time? Used by a receiver to detect drift before acting on a
+    manifest-bound handoff; this function only computes the comparison — it
+    never fetches state or blocks anything itself.
+    """
+    return compute_board_revision(current_items) == expected_revision
+
+
+def _manifest_item_entry(item: "dict[str, Any]") -> "dict[str, Any]":
+    return {
+        "id": item.get("id"),
+        "title": item.get("title"),
+        "status": item.get("status"),
+        "depends_on": item.get("depends_on"),
+        "wave": item.get("wave"),
+        "resources": db_module.parse_touches_resources(item.get("touches_resources")),
+    }
+
+
+def build_handoff_manifest(
+    *,
+    handoff_mode: str,
+    project_id: str,
+    items: "list[dict[str, Any]]",
+    project_name: "str | None" = None,
+    sprint_version: "str | None" = None,
+    session_id: "str | None" = None,
+    origin_identity: "dict[str, Any] | None" = None,
+    generated_at: "str | None" = None,
+    selected_item_ids: "list[str] | None" = None,
+    closure_item_ids: "list[str] | None" = None,
+    waves: "list[list[dict[str, Any]]] | None" = None,
+    stop_conditions: "list[str] | None" = None,
+    deploy_policy: "dict[str, Any] | None" = None,
+    max_items: int = _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+) -> "dict[str, Any]":
+    """acf6f51a — assemble the canonical HandoffManifest as a plain dict with
+    a FIXED field order (mirrored exactly by serialize_handoff_manifest_xml).
+    Never independently authored from prose: every argument here is data the
+    caller already computed for its own human-readable render — see this
+    module's ``emit_manifest`` call site for the source of each one.
+
+    ``items`` is bounded to ``max_items`` (default
+    ``_DEFAULT_COMPACT_CONTRACT_MAX_ITEMS`` — the same cap
+    ``_build_quick_start_goal`` already applies to the rendered /goal block):
+    the manifest never carries more items than the block it accompanies, and
+    truncation here is COUNTED (``items_truncated``/``items_total``), never
+    silent. ``board_revision`` is always computed over the FULL, unbounded
+    ``items`` list (never the truncated view) — a receiver comparing
+    ``board_revision`` against a fresh board fetch must see the same digest
+    a caller with the full board would compute.
+    """
+    ordered_items = list(items)
+    truncated = len(ordered_items) > max_items
+    if truncated:
+        ordered_items = ordered_items[:max_items]
+    return {
+        "schema_version": _MANIFEST_SCHEMA_VERSION,
+        "handoff_mode": handoff_mode,
+        "project_id": project_id,
+        "project_name": project_name,
+        "sprint_version": sprint_version,
+        "session_id": session_id,
+        "origin_identity": dict(origin_identity or {}),
+        "generated_at": generated_at
+        or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "board_revision": compute_board_revision(items),
+        "selected_item_ids": list(selected_item_ids or []),
+        "closure_item_ids": list(closure_item_ids or []),
+        "items": [_manifest_item_entry(it) for it in ordered_items],
+        "items_truncated": truncated,
+        "items_total": len(items),
+        "waves": waves or [],
+        "stop_conditions": list(stop_conditions or []),
+        "deploy_policy": dict(deploy_policy or {}),
+    }
+
+
+def serialize_handoff_manifest_xml(manifest: "dict[str, Any]") -> str:
+    """acf6f51a — deterministic canonical XML serialization of a manifest
+    dict built by ``build_handoff_manifest``. Fixed element order (mirrors
+    the dict's own construction order exactly); every text value passed
+    through ``_xml_escape``, matching every other XML-emitting helper in
+    this module. Raises ``HandoffManifestTooLarge`` instead of truncating —
+    see that class's docstring.
+    """
+
+    def esc(value: "Any") -> str:
+        # 75de5905 (adversarial gate) — must escape `"` too, not just
+        # &/</>: esc() is reused for BOTH element text AND attribute values
+        # below (item id=/status=/depends_on=/wave=, board_revision=,
+        # project_id=, etc.). A bare _xml_escape(str(value)) (the default
+        # entity map, &/</> only) left a literal `"` in an item's id/status/
+        # depends_on/wave free to break out of an attribute and inject an
+        # arbitrary forged attribute into the manifest — confirmed exploit:
+        # an id of 'item-0" evil="injected' serialized to
+        # `<item id="item-0" evil="injected" status="...">`. Every other
+        # attribute-emitting site in this file already passes this same
+        # {chr(34): "&quot;"} extra map (e.g. _build_execution_policy_clause,
+        # the plan_generation/profile_generation/sprint_type clauses) —
+        # &quot; in element text is equally valid XML, so using the same
+        # escape everywhere here (rather than a second attribute-only
+        # helper) is strictly safer with no behavioral cost.
+        return _xml_escape(str(value if value is not None else ""), {chr(34): "&quot;"})
+
+    parts: list[str] = [
+        "<handoff_manifest"
+        f' schema_version="{esc(manifest.get("schema_version"))}"'
+        f' handoff_mode="{esc(manifest.get("handoff_mode"))}"'
+        f' project_id="{esc(manifest.get("project_id"))}"'
+        f' board_revision="{esc(manifest.get("board_revision"))}"'
+        f' generated_at="{esc(manifest.get("generated_at"))}">',
+        f"<project_name>{esc(manifest.get('project_name'))}</project_name>",
+        f"<sprint_version>{esc(manifest.get('sprint_version'))}</sprint_version>",
+        f"<session_id>{esc(manifest.get('session_id'))}</session_id>",
+    ]
+    origin = manifest.get("origin_identity") or {}
+    parts.append("<origin_identity>")
+    for key in sorted(origin):
+        parts.append(f'<field name="{esc(key)}">{esc(origin[key])}</field>')
+    parts.append("</origin_identity>")
+    parts.append(
+        "<selected_item_ids>"
+        f'{esc(",".join(manifest.get("selected_item_ids") or []))}'
+        "</selected_item_ids>"
+    )
+    parts.append(
+        "<closure_item_ids>"
+        f'{esc(",".join(manifest.get("closure_item_ids") or []))}'
+        "</closure_item_ids>"
+    )
+    parts.append(
+        f'<items total="{esc(manifest.get("items_total"))}" '
+        f'truncated="{esc(bool(manifest.get("items_truncated")))}">'
+    )
+    for entry in manifest.get("items") or []:
+        parts.append(
+            f'<item id="{esc(entry.get("id"))}" status="{esc(entry.get("status"))}" '
+            f'depends_on="{esc(entry.get("depends_on"))}" wave="{esc(entry.get("wave"))}">'
+            f"<title>{esc(entry.get('title'))}</title>"
+            "<resources>"
+            + "".join(f"<resource>{esc(r)}</resource>" for r in entry.get("resources") or [])
+            + "</resources></item>"
+        )
+    parts.append("</items>")
+    parts.append("<waves>")
+    for wave_index, wave in enumerate(manifest.get("waves") or []):
+        wave_ids = (
+            [w.get("id") for w in wave if isinstance(w, dict)]
+            if isinstance(wave, list) else []
+        )
+        parts.append(
+            f'<wave index="{esc(wave_index)}" '
+            f'items="{esc(",".join(str(i) for i in wave_ids))}"/>'
+        )
+    parts.append("</waves>")
+    parts.append("<stop_conditions>")
+    for condition in manifest.get("stop_conditions") or []:
+        parts.append(f"<condition>{esc(condition)}</condition>")
+    parts.append("</stop_conditions>")
+    deploy = manifest.get("deploy_policy") or {}
+    parts.append("<deploy_policy>")
+    for key in sorted(deploy):
+        parts.append(f'<field name="{esc(key)}">{esc(deploy[key])}</field>')
+    parts.append("</deploy_policy>")
+    parts.append("</handoff_manifest>")
+
+    xml = "".join(parts)
+    size_bytes = len(xml.encode("utf-8"))
+    if size_bytes > _MANIFEST_MAX_BYTES:
+        raise HandoffManifestTooLarge(str(manifest.get("project_id")), size_bytes)
+    return xml
+
+
+async def mint_manifest_bound_token(
+    db: Any, project_id: str, manifest_xml: str,
+) -> str:
+    """acf6f51a — bind a genuine, verifiable goal token to the canonical
+    manifest XML's own hash, reusing the EXACT SAME body-hash mechanism
+    (``mint_handoff_token(body=...)`` / ``verify_handoff_token(presented_
+    body=...)``) already relied on throughout this module for every other
+    /goal token — no new token schema, no new verification path. A receiver
+    that has the raw manifest XML (e.g. extracted from the ``<handoff_
+    manifest>`` block a manifest-emitting handoff embeds) can verify it
+    independent of the full rendered /goal body.
+    """
+    return await mint_handoff_token(db, project_id, body=manifest_xml)
+
+
+# ---------------------------------------------------------------------------
+# 1bd5e810 — receiver-side manifest acceptance, connector parity, and
+# board-divergence diagnostics.
+#
+# accept_handoff_envelope() is the ONE canonical check every transport (MCP,
+# stdio, HTTP) calls — see the accept_handoff tool wiring in mcp_tools.py /
+# mcp/handler.py / mcp/stdio_handler.py / routes/handoff.py, all of which
+# route to this exact function so they cannot drift out of agreement (the
+# same "one shared implementation" contract load_handoff/verify_handoff_
+# token/record_handoff_correction already established — see f46372e8/
+# d0854621's comments in mcp/stdio_handler.py).
+#
+# Deliberately reuses existing, already-tested primitives instead of
+# reinventing board-staleness detection:
+#   - verify_handoff_token (dd07ece0/efaa918a) for token genuineness + the
+#     manifest/body's own hash binding.
+#   - compute_board_revision/verify_board_revision (acf6f51a) for the
+#     manifest's own narrower (id/status/depends_on) board_revision — NOT
+#     meridian.db.board_snapshot's richer 4-field revision_hash, which is a
+#     DIFFERENT hash over a different tracked-field set and would never
+#     match even on an unchanged board. board_snapshot.build_board_snapshot/
+#     diff_board_snapshots remains the right tool for a full human-readable
+#     resume delta (resume_wave, generate_handoff mode='delta') — this
+#     module intentionally does not duplicate that richer mechanism, only
+#     the manifest-specific one acf6f51a introduced.
+# ---------------------------------------------------------------------------
+
+ACCEPT_RESULT_OK = "ok"
+ACCEPT_RESULT_STALE_HANDOFF = "STALE_HANDOFF"
+ACCEPT_RESULT_BOARD_DIVERGENCE = "BOARD_DIVERGENCE"
+ACCEPT_RESULT_TOOL_MANIFEST_DRIFT = "TOOL_MANIFEST_DRIFT"
+ACCEPT_RESULT_BODY_HASH_MISMATCH = "BODY_HASH_MISMATCH"
+ACCEPT_RESULT_CAPABILITY_UNAVAILABLE = "CAPABILITY_UNAVAILABLE"
+
+# Token-check failure reasons that indicate simple staleness/a sibling
+# already having acted, per AGENTS.md's b763d2ba/ed71ef9b distinction —
+# bucketed under STALE_HANDOFF. `body_mismatch` is handled separately (maps
+# to ACCEPT_RESULT_BODY_HASH_MISMATCH, the one genuinely distinct code the
+# 5-way contract calls out). Every other reason (not_found/wrong_project —
+# REAL spoofing signals) is ALSO bucketed under STALE_HANDOFF here because
+# accept_handoff_envelope's 5-code contract has no separate "spoofed" bucket
+# — the raw token_check.reason sub-field is always preserved so a caller can
+# still recover the not_found/wrong_project-vs-already_consumed/expired
+# distinction AGENTS.md documents, even though the top-level `result` groups
+# them together as "do not execute this envelope".
+_STALE_TOKEN_REASONS = frozenset({"not_found", "wrong_project", "already_consumed", "expired"})
+
+
+def compute_required_tools_hash(items: "list[dict[str, Any]]") -> str:
+    """1bd5e810 — deterministic digest of the UNION of required tool names
+    across ``items``' own ``tool_requirements`` field (already present on
+    every sprint item — see the ``tool_requirements`` column/JSON shape used
+    throughout this project's sprint items). Mirrors compute_board_revision's
+    pattern exactly: sorted canonical JSON, hashed via _hash_goal_body.
+
+    Used to detect TOOL_MANIFEST_DRIFT: a handoff minted when item X required
+    tools {A, B} is no longer accurately described if X's tool_requirements
+    were edited to {A, C} before a receiver acts on it — even though every
+    individual tool might still independently resolve, the DECLARED
+    contract drifted. A caller captures this hash at generation time and
+    compares it against a fresh call at acceptance time via
+    accept_handoff_envelope's expected_required_tools_hash parameter.
+    """
+    names: set[str] = set()
+    for item in items:
+        raw = item.get("tool_requirements")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:  # noqa: BLE001 — malformed stored JSON degrades to "no requirements"
+                raw = None
+        if isinstance(raw, list):
+            for entry in raw:
+                if isinstance(entry, dict) and entry.get("name"):
+                    names.add(str(entry["name"]))
+    return _hash_goal_body(json.dumps(sorted(names), sort_keys=True, separators=(",", ":")))
+
+
+async def accept_handoff_envelope(
+    db: Any,
+    project_id: str,
+    *,
+    goal_token: "str | None" = None,
+    presented_body: "str | None" = None,
+    live_items: "list[dict[str, Any]] | None" = None,
+    expected_board_revision: "str | None" = None,
+    expected_required_tools_hash: "str | None" = None,
+    required_tools: "list[str] | None" = None,
+    available_tools: "list[str] | None" = None,
+) -> "dict[str, Any]":
+    """1bd5e810 — canonical receiver-side acceptance check for a handoff
+    envelope (a pasted /goal block, a manifest-bound token, or both).
+
+    Every parameter is optional and independently gated — a caller supplies
+    whatever it has; a check is skipped (never fails) when its inputs are
+    absent, matching this module's established best-effort/purely-additive
+    convention. Checks run in this fixed precedence order, short-circuiting
+    on the first failure (mirrors handle_resume_wave's own "token check
+    BEFORE board check" ordering — no point reporting board divergence for
+    an envelope whose provenance doesn't even check out):
+
+    1. **Token genuineness** (``goal_token``/``presented_body``) — delegates
+       to :func:`verify_handoff_token`. A ``body_mismatch`` maps to
+       ``ACCEPT_RESULT_BODY_HASH_MISMATCH``; every other invalid reason
+       (``not_found``/``wrong_project``/``already_consumed``/``expired``)
+       maps to ``ACCEPT_RESULT_STALE_HANDOFF`` — see ``_STALE_TOKEN_REASONS``
+       for why these are grouped despite AGENTS.md drawing a real
+       spoofing-vs-staleness distinction between them (the raw
+       ``token_check.reason`` is always preserved in the response).
+    2. **Capability availability** (``required_tools``/``available_tools``)
+       — any name in ``required_tools`` absent from ``available_tools``
+       (when both are given) is ``ACCEPT_RESULT_CAPABILITY_UNAVAILABLE``.
+    3. **Tool-manifest drift** (``expected_required_tools_hash`` vs a hash
+       computed from ``live_items``) — see :func:`compute_required_tools_hash`.
+       Mismatch is ``ACCEPT_RESULT_TOOL_MANIFEST_DRIFT``.
+    4. **Board revision** (``expected_board_revision`` vs
+       :func:`compute_board_revision` of ``live_items``) — mismatch is
+       ``ACCEPT_RESULT_BOARD_DIVERGENCE``.
+
+    Returns ``ACCEPT_RESULT_OK`` (``accepted: True``) when every supplied
+    check passes (or every check was skipped because its inputs were
+    absent — an envelope with NO checkable inputs at all is accepted, same
+    as calling this function with everything omitted being a no-op; callers
+    that want a hard guarantee must supply the corresponding inputs).
+
+    ``live_items`` is a caller-fetched ``get_sprint_items(...)`` result — this
+    function never queries the DB for board state itself, so a caller
+    controls exactly which project/version/status filter "live" means (the
+    same filter used when the compared handoff/manifest was generated).
+    This mirrors :func:`verify_board_revision`'s own "pure comparison, no
+    fetch" contract.
+
+    Deliberately does NOT compare tenant/project identity as a separate
+    check: when ``goal_token`` is supplied, ``verify_handoff_token``'s own
+    ``project_id`` scoping already fails closed (``wrong_project``, bucketed
+    into ``ACCEPT_RESULT_STALE_HANDOFF`` above) — a caller always passes its
+    OWN receiving project_id here, so a mismatch is inherently caught by
+    that existing check rather than needing a second, redundant comparison.
+
+    Scope note: this function VALIDATES and REPORTS; it is deliberately NOT
+    wired as a hard gate inside claim_sprint_item in this pass (that would
+    be a materially larger, riskier change to a heavily-used claim path) —
+    see this item's completion evidence for the explicit scope decision.
+    """
+    token_check: "dict[str, Any] | None" = None
+    if goal_token:
+        token_check = await verify_handoff_token(
+            db, goal_token, project_id, body=presented_body,
+        )
+        if not token_check.get("valid"):
+            reason = token_check.get("reason", "")
+            result = (
+                ACCEPT_RESULT_BODY_HASH_MISMATCH if reason == "body_mismatch"
+                else ACCEPT_RESULT_STALE_HANDOFF
+            )
+            return {
+                "accepted": False,
+                "result": result,
+                "reasons": [f"handoff token verification failed: reason={reason!r}"],
+                "token_check": token_check,
+                "capability_check": None,
+                "tool_manifest_check": None,
+                "board_check": None,
+            }
+
+    capability_check: "dict[str, Any] | None" = None
+    if required_tools and available_tools is not None:
+        missing = sorted(set(required_tools) - set(available_tools))
+        capability_check = {
+            "required_tools": sorted(set(required_tools)),
+            "available_tools": sorted(set(available_tools)),
+            "missing_tools": missing,
+        }
+        if missing:
+            return {
+                "accepted": False,
+                "result": ACCEPT_RESULT_CAPABILITY_UNAVAILABLE,
+                "reasons": [f"required tool(s) unavailable: {', '.join(missing)}"],
+                "token_check": token_check,
+                "capability_check": capability_check,
+                "tool_manifest_check": None,
+                "board_check": None,
+            }
+
+    tool_manifest_check: "dict[str, Any] | None" = None
+    if expected_required_tools_hash and live_items is not None:
+        live_hash = compute_required_tools_hash(live_items)
+        tool_manifest_check = {
+            "expected_required_tools_hash": expected_required_tools_hash,
+            "live_required_tools_hash": live_hash,
+            "matches": live_hash == expected_required_tools_hash,
+        }
+        if not tool_manifest_check["matches"]:
+            return {
+                "accepted": False,
+                "result": ACCEPT_RESULT_TOOL_MANIFEST_DRIFT,
+                "reasons": [
+                    "declared tool_requirements across the handoff's items "
+                    "changed since this envelope was generated"
+                ],
+                "token_check": token_check,
+                "capability_check": capability_check,
+                "tool_manifest_check": tool_manifest_check,
+                "board_check": None,
+            }
+
+    board_check: "dict[str, Any] | None" = None
+    if expected_board_revision and live_items is not None:
+        live_revision = compute_board_revision(live_items)
+        board_check = {
+            "expected_board_revision": expected_board_revision,
+            "live_board_revision": live_revision,
+            "matches": live_revision == expected_board_revision,
+        }
+        if not board_check["matches"]:
+            return {
+                "accepted": False,
+                "result": ACCEPT_RESULT_BOARD_DIVERGENCE,
+                "reasons": [
+                    "the live board's item id/status/depends_on state no "
+                    "longer matches this envelope's declared board_revision"
+                ],
+                "token_check": token_check,
+                "capability_check": capability_check,
+                "tool_manifest_check": tool_manifest_check,
+                "board_check": board_check,
+            }
+
+    return {
+        "accepted": True,
+        "result": ACCEPT_RESULT_OK,
+        "reasons": [],
+        "token_check": token_check,
+        "capability_check": capability_check,
+        "tool_manifest_check": tool_manifest_check,
+        "board_check": board_check,
+    }
+
+
+# 7479e427 — unified proposal-run scope: one immutable, structurally-validated
+# contract object shared by starter/goal/delta/full so the four handoff modes
+# can never disagree about what is in scope, what was omitted and why, what
+# capabilities/HITL gates are live, and whether the resulting handoff is safe
+# to treat as executable. Built ONCE per generate_handoff call (see
+# ``build_proposal_run_scope``/``_build_quick_start_goal``'s own
+# ``proposal_scope_out`` out-param) from data every mode ALREADY computes
+# (the final claimable batch + ``_scope_exclusion_reason_by_id``,
+# ``capability_status``, and pending HITL requests) -- this does not
+# re-derive any of that classification, it only assembles and validates it.
+#
+# Design note: prior to this item, HITL gates were only ever surfaced in
+# planner-mode prose (see ``_generate_planner_handoff``'s "Open decisions"
+# section) -- the four executor-facing modes (starter/goal/delta/full) had no
+# live-HITL signal at all, and the per-mode "omitted/excluded" reasoning
+# (manual/backburner/unprospected/wave_gate_pending) was rendered as prose
+# tags but never exposed as one structured, cross-mode-comparable object. A
+# caller could not tell, without re-deriving it from the rendered XML,
+# whether two different generate_handoff calls (or two different modes for
+# the SAME call) agreed on what was actually executable.
+# ---------------------------------------------------------------------------
+
+
+def _hash_proposal_scope_payload(payload: Any) -> str:
+    """Stable content hash for a proposal-run scope payload.
+
+    Canonical (sorted-key, compact-separator) JSON, hashed via the SAME
+    ``_hash_goal_body`` primitive ``closure_hash``/goal-token hashing already
+    uses elsewhere in this module -- one hashing convention, not two.
+    """
+    return _hash_goal_body(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    )
+
+
+def _validate_proposal_run_scope_integrity(
+    items: list[dict[str, Any]],
+    *,
+    dependencies: dict[str, str],
+    omitted_ids: "set[str]",
+    capability_status: dict[str, Any],
+    hitl_gates: list[dict[str, Any]],
+    truncated: bool,
+) -> list[str]:
+    """7479e427 -- "a syntactically incomplete or contradictory handoff must
+    never be emitted as executable."
+
+    Pure, synchronous, structural validation over an already-assembled scope
+    (no DB/IO) so it can run unconditionally every time a scope is built and
+    unit-test cleanly in isolation. Returns ``[]`` (consistent, safe to call
+    executable) or a list of machine-readable reason codes -- the SAME
+    ``executable_reasons`` vocabulary style ``capability_contract.py``/
+    ``executor_contract.py`` already use elsewhere in this codebase.
+
+    Checks, each chosen to be a GENUINE contradiction rather than an
+    ordinary/expected state (a legitimately-``done`` dependency that is
+    absent from both ``items`` and ``omitted_ids`` is normal and never
+    flagged -- only a dependency this SAME render explicitly excluded is a
+    real contradiction):
+
+    - ``duplicate_item_id`` -- the same item id appears twice in ``items``
+      (structural corruption of the scope itself).
+    - ``depends_on_omitted_item`` -- an in-scope item declares ``depends_on``
+      an id THIS SAME render put in ``omitted_items`` (manual/backburner/
+      unprospected/wave_gate_pending) -- i.e. the scope names an item as
+      executable-now while also declaring its own prerequisite blocked.
+    - ``required_capability_failed`` -- any ``capability_status`` entry is
+      ``status == "failed"`` (a genuinely broken capability, as opposed to
+      ``degraded``, which must stay VISIBLE -- see the ``build_proposal_run_scope``
+      docstring -- but does not by itself make the scope non-executable).
+    - ``content_truncated`` -- the deterministic per-item contract clauses
+      (tool_requirements/sprint_item_pointers/artifact_pointer_findings) hit
+      their bounded-profile cap for this render. Per the canonical receiver
+      contract: "Any TRUNCATED marker makes the compact handoff non-ready/
+      non-executable."
+    """
+    reasons: list[str] = []
+    seen_ids: set[str] = set()
+    for _it in items:
+        _iid = _it.get("id")
+        if _iid and _iid in seen_ids:
+            reasons.append(f"duplicate_item_id:{_iid}")
+        elif _iid:
+            seen_ids.add(_iid)
+    for _iid, _dep in dependencies.items():
+        if _dep in omitted_ids:
+            reasons.append(f"depends_on_omitted_item:{_iid}->{_dep}")
+    for _cap_id, _info in (capability_status or {}).items():
+        if isinstance(_info, dict) and _info.get("status") == "failed":
+            reasons.append(f"required_capability_failed:{_cap_id}")
+    if truncated:
+        reasons.append("content_truncated")
+    return reasons
+
+
+def build_proposal_run_scope(
+    pending_items: list[dict[str, Any]],
+    *,
+    project_id: "str | None",
+    effective_version: "str | None",
+    omitted_items: "list[dict[str, Any]] | None" = None,
+    capability_status: "dict[str, Any] | None" = None,
+    hitl_gates: "list[dict[str, Any]] | None" = None,
+    selected_scope: "dict[str, Any] | None" = None,
+    truncated: bool = False,
+    mode: str = "goal",
+) -> dict[str, Any]:
+    """7479e427 -- assemble ONE immutable proposal-run scope contract.
+
+    ``pending_items`` must already be the FINAL, fully-filtered executable
+    batch for this render (after manual/backburner/unprospected/wave-gate
+    exclusion -- exactly what ``_build_quick_start_goal`` renders under
+    ``<sprint_items>``), so ``items``/``waves``/``dependencies`` below
+    describe what THIS handoff actually proposes to execute, not the raw
+    pending inventory.
+
+    Returns a dict with:
+      - ``proposal_id`` -- short, stable identifier for this exact scope
+        (derived from ``content_hash``); two calls with the same project,
+        version, executable items and omissions always get the SAME id.
+      - ``mode`` / ``project_id`` / ``version``.
+      - ``items`` -- ``[{"id", "status", "parent_id", "depends_on", "wave"}]``
+        for every item in scope.
+      - ``waves`` -- ``{wave_label: [item_id, ...]}``, derived FROM ``items``
+        (so it can never reference an id outside the scope by construction).
+      - ``dependencies`` -- ``{item_id: depends_on_id}`` for items that
+        declare one.
+      - ``pointer_resolution_states`` -- ``{item_id: status}``, sourced from
+        each item's own ``pointer_resolution_status`` when
+        ``_annotate_resolved_pointers`` already ran (full/delta/goal), or
+        ``"unknown"`` when it didn't (starter/compact never resolves
+        pointers -- an honest, non-contradictory value, not an error).
+      - ``required_capabilities`` -- the SAME per-mode ``capability_status``
+        dict (``_CAP_*`` keys, ``verified``/``skipped``/``degraded``/
+        ``failed``) every mode already computes; degraded entries stay
+        visible here even when they do not flip ``executable`` (e.g. a
+        degraded code-intel/graph-search signal must remain visible in
+        executable status per the 2026-08-21 investigation note, not be
+        silently dropped).
+      - ``hitl_gates`` -- live pending HITL requests (bounded by the caller
+        for compact modes), so an executor-facing handoff finally carries
+        the same "open human decisions" signal planner-mode always had.
+      - ``omitted_items`` -- ``[{"id", "reason"}]`` for every item this
+        render excluded from the executable batch (manual/backburner/
+        unprospected/wave_gate_pending), independent of whether an explicit
+        ``selected_item_ids`` scope was ever passed.
+      - ``content_hash`` -- canonical hash of the scope's own identity
+        (project/version/items/omitted), stable across re-renders of the
+        identical underlying board state.
+      - ``truncated`` -- whether the bounded per-item contract clauses hit
+        their deterministic cap for this render.
+      - ``selected_scope_ids`` -- the explicit dependency-closure id list
+        when the caller passed ``selected_item_ids`` (mirrors
+        ``_build_selected_scope_clause``'s own data), else ``None``.
+      - ``executable`` / ``degraded`` / ``executable_reasons`` -- see
+        :func:`_validate_proposal_run_scope_integrity`. ``executable`` is
+        ALWAYS derived by that validator, never set directly by a caller --
+        this is what makes "never emitted as executable when contradictory"
+        a property of construction rather than something each call site
+        must remember to check.
+    """
+    items: list[dict[str, Any]] = []
+    waves: dict[str, list[str]] = {}
+    dependencies: dict[str, str] = {}
+    pointer_states: dict[str, str] = {}
+    for _it in pending_items:
+        _iid = _it.get("id")
+        if not _iid:
+            continue
+        _wave = _it.get("wave")
+        _dep = _it.get("depends_on")
+        items.append({
+            "id": _iid,
+            "status": _it.get("status"),
+            "parent_id": _it.get("parent_id"),
+            "depends_on": _dep,
+            "wave": _wave,
+        })
+        if _wave:
+            waves.setdefault(str(_wave), []).append(_iid)
+        if _dep:
+            dependencies[_iid] = _dep
+        _prs = _it.get("pointer_resolution_status")
+        if isinstance(_prs, dict):
+            if _prs.get("strict_satisfied"):
+                pointer_states[_iid] = "resolved"
+            elif _prs.get("target_resolved"):
+                pointer_states[_iid] = "target_resolved"
+            elif _prs.get("structural_valid"):
+                pointer_states[_iid] = "structural_only"
+            else:
+                pointer_states[_iid] = "unresolved"
+        else:
+            # starter/compact never runs _annotate_resolved_pointers — an
+            # honest, non-contradictory "unknown", not an error.
+            pointer_states[_iid] = "unknown"
+
+    omitted = [dict(o) for o in (omitted_items or []) if o.get("id")]
+    omitted_ids = {o["id"] for o in omitted}
+    capability_status = dict(capability_status or {})
+    hitl_gates = [dict(h) for h in (hitl_gates or [])]
+
+    _hash_payload = {
+        "project_id": project_id,
+        "version": effective_version,
+        "items": sorted(
+            ({"id": i["id"], "depends_on": i["depends_on"], "wave": i["wave"]} for i in items),
+            key=lambda r: r["id"],
+        ),
+        "omitted": sorted(omitted, key=lambda r: r.get("id", "")),
+    }
+    content_hash = _hash_proposal_scope_payload(_hash_payload)
+
+    reasons = _validate_proposal_run_scope_integrity(
+        items,
+        dependencies=dependencies,
+        omitted_ids=omitted_ids,
+        capability_status=capability_status,
+        hitl_gates=hitl_gates,
+        truncated=truncated,
+    )
+    return {
+        "proposal_id": content_hash[:16],
+        "mode": mode,
+        "project_id": project_id,
+        "version": effective_version,
+        "items": items,
+        "waves": waves,
+        "dependencies": dependencies,
+        "pointer_resolution_states": pointer_states,
+        "required_capabilities": capability_status,
+        "hitl_gates": hitl_gates,
+        "omitted_items": omitted,
+        "content_hash": content_hash,
+        "truncated": bool(truncated),
+        "selected_scope_ids": (
+            list(selected_scope.get("closure_item_ids") or [])
+            if selected_scope else None
+        ),
+        "executable": not reasons,
+        "degraded": bool(reasons),
+        "executable_reasons": reasons,
+    }
+
+
+def _build_proposal_scope_clause(
+    scope: "dict[str, Any] | None", *, compact: bool = True,
+) -> str:
+    """7479e427 -- render ``scope`` (see :func:`build_proposal_run_scope`) as
+    a ``<proposal_scope>`` tag, appended to a /goal body the SAME way
+    ``_build_project_start_config_clause``'s output is (post-``_build_quick_start_goal``,
+    pre-token-mint -- see that clause's own docstring for why it must never
+    be a post-mint patch). Returns ``""`` when ``scope`` is falsy so an
+    un-opted-in caller sees zero change.
+
+    ``compact=True`` (goal/starter) renders a small, deterministically-bounded
+    summary -- counts, not full per-item detail -- consistent with the
+    248c0bb9 bounded-profile convention (never re-introduce unbounded
+    serialization into a compact mode). ``compact=False`` (full/delta) also
+    includes the full omitted-items and HITL-gate detail.
+    """
+    if not scope:
+        return ""
+    _exec = "true" if scope.get("executable") else "false"
+    _deg = "true" if scope.get("degraded") else "false"
+    _trunc = "true" if scope.get("truncated") else "false"
+    _reasons = ", ".join(scope.get("executable_reasons") or []) or "none"
+    _n_items = len(scope.get("items") or [])
+    _n_omitted = len(scope.get("omitted_items") or [])
+    _n_hitl = len(scope.get("hitl_gates") or [])
+    _attrs = (
+        f'proposal_id="{_xml_escape(str(scope.get("proposal_id")))}" '
+        f'content_hash="{_xml_escape(str(scope.get("content_hash")))}" '
+        f'executable="{_exec}" degraded="{_deg}" truncated="{_trunc}" '
+        f'executable_reasons="{_xml_escape(_reasons)}"'
+    )
+    if compact:
+        body = (
+            f"{_n_items} item(s) in scope, {_n_omitted} omitted, "
+            f"{_n_hitl} HITL gate(s) open."
+        )
+        return f'\n<proposal_scope {_attrs}>{_xml_escape(body)}</proposal_scope>'
+    _hitl_lines = "\n".join(
+        f'  - [{(h.get("urgency") or "normal").upper()}] '
+        f'{(h.get("id") or "")[:8]} -- {(h.get("question") or "")[:200]}'
+        for h in (scope.get("hitl_gates") or [])
+    ) or "  - none"
+    _omitted_lines = "\n".join(
+        f'  - {o.get("id", "")[:8]} ({o.get("reason", "")})'
+        for o in (scope.get("omitted_items") or [])
+    ) or "  - none"
+    body = (
+        f"items_in_scope: {_n_items}\n"
+        f"waves: {json.dumps(scope.get('waves') or {}, sort_keys=True)}\n"
+        f"hitl_gates:\n{_hitl_lines}\n"
+        f"omitted_items:\n{_omitted_lines}"
+    )
+    return f'\n<proposal_scope {_attrs}>\n{_xml_escape(body)}\n</proposal_scope>'
+
+
 async def generate_handoff(
     db: aiosqlite.Connection,
     project_id: str,
@@ -8598,8 +9643,24 @@ async def generate_handoff(
     strict_test_evidence: bool = False,
     test_run_evidence: dict[str, Any] | None = None,
     test_run_repo_root: "str | None" = None,
+    emit_manifest: bool = False,
+    research_evidence_envelope: Any = None,
+    proposal_scope: "dict[str, Any] | None" = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
+
+    ``emit_manifest`` (acf6f51a) — opt-in, defaults to False (zero behaviour
+    change for every existing caller). Currently wired for ``mode="goal"``
+    only: when True, a canonical ``<handoff_manifest>`` XML block (see
+    ``build_handoff_manifest``/``serialize_handoff_manifest_xml`` above) is
+    spliced into the rendered ``quick_start_goal`` BEFORE the existing
+    ``_mint_and_embed_goal_token`` call, so the manifest is covered by the
+    same ``body_hash``/``verify_handoff_token(presented_body=...)`` check
+    every other part of the /goal block already relies on — no new
+    verification path for a receiver to learn. A caller wanting the same
+    guarantee for ``full``/``delta``/``starter``/``compact`` should build on
+    the same primitives directly; this first pass intentionally covers one
+    mode end-to-end rather than four modes partially.
 
     Returns ``(path, content, amended)`` where ``path`` is the absolute path to
     the rendered file on disk and ``amended`` is True when the prior handoff was
@@ -8898,6 +9959,37 @@ async def generate_handoff(
     the modes where the full pending-item list is resolved; other modes
     leave the passed dict untouched (documented gap, not silent — see the
     module's own KNOWN LIMITATIONS note near ``build_promotion_readiness_for_handoff``).
+
+    ``research_evidence_envelope`` (0ea8fd3c) — optional, ``None`` by
+    default. A caller-supplied typed research-evidence provenance envelope
+    (see ``extensions/meridian-outputs/meridian_outputs/research_evidence
+    .ProvenanceEnvelope`` / ``provenance_status.build_provenance_envelope``)
+    to render as an ADDITIVE "## Research Evidence" section in the handoff
+    body, via :func:`_render_research_evidence_block`. Accepts either a real
+    ``ProvenanceEnvelope`` instance (duck-typed via its ``to_markdown()``
+    method) or its canonical dict shape (``envelope_to_dict()``'s output,
+    e.g. round-tripped through JSON from another process) — meridian core
+    never imports the extension package itself, mirroring the same no-hard-
+    dependency contract ``get_manifest_backed_provenance_status`` already
+    established for the opposite direction. Rendered for ``mode in {"full",
+    "delta"}`` only (the same two modes ``promotion_readiness`` above
+    populates) — ``starter``/``compact``/``goal`` return earlier in this
+    function, before this section would be appended. A caller that passes
+    ``None`` (the default — every pre-existing call site) sees ZERO
+    functional change to the returned ``(path, content, amended)``.
+
+    ``proposal_scope`` (7479e427) — optional output dict, same purely-additive
+    out-param shape as ``evidence_status``: when given (any dict, typically
+    ``{}``), populated in place with the SAME unified proposal-run scope
+    contract (see :func:`build_proposal_run_scope`) embedded in the rendered
+    ``<proposal_scope>`` tag for this call's mode — proposal id, in-scope
+    items (parent/child, dependencies, waves), pointer resolution states,
+    required capabilities, live HITL gates, omitted/deferred items, a content
+    hash, truncation state, and executable/degraded/executable_reasons. Built
+    for every executor-facing mode (``starter``/``compact``, ``goal``,
+    ``delta``, ``full``) — ``planner`` leaves this untouched, matching
+    ``evidence_status``'s own documented mode gap above. A caller that never
+    passes ``proposal_scope`` sees zero functional change.
     """
     project = await db_module.get_project(db, project_id)
     if project is None:
@@ -8987,6 +10079,7 @@ async def generate_handoff(
             evidence_status=evidence_status,
             strict_pointer_evidence=strict_pointer_evidence,
             selected_scope=_selected_scope,
+            proposal_scope=proposal_scope,
         )
         return (
             _st_path,
@@ -9011,6 +10104,8 @@ async def generate_handoff(
             strict_pointer_evidence=strict_pointer_evidence,
             force_include_rejected=force_include_rejected,
             selected_scope=_selected_scope,
+            emit_manifest=emit_manifest,
+            proposal_scope=proposal_scope,
         )
         return (
             _g_path,
@@ -9433,6 +10528,17 @@ async def generate_handoff(
     _finalize_capability_status(
         _capability_status, evidence_status, strict_evidence=strict_evidence,
     )
+    # 7479e427 — live pending HITL gates for the unified proposal-run scope
+    # (see build_proposal_run_scope); guarded, fail-open, never breaks the
+    # mandatory handoff. full/delta carry full detail elsewhere, so this is
+    # bounded more generously than starter/goal's own 10-row cap.
+    _hitl_gates: list[dict[str, Any]] = []
+    try:
+        _hitl_gates = (
+            await db_module.list_hitl_requests(db, project_id, status="pending")
+        )[:20]
+    except Exception:  # noqa: BLE001
+        _hitl_gates = []
     # ecc8b280 — machine-readable continuation_required/terminal_ready state
     # over the SAME freshly re-queried, version-scoped board the pending list
     # above was just finalized against (falls back to the pre-freshness
@@ -9498,6 +10604,10 @@ async def generate_handoff(
     _profile_binding = await build_effective_profile_binding(
         db, project_id, session_id=session_id,
     )
+    # 7479e427 — always built locally so full/delta can render the
+    # <proposal_scope> tag below regardless of whether the caller opted into
+    # the proposal_scope out-param (mirrored into it afterward when given).
+    _full_proposal_scope: dict[str, Any] = {}
     # 60eed526 — deliberately NOT passing full_contract_max_items here even
     # when checkpoint=True: capping construction would also shrink what gets
     # WRITTEN to disk / the handoffs table / pending_goal (this same
@@ -9562,6 +10672,14 @@ async def generate_handoff(
         profile_restart_required=bool(
             _profile_binding.get("restart_required")
         ) if _profile_binding else False,
+        # 7479e427 — unified proposal-run scope; always built into a local
+        # dict (below) so full/delta can render the <proposal_scope> tag
+        # regardless of whether the top-level caller opted into the
+        # proposal_scope out-param.
+        capability_status=_capability_status,
+        hitl_gates=_hitl_gates,
+        proposal_scope_out=_full_proposal_scope,
+        handoff_mode=mode,
     )
     # fb82e51f — a selected_item_ids scope that validated cleanly (every id
     # genuinely pending) can still collapse to zero executable items once the
@@ -9596,6 +10714,21 @@ async def generate_handoff(
             shell=_shell_type_from_settings(proj_settings),
             test_cmd=_test_cmd_from_settings(proj_settings),
         )
+    # 7479e427 — append the unified proposal-run scope tag, same pre-mint
+    # placement as project_start_config above (part of the hashed body).
+    # Full detail (compact=False) for BOTH full and delta: neither passes a
+    # full_contract_max_items cap (see 60eed526's comment above), so this is
+    # where "detailed records stay in full/delta" (per the canonical
+    # receiver contract) actually lives — unlike project_start_config, this
+    # tag carries no literal test_cmd/shell string, so it does not trip
+    # test_handoff_generates_clean_markdown's content-cleanliness assertion
+    # and is safe to render for full mode too.
+    quick_start_goal = quick_start_goal + _build_proposal_scope_clause(
+        _full_proposal_scope, compact=False,
+    )
+    if proposal_scope is not None:
+        proposal_scope.clear()
+        proposal_scope.update(_full_proposal_scope)
     # dd07ece0/581144fa — embed a provenance token + SECURITY verification
     # banner near the top of the /goal block (shared helper — see
     # _mint_and_embed_goal_token; 4611b9a2 also wires this into the
@@ -9871,6 +11004,17 @@ async def generate_handoff(
             f"{content}\n\n## Session narrative (from transcript)\n\n"
             f"{extra_narrative.strip()}\n"
         )
+
+    # 0ea8fd3c — optional, caller-supplied research-evidence provenance
+    # envelope (see _render_research_evidence_block's own docstring and the
+    # research_evidence_envelope parameter doc above). Purely additive: a
+    # caller that never passes this argument sees zero change to the
+    # rendered/persisted/returned content.
+    _research_evidence_block = _render_research_evidence_block(
+        research_evidence_envelope
+    )
+    if _research_evidence_block:
+        content = f"{content}\n\n{_research_evidence_block}"
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -10178,6 +11322,7 @@ async def _generate_starter_handoff(
     evidence_status: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
     selected_scope: "dict[str, Any] | None" = None,
+    proposal_scope: "dict[str, Any] | None" = None,
 ) -> tuple[str, str]:
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
@@ -10297,6 +11442,16 @@ async def _generate_starter_handoff(
     _finalize_capability_status(
         _s_capability_status, evidence_status, strict_evidence=strict_evidence,
     )
+    # 7479e427 — live pending HITL gates for the unified proposal-run scope
+    # (see build_proposal_run_scope); guarded, fail-open, never breaks the
+    # mandatory handoff. Bounded to keep starter's compact profile small.
+    _s_hitl_gates: list[dict[str, Any]] = []
+    try:
+        _s_hitl_gates = (
+            await db_module.list_hitl_requests(db, project_id, status="pending")
+        )[:10]
+    except Exception:  # noqa: BLE001
+        _s_hitl_gates = []
     # d5849a67 — see the twin comment in generate_handoff: batch-resolve durable
     # pointer evidence so the starter handoff's excluded_unprospected list also
     # agrees with claim_sprint_item's own gate. Guarded, fail-open.
@@ -10363,6 +11518,16 @@ async def _generate_starter_handoff(
         profile_restart_required=bool(
             _s_profile_binding.get("restart_required")
         ) if _s_profile_binding else False,
+        # 7479e427 — unified proposal-run scope out-param; see
+        # build_proposal_run_scope's own docstring. Starter's rendered TEXT
+        # deliberately does NOT gain a new <proposal_scope> tag (its hard
+        # <=20-non-empty-line budget has no room — see the twin
+        # <project_start_config> precedent a few lines below), but the
+        # structured object is still exposed here for a programmatic caller.
+        capability_status=_s_capability_status,
+        hitl_gates=_s_hitl_gates,
+        proposal_scope_out=proposal_scope,
+        handoff_mode="starter",
     )
     # fb82e51f — fail CLOSED before the token is minted or anything is
     # written/persisted. See HandoffScopeNonExecutable's own docstring.
@@ -10426,6 +11591,8 @@ async def _generate_goal_only_handoff(
     strict_pointer_evidence: bool = False,
     force_include_rejected: "list[dict[str, Any]] | None" = None,
     selected_scope: "dict[str, Any] | None" = None,
+    emit_manifest: bool = False,
+    proposal_scope: "dict[str, Any] | None" = None,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
 
@@ -10635,6 +11802,16 @@ async def _generate_goal_only_handoff(
     _finalize_capability_status(
         _g_capability_status, evidence_status, strict_evidence=strict_evidence,
     )
+    # 7479e427 — live pending HITL gates for the unified proposal-run scope
+    # (see build_proposal_run_scope); guarded, fail-open, never breaks the
+    # mandatory handoff. Bounded to keep the goal-only profile small.
+    _g_hitl_gates: list[dict[str, Any]] = []
+    try:
+        _g_hitl_gates = (
+            await db_module.list_hitl_requests(db, project_id, status="pending")
+        )[:10]
+    except Exception:  # noqa: BLE001
+        _g_hitl_gates = []
     _pointer_evidence_ids = None
     try:
         _pointer_evidence_ids = await db_module.get_pointer_evidence_item_ids(
@@ -10656,6 +11833,10 @@ async def _generate_goal_only_handoff(
     # profile-identity signal. No session_id in scope for this mode (see
     # this function's own signature). Best-effort: None on any failure.
     _g_profile_binding = await build_effective_profile_binding(db, project_id)
+    # 7479e427 — always built locally so the <proposal_scope> tag can render
+    # below regardless of whether the caller opted into the proposal_scope
+    # out-param (mirrored into it afterward when given).
+    _g_proposal_scope: dict[str, Any] = {}
     quick_start_goal = _build_quick_start_goal(
         pending_sprint_items,
         execution_mode=_g_execution_mode,
@@ -10709,6 +11890,14 @@ async def _generate_goal_only_handoff(
         profile_restart_required=bool(
             _g_profile_binding.get("restart_required")
         ) if _g_profile_binding else False,
+        # 7479e427 — unified proposal-run scope; always built into a local
+        # dict (below) so goal mode can render the <proposal_scope> tag
+        # regardless of whether the top-level generate_handoff caller opted
+        # into the proposal_scope out-param.
+        capability_status=_g_capability_status,
+        hitl_gates=_g_hitl_gates,
+        proposal_scope_out=_g_proposal_scope,
+        handoff_mode="goal",
     )
     # fb82e51f — fail CLOSED before the token is minted or anything is
     # written/persisted. See HandoffScopeNonExecutable's own docstring.
@@ -10717,6 +11906,28 @@ async def _generate_goal_only_handoff(
             project_id,
             _g_selected_scope_outcome.get("requested_ids") or [],
             _g_selected_scope_outcome.get("excluded_requested") or [],
+        )
+    # acf6f51a — opt-in canonical manifest. Built entirely from data this
+    # function already computed for its own render (pending_sprint_items,
+    # selected_scope, _parallel_groups, project) — never independently
+    # authored. Spliced into quick_start_goal BEFORE the token mint below so
+    # the existing body_hash mechanism covers it too; raises
+    # HandoffManifestTooLarge (fail closed, same convention as
+    # HandoffScopeNonExecutable just above) rather than truncating.
+    if emit_manifest:
+        _g_manifest = build_handoff_manifest(
+            handoff_mode="goal",
+            project_id=project_id,
+            items=pending_sprint_items,
+            project_name=project.get("name"),
+            sprint_version=version,
+            origin_identity=resolve_origin_identity(project),
+            selected_item_ids=(selected_scope or {}).get("selected_item_ids"),
+            closure_item_ids=(selected_scope or {}).get("closure_item_ids"),
+            waves=(_parallel_groups or {}).get("groups"),
+        )
+        quick_start_goal = (
+            f"{quick_start_goal}\n{serialize_handoff_manifest_xml(_g_manifest)}"
         )
     # f471c4b8 — append the SAME machine-readable project-start-configuration
     # tag full/delta/starter render, BEFORE the token is minted below. This
@@ -10735,6 +11946,15 @@ async def _generate_goal_only_handoff(
         shell=_shell_type_from_settings(proj_settings),
         test_cmd=_test_cmd_from_settings(proj_settings),
     )
+    # 7479e427 — append the unified proposal-run scope tag, same pre-mint
+    # placement as project_start_config above (part of the hashed body).
+    # Compact form: goal is one of the two bounded profiles (with starter).
+    quick_start_goal = quick_start_goal + _build_proposal_scope_clause(
+        _g_proposal_scope, compact=True,
+    )
+    if proposal_scope is not None:
+        proposal_scope.clear()
+        proposal_scope.update(_g_proposal_scope)
     # dd07ece0/581144fa/4611b9a2 — same structural provenance token + SECURITY
     # banner every /goal-producing path carries.
     quick_start_goal = await _mint_and_embed_goal_token(db, project_id, quick_start_goal)

@@ -844,3 +844,51 @@ def test_mcp_audit_figure_table_provenance_no_figures_or_tables(tmp_path, monkey
             await doc_store.close_all_doc_stores()
 
     asyncio.run(_run())
+
+
+def test_mcp_audit_single_basename_match_is_unresolved_not_ok(tmp_path, monkeypatch):
+    """A sole relocated filename is diagnostic, not exact media lineage."""
+    async def _run():
+        from meridian import server as mh
+        sidecar = _seed_store_via_env(tmp_path, monkeypatch)
+        db = await db_module.init_db(":memory:")
+        try:
+            proj = await db_module.create_project(db, "audit-proj-relocated")
+            pid = proj["id"]
+            outputs_dir = tmp_path / "outputs"
+            actual = outputs_dir / "run_1" / "plot.png"
+            actual.parent.mkdir(parents=True)
+            actual.write_bytes(b"plot bytes")
+            relocated = tmp_path / "docx_media" / "plot.png"
+
+            seed = await doc_store.open_doc_store_for(
+                plan=None, hosted=False, data_dir=str(tmp_path),
+                tenant_pg_url=None, override_url=sidecar,
+            )
+            await seed.put_document(pid, "docx", [], source="thesis.docx")
+            await mh._dispatch_mcp_tool(
+                "index_figure",
+                {"project_id": pid, "doc": "thesis.docx",
+                 "file_path": str(relocated), "caption": "Figure 1: Relocated"},
+                db, str(tmp_path),
+            )
+
+            result = await mh._dispatch_mcp_tool(
+                "audit_figure_table_provenance",
+                {"project_id": pid, "doc": "thesis.docx",
+                 "outputs_dir": str(outputs_dir)},
+                db, str(tmp_path),
+            )
+            assert "error" not in result
+            assert len(result["figures"]) == 1
+            figure = result["figures"][0]
+            assert figure["match_type"] == "basename"
+            assert figure["status"] == "unresolved"
+            assert figure["reason"] == "basename-match-not-authoritative"
+            assert result["summary"]["ok_count"] == 0
+            assert result["summary"]["unresolved_count"] == 1
+        finally:
+            await db.close()
+            await doc_store.close_all_doc_stores()
+
+    asyncio.run(_run())

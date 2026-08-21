@@ -480,9 +480,17 @@ async def _downgrade_wave_gate_tables_to_pre_ed8e4524(db):
     """Rebuild wave_gate_results/wave_gate_configs with the OLD 2-column
     UNIQUE constraint, simulating a table that predates ed8e4524's version
     column (that migration only ever ADD COLUMN'd version onto tables in
-    this shape — it never widened the constraint)."""
+    this shape — it never widened the constraint).
+
+    Backend-portable: ``datetime('now')`` is SQLite-only (invalid syntax on
+    Postgres — no such function), which is one of the two things that broke
+    this helper under ``TEST_DATABASE_URL``. Mirrors the
+    ``"now()" if hasattr(db, "_pool") else "datetime('now')"``
+    backend-discrimination convention already used throughout
+    meridian/db/__init__.py and meridian/handoff.py."""
+    now_expr = "now()" if hasattr(db, "_pool") else "datetime('now')"
     await db.executescript(
-        """
+        f"""
         DROP TABLE IF EXISTS wave_gate_results;
         CREATE TABLE wave_gate_results (
             id TEXT PRIMARY KEY,
@@ -496,7 +504,7 @@ async def _downgrade_wave_gate_tables_to_pre_ed8e4524(db):
             verification_status TEXT,
             evidence_snapshot TEXT,
             actor TEXT,
-            completed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT NOT NULL DEFAULT ({now_expr}),
             UNIQUE(project_id, wave_label)
         );
         DROP TABLE IF EXISTS wave_gate_configs;
@@ -508,12 +516,36 @@ async def _downgrade_wave_gate_tables_to_pre_ed8e4524(db):
             version TEXT,
             actions TEXT NOT NULL,
             actor TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            created_at TEXT NOT NULL DEFAULT ({now_expr}),
+            updated_at TEXT NOT NULL DEFAULT ({now_expr}),
             UNIQUE(project_id, wave_end)
         );
         """
     )
+
+
+def _integrity_error_types() -> tuple[type[BaseException], ...]:
+    """Backend-portable exception types for a UNIQUE/duplicate-key violation.
+
+    ``sqlite3.IntegrityError`` on the SQLite backend; psycopg3's
+    ``IntegrityError`` (the base class of ``psycopg.errors.UniqueViolation``,
+    confirmed via ``psycopg.errors.UniqueViolation.__mro__``) on Postgres.
+    Mirrors the same ``hasattr(db, "_pool")`` backend-discrimination
+    convention used throughout meridian/db/__init__.py — asserting against
+    ``sqlite3.IntegrityError`` alone (the original code) only ever passes on
+    SQLite; the real bug this test reproduces was confirmed live on hosted
+    Postgres in the first place (see the module-level comment above), so the
+    Postgres exception type has to be recognized too."""
+    import sqlite3
+
+    types: list[type[BaseException]] = [sqlite3.IntegrityError]
+    try:
+        import psycopg
+    except ImportError:  # pragma: no cover - psycopg is a hard dependency
+        pass
+    else:
+        types.append(psycopg.IntegrityError)
+    return tuple(types)
 
 
 @pytest.mark.asyncio
@@ -522,8 +554,6 @@ async def test_pre_existing_table_blocks_multi_version_gate_before_migration(db)
     schema, a second version's legitimate complete_wave_gate() for the
     SAME wave_label raises — proving the failure mode is real, not just
     theoretical, before asserting the repair migration fixes it below."""
-    import sqlite3
-
     pid = (await db_module.create_project(db, name="pre-ed8e4524-wave-gate"))["id"]
     await _downgrade_wave_gate_tables_to_pre_ed8e4524(db)
 
@@ -532,7 +562,7 @@ async def test_pre_existing_table_blocks_multi_version_gate_before_migration(db)
     )
     assert result_a["gate_completed"] is True
 
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(_integrity_error_types()):
         await db_module.complete_wave_gate(
             db, pid, "wave-1", _GOOD_PAYLOAD, version="vB",
         )
@@ -541,14 +571,34 @@ async def test_pre_existing_table_blocks_multi_version_gate_before_migration(db)
 @pytest.mark.asyncio
 async def test_version_unique_migration_repairs_pre_existing_table(db):
     """The actual fix: _migrate_wave_gate_results_version_unique /
-    _migrate_wave_gate_configs_version_unique rebuild a pre-ed8e4524 table
-    in place, preserving existing rows, so a second version's gate for the
-    same wave_label can complete afterward without error."""
-    from meridian.db.migrations import (
-        _migrate_wave_gate_configs_version_unique,
-        _migrate_wave_gate_results_version_unique,
-    )
+    _migrate_wave_gate_configs_version_unique (SQLite) or
+    _migrate_pg_wave_gate_version_unique_constraints (Postgres) rebuild a
+    pre-ed8e4524 table in place, preserving existing rows, so a second
+    version's gate for the same wave_label can complete afterward without
+    error.
 
+    Backend-dispatched: SQLite and Postgres ship SEPARATE implementations
+    (meridian.db.migrations vs. meridian.pg_adapter), invoked by init_db /
+    init_pg_db respectively — meridian.db.migrations._migrate_wave_gate_
+    *_version_unique are never called against a real Postgres connection in
+    production (confirmed: init_db, the ONLY caller, builds an
+    aiosqlite.Connection). Calling the SQLite-only functions directly
+    against this test's `db` fixture when it's actually a PostgresConnection
+    (TEST_DATABASE_URL set) was the root cause of the original CI failure:
+    their executescript() body contains a literal ``BEGIN;`` / ``COMMIT;``
+    SQLite transaction-script pair AND ``datetime('now')`` (invalid Postgres
+    syntax). PostgresConnection.executescript() already opens its own
+    ``conn.transaction()`` (a SAVEPOINT, since the test fixture's connection
+    is already inside an outer per-test transaction) around every script it
+    runs — executing a literal ``COMMIT`` statement inside that block closes
+    the real underlying transaction out from under psycopg3's own
+    transaction-tracking, so when that ``conn.transaction()`` context
+    manager then tries to exit (releasing what it believes is still an open
+    SAVEPOINT), Postgres raises exactly the "savepoint release outside a
+    transaction" class of error seen in CI. Dispatching to the real
+    Postgres-side migration (already wired into init_pg_db's own migration
+    list) avoids all of that and exercises the ACTUAL code path a live
+    Postgres project runs."""
     pid = (await db_module.create_project(db, name="repaired-wave-gate"))["id"]
     await _downgrade_wave_gate_tables_to_pre_ed8e4524(db)
 
@@ -562,12 +612,27 @@ async def test_version_unique_migration_repairs_pre_existing_table(db):
     )
     assert cfg["configured"] is True
 
-    # Run the repair migrations (idempotent — safe to call on any shape).
-    await _migrate_wave_gate_results_version_unique(db)
-    await _migrate_wave_gate_configs_version_unique(db)
-    # Calling twice must be a true no-op (already-correct schema).
-    await _migrate_wave_gate_results_version_unique(db)
-    await _migrate_wave_gate_configs_version_unique(db)
+    # Run the backend-appropriate repair migration(s) (idempotent — safe to
+    # call on any shape, including twice in a row on an already-correct one).
+    if hasattr(db, "_pool"):
+        from meridian.pg_adapter import (
+            _migrate_pg_wave_gate_version_unique_constraints,
+        )
+
+        await _migrate_pg_wave_gate_version_unique_constraints(db)
+        # Calling twice must be a true no-op (already-correct schema).
+        await _migrate_pg_wave_gate_version_unique_constraints(db)
+    else:
+        from meridian.db.migrations import (
+            _migrate_wave_gate_configs_version_unique,
+            _migrate_wave_gate_results_version_unique,
+        )
+
+        await _migrate_wave_gate_results_version_unique(db)
+        await _migrate_wave_gate_configs_version_unique(db)
+        # Calling twice must be a true no-op (already-correct schema).
+        await _migrate_wave_gate_results_version_unique(db)
+        await _migrate_wave_gate_configs_version_unique(db)
 
     # Pre-existing row survived the rebuild.
     async with db.execute(

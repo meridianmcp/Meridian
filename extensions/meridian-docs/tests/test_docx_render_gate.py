@@ -802,6 +802,8 @@ class _FakeWordApplication:
     def __init__(self, hwnd, open_document):
         self.Hwnd = hwnd
         self.Visible = None
+        self.DisplayAlerts = None
+        self.open_kwargs = {}
         self._open_document = open_document
         self.quit_called = False
 
@@ -809,7 +811,8 @@ class _FakeWordApplication:
         def __init__(self, outer):
             self._outer = outer
 
-        def Open(self, path, ReadOnly=True):
+        def Open(self, path, ReadOnly=True, **kwargs):
+            self._outer.open_kwargs = {"ReadOnly": ReadOnly, **kwargs}
             return self._outer._open_document(path)
 
     @property
@@ -844,9 +847,16 @@ def _install_fake_win32com(monkeypatch, open_document, hwnd=4242):
     fake_win32process = types.ModuleType("win32process")
     fake_win32process.GetWindowThreadProcessId = lambda hwnd_arg: (0, hwnd_arg)
 
+    fake_pythoncom = types.ModuleType("pythoncom")
+    com_calls: list[str] = []
+    fake_pythoncom.CoInitialize = lambda: com_calls.append("initialize")
+    fake_pythoncom.CoUninitialize = lambda: com_calls.append("uninitialize")
+
     monkeypatch.setitem(sys.modules, "win32com", fake_win32com)
     monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
     monkeypatch.setitem(sys.modules, "win32process", fake_win32process)
+    monkeypatch.setitem(sys.modules, "pythoncom", fake_pythoncom)
+    app_holder["com_calls"] = com_calls
     return app_holder
 
 
@@ -867,6 +877,16 @@ def test_word_com_render_happy_path_produces_pdf(tmp_path, monkeypatch):
 
     assert result["converted_via"] == "word-com"
     assert app_holder["app"].quit_called is True
+    assert app_holder["app"].DisplayAlerts == 0
+    assert app_holder["app"].open_kwargs == {
+        "ReadOnly": True,
+        "ConfirmConversions": False,
+        "AddToRecentFiles": False,
+        "Revert": False,
+        "OpenAndRepair": False,
+        "NoEncodingDialog": True,
+    }
+    assert app_holder["com_calls"] == ["initialize"]
     assert terminate_calls == [], "a successful render must never trigger owned-process cleanup"
 
 

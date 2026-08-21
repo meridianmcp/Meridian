@@ -201,6 +201,138 @@ async def handle_archive_decision(
 
 
 # ---------------------------------------------------------------------------
+# Section 1b: Proposal HITL gates (c6d13571)
+#
+# Typed, lane-blocking gates for materially ambiguous decisions — legal/IP,
+# product scope, destructive operations, production deployment, human
+# acceptance of a contradiction, and other materially ambiguous decisions.
+# Distinct from decisions_pinned (informational) and decision_evidence (a
+# typed pointer backing one decision): a gate BLOCKS its named affected
+# items/pointers until a human explicitly resolves it. See
+# meridian.proposal_gates for the full schema/state-machine docstring.
+# ---------------------------------------------------------------------------
+
+async def handle_add_proposal_gate(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: add_proposal_gate.
+
+    Raises a new HITL gate — always starts ``state='blocked'`` (fail-safe)
+    with no decision yet. ``category`` must be one of
+    ``meridian.proposal_gates.GATE_CATEGORIES``; ``affected`` is a non-empty
+    list of sprint_item_id strings and/or generic pointer objects (see
+    ``meridian.proposal_gates.normalize_affected``).
+    """
+    validate_input_size(args.get("question"), "gate question", 100_000)
+    validate_input_size(args.get("evidence"), "gate evidence", 100_000)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    try:
+        return await db_module.create_proposal_gate(
+            db, args["project_id"], args.get("category"), args.get("question"),
+            args.get("affected"), args.get("evidence"),
+            created_by=args.get("created_by") or args.get("session_id"),
+            expires_at=args.get("expires_at"),
+            reopen_policy=args.get("reopen_policy", "manual"),
+        )
+    except db_module.ProposalGateError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_resolve_proposal_gate(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: resolve_proposal_gate.
+
+    Records a human decision on a gate: the lane's new state
+    (blocked/quarantined/allowed), the free-text decision, and the actor who
+    decided. Refuses (``{"error": ...}``) an already-decided, unexpired gate
+    — call ``reopen_proposal_gate`` first.
+    """
+    validate_input_size(args.get("decision"), "gate decision", 100_000)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    if not args.get("gate_id"):
+        return {"error": "gate_id is required"}
+    kwargs: dict[str, Any] = {}
+    if "expires_at" in args:
+        kwargs["expires_at"] = args.get("expires_at")
+    if "reopen_policy" in args:
+        kwargs["reopen_policy"] = args.get("reopen_policy")
+    try:
+        return await db_module.resolve_proposal_gate(
+            db, args["project_id"], args["gate_id"], args.get("state"),
+            args.get("decision"), args.get("actor"), **kwargs,
+        )
+    except db_module.ProposalGateError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_reopen_proposal_gate(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: reopen_proposal_gate.
+
+    Invalidates a still-standing decision (e.g. new evidence surfaced) so
+    ``resolve_proposal_gate`` can be called again — resets the lane to
+    ``blocked`` (fail-safe) and snapshots the prior decision into
+    ``previous_*``. Refuses (``{"error": ...}``) a gate that was never
+    decided.
+    """
+    validate_input_size(args.get("reason"), "gate reopen reason", 100_000)
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    if not args.get("gate_id"):
+        return {"error": "gate_id is required"}
+    try:
+        return await db_module.reopen_proposal_gate(
+            db, args["project_id"], args["gate_id"], args.get("actor"),
+            args.get("reason"),
+        )
+    except db_module.ProposalGateError as exc:
+        return {"error": str(exc)}
+
+
+async def handle_get_proposal_gates(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_proposal_gates.
+
+    Read-only: list gates for a project, optionally filtered by category
+    and/or (raw, stored) state. Pass ``sprint_item_id`` to instead list only
+    the gates currently blocking/quarantining that one item (via
+    ``meridian.proposal_gates.blocking_gates_for_sprint_item`` — an
+    effective-state-aware view, unlike the unfiltered list).
+    """
+    if not args.get("project_id"):
+        return {"error": "project_id is required"}
+    if args.get("sprint_item_id"):
+        return await db_module.blocking_gates_for_sprint_item(
+            db, args["project_id"], args["sprint_item_id"],
+        )
+    return await db_module.list_proposal_gates(
+        db, args["project_id"],
+        category=args.get("category"), state=args.get("state"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Section 2: Notes
 # ---------------------------------------------------------------------------
 
@@ -1698,13 +1830,14 @@ async def handle_audit_figure_table_provenance(
                 entry["generating_script"] = resolved.get("generating_script")
                 entry["sha256"] = resolved.get("sha256")
                 candidate_count = resolved.get("candidate_count", 1)
-                authoritative = resolved.get("match_type") == "exact" or (
-                    resolved.get("match_type") == "basename" and candidate_count <= 1
-                )
-                if not authoritative:
-                    entry["status"] = "ambiguous"
-                    entry["reason"] = "ambiguous-basename-match"
+                if resolved.get("match_type") != "exact":
                     entry["candidate_count"] = candidate_count
+                    if candidate_count > 1:
+                        entry["status"] = "ambiguous"
+                        entry["reason"] = "ambiguous-basename-match"
+                    else:
+                        entry["status"] = "unresolved"
+                        entry["reason"] = "basename-match-not-authoritative"
                 else:
                     staleness = check_embedded_staleness(
                         "figure", source_path=file_path, embed_sha256=resolved.get("sha256"),

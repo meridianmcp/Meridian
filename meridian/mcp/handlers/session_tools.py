@@ -43,6 +43,14 @@ async def handle_checkpoint(
     # Fetch recent commits for reconcile annotations (non-fatal)
     _ckpt_project = await db_module.get_project(db, project_id)
     _commits = await fetch_recent_commits(_ckpt_project or {}, tenant)
+    # 7479e427 — unified proposal-run scope out-param: populated by the SAME
+    # generate_handoff(mode="delta") call below, so checkpoint()'s own
+    # next_goal can agree with the exact executable batch that call's
+    # <sprint_items>/<proposal_scope> already rendered (manual/backburner/
+    # unprospected/wave_gate_pending exclusions all applied), instead of
+    # independently re-deriving a naive, unfiltered id list. See
+    # build_proposal_run_scope's own docstring in meridian/handoff.py.
+    _proposal_scope: dict[str, Any] = {}
     try:
         # 60eed526 — checkpoint=True bounds the RETURNED delta content to
         # _DEFAULT_CHECKPOINT_MAX_BYTES instead of full/delta's generous
@@ -57,11 +65,13 @@ async def handle_checkpoint(
                 commit_messages=[c["message"] for c in _commits],
                 identity=resolve_caller_identity(tenant),
                 checkpoint=True,
+                proposal_scope=_proposal_scope,
             ),
             timeout=30.0,
         )
     except asyncio.TimeoutError:
         content = "delta handoff timed out"
+        _proposal_scope = {}
     # 660314c1 — scope pending/in_progress + next_goal to the SAME
     # sprint-version bucket generate_handoff (above) already resolved for this
     # session, via the identical helper (`_resolve_session_sprint_version`) that
@@ -95,11 +105,28 @@ async def handle_checkpoint(
                     )
         except Exception:  # noqa: BLE001
             pass
-    ids_str = ", ".join(it["id"][:8] for it in pending_items[:8])
-    next_goal = (
-        f'/goal Complete sprint items: {", ".join(it["id"] for it in pending_items[:8])}. '
-        f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
-    ) if pending_items else "/goal Continue work — all sprint items done."
+    # 7479e427 — prefer the SAME executable batch generate_handoff's own
+    # proposal-run scope just computed above (already excludes manual/
+    # backburner/unprospected/wave_gate_pending items) over a naive,
+    # unfiltered pending_items[:8] slice — otherwise checkpoint() could hand
+    # out a next_goal claim_sprint_item would immediately refuse. Falls back
+    # to the pre-existing raw-list behaviour when proposal_scope wasn't
+    # populated (e.g. the generate_handoff call above timed out).
+    _scope_ids = [
+        it["id"] for it in (_proposal_scope.get("items") or []) if it.get("id")
+    ]
+    if _proposal_scope:
+        ids_str = ", ".join(i[:8] for i in _scope_ids[:8])
+        next_goal = (
+            f'/goal Complete sprint items: {", ".join(_scope_ids[:8])}. '
+            f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
+        ) if _scope_ids else "/goal Continue work — all sprint items done."
+    else:
+        ids_str = ", ".join(it["id"][:8] for it in pending_items[:8])
+        next_goal = (
+            f'/goal Complete sprint items: {", ".join(it["id"] for it in pending_items[:8])}. '
+            f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
+        ) if pending_items else "/goal Continue work — all sprint items done."
     # 04f03ee4 — include start_session one-liner so next session can resume immediately
     # 11a91d31 — default to project_name (idiomatic per 8a449ec0); project_id as a comment.
     try:
@@ -192,6 +219,19 @@ async def handle_checkpoint(
         "next_goal": next_goal,
         "start_fresh": start_fresh,
     }
+    # 7479e427 — bounded proposal-run scope summary, so a caller sees the
+    # SAME executable/degraded verdict generate_handoff's own <proposal_scope>
+    # tag carries without a separate call. Omitted entirely when the
+    # generate_handoff call above never populated it (e.g. timeout).
+    if _proposal_scope:
+        _ckpt_resp["proposal_scope"] = {
+            "proposal_id": _proposal_scope.get("proposal_id"),
+            "executable": _proposal_scope.get("executable"),
+            "degraded": _proposal_scope.get("degraded"),
+            "executable_reasons": _proposal_scope.get("executable_reasons"),
+            "omitted_count": len(_proposal_scope.get("omitted_items") or []),
+            "hitl_gate_count": len(_proposal_scope.get("hitl_gates") or []),
+        }
     if _in_progress:
         _ckpt_resp["in_progress_items"] = [
             {"id": it["id"], "title": (it.get("title") or "")[:80]}

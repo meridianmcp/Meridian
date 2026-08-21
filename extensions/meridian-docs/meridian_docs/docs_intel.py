@@ -50,6 +50,7 @@ import threading
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
@@ -2954,6 +2955,7 @@ def _verify_docx_write(
     expected_range: tuple[int, int] | None = None,
     locate_by_paraid: str | None = None,
     expected_len: int = 1,
+    expected_equation_manifest: dict[str, Any] | None = None,
     artifact_provenance: "dict[str, Any] | None" = None,
 ) -> dict[str, Any] | None:
     """Mandatory post-write verification (9907df44). Returns ``None`` when the
@@ -3036,7 +3038,14 @@ def _verify_docx_write(
             if actual_hash != expected_hash:
                 hash_mismatch = {"expected": expected_hash, "actual": actual_hash}
 
-    if count_mismatches or hash_mismatch or position_error:
+    semantic_equation_mismatches = None
+    if expected_equation_manifest is not None:
+        actual_equation_manifest = _equation_semantic_manifest([body2])
+        semantic_equation_mismatches = _compare_equation_manifests(
+            expected_equation_manifest, actual_equation_manifest
+        )
+
+    if count_mismatches or hash_mismatch or position_error or semantic_equation_mismatches:
         return {
             "error": (
                 "post-write verification failed: the on-disk document does "
@@ -3046,6 +3055,7 @@ def _verify_docx_write(
             ),
             "count_mismatches": count_mismatches,
             "content_hash_mismatch": hash_mismatch,
+            "semantic_equation_mismatches": semantic_equation_mismatches,
         }
 
     return _check_artifact_provenance_binding(artifact_provenance)
@@ -7439,6 +7449,16 @@ def _stdlib_append_mathml(node: ET.Element, parent: ET.Element) -> None:
     if tag in _MATHML_TEXT_TAGS:
         text = node.text or ""
         if text:
+            # Keep common mathematical operators semantic instead of flattening
+            # them into an ordinary run.  A function node is the OMML shape Word
+            # expects for min/max/argmin-style operators.
+            if text.strip().casefold() in {"min", "max", "argmin", "argmax", "sup", "inf"}:
+                func = ET.SubElement(parent, _qm("func"))
+                f_name = ET.SubElement(func, _qm("fName"))
+                run = ET.SubElement(f_name, _qm("r"))
+                ET.SubElement(run, _qm("t")).text = text
+                ET.SubElement(func, _qm("e"))
+                return
             run = ET.SubElement(parent, _qm("r"))
             ET.SubElement(run, _qm("t")).text = text
         return
@@ -7492,11 +7512,13 @@ def _stdlib_append_mathml(node: ET.Element, parent: ET.Element) -> None:
         den = kids[1] if len(kids) > 1 else None
         f = ET.SubElement(parent, _qm("f"))
         n_el = ET.SubElement(f, _qm("num"))
+        n_expr = ET.SubElement(n_el, _qm("e"))
         if num is not None:
-            _stdlib_append_mathml(num, n_el)
+            _stdlib_append_mathml(num, n_expr)
         d_el = ET.SubElement(f, _qm("den"))
+        d_expr = ET.SubElement(d_el, _qm("e"))
         if den is not None:
-            _stdlib_append_mathml(den, d_el)
+            _stdlib_append_mathml(den, d_expr)
         return
 
     if tag == "msqrt":
@@ -7525,8 +7547,53 @@ def _stdlib_append_mathml(node: ET.Element, parent: ET.Element) -> None:
 
     if tag == "mfenced":
         d = ET.SubElement(parent, _qm("d"))
+        expr = ET.SubElement(d, _qm("e"))
         for child in node:
-            _stdlib_append_mathml(child, d)
+            _stdlib_append_mathml(child, expr)
+        return
+
+    if tag == "mtable":
+        # MathML cases/aligned systems become a real OMML equation array.  A
+        # flattened m:r here is visually plausible but semantically unusable.
+        arr = ET.SubElement(parent, _qm("eqArr"))
+        for row in node:
+            if (row.tag.rsplit("}", 1)[-1] if "}" in row.tag else row.tag) != "mtr":
+                continue
+            row_expr = ET.SubElement(arr, _qm("e"))
+            for cell in row:
+                cell_expr = ET.SubElement(row_expr, _qm("e"))
+                for child in cell:
+                    _stdlib_append_mathml(child, cell_expr)
+        return
+
+    if tag in {"munder", "mover", "munderover"}:
+        kids = list(node)
+        base = kids[0] if kids else None
+        lower = kids[1] if tag == "munder" and len(kids) > 1 else None
+        upper = kids[1] if tag == "mover" and len(kids) > 1 else None
+        if tag == "munderover":
+            lower = kids[1] if len(kids) > 1 else None
+            upper = kids[2] if len(kids) > 2 else None
+        # A one-character mover such as ^ or ~ is an accent, not a limit.
+        upper_text = "".join(upper.itertext()).strip() if upper is not None else ""
+        if tag == "mover" and len(upper_text) == 1 and upper_text in {"^", "~", "¯", "ˉ", "→", "⃗", "ˆ"}:
+            acc = ET.SubElement(parent, _qm("acc"))
+            acc_pr = ET.SubElement(acc, _qm("accPr"))
+            ET.SubElement(acc_pr, _qm("chr"), {_qm("val"): upper_text})
+            expr = ET.SubElement(acc, _qm("e"))
+            if base is not None:
+                _stdlib_append_mathml(base, expr)
+            return
+        container = ET.SubElement(parent, _qm("nary" if tag == "munderover" else ("limLow" if tag == "munder" else "limUpp")))
+        expr = ET.SubElement(container, _qm("e"))
+        if base is not None:
+            _stdlib_append_mathml(base, expr)
+        if lower is not None:
+            target = ET.SubElement(container, _qm("sub" if tag == "munderover" else "lim"))
+            _stdlib_append_mathml(lower, target)
+        if upper is not None:
+            target = ET.SubElement(container, _qm("sup" if tag == "munderover" else "lim"))
+            _stdlib_append_mathml(upper, target)
         return
 
     # Unrecognized construct (mtable, mmultiscripts, menclose, ...) — degrade
@@ -7535,6 +7602,170 @@ def _stdlib_append_mathml(node: ET.Element, parent: ET.Element) -> None:
     if flat:
         run = ET.SubElement(parent, _qm("r"))
         ET.SubElement(run, _qm("t")).text = flat
+
+
+_OMML_REQUIRED_CHILDREN: dict[str, tuple[str, ...]] = {
+    "f": ("num", "den"),
+    "sSub": ("e", "sub"),
+    "sSup": ("e", "sup"),
+    "sSubSup": ("e", "sub", "sup"),
+    "rad": ("e",),
+    "acc": ("accPr", "e"),
+    "d": ("e",),
+    "eqArr": ("e",),
+    "func": ("fName", "e"),
+    "limLow": ("e", "lim"),
+    "limUpp": ("e", "lim"),
+    "nary": ("e",),
+}
+_OMML_FALLBACK_MARKERS = {
+    "fraction": {"f"}, "cases": {"eqArr"}, "matrix": {"eqArr"},
+    "summation": {"nary", "limLow", "limUpp"}, "subscript": {"sSub", "sSubSup"},
+    "superscript": {"sSup", "sSubSup"}, "argmin": {"func", "nary", "limLow", "limUpp"},
+}
+
+
+def _validate_omml_structure(omml_raw: str) -> ET.Element:
+    """Validate a single semantic ``m:oMath`` before any DOCX mutation.
+
+    Counting ``m:oMath`` elements or flattening ``m:t`` text is insufficient:
+    malformed fractions and fallback prose can still open as a visually
+    plausible but non-editable equation.  This validator deliberately covers
+    the structural subset emitted by our converter and rejects the ambiguous
+    ``m:oMathPara`` wrapper used by a different insertion contract.
+    """
+    try:
+        root = ET.fromstring(omml_raw)
+    except ET.ParseError as exc:
+        raise ValueError(f"OMML payload is not valid XML: {exc}") from exc
+    if root.tag == _qm("oMathPara"):
+        raise ValueError("OMML m:oMath root required; m:oMathPara is not accepted for insertion")
+    if root.tag != _qm("oMath"):
+        got = root.tag.rsplit("}", 1)[-1]
+        raise ValueError(f"OMML m:oMath root required; got m:{got}")
+    for element in root.iter():
+        name = element.tag.rsplit("}", 1)[-1] if "}" in element.tag else element.tag
+        required = _OMML_REQUIRED_CHILDREN.get(name)
+        if required:
+            children = {child.tag.rsplit("}", 1)[-1] for child in element}
+            missing = [child for child in required if child not in children]
+            if missing:
+                raise ValueError(f"OMML <m:{name}> is missing required child element(s): {', '.join(missing)}")
+        if name in {"num", "den"} and element.find(_qm("e")) is None:
+            raise ValueError(f"OMML <m:{name}> must contain <m:e>")
+    flat = _omml_flatten_text_local(omml_raw).casefold()
+    names = {el.tag.rsplit("}", 1)[-1] for el in root.iter() if "}" in el.tag}
+    for marker, structural_names in _OMML_FALLBACK_MARKERS.items():
+        if marker in flat and not names.intersection(structural_names):
+            raise ValueError(f"OMML contains flattened fallback text {marker!r} without its structural element")
+    return root
+
+
+def _omml_semantic_record(omath: ET.Element) -> dict[str, Any]:
+    """Return a stable, renderer-independent record for one ``m:oMath``.
+
+    Equation counts are not sufficient for section replacement: a flattened
+    run can preserve the count while losing subscripts, hats, functions, or
+    cases.  Keep both the human-readable flattened text and a hash of the
+    actual OMML tree so a visually plausible but structurally different
+    equation cannot pass a preservation gate.
+    """
+    raw = ET.tostring(omath, encoding="unicode")
+    flat_text = re.sub(r"\s+", "", _omml_flatten_text_local(raw))
+    tag_counts = Counter(
+        element.tag.rsplit("}", 1)[-1]
+        for element in omath.iter()
+        if "}" in element.tag
+    )
+    structural_tags = {
+        name: count
+        for name, count in sorted(tag_counts.items())
+        if name in {
+            "f", "eqArr", "sSub", "sSup", "sSubSup", "rad", "acc", "d",
+            "func", "limLow", "limUpp", "nary", "borderBox", "groupChr",
+        }
+    }
+    issues: list[str] = []
+    try:
+        _validate_omml_structure(raw)
+    except ValueError as exc:
+        issues.append(str(exc))
+
+    # These markers are meaningful in the source notation.  If none of the
+    # corresponding OMML structures survived, the result is a flattened
+    # fallback even when its m:oMath count is unchanged.
+    flattened_markers = (
+        r"\\(?:hat|bar|vec|tilde|overline|underline)\b",
+        r"[_^](?:\{|[A-Za-z0-9])",
+        r"\|\|.+\|\|",
+        r"\b(?:argmin|argmax|min|max|lim|sum)\b",
+    )
+    if not structural_tags and any(re.search(pattern, flat_text, re.IGNORECASE) for pattern in flattened_markers):
+        issues.append(
+            "flattened OMML text contains a structural equation marker without "
+            "a corresponding OMML operator/subscript/fence structure"
+        )
+
+    return {
+        "fingerprint": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+        "flat_text": flat_text,
+        "structural_tags": structural_tags,
+        "issues": issues,
+    }
+
+
+def _equation_semantic_manifest(elements: list[ET.Element] | tuple[ET.Element, ...]) -> dict[str, Any]:
+    """Build a semantic inventory for all equations below ``elements``.
+
+    The inventory deliberately includes inline, unnumbered, and numbered
+    equations alike.  ``m:oMathPara`` is treated as a display container and
+    its child ``m:oMath`` is inventoried; the insertion validator still
+    rejects that wrapper when callers supply it as the payload root.
+    """
+    entries: list[dict[str, Any]] = []
+    for element in elements:
+        for omath in element.iter(_qm("oMath")):
+            entries.append(_omml_semantic_record(omath))
+    return {"count": len(entries), "entries": entries}
+
+
+def _equation_manifest_counter(manifest: dict[str, Any]) -> Counter[str]:
+    return Counter(entry.get("fingerprint") for entry in manifest.get("entries", []))
+
+
+def _compare_equation_manifests(
+    expected: dict[str, Any], actual: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Compare semantic equation inventories as multisets, not counts only."""
+    expected_counter = _equation_manifest_counter(expected)
+    actual_counter = _equation_manifest_counter(actual)
+    missing = list((expected_counter - actual_counter).elements())
+    extra = list((actual_counter - expected_counter).elements())
+    invalid = [entry for entry in actual.get("entries", []) if entry.get("issues")]
+    if not missing and not extra and not invalid:
+        return None
+    return {
+        "missing_fingerprints": missing,
+        "unexpected_fingerprints": extra,
+        "invalid_entries": invalid,
+        "expected_count": sum(expected_counter.values()),
+        "actual_count": sum(actual_counter.values()),
+    }
+
+
+def _subtract_equation_manifest(
+    source: dict[str, Any], removed: dict[str, Any]
+) -> dict[str, Any]:
+    """Remove the copied-out range's equations from a document inventory."""
+    remaining = list(source.get("entries", []))
+    for fingerprint in _equation_manifest_counter(removed):
+        count = _equation_manifest_counter(removed)[fingerprint]
+        for _ in range(count):
+            for index, entry in enumerate(remaining):
+                if entry.get("fingerprint") == fingerprint:
+                    remaining.pop(index)
+                    break
+    return {"count": len(remaining), "entries": remaining}
 
 
 def latex_to_omml_local(latex: str | None) -> str | None:
@@ -7560,7 +7791,9 @@ def latex_to_omml_local(latex: str | None) -> str | None:
         # Build the <m:oMath> root element.
         omath = ET.Element(_qm("oMath"))
         _stdlib_append_mathml(mathml_root, omath)
-        return ET.tostring(omath, encoding="unicode")
+        raw = ET.tostring(omath, encoding="unicode")
+        _validate_omml_structure(raw)
+        return raw
     except Exception:  # noqa: BLE001 — conversion is best-effort
         return None
 
@@ -7581,12 +7814,12 @@ def _resolve_omml(payload: str) -> str | None:
     stripped = payload.strip()
     if stripped.startswith("<"):
         # Validate: must be parseable XML.
-        try:
-            ET.fromstring(stripped)
-        except ET.ParseError as exc:
-            raise ValueError(f"payload starts with '<' but is not valid XML: {exc}") from exc
+        _validate_omml_structure(stripped)
         return stripped
-    return latex_to_omml_local(stripped)
+    converted = latex_to_omml_local(stripped)
+    if converted is not None:
+        _validate_omml_structure(converted)
+    return converted
 
 
 # ---------------------------------------------------------------------------
@@ -8185,12 +8418,14 @@ def _build_omath_paragraph(
     omml_raw: str,
     alignment: str | None = None,
     indent_twips: int = 0,
+    para_id: str | None = None,
+    text_id: str | None = None,
 ) -> ET.Element:
     """Wrap a raw OMML string in a new <w:p> for display-mode insertion.
 
     Produces::
 
-        <w:p>
+        <w:p w14:paraId="..." w14:textId="...">
           <w:pPr>
             <w:jc w:val="..."/>        <!-- only when alignment is given -->
             <w:ind w:left="..."/>      <!-- only when indent_twips > 0 -->
@@ -8203,9 +8438,15 @@ def _build_omath_paragraph(
     omitted entirely when neither is set -- matching this function's
     original (pre-4efc63fd) output exactly.
 
+    New display paragraphs always receive fresh Word identity attributes.  The
+    caller should mint collision-free values from the document; direct unit
+    callers may omit them and receive UUID-derived values.
+
     The oMath element is parsed from ``omml_raw`` and appended as a child.
     """
     p = ET.Element(_q(_W, "p"))
+    p.set(_q(_W14, "paraId"), para_id or uuid.uuid4().hex[:8].upper())
+    p.set(_q(_W14, "textId"), text_id or uuid.uuid4().hex[:8].upper())
     if alignment or indent_twips:
         pPr = ET.SubElement(p, _q(_W, "pPr"))
         if alignment:
@@ -8224,6 +8465,8 @@ def _verify_equation_write(
     anchor_para_id: str,
     insert_at: int | None,
     expected_flat_text: str,
+    expected_para_id: str | None = None,
+    expected_text_id: str | None = None,
 ) -> dict[str, Any] | None:
     """a80af3a0 follow-up (ddd79188) — post-write verification for
     :func:`insert_equation_local`, mirroring :func:`_verify_figure_block_write`'s
@@ -8315,6 +8558,23 @@ def _verify_equation_write(
                 f"{expected_flat_text!r}, got {actual_flat_text!r})"
             )
         }
+    if position != "append":
+        actual_para_id = para_elem.get(_q(_W14, "paraId"))
+        actual_text_id = para_elem.get(_q(_W14, "textId"))
+        if expected_para_id and actual_para_id != expected_para_id:
+            return {
+                "error": (
+                    f"post-write verification failed: new equation paragraph at "
+                    f"{where} has paraId {actual_para_id!r}, expected {expected_para_id!r}"
+                )
+            }
+        if expected_text_id and actual_text_id != expected_text_id:
+            return {
+                "error": (
+                    f"post-write verification failed: new equation paragraph at "
+                    f"{where} has textId {actual_text_id!r}, expected {expected_text_id!r}"
+                )
+            }
     return None
 
 
@@ -8430,16 +8690,28 @@ def insert_equation_local(
     body, anchor_elem, child_idx = result
 
     insert_at: int | None = None
+    inserted_para_id: str | None = None
+    inserted_text_id: str | None = None
     if position == "append":
         # Inline: append <m:oMath> directly to the anchor paragraph.
         omath_el = ET.fromstring(omml)
         anchor_elem.append(omath_el)
     else:
         # Display: insert a new <w:p> wrapping the equation.
+        taken_para_ids = _existing_para_ids(root)
+        taken_text_ids = {
+            value
+            for paragraph in root.iter(_q(_W, "p"))
+            if (value := paragraph.get(_q(_W14, "textId")))
+        }
+        inserted_para_id = _new_para_id(taken_para_ids)
+        inserted_text_id = _new_para_id(taken_text_ids)
         new_p = _build_omath_paragraph(
             omml,
             alignment=policy["equation_alignment"],
             indent_twips=policy["body_indent_twips"],
+            para_id=inserted_para_id,
+            text_id=inserted_text_id,
         )
         insert_at = child_idx if position == "before" else child_idx + 1
         body.insert(insert_at, new_p)
@@ -8466,6 +8738,8 @@ def insert_equation_local(
             anchor_para_id=anchor_para_id,
             insert_at=insert_at,
             expected_flat_text=expected_flat_text,
+            expected_para_id=inserted_para_id,
+            expected_text_id=inserted_text_id,
         )
         if verify_error is not None:
             # 5988a5bb -- do NOT blindly restore: a different (concurrent)
@@ -8527,6 +8801,8 @@ def insert_equation_local(
         "status": "inserted",
         "position": position,
         "para_id": anchor_para_id,
+        "inserted_para_id": inserted_para_id,
+        "inserted_text_id": inserted_text_id,
         "omml": omml,
         "docx_path": docx_path,
         **render_info,
@@ -12330,6 +12606,18 @@ def move_section(
     # one of these totals unchanged -- nothing is added or removed).
     baseline_counts = _structural_counts([body])
     baseline_counts["image_count"] = _docx_media_count(raw)
+    baseline_equation_manifest = _equation_semantic_manifest([body])
+    baseline_equation_errors = [
+        entry for entry in baseline_equation_manifest["entries"] if entry.get("issues")
+    ]
+    if baseline_equation_errors:
+        return {
+            "error": (
+                "aborting move_section: source document contains malformed or "
+                "flattened semantic OMML; repair the equations before moving a section"
+            ),
+            "semantic_equation_errors": baseline_equation_errors,
+        }
 
     bounds = _locate_section_bounds(body, section_id)
     if bounds is None:
@@ -12458,6 +12746,7 @@ def move_section(
             expected_counts=baseline_counts,
             expected_hash=expected_hash,
             expected_range=(insert_at, insert_at + len(moved_elements)),
+            expected_equation_manifest=baseline_equation_manifest,
         )
         if verify_error is not None:
             # 5988a5bb -- do NOT blindly restore: a different (concurrent)
@@ -12709,6 +12998,18 @@ def copy_section(
     # intent, to compare against).
     baseline_counts = _structural_counts([body])
     baseline_counts["image_count"] = _docx_media_count(raw)
+    baseline_equation_manifest = _equation_semantic_manifest([body])
+    baseline_equation_errors = [
+        entry for entry in baseline_equation_manifest["entries"] if entry.get("issues")
+    ]
+    if baseline_equation_errors:
+        return {
+            "error": (
+                "aborting copy_section: source document contains malformed or "
+                "flattened semantic OMML; repair the equations before copying a section"
+            ),
+            "semantic_equation_errors": baseline_equation_errors,
+        }
 
     bounds = _locate_section_bounds(body, section_id)
     if bounds is None:
@@ -12838,6 +13139,7 @@ def copy_section(
     # instead of trusting copied_block_count blindly.
     expected_hash = _hash_elements(copied_elements)
     copied_counts = _structural_counts(copied_elements)
+    copied_equation_manifest = _equation_semantic_manifest(copied_elements)
     expected_counts = {
         key: baseline_counts[key] + copied_counts[key] for key in copied_counts
     }
@@ -12862,6 +13164,7 @@ def copy_section(
     # arithmetic-shift reasoning move_section's own post-cut _shift relies on,
     # just for an insert instead of a removal.
     trimmed = False
+    removed_equation_manifest = {"count": 0, "entries": []}
     if trim_original_to is not None:
         inserted_count = len(copied_elements)
         shift = inserted_count if insert_at <= start_idx else 0
@@ -12869,6 +13172,7 @@ def copy_section(
         trim_end = end_idx + shift
         body_list_now = list(body)
         to_remove = body_list_now[trim_start:trim_end]
+        removed_equation_manifest = _equation_semantic_manifest(to_remove)
         # 9907df44 -- adjust expected counts for the trim: whatever's removed
         # here no longer counts toward the post-write total, and a truthy
         # trim_original_to adds back exactly one (non-heading, non-table)
@@ -12915,6 +13219,19 @@ def copy_section(
             expected_hash=expected_hash if new_heading_para_id is not None else None,
             locate_by_paraid=new_heading_para_id,
             expected_len=len(copied_elements),
+            expected_equation_manifest={
+                "count": (
+                    len(baseline_equation_manifest["entries"])
+                    + len(copied_equation_manifest["entries"])
+                    - len(removed_equation_manifest["entries"])
+                ),
+                "entries": (
+                    _subtract_equation_manifest(
+                        baseline_equation_manifest, removed_equation_manifest
+                    )["entries"]
+                    + copied_equation_manifest["entries"]
+                ),
+            },
         )
         if verify_error is not None:
             # 5988a5bb -- do NOT blindly restore: a different (concurrent)
@@ -17701,3 +18018,56 @@ def read_document_snapshot(
 # benchmark possible to build without first deciding anything about (d)'s
 # rollout gate.
 # ---------------------------------------------------------------------------
+
+
+def research_graph_document_identity(
+    source_path: str,
+    *,
+    element_id: str | None = None,
+    content_hash: str | None = None,
+) -> dict[str, Any]:
+    """b558892a -- a plain, dependency-free ``{node_type, identity_key,
+    revision, external_ref}`` shape describing one DOCX/XML document (or one
+    structural element within it) for Meridian's research artifact graph
+    (``meridian.research_graph`` / ``meridian.db.research_graph``, core
+    repo only).
+
+    This package is a standalone, ``uvx``-installable extension with NO
+    dependency on the core ``meridian`` distribution (see this package's
+    pyproject.toml and its own module docstrings noting the deliberately
+    vendored, decoupled parser) -- it must never import ``meridian.*``.
+    This function exists so a caller that DOES have both installed (the
+    core executor, or a future ingestion bridge) can build an identity
+    reference in the exact shape ``meridian.research_graph``'s
+    ``document_identity_key``/``create_node`` expect, without this package
+    taking on that dependency itself. Pure, synchronous, no I/O.
+
+    ``source_path`` is the document's path/uri (mirrors ``doc_documents.source``
+    and ``read_document_snapshot``'s ``docx_path``). ``element_id`` optionally
+    narrows the identity to one structural element within it (a ``doc_store``
+    element id / paraId -- the same value a ``node_id`` pointer selector in
+    ``meridian.pointers`` would carry). ``content_hash`` is the freshness/
+    revision proof -- pass the SAME ``source_sha256`` value
+    ``read_document_snapshot``/``index_docx_structure`` already compute for
+    this document, so the research graph's revision history and this
+    package's own staleness checks agree on what "changed" means.
+
+    Raises ``ValueError`` when ``source_path`` is blank -- mirrors
+    ``meridian.research_graph.document_identity_key``'s own validation
+    (duplicated here rather than imported, per this package's no-core-
+    dependency rule).
+    """
+    source_path = (source_path or "").strip()
+    if not source_path:
+        raise ValueError("research_graph_document_identity requires a non-empty source_path")
+    element_id = (element_id or "").strip() if isinstance(element_id, str) else ""
+    identity_key = f"{source_path}::{element_id}" if element_id else source_path
+    external_ref: dict[str, Any] = {"source": source_path}
+    if element_id:
+        external_ref["element_id"] = element_id
+    return {
+        "node_type": "document",
+        "identity_key": identity_key,
+        "revision": (content_hash or "").strip() or None,
+        "external_ref": external_ref,
+    }

@@ -415,6 +415,46 @@ async def record_handoff_correction_endpoint(
     return result
 
 
+@router.post("/projects/{project_id}/handoff/accept")
+async def accept_handoff_endpoint(
+    project_id: str, request: Request
+) -> dict[str, Any]:
+    """1bd5e810 — REST mirror of the MCP ``accept_handoff`` tool — see
+    ``meridian.handoff.accept_handoff_envelope`` for the full contract. Every
+    field in the body is optional and independently gated; an omitted check
+    is skipped, never failed. Same underlying function as the MCP/stdio
+    transports, so all three produce identical results for identical input.
+    """
+    db = await _db(request)
+    project = await db_module.get_project(db, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except Exception:
+        body = {}
+
+    presented_body = body.get("presented_body")
+    body_for_check = (
+        handoff_module.strip_goal_token_banner(presented_body)
+        if isinstance(presented_body, str)
+        else None
+    )
+    live_items = body.get("live_items")
+    return await handoff_module.accept_handoff_envelope(
+        db, project_id,
+        goal_token=body.get("goal_token"),
+        presented_body=body_for_check,
+        live_items=live_items if isinstance(live_items, list) else None,
+        expected_board_revision=body.get("expected_board_revision"),
+        expected_required_tools_hash=body.get("expected_required_tools_hash"),
+        required_tools=body.get("required_tools"),
+        available_tools=body.get("available_tools"),
+    )
+
+
 @router.get("/projects/{project_id}/handoff/corrections/latest")
 async def load_handoff_correction_endpoint(
     project_id: str, request: Request

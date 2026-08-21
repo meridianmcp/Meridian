@@ -428,10 +428,11 @@ def _bind_one_artifact(
                 "reason": None,
             }
 
-        # Basename tier: relocation-tolerant, but resolve_figure_output never
-        # attaches a hash for this tier (see its own docstring) -- an
-        # ambiguous or hash-unconfirmable basename match can never be
-        # promoted to RESOLVED when the caller asked for a hash check.
+        # Basename tier: relocation-tolerant, but never authoritative. A
+        # basename/label match is diagnostic evidence, not proof that this
+        # exact DOCX media file came from this exact output. Even a single
+        # candidate can be the wrong run's regenerated copy, and this tier
+        # never carries the exact hash needed for a safe artifact binding.
         candidate_count = resolved.get("candidate_count") or 0
         if candidate_count > 1:
             return {
@@ -446,26 +447,17 @@ def _bind_one_artifact(
                     "match, cannot bind with confidence"
                 ),
             }
-        if expected_sha256:
-            return {
-                **base,
-                "status": UNRESOLVED,
-                "match_type": match_type,
-                "evidence": "meridian_outputs_basename",
-                "resolved_sha256": None,
-                "reason": (
-                    "matched by relocated basename only -- meridian-outputs "
-                    "has no hash on file for this tier, so this artifact's "
-                    "expected hash cannot be confirmed"
-                ),
-            }
         return {
             **base,
-            "status": RESOLVED,
+            "status": UNRESOLVED,
             "match_type": match_type,
-            "evidence": "meridian_outputs_basename",
+            "evidence": "meridian_outputs_basename_non_authoritative",
             "resolved_sha256": None,
-            "reason": None,
+            "reason": (
+                "matched by relocated basename only -- basename/label "
+                "evidence is diagnostic and cannot establish exact DOCX "
+                "media-to-output provenance"
+            ),
         }
 
     # Nothing in meridian-outputs' authoritative index at all -- per this

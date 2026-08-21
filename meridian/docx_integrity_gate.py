@@ -522,3 +522,79 @@ async def build_docx_integrity_gate(
         "executable_reasons": executable_reasons,
         "generated_at": generated_at,
     }
+
+
+# ---------------------------------------------------------------------------
+# f6912e2d — RECIPE_CHECK_REGISTRY: the EXACT function/tool each
+# ``artifact_declaration.artifact_recipe.checks`` flag names.
+#
+# The acceptance criteria for f6912e2d require a document/Outputs item's
+# recipe to name its structural / Word-COM-render / Outputs hash-provenance
+# checks EXACTLY — never "some structural check, somewhere". This module
+# already HOSTS two of those three verification classes (this file composes
+# the render-status + equation-style + provenance-manifest verdict every
+# discovered .docx artifact gets); the registry below is the single,
+# reviewable place mapping a recipe's boolean flag to the real, importable
+# reference that flag stands for, so a caller (or a human auditing a
+# declared recipe) never has to guess which function a ``True`` flag means.
+#
+# Deliberately NOT wired into build_docx_integrity_gate's own execution
+# above: that gate already runs ``check_render_capability`` (both backends)
+# uniformly for every discovered artifact regardless of what any one item's
+# recipe declares, and changing that per-item would risk this file's
+# existing, already-tested behavior (test_handoff_docx_integrity_gate.py) —
+# out of this item's touches_resources scope to touch. This registry is
+# read-only declaration metadata a caller MAY cross-reference; it never
+# changes which checks actually run today.
+# ---------------------------------------------------------------------------
+
+RECIPE_CHECK_REGISTRY: dict[str, str] = {
+    "structural_check_required": (
+        "extensions/meridian-docs/meridian_docs/render_gate.py::"
+        "verify_promotion_readiness (its structural_check block) — cheap, "
+        "read-only paragraph/media/table-count comparison; never mutates "
+        "either file"
+    ),
+    "word_com_render_check_required": (
+        "extensions/meridian-docs/meridian_docs/render_gate.py::"
+        "check_word_com_render_receipt — the Word-COM-ONLY three-state "
+        "render check (rendered/unavailable-with-reason/failed); "
+        "deliberately narrower than check_render_capability, which also "
+        "accepts a LibreOffice/soffice render as a general capability "
+        "signal"
+    ),
+    "outputs_provenance_check_required": (
+        "meridian-outputs MCP server (extensions/meridian-outputs) — "
+        "record_provenance / get_provenance_status / get_provenance tools; "
+        "see extensions/meridian-outputs/README.md's tool table"
+    ),
+}
+
+
+def describe_required_checks(item: dict[str, Any]) -> dict[str, Any]:
+    """For ONE sprint item, resolve its declared
+    ``artifact_declaration.artifact_recipe.checks`` flags (if any) into the
+    EXACT check reference each ``True`` flag names, via
+    :data:`RECIPE_CHECK_REGISTRY`.
+
+    Returns ``{"declared": bool, "required": {flag: registry_entry, ...}}``
+    — ``declared=False`` (empty ``required``) when the item has no
+    ``artifact_recipe`` at all, mirroring this module's existing
+    "can't confirm never fabricates a finding" convention. Pure/sync, never
+    raises — a malformed ``item`` degrades to ``declared=False`` exactly
+    like ``artifact_declaration.effective_artifact_recipe`` itself does for
+    a malformed/missing field.
+    """
+    try:
+        recipe = _artifact_declaration.effective_artifact_recipe(item)
+    except Exception:  # noqa: BLE001 — must never raise
+        recipe = None
+    if not recipe:
+        return {"declared": False, "required": {}}
+    checks = recipe.get("checks") or {}
+    required = {
+        flag: RECIPE_CHECK_REGISTRY[flag]
+        for flag in RECIPE_CHECK_REGISTRY
+        if checks.get(flag)
+    }
+    return {"declared": True, "required": required}

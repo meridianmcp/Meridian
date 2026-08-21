@@ -1137,11 +1137,13 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_executor_reports_table(db)
     await _migrate_wave_run_summaries(db)
     await _migrate_decision_evidence(db)
+    await _migrate_proposal_gates(db)
     await _migrate_ai_log_events_table(db)
     await _migrate_proposal_intake_drafts(db)
     await _migrate_profile_layers(db)
     await _migrate_wave_gate_results_version_unique(db)
     await _migrate_wave_gate_configs_version_unique(db)
+    await _migrate_research_graph(db)
     return db
 
 
@@ -12114,6 +12116,7 @@ from .sprint_items import (  # noqa: F401
     fan_out_sprint_items,
     find_cross_project_dependency_mismatches,
     get_blocking_dependency_for_sprint_item,
+    get_sprint_item_blocking_gates,
     get_open_task_for_sprint_item,
     get_parallelizable_groups,
     get_project_blocker_policy,
@@ -12217,6 +12220,11 @@ from .sprint_items import (  # noqa: F401
     # also called directly by tests.
     _predict_resource_granularity,
     _is_legacy_file_symbol_shorthand,
+    # 1b264ce3 — coarse resource-declaration audit + safe repair, also
+    # called directly by tests.
+    _self_contradictory_file_resources,
+    diagnose_resource_coarseness,
+    repair_resource_granularity,
     # 704edefe — reservation/integration-queue manifest helpers, also called
     # directly by tests.
     _classify_verifier_class,
@@ -12620,6 +12628,31 @@ from .decision_evidence import (  # noqa: F401
     reverse_decision_evidence,
 )
 
+# c6d13571 — typed proposal HITL gates (legal/IP, product scope, destructive
+# ops, production deploy, contradiction acceptance, other materially
+# ambiguous decisions): a durable, lane-blocking record distinct from both
+# decisions_pinned (informational "constitution") and decision_evidence (a
+# typed pointer backing one decision). Lives at the top-level
+# meridian.proposal_gates (not meridian/db/) mirroring meridian.handoff's
+# convention of a top-level module owning its own table's direct db.execute
+# calls; imported here last (after decision_evidence) purely for import
+# ordering, same as every import in this trailing block.
+from meridian.proposal_gates import (  # noqa: F401
+    GATE_CATEGORIES,
+    GATE_CATEGORY_LABELS,
+    GATE_STATES,
+    REOPEN_POLICIES,
+    ProposalGateError,
+    _migrate_proposal_gates,
+    create_gate as create_proposal_gate,
+    get_gate as get_proposal_gate,
+    list_gates as list_proposal_gates,
+    resolve_gate as resolve_proposal_gate,
+    reopen_gate as reopen_proposal_gate,
+    blocking_gates_for_sprint_item,
+    effective_state as proposal_gate_effective_state,
+)
+
 # 9e83be4a (Round 1 proposal e143949d) — canonical, versioned, append-only
 # ExecutionEvent storage scaffold (meridian.db.ai_log). Schema/contract only
 # — see meridian.ai_log's module docstring for scope. Imported last (after
@@ -12664,4 +12697,27 @@ from .profile_layers import (  # noqa: F401
     # 77369699 — exact-revision rollback restore for batch_mutate's
     # profile_layer compensation path (db/batch_management.py).
     _restore_profile_layer_row,
+)
+
+# b558892a — the durable research artifact graph: typed nodes/edges linking
+# claims, citations, code, runs, outputs, documents, and executor decisions.
+# Imported LAST (after everything above) — a two-table, append-only-or-
+# transactionally-replaceable shape with no dependency on any other db/*.py
+# submodule at import time. See meridian.research_graph for the closed
+# NODE_TYPES/EDGE_TYPES vocabularies and identity-key builders, and
+# meridian.db.research_graph's own module docstring for the full schema/
+# write-semantics contract.
+from .research_graph import (  # noqa: F401
+    _migrate_research_graph,
+    create_node,
+    replace_node_revision,
+    get_node,
+    get_current_node,
+    list_node_revisions,
+    create_edge,
+    get_unresolved_edges,
+    get_edges_for_identity,
+    get_claim_evidence,
+    get_lineage_subgraph,
+    get_artifact_document_lineage,
 )
