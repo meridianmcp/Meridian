@@ -7947,7 +7947,7 @@ def test_pg_migration_registry_matches_historical_order():
     ]
     # No duplicates across the three groups.
     allnames = core + hosted + late
-    assert len(allnames) == len(set(allnames)) == 153
+    assert len(allnames) == len(set(allnames)) == 154
 
 
 def test_core_schema_literals_have_no_inline_tenant_id_indexes():
