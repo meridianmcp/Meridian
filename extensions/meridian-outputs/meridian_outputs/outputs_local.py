@@ -6133,4 +6133,3 @@ def research_graph_output_identity(
         "revision": sha256 or None,
         "external_ref": external_ref,
     }
-    return result
