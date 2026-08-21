@@ -273,6 +273,27 @@ async def get_blocking_dependency_for_sprint_item(
     return None
 
 
+async def get_sprint_item_blocking_gates(
+    db: aiosqlite.Connection, project_id: str, sprint_item_id: str,
+) -> "list[dict[str, Any]]":
+    """c6d13571 — typed proposal HITL gates (legal/IP, product scope,
+    destructive ops, production deploy, contradiction acceptance, other
+    materially ambiguous decisions — see :mod:`meridian.proposal_gates`)
+    currently blocking or quarantining this sprint item.
+
+    Thin, read-only wrapper over
+    :func:`meridian.proposal_gates.blocking_gates_for_sprint_item`, mirroring
+    :func:`get_blocking_dependency_for_sprint_item`'s "surface what's blocking
+    a claim" shape immediately above — but for HUMAN-decided ambiguity gates
+    rather than an unmet parent-item dependency. Purely additive: this does
+    NOT itself change ``claim_sprint_item``/``complete_sprint_item`` behavior
+    — a caller (dashboard, MCP handler, handoff renderer) decides what to do
+    with a non-empty result. Returns ``[]`` when nothing gates this item.
+    """
+    from meridian.proposal_gates import blocking_gates_for_sprint_item  # noqa: PLC0415
+    return await blocking_gates_for_sprint_item(db, project_id, sprint_item_id)
+
+
 # ---------------------------------------------------------------------------
 # SECTION 3: Lines 4231-6072 — main sprint-item block
 # ---------------------------------------------------------------------------
