@@ -5740,3 +5740,67 @@ class TestAncestorDiskCacheRedirect:
 
         status_via_parent = OL.get_indexed_output_status(str(parent), str(f))
         assert status_via_parent["row"] is not None
+
+
+# ---------------------------------------------------------------------------
+# research_graph_output_identity (ce2f3750 regression)
+# ---------------------------------------------------------------------------
+
+class TestResearchGraphOutputIdentity:
+    """Regression coverage for research_graph_output_identity.
+
+    ce2f3750: CI's blocking ruff pass (F821, undefined-name) failed on a
+    stray, unreachable ``return result`` line that followed the function's
+    real ``return {...}`` statement -- ``result`` was never assigned
+    anywhere in the function. The dead line was removed; nothing else about
+    the function changed. This function previously had zero test coverage,
+    so these tests both lock in its documented return shape and would flag
+    a future edit that reintroduces an incremental result-building pattern
+    (e.g. ``result = {}; ...; return result``) with a missing assignment."""
+
+    def test_prefers_sha256_over_path_when_both_given(self) -> None:
+        out = OL.research_graph_output_identity(path="/tmp/fig.png", sha256="abc123")
+        assert out == {
+            "node_type": "output",
+            "identity_key": "sha256:abc123",
+            "revision": "abc123",
+            "external_ref": {"path": "/tmp/fig.png", "sha256": "abc123"},
+        }
+
+    def test_falls_back_to_path_when_no_sha256(self) -> None:
+        out = OL.research_graph_output_identity(path="/tmp/fig.png")
+        assert out["node_type"] == "output"
+        assert out["identity_key"] == "/tmp/fig.png"
+        assert out["revision"] is None
+        assert out["external_ref"] == {"path": "/tmp/fig.png"}
+
+    def test_reads_from_row_argument(self) -> None:
+        row = {"canonical_path": "/tmp/fig.png", "sha256": "deadbeef"}
+        out = OL.research_graph_output_identity(row=row)
+        assert out["identity_key"] == "sha256:deadbeef"
+        assert out["external_ref"] == {"path": "/tmp/fig.png", "sha256": "deadbeef"}
+
+    def test_row_falls_back_to_path_key_when_no_canonical_path(self) -> None:
+        row = {"path": "/tmp/other.png"}
+        out = OL.research_graph_output_identity(row=row)
+        assert out["identity_key"] == "/tmp/other.png"
+
+    def test_explicit_kwargs_take_precedence_over_row(self) -> None:
+        row = {"canonical_path": "/tmp/row_path.png", "sha256": "row_sha"}
+        out = OL.research_graph_output_identity(path="/tmp/explicit.png", row=row)
+        # Explicit kwargs win over row values (`path or row.get(...)` only
+        # falls back to row when the explicit kwarg is falsy).
+        assert out["external_ref"]["path"] == "/tmp/explicit.png"
+        assert out["identity_key"] == "sha256:row_sha"
+
+    def test_raises_value_error_with_neither_path_nor_sha256(self) -> None:
+        with pytest.raises(ValueError, match="requires at least one of"):
+            OL.research_graph_output_identity()
+
+    def test_raises_value_error_with_empty_row(self) -> None:
+        with pytest.raises(ValueError, match="requires at least one of"):
+            OL.research_graph_output_identity(row={})
+
+    def test_return_shape_has_exactly_the_documented_keys(self) -> None:
+        out = OL.research_graph_output_identity(path="/tmp/x.png")
+        assert set(out.keys()) == {"node_type", "identity_key", "revision", "external_ref"}
