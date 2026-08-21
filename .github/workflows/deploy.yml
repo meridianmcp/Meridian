@@ -53,6 +53,14 @@ on:
         options:
           - 'no'
           - 'yes'
+      cert_check_only:
+        description: 'Set to "yes" to poll the existing custom-domain certificate without replacing it.'
+        required: false
+        default: 'no'
+        type: choice
+        options:
+          - 'no'
+          - 'yes'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -439,15 +447,23 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
           set -u
-          flyctl certs check usemeridian.us --app meridian-hosted --json || true
-          flyctl certs setup usemeridian.us --app meridian-hosted --json || true
-          # The existing ACME record is expired and fly certs add is
-          # idempotent, so remove only the stale ACME issuance before
-          # requesting a fresh certificate. Custom certificates, if any,
-          # are left untouched.
-          flyctl certs remove usemeridian.us --app meridian-hosted --acme --yes || true
-          flyctl certs add usemeridian.us --app meridian-hosted --json
-          flyctl certs check usemeridian.us --app meridian-hosted --json || true
+          if [ "${{ inputs.cert_check_only }}" = "yes" ]; then
+            for attempt in $(seq 1 12); do
+              echo "Certificate poll ${attempt}/12"
+              flyctl certs check usemeridian.us --app meridian-hosted --json || true
+              sleep 15
+            done
+          else
+            flyctl certs check usemeridian.us --app meridian-hosted --json || true
+            flyctl certs setup usemeridian.us --app meridian-hosted --json || true
+            # The existing ACME record is expired and fly certs add is
+            # idempotent, so remove only the stale ACME issuance before
+            # requesting a fresh certificate. Custom certificates, if any,
+            # are left untouched.
+            flyctl certs remove usemeridian.us --app meridian-hosted --acme --yes || true
+            flyctl certs add usemeridian.us --app meridian-hosted --json
+            flyctl certs check usemeridian.us --app meridian-hosted --json || true
+          fi
       - name: Verify public health after certificate reconciliation
         shell: bash
         run: |
