@@ -261,13 +261,34 @@ async def test_link_proposal_lineage_unique_index_exists(db):
     """The COALESCE-normalized unique index actually exists at the schema
     level (belt-and-suspenders for the idempotent-insert pre-check above --
     a genuine concurrent-insert race is caught here, not just by the
-    application-level pre-check)."""
+    application-level pre-check).
+
+    Uses the ``SELECT name FROM sqlite_master WHERE type=... AND name=?``
+    shape -- matching every sibling migration-guard test in this suite (e.g.
+    test_proposal_evidence_linkage.py, test_research_artifact_graph.py,
+    test_proposal_hitl_gates.py, and this same file's own idempotency test
+    above) -- rather than ``SELECT COUNT(*) AS n FROM sqlite_master ...``.
+
+    Root cause of the CI failure this replaces: on the Postgres backend
+    (``TEST_DATABASE_URL`` set), ``PostgresConnection`` translates
+    recognized ``sqlite_master`` query shapes into real ``pg_indexes``
+    lookups (``pg_adapter.PostgresConnection._sqlite_master`` /
+    ``_SQLITE_MASTER_RE``), but only recognizes the literal shapes this
+    codebase actually issues elsewhere -- a bare ``COUNT(*) AS n``
+    projection isn't one of them, so it fell through to the "unrecognized
+    shape" branch and returned an empty result (logging a warning) instead
+    of erroring loudly. ``fetchone()`` then returned ``None``, and
+    ``row["n"] if isinstance(row, dict) else row[0]`` raised
+    ``TypeError: 'NoneType' object is not subscriptable`` on the Postgres
+    CI run -- a test-authored query-shape bug, not a defect in
+    proposal_lineage.py or the Postgres compatibility shim itself. This
+    shape is recognized on both backends."""
     async with db.execute(
-        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='index' "
-        "AND name='idx_proposal_lineage_unique'"
+        "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+        ("idx_proposal_lineage_unique",),
     ) as cur:
         row = await cur.fetchone()
-    assert int(row["n"] if isinstance(row, dict) else row[0]) == 1
+    assert row is not None
 
 
 @pytest.mark.asyncio
