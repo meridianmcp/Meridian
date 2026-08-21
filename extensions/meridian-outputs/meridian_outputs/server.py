@@ -6,15 +6,26 @@ module in this package -- NO hosted call is made by any tool here.  Most
 tools delegate straight to :mod:`meridian_outputs.outputs_local`; a handful
 (``search_outputs``, ``classify_outputs``, ``resolve_figure_output``,
 ``find_outputs_by_source``, ``tag_output``, ``check_staleness``,
-``find_stale_by_script``, ``script_content_hash``, ``get_provenance_status``)
+``find_stale_by_script``, ``script_content_hash``, ``get_provenance_status``,
+``get_provenance_status_envelope``, ``serialize_provenance_envelope``,
+``parse_provenance_envelope``)
 delegate instead to the additive sibling modules built alongside it
 (:mod:`meridian_outputs.search`, :mod:`meridian_outputs.classify`,
 :mod:`meridian_outputs.provenance`, :mod:`meridian_outputs.fingerprint`,
-:mod:`meridian_outputs.provenance_status`) that each layer a drop-in-superset
-fix on top of ``outputs_local``'s public API without touching it directly
-(item a26ad8da wired the first batch of these in; item bd5b8d79 added
-``provenance_status``; see each sibling module's docstring for the gap it
-closes).
+:mod:`meridian_outputs.provenance_status`, :mod:`meridian_outputs.research_evidence`)
+that each layer a drop-in-superset fix on top of ``outputs_local``'s public
+API without touching it directly (item a26ad8da wired the first batch of
+these in; item bd5b8d79 added ``provenance_status``; item 0ea8fd3c added
+``research_evidence`` plus the ``get_provenance_status_envelope``/
+``serialize_provenance_envelope``/``parse_provenance_envelope`` bridge; see
+each sibling module's docstring for the gap it closes).
+
+Non-goals (item 0ea8fd3c, carried over from research_evidence.py's own
+docstring): this server does NOT expose ``validate_output_semantics``,
+``write_artifact_registry``, or ``resolve_artifact_registry`` tools -- an
+artifact registry (cross-envelope persistence/lookup) and output-semantic
+validation are different, not-yet-built capabilities with their own sprint
+items. Nothing below should be read as a promise that those three exist.
 
 This is the wave-1 stopgap for local outputs indexing.  The hosted-aware
 smart-routing layer (item 1365e01a) is deliberately out of scope here.
@@ -41,6 +52,7 @@ from . import (
     outputs_local,
     provenance,
     provenance_status,
+    research_evidence,
     search,
 )
 
@@ -441,6 +453,117 @@ def list_provenance(outputs_dir: str) -> list[dict[str, Any]]:
       value); ``[]`` if nothing has been recorded yet.
     """
     return annotate.list_provenance(outputs_dir)
+
+
+@mcp.tool()
+def get_provenance_status_envelope(
+    outputs_dir: str,
+    paths: list[str],
+) -> dict[str, Any]:
+    """Typed, lossless research-evidence provenance envelope for a batch of
+    output paths (item 0ea8fd3c bridge over ``get_provenance_status``).
+
+    One :class:`research_evidence.EvidenceRecord` (kind ``output``) per
+    path, built via :func:`provenance_status.build_provenance_envelope`
+    from that SAME path's :func:`get_provenance_status` answer -- never a
+    second, independent provenance lookup. See that module's own docstring
+    ("Typed research-evidence bridge") for the exact
+    ``provenance_type`` -> resolver-status mapping (verified/stale/held/
+    ambiguous/unavailable/degraded) and the partial-record rule.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      paths:        Output file paths to build typed records for. ``[]``
+                    returns a valid, empty (non-partial) envelope.
+
+    Returns:
+      The canonical envelope dict (``research_evidence.envelope_to_dict()``'s
+      shape: ``envelope_id``, ``generated_at``, ``records``, ``links``,
+      ``version``, ``partial``, ``partial_reason``) -- pass this straight to
+      ``serialize_provenance_envelope``/``parse_provenance_envelope`` for a
+      round-trippable JSON/XML form, or to ``generate_handoff``'s
+      ``research_evidence_envelope`` parameter to render it into a handoff.
+      ``partial`` is ``True`` whenever ANY contained record is itself
+      partial (e.g. a path that was never discovered, or is indexed but has
+      no provenance record yet) -- never silently reported as fully
+      authoritative just because SOME paths resolved cleanly.
+
+    Raises:
+      Nothing caught here escapes: an empty/missing ``outputs_dir`` or a
+      malformed ``path`` entry raises ``research_evidence
+      .EnvelopeValidationError`` (fails closed, matching every other
+      construction-time failure in that module), rather than silently
+      dropping the bad path from the envelope.
+    """
+    envelope = provenance_status.build_provenance_envelope(outputs_dir, paths)
+    return research_evidence.envelope_to_dict(envelope)
+
+
+@mcp.tool()
+def serialize_provenance_envelope(
+    envelope: dict[str, Any], format: str = "json",
+) -> str:
+    """Serialize a canonical research-evidence provenance envelope dict
+    (item 0ea8fd3c) to a JSON or XML string.
+
+    ``envelope`` is the canonical dict shape produced by this server's own
+    ``get_provenance_status_envelope`` (or
+    ``research_evidence.envelope_to_dict``) -- ``envelope_id``,
+    ``generated_at``, ``records``, ``links``, ``version``, ``partial``,
+    ``partial_reason``. Both formats are two projections of the exact same
+    data (see ``research_evidence.envelope_to_dict``'s own docstring) -- they
+    can never drift apart in what they're able to express, and either
+    round-trips losslessly back through ``parse_provenance_envelope``.
+
+    Args:
+      envelope:  The canonical envelope dict to serialize.
+      format:    ``"json"`` (default) or ``"xml"``.
+
+    Returns:
+      The serialized string. JSON output is key-sorted with stable
+      indentation; the same envelope always serializes to byte-identical
+      output (deterministic).
+
+    Raises:
+      research_evidence.EnvelopeValidationError: ``envelope`` is malformed
+      (missing required keys, invalid enum values, etc.) or ``format`` is
+      neither ``"json"`` nor ``"xml"`` -- never a raw ``KeyError``/
+      ``TypeError`` escaping to the caller.
+    """
+    env = research_evidence.envelope_from_dict(envelope)
+    return research_evidence.serialize_provenance_envelope(env, format=format)
+
+
+@mcp.tool()
+def parse_provenance_envelope(
+    payload: str, format: str = "json",
+) -> dict[str, Any]:
+    """Inverse of ``serialize_provenance_envelope`` (item 0ea8fd3c): parse a
+    JSON or XML provenance envelope payload back into its canonical dict
+    shape.
+
+    Args:
+      payload:  The serialized envelope string (as produced by
+                ``serialize_provenance_envelope``, or hand-built by another
+                system to the same schema).
+      format:   ``"json"`` (default) or ``"xml"`` -- must match the format
+                ``payload`` was serialized in.
+
+    Returns:
+      The canonical envelope dict (``envelope_id``, ``generated_at``,
+      ``records``, ``links``, ``version``, ``partial``, ``partial_reason``)
+      -- the exact same shape ``get_provenance_status_envelope`` returns, so
+      the two tools compose in either direction.
+
+    Raises:
+      research_evidence.EnvelopeValidationError: ``payload`` is malformed
+      JSON/XML, structurally invalid (missing required keys, invalid enum
+      values), or ``format`` is neither ``"json"`` nor ``"xml"`` -- never a
+      raw ``json.JSONDecodeError``/``xml.etree.ElementTree.ParseError``
+      escaping to the caller.
+    """
+    env = research_evidence.parse_provenance_envelope(payload, format=format)
+    return research_evidence.envelope_to_dict(env)
 
 
 @mcp.tool()

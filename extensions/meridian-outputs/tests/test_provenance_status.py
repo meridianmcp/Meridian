@@ -39,6 +39,7 @@ from meridian_outputs import annotate as AN
 from meridian_outputs import fingerprint as FP
 from meridian_outputs import outputs_local as OL
 from meridian_outputs import provenance_status as PS
+from meridian_outputs import research_evidence as RE
 
 try:
     import duckdb as _duckdb_probe  # noqa: F401
@@ -616,3 +617,244 @@ class TestManifestBackedProvenanceStatus:
         for key in base:
             assert result[key] == base[key]
         assert "manifest_status" in result
+
+
+# ---------------------------------------------------------------------------
+# Typed research-evidence bridge (item 0ea8fd3c)
+# ---------------------------------------------------------------------------
+
+class TestEvidenceRecordFromProvenanceStatus:
+    @duckdb_required
+    def test_exact_unchanged_maps_to_verified_non_partial(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "results.csv"
+        f.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(f), generating_script="train.py")
+
+        status = PS.get_provenance_status(str(tmp_path), str(f))
+        rec = PS.evidence_record_from_provenance_status(status)
+
+        assert rec.identity.kind is RE.EvidenceKind.OUTPUT
+        assert rec.identity.id == str(f)
+        assert rec.identity.locator == str(f)
+        assert rec.resolver.status is RE.ResolverStatus.VERIFIED
+        assert rec.partial is False
+        assert rec.is_authoritative is True
+        assert rec.attributes["provenance_type"] == PS.EXACT
+
+    @duckdb_required
+    def test_content_changed_since_recording_maps_to_stale(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "overwritten.csv"
+        f.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(f))
+        f.write_text("a,b\n999,999\n", encoding="utf-8")
+
+        status = PS.get_provenance_status(str(tmp_path), str(f))
+        rec = PS.evidence_record_from_provenance_status(status)
+
+        assert rec.resolver.status is RE.ResolverStatus.STALE
+        assert rec.partial is False  # the record itself is exact, just stale
+        assert rec.is_authoritative is False
+
+    @duckdb_required
+    def test_no_content_hash_captured_maps_to_ambiguous(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "no_hash.csv"
+        f.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(f))
+        # Sanity: a real record was captured with a content hash. Simulate
+        # "no hash was ever captured" the same way the underlying staleness
+        # helper distinguishes it -- by making the recorded hash look absent.
+        status = PS.get_provenance_status(str(tmp_path), str(f))
+        status["staleness"]["recorded_content_hash"] = None
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.AMBIGUOUS
+
+    @duckdb_required
+    def test_script_stale_maps_to_stale(self, tmp_path: Path) -> None:
+        script = tmp_path / "train.py"
+        script.write_text("print('v1')\n", encoding="utf-8")
+        output = tmp_path / "predictions.csv"
+        output.write_text("id,pred\n1,0.5\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(output), generating_script=str(script))
+        FP.tag_output(str(output), str(tmp_path), script_path=str(script))
+        script.write_text("print('v2 fixed')\n", encoding="utf-8")
+
+        status = PS.get_provenance_status(str(tmp_path), str(output))
+        assert status["provenance_type"] == PS.STALE_BY_SCRIPT  # sanity
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.STALE
+
+    @duckdb_required
+    def test_directory_fallback_maps_to_degraded(self, tmp_path: Path) -> None:
+        sub = tmp_path / "run_1"
+        sub.mkdir()
+        (sub / OL.MERIDIAN_NOTES_FILENAME).write_text("a note", encoding="utf-8")
+        target = sub / "width_hist.csv"
+        target.write_text("bin,count\n1,5\n", encoding="utf-8")
+        idx = OL._get_cached_index(str(tmp_path))
+        idx.rebuild()
+
+        status = PS.get_provenance_status(str(tmp_path), str(target))
+        assert status["provenance_type"] == PS.DIRECTORY_FALLBACK  # sanity
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.DEGRADED
+        assert rec.partial is False
+
+    @duckdb_required
+    def test_unregistered_maps_to_held_and_partial(self, tmp_path: Path) -> None:
+        f = tmp_path / "orphaned.csv"
+        f.write_text("a,b\n1,2\n", encoding="utf-8")
+        OL.register_priority_path(str(tmp_path), str(f))
+
+        status = PS.get_provenance_status(str(tmp_path), str(f))
+        assert status["provenance_type"] == PS.UNREGISTERED  # sanity
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.HELD
+        assert rec.partial is True
+        assert rec.partial_reason
+        assert rec.is_authoritative is False
+
+    @duckdb_required
+    def test_unknown_confident_maps_to_unavailable_and_partial(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "some_other_output.csv").write_text("x\n", encoding="utf-8")
+        idx = OL._get_cached_index(str(tmp_path))
+        idx.rebuild()
+
+        never = tmp_path / "genuinely_absent.csv"  # never created on disk
+        status = PS.get_provenance_status(str(tmp_path), str(never))
+        assert status["provenance_type"] == PS.UNKNOWN  # sanity
+        assert status["inconclusive"] is False  # sanity: converged index
+
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.partial is True
+        assert rec.resolver.status is RE.ResolverStatus.UNAVAILABLE
+
+    @duckdb_required
+    def test_unknown_inconclusive_maps_to_ambiguous(self, tmp_path: Path) -> None:
+        for i in range(25):
+            (tmp_path / f"file_{i:03d}.csv").write_text(f"{i}\n", encoding="utf-8")
+        never = tmp_path / "genuinely_absent.csv"
+
+        idx = OL._get_cached_index(str(tmp_path))
+        idx.rebuild(max_seconds=0)
+        assert idx.get_convergence_state().converged is False  # sanity
+
+        status = PS.get_provenance_status(str(tmp_path), str(never))
+        assert status["provenance_type"] == PS.UNKNOWN
+        assert status["inconclusive"] is True  # sanity
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.AMBIGUOUS
+        assert rec.partial is True
+
+    def test_error_status_raises_envelope_validation_error(self) -> None:
+        with pytest.raises(RE.EnvelopeValidationError):
+            PS.evidence_record_from_provenance_status({"error": "outputs_dir is required"})
+
+    @duckdb_required
+    def test_archival_identity_surfaced_as_external_id_and_hash(
+        self, tmp_path: Path,
+    ) -> None:
+        canonical = tmp_path / "results.csv"
+        canonical.write_text("a,b\n1,2\n", encoding="utf-8")
+        archival = tmp_path / "results_old.csv"
+        archival.write_text("a,b\n1,2\n", encoding="utf-8")
+        idx = OL._get_cached_index(str(tmp_path))
+        idx.rebuild()
+
+        status = PS.get_provenance_status(str(tmp_path), str(archival))
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.identity.external_ids.get("canonical_path") == str(canonical)
+        assert rec.attributes["archival"]["is_archival"] is True
+
+    @duckdb_required
+    def test_manifest_status_preserved_in_attributes(self, tmp_path: Path) -> None:
+        target = tmp_path / "out.csv"
+        target.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(target))
+        status = PS.get_manifest_backed_provenance_status(str(tmp_path), str(target), None)
+
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.attributes["manifest_status"] == status["manifest_status"]
+
+    @duckdb_required
+    def test_record_is_json_serializable_end_to_end(self, tmp_path: Path) -> None:
+        """The whole point of the bridge -- what comes out must be a fully
+        valid, round-trippable research_evidence record, not just a
+        constructible one."""
+        f = tmp_path / "results.csv"
+        f.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(f))
+        status = PS.get_provenance_status(str(tmp_path), str(f))
+        rec = PS.evidence_record_from_provenance_status(status)
+
+        env = RE.build_envelope(records=[rec], envelope_id="e", generated_at="t")
+        payload = RE.serialize_provenance_envelope(env, format="json")
+        restored = RE.parse_provenance_envelope(payload, format="json")
+        assert restored == env
+
+
+class TestBuildProvenanceEnvelope:
+    @duckdb_required
+    def test_builds_one_record_per_path(self, tmp_path: Path) -> None:
+        a = tmp_path / "a.csv"
+        a.write_text("a\n1\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(a))
+        b = tmp_path / "b.csv"
+        b.write_text("b\n2\n", encoding="utf-8")  # never recorded -> unknown
+
+        env = PS.build_provenance_envelope(str(tmp_path), [str(a), str(b)])
+        assert len(env.records) == 2
+        ids = {r.identity.id for r in env.records}
+        assert ids == {str(a), str(b)}
+
+    def test_empty_paths_yields_empty_non_partial_envelope(
+        self, tmp_path: Path,
+    ) -> None:
+        env = PS.build_provenance_envelope(str(tmp_path), [])
+        assert env.records == []
+        assert env.partial is False
+
+    @duckdb_required
+    def test_any_partial_record_marks_envelope_partial(
+        self, tmp_path: Path,
+    ) -> None:
+        recorded = tmp_path / "recorded.csv"
+        recorded.write_text("a\n1\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(recorded))
+        never = tmp_path / "never_seen.csv"
+        never.write_text("a\n2\n", encoding="utf-8")
+
+        env = PS.build_provenance_envelope(str(tmp_path), [str(recorded), str(never)])
+        assert env.partial is True
+        assert "partial" in (env.partial_reason or "").lower()
+
+    def test_missing_outputs_dir_raises(self) -> None:
+        with pytest.raises(RE.EnvelopeValidationError):
+            PS.build_provenance_envelope("", ["/some/file.csv"])
+
+    def test_bad_path_raises_rather_than_silently_dropping(
+        self, tmp_path: Path,
+    ) -> None:
+        with pytest.raises(RE.EnvelopeValidationError):
+            PS.build_provenance_envelope(str(tmp_path), [""])
+
+    @duckdb_required
+    def test_envelope_round_trips_losslessly(self, tmp_path: Path) -> None:
+        f = tmp_path / "results.csv"
+        f.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(f))
+
+        env = PS.build_provenance_envelope(
+            str(tmp_path), [str(f)],
+            envelope_id="fixed-env", generated_at="2026-08-21T00:00:00+00:00",
+        )
+        payload = RE.serialize_provenance_envelope(env, format="xml")
+        restored = RE.parse_provenance_envelope(payload, format="xml")
+        assert restored == env

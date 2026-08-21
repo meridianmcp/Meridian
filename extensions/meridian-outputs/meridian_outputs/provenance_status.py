@@ -99,13 +99,61 @@ All of the above are purely ADDITIVE new dict keys -- every field this
 module returned before item d3374b0e (``path``, ``provenance_type``,
 ``record``, ``directory_note``, ``staleness``) keeps the exact same shape and
 values for every scenario the original implementation covered.
+
+Typed research-evidence bridge (sprint item 0ea8fd3c)
+------------------------------------------------------
+:mod:`research_evidence` (same package) defines a canonical, lossless
+:class:`~research_evidence.ProvenanceEnvelope` model -- typed
+:class:`~research_evidence.EvidenceRecord` nodes with an explicit six-state
+:class:`~research_evidence.ResolverStatus` (verified/stale/held/ambiguous/
+unavailable/degraded) plus a ``confidence`` float, instead of this module's
+own bespoke four/five-string ``provenance_type`` enum. Neither module changed
+its OWN existing contract for this -- every field :func:`get_provenance_status`
+already returned keeps the exact same shape/values as before -- this is a pure
+ADDITION on top: :func:`evidence_record_from_provenance_status` maps one
+:func:`get_provenance_status` dict onto a typed
+:class:`~research_evidence.EvidenceRecord` (kind
+:data:`~research_evidence.EvidenceKind.OUTPUT`), and
+:func:`build_provenance_envelope` packages a whole batch of paths into one
+:class:`~research_evidence.ProvenanceEnvelope`.
+
+The ``provenance_type`` -> :class:`~research_evidence.ResolverStatus` mapping
+(see :func:`_resolver_state_for_provenance_status` for the exact rules):
+
+  - :data:`STALE_BY_SCRIPT` -> ``STALE`` -- the generating script itself has
+    since changed content; the strongest, most specific staleness signal this
+    module has.
+  - :data:`EXACT` -> ``VERIFIED`` when the output's own content hash still
+    matches what was recorded, ``STALE`` when it does not, or ``AMBIGUOUS``
+    when there simply isn't enough hash data to say either way (e.g. no
+    content hash was ever captured) -- never silently reported as verified
+    just because an exact record exists.
+  - :data:`DIRECTORY_FALLBACK` -> ``DEGRADED`` -- a real signal, but a
+    directory-wide one, never as strong as a file-specific exact record.
+  - :data:`UNREGISTERED` -> ``HELD`` (a known, indexed path whose provenance
+    capture is simply pending) unless the index has not yet converged, in
+    which case ``AMBIGUOUS`` (matches this module's own ``inconclusive``
+    semantics -- see :func:`get_provenance_status`'s own docstring).
+  - :data:`UNKNOWN` -> ``UNAVAILABLE`` when the index has converged (a
+    confirmed absence), or ``AMBIGUOUS`` when it has not (not confirmed
+    either way yet) -- exactly mirroring this module's own ``inconclusive``
+    flag, never a blanket "not found."
+
+:attr:`~research_evidence.EvidenceRecord.partial` is set (with a required
+``partial_reason``) exactly for :data:`UNREGISTERED`/:data:`UNKNOWN` --
+per this codebase's "partial records ... never presented as authoritative"
+requirement, a record built from either of those two provenance_type values
+is, by construction, known-incomplete (no exact record/directory note was
+ever captured for it), regardless of how confident the resolver mapping
+above is about its VERIFIED/STALE/etc status.
 """
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import Any
 
-from . import annotate, fingerprint, outputs_local
+from . import annotate, fingerprint, outputs_local, research_evidence
 
 __all__ = [
     "EXACT",
@@ -115,6 +163,8 @@ __all__ = [
     "STALE_BY_SCRIPT",
     "get_provenance_status",
     "get_manifest_backed_provenance_status",
+    "evidence_record_from_provenance_status",
+    "build_provenance_envelope",
 ]
 
 EXACT = "exact"
@@ -477,3 +527,336 @@ def get_manifest_backed_provenance_status(
             "current_content_hash": current_hash,
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# 0ea8fd3c -- typed research-evidence bridge (see module docstring for the
+# full provenance_type -> ResolverStatus mapping table and rationale).
+# ---------------------------------------------------------------------------
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _coerce_iso_ts(value: Any) -> "str | None":
+    """Best-effort coercion of a timestamp of unknown shape into a
+    non-empty ISO-8601 string, or ``None`` if it cannot be interpreted.
+
+    ``annotate.record_provenance``'s ledger already stores ``recorded_at_iso``
+    as a real ISO string, but ``outputs_local``'s own annotation timestamps
+    (``created_at``/``updated_at`` on a directory note) are epoch
+    floats/ints (``time.time()``) -- :class:`research_evidence.
+    EvidenceTimestamps` requires a non-empty STRING, so this normalises
+    either shape without assuming either module's storage format changes.
+    """
+    if isinstance(value, str) and value.strip():
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
+def _resolver_state_for_provenance_status(
+    status: "dict[str, Any]",
+) -> "research_evidence.ResolverState":
+    """Map one :func:`get_provenance_status`-shaped dict onto a typed
+    :class:`research_evidence.ResolverState`. See the module docstring's
+    "Typed research-evidence bridge" section for the full rule table --
+    this function is a direct, literal implementation of that table and
+    intentionally carries no additional logic of its own.
+
+    Never raises: an unrecognised/future ``provenance_type`` value falls
+    through to the most conservative reading (``UNAVAILABLE``/``AMBIGUOUS``
+    depending on ``inconclusive``) rather than raising, so a forward-
+    compatible caller on a newer ``provenance_status`` version never crashes
+    building an envelope from an older/unknown status shape.
+    """
+    ptype = status.get("provenance_type")
+    staleness = status.get("staleness") or {}
+    script_staleness = status.get("script_staleness") or {}
+    inconclusive = bool(status.get("inconclusive"))
+
+    if ptype == STALE_BY_SCRIPT:
+        return research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.STALE,
+            confidence=0.3,
+            reason=(
+                script_staleness.get("reason")
+                or "generating script content has changed since it was tagged"
+            ),
+        )
+    if ptype == EXACT:
+        if staleness.get("stale"):
+            return research_evidence.ResolverState(
+                status=research_evidence.ResolverStatus.STALE,
+                confidence=0.3,
+                reason=(
+                    staleness.get("reason")
+                    or "content changed since provenance was recorded"
+                ),
+            )
+        if (
+            staleness.get("recorded_content_hash") is None
+            or staleness.get("current_content_hash") is None
+        ):
+            return research_evidence.ResolverState(
+                status=research_evidence.ResolverStatus.AMBIGUOUS,
+                confidence=0.5,
+                reason=(
+                    staleness.get("reason")
+                    or "staleness could not be confirmed either way"
+                ),
+            )
+        return research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.VERIFIED,
+            confidence=0.95,
+            reason=(
+                staleness.get("reason")
+                or "content hash matches the hash recorded at provenance time"
+            ),
+        )
+    if ptype == DIRECTORY_FALLBACK:
+        return research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.DEGRADED,
+            confidence=0.4,
+            reason=(
+                "covered only by a directory-level MERIDIAN_NOTES.md "
+                "annotation, not an exact per-file provenance record"
+            ),
+        )
+    if ptype == UNREGISTERED:
+        if inconclusive:
+            return research_evidence.ResolverState(
+                status=research_evidence.ResolverStatus.AMBIGUOUS,
+                confidence=0.2,
+                reason=(
+                    "indexed but unregistered, and the outputs index has "
+                    "not yet converged -- this may change"
+                ),
+            )
+        return research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.HELD,
+            confidence=0.5,
+            reason=(
+                "path is indexed by outputs_local but has no exact "
+                "provenance record or directory-level note"
+            ),
+        )
+    # UNKNOWN, or any unrecognised/future provenance_type -- fail toward the
+    # most conservative, least-trusting reading rather than raising.
+    if inconclusive:
+        return research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.AMBIGUOUS,
+            confidence=0.1,
+            reason=(
+                "never discovered by the outputs walker, and the index has "
+                "not yet converged -- may still be found"
+            ),
+        )
+    return research_evidence.ResolverState(
+        status=research_evidence.ResolverStatus.UNAVAILABLE,
+        confidence=0.0,
+        reason=(
+            "never discovered by the outputs walker -- confirmed absent "
+            "from a converged index"
+        ),
+    )
+
+
+def evidence_record_from_provenance_status(
+    status: "dict[str, Any]", *, record_id: "str | None" = None,
+) -> "research_evidence.EvidenceRecord":
+    """Convert one :func:`get_provenance_status`-shaped dict into a typed
+    :class:`research_evidence.EvidenceRecord` (kind
+    :data:`research_evidence.EvidenceKind.OUTPUT`) -- the item 0ea8fd3c
+    bridge. See the module docstring's "Typed research-evidence bridge"
+    section for the full resolver-state mapping and the partial-record rule.
+
+    Args:
+      status:     A dict as returned by :func:`get_provenance_status` (or
+                  :func:`get_manifest_backed_provenance_status`, whose extra
+                  ``manifest_status`` key is preserved verbatim in the
+                  resulting record's ``attributes``, additive only).
+      record_id:  Optional explicit :class:`research_evidence.EvidenceIdentity`
+                  id. Defaults to ``status["path"]``, which is unique per
+                  call and stable across repeated lookups of the same path.
+
+    Returns:
+      A fully-typed, validated :class:`research_evidence.EvidenceRecord`.
+      Every field :func:`get_provenance_status` returned is preserved
+      losslessly in ``attributes`` (nothing is dropped on the floor), so the
+      original dict can always be reconstructed from the typed record.
+
+    Raises:
+      research_evidence.EnvelopeValidationError: ``status`` is the
+      ``{"error": ...}`` shape (missing ``outputs_dir``/``path`` upstream) --
+      there is no meaningful record to build from an error response, so this
+      fails closed rather than silently fabricating one.
+    """
+    if "error" in status:
+        raise research_evidence.EnvelopeValidationError(
+            "cannot build an EvidenceRecord from an error provenance status: "
+            f"{status['error']!r}"
+        )
+    path = status["path"]
+    ptype = status["provenance_type"]
+    record = status.get("record")
+    directory_note = status.get("directory_note")
+    staleness = status.get("staleness") or {}
+    archival = status.get("archival") or None
+
+    observed_at = _coerce_iso_ts(
+        (record or {}).get("recorded_at_iso")
+        or (directory_note or {}).get("created_at")
+    )
+    updated_at = _coerce_iso_ts(
+        (record or {}).get("recorded_at_iso")
+        or (directory_note or {}).get("updated_at")
+        or (directory_note or {}).get("created_at")
+    ) or observed_at
+    if not observed_at:
+        observed_at = _now_iso()
+    if not updated_at:
+        updated_at = observed_at
+
+    hashes: "list[research_evidence.EvidenceHash]" = []
+    primary_hash = staleness.get("current_content_hash") or staleness.get(
+        "recorded_content_hash"
+    )
+    if primary_hash:
+        hashes.append(
+            research_evidence.EvidenceHash(algorithm="sha256", value=primary_hash)
+        )
+    archival_hash = (archival or {}).get("sha256")
+    if archival_hash and archival_hash != primary_hash:
+        hashes.append(
+            research_evidence.EvidenceHash(
+                algorithm="sha256", value=archival_hash,
+                fingerprint="archival_row_sha256",
+            )
+        )
+
+    partial = ptype in (UNREGISTERED, UNKNOWN)
+    partial_reason: "str | None" = None
+    if ptype == UNREGISTERED:
+        partial_reason = (
+            "indexed by outputs_local but no exact provenance record and no "
+            "directory-level note cover this path"
+        )
+    elif ptype == UNKNOWN:
+        partial_reason = "never discovered by the outputs indexing walker"
+        if status.get("inconclusive"):
+            partial_reason += (
+                "; the index has not yet converged, so this may change"
+            )
+
+    external_ids: "dict[str, str]" = {}
+    canonical_path = (archival or {}).get("canonical_path")
+    if canonical_path:
+        external_ids["canonical_path"] = canonical_path
+
+    identity = research_evidence.EvidenceIdentity(
+        id=record_id or path,
+        kind=research_evidence.EvidenceKind.OUTPUT,
+        locator=path,
+        external_ids=external_ids,
+    )
+    timestamps = research_evidence.EvidenceTimestamps(
+        observed_at=observed_at, updated_at=updated_at,
+    )
+    resolver = _resolver_state_for_provenance_status(status)
+
+    return research_evidence.EvidenceRecord(
+        identity=identity,
+        timestamps=timestamps,
+        resolver=resolver,
+        hashes=hashes,
+        partial=partial,
+        partial_reason=partial_reason,
+        attributes={
+            "provenance_type": ptype,
+            "record": record,
+            "directory_note": directory_note,
+            "staleness": status.get("staleness"),
+            "script_staleness": status.get("script_staleness"),
+            "archival": archival,
+            "convergence": status.get("convergence"),
+            "inconclusive": bool(status.get("inconclusive")),
+            "manifest_status": status.get("manifest_status"),
+        },
+    )
+
+
+def build_provenance_envelope(
+    outputs_dir: str,
+    paths: "list[str]",
+    *,
+    envelope_id: "str | None" = None,
+    generated_at: "str | None" = None,
+) -> "research_evidence.ProvenanceEnvelope":
+    """Bridge: build one lossless, typed
+    :class:`research_evidence.ProvenanceEnvelope` (item 0ea8fd3c) from THIS
+    module's own per-file provenance answers -- one
+    :class:`~research_evidence.EvidenceRecord` (kind ``OUTPUT``) per path,
+    via :func:`get_provenance_status` +
+    :func:`evidence_record_from_provenance_status`.
+
+    No edges (:class:`research_evidence.EvidenceLink`) are produced here --
+    ``outputs_local``/``annotate`` have no claim/citation/dataset graph of
+    their own to link against; a caller composing a richer envelope (e.g.
+    joining these OUTPUT records to CLAIM/CITATION records from elsewhere)
+    adds links on the returned :class:`~research_evidence.ProvenanceEnvelope`
+    directly (its ``links`` field is a plain, mutable list).
+
+    Args:
+      outputs_dir:   Absolute path to the outputs directory.
+      paths:         Output file paths to build records for. ``[]`` yields a
+                    valid, empty (non-partial) envelope.
+      envelope_id:   Optional explicit id; auto-generated (uuid4) when omitted.
+      generated_at:  Optional explicit ISO timestamp; current UTC time when
+                    omitted.
+
+    Returns:
+      A :class:`research_evidence.ProvenanceEnvelope` whose ``partial`` flag
+      is ``True`` (with a ``partial_reason`` naming how many of the records
+      are partial) whenever ANY contained record is
+      :attr:`~research_evidence.EvidenceRecord.partial` -- an envelope
+      containing even one known-incomplete record is never reported as a
+      fully-authoritative whole.
+
+    Raises:
+      research_evidence.EnvelopeValidationError: ``outputs_dir`` is missing,
+      or any individual ``path`` lookup itself errors (e.g. an empty-string
+      path) -- fails closed rather than silently dropping the bad path from
+      the envelope.
+    """
+    if not outputs_dir or not str(outputs_dir).strip():
+        raise research_evidence.EnvelopeValidationError("outputs_dir is required")
+
+    records: "list[research_evidence.EvidenceRecord]" = []
+    for path in paths:
+        status = get_provenance_status(outputs_dir, path)
+        if "error" in status:
+            raise research_evidence.EnvelopeValidationError(
+                f"cannot build provenance envelope: {status['error']} "
+                f"(path={path!r})"
+            )
+        records.append(evidence_record_from_provenance_status(status))
+
+    partial_count = sum(1 for r in records if r.partial)
+    partial = partial_count > 0
+    partial_reason = (
+        f"{partial_count} of {len(records)} record(s) are partial -- see "
+        "each record's own partial_reason"
+    ) if partial else None
+
+    return research_evidence.build_envelope(
+        records=records,
+        envelope_id=envelope_id,
+        generated_at=generated_at,
+        partial=partial,
+        partial_reason=partial_reason,
+    )
