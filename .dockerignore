@@ -15,7 +15,16 @@ logs/
 .claude/
 docs/
 tests/
-extensions/
+# extensions/* (not "extensions/") + explicit negation below: `dir/` excludes
+# the directory itself and Docker will NEVER re-include children of a
+# directory-level exclusion, but `dir/*` excludes each entry individually,
+# which a `!` pattern for one specific entry CAN still override.
+# meridian-codeindex must ship in the main image (imported directly by
+# meridian/code_index.py, see Dockerfile) -- the other extensions run as
+# their own separate `uvx`-launched subprocesses and don't need to be here.
+extensions/*
+!extensions/meridian-codeindex
+!extensions/meridian-codeindex/**
 npm/
 scripts/
 site/
