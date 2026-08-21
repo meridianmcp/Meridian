@@ -441,6 +441,11 @@ jobs:
           set -u
           flyctl certs check usemeridian.us --app meridian-hosted --json || true
           flyctl certs setup usemeridian.us --app meridian-hosted --json || true
+          # The existing ACME record is expired and fly certs add is
+          # idempotent, so remove only the stale ACME issuance before
+          # requesting a fresh certificate. Custom certificates, if any,
+          # are left untouched.
+          flyctl certs remove usemeridian.us --app meridian-hosted --acme --yes || true
           flyctl certs add usemeridian.us --app meridian-hosted --json
           flyctl certs check usemeridian.us --app meridian-hosted --json || true
       - name: Verify public health after certificate reconciliation
