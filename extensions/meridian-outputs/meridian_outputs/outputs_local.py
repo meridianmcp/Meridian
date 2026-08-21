@@ -5875,3 +5875,64 @@ def search_logs(
     result["total_matched"] = len(matches)
     result["engine"] = engine
     return result
+
+
+def research_graph_output_identity(
+    *,
+    path: str | None = None,
+    sha256: str | None = None,
+    row: "dict[str, Any] | None" = None,
+) -> dict[str, Any]:
+    """b558892a -- a plain, dependency-free ``{node_type, identity_key,
+    revision, external_ref}`` shape describing one registered output for
+    Meridian's research artifact graph (``meridian.research_graph`` /
+    ``meridian.db.research_graph``, core repo only).
+
+    This package is a standalone, ``uvx``-installable MCP server with NO
+    dependency on the core ``meridian`` distribution (see this package's
+    pyproject.toml) -- it must never import ``meridian.*``. This function
+    exists so a caller that DOES have both installed (the core executor, or
+    a future ingestion bridge) can build an identity reference in the exact
+    shape ``meridian.research_graph``'s ``output_identity_key``/
+    ``create_node`` expect, without this package taking on that dependency
+    itself. Pure, synchronous, no I/O -- callers already have the fields
+    (from :func:`get_indexed_output` / :func:`resolve_output`, or their own
+    :func:`_sha256_file` call) before reaching this function.
+
+    Pass either ``row`` (a row shaped like :func:`get_indexed_output`'s
+    return value -- reads its ``path``/``canonical_path`` and ``sha256``
+    keys) OR explicit ``path``/``sha256`` keyword args. The identity prefers
+    a content fingerprint (``sha256``) over the path when both are
+    available -- a registered output is often moved/renamed but its content
+    identity is what matters for provenance, mirroring
+    ``meridian.research_graph.output_identity_key``'s own preference order
+    (duplicated here rather than imported, per this package's no-core-
+    dependency rule). Raises ``ValueError`` when neither a usable path nor
+    a sha256 is available from either source.
+    """
+    if row is not None:
+        path = path or row.get("canonical_path") or row.get("path")
+        sha256 = sha256 or row.get("sha256")
+    sha256 = (sha256 or "").strip() if isinstance(sha256, str) else ""
+    path = (path or "").strip() if isinstance(path, str) else ""
+    if sha256:
+        identity_key = f"sha256:{sha256}"
+    elif path:
+        identity_key = path
+    else:
+        raise ValueError(
+            "research_graph_output_identity requires at least one of "
+            "path/sha256 (directly or via row)"
+        )
+    external_ref: dict[str, Any] = {}
+    if path:
+        external_ref["path"] = path
+    if sha256:
+        external_ref["sha256"] = sha256
+    return {
+        "node_type": "output",
+        "identity_key": identity_key,
+        "revision": sha256 or None,
+        "external_ref": external_ref,
+    }
+    return result

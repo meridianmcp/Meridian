@@ -1142,6 +1142,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_profile_layers(db)
     await _migrate_wave_gate_results_version_unique(db)
     await _migrate_wave_gate_configs_version_unique(db)
+    await _migrate_research_graph(db)
     return db
 
 
@@ -12664,4 +12665,27 @@ from .profile_layers import (  # noqa: F401
     # 77369699 — exact-revision rollback restore for batch_mutate's
     # profile_layer compensation path (db/batch_management.py).
     _restore_profile_layer_row,
+)
+
+# b558892a — the durable research artifact graph: typed nodes/edges linking
+# claims, citations, code, runs, outputs, documents, and executor decisions.
+# Imported LAST (after everything above) — a two-table, append-only-or-
+# transactionally-replaceable shape with no dependency on any other db/*.py
+# submodule at import time. See meridian.research_graph for the closed
+# NODE_TYPES/EDGE_TYPES vocabularies and identity-key builders, and
+# meridian.db.research_graph's own module docstring for the full schema/
+# write-semantics contract.
+from .research_graph import (  # noqa: F401
+    _migrate_research_graph,
+    create_node,
+    replace_node_revision,
+    get_node,
+    get_current_node,
+    list_node_revisions,
+    create_edge,
+    get_unresolved_edges,
+    get_edges_for_identity,
+    get_claim_evidence,
+    get_lineage_subgraph,
+    get_artifact_document_lineage,
 )

@@ -3209,6 +3209,78 @@ async def _migrate_pg_decision_evidence(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_research_graph(conn: PostgresConnection) -> None:
+    """b558892a — research_nodes / research_edges: the durable research
+    artifact graph (typed nodes/edges linking claims, citations, code, runs,
+    outputs, documents, and executor decisions). Mirrors
+    db.research_graph._migrate_research_graph exactly — see that module's
+    docstring (and meridian.research_graph's) for the full schema,
+    identity/revision, write-semantics (append-only vs. transactionally
+    replaceable), and unresolved-edge contract. Not present in the base
+    CREATE_TABLES_CORE literal — this guarded migration is the only creation
+    path on Postgres, matching _migrate_pg_decision_evidence immediately
+    above.
+
+    The COALESCE-normalized unique index on research_nodes is what makes
+    create_node's idempotent-insert pattern work (a NULL revision is
+    normalized to '' so two rows with no revision at all still collide
+    correctly, matching proposal_lineage's identical COALESCE technique).
+    The plain unique index on research_edges makes create_edge idempotent
+    the same way, on its natural (project, edge_kind, from, to) key.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS research_nodes ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    node_type TEXT NOT NULL CHECK (node_type IN ("
+        "        'claim', 'citation', 'code', 'run', 'output', 'document', 'decision')),"
+        "    identity_key TEXT NOT NULL,"
+        "    external_ref TEXT,"
+        "    revision TEXT,"
+        "    title TEXT,"
+        "    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'superseded')),"
+        "    seq INTEGER NOT NULL DEFAULT 1,"
+        "    supersedes_id TEXT,"
+        "    superseded_by TEXT,"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    updated_at TEXT"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_research_nodes_identity_revision "
+        "ON research_nodes(project_id, node_type, identity_key, COALESCE(revision, ''));"
+        "CREATE INDEX IF NOT EXISTS idx_research_nodes_identity "
+        "ON research_nodes(project_id, node_type, identity_key);"
+        "CREATE INDEX IF NOT EXISTS idx_research_nodes_project "
+        "ON research_nodes(project_id);"
+        "CREATE TABLE IF NOT EXISTS research_edges ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    edge_kind TEXT NOT NULL CHECK (edge_kind IN ("
+        "        'supports', 'contradicts', 'evidences', 'cites', 'produces',"
+        "        'derived_from', 'documents', 'implements', 'references')),"
+        "    from_node_type TEXT NOT NULL,"
+        "    from_identity_key TEXT NOT NULL,"
+        "    from_node_id TEXT,"
+        "    to_node_type TEXT NOT NULL,"
+        "    to_identity_key TEXT NOT NULL,"
+        "    to_node_id TEXT,"
+        "    label TEXT,"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    resolved_at TEXT"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_research_edges_unique "
+        "ON research_edges(project_id, edge_kind, from_node_type, from_identity_key, "
+        "to_node_type, to_identity_key);"
+        "CREATE INDEX IF NOT EXISTS idx_research_edges_from "
+        "ON research_edges(project_id, from_node_type, from_identity_key);"
+        "CREATE INDEX IF NOT EXISTS idx_research_edges_to "
+        "ON research_edges(project_id, to_node_type, to_identity_key);"
+        "CREATE INDEX IF NOT EXISTS idx_research_edges_unresolved "
+        "ON research_edges(project_id, from_node_id, to_node_id);"
+    )
+
+
 async def _migrate_pg_ai_log_events(conn: PostgresConnection) -> None:
     """9e83be4a (Round 1 proposal e143949d) — ai_log_events: canonical,
     versioned, append-only ExecutionEvent storage (mirrors
@@ -4727,4 +4799,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_sprint_batch_claims_reservation_fields,
     _migrate_pg_profile_layers,
     _migrate_pg_wave_gate_version_unique_constraints,
+    _migrate_pg_research_graph,
 )
