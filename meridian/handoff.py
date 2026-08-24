@@ -7492,6 +7492,60 @@ def render_release_transaction_evidence_xml(summary: "dict[str, Any] | None") ->
     return "".join(parts)
 
 
+def render_release_transaction_evidence_markdown(summary: "dict[str, Any] | None") -> str:
+    """MDE-3 rework — the Markdown twin of
+    :func:`render_release_transaction_evidence_xml`, rendering the EXACT
+    SAME :func:`meridian.db.docx_merge.summarize_release_transactions`
+    summary as a human-readable ``## Release Transactions`` section.
+
+    Consumes the identical *summary* dict the XML/JSON renderers do — never
+    a separate query — so all three projections are guaranteed to describe
+    the same evidence. ``""`` for ``None``/falsy input or zero transactions,
+    matching the XML renderer's "purely additive" contract.
+    """
+    if not summary or not summary.get("transaction_count"):
+        return ""
+    lines = [
+        "## Release Transactions",
+        "",
+        f"- Total: {summary.get('transaction_count')}",
+        f"- All released: {bool(summary.get('all_released'))}",
+    ]
+    state_counts = summary.get("state_counts") or {}
+    if state_counts:
+        lines.append("- By state: " + ", ".join(
+            f"{state}={state_counts[state]}" for state in sorted(state_counts)
+        ))
+    recovery = summary.get("recovery_required") or []
+    if recovery:
+        lines.append("")
+        lines.append("**Needs attention (RECOVERY_REQUIRED):**")
+        for entry in recovery:
+            lines.append(
+                f"- `{entry.get('transaction_id')}` — {entry.get('change_set_id')} "
+                f"({entry.get('file_path')}): {entry.get('error')}"
+            )
+    return "\n".join(lines)
+
+
+def render_release_transaction_evidence_json(summary: "dict[str, Any] | None") -> str:
+    """MDE-3 rework — the JSON twin of
+    :func:`render_release_transaction_evidence_xml` / :func:`render_release_
+    transaction_evidence_markdown`: the SAME summary dict, serialized as a
+    deterministic (sorted-key) JSON string. ``""`` for ``None``/falsy input
+    or zero transactions — same "purely additive" contract as its siblings.
+    Callers that want the raw dict (rather than a pre-serialized string —
+    e.g. to embed in a structured MCP response field) should use
+    :func:`meridian.db.docx_merge.summarize_release_transactions`'s own
+    output directly; this function exists for handoff bodies that need a
+    literal JSON TEXT projection (e.g. a fenced code block) alongside the
+    Markdown/XML ones.
+    """
+    if not summary or not summary.get("transaction_count"):
+        return ""
+    return json.dumps(summary, sort_keys=True, default=str)
+
+
 async def _release_transaction_evidence_summary(
     db: Any, project_id: "str | None",
 ) -> "dict[str, Any] | None":
@@ -11515,6 +11569,28 @@ async def generate_handoff(
     if _research_evidence_block:
         content = f"{content}\n\n{_research_evidence_block}"
 
+    # MDE-3 rework — "exact evidence in handoff" for release transactions
+    # (meridian.db.docx_merge's PREPARED->...->RELEASED state machine)
+    # previously ONLY reached goal mode (_generate_goal_only_handoff). This
+    # is the STANDARD/full handoff body — the mode most sessions actually
+    # read — so it gets the SAME evidence, all three projections (Markdown
+    # for a human reader, an XML tag + a fenced JSON block for a machine
+    # parser), from the SAME summary dict as goal mode. Best-effort and
+    # purely additive: "" input from a project with zero release-transaction
+    # activity means zero change to existing handoff content.
+    _release_evidence = await _release_transaction_evidence_summary(db, project_id)
+    _release_evidence_md = render_release_transaction_evidence_markdown(_release_evidence)
+    if _release_evidence_md:
+        content = f"{content}\n\n{_release_evidence_md}"
+    _release_evidence_xml = render_release_transaction_evidence_xml(_release_evidence)
+    if _release_evidence_xml:
+        content = f"{content}\n{_release_evidence_xml}"
+    _release_evidence_json = render_release_transaction_evidence_json(_release_evidence)
+    if _release_evidence_json:
+        content = (
+            f"{content}\n\n```json release_transactions\n{_release_evidence_json}\n```"
+        )
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{handoff_file_stem(project_id)}_handoff.md"
@@ -12456,6 +12532,19 @@ async def _generate_goal_only_handoff(
         _g_release_evidence_block = render_release_transaction_evidence_xml(_g_release_evidence)
         if _g_release_evidence_block:
             quick_start_goal = f"{quick_start_goal}\n{_g_release_evidence_block}"
+        # MDE-3 rework — the SAME summary also as Markdown + JSON, so goal
+        # mode carries all three projections of identical evidence, not
+        # just XML. Independently guarded ("" input -> no-op) so a project
+        # with zero release-transaction activity sees zero change.
+        _g_release_evidence_md = render_release_transaction_evidence_markdown(_g_release_evidence)
+        if _g_release_evidence_md:
+            quick_start_goal = f"{quick_start_goal}\n\n{_g_release_evidence_md}"
+        _g_release_evidence_json = render_release_transaction_evidence_json(_g_release_evidence)
+        if _g_release_evidence_json:
+            quick_start_goal = (
+                f"{quick_start_goal}\n\n```json release_transactions\n"
+                f"{_g_release_evidence_json}\n```"
+            )
     # f471c4b8 — append the SAME machine-readable project-start-configuration
     # tag full/delta/starter render, BEFORE the token is minted below. This
     # is the mode explicitly documented as "hand straight to a fresh

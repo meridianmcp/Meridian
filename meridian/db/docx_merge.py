@@ -1251,6 +1251,104 @@ async def resolve_release_recovery(
     }
 
 
+async def check_release_staleness(
+    db: aiosqlite.Connection,
+    transaction_id: str,
+    *,
+    wave_id: "str | None" = None,
+    element_id: "str | None" = None,
+    expected_base_revision: "str | None" = None,
+    source_path: "str | None" = None,
+    embed_sha256: "str | None" = None,
+    embed_mtime: "float | None" = None,
+    project_id: "str | None" = None,
+    tenant_id: "str | None" = None,
+) -> "dict[str, Any]":
+    """MDE-3 rework — connect the release-transaction promotion gate to the
+    REAL anchor/output-hash staleness signals that already exist elsewhere
+    in this codebase, instead of the generic ``base_hash``/``post_hash``
+    equality :func:`resolve_release_recovery` uses (that check answers
+    "did MY OWN promotion land", not "is the thing I'm about to promote
+    stale relative to a DIFFERENT anchor/source it's tied to" — a real,
+    distinct gap).
+
+    Two independent checks, each SKIPPED (not failed) when its own inputs
+    are not supplied — this function never invents a staleness verdict from
+    data it wasn't given:
+
+    * **Anchor/revision staleness** — delegates to the EXISTING
+      :func:`check_merge_stale_or_overlap` (the same gate
+      ``merge_docx_draft``'s wave-merge coordination already uses) when
+      *wave_id* and *element_id* are both given. Catches a stale draft base
+      revision or a DIFFERENT session having already merged this exact
+      anchor — the "real anchor" half of the acceptance gap.
+    * **Output-hash staleness** — delegates to the EXISTING
+      :mod:`meridian.embedded_staleness`'s ``check_embedded_staleness`` (the
+      same sha256-vs-live-source comparison ``check_embedded_staleness``
+      the MCP tool already exposes standalone) when *source_path* is given.
+      Catches this release's content having been embedded from a
+      meridian-outputs-tracked source that has since changed — the "real
+      output hash" half.
+
+    Returns ``{"blocked": bool, "reasons": [str, ...], "anchor_check":
+    dict|None, "output_check": dict|None}``. ``blocked=True`` on ANY hard
+    staleness signal (``check_merge_stale_or_overlap`` returning non-None,
+    or ``check_embedded_staleness`` reporting ``stale=True``) — the caller
+    (:func:`meridian.routes.tunnel.call_tunnel_tool_with_release_tracking`)
+    is expected to fail the promotion CLOSED (advance to
+    ``RECOVERY_REQUIRED``/``ABORTED`` rather than ``RELEASED``) when this
+    returns ``blocked=True``, never silently proceed. Never raises — an
+    unresolvable underlying check (e.g. no manifest, unreadable source)
+    degrades to a documented ``reasons`` entry rather than blocking on an
+    infrastructure failure; only a POSITIVE staleness/conflict signal from
+    either delegate blocks.
+    """
+    reasons: "list[str]" = []
+    anchor_check: "dict[str, Any] | None" = None
+    output_check: "dict[str, Any] | None" = None
+
+    if wave_id and element_id:
+        current = await get_release_transaction(
+            db, transaction_id, project_id=project_id, tenant_id=tenant_id,
+        )
+        file_path = (current or {}).get("file_path")
+        session_id = (current or {}).get("session_id")
+        if file_path and session_id:
+            anchor_check = await check_merge_stale_or_overlap(
+                db, wave_id, file_path, session_id, element_id,
+                expected_base_revision=expected_base_revision,
+            )
+            if anchor_check is not None:
+                reasons.append(
+                    f"anchor_stale: {anchor_check.get('reason')} "
+                    f"({anchor_check.get('message')})"
+                )
+        else:
+            reasons.append(
+                "anchor_check_skipped: transaction has no recorded "
+                "file_path/session_id to check against"
+            )
+
+    if source_path:
+        from ..embedded_staleness import check_embedded_staleness  # noqa: PLC0415
+        output_check = check_embedded_staleness(
+            "docx_release", source_path=source_path,
+            embed_sha256=embed_sha256, embed_mtime=embed_mtime,
+        )
+        if output_check.get("stale") is True:
+            reasons.append(f"output_hash_stale: {output_check.get('reason')}")
+
+    return {
+        "blocked": bool(
+            (anchor_check is not None)
+            or (output_check is not None and output_check.get("stale") is True)
+        ),
+        "reasons": reasons,
+        "anchor_check": anchor_check,
+        "output_check": output_check,
+    }
+
+
 async def list_release_transactions(
     db: aiosqlite.Connection,
     *,

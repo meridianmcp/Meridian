@@ -2683,6 +2683,26 @@ def _hash_elements(elements: list[ET.Element]) -> str:
     return h.hexdigest()
 
 
+def _current_file_sha256(path: str) -> "str | None":
+    """MDE-3 -- sha256 hex digest of *path*'s CURRENT bytes on disk, or
+    ``None`` on any read failure. Used by move_section/copy_section/
+    relocate_table to report ``promoted_sha256`` in their success payload:
+    the exact fingerprint of what is on disk when the call returns
+    (including any renumber_sequences follow-up write), so a caller that
+    HAS a meridian-core DB handle (meridian/routes/tunnel.py -- see its
+    ``call_tunnel_tool_with_release_tracking``) can drive a real
+    docx_merge release-transaction state machine around this call with
+    genuine post-write evidence instead of inventing one. Deliberately
+    stdlib-only (no meridian-core import) -- see the module-level
+    "no hard dependency" note above find_orphaned_docx_staged_files.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
 def _docx_media_count(raw: bytes) -> int:
     """Count ``word/media/*`` parts in the (pre- or post-write) ZIP bytes.
 
@@ -12906,6 +12926,10 @@ def move_section(
         "docx_path": dest,
         "wave_run_id": wave_run_id,
         "is_draft": bool(draft_output_path),
+        # MDE-3 -- real post-write fingerprint (see _current_file_sha256),
+        # captured AFTER renumber_sequences' own follow-up write so it
+        # reflects what is actually on disk when this call returns.
+        "promoted_sha256": _current_file_sha256(dest),
     }
 
 
@@ -13445,6 +13469,8 @@ def copy_section(
         "docx_path": dest,
         "wave_run_id": wave_run_id,
         "is_draft": bool(draft_output_path),
+        # MDE-3 -- see move_section's identical field for rationale.
+        "promoted_sha256": _current_file_sha256(dest),
     }
 
 
@@ -14111,6 +14137,8 @@ def relocate_table(
         "docx_path": dest,
         "wave_run_id": wave_run_id,
         "is_draft": bool(draft_output_path),
+        # MDE-3 -- see move_section's identical field for rationale.
+        "promoted_sha256": _current_file_sha256(dest),
     }
 
 
