@@ -168,4 +168,5 @@
 - 2026-08-21 **exec-1** — did A (+1 more)
 - 2026-08-21 **session-with-tasks** — task one (+1 more)
 - 2026-08-24 **exec-1** — did A (+1 more)
+- 2026-08-24 **test-ckpt-session** — Fixed the bug
 <!-- MERIDIAN:ANCHOR:END:devlog -->
