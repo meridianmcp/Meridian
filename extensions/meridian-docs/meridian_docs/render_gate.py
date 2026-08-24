@@ -116,6 +116,7 @@ __all__ = [
     "UNAVAILABLE_WITH_REASON",
     "FAILED",
     "RENDER_STATUSES",
+    "RENDER_TEMPDIR_PREFIX",
     "TIMEOUT_ERROR",
     "TRANSPORT_ERROR",
     "CORRUPTION_ERROR",
@@ -144,6 +145,21 @@ UNAVAILABLE_WITH_REASON = "unavailable-with-reason"
 FAILED = "failed"
 
 RENDER_STATUSES: tuple[str, str, str] = (RENDERED, UNAVAILABLE_WITH_REASON, FAILED)
+
+# c7ef8ff7 -- named so it's a single source of truth for the three backend
+# render() functions below (previously three independent string literals
+# that could silently drift apart). This is also the documented STRING
+# CONVENTION ``meridian.local_resilience.reap_stale_render_tempdirs``'s own
+# ``prefix`` default matches -- kept in sync by convention/documentation,
+# never by import: this package is standalone (no dependency on the
+# ``meridian`` core package -- see this module's own docstring), so core's
+# crash-recovery reaper for these exact disposable directories cannot
+# import this constant and must instead default to the identical literal.
+# A ``TemporaryDirectory`` normally self-cleans even on an in-process
+# exception (each backend's own ``with`` block), but NOT if the whole host
+# process is killed before that finalizer runs -- that crash-recovery case
+# is what the reaper on the core side exists for.
+RENDER_TEMPDIR_PREFIX = "meridian_render_gate_"
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +312,7 @@ def _soffice_render(docx_path: str) -> dict[str, Any]:
             error_class=TRANSPORT_ERROR,
             retryable=True,
         )
-    with tempfile.TemporaryDirectory(prefix="meridian_render_gate_") as out_dir:
+    with tempfile.TemporaryDirectory(prefix=RENDER_TEMPDIR_PREFIX) as out_dir:
         try:
             result = subprocess.run(
                 [executable, "--headless", "--convert-to", "pdf", "--outdir", out_dir, docx_path],
@@ -491,7 +507,7 @@ def _terminate_owned_process(pid: int) -> bool:
 def _word_com_render_thread(docx_path: str) -> dict[str, Any]:
     import win32com.client  # local import: optional dependency, only touched when available
 
-    with tempfile.TemporaryDirectory(prefix="meridian_render_gate_") as out_dir:
+    with tempfile.TemporaryDirectory(prefix=RENDER_TEMPDIR_PREFIX) as out_dir:
         pdf_path = os.path.join(out_dir, "render_probe.pdf")
         outcome: dict[str, Any] = {}
         owned: dict[str, Any] = {"pid": None, "version": None}
@@ -659,7 +675,7 @@ def _word_com_process_worker(docx_path: str, pdf_path: str, result_queue: Any) -
 
 
 def _word_com_render_isolated(docx_path: str) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="meridian_render_gate_") as out_dir:
+    with tempfile.TemporaryDirectory(prefix=RENDER_TEMPDIR_PREFIX) as out_dir:
         pdf_path = os.path.join(out_dir, "render_probe.pdf")
         context = multiprocessing.get_context("spawn")
         result_queue = context.Queue()
