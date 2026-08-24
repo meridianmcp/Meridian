@@ -51,13 +51,14 @@ A canonical, typed data model -- :class:`ProvenanceEnvelope`, made of
 Non-goals (explicitly out of scope for this item)
 ---------------------------------------------------
 This module does not implement an artifact *registry* (persistence/lookup
-across many envelopes) or output-semantic validation -- those are different,
-not-yet-built capabilities with their own sprint items; nothing in this
-module's public surface should be read as a promise that
-``validate_output_semantics``/``write_artifact_registry``/
-``resolve_artifact_registry`` exist anywhere in this codebase yet. This
-module owns exactly what its title says: the typed evidence model and its
-JSON/XML envelope.
+across many envelopes) or output-semantic validation. The registry gap was
+closed by a later item (e1c979e3, ``meridian_outputs.artifact_registry`` --
+a durable, relocation-safe artifact identity store bound to source/content-
+hash/generator identity, independent of this envelope model); nothing here
+changed to accommodate it, and this module has no dependency on it either
+direction. ``validate_output_semantics`` remains a different, not-yet-built
+capability with its own sprint item. This module owns exactly what its
+title says: the typed evidence model and its JSON/XML envelope.
 """
 from __future__ import annotations
 

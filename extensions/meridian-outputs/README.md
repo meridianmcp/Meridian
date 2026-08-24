@@ -104,14 +104,36 @@ research_evidence_envelope=...)` call (`mode` in `{"full", "delta"}`) — that
 integration is duck-typed (meridian core never imports this package; see
 `_render_research_evidence_block`'s own docstring in `meridian/handoff.py`).
 
-**Planned, not yet implemented:** `validate_output_semantics`,
-`write_artifact_registry`, and `resolve_artifact_registry` are a separate,
-not-yet-built capability — a cross-envelope artifact *registry*
-(persistence/lookup across many envelopes) and output-semantic validation —
-tracked under their own sprint item(s), distinct from this item's typed
-evidence model + envelope. Nothing in this README, or in
-`research_evidence.py`'s own module docstring, should be read as a promise
-that those three exist anywhere in this codebase yet.
+**Planned, not yet implemented:** `validate_output_semantics` is a separate,
+not-yet-built output-semantic-validation capability, tracked under its own
+sprint item. The artifact-registry gap noted above in earlier revisions of
+this README was closed by item e1c979e3 — see the next section.
+
+### Stable artifact registry (item e1c979e3)
+
+`meridian_outputs.artifact_registry` is a durable, atomic JSON-ledger
+registry (`<outputs_dir>/.meridian-outputs-cache/artifact_registry.json`)
+that mints a **relocation-safe public `artifact_id`** from portable identity
+signals only — content hash, generator/tool, and an explicit
+`source_locator` — never from the absolute path. Re-registering the same
+logical artifact after it has moved yields the identical id. The exact
+on-disk path is stored ONLY inside a clearly-separated, redactable
+`local_paths` bucket. Every resolution outcome is explicit
+(`resolved`/`ambiguous`/`unresolved`/`orphaned`/`hash_mismatch`) — this
+module never falls back to a basename/fuzzy guess the way
+`resolve_figure_output`'s second tier does; multiple genuine candidates are
+always surfaced together, never silently narrowed to one.
+
+| Tool | Description |
+|------|-------------|
+| `register_artifact` | Bind (create or update) a stable public artifact identity; fails closed with no portable anchor or a contradicting hash |
+| `resolve_artifact` | Resolve by public id or by local path (content-hash tier, then exact-path-sighting tier); explicit `ambiguous`/`unresolved`/`orphaned` outcomes, never a basename guess |
+| `verify_artifact_hash` | Recompute an artifact's content hash from disk on demand and compare to what is on file; never silently "verified" with nothing to compare |
+| `bind_artifact_source_edge` | Record a typed edge between a registered artifact and a source locator (idempotent) |
+| `get_artifact_sources` | Artifact → its bound sources |
+| `get_source_artifacts` | Source → the artifacts it produced |
+| `list_registered_artifacts` | All registered artifacts, optionally filtered by kind/lifecycle_state |
+| `reconcile_legacy_artifact_outputs` | Migration/reconciliation report for legacy outputs (defaults to the `record_provenance` ledger); dry-run preview or real registration; ambiguous/unanchored entries are never silently registered |
 
 ## Security
 

@@ -52,6 +52,24 @@ meridian_outputs modules are intentionally left untouched here (out of scope
 for this item / being worked on in parallel elsewhere). Wiring these two
 functions into the live MCP tool catalog is a follow-up, not part of this
 change.
+
+Relationship to the artifact registry (item e1c979e3, added later)
+--------------------------------------------------------------------
+:func:`resolve_figure_output`'s basename-fallback tier and
+:func:`bind_artifact_provenance`'s per-write classification are both
+DELIBERATELY still path-first, per-call lookups against the live outputs FTS
+index -- neither was changed by e1c979e3, and both keep exactly their
+existing contracts (including the basename tier's non-authoritative fuzzy
+match, which is still useful evidence for a per-write classification even
+though it is never treated as identity-confirming). ``artifact_registry``
+(a separate module) is the NEW, narrower answer to "give me a STABLE public
+id for this artifact that survives relocation, resolved with an explicit
+resolved/ambiguous/unresolved/orphaned outcome and never a silent basename
+guess" -- callers that need a durable, portable identity (rather than a
+one-off per-write provenance check) should prefer
+``artifact_registry.register_artifact``/``resolve_artifact`` over building
+one on top of this module's basename tier. The two modules do not import
+each other.
 """
 from __future__ import annotations
 
