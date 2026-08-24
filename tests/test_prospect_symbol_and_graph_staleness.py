@@ -517,6 +517,43 @@ class TestProspectSymbolFallbackChain:
         assert result["rung"] == "semantic"
         assert result["hits"][0]["name"] == "my_fn"
 
+    @pytest.mark.asyncio
+    async def test_semantic_rung_end_to_end_carries_convergence_and_degraded(
+        self, tmp_path,
+    ):
+        """ec91e311 -- routing-contract regression, UNMOCKED end to end.
+
+        Every other test in this class stubs ``hardening.run_in_bulkhead`` so
+        Rung 3 never actually touches ``meridian.code_index.search_code_semantic``.
+        This one runs the real chain over a real tmp_path root_dir (no tenant,
+        so rungs 1/2 are skipped by design) so it proves the FULL routing
+        contract holds all the way down to the real CodeIndex: the semantic
+        rung's raw result must carry the same explicit ``convergence``/
+        ``degraded`` embedding-freshness state (e631d54f) a direct
+        ``search_code_semantic`` caller gets -- not a hand-trimmed subset of
+        it (the exact gap closed on ``meridian.code_index.search_code_semantic``
+        for this item; see its docstring)."""
+        (tmp_path / "svc.py").write_text(
+            "def real_e2e_marker_zzqq():\n    return 1\n", encoding="utf-8",
+        )
+        result = await _prospect_symbol_impl(
+            symbol="real_e2e_marker_zzqq",
+            project_id="",
+            root_dir=str(tmp_path),
+            limit=5,
+            kind=None,
+            stale_graph=False,
+            tenant=None,
+            data_dir=str(tmp_path),
+        )
+        assert result["rung"] == "semantic"
+        assert result["rungs"]["semantic"]["status"] == "succeeded"
+        assert any(h.get("name") == "real_e2e_marker_zzqq" for h in result["hits"])
+        assert "semantic_raw" in result
+        assert "convergence" in result["semantic_raw"]
+        assert result["semantic_raw"]["degraded"] is False
+        assert result["semantic_raw"]["convergence"]["vectors_enabled"] is False
+
 
 # ---------------------------------------------------------------------------
 # Integration: prospect_symbol appears in the MCP tools list

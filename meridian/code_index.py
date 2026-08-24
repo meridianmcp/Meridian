@@ -146,6 +146,20 @@ def search_code_semantic(
     chunking/reindex/search work below is the extracted package's
     (``normalize_root_dir`` / ``get_code_index`` / ``_vectors_enabled``,
     re-exported above); this wrapper adds nothing but the guard + orchestration.
+
+    ec91e311 -- this used to build its OWN result dict by hand (total_indexed
+    / vectors_active / hits only) instead of delegating to the extracted
+    package's own ``impl.search_code_semantic``, which silently dropped the
+    ``convergence`` (:meth:`~meridian_codeindex.code_index.CodeIndex.get_convergence_state`)
+    and top-level ``degraded`` fields that function already computes on every
+    call (e631d54f). That meant every MCP caller of the ``search_code_semantic``
+    tool -- and ``prospect_symbol``'s Rung 3 (``semantic_raw``) -- never saw
+    the explicit embedding-freshness/degraded signal the underlying index
+    already tracks, even though it was one call away. Now delegates to
+    ``impl.search_code_semantic`` for the actual index/search/convergence work
+    and only adds the hosted-mode guard + root_dir pre-normalization on top --
+    so this wrapper's result shape is a strict superset of what it returned
+    before (same keys, same values) plus ``convergence``/``degraded``.
     """
     from meridian_codeindex import code_index as impl
 
@@ -179,12 +193,16 @@ def search_code_semantic(
     if not root_dir or not os.path.isdir(root_dir):
         result["error"] = f"root_dir does not exist: {root_dir}"
         return result
-    idx = impl.get_code_index(root_dir, db_path=db_path)
-    if reindex:
-        idx.reindex()
-    result["total_indexed"] = idx.count()
-    result["vectors_active"] = idx._vss_ready
-    result["hits"] = idx.search(query, limit=limit, kind=kind)
+    # ec91e311 -- delegate to the extracted package's OWN search_code_semantic
+    # (already normalizes root_dir a second time -- a no-op here since we just
+    # did it above -- and already re-checks query/root_dir, both no-ops given
+    # the guards above) so this wrapper's result carries the SAME
+    # convergence/degraded state a direct `meridian_codeindex.search_code_semantic`
+    # caller gets, instead of hand-rolling a subset of the same dict.
+    delegated = impl.search_code_semantic(
+        root_dir, query, limit=limit, kind=kind, db_path=db_path, reindex=reindex,
+    )
+    result.update(delegated)
     return result
 
 
