@@ -49,6 +49,7 @@ nav:
   - Quick Start: quickstart.md
   - Browser Connector: browser-connector.md
   - MCP Tools: mcp-tools.md
+  - Handoff Contract: meridian-handoff-contract.md
   - Parallel Safety: parallel-safety.md
   - Hosted (usemeridian.us): hosted.md
   - Self-Hosting: self-hosting.md
