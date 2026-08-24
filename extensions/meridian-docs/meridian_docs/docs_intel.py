@@ -47,6 +47,7 @@ import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -2522,6 +2523,85 @@ def _atomic_write_docx_bytes(
         "post_counts": post_counts,
         "promoted_sha256": promoted_sha256,
     }
+
+
+# ---------------------------------------------------------------------------
+# MDE-3 — orphaned staged-file detection (the confirmed, previously-unfilled
+# "CRASH RECOVERY" gap this repo's own C84-W1 gap-matrix note documents for
+# _atomic_write_docx_bytes above: "a crash between STAGE and PROMOTE leaves
+# an orphaned .meridian-docx-stage-*.tmp file in dest's directory forever --
+# nothing scans for or cleans up stale staged files on next startup").
+#
+# Deliberately self-contained (no meridian-core import): this package has no
+# hard dependency on meridian core anywhere else in this file (grepped —
+# zero `from meridian` / `import meridian` in this module), matching the
+# same no-hard-dependency contract extensions/meridian-outputs already
+# established for the opposite direction (meridian.handoff duck-types rather
+# than importing research_evidence.py). The cross-store DB-side journal for
+# a FULL release transaction (PREPARED -> ... -> RELEASED, with hash-based
+# recovery) lives in meridian/db/docx_merge.py instead — a caller that HAS a
+# meridian-core DB handle drives that state machine around calls into this
+# package's write functions; this function is the filesystem-only half any
+# caller (with or without meridian core) can use standalone to discover what
+# a crashed process left behind.
+# ---------------------------------------------------------------------------
+
+#: Must match _atomic_write_docx_bytes's own tempfile.NamedTemporaryFile
+#: prefix/suffix exactly (see its STAGE step above) — this is how an
+#: orphaned staged file is recognized as belonging to THIS write pipeline
+#: rather than some unrelated .tmp file that happens to live in the same
+#: directory.
+_DOCX_STAGE_PREFIX = ".meridian-docx-stage-"
+_DOCX_STAGE_SUFFIX = ".tmp"
+
+
+def find_orphaned_docx_staged_files(
+    directory: str, *, max_age_seconds: float = 3600.0,
+) -> list[dict[str, Any]]:
+    """Detect staged-DOCX temp files left behind by a process that crashed
+    between STAGE and PROMOTE inside :func:`_atomic_write_docx_bytes`.
+
+    Returns one ``{"path", "size_bytes", "age_seconds", "likely_orphan"}``
+    dict per file in *directory* matching the staging naming convention,
+    newest-first is NOT the order — sorted OLDEST (largest age) first, so
+    the most suspicious candidates surface first. ``likely_orphan`` is
+    ``True`` only once the file's age exceeds *max_age_seconds* (default 1
+    hour) — a staged file that is only seconds old is far more likely an
+    ACTIVE, in-flight promotion (a legitimate concurrent write) than a
+    crash artifact, and is reported but not flagged.
+
+    Never raises: an unreadable/missing *directory*, or a file that
+    disappears between the listing and the stat call (a real race — e.g. the
+    in-flight writer's own ``finally: os.unlink(staged_path)`` cleanup
+    winning the race), is simply skipped rather than surfaced as an error.
+    Purely a DETECTION utility — it never deletes or otherwise touches
+    anything it finds; removal is a deliberate, separate, caller-driven
+    decision (mirroring this package's existing "never guess, never
+    silently discard" posture for anything touching a user's document).
+    """
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return []
+    now = time.time()
+    results: list[dict[str, Any]] = []
+    for name in entries:
+        if not (name.startswith(_DOCX_STAGE_PREFIX) and name.endswith(_DOCX_STAGE_SUFFIX)):
+            continue
+        full_path = os.path.join(directory, name)
+        try:
+            st = os.stat(full_path)
+        except OSError:
+            continue
+        age = max(0.0, now - st.st_mtime)
+        results.append({
+            "path": full_path,
+            "size_bytes": st.st_size,
+            "age_seconds": age,
+            "likely_orphan": age > max_age_seconds,
+        })
+    results.sort(key=lambda r: r["age_seconds"], reverse=True)
+    return results
 
 
 # ---------------------------------------------------------------------------

@@ -7271,6 +7271,71 @@ def _render_research_evidence_block(envelope: Any) -> str:
         return ""
 
 
+def render_release_transaction_evidence_xml(summary: "dict[str, Any] | None") -> str:
+    """MDE-3 — render a release-transaction crash-recovery evidence summary
+    (:func:`meridian.db.docx_merge.summarize_release_transactions`'s output)
+    as a machine-readable ``<release_transactions>`` block for a handoff
+    body — "exact evidence in handoff": a receiver sees, without re-querying
+    anything, exactly how many change-set release transactions exist, their
+    state breakdown, and which (if any) are stuck in ``RECOVERY_REQUIRED``
+    and need attention before this project can be considered releasable.
+
+    Purely additive: ``""`` for ``None``/falsy input or a summary with zero
+    transactions, so a project with no release-transaction activity sees
+    zero change from before this existed.
+    """
+    if not summary or not summary.get("transaction_count"):
+        return ""
+
+    def esc(value: "Any") -> str:
+        return _xml_escape(str(value if value is not None else ""), {chr(34): "&quot;"})
+
+    parts = [
+        '<release_transactions '
+        f'count="{esc(summary.get("transaction_count"))}" '
+        f'all_released="{esc(bool(summary.get("all_released")))}">'
+    ]
+    state_counts = summary.get("state_counts") or {}
+    for state in sorted(state_counts):
+        parts.append(f'<state name="{esc(state)}" count="{esc(state_counts[state])}"/>')
+    for entry in summary.get("recovery_required") or []:
+        parts.append(
+            f'<recovery_required transaction_id="{esc(entry.get("transaction_id"))}" '
+            f'change_set_id="{esc(entry.get("change_set_id"))}" '
+            f'file_path="{esc(entry.get("file_path"))}">{esc(entry.get("error"))}'
+            "</recovery_required>"
+        )
+    parts.append("</release_transactions>")
+    return "".join(parts)
+
+
+async def _release_transaction_evidence_summary(
+    db: Any, project_id: "str | None",
+) -> "dict[str, Any] | None":
+    """Best-effort fetch of this project's release-transaction evidence
+    summary. Meridian core CAN import ``meridian.db.docx_merge`` directly
+    (unlike the ``extensions/meridian-outputs`` research-evidence surface,
+    this is a same-package sibling module, not an optional external
+    extension) — but the fetch is still fully guarded: any failure (DB
+    hiccup, no transactions ever recorded) degrades to ``None``, never
+    raises, matching every other best-effort evidence surface in this
+    module.
+    """
+    if not project_id:
+        return None
+    try:
+        from .db import docx_merge as _docx_merge_module  # noqa: PLC0415
+
+        transactions = await _docx_merge_module.list_release_transactions(
+            db, project_id=project_id,
+        )
+        if not transactions:
+            return None
+        return _docx_merge_module.summarize_release_transactions(transactions)
+    except Exception:  # noqa: BLE001 — evidence surfacing must never break handoff generation
+        return None
+
+
 def _duck_encode_dataclass_like(obj: Any) -> Any:
     """MDE-5 — generic, ZERO-import reduction of a dataclass/Enum-shaped
     object (e.g. a real ``research_evidence.ProvenanceEnvelope`` instance)
@@ -12140,6 +12205,22 @@ async def _generate_goal_only_handoff(
     _g_research_evidence_block = _render_research_evidence_block(research_evidence_envelope)
     if _g_research_evidence_block:
         quick_start_goal = f"{quick_start_goal}\n\n{_g_research_evidence_block}"
+    # MDE-3 — "exact evidence in handoff": when emit_manifest=True, also
+    # surface this project's release-transaction crash-recovery evidence
+    # (meridian.db.docx_merge's PREPARED->...->RELEASED state machine) as a
+    # machine-readable <release_transactions> block — a receiver can see,
+    # without a separate query, whether any change-set is stuck in
+    # RECOVERY_REQUIRED before treating this project as cleanly releasable.
+    # Gated on emit_manifest (not unconditional) to avoid an extra DB round
+    # trip on every goal-mode call for projects that never opted into
+    # machine-readable manifests at all; "" for a project with zero
+    # release-transaction activity, so this is zero-behavior-change for
+    # every existing caller/project.
+    if emit_manifest:
+        _g_release_evidence = await _release_transaction_evidence_summary(db, project_id)
+        _g_release_evidence_block = render_release_transaction_evidence_xml(_g_release_evidence)
+        if _g_release_evidence_block:
+            quick_start_goal = f"{quick_start_goal}\n{_g_release_evidence_block}"
     # f471c4b8 — append the SAME machine-readable project-start-configuration
     # tag full/delta/starter render, BEFORE the token is minted below. This
     # is the mode explicitly documented as "hand straight to a fresh
