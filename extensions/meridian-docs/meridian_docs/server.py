@@ -2706,6 +2706,128 @@ def merge_docx_draft(
     )
 
 
+@mcp.tool()
+def plan_batch_transform(
+    document_path: str,
+    operations: list[dict[str, Any]],
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """982f8564 -- PURE, READ-ONLY, REPRODUCIBLE dry-run for a declarative
+    batch of operations against document_path's CURRENT on-disk content.
+
+    Each operation is anchored to a stable semantic anchor (a
+    locate_anchor-style query) with an explicit content precondition
+    (expected_quoted_text) -- a stale anchor (the document, or just that
+    one anchor's content, changed since the operation was authored) is
+    rejected explicitly, never silently applied. Tables and figures are
+    treated as OWNED COMPOUND OBJECTS with their captions: deleting one
+    auto-includes its linked caption in the plan unless keep_caption=True.
+
+    Args:
+      document_path:                Document to plan against. Never opened
+                                    for writing.
+      operations:                    Non-empty list of ``{"op_id": <optional
+                                    str>, "op": "delete_anchor"|"set_text",
+                                    "anchor": <locate_anchor-style query>,
+                                    "expected_quoted_text": <optional str>,
+                                    "new_text": <for set_text>,
+                                    "keep_caption": <for delete_anchor>}``.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard (a prior locate_anchor/
+                                    plan_batch_transform/
+                                    read_document_snapshot result's
+                                    source_fingerprint).
+
+    Returns ``{document_path, source_fingerprint, operation_count,
+    ready_count, conflict_count, ready, application_order, conflicts,
+    manifest_hash}`` -- see docs_intel.plan_batch_transform for the full
+    contract. ``manifest_hash`` is REPRODUCIBLE: the same batch against the
+    same document content always hashes identically, so a caller can diff
+    or show it to a human before ever calling apply_batch_transform.
+    """
+    return docs_intel.plan_batch_transform(
+        document_path, operations, expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
+@mcp.tool()
+def apply_batch_transform(
+    document_path: str,
+    operations: list[dict[str, Any]],
+    draft_output_path: str,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """982f8564 -- apply a declarative batch of operations to an ISOLATED
+    draft. document_path is opened read-only throughout and is never the
+    write target -- draft_output_path is.
+
+    ALL-OR-NOTHING: if planning finds even one stale/conflicted/invalid
+    operation, NOTHING is written -- draft_output_path is never created or
+    partially written, so a partial batch failure leaves document_path
+    unchanged by construction. Operations are applied in a fixed,
+    deterministic order (document position, tied-broken by op_id).
+
+    Args:
+      document_path:                The document to transform. Read-only.
+      operations:                    Same shape as plan_batch_transform.
+      draft_output_path:             Where to stage the transformed draft.
+                                    Must differ from document_path.
+      expected_source_fingerprint:   Forwarded to plan_batch_transform.
+
+    Returns ``{applied: True, draft_output_path, manifest, applied_operations,
+    write_transaction}`` on success, or ``{applied: False, reason/error, ...}``
+    on failure (``conflicts``/``manifest`` present when the failure came
+    from planning). See docs_intel.apply_batch_transform for the full
+    contract. This is a LOCAL staging step only -- pair with
+    meridian.db.docx_merge (a separate Meridian MCP connection) for
+    cross-session wave coordination, and merge_docx_draft (or
+    apply_and_merge_batch_transform) for the actual promotion.
+    """
+    return docs_intel.apply_batch_transform(
+        document_path, operations, draft_output_path,
+        expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
+@mcp.tool()
+def apply_and_merge_batch_transform(
+    canonical_path: str,
+    operations: list[dict[str, Any]],
+    draft_output_path: str,
+    expected_source_fingerprint: str | None = None,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """982f8564 -- end-to-end declarative batch transform: plan -> apply to
+    an isolated draft -> promote via merge_docx_draft's own
+    merge_draft_into_canonical (existing, unmodified -- full structural +
+    render verification, atomic backup and restore-on-failure).
+
+    On any planning or apply failure, returns apply_batch_transform's own
+    result verbatim -- canonical_path is never even opened for writing in
+    that case. On a successful promotion, returns merge_draft_into_
+    canonical's own result PLUS a batch_receipt: ``{manifest_hash,
+    source_fingerprint, operations_applied, draft_write_manifest_hash,
+    draft_promoted_sha256, render_status, render_verified}`` -- the
+    package-integrity/provenance/render-receipt evidence for this merged
+    output, composed entirely from the batch's own reproducible manifest
+    and the promotion's own already-verified render gate.
+
+    allow_degraded_render / degraded_render_reason: forwarded to
+    merge_draft_into_canonical unchanged -- required together, an audited
+    opt-in for promoting without real render verification (see
+    merge_docx_draft's own docstring for the shared contract).
+    """
+    return docs_intel.apply_and_merge_batch_transform(
+        canonical_path, operations, draft_output_path,
+        expected_source_fingerprint=expected_source_fingerprint,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+
 def main() -> None:
     """Console entry point (``uvx meridian-docs``)."""
     mcp.run()

@@ -18172,3 +18172,655 @@ def research_graph_document_identity(
         "revision": (content_hash or "").strip() or None,
         "external_ref": external_ref,
     }
+
+
+# ---------------------------------------------------------------------------
+# 982f8564 (MDE-8 P1) -- declarative batch transforms over semantic anchors,
+# compound-object awareness, and conflict-safe draft merging.
+#
+# Builds ENTIRELY on primitives this module already has and already tests:
+#   - locate_anchor/locate_anchors' own anchor-resolution machinery
+#     (_iter_anchor_records / _resolve_anchor_query) is reused VERBATIM for
+#     resolving each operation's target -- never re-implemented, so a batch
+#     operation's anchor resolves exactly the same way a plain locate_anchor
+#     call would (including its existing "stale" / "ambiguous" / "not_found"
+#     states).
+#   - _load_docx_xml_stdlib / _save_docx_xml_stdlib for reading the SOURCE
+#     document (read-only, never mutated here) and staging a NEW isolated
+#     draft (structural-manifest-gated, namespace-preserving, atomic write
+#     -- the exact same hardened path move_section/relocate_table/etc.
+#     already use for their own draft_output_path).
+#   - merge_draft_into_canonical (existing, UNMODIFIED) for the actual
+#     promotion -- full structural + render verification, atomic backup and
+#     restore-on-failure. This section never duplicates that logic.
+#   - meridian.db.docx_merge (a separate, DB-backed package this stdlib-only
+#     extension does not import -- see that module's own docstring) remains
+#     the cross-SESSION coordination layer for wave-scoped parallel merging
+#     (isolated per-session drafts, serialized merge ownership, anchor
+#     locks). THIS section is a single-caller, single-batch DECLARATIVE
+#     layer that composes cleanly on top of it -- a caller can still
+#     register the same draft_output_path with open_merge_manifest /
+#     declare_merge_anchors over the separate Meridian MCP connection for
+#     cross-session visibility; this module has no opinion on that and does
+#     not require it.
+#
+# What is genuinely new here: a caller declares a BATCH of operations up
+# front (never one ad hoc mutation at a time), each anchored to a stable
+# semantic anchor (a locate_anchor-style query) with an explicit content
+# precondition (``expected_quoted_text``). Planning (:func:`plan_batch_
+# transform`) is entirely PURE and REPRODUCIBLE -- no write, no wall-clock
+# content anywhere in the hashed manifest -- so the SAME batch against the
+# SAME document content always produces a byte-identical dry-run manifest
+# (``manifest_hash``): a caller can hash it, diff it, or show it to a human
+# before ever touching disk. Applying (:func:`apply_batch_transform`) is
+# all-or-nothing against an ISOLATED draft (``document_path`` is opened
+# read-only throughout and is NEVER the write target) with a FIXED,
+# deterministic operation order (document position, tie-broken by op_id) --
+# one stale or conflicted operation aborts the WHOLE batch before any write
+# happens, so a partial batch failure leaves the source document
+# byte-for-byte unchanged by construction, not by a rollback step that
+# could itself fail. Tables and figures are treated as OWNED COMPOUND
+# OBJECTS with their captions: deleting one auto-includes its linked
+# caption (never leaves an orphan) unless the caller explicitly opts out
+# with ``keep_caption=True``.
+# ---------------------------------------------------------------------------
+
+BATCH_OP_DELETE_ANCHOR = "delete_anchor"
+BATCH_OP_SET_TEXT = "set_text"
+BATCH_SUPPORTED_OPS: tuple[str, ...] = (BATCH_OP_DELETE_ANCHOR, BATCH_OP_SET_TEXT)
+
+BATCH_STATUS_OK = "ok"
+BATCH_STATUS_STALE = "stale"
+BATCH_STATUS_CONFLICT = "conflict"
+BATCH_STATUS_INVALID = "invalid"
+BATCH_STATUSES: tuple[str, ...] = (
+    BATCH_STATUS_OK, BATCH_STATUS_STALE, BATCH_STATUS_CONFLICT, BATCH_STATUS_INVALID,
+    "not_found", "ambiguous",
+)
+
+# Element types this batch layer knows how to safely locate + mutate
+# in-place, reusing the exact same paragraph/table XML this module already
+# writes elsewhere. Anything else (equation, table_cell, and any future
+# element_kind) resolves fine via locate_anchor's own broader machinery but
+# is refused HERE as "unsupported_element_type" -- treated as an owned
+# object this layer does not yet have safe, verified mutation/partner-
+# linkage logic for, rather than silently guessing at one.
+_BATCH_MUTABLE_ELEMENT_TYPES: frozenset[str] = frozenset({
+    "paragraph", "heading", "figure_caption", "table_caption", "table",
+})
+
+
+def _batch_op_id(op: dict[str, Any], index: int) -> str:
+    op_id = op.get("op_id") if isinstance(op, dict) else None
+    return str(op_id).strip() if op_id and str(op_id).strip() else f"op{index}"
+
+
+def _batch_resolved_entry(
+    op_id: str, op: Any, status: str, reason: "str | None",
+    *, anchor: "dict[str, Any] | None" = None,
+    compound_partner_para_id: "str | None" = None,
+) -> dict[str, Any]:
+    return {
+        "op_id": op_id,
+        "op": op,
+        "status": status,
+        "reason": reason,
+        "anchor": anchor,
+        "compound_partner_para_id": compound_partner_para_id,
+        "document_order": (anchor or {}).get("document_order"),
+    }
+
+
+def _batch_resolve_operations(
+    document_path: str,
+    operations: "list[dict[str, Any]]",
+    *,
+    expected_source_fingerprint: "str | None" = None,
+) -> dict[str, Any]:
+    """Shared resolution step for both :func:`plan_batch_transform` and
+    :func:`apply_batch_transform`: one fresh parse of ``document_path``, one
+    ``locate_anchor``-style resolution per operation, plus this batch
+    layer's own precondition/in-batch-conflict/compound-object checks
+    layered on top. Never mutates ``document_path``.
+
+    Returns ``{"error": ...}`` only when ``document_path`` itself cannot be
+    read/parsed. Otherwise returns ``{"document_path", "source_fingerprint",
+    "records", "resolved"}`` where ``resolved`` has one entry per operation,
+    in INPUT order, each shaped
+    ``{"op_id", "op", "status", "reason", "anchor", "compound_partner_para_id",
+    "document_order"}`` -- ``status`` is one of :data:`BATCH_STATUSES`.
+    """
+    try:
+        with open(document_path, "rb") as handle:
+            raw = handle.read()
+    except OSError as exc:
+        return {"error": str(exc)}
+
+    source_fingerprint = _source_fingerprint(raw)
+    if expected_source_fingerprint and expected_source_fingerprint != source_fingerprint:
+        stale_reason = (
+            f"document_path has changed since this batch was planned "
+            f"(expected source_fingerprint {expected_source_fingerprint!r}, "
+            f"current {source_fingerprint!r}) -- every operation in this "
+            "batch is stale"
+        )
+        return {
+            "error": None,
+            "document_path": document_path,
+            "source_fingerprint": source_fingerprint,
+            "records": [],
+            "resolved": [
+                _batch_resolved_entry(_batch_op_id(op, i), op, BATCH_STATUS_STALE, stale_reason)
+                for i, op in enumerate(operations)
+            ],
+        }
+
+    try:
+        records, _tree = _iter_anchor_records(raw)
+        equations = parse_docx_equations_local(raw)
+    except (ValueError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        return {"error": str(exc)}
+
+    by_para_id = {r.get("para_id"): r for r in records if r.get("para_id")}
+
+    resolved: list[dict[str, Any]] = []
+    seen_targets: dict[str, str] = {}  # target_para_id -> first op_id claiming it
+
+    for index, op in enumerate(operations):
+        op_id = _batch_op_id(op, index)
+        if not isinstance(op, dict) or op.get("op") not in BATCH_SUPPORTED_OPS:
+            resolved.append(_batch_resolved_entry(
+                op_id, op, BATCH_STATUS_INVALID,
+                f"unsupported or missing op (must be one of {BATCH_SUPPORTED_OPS})",
+            ))
+            continue
+        anchor_query = op.get("anchor")
+        if not isinstance(anchor_query, dict) or not anchor_query:
+            resolved.append(_batch_resolved_entry(
+                op_id, op, BATCH_STATUS_INVALID,
+                "op['anchor'] must be a non-empty locate_anchor-style query dict",
+            ))
+            continue
+
+        anchor = _resolve_anchor_query(
+            records, equations, anchor_query,
+            document_path=document_path, source_fingerprint=source_fingerprint,
+        )
+        if anchor.get("status") != "resolved":
+            resolved.append(_batch_resolved_entry(
+                op_id, op, anchor.get("status", "not_found"),
+                anchor.get("reason") or f"anchor did not resolve (status={anchor.get('status')!r})",
+                anchor=anchor,
+            ))
+            continue
+
+        expected_text = op.get("expected_quoted_text")
+        if expected_text is not None and str(expected_text) != anchor.get("quoted_text"):
+            resolved.append(_batch_resolved_entry(
+                op_id, op, BATCH_STATUS_STALE,
+                (
+                    "expected_quoted_text does not match this anchor's current "
+                    "content -- the anchor has changed since this operation was "
+                    "authored"
+                ),
+                anchor=anchor,
+            ))
+            continue
+
+        element_type = anchor.get("element_type")
+        target_para_id = anchor.get("target_para_id")
+
+        if element_type not in _BATCH_MUTABLE_ELEMENT_TYPES:
+            resolved.append(_batch_resolved_entry(
+                op_id, op, BATCH_STATUS_CONFLICT,
+                (
+                    f"unsupported_element_type: {element_type!r} is an owned "
+                    "object this batch layer does not yet have safe "
+                    "mutation/partner-linkage logic for (e.g. equation "
+                    "numbering) -- refusing rather than guessing"
+                ),
+                anchor=anchor,
+            ))
+            continue
+
+        if target_para_id in seen_targets:
+            resolved.append(_batch_resolved_entry(
+                op_id, op, BATCH_STATUS_CONFLICT,
+                (
+                    f"target_para_id {target_para_id!r} is also targeted by "
+                    f"operation {seen_targets[target_para_id]!r} earlier in "
+                    "this same batch -- two operations may never target the "
+                    "same anchor in one batch"
+                ),
+                anchor=anchor,
+            ))
+            continue
+
+        # Owned compound object: auto-include a table's/figure's linked
+        # caption unless the caller explicitly opts out.
+        compound_partner_para_id: "str | None" = None
+        if op.get("op") == BATCH_OP_DELETE_ANCHOR and not op.get("keep_caption"):
+            record = by_para_id.get(target_para_id)
+            if element_type == "table" and record is not None:
+                table_index = record.get("index")
+                partner = next(
+                    (
+                        r for r in records
+                        if r.get("element_kind") == "table_caption"
+                        and r.get("table_ref") == table_index
+                    ),
+                    None,
+                )
+                if partner:
+                    compound_partner_para_id = partner.get("para_id")
+            elif element_type == "paragraph" and record is not None:
+                # e87b8338/existing adjacency convention (see
+                # _direct_body_image_paragraphs' own caption-adjacency
+                # check): a figure's caption, when present, is the very
+                # next document block, never linked by a separate id field.
+                doc_order = record.get("index")
+                next_order = doc_order + 1 if doc_order is not None else None
+                partner = next(
+                    (
+                        r for r in records
+                        if r.get("element_kind") == "figure_caption" and r.get("index") == next_order
+                    ),
+                    None,
+                )
+                if partner:
+                    compound_partner_para_id = partner.get("para_id")
+
+        if compound_partner_para_id and compound_partner_para_id in seen_targets:
+            resolved.append(_batch_resolved_entry(
+                op_id, op, BATCH_STATUS_CONFLICT,
+                (
+                    f"this operation's linked compound-object partner "
+                    f"{compound_partner_para_id!r} is separately, explicitly "
+                    f"targeted by operation {seen_targets[compound_partner_para_id]!r} "
+                    "earlier in this same batch -- ambiguous intent, refusing"
+                ),
+                anchor=anchor, compound_partner_para_id=compound_partner_para_id,
+            ))
+            continue
+
+        seen_targets[target_para_id] = op_id
+        resolved.append(_batch_resolved_entry(
+            op_id, op, BATCH_STATUS_OK, None,
+            anchor=anchor, compound_partner_para_id=compound_partner_para_id,
+        ))
+
+    return {
+        "error": None,
+        "document_path": document_path,
+        "source_fingerprint": source_fingerprint,
+        "records": records,
+        "resolved": resolved,
+    }
+
+
+def plan_batch_transform(
+    document_path: str,
+    operations: "list[dict[str, Any]]",
+    *,
+    expected_source_fingerprint: "str | None" = None,
+) -> dict[str, Any]:
+    """PURE, READ-ONLY, REPRODUCIBLE dry-run for a declarative batch of
+    operations against ``document_path``'s CURRENT on-disk content.
+
+    Args:
+      document_path:                Document to plan against. Never opened
+                                    for writing.
+      operations:                    A non-empty list of operation dicts,
+                                    each ``{"op_id": <optional str>, "op":
+                                    "delete_anchor"|"set_text", "anchor":
+                                    <locate_anchor-style query dict>,
+                                    "expected_quoted_text": <optional str
+                                    precondition>, ...op-specific params
+                                    ("new_text" for set_text,
+                                    "keep_caption" for delete_anchor)}``.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard (the SAME ``source_fingerprint``
+                                    a prior ``locate_anchor``/``plan_batch_
+                                    transform``/``read_document_snapshot``
+                                    call returned) -- a mismatch marks
+                                    EVERY operation ``stale`` immediately,
+                                    without even attempting per-anchor
+                                    resolution.
+
+    Returns:
+      ``{"document_path", "source_fingerprint", "operation_count",
+      "ready_count", "conflict_count", "ready": bool, "application_order":
+      [...], "conflicts": [...], "manifest_hash"}``, or ``{"error": ...}``
+      if ``operations`` is empty/not a list or ``document_path`` cannot be
+      read/parsed.
+
+      ``ready`` is ``True`` only when EVERY operation resolved cleanly
+      (``status="ok"``) -- ``False`` whenever even one operation is
+      stale/conflicted/invalid/unresolved, in which case ``conflicts``
+      lists every one of them (not just the first) with its own reason.
+
+      ``application_order`` is the DETERMINISTIC order operations would be
+      applied in (document position, tie-broken by ``op_id``) -- computed
+      here so a caller can inspect/audit it before ever calling
+      :func:`apply_batch_transform`.
+
+      ``manifest_hash`` is a sha256 of this manifest's own OTHER fields
+      (JSON, sorted keys) -- REPRODUCIBLE: calling this again against the
+      SAME document content with the SAME operations always yields an
+      identical hash. No wall-clock timestamp or random id is included
+      anywhere in the hashed content.
+    """
+    if not isinstance(operations, list) or not operations:
+        return {"error": "operations must be a non-empty list"}
+
+    resolution = _batch_resolve_operations(
+        document_path, operations, expected_source_fingerprint=expected_source_fingerprint,
+    )
+    if resolution.get("error"):
+        return {"error": resolution["error"]}
+
+    resolved = resolution["resolved"]
+    ok_ops = [r for r in resolved if r["status"] == BATCH_STATUS_OK]
+    conflicts = [r for r in resolved if r["status"] != BATCH_STATUS_OK]
+
+    application_order = sorted(
+        ok_ops,
+        key=lambda r: (
+            r["document_order"] if r["document_order"] is not None else 10**9,
+            r["op_id"],
+        ),
+    )
+
+    manifest: dict[str, Any] = {
+        "document_path": document_path,
+        "source_fingerprint": resolution["source_fingerprint"],
+        "operation_count": len(operations),
+        "ready_count": len(ok_ops),
+        "conflict_count": len(conflicts),
+        "ready": not conflicts,
+        "application_order": [
+            {
+                "op_id": r["op_id"],
+                "op_type": r["op"]["op"],
+                "op": r["op"],
+                "target_para_id": r["anchor"]["target_para_id"],
+                "element_type": r["anchor"]["element_type"],
+                "compound_partner_para_id": r["compound_partner_para_id"],
+            }
+            for r in application_order
+        ],
+        "conflicts": [
+            {
+                "op_id": r["op_id"],
+                "op_type": (r["op"] or {}).get("op") if isinstance(r["op"], dict) else None,
+                "status": r["status"],
+                "reason": r["reason"],
+                "target_para_id": (r["anchor"] or {}).get("target_para_id") if r["anchor"] else None,
+            }
+            for r in conflicts
+        ],
+    }
+    manifest["manifest_hash"] = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return manifest
+
+
+def _set_paragraph_text(p_element: "ET.Element", new_text: str) -> None:
+    """Replace ``p_element``'s visible text with a single new run.
+
+    Preserves ``<w:pPr>`` (paragraph properties -- style, alignment, etc.)
+    if present; every other child (existing ``<w:r>`` runs) is discarded.
+    Deliberately simple (one run, no per-run character-formatting
+    preservation) -- documented scope for this batch layer's v1
+    ``set_text`` operation, not a general rich-text editor.
+    """
+    w_ppr = _q(_W, "pPr")
+    w_r = _q(_W, "r")
+    w_t = _q(_W, "t")
+    for child in list(p_element):
+        if child.tag != w_ppr:
+            p_element.remove(child)
+    run = ET.SubElement(p_element, w_r)
+    text_el = ET.SubElement(run, w_t)
+    text_el.text = new_text
+    text_el.set(_q(_XML_NS, "space"), "preserve")
+
+
+def apply_batch_transform(
+    document_path: str,
+    operations: "list[dict[str, Any]]",
+    draft_output_path: str,
+    *,
+    expected_source_fingerprint: "str | None" = None,
+) -> dict[str, Any]:
+    """Apply a declarative batch of operations to an ISOLATED draft.
+
+    ``document_path`` is opened READ-ONLY throughout this call and is
+    NEVER the write target -- ``draft_output_path`` is. All-or-nothing: if
+    planning finds even ONE stale/conflicted/invalid operation, NOTHING is
+    written (``draft_output_path`` is never created or partially written)
+    and this returns the same conflict list :func:`plan_batch_transform`
+    would, under ``"conflicts"``. This is what makes "a partial batch
+    failure leaves canonical unchanged" true by construction: the source
+    document is read-only input from the first line of this function to
+    the last, and the draft write only ever happens after every single
+    operation has already been confirmed applicable.
+
+    Args:
+      document_path:                The document to transform. Read-only.
+      operations:                    Same shape as :func:`plan_batch_transform`.
+      draft_output_path:             Where to stage the transformed draft.
+                                    MUST differ from ``document_path``.
+      expected_source_fingerprint:   Forwarded to :func:`plan_batch_transform`.
+
+    Returns on success: ``{"applied": True, "draft_output_path", "manifest"
+    (the full plan_batch_transform result), "applied_operations": [...one
+    entry per XML mutation actually performed, including auto-included
+    compound-object partners...], "write_transaction" (the
+    ``_save_docx_xml_stdlib`` transaction dict: ``manifest_hash``,
+    ``pre_counts``, ``post_counts``, ``promoted_sha256`` for the DRAFT
+    write itself)}``.
+
+    Returns on failure: ``{"applied": False, "reason"/"error": ...}``,
+    with ``"conflicts"``/``"manifest"`` present when the failure came from
+    planning (never from a partially-applied write -- there is no such
+    state in this function).
+    """
+    if not draft_output_path or not str(draft_output_path).strip():
+        return {"applied": False, "error": "draft_output_path is required"}
+    if os.path.normcase(os.path.abspath(draft_output_path)) == os.path.normcase(os.path.abspath(document_path)):
+        return {
+            "applied": False,
+            "error": (
+                "draft_output_path must differ from document_path -- a batch "
+                "transform's output must be an isolated draft artifact, "
+                "never the source document itself"
+            ),
+        }
+
+    plan = plan_batch_transform(
+        document_path, operations, expected_source_fingerprint=expected_source_fingerprint,
+    )
+    if plan.get("error"):
+        return {"applied": False, "error": plan["error"]}
+    if not plan["ready"]:
+        return {
+            "applied": False,
+            "reason": "batch_has_conflicts",
+            "conflicts": plan["conflicts"],
+            "manifest": plan,
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(document_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {"applied": False, "error": str(exc)}
+
+    current_fingerprint = _source_fingerprint(raw)
+    if current_fingerprint != plan["source_fingerprint"]:
+        return {
+            "applied": False,
+            "reason": "document_changed_during_apply",
+            "error": (
+                "document_path changed on disk between planning and apply -- "
+                "refusing to apply a batch against content it was not "
+                "planned against; re-plan and retry"
+            ),
+        }
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"applied": False, "error": f"{document_path} has no <w:body> element"}
+
+    w_p = _q(_W, "p")
+    w_tbl = _q(_W, "tbl")
+    w14_para_id = _q(_W14, "paraId")
+
+    def _find_paragraph(target_id: "str | None") -> "ET.Element | None":
+        for p in body:
+            if p.tag == w_p and p.get(w14_para_id) == target_id:
+                return p
+        return None
+
+    def _find_table(target_id: "str | None") -> "ET.Element | None":
+        # _table_anchor_id(index) synthesizes "tbl<N>" from the table's
+        # OVERALL document_content_tree block index (shared with every
+        # other top-level block kind -- headings/paragraphs/tables all
+        # advance the SAME counter), never a table-only sequence number.
+        # The matching lookup is therefore "the Nth direct child of body,
+        # confirmed to actually be a <w:tbl>" -- not "the Nth <w:tbl>".
+        match = re.match(r"^tbl(\d+)$", target_id or "")
+        if not match:
+            return None
+        idx = int(match.group(1))
+        children = list(body)
+        if 0 <= idx < len(children) and children[idx].tag == w_tbl:
+            return children[idx]
+        return None
+
+    def _find_element(target_id: "str | None", element_type: "str | None") -> "ET.Element | None":
+        return _find_table(target_id) if element_type == "table" else _find_paragraph(target_id)
+
+    applied: list[dict[str, Any]] = []
+    for entry in plan["application_order"]:
+        op_id = entry["op_id"]
+        op_type = entry["op_type"]
+        op = entry["op"]
+        target_id = entry["target_para_id"]
+        element_type = entry["element_type"]
+
+        el = _find_element(target_id, element_type)
+        if el is None:
+            return {
+                "applied": False,
+                "reason": "element_vanished_during_apply",
+                "error": (
+                    f"operation {op_id!r}'s target {target_id!r} could not be "
+                    "re-located in the live XML tree during apply -- aborting "
+                    "the whole batch, draft_output_path is untouched"
+                ),
+            }
+
+        if op_type == BATCH_OP_DELETE_ANCHOR:
+            body.remove(el)
+            applied.append({"op_id": op_id, "op_type": op_type, "target_para_id": target_id})
+            partner_id = entry.get("compound_partner_para_id")
+            if partner_id:
+                partner_el = _find_paragraph(partner_id)
+                if partner_el is not None:
+                    body.remove(partner_el)
+                    applied.append({
+                        "op_id": op_id, "op_type": "delete_compound_partner",
+                        "target_para_id": partner_id,
+                    })
+        elif op_type == BATCH_OP_SET_TEXT:
+            new_text = op.get("new_text") if isinstance(op, dict) else None
+            if new_text is None:
+                return {
+                    "applied": False,
+                    "reason": "invalid_operation",
+                    "error": f"operation {op_id!r} is set_text but has no 'new_text' param",
+                }
+            if element_type == "table":
+                return {
+                    "applied": False,
+                    "reason": "invalid_operation",
+                    "error": f"operation {op_id!r}: set_text does not support element_type='table'",
+                }
+            _set_paragraph_text(el, str(new_text))
+            applied.append({"op_id": op_id, "op_type": op_type, "target_para_id": target_id})
+
+    try:
+        write_transaction = _save_docx_xml_stdlib(raw, root, draft_output_path)
+    except DocxWriteVerificationError as exc:
+        return {
+            "applied": False,
+            "reason": "draft_write_verification_failed",
+            "error": str(exc),
+        }
+    except OSError as exc:
+        return {"applied": False, "error": f"could not write {draft_output_path}: {exc}"}
+
+    return {
+        "applied": True,
+        "draft_output_path": draft_output_path,
+        "manifest": plan,
+        "applied_operations": applied,
+        "write_transaction": write_transaction,
+    }
+
+
+def apply_and_merge_batch_transform(
+    canonical_path: str,
+    operations: "list[dict[str, Any]]",
+    draft_output_path: str,
+    *,
+    expected_source_fingerprint: "str | None" = None,
+    index_db_path: "str | None" = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: "str | None" = None,
+) -> dict[str, Any]:
+    """End-to-end declarative batch transform: plan -> apply to an isolated
+    draft -> promote via :func:`merge_draft_into_canonical` (existing,
+    UNMODIFIED -- full structural + render verification, atomic backup and
+    restore-on-failure).
+
+    On any planning or apply failure, returns :func:`apply_batch_transform`'s
+    own result verbatim -- ``canonical_path`` is never even opened for
+    writing in that case. On a successful promotion, returns
+    :func:`merge_draft_into_canonical`'s own result PLUS a ``batch_receipt``:
+    ``{"manifest_hash", "source_fingerprint", "operations_applied",
+    "draft_write_manifest_hash", "draft_promoted_sha256", "render_status",
+    "render_verified"}`` -- the package-integrity/provenance/render-receipt
+    evidence this item's acceptance requires, composed entirely from
+    fields ``apply_batch_transform``'s own reproducible manifest and
+    ``merge_draft_into_canonical``'s own already-verified render gate
+    already produce, never invented fresh.
+    """
+    apply_result = apply_batch_transform(
+        canonical_path, operations, draft_output_path,
+        expected_source_fingerprint=expected_source_fingerprint,
+    )
+    if not apply_result.get("applied"):
+        return apply_result
+
+    merge_result = merge_draft_into_canonical(
+        canonical_path, draft_output_path, index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+    if not merge_result.get("merged"):
+        return merge_result
+
+    write_transaction = apply_result.get("write_transaction") or {}
+    batch_receipt = {
+        "manifest_hash": apply_result["manifest"]["manifest_hash"],
+        "source_fingerprint": apply_result["manifest"]["source_fingerprint"],
+        "operations_applied": apply_result["applied_operations"],
+        "draft_write_manifest_hash": write_transaction.get("manifest_hash"),
+        "draft_promoted_sha256": write_transaction.get("promoted_sha256"),
+        "render_status": merge_result.get("render_status"),
+        "render_verified": merge_result.get("render_verified"),
+    }
+    return {**merge_result, "batch_receipt": batch_receipt}
