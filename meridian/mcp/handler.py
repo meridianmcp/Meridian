@@ -1408,6 +1408,17 @@ async def _handle_mcp_request(
                             if _cir.is_code_intel_receipt_tool(name):
                                 _receipt_pid = _cir.resolve_receipt_project_id(args)
                                 if _receipt_pid:
+                                    # MDE-2 -- bind the receipt to the repo
+                                    # identity the tunnel actually forwarded
+                                    # this call against (the same per-tenant
+                                    # active-repo cache call_tunnel_tool
+                                    # itself reads to inject
+                                    # X-Meridian-Repo-Path), not a bare
+                                    # "somewhere, sometime" attribution.
+                                    _receipt_root = (
+                                        _tunnel_mod._tenant_active_repo.get(tenant["id"])
+                                        if tenant else None
+                                    )
                                     await _cir.record_prospect_receipt(
                                         db,
                                         tenant_id=tenant.get("id") if tenant else None,
@@ -1415,6 +1426,8 @@ async def _handle_mcp_request(
                                         session_id=args.get("session_id"),
                                         tool_name=name,
                                         query=_cir.extract_query_hint(args),
+                                        root_dir=_receipt_root,
+                                        default_repo_root=str(_server._REPO_ROOT),
                                     )
                         except Exception:  # noqa: BLE001
                             pass
@@ -6120,6 +6133,22 @@ async def _handle_code_index_tools(
             from .. import code_intel_receipt as _cir  # noqa: PLC0415
             _receipt_pid = _cir.resolve_receipt_project_id(args)
             if _receipt_pid:
+                # MDE-2 -- bind to root_dir (the repo prospect_symbol_impl
+                # actually searched) + the resolved file/rung from its own
+                # result, so a stale/wrong-repo or "wrong-body" receipt can
+                # be rejected explicitly instead of trusted as free-floating
+                # proof prospecting happened SOMEWHERE.
+                _resolved_file = None
+                try:
+                    _hits = (result or {}).get("hits") or []
+                    if _hits and isinstance(_hits[0], dict):
+                        _resolved_file = (
+                            _hits[0].get("file")
+                            or _hits[0].get("path")
+                            or _hits[0].get("relative_path")
+                        )
+                except Exception:  # noqa: BLE001
+                    _resolved_file = None
                 await _cir.record_prospect_receipt(
                     db,
                     tenant_id=(tenant or {}).get("id"),
@@ -6127,6 +6156,10 @@ async def _handle_code_index_tools(
                     session_id=args.get("session_id"),
                     tool_name="prospect_symbol",
                     query=symbol,
+                    root_dir=root_dir or None,
+                    resolved_file=_resolved_file,
+                    rung=(result or {}).get("rung"),
+                    default_repo_root=str(_server._REPO_ROOT),
                 )
         except Exception:  # noqa: BLE001 -- receipt logging must never break the call
             pass

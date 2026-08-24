@@ -1619,6 +1619,13 @@ async def handle_complete_sprint_item(
         return await verify_code_intel_prospecting(
             db, tenant, args["project_id"], _pre_item,
             session_id=_complete_session_id or None,
+            # MDE-2 -- resolve against the SESSION's own registered worktree
+            # first (get_active_worktree_for_session, inside
+            # resolve_receipt_repo_root), falling back to the server's main
+            # checkout -- same preference order test_run_receipt.
+            # resolve_repo_root_for_session already established for the
+            # sibling test-run-receipt gate.
+            default_repo_root=str(_server._REPO_ROOT),
         )
 
     async def _run_test_run_evidence() -> dict[str, Any] | None:

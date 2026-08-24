@@ -52,7 +52,7 @@ def _slow_ci(state, delay, *, failed=0):
 
 
 def _slow_code_intel(result, delay):
-    async def _verify(db, tenant, project_id, item, *, session_id=None, live_inventory=None):
+    async def _verify(db, tenant, project_id, item, *, session_id=None, live_inventory=None, **_kw):
         await asyncio.sleep(delay)
         return result
     return _verify
@@ -121,7 +121,7 @@ async def test_concurrent_gate_precedence_ci_failure_wins_over_code_intel(db, mo
 
     monkeypatch.setattr(github_ci, "verify_commit_ci", _slow_ci("failure", 0.0, failed=2))
 
-    async def _fail_code_intel(db, tenant, project_id, item, *, session_id=None, live_inventory=None):
+    async def _fail_code_intel(db, tenant, project_id, item, *, session_id=None, live_inventory=None, **_kw):
         return {
             "applicable": True, "ok": False,
             "code": "CODE_INTEL_RECEIPT_MISSING",
@@ -201,7 +201,7 @@ async def test_dispatch_timeout_cancels_cleanly_while_gathered_checks_are_in_fli
     item = await db_module.add_sprint_item(db, p["id"], "v1", "cancel me")
     monkeypatch.setattr(mh, "_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S", 0.05)
 
-    async def _hang_code_intel(db, tenant, project_id, item, *, session_id=None, live_inventory=None):
+    async def _hang_code_intel(db, tenant, project_id, item, *, session_id=None, live_inventory=None, **_kw):
         await asyncio.sleep(5.0)
         raise AssertionError("should have been cancelled by the dispatch timeout")
     monkeypatch.setattr(_cir_mod, "verify_code_intel_prospecting", _hang_code_intel)
