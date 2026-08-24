@@ -18,6 +18,8 @@ the field is always populated.
 from __future__ import annotations
 
 import asyncio
+import dataclasses as _dataclasses
+import enum as _enum
 import functools
 import hashlib
 import json
@@ -7269,6 +7271,128 @@ def _render_research_evidence_block(envelope: Any) -> str:
         return ""
 
 
+def _duck_encode_dataclass_like(obj: Any) -> Any:
+    """MDE-5 — generic, ZERO-import reduction of a dataclass/Enum-shaped
+    object (e.g. a real ``research_evidence.ProvenanceEnvelope`` instance)
+    to plain dict/list/str/int/float/bool/None values.
+
+    Uses ONLY the stdlib ``dataclasses``/``enum`` modules — meridian core
+    still never imports ``extensions/meridian-outputs``'s
+    ``research_evidence`` module itself, exactly the same no-hard-dependency
+    contract ``_render_research_evidence_block`` already established (see
+    its own docstring). Structurally mirrors that module's OWN internal
+    ``_encode()`` helper (same reflection technique), just re-implemented
+    independently here rather than imported. A plain dict/list passes
+    through structurally unchanged (already the canonical shape); anything
+    else (str/int/float/bool/None, or an unrecognized object) is returned
+    as-is rather than raising — this is a best-effort projection for an
+    advisory handoff section, never a strict codec.
+    """
+    if isinstance(obj, _enum.Enum):
+        return obj.value
+    if _dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        # Mirrors research_evidence._encode()'s own extra_fields merge
+        # exactly (a field literally named "extra_fields" is merged into
+        # the result dict rather than nested), so a real ProvenanceEnvelope
+        # instance reduces to the SAME shape envelope_to_dict() would
+        # produce for it.
+        result: "dict[str, Any]" = {}
+        extra: "dict[str, Any]" = {}
+        for f in _dataclasses.fields(obj):
+            if f.name == "extra_fields":
+                extra = _duck_encode_dataclass_like(getattr(obj, f.name)) or {}
+                continue
+            result[f.name] = _duck_encode_dataclass_like(getattr(obj, f.name))
+        if extra:
+            result.update(extra)
+        return result
+    if isinstance(obj, dict):
+        return {str(k): _duck_encode_dataclass_like(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_duck_encode_dataclass_like(v) for v in obj]
+    return obj
+
+
+def _evidence_status_and_pointers_from_envelope(
+    envelope: Any,
+) -> "tuple[dict[str, Any] | None, list[dict[str, Any]]]":
+    """MDE-5 — duck-typed, zero-import projection of an optional research-
+    evidence envelope into ``(evidence_status_summary, trusted_pointers)``:
+    the small, BOUNDED pair a ``<handoff_manifest>`` embeds (never the full
+    envelope, which can be arbitrarily large). Mirrors
+    ``research_evidence.evidence_status_summary``/``trusted_pointers``
+    semantics closely (a real ``ProvenanceEnvelope`` instance produces the
+    exact same numbers reduced through this module's own logic instead —
+    see ``_duck_encode_dataclass_like``), reimplemented independently here
+    rather than imported, matching ``_render_research_evidence_block``'s
+    established no-hard-dependency contract exactly.
+
+    Accepts either a real ``ProvenanceEnvelope``-shaped object OR its
+    canonical dict form (``envelope_to_dict()``'s shape). Returns
+    ``(None, [])`` for anything falsy/unrecognized — purely additive, zero
+    change for a caller that never supplies an envelope. Never raises: a
+    malformed envelope degrades to ``(None, [])``, same as ``_render_
+    research_evidence_block``'s own best-effort posture.
+    """
+    if not envelope:
+        return None, []
+    try:
+        data = envelope if isinstance(envelope, dict) else _duck_encode_dataclass_like(envelope)
+        if not isinstance(data, dict):
+            return None, []
+        records = data.get("records")
+        links = data.get("links")
+        if not isinstance(records, list) or not isinstance(links, list):
+            return None, []
+
+        status_counts: "dict[str, int]" = {}
+        partial_records = redacted_records = authoritative_records = 0
+        trusted: "list[dict[str, Any]]" = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            resolver = rec.get("resolver") or {}
+            status = str(resolver.get("status") or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            is_partial = bool(rec.get("partial"))
+            is_redacted = bool(rec.get("redacted"))
+            is_authoritative = status == "verified" and not is_partial and not is_redacted
+            if is_partial:
+                partial_records += 1
+            if is_redacted:
+                redacted_records += 1
+            if is_authoritative:
+                authoritative_records += 1
+                identity = rec.get("identity") or {}
+                trusted.append({
+                    "id": identity.get("id"),
+                    "kind": identity.get("kind"),
+                    "locator": identity.get("locator"),
+                    "label": identity.get("label"),
+                })
+        partial_links = sum(
+            1 for link in links if isinstance(link, dict) and link.get("partial")
+        )
+        trusted.sort(key=lambda p: p.get("id") or "")
+        status_summary = {
+            "envelope_id": data.get("envelope_id"),
+            "generated_at": data.get("generated_at"),
+            "version": data.get("version"),
+            "partial": bool(data.get("partial")),
+            "partial_reason": data.get("partial_reason"),
+            "record_count": len(records),
+            "link_count": len(links),
+            "authoritative_record_count": authoritative_records,
+            "partial_record_count": partial_records,
+            "redacted_record_count": redacted_records,
+            "partial_link_count": partial_links,
+            "status_counts": status_counts,
+        }
+        return status_summary, trusted
+    except Exception:  # noqa: BLE001 — a malformed envelope must never break handoff generation
+        return None, []
+
+
 def _render_custom_handoff(
     template: str,
     *,
@@ -8919,6 +9043,8 @@ def build_handoff_manifest(
     stop_conditions: "list[str] | None" = None,
     deploy_policy: "dict[str, Any] | None" = None,
     max_items: int = _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+    evidence_status: "dict[str, Any] | None" = None,
+    trusted_pointers: "list[dict[str, Any]] | None" = None,
 ) -> "dict[str, Any]":
     """acf6f51a — assemble the canonical HandoffManifest as a plain dict with
     a FIXED field order (mirrored exactly by serialize_handoff_manifest_xml).
@@ -8935,6 +9061,18 @@ def build_handoff_manifest(
     ``items`` list (never the truncated view) — a receiver comparing
     ``board_revision`` against a fresh board fetch must see the same digest
     a caller with the full board would compute.
+
+    ``evidence_status``/``trusted_pointers`` (MDE-5) -- optional, ``None``/
+    omitted by default (byte-for-byte unchanged for every existing caller
+    that doesn't pass them). When the caller has a research-evidence
+    envelope (see ``_evidence_status_and_pointers_from_envelope``), these
+    carry the SAME small, bounded ``{status_counts, record_count,
+    authoritative_record_count, ...}`` summary and the list of
+    already-verified ``{id, kind, locator, label}`` pointers a receiver can
+    treat as trustworthy without re-resolving anything -- never the full
+    envelope, which is unbounded. This is what makes a handoff's evidence
+    state machine-readable rather than only ever narrated in the separate
+    "## Research Evidence" Markdown projection.
     """
     ordered_items = list(items)
     truncated = len(ordered_items) > max_items
@@ -8959,6 +9097,8 @@ def build_handoff_manifest(
         "waves": waves or [],
         "stop_conditions": list(stop_conditions or []),
         "deploy_policy": dict(deploy_policy or {}),
+        "evidence_status": dict(evidence_status or {}),
+        "trusted_pointers": list(trusted_pointers or []),
     }
 
 
@@ -9049,6 +9189,37 @@ def serialize_handoff_manifest_xml(manifest: "dict[str, Any]") -> str:
     for key in sorted(deploy):
         parts.append(f'<field name="{esc(key)}">{esc(deploy[key])}</field>')
     parts.append("</deploy_policy>")
+    # MDE-5 -- machine-readable research-evidence status + trusted pointers.
+    # Both default to {}/[] (build_handoff_manifest's own defaults) when the
+    # caller never supplied a research_evidence_envelope, so a manifest with
+    # no evidence renders empty-but-present elements rather than omitting
+    # them -- a receiver's XML parser never has to special-case "field
+    # absent" vs "field empty" for this section.
+    evidence_status = manifest.get("evidence_status") or {}
+    parts.append("<evidence_status>")
+    for key in sorted(evidence_status):
+        value = evidence_status[key]
+        if key == "status_counts" and isinstance(value, dict):
+            parts.append("<status_counts>")
+            for status_key in sorted(value):
+                parts.append(
+                    f'<field name="{esc(status_key)}">{esc(value[status_key])}</field>'
+                )
+            parts.append("</status_counts>")
+        else:
+            parts.append(f'<field name="{esc(key)}">{esc(value)}</field>')
+    parts.append("</evidence_status>")
+    parts.append("<trusted_pointers>")
+    for pointer in manifest.get("trusted_pointers") or []:
+        if not isinstance(pointer, dict):
+            continue
+        parts.append(
+            f'<pointer id="{esc(pointer.get("id"))}" '
+            f'kind="{esc(pointer.get("kind"))}" '
+            f'locator="{esc(pointer.get("locator"))}" '
+            f'label="{esc(pointer.get("label"))}"/>'
+        )
+    parts.append("</trusted_pointers>")
     parts.append("</handoff_manifest>")
 
     xml = "".join(parts)
@@ -10106,6 +10277,14 @@ async def generate_handoff(
             selected_scope=_selected_scope,
             emit_manifest=emit_manifest,
             proposal_scope=proposal_scope,
+            # MDE-5 -- goal mode previously never saw research_evidence_
+            # envelope at all (it returns before the full/delta-only
+            # _render_research_evidence_block append further below in this
+            # function), so a caller's evidence was silently invisible in
+            # exactly the mode documented as "hand straight to a fresh
+            # sub-agent with zero framing". See _generate_goal_only_handoff's
+            # own docstring for what this now renders.
+            research_evidence_envelope=research_evidence_envelope,
         )
         return (
             _g_path,
@@ -11593,11 +11772,26 @@ async def _generate_goal_only_handoff(
     selected_scope: "dict[str, Any] | None" = None,
     emit_manifest: bool = False,
     proposal_scope: "dict[str, Any] | None" = None,
+    research_evidence_envelope: Any = None,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
 
     ``strict_evidence``/``evidence_status`` (8a883f60) — threaded straight
     through from ``generate_handoff``; see its docstring.
+
+    ``research_evidence_envelope`` (MDE-5) — optional, ``None`` by default
+    (zero behaviour change). Previously this mode NEVER saw this parameter
+    at all: ``generate_handoff``'s own ``_render_research_evidence_block``
+    append only ran on its full/delta branch, further below in that
+    function, which goal mode returns before ever reaching — so a caller's
+    research evidence was silently invisible in exactly the mode documented
+    as "hand straight to a fresh sub-agent with zero framing". Now: (1) the
+    same "## Research Evidence" Markdown projection full/delta already
+    render is appended here too, and (2) when ``emit_manifest=True``, the
+    envelope is also reduced to a small, bounded ``evidence_status``/
+    ``trusted_pointers`` pair (see ``_evidence_status_and_pointers_from_
+    envelope``) and embedded into the canonical ``<handoff_manifest>`` XML
+    block — machine-readable, not just narrated prose.
     ``freshness_requery`` is always reported ``skipped`` here (this mode,
     like starter/compact, never re-queries pending items right before
     rendering — only full/delta do); the other four capabilities reflect
@@ -11914,6 +12108,13 @@ async def _generate_goal_only_handoff(
     # the existing body_hash mechanism covers it too; raises
     # HandoffManifestTooLarge (fail closed, same convention as
     # HandoffScopeNonExecutable just above) rather than truncating.
+    # MDE-5 — reduce the optional research-evidence envelope ONCE, reused by
+    # both the manifest (machine-readable) and the Markdown projection
+    # (human-readable) below. (None, []) when no envelope was supplied —
+    # zero behaviour change for every existing caller.
+    _g_evidence_status, _g_trusted_pointers = _evidence_status_and_pointers_from_envelope(
+        research_evidence_envelope
+    )
     if emit_manifest:
         _g_manifest = build_handoff_manifest(
             handoff_mode="goal",
@@ -11925,10 +12126,20 @@ async def _generate_goal_only_handoff(
             selected_item_ids=(selected_scope or {}).get("selected_item_ids"),
             closure_item_ids=(selected_scope or {}).get("closure_item_ids"),
             waves=(_parallel_groups or {}).get("groups"),
+            evidence_status=_g_evidence_status,
+            trusted_pointers=_g_trusted_pointers,
         )
         quick_start_goal = (
             f"{quick_start_goal}\n{serialize_handoff_manifest_xml(_g_manifest)}"
         )
+    # MDE-5 — the same "## Research Evidence" Markdown projection full/delta
+    # already render (_render_research_evidence_block), now also available
+    # in goal mode — previously invisible here entirely (see this function's
+    # own research_evidence_envelope docstring). Placed pre-mint (part of
+    # the hashed body), same as the manifest splice just above.
+    _g_research_evidence_block = _render_research_evidence_block(research_evidence_envelope)
+    if _g_research_evidence_block:
+        quick_start_goal = f"{quick_start_goal}\n\n{_g_research_evidence_block}"
     # f471c4b8 — append the SAME machine-readable project-start-configuration
     # tag full/delta/starter render, BEFORE the token is minted below. This
     # is the mode explicitly documented as "hand straight to a fresh

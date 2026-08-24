@@ -91,6 +91,10 @@ __all__ = [
     "envelope_from_dict",
     "serialize_provenance_envelope",
     "parse_provenance_envelope",
+    "canonical_envelope_hash",
+    "merge_envelopes",
+    "evidence_status_summary",
+    "trusted_pointers",
 ]
 
 
@@ -337,6 +341,21 @@ class EvidenceRecord:
     partial: bool = False
     partial_reason: "str | None" = None
     attributes: "dict[str, Any]" = field(default_factory=dict)
+    # MDE-5 -- explicit redaction state, same shape/validation as partial/
+    # partial_reason: a redacted record must say WHY (never silently dropped
+    # -- the whole point of an explicit envelope over free-text Markdown is
+    # that "this exists but was redacted" is itself a first-class, visible
+    # fact, not an absence a reader can't distinguish from "never collected").
+    redacted: bool = False
+    redaction_reason: "str | None" = None
+    # MDE-5 -- unknown top-level keys from a newer/different producer's
+    # schema, preserved verbatim across a JSON/XML round trip instead of
+    # being silently dropped by envelope_from_dict. Never populated by code
+    # in THIS module for a record it built itself; only ever set by
+    # _record_from_dict when parsing foreign data. See _encode()'s special
+    # casing: these are merged back into the record's own top-level dict on
+    # re-serialization, not nested under an "extra_fields" key.
+    extra_fields: "dict[str, Any]" = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.partial and not self.partial_reason:
@@ -344,12 +363,17 @@ class EvidenceRecord:
                 f"EvidenceRecord {self.identity.id!r} is marked partial=True but has "
                 "no partial_reason -- a partial record must say what's missing"
             )
+        if self.redacted and not self.redaction_reason:
+            raise EnvelopeValidationError(
+                f"EvidenceRecord {self.identity.id!r} is marked redacted=True but has "
+                "no redaction_reason -- a redacted record must say why"
+            )
 
     @property
     def is_authoritative(self) -> bool:
         """Safe to present as complete + trustworthy without a caveat:
-        fully resolved AND not flagged partial."""
-        return self.resolver.is_authoritative and not self.partial
+        fully resolved, not flagged partial, and not redacted."""
+        return self.resolver.is_authoritative and not self.partial and not self.redacted
 
 
 @dataclass
@@ -373,6 +397,9 @@ class EvidenceLink:
     partial: bool = False
     partial_reason: "str | None" = None
     note: "str | None" = None
+    redacted: bool = False
+    redaction_reason: "str | None" = None
+    extra_fields: "dict[str, Any]" = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.id, field_name="EvidenceLink.id")
@@ -384,10 +411,15 @@ class EvidenceLink:
                 f"EvidenceLink {self.id!r} is marked partial=True but has no "
                 "partial_reason -- a partial link must say what's missing"
             )
+        if self.redacted and not self.redaction_reason:
+            raise EnvelopeValidationError(
+                f"EvidenceLink {self.id!r} is marked redacted=True but has no "
+                "redaction_reason -- a redacted link must say why"
+            )
 
     @property
     def is_authoritative(self) -> bool:
-        return self.resolver.is_authoritative and not self.partial
+        return self.resolver.is_authoritative and not self.partial and not self.redacted
 
 
 @dataclass
@@ -409,6 +441,7 @@ class ProvenanceEnvelope:
     version: str = "1.0"
     partial: bool = False
     partial_reason: "str | None" = None
+    extra_fields: "dict[str, Any]" = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.envelope_id, field_name="ProvenanceEnvelope.envelope_id")
@@ -476,6 +509,8 @@ class ProvenanceEnvelope:
                 f" -- **{rec.resolver.status.value.upper()}**"
                 + (", **PARTIAL**" if rec.partial else "")
                 + (f" ({rec.partial_reason})" if rec.partial else "")
+                + (", **REDACTED**" if rec.redacted else "")
+                + (f" ({rec.redaction_reason})" if rec.redacted else "")
             )
             lines.append(
                 f"- `{rec.identity.kind.value}` **{rec.identity.id}** "
@@ -491,6 +526,8 @@ class ProvenanceEnvelope:
                 f" -- **{link.resolver.status.value.upper()}**"
                 + (", **PARTIAL**" if link.partial else "")
                 + (f" ({link.partial_reason})" if link.partial else "")
+                + (", **REDACTED**" if link.redacted else "")
+                + (f" ({link.redaction_reason})" if link.redacted else "")
             )
             lines.append(
                 f"- `{link.source_id}` --[{link.relation}]--> `{link.target_id}`{caveat}"
@@ -532,11 +569,33 @@ def build_envelope(
 def _encode(obj: Any) -> Any:
     """Recursively reduce dataclasses/enums to plain JSON-able values
     (dict/list/str/int/float/bool/None). Shared by both serialization
-    formats so JSON and XML can never drift in what they can express."""
+    formats so JSON and XML can never drift in what they can express.
+
+    MDE-5 -- a dataclass field literally named ``extra_fields`` (the unknown-
+    field-preservation escape hatch on :class:`EvidenceRecord`/
+    :class:`EvidenceLink`/:class:`ProvenanceEnvelope`) is special-cased: its
+    contents are merged directly into the RESULT dict rather than nested
+    under an ``"extra_fields"`` key, so a foreign producer's unrecognized
+    top-level keys round-trip back out at the same level they came in at
+    (see ``_record_from_dict``/``_link_from_dict``/``envelope_from_dict``,
+    which populate ``extra_fields`` from exactly the keys NOT already known
+    to this schema). Known keys always win: ``extra_fields`` is constructed
+    to exclude every known key in the first place, so this merge can never
+    silently overwrite a real field.
+    """
     if isinstance(obj, Enum):
         return obj.value
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return {f.name: _encode(getattr(obj, f.name)) for f in dataclasses.fields(obj)}
+        result: "dict[str, Any]" = {}
+        extra: "dict[str, Any]" = {}
+        for f in dataclasses.fields(obj):
+            if f.name == "extra_fields":
+                extra = _encode(getattr(obj, f.name)) or {}
+                continue
+            result[f.name] = _encode(getattr(obj, f.name))
+        if extra:
+            result.update(extra)
+        return result
     if isinstance(obj, dict):
         return {str(k): _encode(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -605,6 +664,23 @@ def _identity_from_dict(d: "dict[str, Any]") -> EvidenceIdentity:
     )
 
 
+#: Keys _record_from_dict/_link_from_dict/envelope_from_dict already know how
+#: to interpret. Anything else on the input dict is preserved verbatim via
+#: extra_fields (MDE-5 "preserve unknown fields") rather than dropped.
+_RECORD_KNOWN_KEYS = frozenset({
+    "identity", "timestamps", "resolver", "hashes", "partial", "partial_reason",
+    "attributes", "redacted", "redaction_reason",
+})
+_LINK_KNOWN_KEYS = frozenset({
+    "id", "relation", "source_id", "target_id", "resolver", "partial",
+    "partial_reason", "note", "redacted", "redaction_reason",
+})
+_ENVELOPE_KNOWN_KEYS = frozenset({
+    "envelope_id", "generated_at", "records", "links", "version",
+    "partial", "partial_reason",
+})
+
+
 def _record_from_dict(d: "dict[str, Any]") -> EvidenceRecord:
     return EvidenceRecord(
         identity=_identity_from_dict(_get(d, "identity", ctx="EvidenceRecord")),
@@ -614,6 +690,9 @@ def _record_from_dict(d: "dict[str, Any]") -> EvidenceRecord:
         partial=bool(d.get("partial", False)),
         partial_reason=d.get("partial_reason"),
         attributes=dict(d.get("attributes") or {}),
+        redacted=bool(d.get("redacted", False)),
+        redaction_reason=d.get("redaction_reason"),
+        extra_fields={k: v for k, v in d.items() if k not in _RECORD_KNOWN_KEYS},
     )
 
 
@@ -627,6 +706,9 @@ def _link_from_dict(d: "dict[str, Any]") -> EvidenceLink:
         partial=bool(d.get("partial", False)),
         partial_reason=d.get("partial_reason"),
         note=d.get("note"),
+        redacted=bool(d.get("redacted", False)),
+        redaction_reason=d.get("redaction_reason"),
+        extra_fields={k: v for k, v in d.items() if k not in _LINK_KNOWN_KEYS},
     )
 
 
@@ -647,6 +729,7 @@ def envelope_from_dict(d: "dict[str, Any]") -> ProvenanceEnvelope:
             version=d.get("version", "1.0"),
             partial=bool(d.get("partial", False)),
             partial_reason=d.get("partial_reason"),
+            extra_fields={k: v for k, v in d.items() if k not in _ENVELOPE_KNOWN_KEYS},
         )
     except EnvelopeValidationError:
         raise
@@ -742,6 +825,16 @@ def _xml_to_value(el: ET.Element) -> Any:
 
 _XML_ROOT_TAG = "provenance_envelope"
 
+# MDE-5 -- XML namespace for the provenance envelope root element. The
+# generic dict<->XML codec above is entirely STRUCTURE/ATTRIBUTE-driven (see
+# _value_to_xml: a dict entry's real key lives in the ``key`` attribute, not
+# the element's tag name), so applying a namespace to the root is safe: it
+# never affects how any child element is matched during parsing. Registered
+# as the DEFAULT namespace (empty prefix) so ET.tostring emits a plain
+# ``xmlns="..."`` on the root rather than a ``ns0:`` prefix on every element.
+_XML_NAMESPACE = "https://schemas.usemeridian.us/provenance-envelope/v1"
+ET.register_namespace("", _XML_NAMESPACE)
+
 
 # ---------------------------------------------------------------------------
 # Public serialize / parse
@@ -769,7 +862,15 @@ def serialize_provenance_envelope(envelope: ProvenanceEnvelope, format: str = "j
     if fmt == "json":
         return json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False)
     if fmt == "xml":
-        root = _value_to_xml(_XML_ROOT_TAG, data)
+        # MDE-5 -- the root element carries the provenance-envelope XML
+        # namespace (Clark notation -> a plain xmlns="..." on the root once
+        # tostring renders it, since the namespace is registered as the
+        # default/empty prefix above). Every child element's tag stays a
+        # bare "item"/"entry" (see _value_to_xml) and is never itself
+        # namespaced -- safe, because this codec never matches on tag names
+        # during parsing (see _xml_to_value), only on the "type"/"key"
+        # attributes, which XML namespaces never qualify.
+        root = _value_to_xml(f"{{{_XML_NAMESPACE}}}{_XML_ROOT_TAG}", data)
         return ET.tostring(root, encoding="unicode")
     raise EnvelopeValidationError(
         f"unsupported format {format!r}; expected one of {_SUPPORTED_FORMATS}"
@@ -797,3 +898,199 @@ def parse_provenance_envelope(payload: str, format: str = "json") -> ProvenanceE
             f"unsupported format {format!r}; expected one of {_SUPPORTED_FORMATS}"
         )
     return envelope_from_dict(data)
+
+
+# ---------------------------------------------------------------------------
+# Canonical ordering / content-addressing (MDE-5)
+# ---------------------------------------------------------------------------
+
+def canonical_envelope_hash(envelope: ProvenanceEnvelope, *, algorithm: str = "sha256") -> str:
+    """A stable, content-addressed digest of *envelope*, independent of the
+    order records/links happen to have been APPENDED in.
+
+    :func:`envelope_to_dict`/:func:`serialize_provenance_envelope`
+    deliberately preserve the caller's own list order (an exact,
+    order-faithful round trip -- see their own docstrings); this is the
+    separate "canonical ordering" primitive for when two envelopes built
+    from the SAME evidence in a different construction order need to
+    compare/dedup/hash as equal. Records are sorted by ``identity.id``,
+    links by ``id``, before hashing a compact canonical JSON encoding
+    (sorted keys, no whitespace) via :func:`compute_content_hash` -- the same
+    sha256-of-content idiom this module already uses, never Python's
+    randomized ``hash()`` builtin. This is the only place in the module that
+    reorders anything; every other codepath is order-preserving.
+    """
+    data = envelope_to_dict(envelope)
+    canonical = dict(data)
+    canonical["records"] = sorted(
+        canonical.get("records") or [],
+        key=lambda r: (r.get("identity") or {}).get("id") or "",
+    )
+    canonical["links"] = sorted(
+        canonical.get("links") or [], key=lambda link: link.get("id") or "",
+    )
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return compute_content_hash(payload, algorithm=algorithm)
+
+
+# ---------------------------------------------------------------------------
+# Merge -- "one partial resolver cannot erase other evidence" (MDE-5)
+# ---------------------------------------------------------------------------
+
+def _record_beats(current: EvidenceRecord, candidate: EvidenceRecord) -> bool:
+    """True if *candidate* should REPLACE *current* for the same record id."""
+    cur_auth, cand_auth = current.is_authoritative, candidate.is_authoritative
+    if cand_auth and not cur_auth:
+        return True
+    if cur_auth and not cand_auth:
+        return False
+    # Both (non-)authoritative alike -- most-recently-updated wins; ties
+    # (equal/unparseable timestamps) prefer the incoming candidate.
+    return (candidate.timestamps.updated_at or "") >= (current.timestamps.updated_at or "")
+
+
+def _link_beats(current: EvidenceLink, candidate: EvidenceLink) -> bool:
+    cur_auth, cand_auth = current.is_authoritative, candidate.is_authoritative
+    if cand_auth and not cur_auth:
+        return True
+    if cur_auth and not cand_auth:
+        return False
+    # EvidenceLink carries no timestamp of its own -- incoming wins ties,
+    # matching EvidenceRecord's tie-break direction.
+    return True
+
+
+def merge_envelopes(
+    base: ProvenanceEnvelope,
+    incoming: ProvenanceEnvelope,
+    *,
+    envelope_id: "str | None" = None,
+    generated_at: "str | None" = None,
+) -> ProvenanceEnvelope:
+    """Combine two envelopes' records/links by id WITHOUT letting a partial/
+    non-authoritative contribution silently erase already-good evidence.
+
+    MDE-5 acceptance: "one partial resolver cannot erase other evidence."
+    For each record/link id present in either side:
+
+    - An AUTHORITATIVE side (``is_authoritative`` -- resolver VERIFIED, not
+      partial, not redacted) always wins over a non-authoritative one for
+      the same id, regardless of which envelope it came from or which was
+      merged "later". A resolver that only produced a partial/degraded
+      result for an id another resolver already fully verified can never
+      downgrade that record.
+    - If both sides are (non-)authoritative alike, the more RECENTLY updated
+      one wins (``timestamps.updated_at``, string-comparable ISO-8601);
+      links (which carry no timestamp) prefer the incoming side on a tie.
+
+    An id present on only one side is carried through unchanged. Never
+    mutates ``base``/``incoming`` -- always returns a NEW
+    :class:`ProvenanceEnvelope`. The merged envelope's own ``partial`` flag
+    is the OR of both inputs' (an envelope built from one partial source is
+    itself partial), with a combined, non-empty ``partial_reason``.
+    """
+    merged_records: "dict[str, EvidenceRecord]" = {}
+    for rec in base.records:
+        merged_records[rec.identity.id] = rec
+    for rec in incoming.records:
+        existing = merged_records.get(rec.identity.id)
+        if existing is None or _record_beats(existing, rec):
+            merged_records[rec.identity.id] = rec
+
+    merged_links: "dict[str, EvidenceLink]" = {}
+    for link in base.links:
+        merged_links[link.id] = link
+    for link in incoming.links:
+        existing = merged_links.get(link.id)
+        if existing is None or _link_beats(existing, link):
+            merged_links[link.id] = link
+
+    merged_partial = bool(base.partial or incoming.partial)
+    merged_partial_reason = None
+    if merged_partial:
+        reasons = [r for r in (base.partial_reason, incoming.partial_reason) if r]
+        merged_partial_reason = (
+            "; ".join(dict.fromkeys(reasons)) if reasons
+            else "merged envelope includes at least one partial source envelope"
+        )
+
+    return ProvenanceEnvelope(
+        envelope_id=envelope_id or str(uuid.uuid4()),
+        generated_at=generated_at or _utcnow_iso(),
+        records=list(merged_records.values()),
+        links=list(merged_links.values()),
+        version=incoming.version or base.version,
+        partial=merged_partial,
+        partial_reason=merged_partial_reason,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Handoff integration surface (MDE-5) -- small, boundable projections a
+# handoff manifest can embed without carrying the full envelope.
+# ---------------------------------------------------------------------------
+
+def evidence_status_summary(envelope: ProvenanceEnvelope) -> "dict[str, Any]":
+    """Compact, machine-readable status summary of *envelope*: counts by
+    resolver status, partial/redacted counts, and the envelope's own partial
+    flag. This is the small, BOUNDED projection a handoff manifest embeds
+    (MDE-5: "handoff includes machine-readable evidence status") -- never the
+    full envelope, which can be arbitrarily large.
+    """
+    status_counts: "dict[str, int]" = {s.value: 0 for s in ResolverStatus}
+    partial_records = 0
+    redacted_records = 0
+    authoritative_records = 0
+    for rec in envelope.records:
+        key = rec.resolver.status.value
+        status_counts[key] = status_counts.get(key, 0) + 1
+        if rec.partial:
+            partial_records += 1
+        if rec.redacted:
+            redacted_records += 1
+        if rec.is_authoritative:
+            authoritative_records += 1
+    partial_links = sum(1 for link in envelope.links if link.partial)
+    return {
+        "envelope_id": envelope.envelope_id,
+        "generated_at": envelope.generated_at,
+        "version": envelope.version,
+        "partial": envelope.partial,
+        "partial_reason": envelope.partial_reason,
+        "record_count": len(envelope.records),
+        "link_count": len(envelope.links),
+        "authoritative_record_count": authoritative_records,
+        "partial_record_count": partial_records,
+        "redacted_record_count": redacted_records,
+        "partial_link_count": partial_links,
+        "status_counts": status_counts,
+        "dangling_link_count": len(envelope.dangling_link_endpoints()),
+    }
+
+
+def trusted_pointers(
+    envelope: ProvenanceEnvelope, *, limit: "int | None" = None,
+) -> "list[dict[str, Any]]":
+    """The subset of *envelope*'s records safe to hand a receiver as
+    already-verified pointers, without re-resolving anything: exactly the
+    records where :attr:`EvidenceRecord.is_authoritative` is True (VERIFIED
+    resolver state, not partial, not redacted). Sorted by id for
+    determinism. ``limit`` caps the count -- NEVER silently: a caller that
+    needs to know whether more exist should compare
+    ``len(trusted_pointers(env))`` against
+    ``evidence_status_summary(env)["authoritative_record_count"]`` itself.
+    """
+    pointers = [
+        {
+            "id": rec.identity.id,
+            "kind": rec.identity.kind.value,
+            "locator": rec.identity.locator,
+            "label": rec.identity.label,
+        }
+        for rec in envelope.records
+        if rec.is_authoritative
+    ]
+    pointers.sort(key=lambda p: p["id"])
+    if limit is not None:
+        pointers = pointers[:limit]
+    return pointers

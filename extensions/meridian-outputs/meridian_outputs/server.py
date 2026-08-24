@@ -573,6 +573,45 @@ def parse_provenance_envelope(
 
 
 @mcp.tool()
+def get_evidence_status_and_trusted_pointers(
+    envelope: dict[str, Any], limit: int | None = None,
+) -> dict[str, Any]:
+    """MDE-5 -- the small, BOUNDED projection a handoff embeds instead of the
+    full envelope: a machine-readable evidence status summary plus the
+    subset of records safe to treat as already-verified ("trusted pointers")
+    without re-resolving anything.
+
+    ``envelope`` is the canonical dict shape (same as every other tool on
+    this surface -- ``get_provenance_status_envelope``'s return value, or
+    ``research_evidence.envelope_to_dict``'s). This is the SAME data
+    ``meridian.handoff.generate_handoff(research_evidence_envelope=...,
+    emit_manifest=True)`` embeds into a goal-mode ``<handoff_manifest>``'s
+    ``<evidence_status>``/``<trusted_pointers>`` elements when a caller
+    passes an envelope through -- exposed here directly too, so a caller
+    that only has this server (not meridian core) can get the same
+    projection without round-tripping through a handoff.
+
+    Args:
+      envelope:  The canonical envelope dict to summarize.
+      limit:     Optional cap on the number of trusted pointers returned
+                 (never silent -- compare ``len(trusted_pointers)`` against
+                 ``status["authoritative_record_count"]`` to detect capping).
+
+    Returns:
+      ``{"status": <evidence_status_summary() dict>, "trusted_pointers":
+      [<id, kind, locator, label>, ...]}``.
+
+    Raises:
+      research_evidence.EnvelopeValidationError: ``envelope`` is malformed.
+    """
+    env = research_evidence.envelope_from_dict(envelope)
+    return {
+        "status": research_evidence.evidence_status_summary(env),
+        "trusted_pointers": research_evidence.trusted_pointers(env, limit=limit),
+    }
+
+
+@mcp.tool()
 def classify_outputs(
     paths: list[str],
 ) -> dict[str, Any]:

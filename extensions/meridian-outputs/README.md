@@ -97,6 +97,7 @@ own docstring, "Typed research-evidence bridge", for the exact
 | `get_provenance_status_envelope` | Build one typed, lossless `ProvenanceEnvelope` (canonical dict shape) from a batch of output paths, via `get_provenance_status` + the typed-evidence bridge |
 | `serialize_provenance_envelope` | Serialize a canonical envelope dict to a JSON or XML string (both are lossless projections of the same data; either round-trips back through `parse_provenance_envelope`) |
 | `parse_provenance_envelope` | Inverse of `serialize_provenance_envelope`: parse a JSON/XML envelope payload back into its canonical dict shape |
+| `get_evidence_status_and_trusted_pointers` | MDE-5: the small, bounded `{status, trusted_pointers}` projection a handoff manifest embeds instead of the full envelope -- status counts by resolver state plus the subset of records safe to treat as already-verified without re-resolving |
 
 `meridian/handoff.py` (meridian core) can also render an envelope built this
 way as an additive "## Research Evidence" section of a `generate_handoff(...,
