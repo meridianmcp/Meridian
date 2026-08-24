@@ -25,6 +25,16 @@ hosted Meridian — the gap that fdbd4296 alone could NOT close.
 a .docx for visual QA (LibreOffice headless / Word COM), returning one of
 exactly three states (rendered / unavailable-with-reason / failed) so a
 caller never mistakes "we could not check" for "we verified this renders".
+
+1e6150ef — also exposes :func:`render_with_receipt` / :func:`list_render_
+receipts` / :func:`check_release_render_gate`, thin wrappers over
+:mod:`render_gate`'s durable render-receipt layer: a receipt that survives
+the backend's own temp-directory cleanup (source/PDF hash, backend +
+version, process identity, page count, duration, retry/timeout state,
+field-refresh status), plus a fail-closed release gate requiring a FRESH
+matching receipt unless a human explicitly records an audited degraded
+override. A backend-conversion success is never, by itself, recorded as
+visual verification — see ``render_gate``'s own module docstring.
 """
 from __future__ import annotations
 
@@ -397,6 +407,122 @@ def check_render_capability(docx_path: str) -> dict[str, Any]:
     See ``render_gate.check_render_capability`` for the full contract.
     """
     return render_gate.check_render_capability(docx_path)
+
+
+@mcp.tool()
+def render_with_receipt(
+    docx_path: str,
+    receipts_path: str | None = None,
+    max_retries: int = 1,
+    visual_qa: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """1e6150ef -- run a render attempt and build a DURABLE receipt that
+    survives the render backend's own temp directory being cleaned up.
+
+    Records source DOCX hash, produced-PDF hash/size/page count, backend
+    name + best-effort version, process identity (word-com only), duration,
+    attempts, timeout state, the configured backend priority order,
+    ``field_refresh_status`` (whether this DOCX's fields will auto-update on
+    open -- a document that won't can render "successfully" while showing
+    stale TOC/page-number/cross-reference text), and an explicit
+    ``visual_qa`` verdict. A successful backend CONVERSION is never, by
+    itself, recorded as visual verification -- ``visual_qa`` defaults to an
+    explicit ``"not_reviewed"`` state unless the caller passes a real one.
+
+    Args:
+      docx_path:      The document to attempt to render.
+      receipts_path:   When given, persists the receipt (atomic JSON ledger)
+                       to this path so it survives process restarts, not
+                       just the render's own temp cleanup -- pass the SAME
+                       path across calls for one document/project so
+                       ``check_release_render_gate`` sees full history.
+      max_retries:      Bounds automatic retry of a retryable transient
+                       failure (see ``check_render_capability``).
+      visual_qa:        Optional explicit visual-QA verdict dict, e.g.
+                       ``{"status": "verified", "reviewer": "...", "notes":
+                       "..."}``.
+
+    Returns the full receipt dict -- see ``render_gate.render_with_receipt``
+    for every field. Per this module's existing contract, a timed-out
+    backend probe is always recorded as ``status="failed"``, never
+    ``"rendered"``.
+    """
+    return render_gate.render_with_receipt(
+        docx_path, receipts_path=receipts_path, max_retries=max_retries,
+        visual_qa=visual_qa,
+    )
+
+
+@mcp.tool()
+def list_render_receipts(
+    receipts_path: str, docx_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """1e6150ef -- list durable render receipts (and audited degraded
+    overrides) from a receipts ledger, newest first.
+
+    Args:
+      receipts_path:  Path to the JSON ledger written by ``render_with_
+                     receipt``/``check_release_render_gate``.
+      docx_path:      Optional filter to one document's receipts.
+
+    Returns:
+      ``[]`` if the ledger doesn't exist yet or is empty; otherwise every
+      receipt dict, newest ``created_at_epoch`` first.
+    """
+    return render_gate.list_render_receipts(receipts_path, docx_path=docx_path)
+
+
+@mcp.tool()
+def check_release_render_gate(
+    docx_path: str,
+    receipts_path: str,
+    max_age_seconds: float = 24 * 3600.0,
+    allow_degraded_override: bool = False,
+    override_reason: str | None = None,
+    override_by: str | None = None,
+) -> dict[str, Any]:
+    """1e6150ef -- fail-closed release gate: refuses release unless a FRESH,
+    content-matched, real ``"rendered"`` receipt is on file for
+    ``docx_path``.
+
+    "Fresh" requires the newest matching receipt in ``receipts_path`` to
+    have ``status="rendered"`` AND a ``source_docx_sha256`` matching the
+    document's CURRENT on-disk content AND an age no greater than
+    ``max_age_seconds``. With no such receipt, release is refused unless a
+    human explicitly passes ``allow_degraded_override=True`` WITH a
+    non-empty ``override_reason`` -- which durably records a second, audited
+    ``degraded_override`` receipt in the SAME ledger (never a silent
+    bypass).
+
+    Args:
+      docx_path:                The document to gate release of.
+      receipts_path:             The same ledger path used by
+                                ``render_with_receipt``.
+      max_age_seconds:           How old a matching receipt may be and still
+                                count as fresh (default 24h).
+      allow_degraded_override:   Explicit, audited bypass when no fresh
+                                receipt exists.
+      override_reason:           Required (non-empty) alongside
+                                ``allow_degraded_override=True``, or the
+                                override itself is refused.
+      override_by:               Optional identity of who authorized the
+                                override, recorded on the audit record.
+
+    Returns:
+      ``{release_ready, degraded, visually_verified, reason,
+      matched_receipt, override}`` -- see
+      ``render_gate.check_release_render_gate`` for the full contract.
+      ``visually_verified`` is a DELIBERATELY separate, stricter signal from
+      ``release_ready``: it is only true when the matched receipt's own
+      ``visual_qa.status`` is ``"verified"`` -- a backend-conversion success
+      never sets it on its own, so structural-only success can never
+      masquerade as visual verification.
+    """
+    return render_gate.check_release_render_gate(
+        docx_path, receipts_path, max_age_seconds=max_age_seconds,
+        allow_degraded_override=allow_degraded_override,
+        override_reason=override_reason, override_by=override_by,
+    )
 
 
 @mcp.tool()

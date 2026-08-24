@@ -2799,6 +2799,27 @@ def _enforce_render_verification(
         ``render_verified`` is still ``False`` and ``render_degraded`` /
         ``degraded_render_reason`` are stamped onto the payload so no
         caller can mistake a degraded acceptance for a real verification.
+
+    1e6150ef -- this function's own ``render_result``/degraded-acceptance
+    outcome is a real evidence source but, as returned here, only lives in
+    the caller's in-memory success payload -- it does not itself survive
+    process restart or the render backend's own temp-directory cleanup. A
+    caller that wants a DURABLE, later-queryable record of this exact
+    outcome (backend/version, produced-PDF hash, process identity, page
+    count, field-refresh status, and an explicit non-"verified" visual_qa
+    state for the render-succeeded-but-not-human-reviewed case) should pass
+    THIS function's already-computed ``render_result`` dict straight into
+    ``render_gate.render_with_receipt(write_dest, check_result=render_result,
+    receipts_path=...)`` -- that rebuilds the full receipt from this exact
+    result WITHOUT re-rendering the document a second time, and
+    ``render_gate.check_release_render_gate`` is the corresponding
+    release-time enforcement point (fresh-receipt-or-audited-override,
+    mirroring this function's own allow_degraded_render contract but keyed
+    off a durable ledger instead of a single call's return value). Wiring
+    that persistence directly into this function's own call sites
+    (``insert_figure_block`` / ``merge_draft_into_canonical``) is a
+    deliberate follow-up, not part of this change -- see
+    ``render_gate``'s own module docstring, "1e6150ef" section.
     """
     try:
         render_result = render_gate.check_render_capability(write_dest)
