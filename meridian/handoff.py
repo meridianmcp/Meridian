@@ -88,6 +88,97 @@ _DEFAULT_GOAL_TEST_CMD = "pixi run test"
 _STRATEGIC_NOTE_TAGS = {"planning", "strategy", "competitive", "acquisition"}
 _SESSION_HANDOFF_STATE: dict[str, str] = {}
 
+
+async def _persist_handoff_history_and_pending_goal(
+    db: Any,
+    project_id: str,
+    mode: str,
+    content: str,
+    session_id: "str | None",
+    pending_goal_body: str,
+) -> bool:
+    """aec043cb — shared amend-vs-fresh persistence + pending_goal write.
+
+    Extracted VERBATIM (zero behavior change) from the pre-existing full/
+    delta code path in ``generate_handoff`` so ``mode == "goal"`` — now
+    commonly reached via the OMITTED-mode default (see
+    ``resolve_handoff_mode``) rather than only an explicit request — can
+    wire into the SAME trusted ``pending_goal``/``handoffs``-history channel
+    full/delta have always used, instead of silently never registering
+    with it. Before aec043cb this was a latent, inconsequential gap (682005f4
+    introduced 'goal' mode without this wiring, but it was only ever reached
+    via an explicit request, so a caller who wanted the trusted channel
+    simply used full/delta instead); it becomes load-bearing the moment
+    'goal' is the DEFAULT for the dominant omitted-mode executor call —
+    AGENTS.md documents ``start_session``'s ``pending_goal`` /
+    ``load_handoff()`` as the preferred, trusted delivery channel over a
+    spoofable copy-pasted /goal string, so the new safe default must be
+    able to use it too.
+
+    ``content`` is the full body persisted to the ``handoffs`` history
+    table; ``pending_goal_body`` is what ``start_session``/``load_handoff``
+    later surface as ``pending_goal``. For full/delta these differ
+    (``content`` is the entire rendered handoff, ``pending_goal_body`` is
+    just the embedded /goal snippet — see the original call site below);
+    for 'goal' mode they are identical (the whole body IS the /goal
+    snippet), so that call site simply passes the same string twice.
+
+    Returns whether the prior handoff was amended in place rather than
+    recorded fresh (the same ``amended`` flag ``generate_handoff`` itself
+    returns). Fully guarded exactly as before extraction: a failure in
+    either step is swallowed, never breaking handoff generation.
+    """
+    amended = False
+    try:
+        prior_goal = await db_module.get_pending_goal(db, project_id)
+        if prior_goal is not None:
+            # Prior handoff exists and was never consumed — amend in-place.
+            amend_result = await db_module.amend_handoff(db, project_id, content, mode)
+            if amend_result is not None:
+                amended = True
+            else:
+                # No prior row to amend (e.g. pre-migration DB or the row was
+                # deleted externally) — fall through to fresh record.
+                await db_module.record_handoff(db, project_id, mode, content, session_id)
+        else:
+            # 8819d6b1 — fresh handoff: persist to the history table so the
+            # dashboard / planner can list past handoffs and detect new ones.
+            await db_module.record_handoff(db, project_id, mode, content, session_id)
+    except Exception:  # noqa: BLE001 — never break handoff generation
+        pass
+    # 5efe254b — persist the /goal to the trusted channel so the next
+    # start_session can surface it as an MCP tool result (keyed on project_id)
+    # instead of a spoofable copy-pasted chat string. Read-once (pop). Fully
+    # guarded so a pre-migration DB never breaks handoff generation.
+    try:
+        await db_module.set_pending_goal(db, project_id, pending_goal_body)
+    except Exception:  # noqa: BLE001
+        pass
+    return amended
+
+
+def _mark_session_handoff_produced(session_id: "str | None") -> None:
+    """aec043cb — record that ``session_id`` just received a handoff, so a
+    LATER omitted-mode call from the SAME session correctly auto-switches to
+    ``"delta"`` via ``resolve_handoff_mode`` (the pre-existing continuation
+    check: ``session_id in _SESSION_HANDOFF_STATE``).
+
+    Before aec043cb, only the full/delta code path ever populated
+    ``_SESSION_HANDOFF_STATE`` — sufficient at the time, because an omitted
+    mode always resolved to ``"full"`` (which runs that path) regardless of
+    role. Now that omission commonly resolves to the bounded ``"goal"``/
+    ``"planner"`` modes instead (both of which return well before that
+    shared full/delta code), those two modes call this helper explicitly so
+    the continuation contract keeps working: a session's first (bounded)
+    handoff still makes its SECOND omitted-mode call resolve to ``"delta"``,
+    exactly as it did when the first call happened to be ``"full"``.
+    No-op when ``session_id`` is falsy, matching the original inline check.
+    """
+    if session_id:
+        _SESSION_HANDOFF_STATE[session_id] = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
 # dd07ece0 — provenance token store: short-lived, single-use tokens that let a
 # receiving session independently verify a /goal block came from a real
 # generate_handoff call (not injected/spoofed text shaped like one). cb8e7c0f
@@ -5774,21 +5865,80 @@ async def _annotate_resolved_pointers(
     return pending_items
 
 
+_VALID_HANDOFF_MODES = frozenset(
+    {"full", "delta", "planner", "starter", "compact", "goal"}
+)
+
+
 def resolve_handoff_mode(
     requested_mode: str | None,
     session_id: str | None = None,
+    *,
+    session_role: str | None = None,
 ) -> str:
-    """Resolve the public handoff mode, auto-switching repeat sessions to delta.
+    """Resolve the public handoff mode. Intent-based, never full-by-default.
+
+    aec043cb (P0 HANDOFF) — an OMITTED (or unrecognized) ``requested_mode``
+    used to resolve unconditionally to ``"full"`` — the unbounded, whole-
+    project state dump that also unconditionally prepends EVERY workspace
+    decision/note (across every project in the workspace, no project
+    filtering) via ``_render_workspace_handoff_block``. That made every
+    executor-facing MCP/HTTP call that simply omitted ``mode`` (the common
+    case — the MCP tool schema has always made ``mode`` optional) leak
+    cross-project workspace context into a handoff meant for one project's
+    executor. Per the authoritative aec043cb design decision, omission is
+    now resolved by INTENT, in this order:
+
+      1. An explicit, recognized ``requested_mode`` always wins outright —
+         unconditionally, including ``"full"`` itself. ``"full"`` remains
+         fully available; it is simply never the result of an OMISSION
+         anymore, only of a deliberate, explicit request (the "archival/
+         diagnostic dump" case).
+      2. A genuinely RESUMED session — this ``session_id`` already produced
+         a handoff earlier in the same process (tracked in
+         ``_SESSION_HANDOFF_STATE``) — resolves to ``"delta"``: a bounded,
+         per-session continuation update. Unchanged from the pre-existing
+         auto-switch; still takes priority over role, since "this session
+         already has a handoff to continue from" is a stronger, more
+         specific signal than a role guess.
+      3. A session registered as ``role="executor"`` via ``start_session``
+         (``session_role="executor"``, sourced by the caller from
+         ``meridian.mcp.handler._EXECUTOR_SESSIONS`` — the same in-memory
+         session-role registry the bf51b12e planner-refresh-nudge already
+         relies on; reused here rather than inventing a second concept)
+         resolves to ``"goal"`` — the bounded, executor-facing /goal block:
+         no workspace decisions/notes, no L0/L1/L2, no other project's
+         state (see ``_generate_goal_only_handoff``).
+      4. A session registered as ``role="planner"`` (``session_role=
+         "planner"``, sourced from ``meridian.mcp.handler._PLANNER_SESSIONS``,
+         the symmetric sibling registry) resolves to ``"planner"`` — the
+         directive planning-session prompt, already project-scoped with no
+         workspace decisions/notes (see ``_generate_planner_handoff``).
+      5. Anything else — no ``session_id`` at all, or a session whose role
+         was never registered as executor/planner — has no safe, positive
+         signal to resolve by. Rather than fail the call outright (this is
+         a compatibility-preserving control-plane fix, not a new hard
+         requirement on every pre-existing caller), this degrades to the
+         SAME safe, bounded ``"goal"`` mode used for a known executor: the
+         narrowest, leak-free option available. This still satisfies the
+         one non-negotiable constraint — an omitted mode NEVER silently
+         resolves to ``"full"`` — while remaining usable for a caller that
+         has not (yet) adopted ``start_session(role=...)``.
 
     ``"goal"`` (682005f4) is the 6th mode: it returns ONLY the bare /goal
     block itself — no readiness header, no workspace decisions/notes, no
     L0/L1/L2 context. See ``_generate_goal_only_handoff``.
     """
-    if requested_mode in {"full", "delta", "planner", "starter", "compact", "goal"}:
+    if requested_mode in _VALID_HANDOFF_MODES:
         return requested_mode
     if session_id and session_id in _SESSION_HANDOFF_STATE:
         return "delta"
-    return "full"
+    if session_role == "executor":
+        return "goal"
+    if session_role == "planner":
+        return "planner"
+    # aec043cb — intent unknown: bounded-safe default, never "full".
+    return "goal"
 
 
 def _human_id_clause(identity: str | None) -> str:
@@ -10303,6 +10453,11 @@ async def generate_handoff(
         _resolved_max_bytes = max_content_bytes  # type: ignore[assignment]
     if mode == "planner":
         _pl_path, _pl_content = await _generate_planner_handoff(db, project_id, output_dir)
+        # aec043cb — see _mark_session_handoff_produced's docstring: keeps
+        # the resumed-session -> 'delta' auto-switch working now that
+        # 'planner' is reachable via an omitted mode too (a session
+        # registered role='planner'), not just an explicit request.
+        _mark_session_handoff_produced(session_id)
         return (
             _pl_path,
             format_handoff_mcp_content(_pl_content, max_bytes=_resolved_max_bytes),
@@ -10404,10 +10559,26 @@ async def generate_handoff(
             # own docstring for what this now renders.
             research_evidence_envelope=research_evidence_envelope,
         )
+        # aec043cb — see _mark_session_handoff_produced's docstring: 'goal'
+        # is now the common omitted-mode default, so it must keep the
+        # resumed-session -> 'delta' auto-switch working for THIS session's
+        # next call, exactly as the old 'full' default always did.
+        _mark_session_handoff_produced(session_id)
+        # aec043cb — see _persist_handoff_history_and_pending_goal's own
+        # docstring: 'goal' mode never wired into the handoffs history table
+        # or the trusted pending_goal channel (a latent, inconsequential gap
+        # since 682005f4 — 'goal' was explicit-request-only back then). Now
+        # that it is the common omitted-mode default, it must use the SAME
+        # trusted channel AGENTS.md documents for start_session/load_handoff,
+        # exactly like full/delta always have. content == pending_goal_body
+        # here: the entire goal-only body IS the /goal snippet.
+        _g_amended = await _persist_handoff_history_and_pending_goal(
+            db, project_id, "goal", _g_content, session_id, _g_content,
+        )
         return (
             _g_path,
             format_handoff_mcp_content(_g_content, max_bytes=_resolved_max_bytes),
-            False,
+            _g_amended,
         )
     if mode not in {"full", "delta"}:
         raise ValueError(
@@ -10464,8 +10635,25 @@ async def generate_handoff(
     project_notes = await db_module.get_project_notes(db, project_id, bodies=True)
     strategic_notes = _select_strategic_notes(project_notes)
     # v3.1 — workspace decisions + notes apply across all projects.
-    workspace_decisions = await db_module.get_workspace_decisions(db)
-    workspace_notes = await db_module.get_workspace_notes(db)
+    # aec043cb — that "across all projects" scope is exactly why this is
+    # confined to mode == "full" now: full is the explicit, opt-in archival/
+    # diagnostic dump (never an omitted-mode default anymore — see
+    # resolve_handoff_mode), so a caller who deliberately asked for it is
+    # knowingly asking for cross-project context. mode == "delta" (a bounded
+    # per-session continuation update, whether reached explicitly or via the
+    # resumed-session auto-switch) must NOT bulk-inject unrelated workspace
+    # records — a decision or note pinned for a completely different project
+    # (interview notes, thesis findings, anything workspace-wide but
+    # project-irrelevant) has no business in a bounded continuation handoff.
+    # No allowlisted "workspace-policy" channel exists yet for delta/goal/
+    # starter/planner to opt into a narrow slice of this — see the aec043cb
+    # item notes point 4; until one exists, the answer is "none survives".
+    if mode == "full":
+        workspace_decisions = await db_module.get_workspace_decisions(db)
+        workspace_notes = await db_module.get_workspace_notes(db)
+    else:
+        workspace_decisions = []
+        workspace_notes = []
     # 45f519a0 — include_deferred=False so a deferred item is genuinely invisible
     # to executors in the handoff pending-items list, not just gated at claim time.
     # b8f89491 — version=_effective_version scopes the ENTIRE downstream pipeline
@@ -11352,32 +11540,12 @@ async def generate_handoff(
     # service (regenerate_handoff_correction calls generate_handoff, so
     # generate_handoff routing its own amend decision back through
     # regenerate_handoff_correction would recurse).
-    _amended = False
-    try:
-        _prior_goal = await db_module.get_pending_goal(db, project_id)
-        if _prior_goal is not None:
-            # Prior handoff exists and was never consumed — amend in-place.
-            _amend_result = await db_module.amend_handoff(db, project_id, content, mode)
-            if _amend_result is not None:
-                _amended = True
-            else:
-                # No prior row to amend (e.g. pre-migration DB or the row was
-                # deleted externally) — fall through to fresh record.
-                await db_module.record_handoff(db, project_id, mode, content, session_id)
-        else:
-            # 8819d6b1 — fresh handoff: persist to the history table so the
-            # dashboard / planner can list past handoffs and detect new ones.
-            await db_module.record_handoff(db, project_id, mode, content, session_id)
-    except Exception:  # noqa: BLE001 — never break handoff generation
-        pass
-    # 5efe254b — persist the /goal to the trusted channel so the next
-    # start_session can surface it as an MCP tool result (keyed on project_id)
-    # instead of a spoofable copy-pasted chat string. Read-once (pop). Fully
-    # guarded so a pre-migration DB never breaks handoff generation.
-    try:
-        await db_module.set_pending_goal(db, project_id, quick_start_goal)
-    except Exception:  # noqa: BLE001
-        pass
+    # aec043cb — extracted to _persist_handoff_history_and_pending_goal
+    # (zero behavior change: same calls, same order, same guards) so 'goal'
+    # mode can reuse it too. See that function's own docstring.
+    _amended = await _persist_handoff_history_and_pending_goal(
+        db, project_id, mode, content, session_id, quick_start_goal,
+    )
     # 5abf3e12 — measure & persist this session's goal compliance (did its /goal
     # item list get fully complete_sprint_item()'d?) at the canonical session-end
     # point. N = items this session took on (actor = session id), M = of those,

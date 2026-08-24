@@ -2357,6 +2357,12 @@ def build_mcp_server():
                 mode = handoff_module.resolve_handoff_mode(
                     arguments.get("mode"),
                     session_id,
+                    # aec043cb — same in-memory role registry the HTTP/MCP
+                    # transport uses (start_session already routes through
+                    # _dispatch_mcp_tool for stdio too — see the 325276f8
+                    # comment above), so a stdio executor/planner session
+                    # resolves an omitted mode identically to the HTTP one.
+                    session_role=_handler._session_role_hint(session_id),
                 )
                 # 45f519a0/b8f89491/8a883f60/eb8b6894 — mirror handler.py's HTTP
                 # MCP dispatch exactly, so the stdio transport stops silently

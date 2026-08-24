@@ -55,8 +55,17 @@ def test_resolve_handoff_mode_accepts_goal():
 
 
 def test_resolve_handoff_mode_goal_not_confused_with_default():
-    # An unrecognized string still falls back to 'full', not 'goal'.
-    assert handoff_module.resolve_handoff_mode("gobbledygook") == "full"
+    # aec043cb — an unrecognized string is UNRELATED to an explicit "goal"
+    # request: it falls through the same intent-based default path any
+    # omitted mode does (see resolve_handoff_mode's docstring), which with
+    # no session/role context lands on 'goal' too — but for a completely
+    # different reason (safe fallback, never 'full') than a real, explicit
+    # mode="goal" call (recognized outright, first check in the function).
+    # Assert both distinctly rather than relying on the coincidental equal
+    # return value to prove anything.
+    assert handoff_module.resolve_handoff_mode("goal") == "goal"
+    assert handoff_module.resolve_handoff_mode("gobbledygook") == "goal"
+    assert handoff_module.resolve_handoff_mode("gobbledygook") != "full"
 
 
 # ---------------------------------------------------------------------------

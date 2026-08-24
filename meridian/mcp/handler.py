@@ -2776,11 +2776,42 @@ _PLANNER_REFRESH_TRIGGERS = frozenset({
 # migration + a per-call DB write).
 #   _EXECUTOR_SESSIONS  — session_ids that started with role='executor'; the
 #                         nudge is planner-only, so these are skipped.
+#   _PLANNER_SESSIONS  — session_ids that started with role='planner'
+#                         (aec043cb). Symmetric sibling of _EXECUTOR_SESSIONS,
+#                         populated the exact same way at the exact same
+#                         start_session call site; used ONLY by
+#                         resolve_handoff_mode (via _session_role_hint below)
+#                         to resolve an omitted handoff mode for a planner
+#                         session to 'planner' rather than a generic
+#                         executor-shaped default. Not consulted by the
+#                         bf51b12e nudge itself (that gate only cares whether
+#                         a session is NOT an executor).
 #   _SESSION_REFRESH_STATE — session_id -> {"calls": int, "last_refresh": int};
 #                         "calls" counts tool calls seen, "last_refresh" is the
 #                         call index at which we last attached a refresh.
 _EXECUTOR_SESSIONS: set[str] = set()
+_PLANNER_SESSIONS: set[str] = set()
 _SESSION_REFRESH_STATE: dict[str, dict] = {}
+
+
+def _session_role_hint(session_id: "str | None") -> "str | None":
+    """aec043cb — best-effort session-role lookup for resolve_handoff_mode.
+
+    Returns ``"executor"``/``"planner"`` when this process has seen this
+    session_id register with that role via ``start_session(role=...)``
+    (``_EXECUTOR_SESSIONS``/``_PLANNER_SESSIONS`` above), else ``None``.
+    In-memory/best-effort like the rest of this module's per-process session
+    state (see the comment block above) — a restarted process or a session
+    started on a different worker simply falls back to
+    ``resolve_handoff_mode``'s own safe default, never a crash.
+    """
+    if not session_id:
+        return None
+    if session_id in _EXECUTOR_SESSIONS:
+        return "executor"
+    if session_id in _PLANNER_SESSIONS:
+        return "planner"
+    return None
 
 
 async def _handle_project_tools(
@@ -2878,10 +2909,14 @@ async def _handle_project_tools(
 
     # start_session needs the handler-level _EXECUTOR_SESSIONS set so the
     # bf51b12e planner-nudge gate works without a circular import.
+    # aec043cb — _PLANNER_SESSIONS is the symmetric sibling registry, added
+    # so resolve_handoff_mode can resolve an omitted mode for a role="planner"
+    # session too (see that function's own docstring).
     if name == "start_session":
         return await handle_start_session(
             args, db, data_dir, tenant, _mcp_tenant_id,
             executor_sessions=_EXECUTOR_SESSIONS,
+            planner_sessions=_PLANNER_SESSIONS,
         )
 
     return _MISS
@@ -3021,6 +3056,7 @@ async def _handle_task_tools(
         mode = handoff_module_local.resolve_handoff_mode(
             args.get("mode"),
             session_id,
+            session_role=_session_role_hint(session_id),
         )
         # b8f89491 — resolve + surface the effective sprint-version scope so a
         # caller never has to infer it: an explicit version argument always

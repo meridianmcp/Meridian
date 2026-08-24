@@ -832,7 +832,12 @@ def test_handoff_endpoint(client):
             "description": "step 1",
         },
     )
-    r = client.post(f"/projects/{project['id']}/handoff")
+    # aec043cb — explicit mode='full': MERIDIAN_CONTEXT is a full/delta
+    # template marker; the new 'goal' omitted-mode default renders a
+    # completely different, bounded body without it (see
+    # resolve_handoff_mode's docstring). This test's own point (full-mode
+    # content shape/path) is preserved by asking for 'full' explicitly.
+    r = client.post(f"/projects/{project['id']}/handoff", json={"mode": "full"})
     assert r.status_code == 200
     body = r.json()
     assert "MERIDIAN_CONTEXT" in body["content"]
@@ -859,7 +864,13 @@ def test_handoff_endpoint_auto_switches_repeat_session_to_delta(client):
         json={"session_id": "sess-http-delta"},
     )
     assert first.status_code == 200
-    assert first.json()["mode"] == "full"
+    # aec043cb — this session's FIRST handoff has no prior continuation
+    # state and no known executor/planner role, so an omitted mode now
+    # resolves to the safe bounded 'goal' default (never 'full' — see
+    # resolve_handoff_mode's docstring). The actual point of this test —
+    # that the SAME session's second call auto-switches to 'delta' — is
+    # unaffected and still asserted below.
+    assert first.json()["mode"] == "goal"
 
     client.post(
         f"/projects/{project['id']}/sprint-items/{parent['id']}/complete",
@@ -3043,7 +3054,16 @@ def test_start_session_handoff_path_keyed_on_project_id_not_name(monkeypatch, tm
         assert body_a["handoff_path"].endswith(
             f"{handoff_module.handoff_file_stem(proj_a['id'])}_handoff.md"
         )
-        gen_a = client_a.post(f"/projects/{proj_a['id']}/handoff").json()
+        # aec043cb — explicit mode='full': start_session's own precomputed
+        # handoff_path field always assumes the '_handoff.md' (full/delta)
+        # suffix (see server.py's own literal), independent of which mode a
+        # later generate_handoff call actually resolves to; the new 'goal'
+        # omitted-mode default writes to a '_goal.md' path instead (see
+        # handoff.py's mode-specific out_path suffixes), which would fail
+        # this project-id-keying assertion for an unrelated reason.
+        gen_a = client_a.post(
+            f"/projects/{proj_a['id']}/handoff", json={"mode": "full"}
+        ).json()
         assert gen_a["path"] == body_a["handoff_path"]
         assert Path(body_a["handoff_path"]).exists()
 

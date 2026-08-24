@@ -147,9 +147,25 @@ async def generate_handoff_endpoint(
     except Exception:
         body = {}
     session_id = body.get("session_id")
+    _session_id = session_id if isinstance(session_id, str) else None
+    # aec043cb — same in-memory role registry the MCP transports use (lazy
+    # import: meridian.mcp.handler imports meridian.server, which imports
+    # this module at startup, so a module-level import here would be
+    # circular — mirrors the existing lazy-import pattern this module's
+    # own generate_handoff dispatch already uses elsewhere, e.g. handler.py's
+    # `from ..routes import tunnel as _tunnel_mod`). Best-effort: a failed
+    # import must never break this endpoint, it only means the role hint
+    # falls back to None and resolve_handoff_mode uses its own safe default.
+    _session_role: "str | None" = None
+    try:
+        from ..mcp import handler as _mcp_handler  # noqa: PLC0415
+        _session_role = _mcp_handler._session_role_hint(_session_id)
+    except Exception:  # noqa: BLE001 — role hint is best-effort only
+        _session_role = None
     mode = handoff_module.resolve_handoff_mode(
         body.get("mode"),
-        session_id if isinstance(session_id, str) else None,
+        _session_id,
+        session_role=_session_role,
     )
     # b8f89491 — optional explicit sprint-version scope, same contract as the
     # MCP path: wins over the session's own stored sprint_version; None (no
