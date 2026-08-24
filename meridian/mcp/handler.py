@@ -1378,7 +1378,16 @@ async def _handle_mcp_request(
                     # concurrent-write conflict instead of silently last-save-wins
                     # overwriting another session's edit to the same document.
                     try:
-                        tunnel_result = await _tunnel_mod.call_tunnel_tool(
+                        # MDE-3 rework -- call_tunnel_tool_with_release_tracking
+                        # is a thin, delegate-by-default wrapper: for anything
+                        # other than the PRIMARY docs-slot write tools
+                        # (move_section/copy_section/relocate_table) it is
+                        # byte-identical to calling call_tunnel_tool directly.
+                        # For those three, it drives the docx_merge
+                        # release-transaction state machine around the real
+                        # write instead of leaving it unexercised outside unit
+                        # tests of the transition guard. See routes/tunnel.py.
+                        tunnel_result = await _tunnel_mod.call_tunnel_tool_with_release_tracking(
                             tenant["id"], name, args,
                             db=db, session_id=(args.get("session_id") or "").strip() or None,
                         )
@@ -1419,14 +1428,33 @@ async def _handle_mcp_request(
                                         _tunnel_mod._tenant_active_repo.get(tenant["id"])
                                         if tenant else None
                                     )
+                                    # MDE-2 rework -- this is a THIRD-PARTY
+                                    # tool result (search_graph/find_symbol/
+                                    # ... called directly, not via
+                                    # prospect_symbol), so it never went
+                                    # through prospect_symbol_impl's own
+                                    # exact-match + scope hardening. Apply
+                                    # the SAME wrong-body protection here via
+                                    # resolve_exact_hit_from_tunnel_result --
+                                    # only an EXACT, in-scope hit is ever
+                                    # bound as resolved_file/range/symbol.
+                                    from .. import prospect as _prospect  # noqa: PLC0415
+                                    _query_full = _cir.extract_query_hint_full(args)
+                                    _exact_hit = _prospect.resolve_exact_hit_from_tunnel_result(
+                                        _tunnel_mod, tunnel_result, _query_full, _receipt_root,
+                                    )
                                     await _cir.record_prospect_receipt(
                                         db,
                                         tenant_id=tenant.get("id") if tenant else None,
                                         project_id=_receipt_pid,
                                         session_id=args.get("session_id"),
                                         tool_name=name,
-                                        query=_cir.extract_query_hint(args),
+                                        query=_query_full,
                                         root_dir=_receipt_root,
+                                        resolved_file=_prospect.hit_path(_exact_hit),
+                                        resolved_range=_prospect.hit_range(_exact_hit),
+                                        resolved_symbol=_prospect.hit_identity(_exact_hit),
+                                        hit=_exact_hit,
                                         default_repo_root=str(_server._REPO_ROOT),
                                     )
                         except Exception:  # noqa: BLE001
@@ -6169,22 +6197,28 @@ async def _handle_code_index_tools(
             from .. import code_intel_receipt as _cir  # noqa: PLC0415
             _receipt_pid = _cir.resolve_receipt_project_id(args)
             if _receipt_pid:
-                # MDE-2 -- bind to root_dir (the repo prospect_symbol_impl
-                # actually searched) + the resolved file/rung from its own
-                # result, so a stale/wrong-repo or "wrong-body" receipt can
-                # be rejected explicitly instead of trusted as free-floating
-                # proof prospecting happened SOMEWHERE.
-                _resolved_file = None
+                # MDE-2 rework -- bind to root_dir (the repo prospect_symbol_
+                # impl actually searched) + an EXACT-matched hit from its own
+                # (already scope-filtered/exact-reordered -- see
+                # prospect._finalize_hits) result, so a stale/wrong-repo or
+                # "wrong-body" receipt can be rejected explicitly instead of
+                # trusted as free-floating proof prospecting happened
+                # SOMEWHERE. `hits[0]` alone is NOT enough here even after
+                # _finalize_hits reorders exact matches first -- when no
+                # exact match exists at all in the rung's own results,
+                # hits[0] is still just the best FUZZY match, and binding
+                # the receipt to it would be exactly the wrong-body bug this
+                # rework closes. Only an EXACT identity match
+                # (select_exact_hit) is ever bound as resolved_file/range/
+                # symbol; otherwise those stay None/proxy rather than
+                # asserting a neighboring symbol's location as this query's
+                # answer.
+                _exact_hit = None
                 try:
                     _hits = (result or {}).get("hits") or []
-                    if _hits and isinstance(_hits[0], dict):
-                        _resolved_file = (
-                            _hits[0].get("file")
-                            or _hits[0].get("path")
-                            or _hits[0].get("relative_path")
-                        )
+                    _exact_hit = _prospect.select_exact_hit(_hits, symbol)
                 except Exception:  # noqa: BLE001
-                    _resolved_file = None
+                    _exact_hit = None
                 await _cir.record_prospect_receipt(
                     db,
                     tenant_id=(tenant or {}).get("id"),
@@ -6193,7 +6227,10 @@ async def _handle_code_index_tools(
                     tool_name="prospect_symbol",
                     query=symbol,
                     root_dir=root_dir or None,
-                    resolved_file=_resolved_file,
+                    resolved_file=_prospect.hit_path(_exact_hit),
+                    resolved_range=_prospect.hit_range(_exact_hit),
+                    resolved_symbol=_prospect.hit_identity(_exact_hit),
+                    hit=_exact_hit,
                     rung=(result or {}).get("rung"),
                     default_repo_root=str(_server._REPO_ROOT),
                 )

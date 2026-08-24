@@ -159,6 +159,25 @@ def extract_query_hint(args: "dict[str, Any] | None") -> str:
     return ""
 
 
+def extract_query_hint_full(args: "dict[str, Any] | None") -> str:
+    """MDE-2 rework — same field lookup as :func:`extract_query_hint`, but
+    WITHOUT the 200-char truncation. ``extract_query_hint``'s truncation is
+    fine for the receipt's ``query`` diagnostic field, but truncating BEFORE
+    comparing against a hit's own reported identity would make an exact-name
+    match structurally impossible for any symbol whose qualified name is
+    itself >200 chars (a real, if uncommon, shape for a deeply-nested
+    qualified name) — this is the untruncated string exact-match selection
+    (:func:`meridian.prospect.select_exact_hit`) must be compared against.
+    """
+    if not isinstance(args, dict):
+        return ""
+    for key in _QUERY_HINT_KEYS:
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
 def resolve_receipt_project_id(args: "dict[str, Any] | None") -> "str | None":
     """Best-effort resolution of the MERIDIAN project id a receipt belongs to.
 
@@ -271,6 +290,80 @@ async def compute_source_hash(
         return None
 
 
+def compute_graph_hash(hit: "dict[str, Any] | None") -> "str | None":
+    """MDE-2 rework — sha256 of a hit's OWN inline body/snippet text (see
+    :func:`meridian.prospect.hit_content`), when it carries one. ``None``
+    when the hit has no inline text at all (most graph/serena hits only
+    report a location, not a body) — never fabricated. Paired with
+    :func:`compute_live_range_hash` for the "graph and live-file hashes
+    agree" check.
+    """
+    if not isinstance(hit, dict):
+        return None
+    try:
+        from .prospect import hit_content as _hit_content  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    text = _hit_content(hit)
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _hash_line_range_sync(
+    root_dir: str, resolved_file: str, start_line: "int | None", end_line: "int | None",
+) -> "str | None":
+    try:
+        if start_line is None:
+            return None
+        p = Path(resolved_file)
+        if not p.is_absolute():
+            p = Path(root_dir) / resolved_file
+        if not p.is_file():
+            return None
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        start = max(1, int(start_line))
+        end = max(start, int(end_line) if end_line is not None else start)
+        chunk = "".join(lines[start - 1:end])
+        if not chunk:
+            return None
+        return hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def compute_live_range_hash(
+    root_dir: "str | None", resolved_file: "str | None",
+    start_line: "int | None", end_line: "int | None",
+) -> "str | None":
+    """MDE-2 rework — sha256 of the LIVE file's bytes for exactly
+    ``[start_line, end_line]`` (1-indexed, inclusive) under *root_dir* — the
+    counterpart to :func:`compute_graph_hash`'s hash of the graph/index's
+    OWN reported body for the same location.
+
+    Comparing the two is the "graph and live-file hashes agree" mechanism
+    the acceptance bar asks for: equal hashes mean the indexed body still
+    matches what's really on disk right now (fresh); different hashes are a
+    concrete, positive staleness signal — the graph/index captured a body
+    that no longer matches this exact range (a subsequent edit, or the
+    project reverting to a different revision since the hit was captured) —
+    distinct from (and finer-grained than) :func:`compute_source_hash`'s
+    WHOLE-FILE hash, which this function complements rather than replaces.
+
+    ``None`` (never computed, never a false "disagreement") when any input
+    is missing or the range/file can't be read — off the event loop (worker
+    thread), same rationale as ``compute_source_hash``.
+    """
+    if not root_dir or not resolved_file or start_line is None:
+        return None
+    try:
+        return await asyncio.to_thread(
+            _hash_line_range_sync, root_dir, resolved_file, start_line, end_line,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def resolve_receipt_repo_root(
     db: Any,
     *,
@@ -343,6 +436,9 @@ async def record_prospect_receipt(
     resolved_file: "str | None" = None,
     rung: "str | None" = None,
     default_repo_root: "str | None" = None,
+    resolved_range: "dict[str, Any] | None" = None,
+    resolved_symbol: "str | None" = None,
+    hit: "dict[str, Any] | None" = None,
 ) -> "dict[str, Any] | None":
     """Write ONE durable prospecting receipt to ``action_audit_log``.
 
@@ -356,6 +452,27 @@ async def record_prospect_receipt(
     outright — the receipt is not written at all — so contamination from a
     concurrent, differently-tooled session can never be produced as
     evidence for this (or any other) project's completion gate.
+
+    MDE-2 rework — three additional, OPTIONAL fields, all backward
+    compatible (every existing caller that omits them gets byte-identical
+    detail to before, modulo the new keys being present and null/absent):
+
+    * ``resolved_range`` — ``{"start_line", "end_line"}`` (see
+      :func:`meridian.prospect.hit_range`) — stored as ``range`` in the
+      detail. Never recorded before this rework.
+    * ``resolved_symbol`` — the REAL resolved symbol identity (see
+      :func:`meridian.prospect.hit_identity`), as opposed to the raw,
+      caller-supplied query string ``query`` was always a (200-char
+      truncated) proxy for. Stored as ``symbol``, falling back to the
+      truncated ``query`` proxy (documented via ``symbol_source``) only
+      when no exact hit was resolved.
+    * ``hit`` — the raw, EXACT-matched hit (caller's responsibility to have
+      selected it via :func:`meridian.prospect.select_exact_hit` — this
+      function does not itself re-verify exactness) — used, together with
+      ``resolved_range``, to compute ``graph_hash``/``live_range_hash``/
+      ``hash_agreement``: whether the graph/index's own reported body for
+      this exact range still matches what's really on disk right now. See
+      :func:`compute_graph_hash` / :func:`compute_live_range_hash`.
 
     Best-effort and fully guarded: a receipt-write failure must NEVER break
     the underlying tool call that already succeeded. Returns the stored row,
@@ -374,14 +491,38 @@ async def record_prospect_receipt(
         repo_root = repo_ctx.get("repo_root")
         source_hash = await compute_source_hash(repo_root, resolved_file)
         revision = await _git_revision(repo_root)
+
+        range_start = (
+            resolved_range.get("start_line") if isinstance(resolved_range, dict) else None
+        )
+        range_end = (
+            resolved_range.get("end_line") if isinstance(resolved_range, dict) else None
+        )
+        graph_hash = compute_graph_hash(hit)
+        live_range_hash = await compute_live_range_hash(
+            repo_root, resolved_file, range_start, range_end,
+        )
+        hash_agreement = (
+            (graph_hash == live_range_hash)
+            if (graph_hash is not None and live_range_hash is not None)
+            else None
+        )
+
+        truncated_query = (query or "")[:200]
         detail = json.dumps({
             "tool": tool_name,
-            "query": (query or "")[:200],
+            "query": truncated_query,
+            "symbol": resolved_symbol or (truncated_query or None),
+            "symbol_source": "resolved_hit" if resolved_symbol else "query_hint_proxy",
             "repo_root": repo_root,
             "repo_source": repo_ctx.get("source"),
             "revision": revision,
             "resolved_file": resolved_file,
+            "range": resolved_range if isinstance(resolved_range, dict) else None,
             "source_hash": source_hash,
+            "graph_hash": graph_hash,
+            "live_range_hash": live_range_hash,
+            "hash_agreement": hash_agreement,
             "rung": rung,
         })
         return await db_module.record_action_audit_event(
