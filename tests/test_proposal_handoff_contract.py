@@ -459,7 +459,17 @@ async def test_checkpoint_next_goal_excludes_manual_item(db, tmp_path):
     get_sprint_items(status='pending') slice with NO manual/backburner/
     unprospected/wave-gate exclusion applied -- disagreeing with the SAME
     generate_handoff(mode='delta') call it had just made a few lines above.
-    A MANUAL item must never appear in the executor-facing next_goal."""
+    A MANUAL item must never appear in the CLAIMABLE <sprint_items> batch of
+    the executor-facing next_goal.
+
+    455cfc36 — next_goal is now the SAME canonical, token-embedded goal
+    string generate_handoff renders (see goal_string_out), not an
+    independently re-assembled bare id list. That canonical block reports
+    excluded items transparently in a separate <exclusions> tag (the same
+    omitted_items/reason reporting `scope["omitted_items"]` already carries)
+    -- so the manual item's id DOES now legitimately appear somewhere in
+    next_goal (inside <exclusions>), it just must never appear inside the
+    claimable <sprint_items> section."""
     p = await db_module.create_project(db, "7479e427-checkpoint-manual")
     pid = p["id"]
     normal = await db_module.add_sprint_item(
@@ -472,8 +482,17 @@ async def test_checkpoint_next_goal_excludes_manual_item(db, tmp_path):
     result = await srv._dispatch_mcp_tool(
         "checkpoint", {"session_id": s["id"], "project_id": pid}, db, str(tmp_path),
     )
-    assert normal["id"] in result["next_goal"]
-    assert manual["id"] not in result["next_goal"]
+    next_goal = result["next_goal"]
+    assert normal["id"] in next_goal
+    _items_start = next_goal.index("<sprint_items>")
+    _items_end = next_goal.index("</sprint_items>")
+    claimable_block = next_goal[_items_start:_items_end]
+    assert normal["id"] in claimable_block
+    assert manual["id"] not in claimable_block
+    # The manual item is still transparently reported as excluded, same as
+    # every other full/delta/goal canonical handoff already does.
+    assert "<exclusions>" in next_goal
+    assert manual["id"] in next_goal[next_goal.index("<exclusions>"):]
     assert manual["id"][:8] not in result["pending_ids"]
     assert "proposal_scope" in result
     assert result["proposal_scope"]["executable"] is True

@@ -762,11 +762,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "checkpoint", "description":
         "Save progress mid-session. Runs auto_capture (buckets done tasks into a note), "
         "generates a delta handoff, and returns a compact summary with what was done, "
-        "what's pending, and the suggested next /goal string. Call before context fills "
-        "up or before ending a session.",
+        "what's pending, and the suggested next /goal string (now the same canonical, "
+        "token-embedded continuation block generate_handoff renders — verify it with "
+        "verify_handoff_token exactly like any other /goal block). Call before context "
+        "fills up or before ending a session.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
-         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "version": {"type": "string", "description": "(455cfc36) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this checkpoint to — wins over the calling session's own stored sprint_version, exactly like generate_handoff's own version kwarg. Omit to fall back to the session's resolved scope (unchanged default behavior)."}},
          "required": ["session_id"]}},
     {"name": "request_hitl", "description":
         "Surface a question to the human-in-the-loop queue. ALWAYS use this to ask "

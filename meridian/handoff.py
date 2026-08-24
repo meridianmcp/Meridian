@@ -1758,6 +1758,20 @@ def format_handoff_mcp_content(
     verification (``verify_handoff_token(project_id, token)`` with no
     ``body``) regardless.
 
+    455cfc36 — ``mode='delta'``'s ``<continuation_manifest>`` tag
+    (see :func:`build_continuation_manifest`) is rendered by
+    ``_render_delta_handoff`` BEFORE ``quick_start_goal`` precisely so it
+    falls within this SAME protected floor (the goal-token banner sits near
+    the top of ``quick_start_goal``, i.e. always after the manifest) without
+    this function needing to know about the manifest tag at all — the
+    manifest is small and bounded by construction
+    (:data:`_CONTINUATION_MANIFEST_ID_CAP`), so protecting it never risks
+    reproducing the oversized-checkpoint regression the ``max_bytes`` budget
+    itself exists to prevent (unlike ``quick_start_goal``'s own per-item
+    contract detail, which full/delta deliberately leaves unbounded — see
+    ``generate_handoff``'s ``checkpoint`` docstring — and therefore stays
+    fully truncatable, past the protected floor, exactly like today).
+
     ``max_bytes`` is a budget on the RETURNED string, marker included
     (60eed526) — the appended truncation marker itself is not free bytes
     outside the budget it is reporting against. The cut point below reserves
@@ -6216,7 +6230,6 @@ def _render_delta_handoff(
             kind = (t.get("kind") or "").upper()
             desc = (t.get("description") or "").strip()[:200]
             lines.append(f"- [{kind}] {desc}")
-    lines += ["", "Next:", quick_start_goal]
     if continuation_manifest is not None:
         # 836ca1d5 — durable continuation manifest: canonical revision_hash/
         # counter (board_snapshot.py) so a resuming session (or load_handoff,
@@ -6225,6 +6238,25 @@ def _render_delta_handoff(
         # one. Compact/sorted-keys JSON, matching canonical_json's own
         # discipline in board_snapshot.py, so the tag's content is
         # deterministic for a given manifest.
+        #
+        # 455cfc36 — deliberately emitted BEFORE "Next:"/quick_start_goal,
+        # not after. quick_start_goal embeds a <goal_token>+SECURITY banner
+        # near ITS OWN top (_mint_and_embed_goal_token), and
+        # format_handoff_mcp_content's truncation NEVER cuts through or
+        # before that banner's end — so anything positioned before the
+        # banner is structurally protected from truncation for free, while
+        # anything after it is not. Confirmed live reproduction: with the
+        # manifest positioned AFTER quick_start_goal (the old order), a
+        # generate_handoff(mode='delta', version='current') call that
+        # correctly resolved scope=current could still return content with a
+        # TRUNCATED marker that had silently dropped the manifest — the one
+        # thing criterion 1 requires never be truncated. Moving it here
+        # costs nothing (the manifest is small and bounded by construction,
+        # see _CONTINUATION_MANIFEST_ID_CAP), unlike quick_start_goal's own
+        # per-item contract detail, which full/delta deliberately leaves
+        # UNBOUNDED and therefore stays fully truncatable, exactly as today
+        # (see generate_handoff's `checkpoint` docstring for why capping
+        # construction there would be wrong).
         lines += [
             "",
             "<continuation_manifest>",
@@ -6233,6 +6265,7 @@ def _render_delta_handoff(
             ),
             "</continuation_manifest>",
         ]
+    lines += ["", "Next:", quick_start_goal]
     if run_timeline is not None:
         # 79491e26 — durable, deterministic run-timeline reconstruction (see
         # build_run_timeline_for_handoff's docstring) embedded the same way
@@ -9882,6 +9915,7 @@ async def generate_handoff(
     emit_manifest: bool = False,
     research_evidence_envelope: Any = None,
     proposal_scope: "dict[str, Any] | None" = None,
+    goal_string_out: "dict[str, Any] | None" = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -10058,6 +10092,25 @@ async def generate_handoff(
     either argument at its default (every pre-existing call site) sees ZERO
     functional change to ``(path, content, amended)`` or to ``content``
     itself — this never touches the rendered template.
+
+    ``goal_string_out`` (455cfc36) — optional output dict, same purely-
+    additive out-param shape as ``evidence_status``/``proposal_scope``
+    above. When given (any dict, typically ``{}``), it is populated with
+    ``{"goal_string": ..., "version": ...}`` where ``goal_string`` is the
+    EXACT canonical, token-embedded ``quick_start_goal`` text this call
+    already rendered into ``content`` — the same complete trusted
+    executable continuation block (``<goal_token>``, execution policy,
+    proposal scope, project-start config) every full/delta handoff embeds,
+    with zero independent re-assembly and zero second token mint. Exists so
+    a caller like ``checkpoint()`` can populate its own compact ``next_goal``
+    field from the SAME canonical payload the returned ``content`` carries,
+    instead of hand-rolling a separate, un-tokenized summary string (the
+    confirmed live gap this closes — see ``handle_checkpoint``). Only
+    populated for ``mode in {"full", "delta"}`` (the only modes that reach
+    the shared ``_mint_and_embed_goal_token`` call site below); a caller
+    that passes ``None`` (every pre-existing call site) sees zero
+    functional change to ``(path, content, amended)`` or to ``content``
+    itself.
 
     ``mode='delta'`` (836ca1d5) additionally embeds a durable continuation
     manifest — see :func:`build_continuation_manifest` — as a
@@ -10979,6 +11032,20 @@ async def generate_handoff(
     # starter/compact path via _generate_starter_handoff, which previously
     # built its own quick_start_goal but never called this).
     quick_start_goal = await _mint_and_embed_goal_token(db, project_id, quick_start_goal)
+    # 455cfc36 — expose the EXACT canonical, token-embedded goal string a
+    # caller like checkpoint() can reuse verbatim instead of independently
+    # re-assembling its own next_goal summary (the confirmed live gap: a
+    # hand-rolled f-string with no <goal_token>, no execution_policy, no
+    # proposal_scope — not "a complete trusted executable continuation
+    # block"). Pure ADDITION, mirroring the existing evidence_status/
+    # proposal_scope out-param convention: a caller that passes None (every
+    # pre-existing call site) sees zero functional change. Only reached for
+    # mode in {"full", "delta"} — starter/compact/goal mint their own token
+    # in their own early-return helpers and are not in scope for this
+    # out-param (checkpoint() only ever calls mode="delta").
+    if goal_string_out is not None:
+        goal_string_out["goal_string"] = quick_start_goal
+        goal_string_out["version"] = _effective_version
 
     # Split tasks into L1 (last 10) and L2 (older).
     l1_tasks = tasks[:10]
