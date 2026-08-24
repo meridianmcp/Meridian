@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import difflib
 import hashlib
 import io
 import json
@@ -18824,3 +18825,1232 @@ def apply_and_merge_batch_transform(
         "render_verified": merge_result.get("render_verified"),
     }
     return {**merge_result, "batch_receipt": batch_receipt}
+
+
+# ---------------------------------------------------------------------------
+# 3d0769ab (MDE-B1 P0) -- raw-OOXML equation integrity auditor + golden
+# fixtures.
+#
+# Builds ALONGSIDE the existing equation infrastructure this module already
+# ships and tests (parse_docx_equations_local, _validate_omml_structure,
+# _equation_semantic_manifest, audit_equation_style) rather than replacing
+# any of it -- audit_equation_style already covers alignment/punctuation/
+# explicit-numbering STYLE; this section adds a distinct, read-only
+# INTEGRITY layer that looks past "does an <m:oMath> exist" to ask "is the
+# math actually intact": duplicated plaintext, missing OMML masquerading as
+# prose, two equations spliced into one <m:oMath>, and numbering-scope
+# ambiguity a flat integer-gap check alone cannot see. It also builds
+# alongside (not on top of) ooxml_integrity.py's package-level (ZIP/XML/
+# relationship/comment-namespace) integrity work -- that module answers "is
+# this a Word-safe package"; this section answers "is the MATH in a
+# Word-safe package actually correct".
+#
+# NEVER call an equation healthy solely because an <m:oMath> element exists
+# -- every finding type below exists specifically because OMML presence
+# alone is an insufficient health signal (see MDE-B1's own acceptance
+# criteria).
+# ---------------------------------------------------------------------------
+
+EQUATION_FINDING_PLAINTEXT_MATH_DUPLICATE = "plaintext_math_duplicate"
+EQUATION_FINDING_MISSING_OMML = "missing_omml"
+EQUATION_FINDING_MERGED_OMML_SUSPECTED = "merged_omml_suspected"
+EQUATION_FINDING_NUMBER_GAP = "equation_number_gap"
+EQUATION_FINDING_NUMBER_DUPLICATE = "equation_number_duplicate"
+EQUATION_FINDING_NUMBER_SCOPE_AMBIGUOUS = "equation_number_scope_ambiguous"
+EQUATION_FINDING_REFERENCE_STRUCTURE_MISMATCH = "reference_structure_mismatch"
+
+EQUATION_FINDING_TYPES: tuple[str, ...] = (
+    EQUATION_FINDING_PLAINTEXT_MATH_DUPLICATE,
+    EQUATION_FINDING_MISSING_OMML,
+    EQUATION_FINDING_MERGED_OMML_SUSPECTED,
+    EQUATION_FINDING_NUMBER_GAP,
+    EQUATION_FINDING_NUMBER_DUPLICATE,
+    EQUATION_FINDING_NUMBER_SCOPE_AMBIGUOUS,
+    EQUATION_FINDING_REFERENCE_STRUCTURE_MISMATCH,
+)
+
+# A "duplicate plaintext" match must be at least this many non-whitespace
+# characters AND contain at least one of the structural/operator characters
+# below -- a lone one- or two-character variable mention in ordinary prose
+# ("as x grows...") must never trip this finding just because that same
+# letter also appears inside a nearby equation's flattened text.
+_EQUATION_DUP_MIN_CHARS = 3
+_EQUATION_OPERATOR_CHARS = frozenset("=+-*/^_<>≈≤≥±√∑∫")
+
+# Recognizes a whole paragraph/cell that IS an equation in plaintext form --
+# "F = ma", "E=mc^2" -- deliberately narrow (full-string match, not a
+# substring search) so ordinary prose that merely CONTAINS an "=" in passing
+# is never mistaken for a missing-OMML equation.
+_PLAINTEXT_EQUATION_RE = re.compile(
+    r"^[A-Za-zΑ-ω][\w.]*\s*=\s*[^=]+$"
+)
+
+_EQ_SHAPE_DOTTED = re.compile(r"^\(\s*(\d+)\.(\d+)[a-zA-Z]?\s*\)$")
+_EQ_SHAPE_LETTERED = re.compile(r"^\(\s*([A-Za-z])\.(\d+)[a-zA-Z]?\s*\)$")
+_EQ_SHAPE_PURE_INT = re.compile(r"^\(\s*(\d+)[a-zA-Z]?\s*\)$")
+
+
+def _classify_equation_number_shape(number_text: "str | None") -> "dict[str, Any] | None":
+    """Classify one equation-number LABEL's SHAPE for numbering-scope
+    tracking -- distinct from :func:`_leading_equation_number`'s single
+    leading integer (used for flat 1..N gap detection): a document may
+    legitimately use more than one numbering CONVENTION at once (flat
+    ``(1)``, sectioned ``(2.3)``, appendix ``(A.1)``) and mixing them is a
+    scope-ambiguity SIGNAL, not automatically an error.
+
+    Returns ``{"shape": "pure_int" | "dotted" | "lettered" | "other",
+    "scope_key": <str | None>}`` -- ``scope_key`` groups numbers that share
+    the same local counter (the section number for "dotted", the letter for
+    "lettered", ``"document"`` for a flat "pure_int" sequence, ``None`` for
+    "other"/non-numeric labels which have no well-defined scope). Returns
+    ``None`` for a blank/missing label.
+    """
+    if not number_text:
+        return None
+    normalized = re.sub(r"\s+", "", number_text)
+    m = _EQ_SHAPE_DOTTED.match(normalized)
+    if m:
+        return {"shape": "dotted", "scope_key": m.group(1)}
+    m = _EQ_SHAPE_LETTERED.match(normalized)
+    if m:
+        return {"shape": "lettered", "scope_key": m.group(1).upper()}
+    m = _EQ_SHAPE_PURE_INT.match(normalized)
+    if m:
+        return {"shape": "pure_int", "scope_key": "document"}
+    return {"shape": "other", "scope_key": None}
+
+
+def _omml_token_sequence(omath_el: "ET.Element") -> "list[str]":
+    """A deterministic, prefix-invariant structural fingerprint sequence for
+    one ``<m:oMath>`` tree.
+
+    Walks every descendant in document order (``ET.Element.iter`` is
+    pre-order depth-first). Structural elements contribute their bare tag
+    name (``ET.Element.tag`` is already ``{namespace-uri}localname`` --
+    comparison is by namespace URI, never by the serialized prefix, so two
+    equations differing only in ``ns10:`` vs ``m:`` prefixing produce an
+    IDENTICAL sequence). Text leaves (``<m:t>``) contribute their stripped
+    text content as ``"t:<text>"`` -- stripped so insignificant surrounding
+    whitespace from a different pretty-printer never counts as a structural
+    difference, but the actual math content (numbers, variable names,
+    operators) is preserved and DOES count. Empty/whitespace-only text
+    leaves contribute nothing (they carry no math content).
+
+    This sequence is what :func:`compare_equation_structures` diffs --
+    identical sequences mean two equations are structurally equivalent
+    regardless of XML prefix or formatting; a diff pinpoints exactly which
+    structural element or text token changed.
+    """
+    tokens: list[str] = []
+    for element in omath_el.iter():
+        tag = element.tag.rsplit("}", 1)[-1] if "}" in element.tag else element.tag
+        if tag == "t":
+            text = (element.text or "").strip()
+            if text:
+                tokens.append(f"t:{text}")
+        else:
+            tokens.append(tag)
+    return tokens
+
+
+def _omml_structure_hash(token_sequence: "list[str]") -> str:
+    """Deterministic sha256 over a token sequence -- identical inputs always
+    hash identically; a single changed/added/removed token always changes
+    it."""
+    return hashlib.sha256("\x1f".join(token_sequence).encode("utf-8")).hexdigest()
+
+
+def _split_omath_top_level_segments(omath_el: "ET.Element") -> "list[list[ET.Element]]":
+    """``omath_el``'s DIRECT children split into contiguous segments at any
+    child whose own flattened text is non-empty but entirely whitespace --
+    the telltale seam of two equations' XML naively concatenated with a
+    single joining space. Shared by :func:`_detect_merged_omml` (flattened-
+    text view, for the audit finding) and :func:`repair_equation_batch`'s
+    ``split_merged_omml`` (element view, to build the replacement
+    ``<m:oMath>`` trees) so detection and repair can never disagree about
+    where the seam is.
+    """
+    segments: list[list[ET.Element]] = []
+    current: list[ET.Element] = []
+    for child in list(omath_el):
+        text = "".join(t.text or "" for t in child.iter(_qm("t")))
+        if text != "" and text.strip() == "":
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(child)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _detect_merged_omml(omath_el: "ET.Element") -> "dict[str, Any] | None":
+    """Heuristically detect two originally-separate equations spliced into
+    one ``<m:oMath>``.
+
+    Looks only at ``omath_el``'s top-level structure (see
+    :func:`_split_omath_top_level_segments`) -- a normal equation's internal
+    fractions/subscripts/etc. are always nested inside a structural wrapper
+    (``m:f``, ``m:sSub``, ...), never siblings separated by a whitespace-
+    only run, so an ordinary multi-run equation like ``x + y = z`` (one
+    segment, no internal whitespace-only child) never segments at all. If
+    2+ resulting segments EACH contain their own top-level ``"="`` (each
+    segment reads as a complete, independent equality), this is flagged as
+    a suspected merge.
+    """
+    if len(list(omath_el)) < 2:
+        return None
+    segments = _split_omath_top_level_segments(omath_el)
+    if len(segments) < 2:
+        return None
+
+    equation_like_segments: list[str] = []
+    for segment in segments:
+        flat = "".join(
+            _omml_flatten_text_local(ET.tostring(child, encoding="unicode"))
+            for child in segment
+        )
+        if "=" in flat:
+            equation_like_segments.append(flat.strip())
+
+    if len(equation_like_segments) < 2:
+        return None
+
+    return {
+        "segment_count": len(segments),
+        "equation_like_segments": equation_like_segments,
+    }
+
+
+def _paragraph_prose_text(p_element: "ET.Element") -> str:
+    """Concatenate a paragraph's plain ``<w:t>`` text only -- ``<m:t>`` lives
+    in the separate math namespace (``_M``), so this NEVER includes an
+    equation's own flattened content, making it exactly the "surrounding
+    plaintext" :func:`audit_equation_integrity` compares an equation's flat
+    text against for duplicate-plaintext detection."""
+    return "".join(t.text or "" for t in p_element.iter(_q(_W, "t")))
+
+
+def _plain_text_overlap(equation_flat_text: str, prose_text: str) -> "dict[str, Any]":
+    """Detect whether ``prose_text`` contains a near-duplicate of
+    ``equation_flat_text`` -- the "same math written out twice" defect.
+
+    Both sides are whitespace-collapsed before comparison so trivial
+    formatting differences (extra spaces from separate runs) never mask a
+    real duplicate. Requires the equation side to be at least
+    :data:`_EQUATION_DUP_MIN_CHARS` characters AND contain at least one
+    operator/structural character -- a bare single-letter variable name can
+    never itself trigger this (protects legitimate prose like "as x grows"
+    from a nearby unrelated equation that happens to also use ``x``).
+    """
+    eq_norm = re.sub(r"\s+", "", equation_flat_text)
+    prose_norm = re.sub(r"\s+", "", prose_text)
+    has_duplicate = (
+        len(eq_norm) >= _EQUATION_DUP_MIN_CHARS
+        and any(ch in _EQUATION_OPERATOR_CHARS for ch in eq_norm)
+        and eq_norm in prose_norm
+    )
+    return {
+        "has_duplicate_plaintext": has_duplicate,
+        "matched_text": equation_flat_text.strip() if has_duplicate else None,
+    }
+
+
+def _build_equation_section_paths(body: "ET.Element") -> "dict[int, list[str]]":
+    """One heading-stack section path per DIRECT ``body`` child index --
+    works uniformly for both standalone ``<w:p>`` equations and ``<w:tbl>``
+    numbered-equation tables since both are direct children of ``body``.
+    Mirrors :func:`document_outline`'s heading-stack walk, scoped to just
+    the (level, text) stack instead of the full outline record shape
+    :func:`audit_equation_integrity` does not need."""
+    stack: list[tuple[int, str]] = []
+    paths: dict[int, list[str]] = {}
+    w_p = _q(_W, "p")
+    for body_child_idx, child in enumerate(body):
+        if child.tag == w_p:
+            ppr = child.find(_q(_W, "pPr"))
+            style = None
+            if ppr is not None:
+                pstyle = ppr.find(_q(_W, "pStyle"))
+                if pstyle is not None:
+                    style = pstyle.get(_q(_W, "val"))
+            if _is_heading(style):
+                level = _heading_level(style)
+                while stack and stack[-1][0] >= level:
+                    stack.pop()
+                text = _paragraph_prose_text(child).strip()
+                stack.append((level, text))
+        paths[body_child_idx] = [text for _, text in stack]
+    return paths
+
+
+def audit_equation_integrity(source: "str | bytes | bytearray") -> "dict[str, Any]":
+    """3d0769ab (MDE-B1) -- read-only raw-OOXML equation INTEGRITY audit.
+
+    Distinct from, and complementary to, :func:`audit_equation_style`
+    (alignment/punctuation/explicit-number-gap STYLE) and
+    :func:`_equation_semantic_manifest` (structural preservation across a
+    single write operation): this walks the RAW OOXML directly and never
+    treats "an <m:oMath> element exists" as proof the equation is healthy.
+
+    Args:
+      source: Path to a .docx, or its raw bytes. Read-only -- never mutates
+               anything.
+
+    Returns:
+      ``{document_path, source_fingerprint, equation_count, records,
+      findings, finding_count, findings_by_type}`` or ``{"error": ...}``
+      when the source cannot be read/parsed.
+
+      ``records``: one stable entry per detected equation-bearing anchor --
+      ``{anchor, pattern, section_path, ordinal, omml_count, token_sequence,
+      structure_hash, flat_text, number, numbering_scope,
+      plain_text_overlap}``. ``pattern`` is ``"standalone"`` or
+      ``"table-numbered"`` (mirrors :func:`parse_docx_equations_local`'s own
+      two patterns). ``anchor`` is the containing paragraph's ``w14:paraId``
+      when present, else a positional fallback (``p{n}``/``tbl{n}``).
+
+      ``findings``: typed, structured (never free-text-only) entries, one
+      of :data:`EQUATION_FINDING_TYPES`, each carrying enough identity
+      (``anchor`` and/or ``number``) to locate the defect without
+      re-parsing the document.
+    """
+    if isinstance(source, (bytes, bytearray)):
+        raw = bytes(source)
+    else:
+        try:
+            with open(source, "rb") as handle:
+                raw = handle.read()
+        except OSError as exc:
+            return {"error": str(exc)}
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            document_xml = archive.read("word/document.xml")
+    except (KeyError, zipfile.BadZipFile) as exc:
+        return {"error": str(exc)}
+
+    try:
+        root = ET.fromstring(document_xml)
+    except ET.ParseError as exc:
+        return {"error": str(exc)}
+
+    source_fingerprint = hashlib.sha256(raw).hexdigest()
+    document_path = source if isinstance(source, str) else None
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {
+            "document_path": document_path,
+            "source_fingerprint": source_fingerprint,
+            "equation_count": 0,
+            "records": [],
+            "findings": [],
+            "finding_count": 0,
+            "findings_by_type": {},
+        }
+
+    section_paths = _build_equation_section_paths(body)
+
+    w_p = _q(_W, "p")
+    w_tbl = _q(_W, "tbl")
+    w_tr = _q(_W, "tr")
+    w_tc = _q(_W, "tc")
+    w14_para_id = _q(_W14, "paraId")
+    m_omath = _qm("oMath")
+
+    records: list[dict[str, Any]] = []
+    findings: list[dict[str, Any]] = []
+    ordinal = 0
+
+    def _record_equation(
+        *, anchor: str, pattern: str, section_path: list[str],
+        omath_el: "ET.Element", omml_count: int, number: "str | None",
+        prose_text: str,
+    ) -> None:
+        nonlocal ordinal
+        token_sequence = _omml_token_sequence(omath_el)
+        flat_text = _omml_flatten_text_local(ET.tostring(omath_el, encoding="unicode"))
+        overlap = _plain_text_overlap(flat_text, prose_text)
+        merged = _detect_merged_omml(omath_el)
+        numbering_scope = _classify_equation_number_shape(number)
+        records.append({
+            "anchor": anchor,
+            "pattern": pattern,
+            "section_path": section_path,
+            "ordinal": ordinal,
+            "omml_count": omml_count,
+            "token_sequence": token_sequence,
+            "structure_hash": _omml_structure_hash(token_sequence),
+            "flat_text": flat_text,
+            "number": number,
+            "numbering_scope": numbering_scope,
+            "plain_text_overlap": overlap,
+        })
+        if overlap["has_duplicate_plaintext"]:
+            findings.append({
+                "type": EQUATION_FINDING_PLAINTEXT_MATH_DUPLICATE,
+                "anchor": anchor,
+                "ordinal": ordinal,
+                "matched_text": overlap["matched_text"],
+            })
+        if merged is not None:
+            findings.append({
+                "type": EQUATION_FINDING_MERGED_OMML_SUSPECTED,
+                "anchor": anchor,
+                "ordinal": ordinal,
+                **merged,
+            })
+        ordinal += 1
+
+    for body_child_idx, child in enumerate(body):
+        section_path = section_paths.get(body_child_idx, [])
+
+        if child.tag == w_p:
+            omaths = child.findall(f".//{m_omath}")
+            if omaths:
+                anchor = child.get(w14_para_id) or f"p{body_child_idx}"
+                prose_text = _paragraph_prose_text(child)
+                for omath_el in omaths:
+                    _record_equation(
+                        anchor=anchor, pattern="standalone", section_path=section_path,
+                        omath_el=omath_el, omml_count=len(omaths), number=None,
+                        prose_text=prose_text,
+                    )
+            else:
+                text = _paragraph_prose_text(child).strip()
+                if text and _PLAINTEXT_EQUATION_RE.match(text):
+                    anchor = child.get(w14_para_id) or f"p{body_child_idx}"
+                    findings.append({
+                        "type": EQUATION_FINDING_MISSING_OMML,
+                        "anchor": anchor,
+                        "pattern": "standalone",
+                        "section_path": section_path,
+                        "plain_text": text,
+                    })
+
+        elif child.tag == w_tbl:
+            for tr in child.findall(f".//{w_tr}"):
+                cells = tr.findall(w_tc)
+                if len(cells) < 2:
+                    continue
+                number_text = _cell_text(cells[1]).strip()
+                if not _EQ_NUMBER_RE.match(number_text):
+                    continue
+                cell0_para = cells[0].find(w_p)
+                anchor = (
+                    (cell0_para.get(w14_para_id) if cell0_para is not None else None)
+                    or f"tbl{body_child_idx}"
+                )
+                if not _cell_has_omath(cells[0]):
+                    findings.append({
+                        "type": EQUATION_FINDING_MISSING_OMML,
+                        "anchor": anchor,
+                        "pattern": "table-numbered",
+                        "section_path": section_path,
+                        "number": number_text,
+                        "plain_text": _cell_text(cells[0]).strip(),
+                    })
+                    continue
+
+                row_prose = "".join(_cell_text(c) for i, c in enumerate(cells) if i != 0)
+                omaths = cells[0].findall(f".//{m_omath}")
+                for omath_el in omaths:
+                    _record_equation(
+                        anchor=anchor, pattern="table-numbered", section_path=section_path,
+                        omath_el=omath_el, omml_count=len(omaths), number=number_text,
+                        prose_text=row_prose,
+                    )
+
+    # Cross-equation findings: numbering duplicates/gaps/scope-ambiguity and
+    # reference/structure-identity mismatches -- computed once over every
+    # numbered record, mirroring audit_equation_style's own duplicate/gap
+    # pass but as typed findings on the SAME response this function already
+    # builds (never a separate call a caller must remember to also make).
+    numbered = [r for r in records if r["number"]]
+    by_norm_number: dict[str, list[dict[str, Any]]] = {}
+    for r in numbered:
+        norm = re.sub(r"\s+", "", r["number"])
+        by_norm_number.setdefault(norm, []).append(r)
+
+    shapes_seen: set[str] = set()
+    for group in by_norm_number.values():
+        shapes_seen.add((group[0]["numbering_scope"] or {}).get("shape", "other"))
+        if len(group) > 1:
+            findings.append({
+                "type": EQUATION_FINDING_NUMBER_DUPLICATE,
+                "number": group[0]["number"],
+                "anchors": [g["anchor"] for g in group],
+            })
+            distinct_hashes = {g["structure_hash"] for g in group}
+            if len(distinct_hashes) > 1:
+                findings.append({
+                    "type": EQUATION_FINDING_REFERENCE_STRUCTURE_MISMATCH,
+                    "number": group[0]["number"],
+                    "anchors": [g["anchor"] for g in group],
+                    "structure_hashes": sorted(distinct_hashes),
+                })
+
+    if len(shapes_seen - {"other"}) > 1:
+        findings.append({
+            "type": EQUATION_FINDING_NUMBER_SCOPE_AMBIGUOUS,
+            "shapes": sorted(shapes_seen - {"other"}),
+            "message": (
+                "this document mixes more than one equation-numbering "
+                "convention (e.g. flat and sectioned/lettered) -- a flat "
+                "1..N gap check cannot reliably interpret numbers across "
+                "different scopes"
+            ),
+        })
+
+    flat_shape_numbers = sorted({
+        value
+        for r in numbered
+        if (r["numbering_scope"] or {}).get("shape") == "pure_int"
+        for value in [_leading_equation_number(r["number"])]
+        if value is not None
+    })
+    if flat_shape_numbers:
+        expected_range = set(range(1, flat_shape_numbers[-1] + 1))
+        for missing in sorted(expected_range - set(flat_shape_numbers)):
+            findings.append({
+                "type": EQUATION_FINDING_NUMBER_GAP,
+                "missing_number": missing,
+                "scope": "document",
+            })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+
+    return {
+        "document_path": document_path,
+        "source_fingerprint": source_fingerprint,
+        "equation_count": len(records),
+        "records": records,
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+    }
+
+
+# ---------------------------------------------------------------------------
+# e4265dd1 (MDE-B2 P0) -- reference-aware equation diff and draft-only
+# staged repair.
+#
+# compare_equation_structures composes DIRECTLY on top of
+# audit_equation_integrity's own records (same anchors, same
+# structure_hash/token_sequence) rather than re-parsing or re-deriving
+# equation identity a second way. repair_equation_batch reuses MDE-8's own
+# draft/merge discipline (never write document_path itself; all-or-nothing;
+# a fixed, deterministic per-operation validation pass before any XML is
+# touched) and MDE-3's/tools.meridian_fallbacks' PatchManifest primitive
+# for the durable pre-write record every repair must emit.
+# ---------------------------------------------------------------------------
+
+_EQUATION_STRUCTURAL_TAG_LABELS: dict[str, str] = {
+    "sSub": "subscript", "sSup": "superscript", "sSubSup": "subscript_superscript",
+    "f": "fraction", "num": "fraction_numerator", "den": "fraction_denominator",
+    "nary": "summation_or_integral", "limLow": "limit", "limUpp": "limit",
+    "rad": "radical", "d": "delimiter", "func": "function", "acc": "accent",
+    "eqArr": "array_or_cases",
+}
+
+
+def _diff_token_sequences(reference_tokens: "list[str]", candidate_tokens: "list[str]") -> "dict[str, Any]":
+    """Structured, deterministic diff between two :func:`_omml_token_sequence`
+    outputs.
+
+    Identical sequences (the "equivalent XML prefix/whitespace" case --
+    token sequences are already prefix/whitespace-invariant by
+    construction) return ``{"equal": True, "changed_categories": [],
+    "opcodes": []}``. A real structural or content change is reported as a
+    non-empty ``changed_categories`` set (human-readable labels such as
+    ``"fraction"``, ``"subscript"``, ``"operator_or_value"`` -- see
+    :data:`_EQUATION_STRUCTURAL_TAG_LABELS`) plus the raw
+    ``difflib.SequenceMatcher`` opcodes (index ranges into each side) for a
+    caller that wants the exact positions.
+    """
+    matcher = difflib.SequenceMatcher(a=reference_tokens, b=candidate_tokens, autojunk=False)
+    opcodes = [op for op in matcher.get_opcodes() if op[0] != "equal"]
+    if not opcodes:
+        return {"equal": True, "changed_categories": [], "opcodes": []}
+
+    categories: set[str] = set()
+    for _tag, i1, i2, j1, j2 in opcodes:
+        for token in reference_tokens[i1:i2] + candidate_tokens[j1:j2]:
+            if token.startswith("t:"):
+                categories.add("operator_or_value")
+            else:
+                categories.add(_EQUATION_STRUCTURAL_TAG_LABELS.get(token, token))
+
+    return {
+        "equal": False,
+        "changed_categories": sorted(categories),
+        "opcodes": [
+            {"op": tag, "reference_range": [i1, i2], "candidate_range": [j1, j2]}
+            for tag, i1, i2, j1, j2 in opcodes
+        ],
+    }
+
+
+def _compare_one_equation(
+    reference_record: "dict[str, Any] | None",
+    candidate_record: "dict[str, Any] | None",
+    *, match_basis: str,
+) -> "dict[str, Any]":
+    if reference_record is None and candidate_record is None:
+        raise ValueError("_compare_one_equation requires at least one of reference_record/candidate_record")
+    if reference_record is None:
+        return {
+            "reference_anchor": None,
+            "candidate_anchor": candidate_record["anchor"],
+            "number": candidate_record.get("number"),
+            "section_path": candidate_record.get("section_path"),
+            "numbering_scope": candidate_record.get("numbering_scope"),
+            "match_basis": match_basis,
+            "classification": "added_in_candidate",
+            "reference_structure_hash": None,
+            "candidate_structure_hash": candidate_record["structure_hash"],
+            "token_diff": None,
+        }
+    if candidate_record is None:
+        return {
+            "reference_anchor": reference_record["anchor"],
+            "candidate_anchor": None,
+            "number": reference_record.get("number"),
+            "section_path": reference_record.get("section_path"),
+            "numbering_scope": reference_record.get("numbering_scope"),
+            "match_basis": match_basis,
+            "classification": "missing_in_candidate",
+            "reference_structure_hash": reference_record["structure_hash"],
+            "candidate_structure_hash": None,
+            "token_diff": None,
+        }
+    token_diff = _diff_token_sequences(reference_record["token_sequence"], candidate_record["token_sequence"])
+    return {
+        "reference_anchor": reference_record["anchor"],
+        "candidate_anchor": candidate_record["anchor"],
+        "number": candidate_record.get("number") or reference_record.get("number"),
+        "section_path": candidate_record.get("section_path"),
+        "numbering_scope": candidate_record.get("numbering_scope") or reference_record.get("numbering_scope"),
+        "match_basis": match_basis,
+        "classification": "equivalent" if token_diff["equal"] else "structural_change",
+        "reference_structure_hash": reference_record["structure_hash"],
+        "candidate_structure_hash": candidate_record["structure_hash"],
+        "token_diff": token_diff,
+    }
+
+
+def compare_equation_structures(
+    reference_source: "str | bytes | bytearray",
+    candidate_source: "str | bytes | bytearray",
+) -> "dict[str, Any]":
+    """e4265dd1 (MDE-B2) -- reference-aware structural comparison between two
+    documents' equations (typically a prior-accepted revision vs a new
+    candidate, or a canonical source vs an isolated draft).
+
+    Composes directly on :func:`audit_equation_integrity` for BOTH sides --
+    identity and structure come from the exact same records this module's
+    audit already produces, never a second, parallel extraction path.
+
+    Matching (equation IDENTITY across the two documents):
+      1. **By explicit number** (strongest signal) -- numbered equations
+         (``pattern="table-numbered"``) are matched by their normalized
+         number label. Multiple equations sharing one number on either side
+         are paired in document order; any that don't pair 1:1 are reported
+         as ``added_in_candidate``/``missing_in_candidate``.
+      2. **By stable anchor** -- remaining (unnumbered/standalone)
+         equations are matched by ``w14:paraId`` when it survived unchanged.
+      3. **By position** (degraded fallback, explicitly labeled
+         ``match_basis="position"``) -- an unnumbered equation whose anchor
+         changed is paired with the next unmatched candidate equation in
+         document order, since anchor identity is the only thing that
+         changed, not necessarily the equation.
+
+    Returns ``{reference_source_fingerprint, candidate_source_fingerprint,
+    equation_count_reference, equation_count_candidate, comparisons,
+    mismatch_count, reference_findings, candidate_findings}`` or
+    ``{"error": ...}`` when either side cannot be read/parsed.
+
+    Each ``comparisons`` entry: ``{reference_anchor, candidate_anchor,
+    number, section_path, numbering_scope, match_basis, classification,
+    reference_structure_hash, candidate_structure_hash, token_diff}`` --
+    ``classification`` is one of ``"equivalent"``, ``"structural_change"``,
+    ``"missing_in_candidate"``, ``"added_in_candidate"``. ``"equivalent"``
+    is exactly the "same equation, different XML prefix/whitespace" case;
+    ``"structural_change"`` distinguishes a real subscript/fraction/limit/
+    operator difference via ``token_diff["changed_categories"]``.
+    """
+    reference = audit_equation_integrity(reference_source)
+    if reference.get("error"):
+        return {"error": f"reference_source: {reference['error']}"}
+    candidate = audit_equation_integrity(candidate_source)
+    if candidate.get("error"):
+        return {"error": f"candidate_source: {candidate['error']}"}
+
+    ref_by_number: dict[str, list[dict[str, Any]]] = {}
+    ref_unnumbered: list[dict[str, Any]] = []
+    for r in reference["records"]:
+        if r["number"]:
+            ref_by_number.setdefault(re.sub(r"\s+", "", r["number"]), []).append(r)
+        else:
+            ref_unnumbered.append(r)
+
+    cand_by_number: dict[str, list[dict[str, Any]]] = {}
+    cand_unnumbered: list[dict[str, Any]] = []
+    for c in candidate["records"]:
+        if c["number"]:
+            cand_by_number.setdefault(re.sub(r"\s+", "", c["number"]), []).append(c)
+        else:
+            cand_unnumbered.append(c)
+
+    comparisons: list[dict[str, Any]] = []
+
+    for norm_number, ref_group in ref_by_number.items():
+        cand_group = cand_by_number.get(norm_number, [])
+        for i, ref_rec in enumerate(ref_group):
+            cand_rec = cand_group[i] if i < len(cand_group) else None
+            comparisons.append(_compare_one_equation(ref_rec, cand_rec, match_basis="number"))
+        for extra in cand_group[len(ref_group):]:
+            comparisons.append(_compare_one_equation(None, extra, match_basis="number"))
+
+    remaining_cand = list(cand_unnumbered)
+    for ref_rec in ref_unnumbered:
+        match_idx = next(
+            (i for i, c in enumerate(remaining_cand) if c["anchor"] == ref_rec["anchor"]),
+            None,
+        )
+        match_basis = "anchor"
+        if match_idx is None and remaining_cand:
+            match_idx = 0
+            match_basis = "position"
+        cand_rec = remaining_cand.pop(match_idx) if match_idx is not None else None
+        comparisons.append(
+            _compare_one_equation(ref_rec, cand_rec, match_basis=match_basis if cand_rec is not None else "none")
+        )
+    for extra in remaining_cand:
+        comparisons.append(_compare_one_equation(None, extra, match_basis="none"))
+
+    return {
+        "reference_source_fingerprint": reference["source_fingerprint"],
+        "candidate_source_fingerprint": candidate["source_fingerprint"],
+        "equation_count_reference": reference["equation_count"],
+        "equation_count_candidate": candidate["equation_count"],
+        "comparisons": comparisons,
+        "mismatch_count": sum(1 for c in comparisons if c["classification"] != "equivalent"),
+        "reference_findings": reference["findings"],
+        "candidate_findings": candidate["findings"],
+    }
+
+
+EQUATION_REPAIR_REMOVE_DUPLICATE_PLAINTEXT = "remove_duplicate_plaintext"
+EQUATION_REPAIR_SPLIT_MERGED_OMML = "split_merged_omml"
+EQUATION_REPAIR_RESTORE_MISSING_OMML = "restore_missing_omml"
+EQUATION_REPAIR_RENUMBER_EQUATION = "renumber_equation"
+EQUATION_REPAIR_MANUAL_REVIEW_REQUIRED = "manual_review_required"
+
+EQUATION_REPAIR_CLASSES: tuple[str, ...] = (
+    EQUATION_REPAIR_REMOVE_DUPLICATE_PLAINTEXT,
+    EQUATION_REPAIR_SPLIT_MERGED_OMML,
+    EQUATION_REPAIR_RESTORE_MISSING_OMML,
+    EQUATION_REPAIR_RENUMBER_EQUATION,
+    EQUATION_REPAIR_MANUAL_REVIEW_REQUIRED,
+)
+
+# e4265dd1 -- soft dependency on tools/meridian_fallbacks/patch_manifest.py's
+# existing PatchManifest primitive (reused, not reimplemented, per this
+# item's explicit acceptance criteria). Wrapped in try/except rather than a
+# hard top-level import: this package's OTHER cross-boundary references
+# (see research_graph_document_identity's docstring) are deliberately
+# duplicated rather than imported so extensions/meridian-docs keeps working
+# as a standalone pip install with no access to the rest of this monorepo's
+# tree -- repair_equation_batch is the one function that genuinely needs
+# the real primitive (not just its shape), so it fails closed with a clear
+# error message when unavailable rather than silently reimplementing a
+# parallel, potentially-drifting manifest format.
+try:
+    from tools.meridian_fallbacks.patch_manifest import PatchManifest as _EquationPatchManifest  # noqa: PLC0415
+except ImportError:  # pragma: no cover - exercised only outside this monorepo checkout
+    _EquationPatchManifest = None  # type: ignore[assignment]
+
+
+def _equation_manifest_content_hash(manifest: "Any") -> str:
+    """Deterministic content hash over a :class:`PatchManifest`'s STABLE
+    fields only -- excludes ``manifest_id`` (uuid4) and every timestamp
+    (``created_at``/``applied_at``, wall-clock), which are inherently
+    non-deterministic by that class's own design. The same document plus
+    the same operations list always yields the same
+    ``manifest_content_hash`` across repeated calls, even though two such
+    calls mint DIFFERENT real manifests (different ids/timestamps) -- this
+    is what "reproducible/deterministic patch manifest" means in practice
+    for a primitive whose durable-record semantics require a fresh identity
+    and timestamp per real invocation."""
+    payload = {
+        "target_docx_path": manifest.target_docx_path,
+        "base_sha256": manifest.base_sha256,
+        "operations": [
+            {
+                "kind": op.kind,
+                "target_part": op.target_part,
+                "description": op.description,
+                "metadata": op.metadata,
+            }
+            for op in manifest.operations
+        ],
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _find_any_paragraph(body: "ET.Element", target_id: "str | None") -> "ET.Element | None":
+    """Locate a ``<w:p>`` anywhere under ``body`` (including inside table
+    cells) by its ``w14:paraId``."""
+    w_p = _q(_W, "p")
+    w14_para_id = _q(_W14, "paraId")
+    for p in body.iter(w_p):
+        if p.get(w14_para_id) == target_id:
+            return p
+    return None
+
+
+def _find_direct_child_paragraph(body: "ET.Element", target_id: "str | None") -> "ET.Element | None":
+    """Locate a ``<w:p>`` that is a DIRECT child of ``body`` (never inside a
+    table cell) by its ``w14:paraId`` -- used by ``split_merged_omml``,
+    which needs to insert/remove sibling paragraphs at ``body`` level."""
+    w14_para_id = _q(_W14, "paraId")
+    for p in body.findall(_q(_W, "p")):
+        if p.get(w14_para_id) == target_id:
+            return p
+    return None
+
+
+def _find_row_by_equation_anchor(body: "ET.Element", target_id: "str | None") -> "ET.Element | None":
+    """Locate the ``<w:tr>`` whose FIRST cell's paragraph carries
+    ``target_id`` -- the numbered-equation row convention
+    :func:`parse_docx_equations_local`/:func:`audit_equation_integrity`
+    both already key on."""
+    w_tbl = _q(_W, "tbl")
+    w_tr = _q(_W, "tr")
+    w_tc = _q(_W, "tc")
+    w_p = _q(_W, "p")
+    w14_para_id = _q(_W14, "paraId")
+    for tbl in body.findall(w_tbl):
+        for tr in tbl.findall(f".//{w_tr}"):
+            cells = tr.findall(w_tc)
+            if not cells:
+                continue
+            cell0_para = cells[0].find(w_p)
+            if cell0_para is not None and cell0_para.get(w14_para_id) == target_id:
+                return tr
+    return None
+
+
+def repair_equation_batch(
+    document_path: str,
+    operations: "list[dict[str, Any]]",
+    draft_output_path: str,
+    *,
+    expected_source_fingerprint: "str | None" = None,
+) -> "dict[str, Any]":
+    """e4265dd1 (MDE-B2) -- draft-only staged repair for equation-integrity
+    defects :func:`audit_equation_integrity` already found.
+
+    ``document_path`` is opened READ-ONLY throughout and is NEVER the write
+    target -- ``draft_output_path`` is, mirroring :func:`apply_batch_transform`
+    (MDE-8)'s own contract exactly. A :class:`PatchManifest` (reused from
+    ``tools.meridian_fallbacks.patch_manifest``) is built and returned
+    BEFORE any write is attempted, for every outcome including a rejected
+    batch -- a durable, reviewable record of what was planned/attempted and
+    why, per this item's "every repair must first emit a patch manifest"
+    requirement. ALL-OR-NOTHING: if even one operation fails validation,
+    NOTHING is written -- ``draft_output_path`` is never created.
+
+    Args:
+      document_path:                The canonical .docx to repair. Read-only.
+      operations:                   Non-empty list of ``{"op_id": <optional
+                                    str>, "op_class": one of
+                                    :data:`EQUATION_REPAIR_CLASSES`,
+                                    "anchor": <required except for
+                                    "manual_review_required">,
+                                    "expected_structure_hash": <optional
+                                    staleness precondition>, ...op-specific
+                                    params: "omml"/"latex" for
+                                    restore_missing_omml, "new_number" for
+                                    renumber_equation}``.
+      draft_output_path:             Where to stage the repaired draft.
+                                    MUST differ from ``document_path``.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard (a prior
+                                    ``audit_equation_integrity``/
+                                    ``compare_equation_structures`` result's
+                                    ``source_fingerprint``).
+
+    Supported ``op_class`` values:
+      ``remove_duplicate_plaintext``: requires the anchor to currently carry
+        a ``plaintext_math_duplicate`` finding (standalone equations only);
+        removes the duplicating plaintext run(s), leaves the OMML intact.
+      ``split_merged_omml``: requires a ``merged_omml_suspected`` finding on
+        a STANDALONE anchor; splits the one ``<m:oMath>`` into two sibling
+        paragraphs along the exact seam :func:`_detect_merged_omml` found.
+      ``restore_missing_omml``: requires a ``missing_omml`` finding on the
+        anchor; caller supplies ``"omml"`` (raw ``<m:oMath>`` XML) or
+        ``"latex"``, validated via the same :func:`_resolve_omml` every
+        other equation writer in this module uses; replaces the plaintext
+        paragraph content with the resolved OMML.
+      ``renumber_equation``: requires the anchor to be a
+        ``pattern="table-numbered"`` equation; caller supplies
+        ``"new_number"``; rewrites the number cell's text via
+        :func:`_set_paragraph_text` (the SAME writer :func:`apply_batch_transform`
+        uses for its own ``set_text`` operation).
+      ``manual_review_required``: no mutation -- a deliberate no-op so an
+        ambiguous case can travel in the SAME batch/manifest as an audit
+        trail entry rather than being silently dropped by the caller.
+
+    Every anchor MUST resolve to a real ``w14:paraId`` -- a document with no
+    stable paragraph identity on the affected paragraph is reported
+    ``not_found`` rather than guessed at via a positional fallback (this
+    function never mutates via a fragile position-only match).
+
+    Returns on success: ``{"applied": True, "draft_output_path",
+    "patch_manifest" (the full :class:`PatchManifest`.to_dict()),
+    "manifest_content_hash" (deterministic -- see
+    :func:`_equation_manifest_content_hash`), "applied_operations", "write_transaction"}``.
+
+    Returns on failure: ``{"applied": False, "reason"/"error": ...,
+    "patch_manifest": ..., "conflicts": [...] (when the failure came from
+    per-operation validation)}`` -- ``document_path`` is never opened for
+    writing in that case.
+    """
+    if _EquationPatchManifest is None:
+        return {
+            "applied": False,
+            "error": "tools.meridian_fallbacks.patch_manifest is not importable in this environment",
+        }
+    if not isinstance(operations, list) or not operations:
+        return {"applied": False, "error": "operations must be a non-empty list"}
+    if not draft_output_path or not str(draft_output_path).strip():
+        return {"applied": False, "error": "draft_output_path is required"}
+    if os.path.normcase(os.path.abspath(draft_output_path)) == os.path.normcase(os.path.abspath(document_path)):
+        return {
+            "applied": False,
+            "error": (
+                "draft_output_path must differ from document_path -- a "
+                "repair's output must be an isolated draft artifact, never "
+                "the canonical source"
+            ),
+        }
+
+    audit = audit_equation_integrity(document_path)
+    if audit.get("error"):
+        return {"applied": False, "error": audit["error"]}
+
+    if expected_source_fingerprint and expected_source_fingerprint != audit["source_fingerprint"]:
+        return {
+            "applied": False,
+            "reason": "document_changed_since_planning",
+            "error": (
+                "document_path has changed since this repair batch was "
+                f"planned (expected source_fingerprint {expected_source_fingerprint!r}, "
+                f"current {audit['source_fingerprint']!r})"
+            ),
+        }
+
+    records_by_anchor: dict[str, list[dict[str, Any]]] = {}
+    for r in audit["records"]:
+        records_by_anchor.setdefault(r["anchor"], []).append(r)
+    anchors_with_findings = {f["anchor"] for f in audit["findings"] if f.get("anchor")}
+
+    resolved: list[dict[str, Any]] = []
+    seen_anchors: dict[str, str] = {}
+
+    for index, op in enumerate(operations):
+        raw_op_id = op.get("op_id") if isinstance(op, dict) else None
+        op_id = str(raw_op_id).strip() if raw_op_id and str(raw_op_id).strip() else f"op{index}"
+
+        if not isinstance(op, dict) or op.get("op_class") not in EQUATION_REPAIR_CLASSES:
+            resolved.append({
+                "op_id": op_id, "op": op, "status": "invalid",
+                "reason": f"op_class must be one of {EQUATION_REPAIR_CLASSES}",
+            })
+            continue
+        op_class = op["op_class"]
+
+        if op_class == EQUATION_REPAIR_MANUAL_REVIEW_REQUIRED:
+            resolved.append({"op_id": op_id, "op": op, "status": "ok", "reason": None, "no_op": True})
+            continue
+
+        anchor = op.get("anchor")
+        if not anchor:
+            resolved.append({
+                "op_id": op_id, "op": op, "status": "invalid",
+                "reason": "op['anchor'] is required for this op_class",
+            })
+            continue
+        if anchor in seen_anchors:
+            resolved.append({
+                "op_id": op_id, "op": op, "status": "conflict",
+                "reason": (
+                    f"anchor {anchor!r} is also targeted by operation "
+                    f"{seen_anchors[anchor]!r} earlier in this same batch"
+                ),
+            })
+            continue
+
+        anchor_records = records_by_anchor.get(anchor, [])
+        if not anchor_records and anchor not in anchors_with_findings:
+            resolved.append({
+                "op_id": op_id, "op": op, "status": "not_found",
+                "reason": f"anchor {anchor!r} was not found in the current audit",
+            })
+            continue
+
+        expected_hash = op.get("expected_structure_hash")
+        if expected_hash and anchor_records and not any(r["structure_hash"] == expected_hash for r in anchor_records):
+            resolved.append({
+                "op_id": op_id, "op": op, "status": "stale",
+                "reason": (
+                    "expected_structure_hash does not match this anchor's "
+                    "current structure -- it changed since this operation "
+                    "was authored"
+                ),
+            })
+            continue
+
+        status, reason = "ok", None
+        if op_class == EQUATION_REPAIR_REMOVE_DUPLICATE_PLAINTEXT:
+            if not any(r["plain_text_overlap"]["has_duplicate_plaintext"] for r in anchor_records):
+                status, reason = "conflict", f"anchor {anchor!r} has no detected plaintext_math_duplicate to remove"
+        elif op_class == EQUATION_REPAIR_SPLIT_MERGED_OMML:
+            if not any(
+                f["type"] == EQUATION_FINDING_MERGED_OMML_SUSPECTED and f["anchor"] == anchor
+                for f in audit["findings"]
+            ):
+                status, reason = "conflict", f"anchor {anchor!r} has no detected merged_omml_suspected finding to split"
+            elif not any(r["pattern"] == "standalone" for r in anchor_records):
+                status, reason = "invalid", "split_merged_omml is only supported for standalone equations"
+        elif op_class == EQUATION_REPAIR_RESTORE_MISSING_OMML:
+            if not any(
+                f["type"] == EQUATION_FINDING_MISSING_OMML and f["anchor"] == anchor
+                for f in audit["findings"]
+            ):
+                status, reason = "conflict", f"anchor {anchor!r} has no detected missing_omml finding to restore"
+            else:
+                payload = op.get("omml") or op.get("latex")
+                if not payload:
+                    status, reason = "invalid", "restore_missing_omml requires 'omml' (raw <m:oMath> XML) or 'latex'"
+                else:
+                    try:
+                        if _resolve_omml(str(payload)) is None:
+                            status, reason = "invalid", "could not resolve 'omml'/'latex' payload to valid OMML"
+                    except ValueError as exc:
+                        status, reason = "invalid", f"invalid OMML/LaTeX payload: {exc}"
+        elif op_class == EQUATION_REPAIR_RENUMBER_EQUATION:
+            if not any(r["pattern"] == "table-numbered" for r in anchor_records):
+                status, reason = "conflict", f"anchor {anchor!r} is not a table-numbered equation"
+            elif not op.get("new_number") or not str(op.get("new_number")).strip():
+                status, reason = "invalid", "renumber_equation requires 'new_number'"
+
+        if status != "ok":
+            resolved.append({"op_id": op_id, "op": op, "status": status, "reason": reason})
+            continue
+
+        seen_anchors[anchor] = op_id
+        resolved.append({"op_id": op_id, "op": op, "status": "ok", "reason": None, "no_op": False})
+
+    conflicts = [r for r in resolved if r["status"] != "ok"]
+
+    manifest = _EquationPatchManifest.create_from_file(
+        document_path,
+        notes="MDE-B2 equation repair batch (draft-only; canonical never modified implicitly)",
+    )
+    for entry in resolved:
+        op = entry["op"] if isinstance(entry["op"], dict) else {}
+        manifest.add_operation(
+            "custom",
+            "word/document.xml",
+            f"{op.get('op_class', 'unknown')} @ {op.get('anchor')!r}",
+            metadata={
+                "op_id": entry["op_id"],
+                "repair_class": op.get("op_class"),
+                "anchor": op.get("anchor"),
+                "status": entry["status"],
+                "reason": entry["reason"],
+            },
+        )
+    manifest_content_hash = _equation_manifest_content_hash(manifest)
+
+    if conflicts:
+        manifest.mark_aborted("one or more operations failed validation before any write")
+        return {
+            "applied": False,
+            "reason": "batch_has_conflicts",
+            "conflicts": conflicts,
+            "patch_manifest": manifest.to_dict(),
+            "manifest_content_hash": manifest_content_hash,
+        }
+
+    def _abort_repair(reason_text: str) -> "dict[str, Any]":
+        manifest.mark_aborted(reason_text)
+        return {
+            "applied": False,
+            "reason": "element_vanished_during_apply",
+            "error": reason_text,
+            "patch_manifest": manifest.to_dict(),
+            "manifest_content_hash": manifest_content_hash,
+        }
+
+    try:
+        raw, root = _load_docx_xml_stdlib(document_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return _abort_repair(str(exc))
+
+    if _source_fingerprint(raw) != audit["source_fingerprint"]:
+        return _abort_repair(
+            "document_path changed on disk between planning and apply -- "
+            "refusing to apply; re-plan and retry"
+        )
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return _abort_repair(f"{document_path} has no <w:body> element")
+
+    w_p = _q(_W, "p")
+    w_t = _q(_W, "t")
+    w_tc = _q(_W, "tc")
+    m_omath = _qm("oMath")
+
+    applied_operations: list[dict[str, Any]] = []
+
+    for entry in resolved:
+        op = entry["op"]
+        op_class = op.get("op_class")
+        anchor = op.get("anchor")
+
+        if entry.get("no_op"):
+            applied_operations.append({
+                "op_id": entry["op_id"], "op_class": op_class, "anchor": anchor, "mutated": False,
+            })
+            continue
+
+        if op_class == EQUATION_REPAIR_REMOVE_DUPLICATE_PLAINTEXT:
+            para = _find_any_paragraph(body, anchor)
+            if para is None:
+                return _abort_repair(f"anchor {anchor!r} could not be re-located during apply")
+            matched = next(
+                (
+                    f["matched_text"] for f in audit["findings"]
+                    if f["type"] == EQUATION_FINDING_PLAINTEXT_MATH_DUPLICATE and f["anchor"] == anchor
+                ),
+                None,
+            )
+            if matched is None:
+                return _abort_repair(f"anchor {anchor!r}'s duplicate-plaintext finding vanished during apply")
+            target_norm = re.sub(r"\s+", "", matched)
+            removed = False
+            for c in list(para):
+                if c.tag == _q(_W, "pPr") or c.tag == m_omath or c.find(f".//{m_omath}") is not None:
+                    continue
+                text_norm = re.sub(r"\s+", "", "".join(t.text or "" for t in c.iter(w_t)))
+                if text_norm and text_norm == target_norm:
+                    para.remove(c)
+                    removed = True
+            if not removed:
+                return _abort_repair(
+                    f"anchor {anchor!r}: no matching duplicate-plaintext run found to remove during apply"
+                )
+            applied_operations.append({
+                "op_id": entry["op_id"], "op_class": op_class, "anchor": anchor, "mutated": True,
+            })
+
+        elif op_class == EQUATION_REPAIR_SPLIT_MERGED_OMML:
+            para = _find_direct_child_paragraph(body, anchor)
+            if para is None:
+                return _abort_repair(f"anchor {anchor!r} could not be re-located as a direct paragraph during apply")
+            target_omath = next(
+                (o for o in para.findall(f".//{m_omath}") if _detect_merged_omml(o) is not None),
+                None,
+            )
+            if target_omath is None:
+                return _abort_repair(f"anchor {anchor!r}'s merged-OMML condition no longer holds during apply")
+            segments = _split_omath_top_level_segments(target_omath)
+            para_index = list(body).index(para)
+            pPr_orig = para.find(_q(_W, "pPr"))
+            body.remove(para)
+            inserted = 0
+            for seg in segments:
+                new_p = ET.Element(w_p)
+                new_p.set(_q(_W14, "paraId"), uuid.uuid4().hex[:8].upper())
+                new_p.set(_q(_W14, "textId"), uuid.uuid4().hex[:8].upper())
+                if pPr_orig is not None:
+                    new_p.append(copy.deepcopy(pPr_orig))
+                new_omath = ET.Element(m_omath)
+                for el in seg:
+                    new_omath.append(el)
+                new_p.append(new_omath)
+                body.insert(para_index + inserted, new_p)
+                inserted += 1
+            applied_operations.append({
+                "op_id": entry["op_id"], "op_class": op_class, "anchor": anchor,
+                "mutated": True, "split_into": inserted,
+            })
+
+        elif op_class == EQUATION_REPAIR_RESTORE_MISSING_OMML:
+            para = _find_any_paragraph(body, anchor)
+            if para is None:
+                return _abort_repair(f"anchor {anchor!r} could not be re-located during apply")
+            payload = op.get("omml") or op.get("latex")
+            try:
+                resolved_omml = _resolve_omml(str(payload))
+            except ValueError as exc:
+                return _abort_repair(f"anchor {anchor!r}: OMML/LaTeX payload became invalid during apply: {exc}")
+            if resolved_omml is None:
+                return _abort_repair(f"anchor {anchor!r}: OMML/LaTeX payload no longer resolves during apply")
+            for c in list(para):
+                if c.tag != _q(_W, "pPr"):
+                    para.remove(c)
+            para.append(ET.fromstring(resolved_omml))
+            applied_operations.append({
+                "op_id": entry["op_id"], "op_class": op_class, "anchor": anchor, "mutated": True,
+            })
+
+        elif op_class == EQUATION_REPAIR_RENUMBER_EQUATION:
+            tr = _find_row_by_equation_anchor(body, anchor)
+            if tr is None:
+                return _abort_repair(f"anchor {anchor!r}'s numbered-equation row could not be re-located during apply")
+            cells = tr.findall(w_tc)
+            if len(cells) < 2:
+                return _abort_repair(f"anchor {anchor!r}'s row no longer has a number cell during apply")
+            number_para = cells[1].find(w_p)
+            if number_para is None:
+                return _abort_repair(f"anchor {anchor!r}: number cell has no paragraph to rewrite")
+            _set_paragraph_text(number_para, str(op["new_number"]))
+            applied_operations.append({
+                "op_id": entry["op_id"], "op_class": op_class, "anchor": anchor,
+                "mutated": True, "new_number": op["new_number"],
+            })
+
+    try:
+        write_transaction = _save_docx_xml_stdlib(raw, root, draft_output_path)
+    except DocxWriteVerificationError as exc:
+        manifest.mark_aborted(str(exc))
+        return {
+            "applied": False, "reason": "draft_write_verification_failed", "error": str(exc),
+            "patch_manifest": manifest.to_dict(), "manifest_content_hash": manifest_content_hash,
+        }
+    except OSError as exc:
+        manifest.mark_aborted(str(exc))
+        return {
+            "applied": False, "error": f"could not write {draft_output_path}: {exc}",
+            "patch_manifest": manifest.to_dict(), "manifest_content_hash": manifest_content_hash,
+        }
+
+    manifest.mark_applied()
+    return {
+        "applied": True,
+        "draft_output_path": draft_output_path,
+        "patch_manifest": manifest.to_dict(),
+        "manifest_content_hash": manifest_content_hash,
+        "applied_operations": applied_operations,
+        "write_transaction": write_transaction,
+    }

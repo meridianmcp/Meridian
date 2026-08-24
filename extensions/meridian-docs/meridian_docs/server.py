@@ -2828,6 +2828,118 @@ def apply_and_merge_batch_transform(
     )
 
 
+@mcp.tool()
+def audit_equation_integrity(document_path: str) -> dict[str, Any]:
+    """3d0769ab (MDE-B1) -- read-only raw-OOXML equation INTEGRITY audit.
+
+    Distinct from audit_equation_style (alignment/punctuation/explicit-
+    number-gap STYLE): this never treats "an <m:oMath> element exists" as
+    proof an equation is healthy. Detects plaintext duplicated alongside
+    real OMML, equation-like plaintext with NO OMML at all, two equations
+    spliced into one <m:oMath>, ambiguous/mixed equation-numbering
+    conventions, and duplicate equation numbers whose underlying structure
+    actually differs.
+
+    Args:
+      document_path: Absolute path to the .docx to audit. Read-only.
+
+    Returns ``{document_path, source_fingerprint, equation_count, records,
+    findings, finding_count, findings_by_type}`` -- see
+    docs_intel.audit_equation_integrity for the full contract. Each typed
+    finding is one of: plaintext_math_duplicate, missing_omml,
+    merged_omml_suspected, equation_number_gap, equation_number_duplicate,
+    equation_number_scope_ambiguous, reference_structure_mismatch.
+    """
+    return docs_intel.audit_equation_integrity(document_path)
+
+
+@mcp.tool()
+def compare_equation_structures(
+    reference_path: str,
+    candidate_path: str,
+) -> dict[str, Any]:
+    """e4265dd1 (MDE-B2) -- reference-aware structural comparison between two
+    documents' equations (e.g. a prior-accepted revision vs a new candidate,
+    or a canonical source vs an isolated draft).
+
+    Composes directly on docs_intel.audit_equation_integrity for both
+    sides -- identity and structure come from the exact same records that
+    audit already produces. Equations are matched by explicit number
+    (strongest signal), then by stable w14:paraId anchor, then by document
+    position as an explicitly-labeled degraded fallback.
+
+    Args:
+      reference_path: Absolute path to the reference/baseline .docx.
+      candidate_path: Absolute path to the candidate/new .docx.
+
+    Returns ``{reference_source_fingerprint, candidate_source_fingerprint,
+    equation_count_reference, equation_count_candidate, comparisons,
+    mismatch_count, reference_findings, candidate_findings}`` -- see
+    docs_intel.compare_equation_structures for the full contract. Each
+    comparison's ``classification`` is one of "equivalent" (identical
+    structure, regardless of XML prefix/whitespace), "structural_change"
+    (a real subscript/fraction/limit/operator difference -- see
+    token_diff.changed_categories), "missing_in_candidate", or
+    "added_in_candidate".
+    """
+    return docs_intel.compare_equation_structures(reference_path, candidate_path)
+
+
+@mcp.tool()
+def repair_equation_batch(
+    document_path: str,
+    operations: list[dict[str, Any]],
+    draft_output_path: str,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """e4265dd1 (MDE-B2) -- draft-only staged repair for equation-integrity
+    defects audit_equation_integrity already found.
+
+    document_path is opened READ-ONLY throughout and is NEVER the write
+    target -- draft_output_path is, mirroring apply_batch_transform (MDE-8)'s
+    own contract exactly. A patch manifest (reusing
+    tools.meridian_fallbacks.patch_manifest.PatchManifest) is built and
+    returned BEFORE any write is attempted, for every outcome including a
+    rejected batch. ALL-OR-NOTHING: if even one operation fails validation,
+    NOTHING is written -- draft_output_path is never created.
+
+    Args:
+      document_path:                The canonical .docx to repair. Read-only.
+      operations:                   Non-empty list of ``{"op_id": <optional
+                                    str>, "op_class": one of
+                                    "remove_duplicate_plaintext",
+                                    "split_merged_omml",
+                                    "restore_missing_omml",
+                                    "renumber_equation",
+                                    "manual_review_required", "anchor":
+                                    <required except for
+                                    manual_review_required>,
+                                    "expected_structure_hash": <optional
+                                    staleness precondition>, ...op-specific
+                                    params: "omml"/"latex" for
+                                    restore_missing_omml, "new_number" for
+                                    renumber_equation}``.
+      draft_output_path:             Where to stage the repaired draft.
+                                    MUST differ from document_path.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard (a prior
+                                    audit_equation_integrity/
+                                    compare_equation_structures result's
+                                    source_fingerprint).
+
+    Returns ``{applied: True, draft_output_path, patch_manifest,
+    manifest_content_hash, applied_operations, write_transaction}`` on
+    success, or ``{applied: False, reason/error, patch_manifest,
+    conflicts}`` on failure -- see docs_intel.repair_equation_batch for the
+    full contract, including every supported op_class's exact preconditions
+    and mutation.
+    """
+    return docs_intel.repair_equation_batch(
+        document_path, operations, draft_output_path,
+        expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
 def main() -> None:
     """Console entry point (``uvx meridian-docs``)."""
     mcp.run()
