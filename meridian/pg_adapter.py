@@ -4638,6 +4638,38 @@ async def _migrate_pg_vector_index_state(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_object_sync_state(conn: PostgresConnection) -> None:
+    """1d34c076 (build milestone; investigation 549e66c6 §6) —
+    object_sync_state (mirrors SQLite).
+
+    One row per (project_id, content_hash): which remote backend/state a
+    locally-stored (artifact_store.py) content object is in
+    (local_only/queued_sync/synced/sync_failed/unavailable), the remote
+    key/etag once synced, and retry bookkeeping. Mirrors
+    db.object_sync_state._migrate_object_sync_state.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS object_sync_state ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    content_hash TEXT NOT NULL,"
+        "    backend TEXT NOT NULL DEFAULT 'local',"
+        "    artifact_class TEXT,"
+        "    state TEXT NOT NULL DEFAULT 'local_only',"
+        "    remote_key TEXT,"
+        "    remote_etag TEXT,"
+        "    queued_at TEXT,"
+        "    synced_at TEXT,"
+        "    last_error TEXT,"
+        "    retry_count INTEGER NOT NULL DEFAULT 0,"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE (project_id, content_hash)"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_object_sync_state_state "
+        "    ON object_sync_state(state);"
+    )
+
+
 async def _migrate_pg_executor_reports(conn: PostgresConnection) -> None:
     """9154aa9a — executor_reports: durable executor-report / corrective-
     handoff-lifecycle records (mirrors db.executor_reports._migrate_executor_reports_table
@@ -4848,4 +4880,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_wave_gate_version_unique_constraints,
     _migrate_pg_proposal_gates,
     _migrate_pg_research_graph,
+    _migrate_pg_object_sync_state,
 )
