@@ -36,6 +36,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from . import artifact_classification as artifact_classification_module
 from . import artifact_declaration as artifact_declaration_module
+from . import capability_availability as capability_availability_module
 from . import capability_contract as capability_contract_module
 from . import continuation_gate as continuation_gate_module
 from . import db as db_module
@@ -8144,11 +8145,105 @@ async def log_handoff_correction_event(
         pass
 
 
+def _summarize_capability_availability(
+    evaluated: "list[dict[str, Any]]",
+) -> "dict[str, Any]":
+    """MDE-1 — bucket :func:`capability_availability.evaluate_manifest_availability`'s
+    per-capability verdicts into the ``{available, missing, degraded}``
+    capability-id-list shape ``capability_contract.build_capability_contract``'s
+    ``AvailabilityChecker`` interface expects (see
+    ``capability_contract._resolve_availability``'s ``checker`` contract).
+
+    Fail-closed, policy-aware bucketing -- mirrors
+    ``capability_availability._unconfirmed_status``'s own philosophy so this
+    adapter never contradicts the module it's summarizing: a capability
+    whose live status could not actually be confirmed
+    (``STATUS_UNKNOWN`` -- an unrecognized tool reference, a plugin/tool
+    naming mismatch, or the degenerate empty-``required_tools`` case) is
+    NEVER silently reported as ``available``. It is bucketed the SAME way an
+    unconfirmed tunnel-backed tool already is: ``missing`` for a
+    required/optional capability (fail-closed -- an executor must never be
+    told an unresolved capability is ready), ``degraded`` for a
+    ``degraded_ok`` capability (fail-open into a reduced/read-only mode, per
+    that policy's own documented contract).
+
+    ``STATUS_AVAILABLE`` -> available. ``STATUS_DEGRADED`` -> degraded (a
+    fallback rescued it, or the tool could not be confirmed under a
+    ``degraded_ok`` policy). ``STATUS_MISSING`` -> missing.
+
+    Deterministic: each bucket is a **sorted** list of capability ids, never
+    input order -- two evaluations of the identical underlying live state
+    always summarize byte-identically, which is what lets
+    ``capability_contract.contract_hash`` change if and only if the real
+    availability state actually changed.
+    """
+    available: "list[str]" = []
+    missing: "list[str]" = []
+    degraded: "list[str]" = []
+    for entry in evaluated or []:
+        if not isinstance(entry, dict):
+            continue
+        cap_id = entry.get("capability_id")
+        if not cap_id:
+            continue
+        status = entry.get("status")
+        policy = entry.get("availability_policy") or "required"
+        if status == capability_availability_module.STATUS_AVAILABLE:
+            available.append(cap_id)
+        elif status == capability_availability_module.STATUS_DEGRADED:
+            degraded.append(cap_id)
+        elif status == capability_availability_module.STATUS_MISSING:
+            missing.append(cap_id)
+        else:
+            # STATUS_UNKNOWN (or any status this adapter doesn't recognize
+            # yet) -- fail closed rather than silently dropping the
+            # capability out of every bucket, which would make it invisible
+            # to the executable/missing_required check entirely.
+            if policy == "degraded_ok":
+                degraded.append(cap_id)
+            else:
+                missing.append(cap_id)
+    return {
+        "available": sorted(available),
+        "missing": sorted(missing),
+        "degraded": sorted(degraded),
+    }
+
+
+def _availability_checker_from_live_inventory(
+    live_inventory: "dict[str, Any]",
+) -> "Callable[[list[dict[str, Any]]], dict[str, Any]]":
+    """MDE-1 — build a SYNC callable matching
+    ``capability_contract``'s ``AvailabilityChecker`` contract
+    (``Callable[[list[dict]], dict]``, invoked without ``await`` --
+    see ``capability_contract._resolve_availability``), closed over an
+    already-fetched *live_inventory* snapshot (the shape
+    ``meridian.mcp.handlers.project_tools._build_live_inventory`` /
+    ``check_capability_availability`` build and consume).
+
+    Evaluates whichever capability list it is actually called with (the
+    EFFECTIVE, post-profile-merge list ``build_capability_contract`` passes
+    to its injected checker) fresh, every call -- never a value pre-computed
+    against only the raw persisted manifest, which would silently skip
+    availability evaluation for any capability id a profile layer
+    contributed on top of it (see
+    ``capability_contract._resolve_effective_capabilities``).
+    """
+    def _checker(capabilities: "list[dict[str, Any]]") -> "dict[str, Any]":
+        evaluated = capability_availability_module.evaluate_manifest_availability(
+            capabilities, live_inventory,
+        )
+        return _summarize_capability_availability(evaluated)
+    return _checker
+
+
 async def build_effective_capability_contract(
     db: Any, project_id: str, *, board_stale: bool = False,
     version: "str | None" = None, items: "list[dict[str, Any]] | None" = None,
     max_executor_contracts: "int | None" = None,
     max_contract_list_items: "int | None" = None,
+    tenant: "dict[str, Any] | None" = None,
+    live_inventory: "dict[str, Any] | None" = None,
 ) -> "dict[str, Any] | None":
     """98aaccf4 — thin, fully-guarded wrapper over
     ``capability_contract.build_capability_contract`` for the two trusted
@@ -8180,6 +8275,41 @@ async def build_effective_capability_contract(
     caller that passes small explicit caps, since a full per-item
     breakdown was never needed there and was overflowing the compact
     response (593KB observed on a real board, 382KB from this field alone).
+
+    ``tenant`` / ``live_inventory`` (MDE-1) — wire the REAL ac80aaaf
+    availability check (``meridian.capability_availability`` +
+    ``mcp/handlers/project_tools.py::_build_live_inventory`` /
+    ``check_capability_availability``, both already landed and already
+    exposed as importable helpers) into the emitted contract's
+    ``availability``/``executable``/``executable_reasons`` fields, instead
+    of the permanent ``"unknown"`` degrade that resulted from
+    ``capability_contract._resolve_availability``'s own guessed
+    sibling-module auto-discovery (a ``check_availability`` function name
+    that was never actually defined on ``capability_availability`` --
+    see that function's own TODO(ac80aaaf) docstring) never matching this
+    module's real, differently-named, differently-shaped functions. Before
+    this, ``executable`` could structurally never reflect a truly
+    unavailable ``required`` capability for either trusted handoff channel
+    -- see :func:`_availability_checker_from_live_inventory` and
+    :func:`_summarize_capability_availability`.
+
+    Pass ``live_inventory`` directly (as tests do, and as a caller that
+    already built one -- e.g. alongside its own
+    ``check_capability_availability`` call -- should, to avoid a second
+    redundant tunnel probe) to skip the async, I/O-bound tunnel probe this
+    function would otherwise perform; pass ``tenant`` to have this function
+    derive it the SAME way ``check_capability_availability`` itself does.
+    ``live_inventory`` wins if both are given. Omitting BOTH keeps the exact
+    prior degraded (``"unknown"``) availability behavior -- this is purely
+    additive, so every existing caller that passes neither argument is
+    completely unaffected.
+
+    Guarded the SAME way as the rest of this wrapper: any failure deriving
+    the live inventory or building the checker degrades to no checker
+    (the contract falls back to its pre-existing ``"unknown"`` availability
+    result) rather than breaking the mandatory start_session/generate_handoff
+    call -- a tunnel/tenant-probing problem must never make the contract
+    itself unavailable.
     """
     try:
         kwargs: dict[str, Any] = {}
@@ -8187,6 +8317,17 @@ async def build_effective_capability_contract(
             kwargs["max_executor_contracts"] = max_executor_contracts
         if max_contract_list_items is not None:
             kwargs["max_contract_list_items"] = max_contract_list_items
+        _live_inventory = live_inventory
+        if _live_inventory is None and tenant is not None:
+            try:
+                from meridian.mcp.handlers import project_tools as _project_tools_module  # noqa: PLC0415
+                _live_inventory = await _project_tools_module._build_live_inventory(tenant)
+            except Exception:  # noqa: BLE001 — live-inventory probing is best-effort
+                _live_inventory = None
+        if _live_inventory is not None:
+            kwargs["availability_checker"] = _availability_checker_from_live_inventory(
+                _live_inventory
+            )
         return await capability_contract_module.build_capability_contract(
             db, project_id, board_stale=board_stale, version=version, items=items,
             **kwargs,
