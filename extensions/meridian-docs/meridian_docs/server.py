@@ -2692,7 +2692,10 @@ def merge_docx_draft(
 
     Returns {merged: True, status: "merged", canonical_path, draft_path,
     paragraph_count, heading_count, table_count, image_count, render_status,
-    render_verified, render_backend, render_detail} on success, or
+    render_verified, render_backend, render_detail, promoted_sha256} on
+    success — promoted_sha256 (MDE-3) is the real sha256 of the bytes just
+    promoted into canonical_path, mirroring move_section/copy_section/
+    relocate_table's own post-write fingerprint field. Or
     {merged: False, error: <message>, ...} on failure — with
     file_restored: <bool> present only when a post-promotion structural- or
     render-verification failure triggered a restore.

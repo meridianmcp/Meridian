@@ -12369,7 +12369,13 @@ def merge_draft_into_canonical(
 
     Returns ``{"merged": True, "status": "merged", "canonical_path",
     "draft_path", "paragraph_count", "heading_count", "table_count",
-    "image_count", "render_status", "render_verified", ...}`` on success.
+    "image_count", "render_status", "render_verified", "promoted_sha256",
+    ...}`` on success. ``promoted_sha256`` (MDE-3, mirroring move_section/
+    copy_section/relocate_table's own post-write fingerprint) is the real
+    sha256 of the exact bytes ``_atomic_write_docx_bytes`` just promoted
+    into ``canonical_path`` -- genuine evidence a caller driving a
+    meridian.db.docx_merge release transaction around this call can use as
+    ``post_hash``, rather than inventing one.
 
     Returns ``{"merged": False, "error": <message>, ...}`` on failure --
     with ``"file_restored": <bool>`` present only for the post-promotion
@@ -12535,6 +12541,11 @@ def merge_draft_into_canonical(
         "status": "merged",
         "canonical_path": canonical_path,
         "draft_path": draft_path,
+        # MDE-3 -- real post-promotion fingerprint (see promoted_sha256
+        # above), mirroring move_section/copy_section/relocate_table's own
+        # "promoted_sha256" result field -- genuine evidence for a caller
+        # driving a release-transaction state machine around this call.
+        "promoted_sha256": promoted_sha256,
         **draft_counts,
         **render_info,
     }

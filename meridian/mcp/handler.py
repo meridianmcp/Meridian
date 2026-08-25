@@ -1381,12 +1381,19 @@ async def _handle_mcp_request(
                         # MDE-3 rework -- call_tunnel_tool_with_release_tracking
                         # is a thin, delegate-by-default wrapper: for anything
                         # other than the PRIMARY docs-slot write tools
-                        # (move_section/copy_section/relocate_table) it is
-                        # byte-identical to calling call_tunnel_tool directly.
-                        # For those three, it drives the docx_merge
-                        # release-transaction state machine around the real
-                        # write instead of leaving it unexercised outside unit
-                        # tests of the transition guard. See routes/tunnel.py.
+                        # (move_section/copy_section/relocate_table/
+                        # merge_docx_draft) it is byte-identical to calling
+                        # call_tunnel_tool directly. For those four, it drives
+                        # the docx_merge release-transaction state machine
+                        # around the real write instead of leaving it
+                        # unexercised outside unit tests of the transition
+                        # guard -- except a wave-coordinated DRAFT-mode call
+                        # to the first three, which never touches the
+                        # canonical file and so is deliberately left
+                        # untracked; merge_docx_draft (the tool that actually
+                        # promotes a draft into the canonical file) is what
+                        # gets tracked for that workflow instead. See
+                        # routes/tunnel.py's _PRIMARY_DOCX_RELEASE_TOOLS.
                         tunnel_result = await _tunnel_mod.call_tunnel_tool_with_release_tracking(
                             tenant["id"], name, args,
                             db=db, session_id=(args.get("session_id") or "").strip() or None,

@@ -4443,15 +4443,59 @@ async def check_docs_write_conflict(
 # ``_save_docx_xml_stdlib``/``_atomic_write_docx_bytes`` — giving this module
 # genuine post-write evidence to drive the state machine with, rather than
 # inventing a fake one.
+#
+# THIRD-PASS fix (54619681) — a wave-coordinated DRAFT-mode call to one of
+# those three tools (``draft_output_path`` + ``wave_run_id`` both supplied,
+# see docs_intel._resolve_draft_dest) never touches ``docx_path`` at all: the
+# real write lands on the isolated draft file, and ``docx_path`` (the
+# canonical file) is provably untouched. Opening/advancing a transaction
+# keyed on ``docx_path`` for that call — as this module did before this fix —
+# produced a transaction that reached the terminal RELEASED state claiming
+# the CANONICAL file was released with content it never actually held
+# (``post_hash`` from the tool's own ``promoted_sha256`` reflects the DRAFT
+# file's bytes, not ``docx_path``'s). Because RELEASED is terminal,
+# ``resolve_release_recovery`` would never revisit that misleading row.
+#
+# Fix: ``_open_docs_release_transaction`` now declines to open ANY
+# transaction for a draft-mode call (see the ``draft_output_path`` check
+# below) — a draft write is not a release of anything, so there is nothing
+# honest to open a release transaction FOR. The REAL canonical-mutating
+# event in this workflow is ``merge_docx_draft`` (promotes an already-staged
+# draft into ``canonical_path`` — see docs_intel.merge_draft_into_canonical),
+# which is now itself a PRIMARY release tool below: its own transaction is
+# opened/advanced against ``canonical_path`` (the file it actually mutates),
+# using its own real ``promoted_sha256`` as ``post_hash`` — the same honest,
+# real-evidence pattern the original three tools already established.
+#
+# This was considered against the alternative of instead retargeting a
+# draft-mode transaction's tracked ``file_path`` to the draft artifact
+# itself (still opening *something*, just against the right identity).
+# Rejected: ``check_release_staleness``'s anchor half
+# (meridian.db.docx_merge.check_release_staleness) derives its
+# ``check_merge_stale_or_overlap`` lookup key from the release transaction's
+# OWN recorded ``file_path`` — and that manifest is keyed on the CANONICAL
+# path (see ``open_merge_manifest(db, wave_id, file_path=<canonical>, ...,
+# draft_path=...)``), never the draft path. Retargeting the transaction's
+# identity to the draft file would silently break that lookup (every
+# legitimately wave-coordinated draft write would look up a manifest under
+# a key that was never registered, and misreport ``no_manifest`` ->
+# ``blocked``) — a new, worse false-positive gap. Declining to open a
+# transaction for the draft write, and only ever recording one against the
+# canonical file at the point it is genuinely promoted, avoids that trap
+# entirely while still fully closing the "durable false RELEASED" bug.
 # ---------------------------------------------------------------------------
 
 #: Bare (unprefixed) docs-slot tool names this rework drives the release
-#: state machine around. Deliberately the SAME three tools MDE-3's
-#: acceptance gap names explicitly ("at least the primary write path(s)") —
-#: not the full _DOCS_WRITE_TOOLS map, which would multiply the surface area
-#: (and test burden) of an already-hardened relay path well past what the
-#: gap asks for.
-_PRIMARY_DOCX_RELEASE_TOOLS = frozenset({"move_section", "copy_section", "relocate_table"})
+#: state machine around: the three structural mutators MDE-3's acceptance
+#: gap names explicitly ("at least the primary write path(s)"), PLUS
+#: ``merge_docx_draft`` (added in the THIRD-PASS fix above) — the tool that
+#: performs the REAL canonical-file promotion for any wave-coordinated draft
+#: produced by the other three. Deliberately not the full _DOCS_WRITE_TOOLS
+#: map, which would multiply the surface area (and test burden) of an
+#: already-hardened relay path well past what the gap asks for.
+_PRIMARY_DOCX_RELEASE_TOOLS = frozenset({
+    "move_section", "copy_section", "relocate_table", "merge_docx_draft",
+})
 
 
 def _local_file_sha256(path: "str | None") -> "str | None":
@@ -4485,16 +4529,38 @@ async def _open_docs_release_transaction(
     ``project_id``, ``tenant_id``) to pass to
     :func:`_finish_docs_release_transaction`, or ``None`` when this call
     isn't a primary write tool, ``db`` is unavailable, the target path can't
-    be identified, or the open itself fails — all fail-OPEN (the relay
-    proceeds ungated) so a wiring problem here can never block a write the
-    concurrency guard above already cleared. Mirrors
-    :func:`check_docs_write_conflict`'s own fail-open posture.
+    be identified, this is a wave-coordinated DRAFT-mode call (see below),
+    or the open itself fails — all fail-OPEN (the relay proceeds ungated)
+    so a wiring problem here can never block a write the concurrency guard
+    above already cleared. Mirrors :func:`check_docs_write_conflict`'s own
+    fail-open posture.
+
+    THIRD-PASS fix (54619681) — draft mode: when ``arguments`` carries a
+    non-empty ``draft_output_path`` (move_section/copy_section/
+    relocate_table's opt-in wave-scoped draft mode; see
+    docs_intel._resolve_draft_dest), the REAL write destination is that
+    isolated draft file, never ``docx_path`` — docs_intel guarantees
+    ``draft_output_path`` differs from ``docx_path`` and that ``docx_path``
+    is only ever read in that mode. Opening a transaction keyed on
+    ``docx_path`` here would durably record a RELEASED transaction claiming
+    the canonical file was released with content it never held (the
+    tool's own ``promoted_sha256`` reflects the DRAFT file's bytes) — a
+    misleading, terminal, never-revisited row. So: no transaction is opened
+    for a draft-mode call at all. The real promotion this draft eventually
+    feeds — ``merge_docx_draft`` writing the draft's bytes into
+    ``canonical_path`` — is itself a primary release tool (see
+    :data:`_PRIMARY_DOCX_RELEASE_TOOLS`) and opens/advances its OWN
+    transaction against the file it actually mutates.
     """
     if db is None:
         return None
     bare = name.split("__", 1)[1] if "__" in name else name
     if bare not in _PRIMARY_DOCX_RELEASE_TOOLS:
         return None
+    if isinstance(arguments, dict):
+        draft_dest = arguments.get("draft_output_path")
+        if isinstance(draft_dest, str) and draft_dest.strip():
+            return None
     target = _docs_write_target(bare, arguments)
     if not target:
         return None
@@ -4593,6 +4659,25 @@ async def _finish_docs_release_transaction(
         # _open_docs_release_transaction) — silently skipped (never
         # fabricated) otherwise, same "don't overclaim" posture as the rest
         # of this write-guard surface.
+        #
+        # THIRD-PASS fix (54619681) — this block is now reachable ONLY for a
+        # transaction whose recorded ``file_path`` (``ctx["docx_path"]``,
+        # via the row ``check_release_staleness`` reads back via
+        # ``get_release_transaction``) is a file this call genuinely wrote:
+        # a wave-coordinated DRAFT-mode call never reaches here at all
+        # (``_open_docs_release_transaction`` returns ``None`` for it — see
+        # its own docstring), so a "blocked" verdict from this gate can no
+        # longer be recorded against a canonical file that was never
+        # touched. ``wave_id``/``element_id`` remain empty for every current
+        # caller of this path (including ``merge_docx_draft``, whose own
+        # tool signature has no wave/anchor argument — its promotion is
+        # gated upstream, by the caller's own
+        # ``check_merge_stale_or_overlap``/``claim_merge_owner`` calls over
+        # the separate Meridian MCP connection, per
+        # merge_draft_into_canonical's own docstring), so this specific
+        # anchor check does not currently fire for anyone — but it no
+        # longer has a broken-identity transaction to falsely fire against
+        # either, which was the actual bug.
         wave_id = ctx.get("wave_id")
         element_id = ctx.get("element_id")
         if wave_id and element_id:
@@ -4722,6 +4807,16 @@ async def call_tunnel_tool_with_release_tracking(
     lookup that cannot be performed blocks the write outright
     (:class:`RequiredClaimLookupFailed`) rather than proceeding as if the
     unchecked lookup had come back clear.
+
+    THIRD-PASS fix (54619681) — ``_open_docs_release_transaction`` declines
+    to open a transaction at all for a wave-coordinated DRAFT-mode call to
+    move_section/copy_section/relocate_table (returns ``None``, same as any
+    other non-tracked call), so this wrapper still delegates to
+    :func:`call_tunnel_tool` for those with zero bookkeeping — the draft
+    write itself is not a release. ``merge_docx_draft`` — the tool that
+    actually promotes a draft into ``canonical_path`` — is itself a primary
+    write tool, so its own real promotion IS tracked through this same
+    PREPARED -> ... -> RELEASED/ABORTED machinery.
     """
     await _required_claim_lookup_gate(db, name, arguments, session_id=session_id)
     release_ctx = await _open_docs_release_transaction(

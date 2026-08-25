@@ -22,10 +22,27 @@ Closes the verifier's exact findings:
 
 Every test below is written so it would have FAILED against the
 pre-rework code and passes against the rework.
+
+THIRD-PASS fix (54619681) -- TestDraftModeReleaseTrackingRealDocsIntel below
+closes the verifier's follow-up finding: a wave-coordinated DRAFT-mode call
+(draft_output_path + wave_run_id together) to move_section/copy_section/
+relocate_table drove a transaction against the untouched CANONICAL
+docx_path all the way to a terminal, misleading RELEASED using the DRAFT
+file's own promoted_sha256 as post_hash -- and merge_docx_draft (the tool
+that performs the REAL canonical promotion for this workflow) was not
+wired into the release-transaction machinery at all. These tests exercise
+the REAL extensions/meridian-docs docs_intel functions (not hand-crafted
+payloads) through call_tunnel_tool_with_release_tracking end-to-end, and
+were confirmed to FAIL against the pre-fix code (see commit history for
+this file) before passing against the fix.
 """
 from __future__ import annotations
 
+import io
 import json
+import os
+import sys
+import zipfile
 
 import pytest
 
@@ -33,6 +50,20 @@ from meridian import db as db_module
 from meridian import handoff as handoff_module
 from meridian.db import docx_merge as DM
 from meridian.routes import tunnel as tunnel_module
+
+# Make meridian_docs importable from the local extensions directory --
+# mirrors the established convention in tests/test_meridian_docs_caption_
+# citation_write.py and friends (meridian_docs is deliberately NOT a pypi
+# dependency of the core `meridian` package; see extensions/meridian-docs's
+# own pyproject.toml and CLAUDE.local.md's "Testing extensions/meridian-docs
+# locally" note).
+_EXT_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "extensions", "meridian-docs")
+)
+if _EXT_PATH not in sys.path:
+    sys.path.insert(0, _EXT_PATH)
+
+from meridian_docs import docs_intel  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -505,3 +536,203 @@ class TestRequiredClaimLookupGate:
                 db=db, session_id="s1",
             )
         assert called == []  # the write was never attempted
+
+
+# ---------------------------------------------------------------------------
+# THIRD-PASS fix (54619681) -- wave-coordinated DRAFT-mode calls to the REAL
+# extensions/meridian-docs docs_intel functions, through
+# call_tunnel_tool_with_release_tracking end-to-end. Only the outbound
+# tunnel RPC itself is stubbed (call_tunnel_tool) -- exactly the same
+# boundary every other test in this file stubs at -- and the stub forwards
+# straight into the real docs_intel function, so these tests exercise the
+# REAL move_section/merge_draft_into_canonical business logic, not a
+# hand-crafted payload standing in for it.
+# ---------------------------------------------------------------------------
+
+_TWO_SECTION_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="H0000001">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000001">
+      <w:r><w:t>Intro body paragraph.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="H0000002">
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Results</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000002">
+      <w:r><w:t>Results body paragraph.</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def _make_two_section_docx_bytes() -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", _TWO_SECTION_XML)
+    return buf.getvalue()
+
+
+async def _fake_relay_to_real_docs_intel(fn):
+    """Build a call_tunnel_tool stand-in that forwards ``arguments`` straight
+    into the real ``fn`` (a docs_intel function) and wraps its plain dict
+    result in the MCP tools/call content envelope -- the exact shape a real
+    tunnel round-trip through the meridian-docs MCP server would produce.
+    """
+    async def _relay(tenant_id, name, arguments, *, db=None, session_id=None):
+        result = fn(**(arguments or {}))
+        return {"content": [{"type": "text", "text": json.dumps(result)}]}
+
+    return _relay
+
+
+class TestDraftModeReleaseTrackingRealDocsIntel:
+    @pytest.mark.asyncio
+    async def test_draft_mode_move_section_never_marks_canonical_released(
+        self, db, tmp_path, monkeypatch,
+    ):
+        """THE bug: pre-fix, this exact scenario opened a transaction keyed
+        on the canonical file and drove it to a terminal RELEASED using the
+        draft file's promoted_sha256 as post_hash -- even though the
+        canonical file was (correctly, per docs_intel's own contract)
+        never touched. Written to fail against the pre-fix code: before
+        this fix, ``canonical_txns`` below would be non-empty and its
+        state would be RELEASED.
+        """
+        canonical = tmp_path / "canonical.docx"
+        canonical.write_bytes(_make_two_section_docx_bytes())
+        with open(canonical, "rb") as fh:
+            original_bytes = fh.read()
+        draft = str(tmp_path / "draft.docx")
+
+        monkeypatch.setattr(
+            tunnel_module, "call_tunnel_tool",
+            await _fake_relay_to_real_docs_intel(docs_intel.move_section),
+        )
+
+        result = await tunnel_module.call_tunnel_tool_with_release_tracking(
+            "tenant-1", "move_section",
+            {
+                "docx_path": str(canonical),
+                "section_id": "H0000002",
+                "destination_anchor_para_id": "H0000001",
+                "destination_position": "before",
+                "draft_output_path": draft,
+                "wave_run_id": "wave-1",
+            },
+            db=db, session_id="s1",
+        )
+
+        # Sanity: the REAL docs_intel.move_section actually ran and actually
+        # moved the section -- into the DRAFT file, never canonical.
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "moved"
+        assert payload["is_draft"] is True
+        assert payload["docx_path"] == draft
+        with open(canonical, "rb") as fh:
+            assert fh.read() == original_bytes, "canonical must be untouched by a draft-mode write"
+
+        # THE fix: no transaction may exist claiming the canonical file was
+        # released -- durably or otherwise.
+        transactions = await DM.list_release_transactions(db)
+        canonical_txns = [t for t in transactions if t.get("file_path") == str(canonical)]
+        assert canonical_txns == [], (
+            "a draft-mode write must never open/advance a release transaction "
+            f"against the untouched canonical file, found: {canonical_txns}"
+        )
+        # Nothing reached RELEASED for this call at all -- a draft write is
+        # not itself a release of anything (see merge_docx_draft test below
+        # for the transaction the REAL promotion opens).
+        released = [t for t in transactions if t.get("state") == DM.RELEASE_STATE_RELEASED]
+        assert released == []
+
+    @pytest.mark.asyncio
+    async def test_direct_write_mode_unaffected_still_releases_canonical(
+        self, db, tmp_path, monkeypatch,
+    ):
+        """Guard-rail: the fix must be scoped to draft mode ONLY -- a
+        legacy direct write (no draft_output_path/wave_run_id) through the
+        REAL move_section must still open/advance a transaction against the
+        canonical file it actually mutated, exactly as before this fix.
+        """
+        canonical = tmp_path / "canonical.docx"
+        canonical.write_bytes(_make_two_section_docx_bytes())
+
+        monkeypatch.setattr(
+            tunnel_module, "call_tunnel_tool",
+            await _fake_relay_to_real_docs_intel(docs_intel.move_section),
+        )
+
+        result = await tunnel_module.call_tunnel_tool_with_release_tracking(
+            "tenant-1", "move_section",
+            {
+                "docx_path": str(canonical),
+                "section_id": "H0000002",
+                "destination_anchor_para_id": "H0000001",
+                "destination_position": "before",
+            },
+            db=db, session_id="s1",
+        )
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["status"] == "moved"
+        assert payload["is_draft"] is False
+        assert payload["docx_path"] == str(canonical)
+
+        transactions = await DM.list_release_transactions(db)
+        matching = [t for t in transactions if t.get("file_path") == str(canonical)]
+        assert matching and matching[0]["state"] == DM.RELEASE_STATE_RELEASED
+        assert matching[0]["post_hash"] == payload["promoted_sha256"]
+
+    @pytest.mark.asyncio
+    async def test_merge_docx_draft_promotion_is_the_gated_event(
+        self, db, tmp_path, monkeypatch,
+    ):
+        """The REAL canonical-mutating tool for this workflow --
+        merge_docx_draft -- is now itself a PRIMARY release tool: driven
+        through the SAME call_tunnel_tool_with_release_tracking chokepoint,
+        it opens and advances a transaction against canonical_path (the
+        file it genuinely mutates) all the way to RELEASED, using its own
+        real promoted_sha256 as post_hash -- closing the verifier's
+        "merge_docx_draft is not wired into the release-transaction
+        machinery at all" finding.
+        """
+        monkeypatch.setattr(
+            docs_intel.render_gate, "check_render_capability",
+            lambda docx_path, **kwargs: {
+                "status": "rendered", "backend": "test-stub", "detail": {"stub": True},
+            },
+        )
+        canonical = tmp_path / "canonical.docx"
+        canonical.write_bytes(_make_two_section_docx_bytes())
+        draft = tmp_path / "draft.docx"
+        # A structurally-compatible draft (same zero media/style/relationship
+        # counts as canonical) -- same shape move_section's own draft mode
+        # would actually produce.
+        draft.write_bytes(_make_two_section_docx_bytes())
+
+        monkeypatch.setattr(
+            tunnel_module, "call_tunnel_tool",
+            await _fake_relay_to_real_docs_intel(docs_intel.merge_draft_into_canonical),
+        )
+
+        result = await tunnel_module.call_tunnel_tool_with_release_tracking(
+            "tenant-1", "merge_docx_draft",
+            {"canonical_path": str(canonical), "draft_path": str(draft)},
+            db=db, session_id="s1",
+        )
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["merged"] is True
+        assert payload["promoted_sha256"]
+
+        transactions = await DM.list_release_transactions(db)
+        matching = [t for t in transactions if t.get("file_path") == str(canonical)]
+        assert matching and matching[0]["state"] == DM.RELEASE_STATE_RELEASED
+        assert matching[0]["post_hash"] == payload["promoted_sha256"]
