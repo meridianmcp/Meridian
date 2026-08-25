@@ -1125,7 +1125,16 @@ async def test_dispatch_complete_sprint_item_timeout_classifies_committed(db, mo
     from meridian.mcp import handler as mh
 
     p, item = await _project_with_item(db)
-    monkeypatch.setattr(mh, "_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S", 0.05)
+    # 2.0s (not the sibling test's 0.05s -- that test never calls the real
+    # handler at all, see test_..._timed_out_before_commit below) gives the
+    # REAL handle_complete_sprint_item call below comfortable headroom to
+    # finish and commit (capability-contract building, code-intel-receipt
+    # checks, and other real per-completion work now run in that path) while
+    # staying far under the 5.0s artificial stall this test adds afterward
+    # -- the dispatch timeout must still fire during that stall, after the
+    # commit has already landed, for this test to exercise what it says it
+    # exercises.
+    monkeypatch.setattr(mh, "_COMPLETE_SPRINT_ITEM_DISPATCH_TIMEOUT_S", 2.0)
 
     from meridian.mcp.handlers import sprint_tools as st_mod
     real_handle = st_mod.handle_complete_sprint_item

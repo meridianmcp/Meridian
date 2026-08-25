@@ -56,7 +56,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
-from . import render_gate
+from . import ooxml_integrity, render_gate
 
 # OOXML namespaces.
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -2265,39 +2265,19 @@ def _save_docx_xml_stdlib(raw: bytes, root: ET.Element, dest: str) -> dict[str, 
         original_document_xml = zf.read("word/document.xml")
     original_ns_decls = _root_namespace_declarations(original_document_xml)
 
-    with _NAMESPACE_REGISTRATION_LOCK:
-        snapshot = dict(ET._namespace_map)  # type: ignore[attr-defined]
-        try:
-            for prefix, uri in original_ns_decls:
-                ET.register_namespace(prefix, uri)
-            new_xml = ET.tostring(root, encoding="unicode")
-        finally:
-            ET._namespace_map.clear()  # type: ignore[attr-defined]
-            ET._namespace_map.update(snapshot)  # type: ignore[attr-defined]
-
-    new_document_bytes = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + new_xml
-    ).encode("utf-8")
-
-    # Validate well-formedness BEFORE the namespace-restore splice touches
-    # the string: _restore_dropped_namespace_declarations itself parses
-    # (via _root_namespace_declarations) to discover what ET emitted, and a
-    # malformed ET.tostring() result would otherwise surface as an
-    # unhandled xml.etree.ElementTree.ParseError there instead of the
-    # intended fail-closed DocxWriteVerificationError.
     try:
-        ET.fromstring(new_document_bytes)
-    except ET.ParseError as exc:
+        # ElementTree is still the mutation API used by this module, but lxml
+        # owns the final lexical serialization.  This preserves legitimate
+        # source prefixes (including ns10) that ET refuses to register.
+        new_document_bytes = ooxml_integrity.serialize_document_xml_preserving_namespaces(
+            original_document_xml, root
+        )
+    except ooxml_integrity.DocxPackageIntegrityError as exc:
         raise DocxWriteVerificationError(
-            "post-write verification failed: the serialized "
-            f"word/document.xml for {dest} is not well-formed XML: {exc} -- "
-            f"discarding the staged write, {dest} is untouched",
-            manifest={"parse_error": str(exc)},
+            f"post-write verification failed: {exc} -- discarding the staged "
+            f"write, {dest} is untouched",
+            manifest={"serialization_error": str(exc)},
         ) from exc
-
-    new_document_bytes = _restore_dropped_namespace_declarations(
-        original_document_xml, new_document_bytes
-    )
 
     try:
         reparsed_root = ET.fromstring(new_document_bytes)
@@ -2388,6 +2368,18 @@ def _atomic_write_docx_bytes(
     since mine" (restoring would destroy that writer's completed work — see
     :func:`_safe_restore_after_verification_failure`).
     """
+    try:
+        # Normalize the legacy unqualified comment attributes before the
+        # staged artifact is even written.  This is lexical-only and preserves
+        # the existing comment text/ranges, while preventing Word's repair
+        # dialog for multi-comment packages.
+        payload = ooxml_integrity.normalize_word_comment_attributes(payload)
+    except ooxml_integrity.DocxPackageIntegrityError as exc:
+        raise DocxWriteVerificationError(
+            f"pre-write package integrity failed for {dest}: {exc}",
+            manifest={"package_integrity_error": str(exc)},
+        ) from exc
+
     parent = os.path.dirname(os.path.abspath(dest)) or "."
     os.makedirs(parent, exist_ok=True)
     manifest_hash = _docx_manifest_hash(changed_parts) if changed_parts else None

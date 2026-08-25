@@ -1827,28 +1827,39 @@ def format_handoff_mcp_content(
     every existing caller's content — is returned BYTE-IDENTICAL: zero
     functional change. ``None`` or a non-positive value disables the budget
     entirely (opt out, e.g. a caller that deliberately wants the full raw
-    text regardless of size).
+    text regardless of size). Executable ``/goal`` payloads are also returned
+    byte-identically when oversized because their token-bound body is atomic
+    (MDE-10 — see the ``_is_executable_goal`` short-circuit below).
 
-    When ``content`` exceeds the budget, truncation is INTEGRITY-FIRST, never
-    blind: this function locates any embedded ``<goal_token>...</goal_token>``
-    plus SECURITY banner (``_mint_and_embed_goal_token``'s own marker,
-    matched via ``_GOAL_TOKEN_BANNER_RE``) and NEVER cuts through or before
-    the end of that banner, even if honoring that means exceeding
-    ``max_bytes`` — the provenance token and its verification instructions
-    are the one thing a truncated handoff must never silently lose or
-    corrupt (the "preserve... body-integrity metadata" half of the cb00889c
-    contract; see ``mint_handoff_token``'s ``body`` param /
-    ``verify_handoff_token`` for the binding itself). Truncation removes only
-    trailing bytes AFTER that protected point (or from the very start when no
-    banner is present, e.g. planner-mode content) and appends an explicit,
-    machine-readable marker naming exactly how many bytes were omitted —
-    never a silent drop. A receiving session that runs
-    ``verify_handoff_token(body=...)`` against truncated content correctly
-    gets ``reason="body_mismatch"`` (the presented body genuinely is not the
-    exact one that was minted) rather than a falsely-reassuring match; the
-    ``<goal_token>`` value itself remains valid for plain provenance
-    verification (``verify_handoff_token(project_id, token)`` with no
-    ``body``) regardless.
+    When ordinary content exceeds the budget, truncation is INTEGRITY-FIRST,
+    never blind: this function locates any embedded
+    ``<goal_token>...</goal_token>`` plus SECURITY banner
+    (``_mint_and_embed_goal_token``'s own marker, matched via
+    ``_GOAL_TOKEN_BANNER_RE``) and NEVER cuts through or before the end of
+    that banner, even if honoring that means exceeding ``max_bytes`` — the
+    provenance token and its verification instructions are the one thing a
+    truncated handoff must never silently lose or corrupt (the
+    "preserve... body-integrity metadata" half of the cb00889c contract; see
+    ``mint_handoff_token``'s ``body`` param / ``verify_handoff_token`` for
+    the binding itself). Truncation removes only trailing bytes AFTER that
+    protected point (or from the very start when no banner is present, e.g.
+    planner-mode content) and appends an explicit, machine-readable marker
+    naming exactly how many bytes were omitted — never a silent drop. A
+    receiving session that runs ``verify_handoff_token(body=...)`` against
+    truncated content correctly gets ``reason="body_mismatch"`` (the
+    presented body genuinely is not the exact one that was minted) rather
+    than a falsely-reassuring match; the ``<goal_token>`` value itself
+    remains valid for plain provenance verification
+    (``verify_handoff_token(project_id, token)`` with no ``body``)
+    regardless.
+
+    Executable ``/goal`` content (body starts with ``/goal`` or
+    ``/loop /goal`` and carries a goal-token banner) is handled BEFORE this
+    truncation branch and is never cut: a token-bound body that is delivered
+    with a truncation marker is not an executable handoff, even though
+    token-only provenance verification would still pass against the
+    truncated text. Non-goal/full narrative profiles retain the bounded
+    marker behavior described above unaffected.
 
     455cfc36 — ``mode='delta'``'s ``<continuation_manifest>`` tag
     (see :func:`build_continuation_manifest`) is rendered by
@@ -1878,6 +1889,18 @@ def format_handoff_mcp_content(
         return content
     _raw = content.encode("utf-8")
     if len(_raw) <= max_bytes:
+        return content
+    # MDE-10 — executable goal payloads are an atomic integrity unit. The
+    # token's body_hash covers the full /goal body, so post-mint truncation
+    # creates a handoff that looks present but cannot pass body verification.
+    # Preserve the exact body and let the caller narrow the scope if the
+    # client cannot accept it. Non-goal/full narrative profiles retain the
+    # bounded marker behavior below.
+    _is_executable_goal = (
+        content.lstrip().startswith(("/goal", "/loop /goal"))
+        and _GOAL_TOKEN_BANNER_RE.search(content) is not None
+    )
+    if _is_executable_goal:
         return content
     _protected_end = 0
     _banner_match = _GOAL_TOKEN_BANNER_RE.search(content)

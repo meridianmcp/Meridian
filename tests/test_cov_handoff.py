@@ -3438,10 +3438,14 @@ def test_format_handoff_mcp_content_truncates_oversized_content():
     assert "limit=1000 bytes" in out
 
 
-async def test_format_handoff_mcp_content_never_truncates_goal_token_banner(db):
-    """Even a budget far smaller than the protected region still keeps the
-    <goal_token>/SECURITY banner (and everything before it) byte-for-byte —
-    integrity-first over strict budget compliance."""
+async def test_format_handoff_mcp_content_never_truncates_executable_goal(db):
+    """An executable /goal is an atomic token-bound payload.
+
+    MDE-10: preserving only the token/banner prefix is insufficient because
+    the body hash covers the complete goal. The shared wire formatter must
+    return the complete goal, even when its generic narrative budget is too
+    small; callers must narrow the handoff at construction time instead.
+    """
     p = await db_module.create_project(db, "budget-token-protect")
     body = '/goal\nstart_session(project_name="x")'
     embedded = await handoff_module._mint_and_embed_goal_token(db, p["id"], body)
@@ -3450,10 +3454,9 @@ async def test_format_handoff_mcp_content_never_truncates_goal_token_banner(db):
     out = handoff_module.format_handoff_mcp_content(padded, max_bytes=10)
     banner_match = handoff_module._GOAL_TOKEN_BANNER_RE.search(embedded)
     assert banner_match is not None
-    protected_prefix = embedded[: banner_match.end()]
-    assert out.startswith(protected_prefix)
-    assert "TRUNCATED" in out
-    assert len(out.encode("utf-8")) < len(padded.encode("utf-8"))
+    assert out == padded
+    assert "TRUNCATED" not in out
+    assert len(out.encode("utf-8")) > 10
 
 
 def test_format_handoff_mcp_content_non_string_passthrough():

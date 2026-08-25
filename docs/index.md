@@ -118,6 +118,9 @@ When a client shows an old or incomplete tool list, see [MCP tool-surface
 freshness](mcp-tool-surface.md) for the cross-platform refresh contract and
 client-specific recovery steps.
 
+For the canonical producer/receiver workflow, token and body verification,
+bounded scopes, and recovery rules, see the [Meridian handoff contract](meridian-handoff-contract.md).
+
 ## Dashboard
 
 The Meridian dashboard runs at `localhost:7878` (self-hosted) or `usemeridian.us/dashboard` (hosted). All project data, session activity, and configuration lives here.

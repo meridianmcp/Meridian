@@ -78,18 +78,17 @@ async def test_contract_requested_mirrors_persisted_manifest(db):
     assert contract["manifest_hash"] == cm.manifest_hash(saved["capabilities"])
 
 
-async def test_contract_unknown_availability_never_forces_non_executable(db):
-    """A 'required' capability with unresolved (unknown) availability must NOT
-    be treated as missing — that would incorrectly flip executable=false on
-    every project until the ac80aaaf sibling lands."""
+async def test_contract_unknown_availability_fails_closed_for_required(db):
+    """A required capability whose availability cannot be verified is not executable."""
     project = await db_module.create_project(db, "cap-contract-unknown-avail")
     await db_module.set_project_capability_manifest(
         db, project["id"], [_valid_capability(availability_policy="required")]
     )
     contract = await cc.build_capability_contract(db, project["id"])
     assert contract["availability"]["status"] == "unknown"
-    assert contract["executable"] is True
-    assert contract["executable_reasons"] == []
+    assert contract["availability"]["unverified"] == ["code-search"]
+    assert contract["executable"] is False
+    assert "required_capabilities_unverified:code-search" in contract["executable_reasons"]
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +203,8 @@ async def test_contract_no_capability_profile_still_degrades_to_raw_manifest(db)
     # A "required" capability declared only in the raw manifest must still be
     # enforced -- effective_capabilities silently coming back empty would
     # make the executable/missing_required check below a permanent no-op.
-    assert contract["executable"] is True
+    assert contract["executable"] is False
+    assert "required_capabilities_unverified:code-search" in contract["executable_reasons"]
 
 
 async def test_contract_availability_checker_flags_missing_required(db):
@@ -257,7 +257,9 @@ async def test_contract_availability_checker_exception_degrades_to_unknown(db):
         db, project["id"], availability_checker=_bad_checker,
     )
     assert contract["availability"]["status"] == "unknown"
-    assert contract["executable"] is True
+    assert contract["availability"]["unverified"] == ["code-search"]
+    assert contract["executable"] is False
+    assert any("required_capabilities_unverified:code-search" in r for r in contract["executable_reasons"])
 
 
 # ---------------------------------------------------------------------------

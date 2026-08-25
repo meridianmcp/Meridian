@@ -34,7 +34,7 @@ keywords = ["mcp", "docx", "ooxml", "documents", "thesis"]
 # startup. Pinned below the v2 major so uvx cannot resolve an incompatible SDK;
 # see tests/test_tunnel_extension_dependencies.py for the regression coverage.
 version = "0.1.2"
-dependencies = ["mcp>=1.27,<2", "latex2mathml>=2.0"]
+dependencies = ["mcp>=1.27,<2", "latex2mathml>=2.0", "lxml>=5.0"]
 
 [project.scripts]
 # 58a044c7 — renamed from "meridian-docs" to "meridian-docs-mcp" to avoid the

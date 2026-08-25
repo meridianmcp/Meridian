@@ -244,23 +244,44 @@ async def test_recovery_tool_coming_back_flips_executable_true_again(db):
 async def test_empty_legacy_manifest_stays_backward_compatible_with_live_inventory(db):
     """An empty/legacy manifest must never be reported as having an
     unavailable capability -- there is nothing declared to check, so all
-    three buckets are empty lists (not 'unknown' strings, since a real
-    checker DID run) and executable stays True."""
+    four buckets are empty lists (not 'unknown' strings, since a real
+    checker DID run) and executable stays True. ``unverified`` (added by
+    capability_contract's separately-landed fail-closed fix, see the
+    ``no_tenant_or_live_inventory``/``live_inventory_probe_failure`` tests
+    above) is additive to this dict shape, not a behavior change for the
+    empty-manifest case: there are no capability ids to leave unverified."""
     project = await db_module.create_project(db, "mde1-empty-legacy")
     contract = await handoff_module.build_effective_capability_contract(
         db, project["id"], live_inventory=_inventory(),
     )
     assert contract["requested"]["capabilities"] == []
     assert contract["availability"]["status"] == "checked"
-    assert contract["availability"] == {"status": "checked", "available": [], "missing": [], "degraded": []}
+    assert contract["availability"] == {
+        "status": "checked", "available": [], "missing": [], "degraded": [], "unverified": [],
+    }
     assert contract["executable"] is True
     assert contract["executable_reasons"] == []
 
 
 async def test_no_tenant_or_live_inventory_keeps_prior_unknown_degrade(db):
-    """Backward compatibility for every EXISTING caller that passes neither
-    argument (all four production call sites, unmodified by this fix):
-    behavior must be byte-identical to before this change existed."""
+    """Every EXISTING caller that passes neither argument (all four
+    production call sites, unmodified by this fix) still degrades the
+    ``availability`` dict to the SAME ``"unknown"``/``"unknown"`` shape as
+    before this change existed -- this fix adds no new arguments-required
+    behavior for those callers.
+
+    ``executable`` itself, however, is intentionally NOT byte-identical to
+    the pre-fail-closed world: the separately-landed capability_contract
+    fail-closed fix (unverified-required-capability handling, see
+    tests/test_capability_contract.py's
+    ``test_contract_unknown_availability_fails_closed_for_required``) means
+    a ``required`` capability whose availability could not be verified --
+    whether because no checker ran at all (this test) or because a real
+    checker ran and returned ``unknown`` -- now correctly blocks
+    executability rather than silently defaulting to ``True``. That fix
+    composes with this one: MDE-1 supplies a real checker when it can;
+    capability_contract fails closed when no checker (or an inconclusive
+    one) leaves a required capability's status unresolved either way."""
     project = await db_module.create_project(db, "mde1-no-wiring")
     await db_module.set_project_capability_manifest(
         db, project["id"],
@@ -269,8 +290,9 @@ async def test_no_tenant_or_live_inventory_keeps_prior_unknown_degrade(db):
     contract = await handoff_module.build_effective_capability_contract(db, project["id"])
     assert contract["availability"]["status"] == "unknown"
     assert contract["availability"]["missing"] == "unknown"
-    assert contract["executable"] is True
-    assert contract["executable_reasons"] == []
+    assert contract["availability"]["unverified"] == ["alpha"]
+    assert contract["executable"] is False
+    assert "required_capabilities_unverified:alpha" in contract["executable_reasons"]
 
 
 async def test_tenant_kwarg_derives_live_inventory_via_project_tools(db, monkeypatch):
@@ -302,9 +324,16 @@ async def test_tenant_kwarg_derives_live_inventory_via_project_tools(db, monkeyp
 async def test_live_inventory_probe_failure_degrades_gracefully(db, monkeypatch):
     """A failure deriving the live inventory from ``tenant`` (tunnel probe
     blew up, project_tools import failed, whatever) must degrade to the
-    prior 'unknown' behavior -- never crash or turn the whole contract into
-    None. A tunnel-probing problem must never make the mandatory
-    start_session/generate_handoff response unavailable."""
+    'unknown' availability shape -- never crash or turn the whole contract
+    into None. A tunnel-probing problem must never make the mandatory
+    start_session/generate_handoff response unavailable (``contract is not
+    None`` below).
+
+    A required capability left unverified by that degrade is correctly
+    reported non-executable (capability_contract's fail-closed fix -- see
+    the sibling test above for the full rationale): "gracefully" means the
+    caller gets a well-formed, honest contract back, not that a probe
+    failure is invisible to ``executable``."""
     project = await db_module.create_project(db, "mde1-probe-failure")
     await db_module.set_project_capability_manifest(
         db, project["id"], [_valid_capability(id="alpha", availability_policy="required")],
@@ -322,7 +351,9 @@ async def test_live_inventory_probe_failure_degrades_gracefully(db, monkeypatch)
     )
     assert contract is not None
     assert contract["availability"]["status"] == "unknown"
-    assert contract["executable"] is True
+    assert contract["availability"]["unverified"] == ["alpha"]
+    assert contract["executable"] is False
+    assert "required_capabilities_unverified:alpha" in contract["executable_reasons"]
 
 
 async def test_live_inventory_wins_over_tenant_when_both_supplied(db, monkeypatch):

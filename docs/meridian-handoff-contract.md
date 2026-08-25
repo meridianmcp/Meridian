@@ -276,6 +276,35 @@ so this should be unreachable in practice; it exists purely as the
 fail-closed guarantee that a caller can rely on either "a complete manifest"
 or "an explicit error," never a corrupted one.
 
+## Wire-level truncation is never allowed to cut an executable body
+
+The two backstops above bound content as it is *built*. `format_handoff_mcp_content`
+(the single choke point every MCP transport — `meridian/mcp/handler.py`,
+`meridian/mcp/stdio_handler.py`, and the HTTP route in `meridian/routes/handoff.py`
+— funnels through before returning the `content` field) applies one more budget
+at the *wire* layer via `max_bytes` (cb00889c). For ordinary narrative content
+that still exceeds the budget after the two backstops above, truncation is
+integrity-first: it never cuts through or before the end of an embedded
+`<goal_token>...</goal_token>` + SECURITY banner (`_GOAL_TOKEN_BANNER_RE`), and
+appends an explicit machine-readable marker naming how many bytes were omitted
+— never a silent drop.
+
+MDE-10 goes one step further for **executable** `/goal` payloads specifically:
+a token's body-hash covers the complete `/goal` body, so any truncation of that
+body — even truncation that respects the banner floor above — would hand a
+receiver a block whose token is genuine but whose presented body no longer
+hash-matches what was minted (`verify_handoff_token` would correctly return
+`body_mismatch`, but the handoff itself is now dead on arrival). Content that
+starts with `/goal` or `/loop /goal` and carries a goal-token banner is
+therefore returned byte-identically regardless of `max_bytes` — this is an
+opt-out from the wire budget for that one content shape, not a bypass of the
+budget's intent, since a token-bound body is atomic by construction. If a
+client genuinely cannot accept the resulting size, the producer narrows scope
+at generation time (`selected_item_ids`, `skip_ai_summary=true`) rather than
+letting the wire layer mutilate an already-minted body. Non-goal/full
+narrative profiles are unaffected and keep the bounded marker behavior
+described above.
+
 ## Planner vs. executor modes
 
 | | Planner (`mode="planner"`, `mode="full"`) | Executor (`mode="goal"`, `mode="starter"`) |

@@ -724,6 +724,23 @@ class TestModeAwareMaxContentBytesDefaults:
         "never cut through the banner, even if that means exceeding
         max_bytes" contract) -- so this does not assert a strict `<=`
         against a tiny budget; it asserts the override is genuinely applied.
+
+        Uses ``mode="starter"`` rather than ``mode="goal"`` deliberately
+        (2ee0000c/MDE-10): a goal-mode render's top-level content itself IS
+        the token-bound executable payload (starts with ``/goal`` or
+        ``/loop /goal``), and MDE-10 makes ``format_handoff_mcp_content``
+        return that content byte-identically regardless of ``max_bytes`` --
+        wire-level truncation of an already-minted, hash-bound body is
+        exactly the corruption MDE-10 closes (see
+        ``test_format_handoff_mcp_content_never_truncates_executable_goal``
+        in tests/test_cov_handoff.py, and the "Wire-level truncation is
+        never allowed to cut an executable body" section of
+        docs/meridian-handoff-contract.md). Starter mode wraps its own
+        internal ``/goal`` block in a "Done:"/"# Pending" preview, so its
+        top-level content does not match the atomic-goal prefix check and
+        the pre-existing bounded-truncation behavior this test pins remains
+        observable, while the protected banner region is still present to
+        assert on below.
         """
         project = await db_module.create_project(db, "budget-explicit-proj")
         await db_module.set_goal(db, project["id"], "ship it", sprint="v1")
@@ -731,10 +748,10 @@ class TestModeAwareMaxContentBytesDefaults:
             await db_module.add_sprint_item(db, project["id"], "v1", f"item number {i}")
 
         _path, default_content, _a1 = await handoff_module.generate_handoff(
-            db, project["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+            db, project["id"], str(tmp_path), mode="starter", skip_ai_summary=True,
         )
         _path, small_content, _a2 = await handoff_module.generate_handoff(
-            db, project["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+            db, project["id"], str(tmp_path), mode="starter", skip_ai_summary=True,
             max_content_bytes=3000,
         )
         assert len(small_content.encode("utf-8")) < len(default_content.encode("utf-8"))

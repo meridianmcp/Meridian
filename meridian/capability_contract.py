@@ -883,10 +883,19 @@ async def build_capability_contract(
         available: Any = sorted(availability_result.get("available") or [])
         missing: Any = sorted(availability_result.get("missing") or [])
         degraded: Any = sorted(availability_result.get("degraded") or [])
+        unverified: list[str] = []
     else:
         available = "unknown"
         missing = "unknown"
         degraded = "unknown"
+        # An unavailable checker is not evidence that a declared capability
+        # works. Keep the legacy fields lossless for clients that understand
+        # the older contract, while exposing the exact ids whose status is
+        # unverified so executors can make a deterministic decision.
+        unverified = sorted(
+            c["id"] for c in effective_capabilities
+            if isinstance(c, dict) and c.get("id")
+        )
 
     required_ids = {
         c["id"] for c in effective_capabilities
@@ -895,6 +904,7 @@ async def build_capability_contract(
     missing_required = (
         sorted(required_ids & set(missing)) if isinstance(missing, list) else []
     )
+    unverified_required = sorted(required_ids & set(unverified))
 
     executable = True
     executable_reasons: list[str] = []
@@ -902,6 +912,11 @@ async def build_capability_contract(
         executable = False
         executable_reasons.append(
             "missing_required_capabilities:" + ",".join(missing_required)
+        )
+    if unverified_required:
+        executable = False
+        executable_reasons.append(
+            "required_capabilities_unverified:" + ",".join(unverified_required)
         )
     if board_stale:
         executable = False
@@ -935,6 +950,7 @@ async def build_capability_contract(
             "available": available,
             "missing": missing,
             "degraded": degraded,
+            "unverified": unverified,
         },
         "manifest_hash": effective_hash,
         "item_tool_requirements": item_tool_requirements,
