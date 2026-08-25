@@ -1133,6 +1133,7 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_handoffs_invalidation(db)
     await _migrate_handoff_corrections_table(db)
     await _migrate_vector_index_state(db)
+    await _migrate_object_sync_state(db)
     await _migrate_pixi_env_roots(db)
     await _migrate_executor_reports_table(db)
     await _migrate_wave_run_summaries(db)
@@ -12580,6 +12581,27 @@ from .vector_index_state import (  # noqa: F401
     list_vector_index_states,
     upsert_vector_index_state,
     record_vector_backend_benchmark,
+)
+
+
+# 1d34c076 (build milestone; investigation 549e66c6) — durable sync-state
+# tracking for the optional, inactive-by-default object-storage backend
+# (meridian.object_store). One row per (project_id, content_hash): which
+# remote backend/state it's in (local_only/queued_sync/synced/sync_failed/
+# unavailable), remote key/etag once synced, and retry bookkeeping. Mirrors
+# the vector_index_state import immediately above.
+from .object_sync_state import (  # noqa: F401
+    OBJECT_SYNC_STATES,
+    RETRY_ELIGIBLE_STATES as OBJECT_SYNC_RETRY_ELIGIBLE_STATES,
+    _migrate_object_sync_state,
+    get_object_sync_state,
+    list_object_sync_states,
+    list_retry_eligible as list_object_sync_retry_eligible,
+    mark_local_only as mark_object_local_only,
+    mark_queued_sync as mark_object_queued_sync,
+    mark_synced as mark_object_synced,
+    mark_sync_failed as mark_object_sync_failed,
+    mark_unavailable as mark_object_unavailable,
 )
 
 
