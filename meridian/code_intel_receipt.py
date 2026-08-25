@@ -77,8 +77,12 @@ receipt found" rather than fabricating one.
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import re
+import subprocess
+from pathlib import Path
 from typing import Any
 
 from . import db as db_module
@@ -86,6 +90,21 @@ from . import db as db_module
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I
 )
+
+# MDE-2 — identity-binding markers, so a receipt can be REJECTED (not just
+# recorded), instead of treated as evidence for a project it never actually
+# touched. See ``is_contaminated_repo_path`` / ``resolve_receipt_repo_root``.
+#
+# ``.codex/worktrees/...`` is a DIFFERENT agent tool's own isolated scratch
+# checkout convention (Codex, running directly in a shared main checkout per
+# this session's own launch context) -- distinct from Meridian's own
+# ``.claude/worktrees/...`` convention (see worktree_cleanup.py's
+# ``looks_like_worktree_path``, which a genuine Meridian-registered worktree
+# always matches instead). A prospecting call resolved against a sibling
+# tool's temp checkout says nothing about whether prospecting happened
+# against THIS session's actual code -- excluded outright, never silently
+# accepted as if it were an ordinary worktree.
+_CONTAMINATION_MARKERS = ("/.codex/worktrees/",)
 
 #: event_type recorded in action_audit_log for a genuine prospecting receipt.
 RECEIPT_EVENT_TYPE = "code_intel_prospect_receipt"
@@ -140,6 +159,25 @@ def extract_query_hint(args: "dict[str, Any] | None") -> str:
     return ""
 
 
+def extract_query_hint_full(args: "dict[str, Any] | None") -> str:
+    """MDE-2 rework — same field lookup as :func:`extract_query_hint`, but
+    WITHOUT the 200-char truncation. ``extract_query_hint``'s truncation is
+    fine for the receipt's ``query`` diagnostic field, but truncating BEFORE
+    comparing against a hit's own reported identity would make an exact-name
+    match structurally impossible for any symbol whose qualified name is
+    itself >200 chars (a real, if uncommon, shape for a deeply-nested
+    qualified name) — this is the untruncated string exact-match selection
+    (:func:`meridian.prospect.select_exact_hit`) must be compared against.
+    """
+    if not isinstance(args, dict):
+        return ""
+    for key in _QUERY_HINT_KEYS:
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
 def resolve_receipt_project_id(args: "dict[str, Any] | None") -> "str | None":
     """Best-effort resolution of the MERIDIAN project id a receipt belongs to.
 
@@ -168,6 +206,224 @@ def resolve_receipt_project_id(args: "dict[str, Any] | None") -> "str | None":
     return None
 
 
+def normalize_repo_root(path: "str | None") -> "str | None":
+    """Canonicalize a filesystem path for stable repo-identity comparison.
+
+    Falls back to a stripped string for anything that isn't resolvable on
+    this machine (matches ``worktree_code_intel_context.normalize_context_
+    path``'s own fallback posture) rather than raising.
+    """
+    if not path:
+        return None
+    try:
+        resolved = str(Path(str(path)).expanduser().resolve())
+        return resolved or None
+    except Exception:  # noqa: BLE001
+        text = str(path).strip()
+        return text or None
+
+
+def is_contaminated_repo_path(path: "str | None") -> bool:
+    """True when *path* passes through another agent tool's own isolated
+    scratch-checkout convention (``.codex/worktrees/...``) rather than this
+    project's own repo, or Meridian's own ``.claude/worktrees/...``
+    convention. See the module-level ``_CONTAMINATION_MARKERS`` docstring.
+    """
+    if not path:
+        return False
+    normalized = "/" + str(path).replace("\\", "/").strip("/").lower() + "/"
+    return any(marker in normalized for marker in _CONTAMINATION_MARKERS)
+
+
+def _git_head_sync(root_dir: str) -> "str | None":
+    """Best-effort, synchronous ``git rev-parse HEAD`` -- MUST be called from
+    a worker thread (see ``_git_revision``), never awaited directly: asyncio
+    subprocess creation is unsupported on the Windows SelectorEventLoop this
+    project forces (see ``__main__.py`` / ``git_md.py``'s identical rationale).
+    Never raises; returns ``None`` for anything that isn't a clean git repo.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root_dir, capture_output=True, text=True, timeout=3,
+        )
+        if proc.returncode != 0:
+            return None
+        sha = (proc.stdout or "").strip()
+        return sha or None
+    except Exception:  # noqa: BLE001 -- identity probe must never raise
+        return None
+
+
+async def _git_revision(root_dir: "str | None") -> "str | None":
+    if not root_dir:
+        return None
+    try:
+        return await asyncio.to_thread(_git_head_sync, root_dir)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _hash_file_sync(root_dir: str, resolved_file: str) -> "str | None":
+    try:
+        p = Path(resolved_file)
+        if not p.is_absolute():
+            p = Path(root_dir) / resolved_file
+        if not p.is_file():
+            return None
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def compute_source_hash(
+    root_dir: "str | None", resolved_file: "str | None"
+) -> "str | None":
+    """sha256 of *resolved_file*'s current bytes under *root_dir*, or ``None``
+    when either is missing or the file can't be read. Off the event loop
+    (worker thread), same rationale as ``_git_head_sync``."""
+    if not root_dir or not resolved_file:
+        return None
+    try:
+        return await asyncio.to_thread(_hash_file_sync, root_dir, resolved_file)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def compute_graph_hash(hit: "dict[str, Any] | None") -> "str | None":
+    """MDE-2 rework — sha256 of a hit's OWN inline body/snippet text (see
+    :func:`meridian.prospect.hit_content`), when it carries one. ``None``
+    when the hit has no inline text at all (most graph/serena hits only
+    report a location, not a body) — never fabricated. Paired with
+    :func:`compute_live_range_hash` for the "graph and live-file hashes
+    agree" check.
+    """
+    if not isinstance(hit, dict):
+        return None
+    try:
+        from .prospect import hit_content as _hit_content  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    text = _hit_content(hit)
+    if not text:
+        return None
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _hash_line_range_sync(
+    root_dir: str, resolved_file: str, start_line: "int | None", end_line: "int | None",
+) -> "str | None":
+    try:
+        if start_line is None:
+            return None
+        p = Path(resolved_file)
+        if not p.is_absolute():
+            p = Path(root_dir) / resolved_file
+        if not p.is_file():
+            return None
+        lines = p.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+        start = max(1, int(start_line))
+        end = max(start, int(end_line) if end_line is not None else start)
+        chunk = "".join(lines[start - 1:end])
+        if not chunk:
+            return None
+        return hashlib.sha256(chunk.encode("utf-8")).hexdigest()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def compute_live_range_hash(
+    root_dir: "str | None", resolved_file: "str | None",
+    start_line: "int | None", end_line: "int | None",
+) -> "str | None":
+    """MDE-2 rework — sha256 of the LIVE file's bytes for exactly
+    ``[start_line, end_line]`` (1-indexed, inclusive) under *root_dir* — the
+    counterpart to :func:`compute_graph_hash`'s hash of the graph/index's
+    OWN reported body for the same location.
+
+    Comparing the two is the "graph and live-file hashes agree" mechanism
+    the acceptance bar asks for: equal hashes mean the indexed body still
+    matches what's really on disk right now (fresh); different hashes are a
+    concrete, positive staleness signal — the graph/index captured a body
+    that no longer matches this exact range (a subsequent edit, or the
+    project reverting to a different revision since the hit was captured) —
+    distinct from (and finer-grained than) :func:`compute_source_hash`'s
+    WHOLE-FILE hash, which this function complements rather than replaces.
+
+    ``None`` (never computed, never a false "disagreement") when any input
+    is missing or the range/file can't be read — off the event loop (worker
+    thread), same rationale as ``compute_source_hash``.
+    """
+    if not root_dir or not resolved_file or start_line is None:
+        return None
+    try:
+        return await asyncio.to_thread(
+            _hash_line_range_sync, root_dir, resolved_file, start_line, end_line,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def resolve_receipt_repo_root(
+    db: Any,
+    *,
+    session_id: "str | None",
+    root_dir: "str | None" = None,
+    default_repo_root: "str | None" = None,
+) -> "dict[str, Any]":
+    """Resolve the repo identity a prospecting receipt should bind to.
+
+    Preference order, mirroring ``test_run_receipt.resolve_repo_root_for_
+    session``'s already-established "session's own registered worktree wins
+    over the server's default checkout" technique (same root cause: a
+    parallel-worktree executor session's real work lives in ITS OWN
+    checkout, not the server process's ambient one):
+
+    1. An explicit ``root_dir`` the caller already resolved for this exact
+       tool call (e.g. the tunnel's per-tenant active-repo cache, or
+       ``prospect_symbol``'s own ``root_dir`` argument).
+    2. The session's registered ``active_worktrees`` row, resolved to a real
+       disk path via ``worktree_cleanup.resolve_worktree_disk_path``.
+    3. ``default_repo_root`` (typically the server's own main checkout).
+
+    Returns ``{"repo_root", "source", "contaminated"}``. ``repo_root`` is
+    ``None`` (``source="unresolved"``) when nothing above resolves --
+    callers must treat that as "identity unknown", never as a mismatch.
+    Never raises.
+    """
+    explicit = normalize_repo_root(root_dir)
+    if explicit:
+        return {
+            "repo_root": explicit, "source": "explicit_root_dir",
+            "contaminated": is_contaminated_repo_path(explicit),
+        }
+    if session_id:
+        try:
+            from . import worktree_cleanup as _worktree_cleanup  # noqa: PLC0415
+
+            wt = await db_module.get_active_worktree_for_session(db, session_id)
+            if wt and wt.get("path"):
+                base = normalize_repo_root(default_repo_root) or "."
+                wt_abs = _worktree_cleanup.resolve_worktree_disk_path(
+                    Path(base), wt["path"],
+                )
+                resolved = normalize_repo_root(str(wt_abs))
+                if resolved:
+                    return {
+                        "repo_root": resolved, "source": "session_worktree",
+                        "contaminated": is_contaminated_repo_path(resolved),
+                    }
+        except Exception:  # noqa: BLE001 -- unresolvable worktree isn't itself a failure
+            pass
+    default = normalize_repo_root(default_repo_root)
+    if default:
+        return {
+            "repo_root": default, "source": "default_repo_root",
+            "contaminated": is_contaminated_repo_path(default),
+        }
+    return {"repo_root": None, "source": "unresolved", "contaminated": False}
+
+
 async def record_prospect_receipt(
     db: Any,
     *,
@@ -176,18 +432,99 @@ async def record_prospect_receipt(
     session_id: "str | None",
     tool_name: str,
     query: "str | None" = None,
+    root_dir: "str | None" = None,
+    resolved_file: "str | None" = None,
+    rung: "str | None" = None,
+    default_repo_root: "str | None" = None,
+    resolved_range: "dict[str, Any] | None" = None,
+    resolved_symbol: "str | None" = None,
+    hit: "dict[str, Any] | None" = None,
 ) -> "dict[str, Any] | None":
     """Write ONE durable prospecting receipt to ``action_audit_log``.
+
+    MDE-2 — the receipt now binds to the active repo identity: resolved
+    ``repo_root`` (explicit ``root_dir``, else the session's registered
+    worktree, else ``default_repo_root`` — see ``resolve_receipt_repo_
+    root``), best-effort git ``revision`` (HEAD sha) for that root, and,
+    when the caller supplied one, the ``resolved_file``'s current content
+    hash. A resolved identity that lands inside another agent tool's
+    isolated scratch checkout (``.codex/worktrees/...``) is EXCLUDED
+    outright — the receipt is not written at all — so contamination from a
+    concurrent, differently-tooled session can never be produced as
+    evidence for this (or any other) project's completion gate.
+
+    MDE-2 rework — three additional, OPTIONAL fields, all backward
+    compatible (every existing caller that omits them gets byte-identical
+    detail to before, modulo the new keys being present and null/absent):
+
+    * ``resolved_range`` — ``{"start_line", "end_line"}`` (see
+      :func:`meridian.prospect.hit_range`) — stored as ``range`` in the
+      detail. Never recorded before this rework.
+    * ``resolved_symbol`` — the REAL resolved symbol identity (see
+      :func:`meridian.prospect.hit_identity`), as opposed to the raw,
+      caller-supplied query string ``query`` was always a (200-char
+      truncated) proxy for. Stored as ``symbol``, falling back to the
+      truncated ``query`` proxy (documented via ``symbol_source``) only
+      when no exact hit was resolved.
+    * ``hit`` — the raw, EXACT-matched hit (caller's responsibility to have
+      selected it via :func:`meridian.prospect.select_exact_hit` — this
+      function does not itself re-verify exactness) — used, together with
+      ``resolved_range``, to compute ``graph_hash``/``live_range_hash``/
+      ``hash_agreement``: whether the graph/index's own reported body for
+      this exact range still matches what's really on disk right now. See
+      :func:`compute_graph_hash` / :func:`compute_live_range_hash`.
 
     Best-effort and fully guarded: a receipt-write failure must NEVER break
     the underlying tool call that already succeeded. Returns the stored row,
     or ``None`` when nothing could be written (no ``project_id`` to attribute
-    it to, or an unexpected DB error).
+    it to, a contaminated resolved identity, or an unexpected DB error).
     """
     if not project_id:
         return None
     try:
-        detail = json.dumps({"tool": tool_name, "query": (query or "")[:200]})
+        repo_ctx = await resolve_receipt_repo_root(
+            db, session_id=session_id, root_dir=root_dir,
+            default_repo_root=default_repo_root,
+        )
+        if repo_ctx.get("contaminated"):
+            return None
+        repo_root = repo_ctx.get("repo_root")
+        source_hash = await compute_source_hash(repo_root, resolved_file)
+        revision = await _git_revision(repo_root)
+
+        range_start = (
+            resolved_range.get("start_line") if isinstance(resolved_range, dict) else None
+        )
+        range_end = (
+            resolved_range.get("end_line") if isinstance(resolved_range, dict) else None
+        )
+        graph_hash = compute_graph_hash(hit)
+        live_range_hash = await compute_live_range_hash(
+            repo_root, resolved_file, range_start, range_end,
+        )
+        hash_agreement = (
+            (graph_hash == live_range_hash)
+            if (graph_hash is not None and live_range_hash is not None)
+            else None
+        )
+
+        truncated_query = (query or "")[:200]
+        detail = json.dumps({
+            "tool": tool_name,
+            "query": truncated_query,
+            "symbol": resolved_symbol or (truncated_query or None),
+            "symbol_source": "resolved_hit" if resolved_symbol else "query_hint_proxy",
+            "repo_root": repo_root,
+            "repo_source": repo_ctx.get("source"),
+            "revision": revision,
+            "resolved_file": resolved_file,
+            "range": resolved_range if isinstance(resolved_range, dict) else None,
+            "source_hash": source_hash,
+            "graph_hash": graph_hash,
+            "live_range_hash": live_range_hash,
+            "hash_agreement": hash_agreement,
+            "rung": rung,
+        })
         return await db_module.record_action_audit_event(
             db, RECEIPT_EVENT_TYPE,
             tenant_id=tenant_id, project_id=project_id,
@@ -197,14 +534,121 @@ async def record_prospect_receipt(
         return None
 
 
+def _receipt_detail(row: "dict[str, Any]") -> "dict[str, Any]":
+    try:
+        parsed = json.loads(row.get("detail") or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _receipt_repo_root(row: "dict[str, Any]") -> "str | None":
+    val = _receipt_detail(row).get("repo_root")
+    return val if isinstance(val, str) and val.strip() else None
+
+
+def _receipt_resolved_file(row: "dict[str, Any]") -> "str | None":
+    val = _receipt_detail(row).get("resolved_file")
+    return val if isinstance(val, str) and val.strip() else None
+
+
+def _file_exists_under_root(root: "str | None", resolved_file: "str | None") -> bool:
+    """True unless *root*/*resolved_file* is a concrete, checkable pair that
+    fails to exist. Nothing to check (either side missing) or an
+    unverifiable filesystem error both return True -- this function only
+    ever REJECTS a receipt on positive evidence the file isn't there, never
+    manufactures a rejection out of an unresolved/unverifiable case (same
+    "don't overclaim" posture as the rest of this module)."""
+    if not root or not resolved_file:
+        return True
+    try:
+        p = Path(resolved_file)
+        if not p.is_absolute():
+            p = Path(root) / resolved_file
+        return p.is_file()
+    except Exception:  # noqa: BLE001
+        return True
+
+
+async def find_recent_prospect_receipt_with_context(
+    db: Any,
+    *,
+    project_id: str,
+    tenant_id: "str | None" = None,
+    since: "str | None" = None,
+    expected_repo_root: "str | None" = None,
+) -> "dict[str, Any]":
+    """MDE-2 — identity-aware receipt lookup.
+
+    Returns ``{"receipt": row|None, "wrong_repo_only": bool, "candidates":
+    [rows]}``. When *expected_repo_root* is given, a candidate whose OWN
+    resolved ``repo_root`` is recorded and disagrees is skipped (never
+    treated as evidence for a different checkout); one whose declared
+    ``resolved_file`` doesn't actually exist under its own ``repo_root`` is
+    ALSO skipped ("wrong-body" rejection — a receipt claiming to have
+    resolved a file that isn't really there is never silently trusted). A
+    candidate with NO resolved repo identity of its own is accepted (can't
+    prove a mismatch against an unresolved receipt — same "don't overclaim"
+    posture the whole module uses elsewhere), matching pre-MDE-2 behavior
+    for receipts written before this identity binding existed.
+
+    ``wrong_repo_only=True`` means: real receipts exist for this project
+    and time window, every one of them carries a RESOLVED identity, and
+    NONE of them matches *expected_repo_root* -- the explicit "stale/wrong
+    repo" signal distinct from "no receipt was ever recorded at all".
+    """
+    fetch_limit = 8 if expected_repo_root else 1
+    try:
+        rows = await db_module.get_action_audit_log(
+            db, project_id=project_id, tenant_id=tenant_id,
+            event_type=RECEIPT_EVENT_TYPE, since=since, limit=fetch_limit,
+        )
+    except Exception:  # noqa: BLE001 -- an unverifiable check must never wedge completion
+        return {"receipt": None, "wrong_repo_only": False, "candidates": []}
+    if not rows:
+        return {"receipt": None, "wrong_repo_only": False, "candidates": []}
+    if not expected_repo_root:
+        return {"receipt": rows[0], "wrong_repo_only": False, "candidates": rows}
+
+    expected_norm = normalize_repo_root(expected_repo_root)
+    saw_resolved_mismatch = False
+    for row in rows:
+        stored_root = _receipt_repo_root(row)
+        if stored_root is None:
+            # This receipt never resolved an identity of its own (legacy
+            # row, or a tunnel-forwarded call with no active-repo cache) --
+            # cannot prove it's wrong, so it's accepted rather than
+            # penalized for a gap this receipt predates or can't see.
+            return {"receipt": row, "wrong_repo_only": False, "candidates": rows}
+        if is_contaminated_repo_path(stored_root):
+            continue
+        if normalize_repo_root(stored_root) != expected_norm:
+            saw_resolved_mismatch = True
+            continue
+        resolved_file = _receipt_resolved_file(row)
+        if resolved_file and not _file_exists_under_root(stored_root, resolved_file):
+            # "Wrong-body" signal: the receipt's OWN declared repo_root
+            # doesn't actually contain the file it claims to have resolved.
+            # Never trusted as valid prospecting evidence -- keep looking.
+            saw_resolved_mismatch = True
+            continue
+        return {"receipt": row, "wrong_repo_only": False, "candidates": rows}
+    return {"receipt": None, "wrong_repo_only": saw_resolved_mismatch, "candidates": rows}
+
+
 async def find_recent_prospect_receipt(
     db: Any,
     *,
     project_id: str,
     tenant_id: "str | None" = None,
     since: "str | None" = None,
+    expected_repo_root: "str | None" = None,
 ) -> "dict[str, Any] | None":
-    """Return the newest prospecting receipt for *project_id*, or ``None``.
+    """Return the newest MATCHING prospecting receipt for *project_id*, or
+    ``None``. Back-compat entry point (unchanged 0-arg behavior when
+    *expected_repo_root* is omitted, same as before MDE-2): every existing
+    caller that doesn't pass *expected_repo_root* gets byte-identical
+    behavior to the pre-MDE-2 implementation.
 
     ``since`` (inclusive lower bound on ``created_at``, same TEXT-comparable
     ``YYYY-MM-DD HH:MM:SS`` form the rest of this codebase's timestamps use)
@@ -212,15 +656,16 @@ async def find_recent_prospect_receipt(
     ``claimed_at`` -- a receipt from a stale, earlier pass at the item does
     not count as evidence for the CURRENT claim, mirroring
     ``sprint_evidence_guard``'s ``EVIDENCE_STALE`` freshness check.
+
+    Callers that need to distinguish "no receipt at all" from "receipts
+    exist but none match this repo identity" should call
+    :func:`find_recent_prospect_receipt_with_context` directly instead.
     """
-    try:
-        rows = await db_module.get_action_audit_log(
-            db, project_id=project_id, tenant_id=tenant_id,
-            event_type=RECEIPT_EVENT_TYPE, since=since, limit=1,
-        )
-    except Exception:  # noqa: BLE001 -- an unverifiable check must never wedge completion
-        return None
-    return rows[0] if rows else None
+    result = await find_recent_prospect_receipt_with_context(
+        db, project_id=project_id, tenant_id=tenant_id, since=since,
+        expected_repo_root=expected_repo_root,
+    )
+    return result["receipt"]
 
 
 def _claimed_at_since(item: "dict[str, Any]") -> "str | None":
@@ -242,6 +687,8 @@ async def verify_code_intel_prospecting(
     *,
     session_id: "str | None" = None,
     live_inventory: "dict[str, Any] | None" = None,
+    root_dir: "str | None" = None,
+    default_repo_root: "str | None" = None,
 ) -> "dict[str, Any]":
     """The completion-time prospecting-receipt gate.
 
@@ -323,13 +770,58 @@ async def verify_code_intel_prospecting(
 
     # Code-intel IS usable (available, or degraded via a working fallback) --
     # the executor genuinely had the means to prospect. A durable receipt is
-    # required to prove it actually happened for the CURRENT claim.
-    receipt = await find_recent_prospect_receipt(
-        db, project_id=project_id, tenant_id=(tenant or {}).get("id") if tenant else None,
-        since=_claimed_at_since(item),
+    # required to prove it actually happened for the CURRENT claim, AND
+    # (MDE-2) that receipt must bind to THIS session's own repo identity --
+    # a receipt is not free-floating proof "prospecting happened somewhere",
+    # it's evidence prospecting happened against the code this completion is
+    # actually about.
+    repo_ctx = await resolve_receipt_repo_root(
+        db, session_id=session_id, root_dir=root_dir,
+        default_repo_root=default_repo_root,
     )
+    expected_repo_root = (
+        None if repo_ctx.get("contaminated") else repo_ctx.get("repo_root")
+    )
+    lookup = await find_recent_prospect_receipt_with_context(
+        db, project_id=project_id, tenant_id=(tenant or {}).get("id") if tenant else None,
+        since=_claimed_at_since(item), expected_repo_root=expected_repo_root,
+    )
+    receipt = lookup.get("receipt")
     if receipt is not None:
         return {**base, "applicable": True, "ok": True, "capability": cap_result, "receipt": receipt}
+
+    if lookup.get("wrong_repo_only"):
+        # Explicit, distinct signal from CODE_INTEL_RECEIPT_MISSING: real
+        # receipt(s) exist for this project/time-window, but every one of
+        # them resolved to a DIFFERENT repo identity than the one this
+        # completion is actually running against -- a stale/wrong-repo (or
+        # wrong-body) receipt must never silently satisfy the gate.
+        if policy == "required":
+            return {
+                **base, "applicable": True, "ok": False,
+                "code": "CODE_INTEL_RECEIPT_WRONG_REPO", "capability": cap_result,
+                "message": (
+                    "code-intel prospecting receipt(s) were recorded for this "
+                    "project since the item was claimed, but none resolve to "
+                    f"the current repo identity ({expected_repo_root!r}) -- "
+                    "they were recorded against a different checkout/worktree "
+                    "(or claim a resolved file that isn't actually there) and "
+                    "cannot attest to prospecting against THIS session's "
+                    "actual code. Prospect again from the current worktree, "
+                    "or pass override_code_intel_receipt=true with a "
+                    "non-empty override_reason to explicitly acknowledge and "
+                    "complete anyway (audited)."
+                ),
+            }
+        return {
+            **base, "applicable": True, "ok": True, "degraded": True,
+            "capability": cap_result,
+            "warning": (
+                "code-intel prospecting receipt(s) exist but none match the "
+                f"current repo identity (policy={policy}) -- proceeding, "
+                "skip noted."
+            ),
+        }
 
     if policy == "required":
         return {

@@ -915,13 +915,35 @@ async def _resolve_symbol(
     if not matches:
         return _unresolved("no matching symbol in graph snapshot",
                            selector_type="symbol", uri=uri, qualified_name=qn)
-    # Prefer an exact qualified_name match; else the first (best-ranked) row.
+    # MDE-2 rework — require an EXACT qualified_name match. `matches` can
+    # legitimately contain NEIGHBORING symbols (the default resolver does a
+    # fuzzy LIKE-token search over qualified_name/file — see
+    # db.search_graph_entities; a tenant-aware resolver's graph/serena/
+    # semantic rungs are similarly fuzzy by nature). The previous fallback
+    # (`best = best or matches[0]`) silently returned resolved=True with an
+    # UNRELATED symbol's file/match whenever no exact match existed — the
+    # exact "wrong body" bug this closes: a caller that trusts this result
+    # to fetch a snippet/body would fetch a neighboring symbol's code under
+    # the queried symbol's identity. Falling back to a near-miss candidate
+    # is never safe here; report unresolved instead, surfacing the
+    # near-miss candidates as diagnostics only (never as a match).
     best = None
     for m in matches:
         if isinstance(m, dict) and str(m.get("qualified_name") or "") == str(qn):
             best = m
             break
-    best = best or matches[0]
+    if best is None:
+        near_miss = [
+            (m.get("qualified_name") if isinstance(m, dict) else None) for m in matches[:5]
+        ]
+        return _unresolved(
+            "no EXACT qualified_name match in graph snapshot "
+            f"({len(matches)} near-miss candidate(s) found but not treated as "
+            "a match — resolving to one would risk returning a neighboring "
+            "symbol's body under this symbol's identity)",
+            selector_type="symbol", uri=uri, qualified_name=qn,
+            near_miss_candidates=near_miss,
+        )
     out: dict[str, Any] = {
         "resolved": True,
         "selector_type": "symbol",

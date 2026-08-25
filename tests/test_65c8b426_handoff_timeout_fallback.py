@@ -124,7 +124,12 @@ async def test_generate_handoff_success_has_degraded_false(db, tmp_path):
     assert result.get("degraded") is False, (
         f"Expected degraded=False on success, got {result.get('degraded')!r}"
     )
-    assert result.get("mode") in ("full", "delta", "starter", "planner", "compact"), (
+    # aec043cb — 'goal' is now a reachable, legitimate omitted-mode default
+    # (the bounded, safe resolution for a call with no session/role
+    # context) alongside the pre-existing explicit modes.
+    assert result.get("mode") in (
+        "full", "delta", "starter", "planner", "compact", "goal",
+    ), (
         f"Expected a real mode on success, got {result.get('mode')!r}"
     )
 

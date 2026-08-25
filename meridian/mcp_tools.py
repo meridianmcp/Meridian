@@ -431,7 +431,7 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "(hosted HTTP MCP, stdio, and the REST /handoff route).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"]},
+         "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"], "description": "(aec043cb) Optional — omitting mode is now INTENT-BASED, never a silent 'full'. Omission resolves to: 'delta' if session_id already produced a handoff this session (resumed/continuation); else 'goal' if session_id was started with role='executor'; else 'planner' if role='planner'; else 'goal' (the safe, bounded default — no workspace decisions/notes, no other project's state) when intent can't otherwise be determined. 'full' — the unbounded, whole-workspace archival/diagnostic dump, including cross-project workspace decisions/notes — is now returned ONLY for an explicit mode='full' request, never for an omitted one."},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."},
          "root_dir": {"type": "string", "description": "Optional request-local absolute source-tree root used by live pointer resolution's local semantic fallback when no code tunnel is available. Never persisted."},
          "version": {"type": "string", "description": "(b8f89491) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this handoff to — applies to every mode (full/delta/starter/compact/goal), not just starter. Wins over the calling session's own stored sprint_version. Omit to fall back to session_id's scope, or to the whole project's cross-version backlog when neither is set."},
@@ -762,11 +762,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "checkpoint", "description":
         "Save progress mid-session. Runs auto_capture (buckets done tasks into a note), "
         "generates a delta handoff, and returns a compact summary with what was done, "
-        "what's pending, and the suggested next /goal string. Call before context fills "
-        "up or before ending a session.",
+        "what's pending, and the suggested next /goal string (now the same canonical, "
+        "token-embedded continuation block generate_handoff renders — verify it with "
+        "verify_handoff_token exactly like any other /goal block). Call before context "
+        "fills up or before ending a session.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
-         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "version": {"type": "string", "description": "(455cfc36) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this checkpoint to — wins over the calling session's own stored sprint_version, exactly like generate_handoff's own version kwarg. Omit to fall back to the session's resolved scope (unchanged default behavior)."}},
          "required": ["session_id"]}},
     {"name": "request_hitl", "description":
         "Surface a question to the human-in-the-loop queue. ALWAYS use this to ask "

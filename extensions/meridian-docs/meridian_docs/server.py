@@ -25,6 +25,16 @@ hosted Meridian — the gap that fdbd4296 alone could NOT close.
 a .docx for visual QA (LibreOffice headless / Word COM), returning one of
 exactly three states (rendered / unavailable-with-reason / failed) so a
 caller never mistakes "we could not check" for "we verified this renders".
+
+1e6150ef — also exposes :func:`render_with_receipt` / :func:`list_render_
+receipts` / :func:`check_release_render_gate`, thin wrappers over
+:mod:`render_gate`'s durable render-receipt layer: a receipt that survives
+the backend's own temp-directory cleanup (source/PDF hash, backend +
+version, process identity, page count, duration, retry/timeout state,
+field-refresh status), plus a fail-closed release gate requiring a FRESH
+matching receipt unless a human explicitly records an audited degraded
+override. A backend-conversion success is never, by itself, recorded as
+visual verification — see ``render_gate``'s own module docstring.
 """
 from __future__ import annotations
 
@@ -397,6 +407,122 @@ def check_render_capability(docx_path: str) -> dict[str, Any]:
     See ``render_gate.check_render_capability`` for the full contract.
     """
     return render_gate.check_render_capability(docx_path)
+
+
+@mcp.tool()
+def render_with_receipt(
+    docx_path: str,
+    receipts_path: str | None = None,
+    max_retries: int = 1,
+    visual_qa: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """1e6150ef -- run a render attempt and build a DURABLE receipt that
+    survives the render backend's own temp directory being cleaned up.
+
+    Records source DOCX hash, produced-PDF hash/size/page count, backend
+    name + best-effort version, process identity (word-com only), duration,
+    attempts, timeout state, the configured backend priority order,
+    ``field_refresh_status`` (whether this DOCX's fields will auto-update on
+    open -- a document that won't can render "successfully" while showing
+    stale TOC/page-number/cross-reference text), and an explicit
+    ``visual_qa`` verdict. A successful backend CONVERSION is never, by
+    itself, recorded as visual verification -- ``visual_qa`` defaults to an
+    explicit ``"not_reviewed"`` state unless the caller passes a real one.
+
+    Args:
+      docx_path:      The document to attempt to render.
+      receipts_path:   When given, persists the receipt (atomic JSON ledger)
+                       to this path so it survives process restarts, not
+                       just the render's own temp cleanup -- pass the SAME
+                       path across calls for one document/project so
+                       ``check_release_render_gate`` sees full history.
+      max_retries:      Bounds automatic retry of a retryable transient
+                       failure (see ``check_render_capability``).
+      visual_qa:        Optional explicit visual-QA verdict dict, e.g.
+                       ``{"status": "verified", "reviewer": "...", "notes":
+                       "..."}``.
+
+    Returns the full receipt dict -- see ``render_gate.render_with_receipt``
+    for every field. Per this module's existing contract, a timed-out
+    backend probe is always recorded as ``status="failed"``, never
+    ``"rendered"``.
+    """
+    return render_gate.render_with_receipt(
+        docx_path, receipts_path=receipts_path, max_retries=max_retries,
+        visual_qa=visual_qa,
+    )
+
+
+@mcp.tool()
+def list_render_receipts(
+    receipts_path: str, docx_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """1e6150ef -- list durable render receipts (and audited degraded
+    overrides) from a receipts ledger, newest first.
+
+    Args:
+      receipts_path:  Path to the JSON ledger written by ``render_with_
+                     receipt``/``check_release_render_gate``.
+      docx_path:      Optional filter to one document's receipts.
+
+    Returns:
+      ``[]`` if the ledger doesn't exist yet or is empty; otherwise every
+      receipt dict, newest ``created_at_epoch`` first.
+    """
+    return render_gate.list_render_receipts(receipts_path, docx_path=docx_path)
+
+
+@mcp.tool()
+def check_release_render_gate(
+    docx_path: str,
+    receipts_path: str,
+    max_age_seconds: float = 24 * 3600.0,
+    allow_degraded_override: bool = False,
+    override_reason: str | None = None,
+    override_by: str | None = None,
+) -> dict[str, Any]:
+    """1e6150ef -- fail-closed release gate: refuses release unless a FRESH,
+    content-matched, real ``"rendered"`` receipt is on file for
+    ``docx_path``.
+
+    "Fresh" requires the newest matching receipt in ``receipts_path`` to
+    have ``status="rendered"`` AND a ``source_docx_sha256`` matching the
+    document's CURRENT on-disk content AND an age no greater than
+    ``max_age_seconds``. With no such receipt, release is refused unless a
+    human explicitly passes ``allow_degraded_override=True`` WITH a
+    non-empty ``override_reason`` -- which durably records a second, audited
+    ``degraded_override`` receipt in the SAME ledger (never a silent
+    bypass).
+
+    Args:
+      docx_path:                The document to gate release of.
+      receipts_path:             The same ledger path used by
+                                ``render_with_receipt``.
+      max_age_seconds:           How old a matching receipt may be and still
+                                count as fresh (default 24h).
+      allow_degraded_override:   Explicit, audited bypass when no fresh
+                                receipt exists.
+      override_reason:           Required (non-empty) alongside
+                                ``allow_degraded_override=True``, or the
+                                override itself is refused.
+      override_by:               Optional identity of who authorized the
+                                override, recorded on the audit record.
+
+    Returns:
+      ``{release_ready, degraded, visually_verified, reason,
+      matched_receipt, override}`` -- see
+      ``render_gate.check_release_render_gate`` for the full contract.
+      ``visually_verified`` is a DELIBERATELY separate, stricter signal from
+      ``release_ready``: it is only true when the matched receipt's own
+      ``visual_qa.status`` is ``"verified"`` -- a backend-conversion success
+      never sets it on its own, so structural-only success can never
+      masquerade as visual verification.
+    """
+    return render_gate.check_release_render_gate(
+        docx_path, receipts_path, max_age_seconds=max_age_seconds,
+        allow_degraded_override=allow_degraded_override,
+        override_reason=override_reason, override_by=override_by,
+    )
 
 
 @mcp.tool()
@@ -2566,7 +2692,10 @@ def merge_docx_draft(
 
     Returns {merged: True, status: "merged", canonical_path, draft_path,
     paragraph_count, heading_count, table_count, image_count, render_status,
-    render_verified, render_backend, render_detail} on success, or
+    render_verified, render_backend, render_detail, promoted_sha256} on
+    success — promoted_sha256 (MDE-3) is the real sha256 of the bytes just
+    promoted into canonical_path, mirroring move_section/copy_section/
+    relocate_table's own post-write fingerprint field. Or
     {merged: False, error: <message>, ...} on failure — with
     file_restored: <bool> present only when a post-promotion structural- or
     render-verification failure triggered a restore.
@@ -2577,6 +2706,240 @@ def merge_docx_draft(
         index_db_path=index_db_path,
         allow_degraded_render=allow_degraded_render,
         degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
+def plan_batch_transform(
+    document_path: str,
+    operations: list[dict[str, Any]],
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """982f8564 -- PURE, READ-ONLY, REPRODUCIBLE dry-run for a declarative
+    batch of operations against document_path's CURRENT on-disk content.
+
+    Each operation is anchored to a stable semantic anchor (a
+    locate_anchor-style query) with an explicit content precondition
+    (expected_quoted_text) -- a stale anchor (the document, or just that
+    one anchor's content, changed since the operation was authored) is
+    rejected explicitly, never silently applied. Tables and figures are
+    treated as OWNED COMPOUND OBJECTS with their captions: deleting one
+    auto-includes its linked caption in the plan unless keep_caption=True.
+
+    Args:
+      document_path:                Document to plan against. Never opened
+                                    for writing.
+      operations:                    Non-empty list of ``{"op_id": <optional
+                                    str>, "op": "delete_anchor"|"set_text",
+                                    "anchor": <locate_anchor-style query>,
+                                    "expected_quoted_text": <optional str>,
+                                    "new_text": <for set_text>,
+                                    "keep_caption": <for delete_anchor>}``.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard (a prior locate_anchor/
+                                    plan_batch_transform/
+                                    read_document_snapshot result's
+                                    source_fingerprint).
+
+    Returns ``{document_path, source_fingerprint, operation_count,
+    ready_count, conflict_count, ready, application_order, conflicts,
+    manifest_hash}`` -- see docs_intel.plan_batch_transform for the full
+    contract. ``manifest_hash`` is REPRODUCIBLE: the same batch against the
+    same document content always hashes identically, so a caller can diff
+    or show it to a human before ever calling apply_batch_transform.
+    """
+    return docs_intel.plan_batch_transform(
+        document_path, operations, expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
+@mcp.tool()
+def apply_batch_transform(
+    document_path: str,
+    operations: list[dict[str, Any]],
+    draft_output_path: str,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """982f8564 -- apply a declarative batch of operations to an ISOLATED
+    draft. document_path is opened read-only throughout and is never the
+    write target -- draft_output_path is.
+
+    ALL-OR-NOTHING: if planning finds even one stale/conflicted/invalid
+    operation, NOTHING is written -- draft_output_path is never created or
+    partially written, so a partial batch failure leaves document_path
+    unchanged by construction. Operations are applied in a fixed,
+    deterministic order (document position, tied-broken by op_id).
+
+    Args:
+      document_path:                The document to transform. Read-only.
+      operations:                    Same shape as plan_batch_transform.
+      draft_output_path:             Where to stage the transformed draft.
+                                    Must differ from document_path.
+      expected_source_fingerprint:   Forwarded to plan_batch_transform.
+
+    Returns ``{applied: True, draft_output_path, manifest, applied_operations,
+    write_transaction}`` on success, or ``{applied: False, reason/error, ...}``
+    on failure (``conflicts``/``manifest`` present when the failure came
+    from planning). See docs_intel.apply_batch_transform for the full
+    contract. This is a LOCAL staging step only -- pair with
+    meridian.db.docx_merge (a separate Meridian MCP connection) for
+    cross-session wave coordination, and merge_docx_draft (or
+    apply_and_merge_batch_transform) for the actual promotion.
+    """
+    return docs_intel.apply_batch_transform(
+        document_path, operations, draft_output_path,
+        expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
+@mcp.tool()
+def apply_and_merge_batch_transform(
+    canonical_path: str,
+    operations: list[dict[str, Any]],
+    draft_output_path: str,
+    expected_source_fingerprint: str | None = None,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """982f8564 -- end-to-end declarative batch transform: plan -> apply to
+    an isolated draft -> promote via merge_docx_draft's own
+    merge_draft_into_canonical (existing, unmodified -- full structural +
+    render verification, atomic backup and restore-on-failure).
+
+    On any planning or apply failure, returns apply_batch_transform's own
+    result verbatim -- canonical_path is never even opened for writing in
+    that case. On a successful promotion, returns merge_draft_into_
+    canonical's own result PLUS a batch_receipt: ``{manifest_hash,
+    source_fingerprint, operations_applied, draft_write_manifest_hash,
+    draft_promoted_sha256, render_status, render_verified}`` -- the
+    package-integrity/provenance/render-receipt evidence for this merged
+    output, composed entirely from the batch's own reproducible manifest
+    and the promotion's own already-verified render gate.
+
+    allow_degraded_render / degraded_render_reason: forwarded to
+    merge_draft_into_canonical unchanged -- required together, an audited
+    opt-in for promoting without real render verification (see
+    merge_docx_draft's own docstring for the shared contract).
+    """
+    return docs_intel.apply_and_merge_batch_transform(
+        canonical_path, operations, draft_output_path,
+        expected_source_fingerprint=expected_source_fingerprint,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
+def audit_equation_integrity(document_path: str) -> dict[str, Any]:
+    """3d0769ab (MDE-B1) -- read-only raw-OOXML equation INTEGRITY audit.
+
+    Distinct from audit_equation_style (alignment/punctuation/explicit-
+    number-gap STYLE): this never treats "an <m:oMath> element exists" as
+    proof an equation is healthy. Detects plaintext duplicated alongside
+    real OMML, equation-like plaintext with NO OMML at all, two equations
+    spliced into one <m:oMath>, ambiguous/mixed equation-numbering
+    conventions, and duplicate equation numbers whose underlying structure
+    actually differs.
+
+    Args:
+      document_path: Absolute path to the .docx to audit. Read-only.
+
+    Returns ``{document_path, source_fingerprint, equation_count, records,
+    findings, finding_count, findings_by_type}`` -- see
+    docs_intel.audit_equation_integrity for the full contract. Each typed
+    finding is one of: plaintext_math_duplicate, missing_omml,
+    merged_omml_suspected, equation_number_gap, equation_number_duplicate,
+    equation_number_scope_ambiguous, reference_structure_mismatch.
+    """
+    return docs_intel.audit_equation_integrity(document_path)
+
+
+@mcp.tool()
+def compare_equation_structures(
+    reference_path: str,
+    candidate_path: str,
+) -> dict[str, Any]:
+    """e4265dd1 (MDE-B2) -- reference-aware structural comparison between two
+    documents' equations (e.g. a prior-accepted revision vs a new candidate,
+    or a canonical source vs an isolated draft).
+
+    Composes directly on docs_intel.audit_equation_integrity for both
+    sides -- identity and structure come from the exact same records that
+    audit already produces. Equations are matched by explicit number
+    (strongest signal), then by stable w14:paraId anchor, then by document
+    position as an explicitly-labeled degraded fallback.
+
+    Args:
+      reference_path: Absolute path to the reference/baseline .docx.
+      candidate_path: Absolute path to the candidate/new .docx.
+
+    Returns ``{reference_source_fingerprint, candidate_source_fingerprint,
+    equation_count_reference, equation_count_candidate, comparisons,
+    mismatch_count, reference_findings, candidate_findings}`` -- see
+    docs_intel.compare_equation_structures for the full contract. Each
+    comparison's ``classification`` is one of "equivalent" (identical
+    structure, regardless of XML prefix/whitespace), "structural_change"
+    (a real subscript/fraction/limit/operator difference -- see
+    token_diff.changed_categories), "missing_in_candidate", or
+    "added_in_candidate".
+    """
+    return docs_intel.compare_equation_structures(reference_path, candidate_path)
+
+
+@mcp.tool()
+def repair_equation_batch(
+    document_path: str,
+    operations: list[dict[str, Any]],
+    draft_output_path: str,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """e4265dd1 (MDE-B2) -- draft-only staged repair for equation-integrity
+    defects audit_equation_integrity already found.
+
+    document_path is opened READ-ONLY throughout and is NEVER the write
+    target -- draft_output_path is, mirroring apply_batch_transform (MDE-8)'s
+    own contract exactly. A patch manifest (reusing
+    tools.meridian_fallbacks.patch_manifest.PatchManifest) is built and
+    returned BEFORE any write is attempted, for every outcome including a
+    rejected batch. ALL-OR-NOTHING: if even one operation fails validation,
+    NOTHING is written -- draft_output_path is never created.
+
+    Args:
+      document_path:                The canonical .docx to repair. Read-only.
+      operations:                   Non-empty list of ``{"op_id": <optional
+                                    str>, "op_class": one of
+                                    "remove_duplicate_plaintext",
+                                    "split_merged_omml",
+                                    "restore_missing_omml",
+                                    "renumber_equation",
+                                    "manual_review_required", "anchor":
+                                    <required except for
+                                    manual_review_required>,
+                                    "expected_structure_hash": <optional
+                                    staleness precondition>, ...op-specific
+                                    params: "omml"/"latex" for
+                                    restore_missing_omml, "new_number" for
+                                    renumber_equation}``.
+      draft_output_path:             Where to stage the repaired draft.
+                                    MUST differ from document_path.
+      expected_source_fingerprint:   Optional whole-document staleness
+                                    guard (a prior
+                                    audit_equation_integrity/
+                                    compare_equation_structures result's
+                                    source_fingerprint).
+
+    Returns ``{applied: True, draft_output_path, patch_manifest,
+    manifest_content_hash, applied_operations, write_transaction}`` on
+    success, or ``{applied: False, reason/error, patch_manifest,
+    conflicts}`` on failure -- see docs_intel.repair_equation_batch for the
+    full contract, including every supported op_class's exact preconditions
+    and mutation.
+    """
+    return docs_intel.repair_equation_batch(
+        document_path, operations, draft_output_path,
+        expected_source_fingerprint=expected_source_fingerprint,
     )
 
 

@@ -1378,7 +1378,23 @@ async def _handle_mcp_request(
                     # concurrent-write conflict instead of silently last-save-wins
                     # overwriting another session's edit to the same document.
                     try:
-                        tunnel_result = await _tunnel_mod.call_tunnel_tool(
+                        # MDE-3 rework -- call_tunnel_tool_with_release_tracking
+                        # is a thin, delegate-by-default wrapper: for anything
+                        # other than the PRIMARY docs-slot write tools
+                        # (move_section/copy_section/relocate_table/
+                        # merge_docx_draft) it is byte-identical to calling
+                        # call_tunnel_tool directly. For those four, it drives
+                        # the docx_merge release-transaction state machine
+                        # around the real write instead of leaving it
+                        # unexercised outside unit tests of the transition
+                        # guard -- except a wave-coordinated DRAFT-mode call
+                        # to the first three, which never touches the
+                        # canonical file and so is deliberately left
+                        # untracked; merge_docx_draft (the tool that actually
+                        # promotes a draft into the canonical file) is what
+                        # gets tracked for that workflow instead. See
+                        # routes/tunnel.py's _PRIMARY_DOCX_RELEASE_TOOLS.
+                        tunnel_result = await _tunnel_mod.call_tunnel_tool_with_release_tracking(
                             tenant["id"], name, args,
                             db=db, session_id=(args.get("session_id") or "").strip() or None,
                         )
@@ -1408,13 +1424,45 @@ async def _handle_mcp_request(
                             if _cir.is_code_intel_receipt_tool(name):
                                 _receipt_pid = _cir.resolve_receipt_project_id(args)
                                 if _receipt_pid:
+                                    # MDE-2 -- bind the receipt to the repo
+                                    # identity the tunnel actually forwarded
+                                    # this call against (the same per-tenant
+                                    # active-repo cache call_tunnel_tool
+                                    # itself reads to inject
+                                    # X-Meridian-Repo-Path), not a bare
+                                    # "somewhere, sometime" attribution.
+                                    _receipt_root = (
+                                        _tunnel_mod._tenant_active_repo.get(tenant["id"])
+                                        if tenant else None
+                                    )
+                                    # MDE-2 rework -- this is a THIRD-PARTY
+                                    # tool result (search_graph/find_symbol/
+                                    # ... called directly, not via
+                                    # prospect_symbol), so it never went
+                                    # through prospect_symbol_impl's own
+                                    # exact-match + scope hardening. Apply
+                                    # the SAME wrong-body protection here via
+                                    # resolve_exact_hit_from_tunnel_result --
+                                    # only an EXACT, in-scope hit is ever
+                                    # bound as resolved_file/range/symbol.
+                                    from .. import prospect as _prospect  # noqa: PLC0415
+                                    _query_full = _cir.extract_query_hint_full(args)
+                                    _exact_hit = _prospect.resolve_exact_hit_from_tunnel_result(
+                                        _tunnel_mod, tunnel_result, _query_full, _receipt_root,
+                                    )
                                     await _cir.record_prospect_receipt(
                                         db,
                                         tenant_id=tenant.get("id") if tenant else None,
                                         project_id=_receipt_pid,
                                         session_id=args.get("session_id"),
                                         tool_name=name,
-                                        query=_cir.extract_query_hint(args),
+                                        query=_query_full,
+                                        root_dir=_receipt_root,
+                                        resolved_file=_prospect.hit_path(_exact_hit),
+                                        resolved_range=_prospect.hit_range(_exact_hit),
+                                        resolved_symbol=_prospect.hit_identity(_exact_hit),
+                                        hit=_exact_hit,
+                                        default_repo_root=str(_server._REPO_ROOT),
                                     )
                         except Exception:  # noqa: BLE001
                             pass
@@ -2763,11 +2811,42 @@ _PLANNER_REFRESH_TRIGGERS = frozenset({
 # migration + a per-call DB write).
 #   _EXECUTOR_SESSIONS  — session_ids that started with role='executor'; the
 #                         nudge is planner-only, so these are skipped.
+#   _PLANNER_SESSIONS  — session_ids that started with role='planner'
+#                         (aec043cb). Symmetric sibling of _EXECUTOR_SESSIONS,
+#                         populated the exact same way at the exact same
+#                         start_session call site; used ONLY by
+#                         resolve_handoff_mode (via _session_role_hint below)
+#                         to resolve an omitted handoff mode for a planner
+#                         session to 'planner' rather than a generic
+#                         executor-shaped default. Not consulted by the
+#                         bf51b12e nudge itself (that gate only cares whether
+#                         a session is NOT an executor).
 #   _SESSION_REFRESH_STATE — session_id -> {"calls": int, "last_refresh": int};
 #                         "calls" counts tool calls seen, "last_refresh" is the
 #                         call index at which we last attached a refresh.
 _EXECUTOR_SESSIONS: set[str] = set()
+_PLANNER_SESSIONS: set[str] = set()
 _SESSION_REFRESH_STATE: dict[str, dict] = {}
+
+
+def _session_role_hint(session_id: "str | None") -> "str | None":
+    """aec043cb — best-effort session-role lookup for resolve_handoff_mode.
+
+    Returns ``"executor"``/``"planner"`` when this process has seen this
+    session_id register with that role via ``start_session(role=...)``
+    (``_EXECUTOR_SESSIONS``/``_PLANNER_SESSIONS`` above), else ``None``.
+    In-memory/best-effort like the rest of this module's per-process session
+    state (see the comment block above) — a restarted process or a session
+    started on a different worker simply falls back to
+    ``resolve_handoff_mode``'s own safe default, never a crash.
+    """
+    if not session_id:
+        return None
+    if session_id in _EXECUTOR_SESSIONS:
+        return "executor"
+    if session_id in _PLANNER_SESSIONS:
+        return "planner"
+    return None
 
 
 async def _handle_project_tools(
@@ -2865,10 +2944,14 @@ async def _handle_project_tools(
 
     # start_session needs the handler-level _EXECUTOR_SESSIONS set so the
     # bf51b12e planner-nudge gate works without a circular import.
+    # aec043cb — _PLANNER_SESSIONS is the symmetric sibling registry, added
+    # so resolve_handoff_mode can resolve an omitted mode for a role="planner"
+    # session too (see that function's own docstring).
     if name == "start_session":
         return await handle_start_session(
             args, db, data_dir, tenant, _mcp_tenant_id,
             executor_sessions=_EXECUTOR_SESSIONS,
+            planner_sessions=_PLANNER_SESSIONS,
         )
 
     return _MISS
@@ -3008,6 +3091,7 @@ async def _handle_task_tools(
         mode = handoff_module_local.resolve_handoff_mode(
             args.get("mode"),
             session_id,
+            session_role=_session_role_hint(session_id),
         )
         # b8f89491 — resolve + surface the effective sprint-version scope so a
         # caller never has to infer it: an explicit version argument always
@@ -6120,6 +6204,28 @@ async def _handle_code_index_tools(
             from .. import code_intel_receipt as _cir  # noqa: PLC0415
             _receipt_pid = _cir.resolve_receipt_project_id(args)
             if _receipt_pid:
+                # MDE-2 rework -- bind to root_dir (the repo prospect_symbol_
+                # impl actually searched) + an EXACT-matched hit from its own
+                # (already scope-filtered/exact-reordered -- see
+                # prospect._finalize_hits) result, so a stale/wrong-repo or
+                # "wrong-body" receipt can be rejected explicitly instead of
+                # trusted as free-floating proof prospecting happened
+                # SOMEWHERE. `hits[0]` alone is NOT enough here even after
+                # _finalize_hits reorders exact matches first -- when no
+                # exact match exists at all in the rung's own results,
+                # hits[0] is still just the best FUZZY match, and binding
+                # the receipt to it would be exactly the wrong-body bug this
+                # rework closes. Only an EXACT identity match
+                # (select_exact_hit) is ever bound as resolved_file/range/
+                # symbol; otherwise those stay None/proxy rather than
+                # asserting a neighboring symbol's location as this query's
+                # answer.
+                _exact_hit = None
+                try:
+                    _hits = (result or {}).get("hits") or []
+                    _exact_hit = _prospect.select_exact_hit(_hits, symbol)
+                except Exception:  # noqa: BLE001
+                    _exact_hit = None
                 await _cir.record_prospect_receipt(
                     db,
                     tenant_id=(tenant or {}).get("id"),
@@ -6127,6 +6233,13 @@ async def _handle_code_index_tools(
                     session_id=args.get("session_id"),
                     tool_name="prospect_symbol",
                     query=symbol,
+                    root_dir=root_dir or None,
+                    resolved_file=_prospect.hit_path(_exact_hit),
+                    resolved_range=_prospect.hit_range(_exact_hit),
+                    resolved_symbol=_prospect.hit_identity(_exact_hit),
+                    hit=_exact_hit,
+                    rung=(result or {}).get("rung"),
+                    default_repo_root=str(_server._REPO_ROOT),
                 )
         except Exception:  # noqa: BLE001 -- receipt logging must never break the call
             pass

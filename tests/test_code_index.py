@@ -106,6 +106,69 @@ def test_search_code_semantic_truly_missing_dir_still_errors(tmp_path):
 
 
 # ===========================================================================
+# ec91e311 -- the shim must forward the extracted package's own explicit
+# convergence/degraded state (e631d54f), not hand-roll a subset of its
+# result dict. Before this item, ``ci.search_code_semantic`` built its OWN
+# result (total_indexed / vectors_active / hits only) instead of delegating
+# to ``meridian_codeindex.code_index.search_code_semantic``, so every MCP
+# caller of the ``search_code_semantic`` tool -- and prospect_symbol's Rung 3
+# -- silently never saw ``convergence``/``degraded`` even though the
+# underlying CodeIndex computed it on every call.
+# ===========================================================================
+
+def test_search_code_semantic_forwards_convergence_bm25_only_not_degraded(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.delenv("MERIDIAN_CODE_INDEX_VECTORS", raising=False)
+    _write(tmp_path / "svc.py", "def convergence_marker_zzqq():\n    return 1\n")
+    db_path = str(tmp_path / "idx.duckdb")
+    res = ci.search_code_semantic(
+        str(tmp_path), "convergence_marker_zzqq", db_path=db_path,
+    )
+    assert "error" not in res, res
+    assert "convergence" in res
+    assert res["degraded"] is False
+    assert res["convergence"]["degraded"] is False
+    assert res["convergence"]["vectors_enabled"] is False
+    assert res["convergence"]["index_revision"] >= 1
+    assert res["convergence"]["root_dir"] == os.path.abspath(str(tmp_path))
+
+
+def test_search_code_semantic_forwards_degraded_when_vector_leg_cant_embed(
+    monkeypatch, tmp_path,
+):
+    """Vectors enabled but the embedder can't actually produce vectors (e.g.
+    ``model2vec`` missing/broken) -- the shim's result must surface
+    ``degraded=True`` rather than silently reporting a clean BM25 result.
+    """
+    from meridian_codeindex import code_index as impl
+
+    monkeypatch.setattr(impl._Embedder, "available", lambda self: True)
+    monkeypatch.setattr(impl._Embedder, "embed", lambda self, texts: None)
+    _write(tmp_path / "svc.py", "def degraded_marker_zzqq():\n    return 1\n")
+    db_path = str(tmp_path / "idx.duckdb")
+    res = ci.search_code_semantic(
+        str(tmp_path), "degraded_marker_zzqq", db_path=db_path,
+    )
+    assert "error" not in res, res
+    assert res["degraded"] is True
+    assert res["convergence"]["vectors_enabled"] is True
+    assert res["convergence"]["vectors_ready"] is False
+
+
+def test_search_code_semantic_hosted_guard_response_omits_convergence(
+    monkeypatch, tmp_path,
+):
+    """The hosted-mode guard returns BEFORE any delegation -- it must never
+    claim a convergence state for an index it never touched."""
+    monkeypatch.setenv("MERIDIAN_HOSTED", "1")
+    res = ci.search_code_semantic(str(tmp_path), "anything")
+    assert "convergence" not in res
+    assert "degraded" not in res
+    assert "error" in res
+
+
+# ===========================================================================
 # Dispatch + registration — Meridian's own MCP surface
 # ===========================================================================
 
@@ -149,6 +212,28 @@ async def test_dispatch_search_code_semantic_requires_root_dir():
         await srv._dispatch_mcp_tool(
             "search_code_semantic", {"query": "x"}, None, "/tmp"
         )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_search_code_semantic_includes_convergence_and_degraded(
+    tmp_path,
+):
+    """ec91e311 -- routing-contract regression at the actual MCP tool-call
+    boundary (not just the shim function): a client calling the
+    ``search_code_semantic`` tool must see the same explicit
+    convergence/degraded state a direct library caller gets."""
+    from meridian import server as srv
+
+    _write(tmp_path / "dispatched.py", "def dispatch_convergence_marker():\n    return 1\n")
+    result = await srv._dispatch_mcp_tool(
+        "search_code_semantic",
+        {"root_dir": str(tmp_path), "query": "dispatch_convergence_marker"},
+        None,
+        str(tmp_path),
+    )
+    assert "error" not in result, result
+    assert "convergence" in result
+    assert result["degraded"] is False
 
 
 @pytest.mark.asyncio

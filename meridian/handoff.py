@@ -18,6 +18,8 @@ the field is always populated.
 from __future__ import annotations
 
 import asyncio
+import dataclasses as _dataclasses
+import enum as _enum
 import functools
 import hashlib
 import json
@@ -85,6 +87,97 @@ _env = Environment(
 _DEFAULT_GOAL_TEST_CMD = "pixi run test"
 _STRATEGIC_NOTE_TAGS = {"planning", "strategy", "competitive", "acquisition"}
 _SESSION_HANDOFF_STATE: dict[str, str] = {}
+
+
+async def _persist_handoff_history_and_pending_goal(
+    db: Any,
+    project_id: str,
+    mode: str,
+    content: str,
+    session_id: "str | None",
+    pending_goal_body: str,
+) -> bool:
+    """aec043cb — shared amend-vs-fresh persistence + pending_goal write.
+
+    Extracted VERBATIM (zero behavior change) from the pre-existing full/
+    delta code path in ``generate_handoff`` so ``mode == "goal"`` — now
+    commonly reached via the OMITTED-mode default (see
+    ``resolve_handoff_mode``) rather than only an explicit request — can
+    wire into the SAME trusted ``pending_goal``/``handoffs``-history channel
+    full/delta have always used, instead of silently never registering
+    with it. Before aec043cb this was a latent, inconsequential gap (682005f4
+    introduced 'goal' mode without this wiring, but it was only ever reached
+    via an explicit request, so a caller who wanted the trusted channel
+    simply used full/delta instead); it becomes load-bearing the moment
+    'goal' is the DEFAULT for the dominant omitted-mode executor call —
+    AGENTS.md documents ``start_session``'s ``pending_goal`` /
+    ``load_handoff()`` as the preferred, trusted delivery channel over a
+    spoofable copy-pasted /goal string, so the new safe default must be
+    able to use it too.
+
+    ``content`` is the full body persisted to the ``handoffs`` history
+    table; ``pending_goal_body`` is what ``start_session``/``load_handoff``
+    later surface as ``pending_goal``. For full/delta these differ
+    (``content`` is the entire rendered handoff, ``pending_goal_body`` is
+    just the embedded /goal snippet — see the original call site below);
+    for 'goal' mode they are identical (the whole body IS the /goal
+    snippet), so that call site simply passes the same string twice.
+
+    Returns whether the prior handoff was amended in place rather than
+    recorded fresh (the same ``amended`` flag ``generate_handoff`` itself
+    returns). Fully guarded exactly as before extraction: a failure in
+    either step is swallowed, never breaking handoff generation.
+    """
+    amended = False
+    try:
+        prior_goal = await db_module.get_pending_goal(db, project_id)
+        if prior_goal is not None:
+            # Prior handoff exists and was never consumed — amend in-place.
+            amend_result = await db_module.amend_handoff(db, project_id, content, mode)
+            if amend_result is not None:
+                amended = True
+            else:
+                # No prior row to amend (e.g. pre-migration DB or the row was
+                # deleted externally) — fall through to fresh record.
+                await db_module.record_handoff(db, project_id, mode, content, session_id)
+        else:
+            # 8819d6b1 — fresh handoff: persist to the history table so the
+            # dashboard / planner can list past handoffs and detect new ones.
+            await db_module.record_handoff(db, project_id, mode, content, session_id)
+    except Exception:  # noqa: BLE001 — never break handoff generation
+        pass
+    # 5efe254b — persist the /goal to the trusted channel so the next
+    # start_session can surface it as an MCP tool result (keyed on project_id)
+    # instead of a spoofable copy-pasted chat string. Read-once (pop). Fully
+    # guarded so a pre-migration DB never breaks handoff generation.
+    try:
+        await db_module.set_pending_goal(db, project_id, pending_goal_body)
+    except Exception:  # noqa: BLE001
+        pass
+    return amended
+
+
+def _mark_session_handoff_produced(session_id: "str | None") -> None:
+    """aec043cb — record that ``session_id`` just received a handoff, so a
+    LATER omitted-mode call from the SAME session correctly auto-switches to
+    ``"delta"`` via ``resolve_handoff_mode`` (the pre-existing continuation
+    check: ``session_id in _SESSION_HANDOFF_STATE``).
+
+    Before aec043cb, only the full/delta code path ever populated
+    ``_SESSION_HANDOFF_STATE`` — sufficient at the time, because an omitted
+    mode always resolved to ``"full"`` (which runs that path) regardless of
+    role. Now that omission commonly resolves to the bounded ``"goal"``/
+    ``"planner"`` modes instead (both of which return well before that
+    shared full/delta code), those two modes call this helper explicitly so
+    the continuation contract keeps working: a session's first (bounded)
+    handoff still makes its SECOND omitted-mode call resolve to ``"delta"``,
+    exactly as it did when the first call happened to be ``"full"``.
+    No-op when ``session_id`` is falsy, matching the original inline check.
+    """
+    if session_id:
+        _SESSION_HANDOFF_STATE[session_id] = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
 # dd07ece0 — provenance token store: short-lived, single-use tokens that let a
 # receiving session independently verify a /goal block came from a real
@@ -1755,6 +1848,20 @@ def format_handoff_mcp_content(
     ``<goal_token>`` value itself remains valid for plain provenance
     verification (``verify_handoff_token(project_id, token)`` with no
     ``body``) regardless.
+
+    455cfc36 — ``mode='delta'``'s ``<continuation_manifest>`` tag
+    (see :func:`build_continuation_manifest`) is rendered by
+    ``_render_delta_handoff`` BEFORE ``quick_start_goal`` precisely so it
+    falls within this SAME protected floor (the goal-token banner sits near
+    the top of ``quick_start_goal``, i.e. always after the manifest) without
+    this function needing to know about the manifest tag at all — the
+    manifest is small and bounded by construction
+    (:data:`_CONTINUATION_MANIFEST_ID_CAP`), so protecting it never risks
+    reproducing the oversized-checkpoint regression the ``max_bytes`` budget
+    itself exists to prevent (unlike ``quick_start_goal``'s own per-item
+    contract detail, which full/delta deliberately leaves unbounded — see
+    ``generate_handoff``'s ``checkpoint`` docstring — and therefore stays
+    fully truncatable, past the protected floor, exactly like today).
 
     ``max_bytes`` is a budget on the RETURNED string, marker included
     (60eed526) — the appended truncation marker itself is not free bytes
@@ -5758,21 +5865,80 @@ async def _annotate_resolved_pointers(
     return pending_items
 
 
+_VALID_HANDOFF_MODES = frozenset(
+    {"full", "delta", "planner", "starter", "compact", "goal"}
+)
+
+
 def resolve_handoff_mode(
     requested_mode: str | None,
     session_id: str | None = None,
+    *,
+    session_role: str | None = None,
 ) -> str:
-    """Resolve the public handoff mode, auto-switching repeat sessions to delta.
+    """Resolve the public handoff mode. Intent-based, never full-by-default.
+
+    aec043cb (P0 HANDOFF) — an OMITTED (or unrecognized) ``requested_mode``
+    used to resolve unconditionally to ``"full"`` — the unbounded, whole-
+    project state dump that also unconditionally prepends EVERY workspace
+    decision/note (across every project in the workspace, no project
+    filtering) via ``_render_workspace_handoff_block``. That made every
+    executor-facing MCP/HTTP call that simply omitted ``mode`` (the common
+    case — the MCP tool schema has always made ``mode`` optional) leak
+    cross-project workspace context into a handoff meant for one project's
+    executor. Per the authoritative aec043cb design decision, omission is
+    now resolved by INTENT, in this order:
+
+      1. An explicit, recognized ``requested_mode`` always wins outright —
+         unconditionally, including ``"full"`` itself. ``"full"`` remains
+         fully available; it is simply never the result of an OMISSION
+         anymore, only of a deliberate, explicit request (the "archival/
+         diagnostic dump" case).
+      2. A genuinely RESUMED session — this ``session_id`` already produced
+         a handoff earlier in the same process (tracked in
+         ``_SESSION_HANDOFF_STATE``) — resolves to ``"delta"``: a bounded,
+         per-session continuation update. Unchanged from the pre-existing
+         auto-switch; still takes priority over role, since "this session
+         already has a handoff to continue from" is a stronger, more
+         specific signal than a role guess.
+      3. A session registered as ``role="executor"`` via ``start_session``
+         (``session_role="executor"``, sourced by the caller from
+         ``meridian.mcp.handler._EXECUTOR_SESSIONS`` — the same in-memory
+         session-role registry the bf51b12e planner-refresh-nudge already
+         relies on; reused here rather than inventing a second concept)
+         resolves to ``"goal"`` — the bounded, executor-facing /goal block:
+         no workspace decisions/notes, no L0/L1/L2, no other project's
+         state (see ``_generate_goal_only_handoff``).
+      4. A session registered as ``role="planner"`` (``session_role=
+         "planner"``, sourced from ``meridian.mcp.handler._PLANNER_SESSIONS``,
+         the symmetric sibling registry) resolves to ``"planner"`` — the
+         directive planning-session prompt, already project-scoped with no
+         workspace decisions/notes (see ``_generate_planner_handoff``).
+      5. Anything else — no ``session_id`` at all, or a session whose role
+         was never registered as executor/planner — has no safe, positive
+         signal to resolve by. Rather than fail the call outright (this is
+         a compatibility-preserving control-plane fix, not a new hard
+         requirement on every pre-existing caller), this degrades to the
+         SAME safe, bounded ``"goal"`` mode used for a known executor: the
+         narrowest, leak-free option available. This still satisfies the
+         one non-negotiable constraint — an omitted mode NEVER silently
+         resolves to ``"full"`` — while remaining usable for a caller that
+         has not (yet) adopted ``start_session(role=...)``.
 
     ``"goal"`` (682005f4) is the 6th mode: it returns ONLY the bare /goal
     block itself — no readiness header, no workspace decisions/notes, no
     L0/L1/L2 context. See ``_generate_goal_only_handoff``.
     """
-    if requested_mode in {"full", "delta", "planner", "starter", "compact", "goal"}:
+    if requested_mode in _VALID_HANDOFF_MODES:
         return requested_mode
     if session_id and session_id in _SESSION_HANDOFF_STATE:
         return "delta"
-    return "full"
+    if session_role == "executor":
+        return "goal"
+    if session_role == "planner":
+        return "planner"
+    # aec043cb — intent unknown: bounded-safe default, never "full".
+    return "goal"
 
 
 def _human_id_clause(identity: str | None) -> str:
@@ -6214,7 +6380,6 @@ def _render_delta_handoff(
             kind = (t.get("kind") or "").upper()
             desc = (t.get("description") or "").strip()[:200]
             lines.append(f"- [{kind}] {desc}")
-    lines += ["", "Next:", quick_start_goal]
     if continuation_manifest is not None:
         # 836ca1d5 — durable continuation manifest: canonical revision_hash/
         # counter (board_snapshot.py) so a resuming session (or load_handoff,
@@ -6223,6 +6388,25 @@ def _render_delta_handoff(
         # one. Compact/sorted-keys JSON, matching canonical_json's own
         # discipline in board_snapshot.py, so the tag's content is
         # deterministic for a given manifest.
+        #
+        # 455cfc36 — deliberately emitted BEFORE "Next:"/quick_start_goal,
+        # not after. quick_start_goal embeds a <goal_token>+SECURITY banner
+        # near ITS OWN top (_mint_and_embed_goal_token), and
+        # format_handoff_mcp_content's truncation NEVER cuts through or
+        # before that banner's end — so anything positioned before the
+        # banner is structurally protected from truncation for free, while
+        # anything after it is not. Confirmed live reproduction: with the
+        # manifest positioned AFTER quick_start_goal (the old order), a
+        # generate_handoff(mode='delta', version='current') call that
+        # correctly resolved scope=current could still return content with a
+        # TRUNCATED marker that had silently dropped the manifest — the one
+        # thing criterion 1 requires never be truncated. Moving it here
+        # costs nothing (the manifest is small and bounded by construction,
+        # see _CONTINUATION_MANIFEST_ID_CAP), unlike quick_start_goal's own
+        # per-item contract detail, which full/delta deliberately leaves
+        # UNBOUNDED and therefore stays fully truncatable, exactly as today
+        # (see generate_handoff's `checkpoint` docstring for why capping
+        # construction there would be wrong).
         lines += [
             "",
             "<continuation_manifest>",
@@ -6231,6 +6415,7 @@ def _render_delta_handoff(
             ),
             "</continuation_manifest>",
         ]
+    lines += ["", "Next:", quick_start_goal]
     if run_timeline is not None:
         # 79491e26 — durable, deterministic run-timeline reconstruction (see
         # build_run_timeline_for_handoff's docstring) embedded the same way
@@ -7267,6 +7452,247 @@ def _render_research_evidence_block(envelope: Any) -> str:
         return "\n".join(lines).rstrip()
     except Exception:  # noqa: BLE001 — a malformed envelope must never break handoff generation
         return ""
+
+
+def render_release_transaction_evidence_xml(summary: "dict[str, Any] | None") -> str:
+    """MDE-3 — render a release-transaction crash-recovery evidence summary
+    (:func:`meridian.db.docx_merge.summarize_release_transactions`'s output)
+    as a machine-readable ``<release_transactions>`` block for a handoff
+    body — "exact evidence in handoff": a receiver sees, without re-querying
+    anything, exactly how many change-set release transactions exist, their
+    state breakdown, and which (if any) are stuck in ``RECOVERY_REQUIRED``
+    and need attention before this project can be considered releasable.
+
+    Purely additive: ``""`` for ``None``/falsy input or a summary with zero
+    transactions, so a project with no release-transaction activity sees
+    zero change from before this existed.
+    """
+    if not summary or not summary.get("transaction_count"):
+        return ""
+
+    def esc(value: "Any") -> str:
+        return _xml_escape(str(value if value is not None else ""), {chr(34): "&quot;"})
+
+    parts = [
+        '<release_transactions '
+        f'count="{esc(summary.get("transaction_count"))}" '
+        f'all_released="{esc(bool(summary.get("all_released")))}">'
+    ]
+    state_counts = summary.get("state_counts") or {}
+    for state in sorted(state_counts):
+        parts.append(f'<state name="{esc(state)}" count="{esc(state_counts[state])}"/>')
+    for entry in summary.get("recovery_required") or []:
+        parts.append(
+            f'<recovery_required transaction_id="{esc(entry.get("transaction_id"))}" '
+            f'change_set_id="{esc(entry.get("change_set_id"))}" '
+            f'file_path="{esc(entry.get("file_path"))}">{esc(entry.get("error"))}'
+            "</recovery_required>"
+        )
+    parts.append("</release_transactions>")
+    return "".join(parts)
+
+
+def render_release_transaction_evidence_markdown(summary: "dict[str, Any] | None") -> str:
+    """MDE-3 rework — the Markdown twin of
+    :func:`render_release_transaction_evidence_xml`, rendering the EXACT
+    SAME :func:`meridian.db.docx_merge.summarize_release_transactions`
+    summary as a human-readable ``## Release Transactions`` section.
+
+    Consumes the identical *summary* dict the XML/JSON renderers do — never
+    a separate query — so all three projections are guaranteed to describe
+    the same evidence. ``""`` for ``None``/falsy input or zero transactions,
+    matching the XML renderer's "purely additive" contract.
+    """
+    if not summary or not summary.get("transaction_count"):
+        return ""
+    lines = [
+        "## Release Transactions",
+        "",
+        f"- Total: {summary.get('transaction_count')}",
+        f"- All released: {bool(summary.get('all_released'))}",
+    ]
+    state_counts = summary.get("state_counts") or {}
+    if state_counts:
+        lines.append("- By state: " + ", ".join(
+            f"{state}={state_counts[state]}" for state in sorted(state_counts)
+        ))
+    recovery = summary.get("recovery_required") or []
+    if recovery:
+        lines.append("")
+        lines.append("**Needs attention (RECOVERY_REQUIRED):**")
+        for entry in recovery:
+            lines.append(
+                f"- `{entry.get('transaction_id')}` — {entry.get('change_set_id')} "
+                f"({entry.get('file_path')}): {entry.get('error')}"
+            )
+    return "\n".join(lines)
+
+
+def render_release_transaction_evidence_json(summary: "dict[str, Any] | None") -> str:
+    """MDE-3 rework — the JSON twin of
+    :func:`render_release_transaction_evidence_xml` / :func:`render_release_
+    transaction_evidence_markdown`: the SAME summary dict, serialized as a
+    deterministic (sorted-key) JSON string. ``""`` for ``None``/falsy input
+    or zero transactions — same "purely additive" contract as its siblings.
+    Callers that want the raw dict (rather than a pre-serialized string —
+    e.g. to embed in a structured MCP response field) should use
+    :func:`meridian.db.docx_merge.summarize_release_transactions`'s own
+    output directly; this function exists for handoff bodies that need a
+    literal JSON TEXT projection (e.g. a fenced code block) alongside the
+    Markdown/XML ones.
+    """
+    if not summary or not summary.get("transaction_count"):
+        return ""
+    return json.dumps(summary, sort_keys=True, default=str)
+
+
+async def _release_transaction_evidence_summary(
+    db: Any, project_id: "str | None",
+) -> "dict[str, Any] | None":
+    """Best-effort fetch of this project's release-transaction evidence
+    summary. Meridian core CAN import ``meridian.db.docx_merge`` directly
+    (unlike the ``extensions/meridian-outputs`` research-evidence surface,
+    this is a same-package sibling module, not an optional external
+    extension) — but the fetch is still fully guarded: any failure (DB
+    hiccup, no transactions ever recorded) degrades to ``None``, never
+    raises, matching every other best-effort evidence surface in this
+    module.
+    """
+    if not project_id:
+        return None
+    try:
+        from .db import docx_merge as _docx_merge_module  # noqa: PLC0415
+
+        transactions = await _docx_merge_module.list_release_transactions(
+            db, project_id=project_id,
+        )
+        if not transactions:
+            return None
+        return _docx_merge_module.summarize_release_transactions(transactions)
+    except Exception:  # noqa: BLE001 — evidence surfacing must never break handoff generation
+        return None
+
+
+def _duck_encode_dataclass_like(obj: Any) -> Any:
+    """MDE-5 — generic, ZERO-import reduction of a dataclass/Enum-shaped
+    object (e.g. a real ``research_evidence.ProvenanceEnvelope`` instance)
+    to plain dict/list/str/int/float/bool/None values.
+
+    Uses ONLY the stdlib ``dataclasses``/``enum`` modules — meridian core
+    still never imports ``extensions/meridian-outputs``'s
+    ``research_evidence`` module itself, exactly the same no-hard-dependency
+    contract ``_render_research_evidence_block`` already established (see
+    its own docstring). Structurally mirrors that module's OWN internal
+    ``_encode()`` helper (same reflection technique), just re-implemented
+    independently here rather than imported. A plain dict/list passes
+    through structurally unchanged (already the canonical shape); anything
+    else (str/int/float/bool/None, or an unrecognized object) is returned
+    as-is rather than raising — this is a best-effort projection for an
+    advisory handoff section, never a strict codec.
+    """
+    if isinstance(obj, _enum.Enum):
+        return obj.value
+    if _dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        # Mirrors research_evidence._encode()'s own extra_fields merge
+        # exactly (a field literally named "extra_fields" is merged into
+        # the result dict rather than nested), so a real ProvenanceEnvelope
+        # instance reduces to the SAME shape envelope_to_dict() would
+        # produce for it.
+        result: "dict[str, Any]" = {}
+        extra: "dict[str, Any]" = {}
+        for f in _dataclasses.fields(obj):
+            if f.name == "extra_fields":
+                extra = _duck_encode_dataclass_like(getattr(obj, f.name)) or {}
+                continue
+            result[f.name] = _duck_encode_dataclass_like(getattr(obj, f.name))
+        if extra:
+            result.update(extra)
+        return result
+    if isinstance(obj, dict):
+        return {str(k): _duck_encode_dataclass_like(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_duck_encode_dataclass_like(v) for v in obj]
+    return obj
+
+
+def _evidence_status_and_pointers_from_envelope(
+    envelope: Any,
+) -> "tuple[dict[str, Any] | None, list[dict[str, Any]]]":
+    """MDE-5 — duck-typed, zero-import projection of an optional research-
+    evidence envelope into ``(evidence_status_summary, trusted_pointers)``:
+    the small, BOUNDED pair a ``<handoff_manifest>`` embeds (never the full
+    envelope, which can be arbitrarily large). Mirrors
+    ``research_evidence.evidence_status_summary``/``trusted_pointers``
+    semantics closely (a real ``ProvenanceEnvelope`` instance produces the
+    exact same numbers reduced through this module's own logic instead —
+    see ``_duck_encode_dataclass_like``), reimplemented independently here
+    rather than imported, matching ``_render_research_evidence_block``'s
+    established no-hard-dependency contract exactly.
+
+    Accepts either a real ``ProvenanceEnvelope``-shaped object OR its
+    canonical dict form (``envelope_to_dict()``'s shape). Returns
+    ``(None, [])`` for anything falsy/unrecognized — purely additive, zero
+    change for a caller that never supplies an envelope. Never raises: a
+    malformed envelope degrades to ``(None, [])``, same as ``_render_
+    research_evidence_block``'s own best-effort posture.
+    """
+    if not envelope:
+        return None, []
+    try:
+        data = envelope if isinstance(envelope, dict) else _duck_encode_dataclass_like(envelope)
+        if not isinstance(data, dict):
+            return None, []
+        records = data.get("records")
+        links = data.get("links")
+        if not isinstance(records, list) or not isinstance(links, list):
+            return None, []
+
+        status_counts: "dict[str, int]" = {}
+        partial_records = redacted_records = authoritative_records = 0
+        trusted: "list[dict[str, Any]]" = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            resolver = rec.get("resolver") or {}
+            status = str(resolver.get("status") or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            is_partial = bool(rec.get("partial"))
+            is_redacted = bool(rec.get("redacted"))
+            is_authoritative = status == "verified" and not is_partial and not is_redacted
+            if is_partial:
+                partial_records += 1
+            if is_redacted:
+                redacted_records += 1
+            if is_authoritative:
+                authoritative_records += 1
+                identity = rec.get("identity") or {}
+                trusted.append({
+                    "id": identity.get("id"),
+                    "kind": identity.get("kind"),
+                    "locator": identity.get("locator"),
+                    "label": identity.get("label"),
+                })
+        partial_links = sum(
+            1 for link in links if isinstance(link, dict) and link.get("partial")
+        )
+        trusted.sort(key=lambda p: p.get("id") or "")
+        status_summary = {
+            "envelope_id": data.get("envelope_id"),
+            "generated_at": data.get("generated_at"),
+            "version": data.get("version"),
+            "partial": bool(data.get("partial")),
+            "partial_reason": data.get("partial_reason"),
+            "record_count": len(records),
+            "link_count": len(links),
+            "authoritative_record_count": authoritative_records,
+            "partial_record_count": partial_records,
+            "redacted_record_count": redacted_records,
+            "partial_link_count": partial_links,
+            "status_counts": status_counts,
+        }
+        return status_summary, trusted
+    except Exception:  # noqa: BLE001 — a malformed envelope must never break handoff generation
+        return None, []
 
 
 def _render_custom_handoff(
@@ -8919,6 +9345,8 @@ def build_handoff_manifest(
     stop_conditions: "list[str] | None" = None,
     deploy_policy: "dict[str, Any] | None" = None,
     max_items: int = _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+    evidence_status: "dict[str, Any] | None" = None,
+    trusted_pointers: "list[dict[str, Any]] | None" = None,
 ) -> "dict[str, Any]":
     """acf6f51a — assemble the canonical HandoffManifest as a plain dict with
     a FIXED field order (mirrored exactly by serialize_handoff_manifest_xml).
@@ -8935,6 +9363,18 @@ def build_handoff_manifest(
     ``items`` list (never the truncated view) — a receiver comparing
     ``board_revision`` against a fresh board fetch must see the same digest
     a caller with the full board would compute.
+
+    ``evidence_status``/``trusted_pointers`` (MDE-5) -- optional, ``None``/
+    omitted by default (byte-for-byte unchanged for every existing caller
+    that doesn't pass them). When the caller has a research-evidence
+    envelope (see ``_evidence_status_and_pointers_from_envelope``), these
+    carry the SAME small, bounded ``{status_counts, record_count,
+    authoritative_record_count, ...}`` summary and the list of
+    already-verified ``{id, kind, locator, label}`` pointers a receiver can
+    treat as trustworthy without re-resolving anything -- never the full
+    envelope, which is unbounded. This is what makes a handoff's evidence
+    state machine-readable rather than only ever narrated in the separate
+    "## Research Evidence" Markdown projection.
     """
     ordered_items = list(items)
     truncated = len(ordered_items) > max_items
@@ -8959,6 +9399,8 @@ def build_handoff_manifest(
         "waves": waves or [],
         "stop_conditions": list(stop_conditions or []),
         "deploy_policy": dict(deploy_policy or {}),
+        "evidence_status": dict(evidence_status or {}),
+        "trusted_pointers": list(trusted_pointers or []),
     }
 
 
@@ -9049,6 +9491,37 @@ def serialize_handoff_manifest_xml(manifest: "dict[str, Any]") -> str:
     for key in sorted(deploy):
         parts.append(f'<field name="{esc(key)}">{esc(deploy[key])}</field>')
     parts.append("</deploy_policy>")
+    # MDE-5 -- machine-readable research-evidence status + trusted pointers.
+    # Both default to {}/[] (build_handoff_manifest's own defaults) when the
+    # caller never supplied a research_evidence_envelope, so a manifest with
+    # no evidence renders empty-but-present elements rather than omitting
+    # them -- a receiver's XML parser never has to special-case "field
+    # absent" vs "field empty" for this section.
+    evidence_status = manifest.get("evidence_status") or {}
+    parts.append("<evidence_status>")
+    for key in sorted(evidence_status):
+        value = evidence_status[key]
+        if key == "status_counts" and isinstance(value, dict):
+            parts.append("<status_counts>")
+            for status_key in sorted(value):
+                parts.append(
+                    f'<field name="{esc(status_key)}">{esc(value[status_key])}</field>'
+                )
+            parts.append("</status_counts>")
+        else:
+            parts.append(f'<field name="{esc(key)}">{esc(value)}</field>')
+    parts.append("</evidence_status>")
+    parts.append("<trusted_pointers>")
+    for pointer in manifest.get("trusted_pointers") or []:
+        if not isinstance(pointer, dict):
+            continue
+        parts.append(
+            f'<pointer id="{esc(pointer.get("id"))}" '
+            f'kind="{esc(pointer.get("kind"))}" '
+            f'locator="{esc(pointer.get("locator"))}" '
+            f'label="{esc(pointer.get("label"))}"/>'
+        )
+    parts.append("</trusted_pointers>")
     parts.append("</handoff_manifest>")
 
     xml = "".join(parts)
@@ -9646,6 +10119,7 @@ async def generate_handoff(
     emit_manifest: bool = False,
     research_evidence_envelope: Any = None,
     proposal_scope: "dict[str, Any] | None" = None,
+    goal_string_out: "dict[str, Any] | None" = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -9822,6 +10296,25 @@ async def generate_handoff(
     either argument at its default (every pre-existing call site) sees ZERO
     functional change to ``(path, content, amended)`` or to ``content``
     itself — this never touches the rendered template.
+
+    ``goal_string_out`` (455cfc36) — optional output dict, same purely-
+    additive out-param shape as ``evidence_status``/``proposal_scope``
+    above. When given (any dict, typically ``{}``), it is populated with
+    ``{"goal_string": ..., "version": ...}`` where ``goal_string`` is the
+    EXACT canonical, token-embedded ``quick_start_goal`` text this call
+    already rendered into ``content`` — the same complete trusted
+    executable continuation block (``<goal_token>``, execution policy,
+    proposal scope, project-start config) every full/delta handoff embeds,
+    with zero independent re-assembly and zero second token mint. Exists so
+    a caller like ``checkpoint()`` can populate its own compact ``next_goal``
+    field from the SAME canonical payload the returned ``content`` carries,
+    instead of hand-rolling a separate, un-tokenized summary string (the
+    confirmed live gap this closes — see ``handle_checkpoint``). Only
+    populated for ``mode in {"full", "delta"}`` (the only modes that reach
+    the shared ``_mint_and_embed_goal_token`` call site below); a caller
+    that passes ``None`` (every pre-existing call site) sees zero
+    functional change to ``(path, content, amended)`` or to ``content``
+    itself.
 
     ``mode='delta'`` (836ca1d5) additionally embeds a durable continuation
     manifest — see :func:`build_continuation_manifest` — as a
@@ -10014,6 +10507,11 @@ async def generate_handoff(
         _resolved_max_bytes = max_content_bytes  # type: ignore[assignment]
     if mode == "planner":
         _pl_path, _pl_content = await _generate_planner_handoff(db, project_id, output_dir)
+        # aec043cb — see _mark_session_handoff_produced's docstring: keeps
+        # the resumed-session -> 'delta' auto-switch working now that
+        # 'planner' is reachable via an omitted mode too (a session
+        # registered role='planner'), not just an explicit request.
+        _mark_session_handoff_produced(session_id)
         return (
             _pl_path,
             format_handoff_mcp_content(_pl_content, max_bytes=_resolved_max_bytes),
@@ -10106,11 +10604,35 @@ async def generate_handoff(
             selected_scope=_selected_scope,
             emit_manifest=emit_manifest,
             proposal_scope=proposal_scope,
+            # MDE-5 -- goal mode previously never saw research_evidence_
+            # envelope at all (it returns before the full/delta-only
+            # _render_research_evidence_block append further below in this
+            # function), so a caller's evidence was silently invisible in
+            # exactly the mode documented as "hand straight to a fresh
+            # sub-agent with zero framing". See _generate_goal_only_handoff's
+            # own docstring for what this now renders.
+            research_evidence_envelope=research_evidence_envelope,
+        )
+        # aec043cb — see _mark_session_handoff_produced's docstring: 'goal'
+        # is now the common omitted-mode default, so it must keep the
+        # resumed-session -> 'delta' auto-switch working for THIS session's
+        # next call, exactly as the old 'full' default always did.
+        _mark_session_handoff_produced(session_id)
+        # aec043cb — see _persist_handoff_history_and_pending_goal's own
+        # docstring: 'goal' mode never wired into the handoffs history table
+        # or the trusted pending_goal channel (a latent, inconsequential gap
+        # since 682005f4 — 'goal' was explicit-request-only back then). Now
+        # that it is the common omitted-mode default, it must use the SAME
+        # trusted channel AGENTS.md documents for start_session/load_handoff,
+        # exactly like full/delta always have. content == pending_goal_body
+        # here: the entire goal-only body IS the /goal snippet.
+        _g_amended = await _persist_handoff_history_and_pending_goal(
+            db, project_id, "goal", _g_content, session_id, _g_content,
         )
         return (
             _g_path,
             format_handoff_mcp_content(_g_content, max_bytes=_resolved_max_bytes),
-            False,
+            _g_amended,
         )
     if mode not in {"full", "delta"}:
         raise ValueError(
@@ -10167,8 +10689,25 @@ async def generate_handoff(
     project_notes = await db_module.get_project_notes(db, project_id, bodies=True)
     strategic_notes = _select_strategic_notes(project_notes)
     # v3.1 — workspace decisions + notes apply across all projects.
-    workspace_decisions = await db_module.get_workspace_decisions(db)
-    workspace_notes = await db_module.get_workspace_notes(db)
+    # aec043cb — that "across all projects" scope is exactly why this is
+    # confined to mode == "full" now: full is the explicit, opt-in archival/
+    # diagnostic dump (never an omitted-mode default anymore — see
+    # resolve_handoff_mode), so a caller who deliberately asked for it is
+    # knowingly asking for cross-project context. mode == "delta" (a bounded
+    # per-session continuation update, whether reached explicitly or via the
+    # resumed-session auto-switch) must NOT bulk-inject unrelated workspace
+    # records — a decision or note pinned for a completely different project
+    # (interview notes, thesis findings, anything workspace-wide but
+    # project-irrelevant) has no business in a bounded continuation handoff.
+    # No allowlisted "workspace-policy" channel exists yet for delta/goal/
+    # starter/planner to opt into a narrow slice of this — see the aec043cb
+    # item notes point 4; until one exists, the answer is "none survives".
+    if mode == "full":
+        workspace_decisions = await db_module.get_workspace_decisions(db)
+        workspace_notes = await db_module.get_workspace_notes(db)
+    else:
+        workspace_decisions = []
+        workspace_notes = []
     # 45f519a0 — include_deferred=False so a deferred item is genuinely invisible
     # to executors in the handoff pending-items list, not just gated at claim time.
     # b8f89491 — version=_effective_version scopes the ENTIRE downstream pipeline
@@ -10735,6 +11274,20 @@ async def generate_handoff(
     # starter/compact path via _generate_starter_handoff, which previously
     # built its own quick_start_goal but never called this).
     quick_start_goal = await _mint_and_embed_goal_token(db, project_id, quick_start_goal)
+    # 455cfc36 — expose the EXACT canonical, token-embedded goal string a
+    # caller like checkpoint() can reuse verbatim instead of independently
+    # re-assembling its own next_goal summary (the confirmed live gap: a
+    # hand-rolled f-string with no <goal_token>, no execution_policy, no
+    # proposal_scope — not "a complete trusted executable continuation
+    # block"). Pure ADDITION, mirroring the existing evidence_status/
+    # proposal_scope out-param convention: a caller that passes None (every
+    # pre-existing call site) sees zero functional change. Only reached for
+    # mode in {"full", "delta"} — starter/compact/goal mint their own token
+    # in their own early-return helpers and are not in scope for this
+    # out-param (checkpoint() only ever calls mode="delta").
+    if goal_string_out is not None:
+        goal_string_out["goal_string"] = quick_start_goal
+        goal_string_out["version"] = _effective_version
 
     # Split tasks into L1 (last 10) and L2 (older).
     l1_tasks = tasks[:10]
@@ -11016,6 +11569,28 @@ async def generate_handoff(
     if _research_evidence_block:
         content = f"{content}\n\n{_research_evidence_block}"
 
+    # MDE-3 rework — "exact evidence in handoff" for release transactions
+    # (meridian.db.docx_merge's PREPARED->...->RELEASED state machine)
+    # previously ONLY reached goal mode (_generate_goal_only_handoff). This
+    # is the STANDARD/full handoff body — the mode most sessions actually
+    # read — so it gets the SAME evidence, all three projections (Markdown
+    # for a human reader, an XML tag + a fenced JSON block for a machine
+    # parser), from the SAME summary dict as goal mode. Best-effort and
+    # purely additive: "" input from a project with zero release-transaction
+    # activity means zero change to existing handoff content.
+    _release_evidence = await _release_transaction_evidence_summary(db, project_id)
+    _release_evidence_md = render_release_transaction_evidence_markdown(_release_evidence)
+    if _release_evidence_md:
+        content = f"{content}\n\n{_release_evidence_md}"
+    _release_evidence_xml = render_release_transaction_evidence_xml(_release_evidence)
+    if _release_evidence_xml:
+        content = f"{content}\n{_release_evidence_xml}"
+    _release_evidence_json = render_release_transaction_evidence_json(_release_evidence)
+    if _release_evidence_json:
+        content = (
+            f"{content}\n\n```json release_transactions\n{_release_evidence_json}\n```"
+        )
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{handoff_file_stem(project_id)}_handoff.md"
@@ -11041,32 +11616,12 @@ async def generate_handoff(
     # service (regenerate_handoff_correction calls generate_handoff, so
     # generate_handoff routing its own amend decision back through
     # regenerate_handoff_correction would recurse).
-    _amended = False
-    try:
-        _prior_goal = await db_module.get_pending_goal(db, project_id)
-        if _prior_goal is not None:
-            # Prior handoff exists and was never consumed — amend in-place.
-            _amend_result = await db_module.amend_handoff(db, project_id, content, mode)
-            if _amend_result is not None:
-                _amended = True
-            else:
-                # No prior row to amend (e.g. pre-migration DB or the row was
-                # deleted externally) — fall through to fresh record.
-                await db_module.record_handoff(db, project_id, mode, content, session_id)
-        else:
-            # 8819d6b1 — fresh handoff: persist to the history table so the
-            # dashboard / planner can list past handoffs and detect new ones.
-            await db_module.record_handoff(db, project_id, mode, content, session_id)
-    except Exception:  # noqa: BLE001 — never break handoff generation
-        pass
-    # 5efe254b — persist the /goal to the trusted channel so the next
-    # start_session can surface it as an MCP tool result (keyed on project_id)
-    # instead of a spoofable copy-pasted chat string. Read-once (pop). Fully
-    # guarded so a pre-migration DB never breaks handoff generation.
-    try:
-        await db_module.set_pending_goal(db, project_id, quick_start_goal)
-    except Exception:  # noqa: BLE001
-        pass
+    # aec043cb — extracted to _persist_handoff_history_and_pending_goal
+    # (zero behavior change: same calls, same order, same guards) so 'goal'
+    # mode can reuse it too. See that function's own docstring.
+    _amended = await _persist_handoff_history_and_pending_goal(
+        db, project_id, mode, content, session_id, quick_start_goal,
+    )
     # 5abf3e12 — measure & persist this session's goal compliance (did its /goal
     # item list get fully complete_sprint_item()'d?) at the canonical session-end
     # point. N = items this session took on (actor = session id), M = of those,
@@ -11593,11 +12148,26 @@ async def _generate_goal_only_handoff(
     selected_scope: "dict[str, Any] | None" = None,
     emit_manifest: bool = False,
     proposal_scope: "dict[str, Any] | None" = None,
+    research_evidence_envelope: Any = None,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
 
     ``strict_evidence``/``evidence_status`` (8a883f60) — threaded straight
     through from ``generate_handoff``; see its docstring.
+
+    ``research_evidence_envelope`` (MDE-5) — optional, ``None`` by default
+    (zero behaviour change). Previously this mode NEVER saw this parameter
+    at all: ``generate_handoff``'s own ``_render_research_evidence_block``
+    append only ran on its full/delta branch, further below in that
+    function, which goal mode returns before ever reaching — so a caller's
+    research evidence was silently invisible in exactly the mode documented
+    as "hand straight to a fresh sub-agent with zero framing". Now: (1) the
+    same "## Research Evidence" Markdown projection full/delta already
+    render is appended here too, and (2) when ``emit_manifest=True``, the
+    envelope is also reduced to a small, bounded ``evidence_status``/
+    ``trusted_pointers`` pair (see ``_evidence_status_and_pointers_from_
+    envelope``) and embedded into the canonical ``<handoff_manifest>`` XML
+    block — machine-readable, not just narrated prose.
     ``freshness_requery`` is always reported ``skipped`` here (this mode,
     like starter/compact, never re-queries pending items right before
     rendering — only full/delta do); the other four capabilities reflect
@@ -11914,6 +12484,13 @@ async def _generate_goal_only_handoff(
     # the existing body_hash mechanism covers it too; raises
     # HandoffManifestTooLarge (fail closed, same convention as
     # HandoffScopeNonExecutable just above) rather than truncating.
+    # MDE-5 — reduce the optional research-evidence envelope ONCE, reused by
+    # both the manifest (machine-readable) and the Markdown projection
+    # (human-readable) below. (None, []) when no envelope was supplied —
+    # zero behaviour change for every existing caller.
+    _g_evidence_status, _g_trusted_pointers = _evidence_status_and_pointers_from_envelope(
+        research_evidence_envelope
+    )
     if emit_manifest:
         _g_manifest = build_handoff_manifest(
             handoff_mode="goal",
@@ -11925,10 +12502,49 @@ async def _generate_goal_only_handoff(
             selected_item_ids=(selected_scope or {}).get("selected_item_ids"),
             closure_item_ids=(selected_scope or {}).get("closure_item_ids"),
             waves=(_parallel_groups or {}).get("groups"),
+            evidence_status=_g_evidence_status,
+            trusted_pointers=_g_trusted_pointers,
         )
         quick_start_goal = (
             f"{quick_start_goal}\n{serialize_handoff_manifest_xml(_g_manifest)}"
         )
+    # MDE-5 — the same "## Research Evidence" Markdown projection full/delta
+    # already render (_render_research_evidence_block), now also available
+    # in goal mode — previously invisible here entirely (see this function's
+    # own research_evidence_envelope docstring). Placed pre-mint (part of
+    # the hashed body), same as the manifest splice just above.
+    _g_research_evidence_block = _render_research_evidence_block(research_evidence_envelope)
+    if _g_research_evidence_block:
+        quick_start_goal = f"{quick_start_goal}\n\n{_g_research_evidence_block}"
+    # MDE-3 — "exact evidence in handoff": when emit_manifest=True, also
+    # surface this project's release-transaction crash-recovery evidence
+    # (meridian.db.docx_merge's PREPARED->...->RELEASED state machine) as a
+    # machine-readable <release_transactions> block — a receiver can see,
+    # without a separate query, whether any change-set is stuck in
+    # RECOVERY_REQUIRED before treating this project as cleanly releasable.
+    # Gated on emit_manifest (not unconditional) to avoid an extra DB round
+    # trip on every goal-mode call for projects that never opted into
+    # machine-readable manifests at all; "" for a project with zero
+    # release-transaction activity, so this is zero-behavior-change for
+    # every existing caller/project.
+    if emit_manifest:
+        _g_release_evidence = await _release_transaction_evidence_summary(db, project_id)
+        _g_release_evidence_block = render_release_transaction_evidence_xml(_g_release_evidence)
+        if _g_release_evidence_block:
+            quick_start_goal = f"{quick_start_goal}\n{_g_release_evidence_block}"
+        # MDE-3 rework — the SAME summary also as Markdown + JSON, so goal
+        # mode carries all three projections of identical evidence, not
+        # just XML. Independently guarded ("" input -> no-op) so a project
+        # with zero release-transaction activity sees zero change.
+        _g_release_evidence_md = render_release_transaction_evidence_markdown(_g_release_evidence)
+        if _g_release_evidence_md:
+            quick_start_goal = f"{quick_start_goal}\n\n{_g_release_evidence_md}"
+        _g_release_evidence_json = render_release_transaction_evidence_json(_g_release_evidence)
+        if _g_release_evidence_json:
+            quick_start_goal = (
+                f"{quick_start_goal}\n\n```json release_transactions\n"
+                f"{_g_release_evidence_json}\n```"
+            )
     # f471c4b8 — append the SAME machine-readable project-start-configuration
     # tag full/delta/starter render, BEFORE the token is minted below. This
     # is the mode explicitly documented as "hand straight to a fresh

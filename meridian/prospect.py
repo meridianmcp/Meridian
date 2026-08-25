@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 # 4b8f083f — a stored fingerprint only counts as a git-commit-drift baseline
@@ -188,6 +189,261 @@ def _payload_is_error(payload: Any) -> "str | None":
     return None
 
 
+# ---------------------------------------------------------------------------
+# MDE-2 rework — wrong-body resolution + active-repository scoping.
+#
+# The verifier's finding: every rung above returns FUZZY hits by design
+# (BM25/keyword matching for `semantic`, a third-party graph search keyed on
+# a free-text `query` for `graph`, name-substring matching for `serena`'s
+# find_symbol). A caller that blindly reads ``hits[0]`` (the previous
+# behavior at every call site below, and in the two production consumers —
+# ``mcp/handler.py``'s receipt-writer and ``pointers._resolve_symbol``) can
+# silently be handed a NEIGHBORING symbol's file/body under the queried
+# symbol's identity: e.g. querying "compute_total" and getting back
+# "compute_total_v2" or "compute_totals" because that happened to rank first
+# in the underlying search. The receipt layer's file-existence check
+# (``code_intel_receipt._file_exists_under_root``) cannot catch this at all
+# — a neighboring symbol's file genuinely exists, just isn't the RIGHT file.
+#
+# The fix is at the resolution engine, not the receipt: never let a fuzzy hit
+# be treated as authoritative for the queried symbol unless its OWN reported
+# identity (qualified_name/name_path/name) is an EXACT match. Two composable
+# pieces:
+#   - `_hit_identity_matches` / `select_exact_hit` — the exactness check.
+#   - `_hit_is_out_of_scope` / scope-filtering — the ACTIVE REPOSITORY
+#     scoping half: a hit whose file resolves outside `root_dir` (or carries
+#     a cross-tool contamination marker) is never in-scope for THIS session's
+#     query, regardless of name match, so a graph/backend response about a
+#     different indexed repository can never be silently accepted as
+#     belonging to the active one.
+# `_finalize_hits` applies both, uniformly, before a rung's hits are stored
+# on `result["hits"]` — so every existing caller that reads `hits[0]`
+# (unchanged call shape) gets the hardened selection for free.
+# ---------------------------------------------------------------------------
+
+def _hit_identity_matches(hit: Any, symbol: str) -> bool:
+    """True when *hit*'s OWN reported identity (``qualified_name``,
+    ``name_path``, or ``name``) is an EXACT (case-sensitive) match for
+    *symbol*. The only signal that lets a caller safely treat a hit's
+    file/line-range as authoritative for the QUERIED symbol rather than a
+    neighboring one returned by fuzzy graph/BM25/keyword matching.
+    """
+    if not isinstance(hit, dict) or not symbol:
+        return False
+    for key in ("qualified_name", "name_path", "name"):
+        val = hit.get(key)
+        if isinstance(val, str) and val == symbol:
+            return True
+    return False
+
+
+def select_exact_hit(hits: "list[Any] | None", symbol: str) -> "dict[str, Any] | None":
+    """Return the first hit in *hits* whose own identity EXACTLY matches
+    *symbol* (see :func:`_hit_identity_matches`), or ``None`` when every hit
+    is a near-miss/fuzzy match. Any caller that wants to treat a hit's
+    file/range as authoritative for the queried symbol (a receipt's
+    ``resolved_file``, ``pointers._resolve_symbol``, a ``get_code_snippet``
+    fetch) MUST go through this — or an equivalent exact check — instead of
+    indexing ``hits[0]`` directly.
+    """
+    for hit in hits or []:
+        if _hit_identity_matches(hit, symbol):
+            return hit
+    return None
+
+
+def hit_path(hit: "dict[str, Any] | None") -> "str | None":
+    """Extract the file/path field from a normalized or raw hit dict,
+    across the field-name variance between rungs (graph/serena carry
+    ``file``, semantic carries ``path``, some third-party shapes carry
+    ``relative_path``/``uri``)."""
+    if not isinstance(hit, dict):
+        return None
+    val = hit.get("file") or hit.get("path") or hit.get("relative_path") or hit.get("uri")
+    return val if isinstance(val, str) and val else None
+
+
+def hit_identity(hit: "dict[str, Any] | None") -> "str | None":
+    """Extract the resolved symbol identity a hit itself reports
+    (``qualified_name`` preferred, then ``name_path``/``name``) — the REAL
+    resolved identity, as opposed to the raw (and receipt-truncated) query
+    string a caller searched for."""
+    if not isinstance(hit, dict):
+        return None
+    for key in ("qualified_name", "name_path", "name"):
+        val = hit.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return None
+
+
+def hit_range(hit: "dict[str, Any] | None") -> "dict[str, int] | None":
+    """Extract a ``{start_line, end_line}`` line range from a hit, across
+    the several shapes rungs report a location in (``line_start``/
+    ``line_end`` — semantic; ``start_line``/``end_line`` or a nested
+    ``range`` dict — some graph/serena shapes; a bare ``line`` — the most
+    common minimal shape, treated as a single-line range). Returns ``None``
+    when no line information is present at all — never fabricates one.
+    """
+    if not isinstance(hit, dict):
+        return None
+    start = hit.get("line_start")
+    end = hit.get("line_end")
+    if start is None:
+        start = hit.get("start_line")
+        end = hit.get("end_line")
+    if start is None:
+        rng = hit.get("range")
+        if isinstance(rng, dict):
+            start = rng.get("start_line") or rng.get("start")
+            end = rng.get("end_line") or rng.get("end")
+    if start is None:
+        start = hit.get("line")
+        end = end if end is not None else start
+    if start is None:
+        return None
+    if end is None:
+        end = start
+    try:
+        return {"start_line": int(start), "end_line": int(end)}
+    except (TypeError, ValueError):
+        return None
+
+
+def hit_content(hit: "dict[str, Any] | None") -> "str | None":
+    """Extract whatever body/snippet text a hit already carries inline
+    (``content`` — the local semantic/BM25 index's own chunk text;
+    ``snippet``/``body``/``text`` — plausible third-party shapes). Used by
+    :mod:`code_intel_receipt`'s graph-vs-live-file hash comparison. ``None``
+    when the hit carries no inline text at all (most graph/serena hits —
+    those only report a location, not a body)."""
+    if not isinstance(hit, dict):
+        return None
+    for key in ("content", "snippet", "body", "text"):
+        val = hit.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return None
+
+
+def _hit_is_out_of_scope(hit: Any, root_dir: "str | None") -> bool:
+    """True only on POSITIVE evidence that *hit*'s file lies OUTSIDE the
+    active repository (*root_dir*) — MDE-2's "scope graph queries to the
+    active repository" fix. Two forms of positive evidence:
+
+      1. a cross-tool contamination marker in the path (reuses
+         ``code_intel_receipt.is_contaminated_repo_path`` — the SAME
+         ``.codex/worktrees/...`` marker the receipt layer already excludes,
+         applied here at hit-selection time instead of only after the fact);
+      2. an ABSOLUTE path that resolves outside ``root_dir``'s real path —
+         i.e. the backend genuinely returned a file from a different
+         checkout on disk.
+
+    Never rejects on an unverifiable case (no ``root_dir`` to scope against,
+    no path on the hit, or a RELATIVE path — which could legitimately
+    resolve under ``root_dir`` and can't be proven otherwise without
+    guessing) — same fail-open, "don't overclaim" posture as the rest of
+    this module and ``code_intel_receipt.py``.
+    """
+    if not root_dir or not isinstance(hit, dict):
+        return False
+    raw_path = hit_path(hit)
+    if not raw_path:
+        return False
+    try:
+        from .code_intel_receipt import is_contaminated_repo_path as _is_contaminated
+    except Exception:  # noqa: BLE001 — scoping must never raise
+        _is_contaminated = None
+    if _is_contaminated is not None and _is_contaminated(raw_path):
+        return True
+    p = Path(raw_path)
+    if not p.is_absolute():
+        return False
+    try:
+        root_real = Path(root_dir).resolve()
+        hit_real = p.resolve()
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        hit_real.relative_to(root_real)
+        return False
+    except ValueError:
+        return True
+
+
+def _reorder_exact_first(hits: "list[Any]", symbol: str) -> "list[Any]":
+    """Stable-reorder *hits* so any exact-identity match (see
+    :func:`_hit_identity_matches`) comes first; non-exact hits keep their
+    relative order after. Uses ``id()`` (not ``==``) to split the list so
+    content-equal-but-distinct hit dicts are never misclassified."""
+    if not hits:
+        return hits
+    exact_ids: set = set()
+    exact: list = []
+    rest: list = []
+    for h in hits:
+        if _hit_identity_matches(h, symbol):
+            exact.append(h)
+            exact_ids.add(id(h))
+        else:
+            rest.append(h)
+    if not exact:
+        return hits
+    return exact + rest
+
+
+def _finalize_hits(hits: "list[Any]", symbol: str, root_dir: "str | None") -> "list[Any]":
+    """Apply BOTH MDE-2 hardenings to a rung's raw hit list before it is
+    stored on ``result["hits"]``:
+
+      1. drop any hit with POSITIVE evidence of being outside the active
+         repository (:func:`_hit_is_out_of_scope`) — never drops down to an
+         EMPTY list when every hit happens to look out-of-scope (that would
+         silently hide real, if imperfect, prospecting evidence); only
+         filters when at least one hit remains in-scope;
+      2. stable-reorder so an exact identity match comes first
+         (:func:`_reorder_exact_first`), so any caller that only looks at
+         ``hits[0]`` is never handed a neighboring symbol's body when an
+         exact match was available in this rung's own results.
+    """
+    if not hits:
+        return hits
+    in_scope = [h for h in hits if not _hit_is_out_of_scope(h, root_dir)]
+    working = in_scope if in_scope else hits
+    return _reorder_exact_first(working, symbol)
+
+
+def resolve_exact_hit_from_tunnel_result(
+    tunnel_mod: Any, tunnel_result: Any, symbol: "str | None", root_dir: "str | None",
+) -> "dict[str, Any] | None":
+    """MDE-2 rework — parse a raw tunnel-FORWARDED tool result (a direct
+    ``codebase__search_graph``/``extractor__find_symbol``/... call, NOT
+    routed through :func:`prospect_symbol_impl`) the same way its own
+    graph/serena rungs do, then apply the identical exact-match +
+    active-repository scoping used everywhere else in this module.
+
+    Used by ``mcp/handler.py``'s tunnel-forward receipt chokepoint (the
+    ``tools/call`` dispatch path a THIRD-PARTY code-intel tool name takes
+    when called directly, never touching ``prospect_symbol_impl`` at all) so
+    that chokepoint gets the SAME wrong-body protection as the native
+    ``prospect_symbol`` tool, instead of a separate, weaker code path.
+
+    Never raises; returns ``None`` on any parse failure, when *symbol* is
+    empty, or when no exact, in-scope hit is found (never a fuzzy fallback).
+    """
+    if not symbol:
+        return None
+    try:
+        payload = tunnel_mod._extract_graph_matches(tunnel_result)
+        hits = _extract_hits(payload)
+    except Exception:  # noqa: BLE001 — parsing a third-party payload must never raise
+        return None
+    if not hits:
+        return None
+    scoped = _finalize_hits(hits, symbol, root_dir)
+    return select_exact_hit(scoped, symbol)
+
+
 async def prospect_symbol_impl(
     symbol: str,
     project_id: str,
@@ -345,7 +601,7 @@ async def prospect_symbol_impl(
                     if not (broad_hits and isinstance(broad_hits, list) and len(broad_hits) > 0):
                         return False
                     result["rung"] = "graph"
-                    result["hits"] = broad_hits
+                    result["hits"] = _finalize_hits(broad_hits, symbol, root_dir)
                     result["graph_raw"] = broad_payload
                     _mark_rung(
                         "graph", "succeeded",
@@ -402,7 +658,7 @@ async def prospect_symbol_impl(
                     hits = _extract_hits(payload)
                     if hits and isinstance(hits, list) and len(hits) > 0:
                         result["rung"] = "graph"
-                        result["hits"] = hits
+                        result["hits"] = _finalize_hits(hits, symbol, root_dir)
                         result["graph_raw"] = payload
                         _mark_rung(
                             "graph", "succeeded",
@@ -453,7 +709,7 @@ async def prospect_symbol_impl(
                             broad_hits = _extract_hits(broad_payload)
                             if broad_hits and isinstance(broad_hits, list) and len(broad_hits) > 0:
                                 result["rung"] = "graph"
-                                result["hits"] = broad_hits
+                                result["hits"] = _finalize_hits(broad_hits, symbol, root_dir)
                                 result["graph_raw"] = broad_payload
                                 _mark_rung(
                                     "graph", "succeeded",
@@ -567,7 +823,7 @@ async def prospect_symbol_impl(
                         break
                 if serena_hits:
                     result["rung"] = "serena"
-                    result["hits"] = serena_hits[:limit]
+                    result["hits"] = _finalize_hits(serena_hits, symbol, root_dir)[:limit]
                     _mark_rung(
                         "serena", "succeeded",
                         attempted_tool=_SERENA_TOOLS,
@@ -634,7 +890,7 @@ async def prospect_symbol_impl(
                 sem_hits = (sem_result or {}).get("hits") or []
                 if sem_hits:
                     result["rung"] = "semantic"
-                    result["hits"] = sem_hits
+                    result["hits"] = _finalize_hits(sem_hits, symbol, root_dir)
                     result["semantic_raw"] = sem_result
                     _mark_rung(
                         "semantic", "succeeded",

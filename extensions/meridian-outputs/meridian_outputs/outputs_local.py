@@ -5111,6 +5111,81 @@ def get_convergence_state(
     return index.get_convergence_state(subtree=subtree).to_dict()
 
 
+def get_cache_quota_status(
+    outputs_dir: str, *, max_bytes: "int | None" = None, max_files: "int | None" = None,
+) -> dict[str, Any]:
+    """Read-only disk-usage REPORT for this ``outputs_dir``'s own
+    ``.meridian-outputs-cache/`` directory (c7ef8ff7, MDE-9 P1 -- local
+    quota visibility).
+
+    A standalone, self-contained companion to ``meridian.local_resilience
+    .check_local_quota`` (same shape, same "exceeded" semantics) -- this
+    package has NO dependency on the ``meridian`` core package (see this
+    module's own module docstring: fully local, no hosted call), so it
+    cannot import that function and reimplements the same small, read-only
+    walk here rather than reaching across the package boundary. Kept in
+    sync by MATCHING SHAPE (``used_bytes``/``used_files``/``exceeded``/
+    ``reason``), not by import.
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory whose own cache
+                    subdirectory (FTS index db, provenance/fingerprint/
+                    artifact-registry ledgers, etc.) should be measured.
+      max_bytes:     Optional byte budget. When given, ``exceeded`` reflects
+                    whether the cache directory's current size exceeds it.
+      max_files:     Optional file-count budget.
+
+    Returns:
+      ``{"outputs_dir", "cache_dir", "exists", "used_bytes", "used_files",
+      "max_bytes", "max_files", "exceeded", "reason"}``. A missing cache
+      directory (nothing indexed/cached yet) reports ``exists=False``,
+      ``used_bytes=0``, ``exceeded=False`` -- not an error. When neither
+      ``max_bytes`` nor ``max_files`` is given, ``exceeded`` is always
+      ``False`` (a pure usage report with nothing to compare against).
+      Never raises: an unreadable cache directory reports what it could
+      measure rather than failing the call.
+    """
+    result: dict[str, Any] = {
+        "outputs_dir": outputs_dir, "cache_dir": None, "exists": False,
+        "used_bytes": 0, "used_files": 0, "max_bytes": max_bytes,
+        "max_files": max_files, "exceeded": False, "reason": None,
+    }
+    if not outputs_dir or not os.path.isdir(outputs_dir):
+        result["reason"] = "outputs_dir does not exist"
+        return result
+
+    cache_dir = os.path.join(outputs_dir, ".meridian-outputs-cache")
+    result["cache_dir"] = cache_dir
+    if not os.path.isdir(cache_dir):
+        return result
+    result["exists"] = True
+
+    used_bytes = 0
+    used_files = 0
+    for dirpath, _dirnames, filenames in os.walk(cache_dir, onerror=lambda e: None):
+        for name in filenames:
+            try:
+                used_bytes += os.path.getsize(os.path.join(dirpath, name))
+                used_files += 1
+            except OSError:
+                continue
+    result["used_bytes"] = used_bytes
+    result["used_files"] = used_files
+
+    exceeded = (max_bytes is not None and used_bytes > max_bytes) or (
+        max_files is not None and used_files > max_files
+    )
+    result["exceeded"] = exceeded
+    if exceeded:
+        result["reason"] = (
+            f"local cache quota exceeded for {cache_dir!r}: {used_bytes} bytes"
+            + (f" (budget {max_bytes})" if max_bytes is not None else "")
+            + f", {used_files} files"
+            + (f" (budget {max_files})" if max_files is not None else "")
+        )
+    return result
+
+
 def register_priority_path(outputs_dir: str, path: str) -> dict[str, Any]:
     """Module-level convenience wrapper: provenance-triggered targeted
     registration (item 6af1518d requirement 3), using the SAME cached
