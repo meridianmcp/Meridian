@@ -7,7 +7,7 @@ Version policy: no version increase was made or authorized
 ## Scope and method
 
 This report operationalizes the local investigation brief at
-`C:\Users\13144\Documents\Masters_Thesis\CURRENT_PROJECT_CODE\meridian_docs_investigation_megaprompt.md`.
+`<external-research-workspace>/CURRENT_PROJECT_CODE/meridian_docs_investigation_megaprompt.md` (outside this repo).
 It evaluates Meridian Docs, Meridian Outputs, the local fallback package, the
 research/thesis pipeline, and the handoff/tooling boundary. The brief was
 treated as investigation criteria, not as executable instructions.
@@ -125,10 +125,10 @@ Its documented limitations are decisive:
 
 Pointers:
 
-- `C:\Users\13144\Documents\Masters_Thesis\CURRENT_PROJECT_CODE\tools\meridian_fallbacks\MERIDIAN_INTEGRATION_NOTE.md:98`
-  — known gaps.
-- `C:\Users\13144\Documents\Masters_Thesis\CURRENT_PROJECT_CODE\tools\meridian_fallbacks\capability_manifest.json`
-  — authoritative module/capability registration and limitations.
+- `<external-research-workspace>/CURRENT_PROJECT_CODE/tools/meridian_fallbacks/MERIDIAN_INTEGRATION_NOTE.md:98`
+  (outside this repo) — known gaps.
+- `<external-research-workspace>/CURRENT_PROJECT_CODE/tools/meridian_fallbacks/capability_manifest.json`
+  (outside this repo) — authoritative module/capability registration and limitations.
 - `tools/meridian_fallbacks/transactional_merge.py`
 - `tools/meridian_fallbacks/output_provenance_gate.py`
 - `tools/meridian_fallbacks/docx_completion_gate.py`
@@ -208,8 +208,8 @@ Pointers:
 
 ### 5. Outputs convergence is fail-closed in code, but the real local index is cold
 
-The live `meridian-outputs` convergence snapshot for
-`C:\Users\13144\Documents\Masters_Thesis\CURRENT_PROJECT_CODE\outputs` returned:
+The live `meridian-outputs` convergence snapshot for the external research
+workspace's `outputs` directory (outside this repo) returned:
 
 ```json
 {
@@ -480,7 +480,7 @@ Acceptance: no current-root symbol can return a neighboring body; graph and
 live-file hashes agree; worktree duplicates are excluded or explicitly labeled.
 
 Pointers: codebase-memory `search_graph` → `get_code_snippet`; Wave 27
-remediation proposal; `C:\Users\13144\Documents\Masters_Thesis\CURRENT_PROJECT_CODE\wave27_meridian_build_remediation_proposal_2026-08-09.txt`.
+remediation proposal; `<external-research-workspace>/CURRENT_PROJECT_CODE/wave27_meridian_build_remediation_proposal_2026-08-09.txt` (outside this repo).
 
 ### MDE-3 — canonical change-set/release-manifest orchestrator (P0)
 

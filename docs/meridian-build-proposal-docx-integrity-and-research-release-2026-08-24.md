@@ -96,13 +96,11 @@ The saved-byte fingerprints from that run were:
 | Canonical dissertation reference | `4cfda7e4faa20755d63cb6186e4071b70ebe081db92b2eec7e4d3f1c6b19d4e0` | 408 | Reference structure retained |
 | Staged JCSHM manuscript v12 | `4074c54ddf139c31330ed9b667bd8fdf920d978860db67d3d20f8947c8730746` | 151 | Candidate has the corruption findings below |
 
-The canonical dissertation remains at:
+The canonical dissertation remains at its private location outside this repo
+(identified by SHA-256 above, not by path).
 
-`C:\Users\13144\OneDrive\Masters_Dissertation_Report_Defense.docx`
-
-The candidate examined was:
-
-`C:\Users\13144\Documents\Masters_Thesis\CURRENT_PROJECT_CODE\staging\jcshm_megaexecutor_20260823\candidate_v12\proposed_manuscript_v12.docx`
+The candidate examined was a staged manuscript revision in the external
+research workspace's staging area (identified by SHA-256 above, not by path).
 
 ### Equation incident details
 

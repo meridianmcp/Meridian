@@ -231,13 +231,13 @@ drift.
 
 ## Canonical evidence pointers
 
-- Thesis research source: `C:\Users\13144\Documents\Masters_Thesis\CURRENT_PROJECT_CODE`
-- Research reconciliation: `C:\Users\13144\Documents\Masters_Thesis\CURRENT_PROJECT_CODE\wave50_results_reconciliation_report.md`
-- Local fallback contract: `C:\Users\13144\Documents\Masters_Thesis\CURRENT_PROJECT_CODE\tools\meridian_fallbacks\MERIDIAN_INTEGRATION_NOTE.md`
-- Reliability findings: `C:\Users\13144\Documents\Masters_Thesis\CURRENT_PROJECT_CODE\provenance\meridian_reliability_audit_20260821.md`
-- Table/OMML contract: `C:\Users\13144\Documents\Masters_Thesis\CURRENT_PROJECT_CODE\proposals\meridian_docs_table_contract_wave53_20260818.md`
-- Existing document-release proposal: `C:\Users\13144\Documents\Meridian\repository\docs\meridian-build-proposal-track-b-2026-08-24.md`
-- Current Meridian OOXML integrity implementation: `C:\Users\13144\Documents\Meridian\repository\extensions\meridian-docs\meridian_docs\ooxml_integrity.py`
+- Thesis research source: `<external-research-workspace>/CURRENT_PROJECT_CODE` (outside this repo)
+- Research reconciliation: `<external-research-workspace>/CURRENT_PROJECT_CODE/wave50_results_reconciliation_report.md` (outside this repo)
+- Local fallback contract: `<external-research-workspace>/CURRENT_PROJECT_CODE/tools/meridian_fallbacks/MERIDIAN_INTEGRATION_NOTE.md` (outside this repo)
+- Reliability findings: `<external-research-workspace>/CURRENT_PROJECT_CODE/provenance/meridian_reliability_audit_20260821.md` (outside this repo)
+- Table/OMML contract: `<external-research-workspace>/CURRENT_PROJECT_CODE/proposals/meridian_docs_table_contract_wave53_20260818.md` (outside this repo)
+- Existing document-release proposal: `docs/meridian-build-proposal-track-b-2026-08-24.md`
+- Current Meridian OOXML integrity implementation: `extensions/meridian-docs/meridian_docs/ooxml_integrity.py`
 
 ## Status
 
