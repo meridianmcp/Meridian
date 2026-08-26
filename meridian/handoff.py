@@ -9954,8 +9954,13 @@ def compute_required_tools_hash(items: "list[dict[str, Any]]") -> str:
 # genuine token) WITHOUT ever touching the token or invalidating a
 # body_hash that was never recorded in the first place. This check is
 # orthogonal to token validity: it runs whenever a presented_body is
-# supplied, regardless of whether goal_token verification passed, failed,
-# or was never attempted in this call.
+# supplied and the token check did not already reject the envelope on
+# its own, separate basis — i.e. token verification passed, or no token
+# was presented at all. When token verification itself fails
+# (STALE_HANDOFF / BODY_HASH_MISMATCH), accept_handoff_envelope returns
+# before reaching this check, since the envelope is already rejected;
+# this check exists to catch what those two cannot, not to re-run
+# unconditionally after a failure they already reported.
 _PROJECT_START_CONFIG_TAG_RE = re.compile(
     r"<project_start_config\b([^>]*)/?>", re.IGNORECASE
 )
