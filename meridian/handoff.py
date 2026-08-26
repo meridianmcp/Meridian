@@ -1789,6 +1789,74 @@ _MODE_DEFAULT_MAX_BYTES = object()
 # extract_artifact_pointer_findings source this clause itself reads.
 _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS = 15
 
+# 4f3bd70c — canonical structural safety net for format_handoff_mcp_content's
+# wire-level byte budget below. That budget, on its own, is purely byte-
+# oriented: it decides HOW MANY bytes survive with no notion of the
+# structural tags (<tool_requirements>, <sprint_item_pointers>,
+# <artifact_pointer_findings>, <selected_item_scope>, <continuation_manifest>,
+# <handoff_manifest>, <proposal_scope>, <executor_item_ids>, ...) those bytes
+# might fall in the middle of — a naive byte cut can land inside one of those
+# tags (or the JSON it encloses), leaving a dangling open tag or a truncated
+# JSON value in an otherwise "complete" render. The existing
+# <goal_token>/SECURITY banner floor already solves exactly this for ONE
+# specific tag; the two helpers below generalize the same idea to every
+# top-level ``<tag>...</tag>`` span in the content, reused identically by
+# every mode that funnels through format_handoff_mcp_content (full, delta,
+# starter/compact, goal, checkpoint, continue) since none of them have their
+# own separate truncation path. A byte cut can now only ever land BETWEEN
+# whole tags (or between a tag and surrounding narrative) — a tag that would
+# only partially survive is dropped in its entirety instead, which is what
+# keeps the surviving content syntactically complete for whatever it does
+# include (see docs/meridian-handoff-contract.md's "Wire-level truncation"
+# section).
+_STRUCTURAL_TAG_RE = re.compile(
+    r"<([a-zA-Z][a-zA-Z0-9_]*)>.*?</\1>", re.DOTALL,
+)
+
+
+def _structural_tag_spans(content: str) -> "list[tuple[int, int]]":
+    """Return ``(start_byte, end_byte)`` UTF-8 byte offsets for every
+    top-level ``<tag>...</tag>`` span in ``content``.
+
+    Matches are whatever ``re.finditer`` returns for the (non-overlapping)
+    pattern above — good enough for the flat, sibling-tag shape every handoff
+    mode actually renders (no mode nests one of these tags inside another).
+    Offsets are in UTF-8 BYTES (not characters) so they compare directly
+    against the byte-oriented cut point ``format_handoff_mcp_content`` already
+    computes.
+    """
+    spans: "list[tuple[int, int]]" = []
+    for m in _STRUCTURAL_TAG_RE.finditer(content):
+        start_b = len(content[: m.start()].encode("utf-8"))
+        end_b = len(content[: m.end()].encode("utf-8"))
+        spans.append((start_b, end_b))
+    return spans
+
+
+def _snap_to_safe_boundary(
+    cut: int, spans: "list[tuple[int, int]]", protected_end: int,
+) -> int:
+    """Move ``cut`` (a UTF-8 byte offset) backward, if needed, so it never
+    lands strictly inside one of ``spans``.
+
+    Dropping a tag span always drops the WHOLE span, never a partial one.
+    Never returns less than ``protected_end`` (the caller's own separate,
+    higher-priority "never cut the goal-token banner" floor). Iterates to a
+    fixed point since snapping out of one span can land inside an earlier,
+    lower-offset span; bounded by ``len(spans)`` tries, which always
+    terminates because each move strictly decreases ``safe_cut``.
+    """
+    safe_cut = max(protected_end, cut)
+    for _ in range(len(spans) + 2):
+        moved = False
+        for start_b, end_b in spans:
+            if start_b < safe_cut < end_b:
+                safe_cut = start_b
+                moved = True
+        if not moved:
+            break
+    return max(protected_end, safe_cut)
+
 
 def format_handoff_mcp_content(
     content: str, *, max_bytes: "int | None" = _DEFAULT_HANDOFF_MAX_BYTES,
@@ -1844,7 +1912,22 @@ def format_handoff_mcp_content(
     the binding itself). Truncation removes only trailing bytes AFTER that
     protected point (or from the very start when no banner is present, e.g.
     planner-mode content) and appends an explicit, machine-readable marker
-    naming exactly how many bytes were omitted — never a silent drop. A
+    naming exactly how many bytes (and structural sections) were omitted —
+    never a silent drop.
+
+    4f3bd70c — the cut point is additionally snapped to a STRUCTURAL boundary
+    via :func:`_structural_tag_spans`/:func:`_snap_to_safe_boundary`: it can
+    never land strictly inside a top-level ``<tag>...</tag>`` span (e.g.
+    ``<tool_requirements>``, ``<sprint_item_pointers>``,
+    ``<artifact_pointer_findings>``, ``<selected_item_scope>``,
+    ``<continuation_manifest>``, ``<handoff_manifest>``, ``<proposal_scope>``,
+    ``<executor_item_ids>``). A tag that would only partially survive a raw
+    byte cut is instead dropped in its entirety, so the surviving content is
+    always syntactically complete for whatever it does include — never a
+    dangling open tag or a truncated JSON/XML value. This generalizes the
+    pre-existing goal-token-banner protection (one specific tag) to every
+    structural tag the renderer emits, uniformly, for every mode that funnels
+    through this one function. A
     receiving session that runs ``verify_handoff_token(body=...)`` against
     truncated content correctly gets ``reason="body_mismatch"`` (the
     presented body genuinely is not the exact one that was minted) rather
@@ -1907,41 +1990,93 @@ def format_handoff_mcp_content(
     if _banner_match:
         _protected_end = len(content[: _banner_match.end()].encode("utf-8"))
     _total_bytes = len(_raw)
+    # 4f3bd70c — every top-level structural tag span, so the cut point below
+    # can be snapped to never land inside one (see _snap_to_safe_boundary).
+    _spans = _structural_tag_spans(content)
 
-    def _marker_bytes_for(omitted: int) -> bytes:
+    def _sections_omitted_for(cut: int) -> int:
+        # Safe post-snap: for every span, either fully kept (end <= cut) or
+        # fully omitted (start >= cut) — no straddling case remains once
+        # `cut` has been through _snap_to_safe_boundary.
+        return sum(1 for _start_b, _end_b in _spans if _start_b >= cut)
+
+    def _marker_bytes_for(omitted: int, sections_omitted: int) -> bytes:
+        _meta = json.dumps(
+            {
+                "content_truncated": True,
+                "omitted_bytes": omitted,
+                "total_bytes": _total_bytes,
+                "limit_bytes": max_bytes,
+                "sections_omitted": sections_omitted,
+                "reason": "response_size_budget",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         return (
             "\n\n<!-- TRUNCATED (cb00889c bounded handoff profile): "
             f"{omitted} of {_total_bytes} total bytes omitted to satisfy the "
             f"handoff response-size budget (limit={max_bytes} bytes). Everything "
             "up to and including any <goal_token>/SECURITY banner above is "
-            "complete and byte-identical to the original render. "
-            "Narrative/context beyond this point was trimmed to fit the budget "
-            "-- request mode='goal' for the minimal bounded executable profile, "
-            "or a narrower version scope, to see it in full. -->"
+            "complete and byte-identical to the original render. The cut point "
+            "below never lands inside a <tag>...</tag> span -- a tag that would "
+            "only partially survive is dropped in full instead, never sliced -- "
+            "so the surviving content stays syntactically complete for whatever "
+            "it does include. Narrative/context beyond this point was trimmed "
+            "to fit the budget -- request mode='goal' for the minimal bounded "
+            "executable profile, or a narrower version scope, to see it in "
+            f"full. machine_readable={_meta} -->"
         ).encode("utf-8")
 
     # 60eed526 — iterate to a fixed point: the marker's own length depends
     # on the omitted-byte count it names, which depends on the cut point.
-    # Converges in 1-2 tries in practice (the marker only grows/shrinks when
-    # `_omitted`'s digit count crosses a power-of-ten boundary); the exact
-    # correction pass right after this loop makes the final result precise
-    # regardless of how many tries it takes.
+    # 4f3bd70c — each candidate cut is ALSO snapped to a safe structural
+    # boundary before the marker is measured against it, since snapping can
+    # only ever shrink the kept prefix further (never grow it, never move it
+    # past `max_bytes`), so this still converges to a stable, in-budget,
+    # tag-safe cut within a handful of tries — bounded by len(_spans) below,
+    # never just a fixed constant, so a content with many structural tags
+    # still converges correctly.
     _cut = max_bytes
-    for _ in range(5):
-        _marker_len = len(_marker_bytes_for(_total_bytes - _cut))
+    for _ in range(max(5, len(_spans) + 3)):
+        _candidate = _snap_to_safe_boundary(
+            max(_protected_end, min(_cut, max_bytes)), _spans, _protected_end,
+        )
+        _marker_len = len(
+            _marker_bytes_for(
+                _total_bytes - _candidate, _sections_omitted_for(_candidate),
+            )
+        )
         _next_cut = max(_protected_end, min(_cut, max_bytes - _marker_len))
+        _next_cut = _snap_to_safe_boundary(_next_cut, _spans, _protected_end)
         if _next_cut == _cut:
             break
         _cut = _next_cut
+    _cut = _snap_to_safe_boundary(
+        max(_protected_end, min(_cut, max_bytes)), _spans, _protected_end,
+    )
     _kept_raw = _raw[:_cut]
-    _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw))
-    _overshoot = (len(_kept_raw) + len(_marker_bytes)) - max_bytes
-    if _overshoot > 0 and _cut > _protected_end:
-        _cut = max(_protected_end, _cut - _overshoot)
+    _sections_omitted = _sections_omitted_for(_cut)
+    _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw), _sections_omitted)
+    # 4f3bd70c — the overshoot-correction pass can itself land back inside a
+    # span (shrinking `_cut` by a raw byte count knows nothing about tag
+    # boundaries), so re-snap after every shrink; bounded retries since each
+    # pass strictly decreases `_cut` (or the loop exits via the `<= 0` check).
+    for _ in range(max(3, len(_spans) + 1)):
+        _overshoot = (len(_kept_raw) + len(_marker_bytes)) - max_bytes
+        if _overshoot <= 0 or _cut <= _protected_end:
+            break
+        _cut = _snap_to_safe_boundary(
+            max(_protected_end, _cut - _overshoot), _spans, _protected_end,
+        )
         _kept_raw = _raw[:_cut]
-        _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw))
+        _sections_omitted = _sections_omitted_for(_cut)
+        _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw), _sections_omitted)
     # errors="ignore" — never split a multi-byte UTF-8 sequence into an
-    # invalid trailing fragment; at most drops the final incomplete char.
+    # invalid trailing fragment; at most drops the final incomplete char. The
+    # structural snapping above already guarantees `_cut` never lands inside
+    # a <tag> span, so this only ever trims a stray partial multi-byte
+    # character in ordinary narrative text between/after tags.
     _kept_text = _kept_raw.decode("utf-8", errors="ignore")
     return _kept_text + _marker_bytes.decode("utf-8")
 
@@ -10742,6 +10877,12 @@ async def generate_handoff(
             strict_pointer_evidence=strict_pointer_evidence,
             selected_scope=_selected_scope,
             proposal_scope=proposal_scope,
+            # 4f3bd70c — session_id now threaded consistently into EVERY mode's
+            # build_effective_profile_binding call, matching full/delta below
+            # and the MCP wrapper's own sibling profile_binding computation
+            # (previously starter/compact silently resolved the binding with
+            # no session_id at all — see that function's own comment).
+            session_id=session_id,
         )
         return (
             _st_path,
@@ -10768,6 +10909,10 @@ async def generate_handoff(
             selected_scope=_selected_scope,
             emit_manifest=emit_manifest,
             proposal_scope=proposal_scope,
+            # 4f3bd70c — same session_id threading fix as the starter/compact
+            # branch above; goal-only previously had no session_id parameter
+            # at all (see that function's own signature/comment).
+            session_id=session_id,
             # MDE-5 -- goal mode previously never saw research_evidence_
             # envelope at all (it returns before the full/delta-only
             # _render_research_evidence_block append further below in this
@@ -12042,6 +12187,7 @@ async def _generate_starter_handoff(
     strict_pointer_evidence: bool = False,
     selected_scope: "dict[str, Any] | None" = None,
     proposal_scope: "dict[str, Any] | None" = None,
+    session_id: str | None = None,
 ) -> tuple[str, str]:
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
@@ -12189,11 +12335,17 @@ async def _generate_starter_handoff(
     # the exclusion filters below run.
     _s_selected_scope_outcome: dict[str, Any] = {}
     # 89a06e40 — resolved ONCE per starter/compact render, threaded into
-    # quick_start_goal's inline <profile_generation> tag below. No session_id
-    # in scope for this mode (see this function's own signature) — resolves
-    # the project/workspace/hosted_default layers only. Best-effort: None on
-    # any failure, per build_effective_profile_binding's own docstring.
-    _s_profile_binding = await build_effective_profile_binding(db, project_id)
+    # quick_start_goal's inline <profile_generation> tag below. 4f3bd70c —
+    # now passes session_id (this function's own new parameter) so
+    # starter/compact resolves the SAME session-scoped layer full/delta and
+    # the MCP wrapper's sibling profile_binding already did; a caller with no
+    # session_id (the default) sees identical behavior to before this fix —
+    # build_effective_profile_binding treats a missing session_id exactly
+    # like before. Best-effort: None on any failure, per
+    # build_effective_profile_binding's own docstring.
+    _s_profile_binding = await build_effective_profile_binding(
+        db, project_id, session_id=session_id,
+    )
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=_s_execution_mode,
@@ -12313,8 +12465,18 @@ async def _generate_goal_only_handoff(
     emit_manifest: bool = False,
     proposal_scope: "dict[str, Any] | None" = None,
     research_evidence_envelope: Any = None,
+    session_id: str | None = None,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
+
+    ``session_id`` (4f3bd70c) — optional, ``None`` by default (zero behaviour
+    change for a caller that omits it). Threaded into
+    :func:`build_effective_profile_binding` below so ``mode='goal'`` resolves
+    the SAME session-scoped profile layer full/delta and the MCP wrapper's
+    own sibling ``profile_binding`` computation already did — this mode
+    previously had no ``session_id`` parameter at all and always resolved
+    only the project/workspace/hosted_default layers, silently disagreeing
+    with a session-scoped override that WAS in effect elsewhere.
 
     ``strict_evidence``/``evidence_status`` (8a883f60) — threaded straight
     through from ``generate_handoff``; see its docstring.
@@ -12564,9 +12726,13 @@ async def _generate_goal_only_handoff(
     # is the ONE handoff mode that returns ONLY this rendered text (no
     # sibling `profile_binding` field for a caller to fall back on — see
     # generate_handoff's own docstring), so this tag is this mode's sole
-    # profile-identity signal. No session_id in scope for this mode (see
-    # this function's own signature). Best-effort: None on any failure.
-    _g_profile_binding = await build_effective_profile_binding(db, project_id)
+    # profile-identity signal. 4f3bd70c — now passes session_id (this
+    # function's own new parameter), matching full/delta/starter/compact so
+    # goal mode never disagrees with a session-scoped profile override that
+    # IS in effect. Best-effort: None on any failure.
+    _g_profile_binding = await build_effective_profile_binding(
+        db, project_id, session_id=session_id,
+    )
     # 7479e427 — always built locally so the <proposal_scope> tag can render
     # below regardless of whether the caller opted into the proposal_scope
     # out-param (mirrored into it afterward when given).

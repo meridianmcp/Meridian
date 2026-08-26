@@ -289,6 +289,22 @@ integrity-first: it never cuts through or before the end of an embedded
 appends an explicit machine-readable marker naming how many bytes were omitted
 — never a silent drop.
 
+4f3bd70c — the cut point is additionally snapped to a **structural** boundary
+(`_structural_tag_spans`/`_snap_to_safe_boundary`): it can never land strictly
+inside a top-level `<tag>...</tag>` span (`<tool_requirements>`,
+`<sprint_item_pointers>`, `<artifact_pointer_findings>`, `<selected_item_scope>`,
+`<continuation_manifest>`, `<handoff_manifest>`, `<proposal_scope>`,
+`<executor_item_ids>`, ...). A tag that would only partially survive a raw byte
+cut is dropped in its entirety instead — never sliced — so the surviving
+content is always syntactically complete for whatever it does include. This
+generalizes the pre-existing goal-token-banner protection (one specific tag)
+to every structural tag the renderer emits, uniformly, for every mode that
+funnels through `format_handoff_mcp_content` (full, delta, starter/compact,
+goal, checkpoint, continue). The appended marker also carries a compact
+`machine_readable={...}` JSON object — `content_truncated`, `omitted_bytes`,
+`total_bytes`, `limit_bytes`, `sections_omitted`, `reason` — so a receiver can
+parse the omission instead of scraping prose.
+
 MDE-10 goes one step further for **executable** `/goal` payloads specifically:
 a token's body-hash covers the complete `/goal` body, so any truncation of that
 body — even truncation that respects the banner floor above — would hand a
