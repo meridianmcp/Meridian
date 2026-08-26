@@ -189,6 +189,11 @@ async def generate_handoff_endpoint(
     _raw_sel = body.get("selected_item_ids")
     if isinstance(_raw_sel, list):
         _selected_item_ids = [str(x) for x in _raw_sel if x]
+    # d2fc7465 — mirror handler.py's out-param: closure ids/hash plus, once
+    # generation finishes, which requested ids survived every downstream
+    # claimability filter and why. See handoff.generate_handoff's
+    # selected_scope_outcome docstring.
+    _selected_scope_outcome: dict[str, Any] = {}
     _strict_evidence = bool(body.get("strict_evidence"))
     _strict_pointer_evidence = bool(body.get("strict_pointer_evidence"))
     # 3cab355a — mirror handler.py's out-param: one entry per requested
@@ -215,6 +220,7 @@ async def generate_handoff_endpoint(
                 version=_version if isinstance(_version, str) else None,
                 force_include_ids=_force_include_ids,
                 selected_item_ids=_selected_item_ids,
+                selected_scope_outcome=_selected_scope_outcome,
                 strict_evidence=_strict_evidence,
                 strict_pointer_evidence=_strict_pointer_evidence,
                 force_include_rejected=_force_include_rejected,
@@ -331,12 +337,26 @@ async def generate_handoff_endpoint(
         # MCP transports; see format_handoff_mcp_content's docstring.
         "path": path, "content": handoff_module.format_handoff_mcp_content(content),
         "mode": mode,
+        # d2fc7465 — same explicit persistence contract the MCP transport
+        # returns; see handoff_module.handoff_mode_is_retrievable's docstring.
+        # `_board_stale` also guards this: on the 90s-timeout emergency L0
+        # fallback above, `mode` is (pre-existingly, unlike the MCP transport's
+        # honest 'l0_fallback' relabel) left as the ORIGINALLY requested mode
+        # (often 'full'), which would otherwise make this field claim
+        # retrievability for a render that never actually reached
+        # _persist_handoff_history_and_pending_goal.
+        "retrievable_via_load_handoff": (
+            not _board_stale and handoff_module.handoff_mode_is_retrievable(mode)
+        ),
         "capability_contract": capability_contract,
         "profile_binding": profile_binding,
         "proposal_evidence": proposal_evidence,
         "docx_integrity": docx_integrity,
         "force_include_rejected": _force_include_rejected,
         "continuation_status": _continuation_status,
+        # d2fc7465 — same structured selected-scope signal the MCP transport
+        # returns; see handler.py's own "selected_scope" field comment.
+        "selected_scope": _selected_scope_outcome or None,
     }
 
 

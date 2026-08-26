@@ -158,6 +158,43 @@ async def _persist_handoff_history_and_pending_goal(
     return amended
 
 
+# d2fc7465 (PERSISTENCE READINESS) — the set of modes that call
+# _persist_handoff_history_and_pending_goal above, i.e. that write to the
+# `handoffs` history table AND the trusted `pending_goal` channel
+# start_session/load_handoff read from. This is the single source of truth
+# both call sites below (generate_handoff's mode branches) and every MCP/
+# HTTP/stdio transport's response use — never hand-maintain a second copy of
+# this set, or the two are guaranteed to drift the exact way the underlying
+# 2026-08-25 incident did (a mode silently not wired into persistence with no
+# way for a caller to tell short of noticing a stale load_handoff read).
+#
+# 'planner'/'starter'/'compact' are deliberately excluded: they are call-and-
+# forget renders meant to be pasted directly into a fresh chat/terminal, not
+# the canonical stored handoff a later load_handoff() should return — see the
+# "Persistence and retrievability" section of
+# docs/meridian-handoff-mode-contract-2026-08-26.md for the full contract
+# this makes explicit and machine-readable (rather than something a caller
+# had to infer from source or from an unexpectedly-stale load_handoff read).
+# 'l0_fallback' (the emergency timeout degrade) is excluded for the same
+# reason it is not in _VALID_HANDOFF_MODES: it is a synthetic mode value,
+# never something a caller requests.
+_RETRIEVABLE_HANDOFF_MODES = frozenset({"full", "delta", "goal"})
+
+
+def handoff_mode_is_retrievable(mode: "str | None") -> bool:
+    """d2fc7465 — True when a ``generate_handoff(mode=mode)`` call of this
+    mode persists to the `handoffs` history table and the trusted
+    ``pending_goal`` channel (so a following ``load_handoff()`` call will
+    return exactly this render), False otherwise.
+
+    Every MCP/HTTP/stdio transport calls this ONCE, right after
+    ``generate_handoff`` returns, to populate a ``retrievable_via_load_handoff``
+    response field — see ``_RETRIEVABLE_HANDOFF_MODES``'s own docstring for
+    why this must be the one place that set is spelled out.
+    """
+    return mode in _RETRIEVABLE_HANDOFF_MODES
+
+
 def _mark_session_handoff_produced(session_id: "str | None") -> None:
     """aec043cb — record that ``session_id`` just received a handoff, so a
     LATER omitted-mode call from the SAME session correctly auto-switches to
@@ -3705,7 +3742,14 @@ def _build_quick_start_goal(
             if rid not in _final_ids_set
         ]
         if selected_scope_outcome is not None:
-            selected_scope_outcome.clear()
+            # d2fc7465 — no longer .clear()s first: generate_handoff now
+            # pre-seeds this SAME dict with selected_item_ids/closure_item_ids/
+            # closure_hash the moment _resolve_selected_item_scope resolves
+            # (before any mode branch runs) — see that seeding's own comment.
+            # A plain .update() layers the exclusion-outcome keys on top
+            # without erasing them; there is no other legitimate producer of
+            # this dict that a .clear() here would need to guard against
+            # (each generate_handoff call reaches this code path at most once).
             selected_scope_outcome.update({
                 "requested_ids": _requested_scope_ids,
                 "executable_ids": _executable_requested_ids,
@@ -10599,6 +10643,7 @@ async def generate_handoff(
     strict_continuation: bool = False,
     continuation_status: dict[str, Any] | None = None,
     selected_item_ids: list[str] | None = None,
+    selected_scope_outcome: "dict[str, Any] | None" = None,
     promotion_readiness: dict[str, Any] | None = None,
     strict_test_evidence: bool = False,
     test_run_evidence: dict[str, Any] | None = None,
@@ -10919,6 +10964,32 @@ async def generate_handoff(
     (it returns before this resolution runs, same as the pre-existing
     ``version``/``HandoffStaleReferenceError`` handling below).
 
+    ``selected_scope_outcome`` (d2fc7465) — optional output dict, same
+    purely-additive out-param shape as ``evidence_status``/
+    ``force_include_rejected`` above: when given (any dict, typically
+    ``{}``) AND ``selected_item_ids`` is also given, populated in place with
+    ``{"selected_item_ids", "closure_item_ids", "closure_hash",
+    "requested_ids", "executable_ids", "excluded_requested",
+    "all_excluded"}``. The first three are copied straight from
+    :func:`_resolve_selected_item_scope`'s own return the moment it resolves
+    — the exact same ids/hash already rendered into the body's
+    ``<selected_item_scope>`` tag, now ALSO available as a structured field
+    for a caller that would rather not parse XML out of ``content``. The
+    remaining four are populated by whichever executable mode actually runs
+    (see ``_build_quick_start_goal``'s own ``selected_scope_outcome``
+    docstring) and report which of the requested ids survived every
+    downstream claimability filter (unprospected/backburner/manual/wave-gate)
+    — this is the "omitted ids, with reasons" signal that was previously
+    surfaced ONLY on total failure (:class:`HandoffScopeNonExecutable`,
+    ``all_excluded=True``); a call that succeeds with a PARTIAL exclusion
+    (some, not all, requested ids dropped) used to leave a caller with no
+    way to learn that short of diffing the rendered ``<sprint_items>`` list
+    by hand. A caller that passes ``None`` (the default — every pre-existing
+    call site) sees ZERO functional change to the returned ``(path, content,
+    amended)`` or to ``content`` itself; a caller that never passes
+    ``selected_item_ids`` sees this dict stay empty (or whatever it already
+    contained) regardless.
+
     ``promotion_readiness`` (24f5146d) — optional output dict, SAME purely-
     additive out-param shape as ``evidence_status``/``continuation_status``
     above: when given (any dict, typically ``{}``), it is populated in place
@@ -11029,12 +11100,29 @@ async def generate_handoff(
     _selected_scope = await _resolve_selected_item_scope(
         db, project_id, selected_item_ids, effective_version=_effective_version,
     )
+    # d2fc7465 — seed the CALLER's own selected_scope_outcome dict (when
+    # given) with the ids/hash _resolve_selected_item_scope just computed, so
+    # they are visible to a caller even for a mode that never reaches the
+    # exclusion-filter step below (or fails before it) — the same dict object
+    # is reused (not copied) so every further write below (by whichever mode
+    # branch actually runs) lands on the SAME dict the caller is holding.
+    if selected_scope_outcome is not None and _selected_scope:
+        selected_scope_outcome.update({
+            "selected_item_ids": _selected_scope.get("selected_item_ids"),
+            "closure_item_ids": _selected_scope.get("closure_item_ids"),
+            "closure_hash": _selected_scope.get("closure_hash"),
+        })
     # fb82e51f — out-param for _build_quick_start_goal's full/delta call below
     # (the starter/goal-only modes compute their own inside their respective
     # helper functions, which already receive _selected_scope as an
     # argument). See HandoffScopeNonExecutable's docstring for the check this
-    # feeds.
-    _selected_scope_outcome: dict[str, Any] = {}
+    # feeds. d2fc7465 — seeded from the caller's own out-param (when given)
+    # rather than always starting fresh, so the closure fields just written
+    # above and the exclusion fields _build_quick_start_goal writes below
+    # land in the SAME dict.
+    _selected_scope_outcome: dict[str, Any] = (
+        selected_scope_outcome if selected_scope_outcome is not None else {}
+    )
     # 2204ce80 — optional, additive "related planning records" lookup. Runs
     # only when the caller opted in on BOTH arguments; see the docstring above.
     if related_records_query is not None and related_records is not None:
@@ -11064,6 +11152,7 @@ async def generate_handoff(
             evidence_status=evidence_status,
             strict_pointer_evidence=strict_pointer_evidence,
             selected_scope=_selected_scope,
+            selected_scope_outcome=_selected_scope_outcome,
             proposal_scope=proposal_scope,
             # 4f3bd70c — session_id now threaded consistently into EVERY mode's
             # build_effective_profile_binding call, matching full/delta below
@@ -11095,6 +11184,7 @@ async def generate_handoff(
             strict_pointer_evidence=strict_pointer_evidence,
             force_include_rejected=force_include_rejected,
             selected_scope=_selected_scope,
+            selected_scope_outcome=_selected_scope_outcome,
             emit_manifest=emit_manifest,
             proposal_scope=proposal_scope,
             # 4f3bd70c — same session_id threading fix as the starter/compact
@@ -12374,6 +12464,7 @@ async def _generate_starter_handoff(
     evidence_status: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
     selected_scope: "dict[str, Any] | None" = None,
+    selected_scope_outcome: "dict[str, Any] | None" = None,
     proposal_scope: "dict[str, Any] | None" = None,
     session_id: str | None = None,
 ) -> tuple[str, str]:
@@ -12520,8 +12611,12 @@ async def _generate_starter_handoff(
     )
     # fb82e51f — see HandoffScopeNonExecutable's docstring: a selected_scope
     # that validated cleanly can still collapse to zero executable items once
-    # the exclusion filters below run.
-    _s_selected_scope_outcome: dict[str, Any] = {}
+    # the exclusion filters below run. d2fc7465 — seeded from the caller's
+    # own out-param (when given) rather than always starting fresh, so the
+    # closure fields generate_handoff already wrote land in the SAME dict.
+    _s_selected_scope_outcome: dict[str, Any] = (
+        selected_scope_outcome if selected_scope_outcome is not None else {}
+    )
     # 89a06e40 — resolved ONCE per starter/compact render, threaded into
     # quick_start_goal's inline <profile_generation> tag below. 4f3bd70c —
     # now passes session_id (this function's own new parameter) so
@@ -12650,6 +12745,7 @@ async def _generate_goal_only_handoff(
     strict_pointer_evidence: bool = False,
     force_include_rejected: "list[dict[str, Any]] | None" = None,
     selected_scope: "dict[str, Any] | None" = None,
+    selected_scope_outcome: "dict[str, Any] | None" = None,
     emit_manifest: bool = False,
     proposal_scope: "dict[str, Any] | None" = None,
     research_evidence_envelope: Any = None,
@@ -12907,8 +13003,12 @@ async def _generate_goal_only_handoff(
     _g_execution_mode = db_module.normalize_execution_mode(project.get("execution_mode"))
     # fb82e51f — see HandoffScopeNonExecutable's docstring: a selected_scope
     # that validated cleanly can still collapse to zero executable items once
-    # the exclusion filters below run.
-    _g_selected_scope_outcome: dict[str, Any] = {}
+    # the exclusion filters below run. d2fc7465 — seeded from the caller's
+    # own out-param (when given) rather than always starting fresh, so the
+    # closure fields generate_handoff already wrote land in the SAME dict.
+    _g_selected_scope_outcome: dict[str, Any] = (
+        selected_scope_outcome if selected_scope_outcome is not None else {}
+    )
     # 89a06e40 — resolved ONCE per goal-only render, threaded into
     # quick_start_goal's inline <profile_generation> tag below. mode="goal"
     # is the ONE handoff mode that returns ONLY this rendered text (no

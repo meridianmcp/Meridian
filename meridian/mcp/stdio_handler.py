@@ -2383,6 +2383,10 @@ def build_mcp_server():
                 _raw_stdio_sel = arguments.get("selected_item_ids")
                 if isinstance(_raw_stdio_sel, list):
                     _stdio_selected_item_ids = [str(x) for x in _raw_stdio_sel if x]
+                # d2fc7465 — mirror handler.py's out-param: closure ids/hash
+                # plus, once generation finishes, which requested ids
+                # survived every downstream claimability filter and why.
+                _stdio_selected_scope_outcome: dict[str, Any] = {}
                 _stdio_strict_evidence = bool(arguments.get("strict_evidence"))
                 _stdio_strict_pointer_evidence = bool(
                     arguments.get("strict_pointer_evidence")
@@ -2401,6 +2405,7 @@ def build_mcp_server():
                 _handoff_stale_reference_blocked = False
                 _handoff_selection_blocked = False
                 _handoff_scope_non_executable_blocked = False
+                _stdio_board_stale = False
                 try:
                     path, content, _ = await asyncio.wait_for(
                         handoff_module.generate_handoff(
@@ -2412,6 +2417,7 @@ def build_mcp_server():
                             version=_stdio_version,
                             force_include_ids=_stdio_force_include_ids,
                             selected_item_ids=_stdio_selected_item_ids,
+                            selected_scope_outcome=_stdio_selected_scope_outcome,
                             strict_evidence=_stdio_strict_evidence,
                             strict_pointer_evidence=_stdio_strict_pointer_evidence,
                             force_include_rejected=_stdio_force_include_rejected,
@@ -2426,6 +2432,11 @@ def build_mcp_server():
                         db, arguments["project_id"], state["data_dir"]
                     )
                     mode = "full"
+                    # d2fc7465 — the emergency L0 fallback never reaches
+                    # _persist_handoff_history_and_pending_goal, so
+                    # retrievable_via_load_handoff below must not claim
+                    # otherwise just because `mode` is left as "full".
+                    _stdio_board_stale = True
                 except handoff_module.HandoffEvidenceRequired as exc:
                     # 8a883f60 — mirror handler.py's structured refusal: nothing
                     # was rendered/persisted, so surface that instead of falling
@@ -2516,6 +2527,18 @@ def build_mcp_server():
                         # the 90s timeout fired before validation ran.
                         "force_include_rejected": _stdio_force_include_rejected,
                         "continuation_status": _stdio_continuation_status,
+                        # d2fc7465 — same structured selected-scope signal the
+                        # HTTP MCP dispatch/REST route return.
+                        "selected_scope": _stdio_selected_scope_outcome or None,
+                        # d2fc7465 — same explicit persistence contract the
+                        # other two transports return; see
+                        # handoff_module.handoff_mode_is_retrievable's
+                        # docstring. Guarded by _stdio_board_stale for the
+                        # same reason the REST route's own field is.
+                        "retrievable_via_load_handoff": (
+                            not _stdio_board_stale
+                            and handoff_module.handoff_mode_is_retrievable(mode)
+                        ),
                     }
             elif name == "get_context_block":
                 # v2.3 — reuse the dispatch impl so HTTP and stdio share one path.

@@ -3164,6 +3164,16 @@ async def _handle_task_tools(
         _raw_sel = args.get("selected_item_ids")
         if isinstance(_raw_sel, list):
             _selected_item_ids = [str(x) for x in _raw_sel if x]
+        # d2fc7465 — out-param populated by generate_handoff with the
+        # resolved closure ids/hash PLUS, once the mode branch that actually
+        # ran has finished, which of the requested ids survived every
+        # downstream claimability filter and why. Always passed (same
+        # ALWAYS-passed pattern as evidence_status below) so a caller gets
+        # this even when the call succeeds with only a PARTIAL exclusion —
+        # previously that signal was surfaced ONLY on total failure
+        # (HANDOFF_SCOPE_NON_EXECUTABLE below). Stays {} when
+        # selected_item_ids was never passed.
+        _selected_scope_outcome: dict[str, Any] = {}
         _handoff_degraded = False
         # 8a883f60 — opt-in, fail-closed strict evidence for this handoff's
         # best-effort steps (mirrors complete_sprint_item's strict_evidence
@@ -3211,6 +3221,7 @@ async def _handle_task_tools(
                     identity=_resolve_caller_identity(tenant),
                     force_include_ids=_force_include_ids,
                     selected_item_ids=_selected_item_ids,
+                    selected_scope_outcome=_selected_scope_outcome,
                     skip_ai_summary=_skip_ai,
                     version=_requested_version,
                     strict_evidence=_strict_evidence,
@@ -3449,6 +3460,16 @@ async def _handle_task_tools(
             "file_path": path,
             "content": _plain_content,
             "mode": mode,
+            # d2fc7465 — explicit, machine-readable persistence contract: True
+            # only for the modes that write to the `handoffs` history table
+            # AND the trusted pending_goal channel (see
+            # handoff_module_local.handoff_mode_is_retrievable's own
+            # docstring for the single source of truth this reads). A caller
+            # that requests mode='starter'/'compact'/'planner' — or gets the
+            # emergency 'l0_fallback' degrade — sees False here instead of
+            # having to infer non-persistence from a later stale-looking
+            # load_handoff() read.
+            "retrievable_via_load_handoff": handoff_module_local.handoff_mode_is_retrievable(mode),
             # 65c8b426 — Part 1: degraded=True when the full handoff timed out and
             # the emergency L0 fallback was used instead. Callers should surface
             # this visibly rather than treating it as a normal full handoff.
@@ -3474,6 +3495,21 @@ async def _handle_task_tools(
             # Pure ADDITION — [] when force_include_ids was empty/absent, or
             # when the 180s timeout fired before validation ran.
             "force_include_rejected": _force_include_rejected,
+            # d2fc7465 — {} when selected_item_ids was never passed for this
+            # call (mirrors selected_scope_ids' own None-when-unused
+            # convention elsewhere in this module); otherwise
+            # {selected_item_ids, closure_item_ids, closure_hash,
+            # requested_ids, executable_ids, excluded_requested,
+            # all_excluded} — see handoff.generate_handoff's
+            # selected_scope_outcome docstring for exactly what each key
+            # means and when it's populated. This is the structured,
+            # parse-free counterpart to the <selected_item_scope> tag
+            # already embedded in `content`, and the ONLY place a caller can
+            # learn about a PARTIAL exclusion (some, not all, requested ids
+            # dropped) — a total exclusion instead raises
+            # HANDOFF_SCOPE_NON_EXECUTABLE below, before this return is ever
+            # reached.
+            "selected_scope": _selected_scope_outcome or None,
             # 8a883f60 — echoes the strict_evidence flag this call actually
             # used, so a caller never has to re-derive it from args.
             "strict_evidence": _strict_evidence,
