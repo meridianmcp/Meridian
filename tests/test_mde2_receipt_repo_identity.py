@@ -60,6 +60,13 @@ class TestContaminationDetection:
         assert a == b
         assert a is not None
 
+    def test_normalize_repo_root_preserves_windows_drive_root(self):
+        # A bare drive root ("C:\\") must not be trimmed down to "C:",
+        # which pathlib treats as a relative path on the same drive
+        # rather than the drive's filesystem root.
+        result = _cir.normalize_repo_root("C:\\")
+        assert result is not None
+
     def test_normalize_repo_root_none_for_empty(self):
         assert _cir.normalize_repo_root("") is None
         assert _cir.normalize_repo_root(None) is None

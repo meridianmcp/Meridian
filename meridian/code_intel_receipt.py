@@ -216,7 +216,22 @@ def normalize_repo_root(path: "str | None") -> "str | None":
     if not path:
         return None
     try:
-        resolved = str(Path(str(path)).expanduser().resolve())
+        raw_path = str(path)
+        if raw_path.endswith("\\"):
+            trimmed_path = raw_path.rstrip("\\")
+            # A trailing backslash is a real path separator on Windows
+            # (already handled correctly there) but pathlib treats it as a
+            # literal character on POSIX hosts, so two calls that differ
+            # only by a trailing "\\" would otherwise resolve to two
+            # different strings on Linux/macOS. Strip it before resolving,
+            # except when trimming would collapse a bare Windows drive
+            # root ("C:\\" -> "C:") into something that no longer parses
+            # as an absolute path.
+            if trimmed_path and not (
+                len(trimmed_path) == 2 and trimmed_path[1] == ":"
+            ):
+                raw_path = trimmed_path
+        resolved = str(Path(raw_path).expanduser().resolve())
         return resolved or None
     except Exception:  # noqa: BLE001
         text = str(path).strip()
