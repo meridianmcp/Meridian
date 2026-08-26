@@ -4416,6 +4416,429 @@ async def check_docs_write_conflict(
         return None
 
 
+# ---------------------------------------------------------------------------
+# MDE-3 rework — drive the docx_merge release-transaction state machine
+# around the PRIMARY docs-slot write tools.
+#
+# meridian.db.docx_merge's PREPARED -> STAGED -> PROMOTED -> VERIFIED ->
+# DB_COMMITTED -> RELEASED state machine (plus RECOVERY_REQUIRED/ABORTED) was,
+# before this rework, only ever driven by isolated unit tests of the
+# transition guard — no production write path ever called
+# open_release_transaction/advance_release_state around a real DOCX write, so
+# "a failed gate leaves the canonical DOCX byte-identical" was true of the
+# state machine's OWN internal validation logic but not actually ENFORCED
+# over any real write.
+#
+# extensions/meridian-docs (docs_intel.py / server.py) is deliberately
+# meridian-core-free (see docs_intel.py's own "no hard dependency" comment
+# above find_orphaned_docx_staged_files) — it cannot import
+# meridian.db.docx_merge itself. The correct integration seam, per that same
+# comment ("a caller that HAS a meridian-core DB handle drives that state
+# machine around calls into this package's write functions"), is THIS
+# module: call_tunnel_tool is the one place a meridian-core DB handle and a
+# tunnel-forwarded docs-slot write both meet. move_section/copy_section/
+# relocate_table are the PRIMARY write tools named in the MDE-3 acceptance
+# gap; each already computes (and, since this rework, RETURNS) a real
+# ``promoted_sha256`` for the exact bytes it wrote — see docs_intel.py's
+# ``_save_docx_xml_stdlib``/``_atomic_write_docx_bytes`` — giving this module
+# genuine post-write evidence to drive the state machine with, rather than
+# inventing a fake one.
+#
+# THIRD-PASS fix (54619681) — a wave-coordinated DRAFT-mode call to one of
+# those three tools (``draft_output_path`` + ``wave_run_id`` both supplied,
+# see docs_intel._resolve_draft_dest) never touches ``docx_path`` at all: the
+# real write lands on the isolated draft file, and ``docx_path`` (the
+# canonical file) is provably untouched. Opening/advancing a transaction
+# keyed on ``docx_path`` for that call — as this module did before this fix —
+# produced a transaction that reached the terminal RELEASED state claiming
+# the CANONICAL file was released with content it never actually held
+# (``post_hash`` from the tool's own ``promoted_sha256`` reflects the DRAFT
+# file's bytes, not ``docx_path``'s). Because RELEASED is terminal,
+# ``resolve_release_recovery`` would never revisit that misleading row.
+#
+# Fix: ``_open_docs_release_transaction`` now declines to open ANY
+# transaction for a draft-mode call (see the ``draft_output_path`` check
+# below) — a draft write is not a release of anything, so there is nothing
+# honest to open a release transaction FOR. The REAL canonical-mutating
+# event in this workflow is ``merge_docx_draft`` (promotes an already-staged
+# draft into ``canonical_path`` — see docs_intel.merge_draft_into_canonical),
+# which is now itself a PRIMARY release tool below: its own transaction is
+# opened/advanced against ``canonical_path`` (the file it actually mutates),
+# using its own real ``promoted_sha256`` as ``post_hash`` — the same honest,
+# real-evidence pattern the original three tools already established.
+#
+# This was considered against the alternative of instead retargeting a
+# draft-mode transaction's tracked ``file_path`` to the draft artifact
+# itself (still opening *something*, just against the right identity).
+# Rejected: ``check_release_staleness``'s anchor half
+# (meridian.db.docx_merge.check_release_staleness) derives its
+# ``check_merge_stale_or_overlap`` lookup key from the release transaction's
+# OWN recorded ``file_path`` — and that manifest is keyed on the CANONICAL
+# path (see ``open_merge_manifest(db, wave_id, file_path=<canonical>, ...,
+# draft_path=...)``), never the draft path. Retargeting the transaction's
+# identity to the draft file would silently break that lookup (every
+# legitimately wave-coordinated draft write would look up a manifest under
+# a key that was never registered, and misreport ``no_manifest`` ->
+# ``blocked``) — a new, worse false-positive gap. Declining to open a
+# transaction for the draft write, and only ever recording one against the
+# canonical file at the point it is genuinely promoted, avoids that trap
+# entirely while still fully closing the "durable false RELEASED" bug.
+# ---------------------------------------------------------------------------
+
+#: Bare (unprefixed) docs-slot tool names this rework drives the release
+#: state machine around: the three structural mutators MDE-3's acceptance
+#: gap names explicitly ("at least the primary write path(s)"), PLUS
+#: ``merge_docx_draft`` (added in the THIRD-PASS fix above) — the tool that
+#: performs the REAL canonical-file promotion for any wave-coordinated draft
+#: produced by the other three. Deliberately not the full _DOCS_WRITE_TOOLS
+#: map, which would multiply the surface area (and test burden) of an
+#: already-hardened relay path well past what the gap asks for.
+_PRIMARY_DOCX_RELEASE_TOOLS = frozenset({
+    "move_section", "copy_section", "relocate_table", "merge_docx_draft",
+})
+
+
+def _local_file_sha256(path: "str | None") -> "str | None":
+    """Best-effort sha256 of a file THIS process can read locally. ``None``
+    (never raises) when the path is missing, unreadable, or lives only on a
+    remote tunnel host this process has no filesystem access to — the release
+    transaction tolerates a missing ``base_hash`` the same way it already
+    tolerates a missing ``resolved_file``/``source_hash`` elsewhere."""
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _open_docs_release_transaction(
+    db: Any,
+    name: str,
+    arguments: "dict | None",
+    *,
+    session_id: "str | None",
+    tenant_id: "str | None",
+) -> "dict[str, Any] | None":
+    """Open (or resume) a docx_merge release transaction for a PRIMARY
+    docs-slot write tool (see :data:`_PRIMARY_DOCX_RELEASE_TOOLS`) BEFORE it
+    is relayed over the tunnel.
+
+    Returns a small context dict (``transaction_id``, ``docx_path``,
+    ``project_id``, ``tenant_id``) to pass to
+    :func:`_finish_docs_release_transaction`, or ``None`` when this call
+    isn't a primary write tool, ``db`` is unavailable, the target path can't
+    be identified, this is a wave-coordinated DRAFT-mode call (see below),
+    or the open itself fails — all fail-OPEN (the relay proceeds ungated)
+    so a wiring problem here can never block a write the concurrency guard
+    above already cleared. Mirrors :func:`check_docs_write_conflict`'s own
+    fail-open posture.
+
+    THIRD-PASS fix (54619681) — draft mode: when ``arguments`` carries a
+    non-empty ``draft_output_path`` (move_section/copy_section/
+    relocate_table's opt-in wave-scoped draft mode; see
+    docs_intel._resolve_draft_dest), the REAL write destination is that
+    isolated draft file, never ``docx_path`` — docs_intel guarantees
+    ``draft_output_path`` differs from ``docx_path`` and that ``docx_path``
+    is only ever read in that mode. Opening a transaction keyed on
+    ``docx_path`` here would durably record a RELEASED transaction claiming
+    the canonical file was released with content it never held (the
+    tool's own ``promoted_sha256`` reflects the DRAFT file's bytes) — a
+    misleading, terminal, never-revisited row. So: no transaction is opened
+    for a draft-mode call at all. The real promotion this draft eventually
+    feeds — ``merge_docx_draft`` writing the draft's bytes into
+    ``canonical_path`` — is itself a primary release tool (see
+    :data:`_PRIMARY_DOCX_RELEASE_TOOLS`) and opens/advances its OWN
+    transaction against the file it actually mutates.
+    """
+    if db is None:
+        return None
+    bare = name.split("__", 1)[1] if "__" in name else name
+    if bare not in _PRIMARY_DOCX_RELEASE_TOOLS:
+        return None
+    if isinstance(arguments, dict):
+        draft_dest = arguments.get("draft_output_path")
+        if isinstance(draft_dest, str) and draft_dest.strip():
+            return None
+    target = _docs_write_target(bare, arguments)
+    if not target:
+        return None
+    docx_path, element_id = target
+    # MDE-3 rework (b) — fe989980's wave_run_id is the SAME wave concept
+    # docx_merge's wave-merge manifest layer (open_merge_manifest et al.)
+    # uses; when a caller supplies one alongside a section_id anchor, this
+    # write is happening inside an active wave-merge context, and
+    # check_release_staleness's anchor-staleness half becomes checkable at
+    # finish time — see _finish_docs_release_transaction.
+    wave_id = (arguments or {}).get("wave_run_id") if isinstance(arguments, dict) else None
+    wave_id = wave_id.strip() if isinstance(wave_id, str) and wave_id.strip() else None
+    try:
+        from ..code_intel_receipt import resolve_receipt_project_id as _resolve_pid
+        project_id = _resolve_pid(arguments)
+    except Exception:  # noqa: BLE001
+        project_id = None
+    try:
+        from ..db import docx_merge as _docx_merge  # noqa: PLC0415
+        base_hash = _local_file_sha256(docx_path)
+        change_set_id = f"tunnel:{bare}:{docx_path}"
+        txn = await _docx_merge.open_release_transaction(
+            db, change_set_id, docx_path,
+            session_id=session_id, base_hash=base_hash,
+            project_id=project_id, tenant_id=tenant_id,
+        )
+        if not isinstance(txn, dict) or not txn.get("opened") or not txn.get("transaction_id"):
+            return None
+        return {
+            "transaction_id": txn["transaction_id"], "docx_path": docx_path,
+            "project_id": project_id, "tenant_id": tenant_id,
+            "wave_id": wave_id, "element_id": element_id,
+        }
+    except Exception as exc:  # noqa: BLE001 — must never block the relay
+        _log.debug("docs release-transaction open failed for %s: %s", docx_path, exc)
+        return None
+
+
+async def _finish_docs_release_transaction(
+    ctx: "dict[str, Any] | None",
+    db: Any,
+    *,
+    session_id: "str | None",
+    tool_payload: "dict[str, Any] | None" = None,
+    relay_exception: "BaseException | None" = None,
+) -> None:
+    """Advance (or abort) the release transaction :func:`_open_docs_release_
+    transaction` opened, using whatever the tool call actually reported.
+
+    * ``relay_exception`` set (the tunnel RPC itself raised — a protocol/
+      network-level failure BEFORE any tool-level result was ever produced)
+      or ``tool_payload`` carrying an ``"error"`` key (the write tool ran
+      and reported failure — move_section/copy_section/relocate_table's own
+      docstrings guarantee the canonical file is untouched, or restored, on
+      that path) both advance the transaction to ``ABORTED``: the write did
+      not durably land, so the state machine should say so instead of
+      staying open forever.
+    * Otherwise (a normal, non-error tool result) advances through
+      STAGED -> PROMOTED -> VERIFIED -> DB_COMMITTED -> RELEASED, using the
+      tool's own ``promoted_sha256`` (when present) as ``post_hash`` on
+      every step — real evidence of what was actually written, not a
+      fabricated value.
+
+    Best-effort and fully guarded: a bookkeeping failure here must NEVER
+    surface as a failure of a write that already happened (or, for an
+    aborted write, already correctly did not happen) — mirrors every other
+    receipt/audit seam in this codebase (record_prospect_receipt et al.).
+    """
+    if not ctx or not ctx.get("transaction_id"):
+        return
+    transaction_id = ctx["transaction_id"]
+    project_id = ctx.get("project_id")
+    tenant_id = ctx.get("tenant_id")
+    try:
+        from ..db import docx_merge as _docx_merge  # noqa: PLC0415
+        error_msg: "str | None" = None
+        if relay_exception is not None:
+            error_msg = f"{type(relay_exception).__name__}: {relay_exception}"
+        elif isinstance(tool_payload, dict) and tool_payload.get("error"):
+            error_msg = str(tool_payload["error"])
+        if error_msg is not None:
+            await _docx_merge.advance_release_state(
+                db, transaction_id, _docx_merge.RELEASE_STATE_ABORTED,
+                session_id=session_id, project_id=project_id, tenant_id=tenant_id,
+                error=error_msg[:500],
+            )
+            return
+        post_hash = (
+            tool_payload.get("promoted_sha256") if isinstance(tool_payload, dict) else None
+        )
+
+        # MDE-3 rework (b) — fail CLOSED on a real anchor/output-hash
+        # staleness signal instead of proceeding straight to RELEASED just
+        # because the write itself reported no error. Only checkable when
+        # the caller supplied a wave_id/element_id (see
+        # _open_docs_release_transaction) — silently skipped (never
+        # fabricated) otherwise, same "don't overclaim" posture as the rest
+        # of this write-guard surface.
+        #
+        # THIRD-PASS fix (54619681) — this block is now reachable ONLY for a
+        # transaction whose recorded ``file_path`` (``ctx["docx_path"]``,
+        # via the row ``check_release_staleness`` reads back via
+        # ``get_release_transaction``) is a file this call genuinely wrote:
+        # a wave-coordinated DRAFT-mode call never reaches here at all
+        # (``_open_docs_release_transaction`` returns ``None`` for it — see
+        # its own docstring), so a "blocked" verdict from this gate can no
+        # longer be recorded against a canonical file that was never
+        # touched. ``wave_id``/``element_id`` remain empty for every current
+        # caller of this path (including ``merge_docx_draft``, whose own
+        # tool signature has no wave/anchor argument — its promotion is
+        # gated upstream, by the caller's own
+        # ``check_merge_stale_or_overlap``/``claim_merge_owner`` calls over
+        # the separate Meridian MCP connection, per
+        # merge_draft_into_canonical's own docstring), so this specific
+        # anchor check does not currently fire for anyone — but it no
+        # longer has a broken-identity transaction to falsely fire against
+        # either, which was the actual bug.
+        wave_id = ctx.get("wave_id")
+        element_id = ctx.get("element_id")
+        if wave_id and element_id:
+            staleness = await _docx_merge.check_release_staleness(
+                db, transaction_id, wave_id=wave_id, element_id=element_id,
+                project_id=project_id, tenant_id=tenant_id,
+            )
+            if staleness.get("blocked"):
+                await _docx_merge.advance_release_state(
+                    db, transaction_id, _docx_merge.RELEASE_STATE_RECOVERY_REQUIRED,
+                    session_id=session_id, project_id=project_id, tenant_id=tenant_id,
+                    error=(
+                        "MDE-3 staleness gate blocked promotion: "
+                        + "; ".join(staleness.get("reasons") or [])
+                    )[:500],
+                )
+                return
+
+        for state in (
+            _docx_merge.RELEASE_STATE_STAGED,
+            _docx_merge.RELEASE_STATE_PROMOTED,
+            _docx_merge.RELEASE_STATE_VERIFIED,
+            _docx_merge.RELEASE_STATE_DB_COMMITTED,
+            _docx_merge.RELEASE_STATE_RELEASED,
+        ):
+            outcome = await _docx_merge.advance_release_state(
+                db, transaction_id, state,
+                session_id=session_id, project_id=project_id, tenant_id=tenant_id,
+                post_hash=post_hash,
+            )
+            if not outcome.get("advanced"):
+                # An illegal-transition refusal here means something about
+                # this transaction's state already diverged (e.g. a
+                # concurrent recovery ran) — stop advancing rather than
+                # keep calling into a transaction that's telling us no.
+                break
+    except Exception as exc:  # noqa: BLE001 — bookkeeping must never raise
+        _log.debug(
+            "docs release-transaction finish failed for txn %s: %s", transaction_id, exc,
+        )
+
+
+class RequiredClaimLookupFailed(RuntimeError):
+    """MDE-3 rework (d) — a REQUIRED claim/lease lookup could not be
+    performed before a primary docs-slot write's promotion. Distinct from
+    an ordinary conflict (another session genuinely holds a claim, which
+    ``check_docs_write_conflict`` already reports and blocks on) — this is
+    "the lookup itself failed" (DB error, exception inside the claims
+    layer), which must BLOCK promotion rather than silently degrade to
+    'no conflict found' the way the general-purpose, fail-open
+    ``check_docs_write_conflict`` guard does for the wider docs-tool
+    surface. A caller seeing this should treat it exactly like any other
+    write-blocking error — the write was never attempted.
+    """
+
+
+async def _required_claim_lookup_gate(
+    db: Any, name: str, arguments: "dict | None", *, session_id: "str | None",
+) -> None:
+    """MDE-3 rework (d) — before a PRIMARY docs-slot write is even attempted,
+    perform the SAME underlying claim lookup
+    (``meridian.db.locks.check_docx_region_write_conflict``)
+    :func:`check_docs_write_conflict` already performs — but where that
+    general-purpose guard is deliberately FAIL-OPEN on a lookup error (an
+    unidentifiable target or a DB hiccup degrades to "no conflict, proceed"
+    — the correct posture for its much wider tool surface), THIS gate is
+    deliberately FAIL-CLOSED for the specific primary write path: a required
+    claim/lease lookup that cannot be PERFORMED at all (raises) blocks the
+    write outright (:class:`RequiredClaimLookupFailed`) instead of silently
+    treating "couldn't check" as "checked and clear" — the confirmed gap
+    ("required claim lookup failure blocks promotion instead of silently
+    degrading").
+
+    A lookup that completes and finds NO conflict is a normal pass-through
+    (returns ``None``); a genuine conflict is left to
+    :func:`check_docs_write_conflict`'s own (already correct) raise — this
+    gate only changes behavior for the "lookup itself broke" case.
+
+    No-op (returns immediately) when ``db`` is unavailable or the tool
+    isn't a target/primary write — this gate adds a NEW failure mode, it
+    must never invent one for calls it has no business gating.
+    """
+    if db is None:
+        return
+    bare = name.split("__", 1)[1] if "__" in name else name
+    if bare not in _PRIMARY_DOCX_RELEASE_TOOLS:
+        return
+    target = _docs_write_target(bare, arguments)
+    if not target:
+        return
+    docx_path, element_id = target
+    try:
+        await db_module.check_docx_region_write_conflict(
+            db, session_id, docx_path, element_id,
+        )
+    except Exception as exc:  # noqa: BLE001 — the whole point: observe and BLOCK
+        raise RequiredClaimLookupFailed(
+            f"required claim/lease lookup failed for {docx_path!r} before "
+            f"promoting {bare!r} — refusing to proceed as if it were clear. "
+            f"Underlying error: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+async def call_tunnel_tool_with_release_tracking(
+    tenant_id: str,
+    name: str,
+    arguments: "dict | None",
+    *,
+    db: Any = None,
+    session_id: "str | None" = None,
+) -> "dict | None":
+    """Thin wrapper around :func:`call_tunnel_tool` that also drives the
+    docx_merge release-transaction state machine for the PRIMARY docs-slot
+    write tools (:data:`_PRIMARY_DOCX_RELEASE_TOOLS`).
+
+    Delegates to :func:`call_tunnel_tool` UNCHANGED for every other tool —
+    zero behavior difference for non-docs, non-primary-write, or ``db=None``
+    callers, matching the fail-open posture the rest of this write-guard
+    surface (``check_docs_write_conflict`` et al.) already uses. Re-raises
+    whatever :func:`call_tunnel_tool` raises, after recording the
+    transaction as ``ABORTED`` first — this wrapper never changes the
+    caller-visible outcome of the relay, only adds durable bookkeeping
+    around it.
+
+    MDE-3 rework (d) — for a primary write tool, ALSO runs
+    :func:`_required_claim_lookup_gate` first: a required claim/lease
+    lookup that cannot be performed blocks the write outright
+    (:class:`RequiredClaimLookupFailed`) rather than proceeding as if the
+    unchecked lookup had come back clear.
+
+    THIRD-PASS fix (54619681) — ``_open_docs_release_transaction`` declines
+    to open a transaction at all for a wave-coordinated DRAFT-mode call to
+    move_section/copy_section/relocate_table (returns ``None``, same as any
+    other non-tracked call), so this wrapper still delegates to
+    :func:`call_tunnel_tool` for those with zero bookkeeping — the draft
+    write itself is not a release. ``merge_docx_draft`` — the tool that
+    actually promotes a draft into ``canonical_path`` — is itself a primary
+    write tool, so its own real promotion IS tracked through this same
+    PREPARED -> ... -> RELEASED/ABORTED machinery.
+    """
+    await _required_claim_lookup_gate(db, name, arguments, session_id=session_id)
+    release_ctx = await _open_docs_release_transaction(
+        db, name, arguments, session_id=session_id, tenant_id=tenant_id,
+    )
+    if release_ctx is None:
+        return await call_tunnel_tool(tenant_id, name, arguments, db=db, session_id=session_id)
+    try:
+        result = await call_tunnel_tool(tenant_id, name, arguments, db=db, session_id=session_id)
+    except BaseException as exc:  # noqa: BLE001 — must observe, then re-raise unchanged
+        await _finish_docs_release_transaction(
+            release_ctx, db, session_id=session_id, relay_exception=exc,
+        )
+        raise
+    payload = _extract_graph_matches(result) if result is not None else None
+    await _finish_docs_release_transaction(
+        release_ctx, db, session_id=session_id,
+        tool_payload=payload if isinstance(payload, dict) else None,
+    )
+    return result
+
+
 # 7ef712a8 — code-intel graph tools identify a project by the *local repo-path
 # slug* (e.g. "C-Users-13144-Documents-Meridian-repository"), NOT the Meridian
 # planning-project name (e.g. "meridian-build"). A session naturally passes the

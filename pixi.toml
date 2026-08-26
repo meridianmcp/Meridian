@@ -155,8 +155,16 @@ google-api-python-client = ">=2.197.0, <3"
 google-auth-oauthlib = ">=1.4.0, <2"
 fpdf2 = ">=2.7"
 
+# Local-only semantic code-search environment. Keep model2vec out of the
+# default and hosted/prod environments; Claude Desktop can opt into this
+# persistent environment while the BM25 leg remains the universal fallback.
+[feature.semantic.pypi-dependencies]
+model2vec = ">=0.3"
+psutil = ">=5.9"
+
 [environments]
 dev = { features = ["dev"], solve-group = "default" }
+semantic = { features = ["semantic"], solve-group = "default" }
 
 [tasks]
 start = { cmd = "python -m meridian", env = { MERIDIAN_CLAUDE_CLI = "cmd /c C:/Users/13144/AppData/Roaming/npm/claude.cmd -p" } }

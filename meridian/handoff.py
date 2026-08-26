@@ -18,6 +18,8 @@ the field is always populated.
 from __future__ import annotations
 
 import asyncio
+import dataclasses as _dataclasses
+import enum as _enum
 import functools
 import hashlib
 import json
@@ -34,6 +36,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from . import artifact_classification as artifact_classification_module
 from . import artifact_declaration as artifact_declaration_module
+from . import capability_availability as capability_availability_module
 from . import capability_contract as capability_contract_module
 from . import continuation_gate as continuation_gate_module
 from . import db as db_module
@@ -85,6 +88,134 @@ _env = Environment(
 _DEFAULT_GOAL_TEST_CMD = "pixi run test"
 _STRATEGIC_NOTE_TAGS = {"planning", "strategy", "competitive", "acquisition"}
 _SESSION_HANDOFF_STATE: dict[str, str] = {}
+
+
+async def _persist_handoff_history_and_pending_goal(
+    db: Any,
+    project_id: str,
+    mode: str,
+    content: str,
+    session_id: "str | None",
+    pending_goal_body: str,
+) -> bool:
+    """aec043cb — shared amend-vs-fresh persistence + pending_goal write.
+
+    Extracted VERBATIM (zero behavior change) from the pre-existing full/
+    delta code path in ``generate_handoff`` so ``mode == "goal"`` — now
+    commonly reached via the OMITTED-mode default (see
+    ``resolve_handoff_mode``) rather than only an explicit request — can
+    wire into the SAME trusted ``pending_goal``/``handoffs``-history channel
+    full/delta have always used, instead of silently never registering
+    with it. Before aec043cb this was a latent, inconsequential gap (682005f4
+    introduced 'goal' mode without this wiring, but it was only ever reached
+    via an explicit request, so a caller who wanted the trusted channel
+    simply used full/delta instead); it becomes load-bearing the moment
+    'goal' is the DEFAULT for the dominant omitted-mode executor call —
+    AGENTS.md documents ``start_session``'s ``pending_goal`` /
+    ``load_handoff()`` as the preferred, trusted delivery channel over a
+    spoofable copy-pasted /goal string, so the new safe default must be
+    able to use it too.
+
+    ``content`` is the full body persisted to the ``handoffs`` history
+    table; ``pending_goal_body`` is what ``start_session``/``load_handoff``
+    later surface as ``pending_goal``. For full/delta these differ
+    (``content`` is the entire rendered handoff, ``pending_goal_body`` is
+    just the embedded /goal snippet — see the original call site below);
+    for 'goal' mode they are identical (the whole body IS the /goal
+    snippet), so that call site simply passes the same string twice.
+
+    Returns whether the prior handoff was amended in place rather than
+    recorded fresh (the same ``amended`` flag ``generate_handoff`` itself
+    returns). Fully guarded exactly as before extraction: a failure in
+    either step is swallowed, never breaking handoff generation.
+    """
+    amended = False
+    try:
+        prior_goal = await db_module.get_pending_goal(db, project_id)
+        if prior_goal is not None:
+            # Prior handoff exists and was never consumed — amend in-place.
+            amend_result = await db_module.amend_handoff(db, project_id, content, mode)
+            if amend_result is not None:
+                amended = True
+            else:
+                # No prior row to amend (e.g. pre-migration DB or the row was
+                # deleted externally) — fall through to fresh record.
+                await db_module.record_handoff(db, project_id, mode, content, session_id)
+        else:
+            # 8819d6b1 — fresh handoff: persist to the history table so the
+            # dashboard / planner can list past handoffs and detect new ones.
+            await db_module.record_handoff(db, project_id, mode, content, session_id)
+    except Exception:  # noqa: BLE001 — never break handoff generation
+        pass
+    # 5efe254b — persist the /goal to the trusted channel so the next
+    # start_session can surface it as an MCP tool result (keyed on project_id)
+    # instead of a spoofable copy-pasted chat string. Read-once (pop). Fully
+    # guarded so a pre-migration DB never breaks handoff generation.
+    try:
+        await db_module.set_pending_goal(db, project_id, pending_goal_body)
+    except Exception:  # noqa: BLE001
+        pass
+    return amended
+
+
+# d2fc7465 (PERSISTENCE READINESS) — the set of modes that call
+# _persist_handoff_history_and_pending_goal above, i.e. that write to the
+# `handoffs` history table AND the trusted `pending_goal` channel
+# start_session/load_handoff read from. This is the single source of truth
+# both call sites below (generate_handoff's mode branches) and every MCP/
+# HTTP/stdio transport's response use — never hand-maintain a second copy of
+# this set, or the two are guaranteed to drift the exact way the underlying
+# 2026-08-25 incident did (a mode silently not wired into persistence with no
+# way for a caller to tell short of noticing a stale load_handoff read).
+#
+# 'planner'/'starter'/'compact' are deliberately excluded: they are call-and-
+# forget renders meant to be pasted directly into a fresh chat/terminal, not
+# the canonical stored handoff a later load_handoff() should return — see the
+# "Persistence and retrievability" section of
+# docs/meridian-handoff-mode-contract-2026-08-26.md for the full contract
+# this makes explicit and machine-readable (rather than something a caller
+# had to infer from source or from an unexpectedly-stale load_handoff read).
+# 'l0_fallback' (the emergency timeout degrade) is excluded for the same
+# reason it is not in _VALID_HANDOFF_MODES: it is a synthetic mode value,
+# never something a caller requests.
+_RETRIEVABLE_HANDOFF_MODES = frozenset({"full", "delta", "goal"})
+
+
+def handoff_mode_is_retrievable(mode: "str | None") -> bool:
+    """d2fc7465 — True when a ``generate_handoff(mode=mode)`` call of this
+    mode persists to the `handoffs` history table and the trusted
+    ``pending_goal`` channel (so a following ``load_handoff()`` call will
+    return exactly this render), False otherwise.
+
+    Every MCP/HTTP/stdio transport calls this ONCE, right after
+    ``generate_handoff`` returns, to populate a ``retrievable_via_load_handoff``
+    response field — see ``_RETRIEVABLE_HANDOFF_MODES``'s own docstring for
+    why this must be the one place that set is spelled out.
+    """
+    return mode in _RETRIEVABLE_HANDOFF_MODES
+
+
+def _mark_session_handoff_produced(session_id: "str | None") -> None:
+    """aec043cb — record that ``session_id`` just received a handoff, so a
+    LATER omitted-mode call from the SAME session correctly auto-switches to
+    ``"delta"`` via ``resolve_handoff_mode`` (the pre-existing continuation
+    check: ``session_id in _SESSION_HANDOFF_STATE``).
+
+    Before aec043cb, only the full/delta code path ever populated
+    ``_SESSION_HANDOFF_STATE`` — sufficient at the time, because an omitted
+    mode always resolved to ``"full"`` (which runs that path) regardless of
+    role. Now that omission commonly resolves to the bounded ``"goal"``/
+    ``"planner"`` modes instead (both of which return well before that
+    shared full/delta code), those two modes call this helper explicitly so
+    the continuation contract keeps working: a session's first (bounded)
+    handoff still makes its SECOND omitted-mode call resolve to ``"delta"``,
+    exactly as it did when the first call happened to be ``"full"``.
+    No-op when ``session_id`` is falsy, matching the original inline check.
+    """
+    if session_id:
+        _SESSION_HANDOFF_STATE[session_id] = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
 # dd07ece0 — provenance token store: short-lived, single-use tokens that let a
 # receiving session independently verify a /goal block came from a real
@@ -1695,6 +1826,74 @@ _MODE_DEFAULT_MAX_BYTES = object()
 # extract_artifact_pointer_findings source this clause itself reads.
 _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS = 15
 
+# 4f3bd70c — canonical structural safety net for format_handoff_mcp_content's
+# wire-level byte budget below. That budget, on its own, is purely byte-
+# oriented: it decides HOW MANY bytes survive with no notion of the
+# structural tags (<tool_requirements>, <sprint_item_pointers>,
+# <artifact_pointer_findings>, <selected_item_scope>, <continuation_manifest>,
+# <handoff_manifest>, <proposal_scope>, <executor_item_ids>, ...) those bytes
+# might fall in the middle of — a naive byte cut can land inside one of those
+# tags (or the JSON it encloses), leaving a dangling open tag or a truncated
+# JSON value in an otherwise "complete" render. The existing
+# <goal_token>/SECURITY banner floor already solves exactly this for ONE
+# specific tag; the two helpers below generalize the same idea to every
+# top-level ``<tag>...</tag>`` span in the content, reused identically by
+# every mode that funnels through format_handoff_mcp_content (full, delta,
+# starter/compact, goal, checkpoint, continue) since none of them have their
+# own separate truncation path. A byte cut can now only ever land BETWEEN
+# whole tags (or between a tag and surrounding narrative) — a tag that would
+# only partially survive is dropped in its entirety instead, which is what
+# keeps the surviving content syntactically complete for whatever it does
+# include (see docs/meridian-handoff-contract.md's "Wire-level truncation"
+# section).
+_STRUCTURAL_TAG_RE = re.compile(
+    r"<([a-zA-Z][a-zA-Z0-9_]*)>.*?</\1>", re.DOTALL,
+)
+
+
+def _structural_tag_spans(content: str) -> "list[tuple[int, int]]":
+    """Return ``(start_byte, end_byte)`` UTF-8 byte offsets for every
+    top-level ``<tag>...</tag>`` span in ``content``.
+
+    Matches are whatever ``re.finditer`` returns for the (non-overlapping)
+    pattern above — good enough for the flat, sibling-tag shape every handoff
+    mode actually renders (no mode nests one of these tags inside another).
+    Offsets are in UTF-8 BYTES (not characters) so they compare directly
+    against the byte-oriented cut point ``format_handoff_mcp_content`` already
+    computes.
+    """
+    spans: "list[tuple[int, int]]" = []
+    for m in _STRUCTURAL_TAG_RE.finditer(content):
+        start_b = len(content[: m.start()].encode("utf-8"))
+        end_b = len(content[: m.end()].encode("utf-8"))
+        spans.append((start_b, end_b))
+    return spans
+
+
+def _snap_to_safe_boundary(
+    cut: int, spans: "list[tuple[int, int]]", protected_end: int,
+) -> int:
+    """Move ``cut`` (a UTF-8 byte offset) backward, if needed, so it never
+    lands strictly inside one of ``spans``.
+
+    Dropping a tag span always drops the WHOLE span, never a partial one.
+    Never returns less than ``protected_end`` (the caller's own separate,
+    higher-priority "never cut the goal-token banner" floor). Iterates to a
+    fixed point since snapping out of one span can land inside an earlier,
+    lower-offset span; bounded by ``len(spans)`` tries, which always
+    terminates because each move strictly decreases ``safe_cut``.
+    """
+    safe_cut = max(protected_end, cut)
+    for _ in range(len(spans) + 2):
+        moved = False
+        for start_b, end_b in spans:
+            if start_b < safe_cut < end_b:
+                safe_cut = start_b
+                moved = True
+        if not moved:
+            break
+    return max(protected_end, safe_cut)
+
 
 def format_handoff_mcp_content(
     content: str, *, max_bytes: "int | None" = _DEFAULT_HANDOFF_MAX_BYTES,
@@ -1733,28 +1932,68 @@ def format_handoff_mcp_content(
     every existing caller's content — is returned BYTE-IDENTICAL: zero
     functional change. ``None`` or a non-positive value disables the budget
     entirely (opt out, e.g. a caller that deliberately wants the full raw
-    text regardless of size).
+    text regardless of size). Executable ``/goal`` payloads are also returned
+    byte-identically when oversized because their token-bound body is atomic
+    (MDE-10 — see the ``_is_executable_goal`` short-circuit below).
 
-    When ``content`` exceeds the budget, truncation is INTEGRITY-FIRST, never
-    blind: this function locates any embedded ``<goal_token>...</goal_token>``
-    plus SECURITY banner (``_mint_and_embed_goal_token``'s own marker,
-    matched via ``_GOAL_TOKEN_BANNER_RE``) and NEVER cuts through or before
-    the end of that banner, even if honoring that means exceeding
-    ``max_bytes`` — the provenance token and its verification instructions
-    are the one thing a truncated handoff must never silently lose or
-    corrupt (the "preserve... body-integrity metadata" half of the cb00889c
-    contract; see ``mint_handoff_token``'s ``body`` param /
-    ``verify_handoff_token`` for the binding itself). Truncation removes only
-    trailing bytes AFTER that protected point (or from the very start when no
-    banner is present, e.g. planner-mode content) and appends an explicit,
-    machine-readable marker naming exactly how many bytes were omitted —
-    never a silent drop. A receiving session that runs
-    ``verify_handoff_token(body=...)`` against truncated content correctly
-    gets ``reason="body_mismatch"`` (the presented body genuinely is not the
-    exact one that was minted) rather than a falsely-reassuring match; the
-    ``<goal_token>`` value itself remains valid for plain provenance
-    verification (``verify_handoff_token(project_id, token)`` with no
-    ``body``) regardless.
+    When ordinary content exceeds the budget, truncation is INTEGRITY-FIRST,
+    never blind: this function locates any embedded
+    ``<goal_token>...</goal_token>`` plus SECURITY banner
+    (``_mint_and_embed_goal_token``'s own marker, matched via
+    ``_GOAL_TOKEN_BANNER_RE``) and NEVER cuts through or before the end of
+    that banner, even if honoring that means exceeding ``max_bytes`` — the
+    provenance token and its verification instructions are the one thing a
+    truncated handoff must never silently lose or corrupt (the
+    "preserve... body-integrity metadata" half of the cb00889c contract; see
+    ``mint_handoff_token``'s ``body`` param / ``verify_handoff_token`` for
+    the binding itself). Truncation removes only trailing bytes AFTER that
+    protected point (or from the very start when no banner is present, e.g.
+    planner-mode content) and appends an explicit, machine-readable marker
+    naming exactly how many bytes (and structural sections) were omitted —
+    never a silent drop.
+
+    4f3bd70c — the cut point is additionally snapped to a STRUCTURAL boundary
+    via :func:`_structural_tag_spans`/:func:`_snap_to_safe_boundary`: it can
+    never land strictly inside a top-level ``<tag>...</tag>`` span (e.g.
+    ``<tool_requirements>``, ``<sprint_item_pointers>``,
+    ``<artifact_pointer_findings>``, ``<selected_item_scope>``,
+    ``<continuation_manifest>``, ``<handoff_manifest>``, ``<proposal_scope>``,
+    ``<executor_item_ids>``). A tag that would only partially survive a raw
+    byte cut is instead dropped in its entirety, so the surviving content is
+    always syntactically complete for whatever it does include — never a
+    dangling open tag or a truncated JSON/XML value. This generalizes the
+    pre-existing goal-token-banner protection (one specific tag) to every
+    structural tag the renderer emits, uniformly, for every mode that funnels
+    through this one function. A
+    receiving session that runs ``verify_handoff_token(body=...)`` against
+    truncated content correctly gets ``reason="body_mismatch"`` (the
+    presented body genuinely is not the exact one that was minted) rather
+    than a falsely-reassuring match; the ``<goal_token>`` value itself
+    remains valid for plain provenance verification
+    (``verify_handoff_token(project_id, token)`` with no ``body``)
+    regardless.
+
+    Executable ``/goal`` content (body starts with ``/goal`` or
+    ``/loop /goal`` and carries a goal-token banner) is handled BEFORE this
+    truncation branch and is never cut: a token-bound body that is delivered
+    with a truncation marker is not an executable handoff, even though
+    token-only provenance verification would still pass against the
+    truncated text. Non-goal/full narrative profiles retain the bounded
+    marker behavior described above unaffected.
+
+    455cfc36 — ``mode='delta'``'s ``<continuation_manifest>`` tag
+    (see :func:`build_continuation_manifest`) is rendered by
+    ``_render_delta_handoff`` BEFORE ``quick_start_goal`` precisely so it
+    falls within this SAME protected floor (the goal-token banner sits near
+    the top of ``quick_start_goal``, i.e. always after the manifest) without
+    this function needing to know about the manifest tag at all — the
+    manifest is small and bounded by construction
+    (:data:`_CONTINUATION_MANIFEST_ID_CAP`), so protecting it never risks
+    reproducing the oversized-checkpoint regression the ``max_bytes`` budget
+    itself exists to prevent (unlike ``quick_start_goal``'s own per-item
+    contract detail, which full/delta deliberately leaves unbounded — see
+    ``generate_handoff``'s ``checkpoint`` docstring — and therefore stays
+    fully truncatable, past the protected floor, exactly like today).
 
     ``max_bytes`` is a budget on the RETURNED string, marker included
     (60eed526) — the appended truncation marker itself is not free bytes
@@ -1771,46 +2010,110 @@ def format_handoff_mcp_content(
     _raw = content.encode("utf-8")
     if len(_raw) <= max_bytes:
         return content
+    # MDE-10 — executable goal payloads are an atomic integrity unit. The
+    # token's body_hash covers the full /goal body, so post-mint truncation
+    # creates a handoff that looks present but cannot pass body verification.
+    # Preserve the exact body and let the caller narrow the scope if the
+    # client cannot accept it. Non-goal/full narrative profiles retain the
+    # bounded marker behavior below.
+    _is_executable_goal = (
+        content.lstrip().startswith(("/goal", "/loop /goal"))
+        and _GOAL_TOKEN_BANNER_RE.search(content) is not None
+    )
+    if _is_executable_goal:
+        return content
     _protected_end = 0
     _banner_match = _GOAL_TOKEN_BANNER_RE.search(content)
     if _banner_match:
         _protected_end = len(content[: _banner_match.end()].encode("utf-8"))
     _total_bytes = len(_raw)
+    # 4f3bd70c — every top-level structural tag span, so the cut point below
+    # can be snapped to never land inside one (see _snap_to_safe_boundary).
+    _spans = _structural_tag_spans(content)
 
-    def _marker_bytes_for(omitted: int) -> bytes:
+    def _sections_omitted_for(cut: int) -> int:
+        # Safe post-snap: for every span, either fully kept (end <= cut) or
+        # fully omitted (start >= cut) — no straddling case remains once
+        # `cut` has been through _snap_to_safe_boundary.
+        return sum(1 for _start_b, _end_b in _spans if _start_b >= cut)
+
+    def _marker_bytes_for(omitted: int, sections_omitted: int) -> bytes:
+        _meta = json.dumps(
+            {
+                "content_truncated": True,
+                "omitted_bytes": omitted,
+                "total_bytes": _total_bytes,
+                "limit_bytes": max_bytes,
+                "sections_omitted": sections_omitted,
+                "reason": "response_size_budget",
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         return (
             "\n\n<!-- TRUNCATED (cb00889c bounded handoff profile): "
             f"{omitted} of {_total_bytes} total bytes omitted to satisfy the "
             f"handoff response-size budget (limit={max_bytes} bytes). Everything "
             "up to and including any <goal_token>/SECURITY banner above is "
-            "complete and byte-identical to the original render. "
-            "Narrative/context beyond this point was trimmed to fit the budget "
-            "-- request mode='goal' for the minimal bounded executable profile, "
-            "or a narrower version scope, to see it in full. -->"
+            "complete and byte-identical to the original render. The cut point "
+            "below never lands inside a <tag>...</tag> span -- a tag that would "
+            "only partially survive is dropped in full instead, never sliced -- "
+            "so the surviving content stays syntactically complete for whatever "
+            "it does include. Narrative/context beyond this point was trimmed "
+            "to fit the budget -- request mode='goal' for the minimal bounded "
+            "executable profile, or a narrower version scope, to see it in "
+            f"full. machine_readable={_meta} -->"
         ).encode("utf-8")
 
     # 60eed526 — iterate to a fixed point: the marker's own length depends
     # on the omitted-byte count it names, which depends on the cut point.
-    # Converges in 1-2 tries in practice (the marker only grows/shrinks when
-    # `_omitted`'s digit count crosses a power-of-ten boundary); the exact
-    # correction pass right after this loop makes the final result precise
-    # regardless of how many tries it takes.
+    # 4f3bd70c — each candidate cut is ALSO snapped to a safe structural
+    # boundary before the marker is measured against it, since snapping can
+    # only ever shrink the kept prefix further (never grow it, never move it
+    # past `max_bytes`), so this still converges to a stable, in-budget,
+    # tag-safe cut within a handful of tries — bounded by len(_spans) below,
+    # never just a fixed constant, so a content with many structural tags
+    # still converges correctly.
     _cut = max_bytes
-    for _ in range(5):
-        _marker_len = len(_marker_bytes_for(_total_bytes - _cut))
+    for _ in range(max(5, len(_spans) + 3)):
+        _candidate = _snap_to_safe_boundary(
+            max(_protected_end, min(_cut, max_bytes)), _spans, _protected_end,
+        )
+        _marker_len = len(
+            _marker_bytes_for(
+                _total_bytes - _candidate, _sections_omitted_for(_candidate),
+            )
+        )
         _next_cut = max(_protected_end, min(_cut, max_bytes - _marker_len))
+        _next_cut = _snap_to_safe_boundary(_next_cut, _spans, _protected_end)
         if _next_cut == _cut:
             break
         _cut = _next_cut
+    _cut = _snap_to_safe_boundary(
+        max(_protected_end, min(_cut, max_bytes)), _spans, _protected_end,
+    )
     _kept_raw = _raw[:_cut]
-    _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw))
-    _overshoot = (len(_kept_raw) + len(_marker_bytes)) - max_bytes
-    if _overshoot > 0 and _cut > _protected_end:
-        _cut = max(_protected_end, _cut - _overshoot)
+    _sections_omitted = _sections_omitted_for(_cut)
+    _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw), _sections_omitted)
+    # 4f3bd70c — the overshoot-correction pass can itself land back inside a
+    # span (shrinking `_cut` by a raw byte count knows nothing about tag
+    # boundaries), so re-snap after every shrink; bounded retries since each
+    # pass strictly decreases `_cut` (or the loop exits via the `<= 0` check).
+    for _ in range(max(3, len(_spans) + 1)):
+        _overshoot = (len(_kept_raw) + len(_marker_bytes)) - max_bytes
+        if _overshoot <= 0 or _cut <= _protected_end:
+            break
+        _cut = _snap_to_safe_boundary(
+            max(_protected_end, _cut - _overshoot), _spans, _protected_end,
+        )
         _kept_raw = _raw[:_cut]
-        _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw))
+        _sections_omitted = _sections_omitted_for(_cut)
+        _marker_bytes = _marker_bytes_for(_total_bytes - len(_kept_raw), _sections_omitted)
     # errors="ignore" — never split a multi-byte UTF-8 sequence into an
-    # invalid trailing fragment; at most drops the final incomplete char.
+    # invalid trailing fragment; at most drops the final incomplete char. The
+    # structural snapping above already guarantees `_cut` never lands inside
+    # a <tag> span, so this only ever trims a stray partial multi-byte
+    # character in ordinary narrative text between/after tags.
     _kept_text = _kept_raw.decode("utf-8", errors="ignore")
     return _kept_text + _marker_bytes.decode("utf-8")
 
@@ -3439,7 +3742,14 @@ def _build_quick_start_goal(
             if rid not in _final_ids_set
         ]
         if selected_scope_outcome is not None:
-            selected_scope_outcome.clear()
+            # d2fc7465 — no longer .clear()s first: generate_handoff now
+            # pre-seeds this SAME dict with selected_item_ids/closure_item_ids/
+            # closure_hash the moment _resolve_selected_item_scope resolves
+            # (before any mode branch runs) — see that seeding's own comment.
+            # A plain .update() layers the exclusion-outcome keys on top
+            # without erasing them; there is no other legitimate producer of
+            # this dict that a .clear() here would need to guard against
+            # (each generate_handoff call reaches this code path at most once).
             selected_scope_outcome.update({
                 "requested_ids": _requested_scope_ids,
                 "executable_ids": _executable_requested_ids,
@@ -5758,21 +6068,80 @@ async def _annotate_resolved_pointers(
     return pending_items
 
 
+_VALID_HANDOFF_MODES = frozenset(
+    {"full", "delta", "planner", "starter", "compact", "goal"}
+)
+
+
 def resolve_handoff_mode(
     requested_mode: str | None,
     session_id: str | None = None,
+    *,
+    session_role: str | None = None,
 ) -> str:
-    """Resolve the public handoff mode, auto-switching repeat sessions to delta.
+    """Resolve the public handoff mode. Intent-based, never full-by-default.
+
+    aec043cb (P0 HANDOFF) — an OMITTED (or unrecognized) ``requested_mode``
+    used to resolve unconditionally to ``"full"`` — the unbounded, whole-
+    project state dump that also unconditionally prepends EVERY workspace
+    decision/note (across every project in the workspace, no project
+    filtering) via ``_render_workspace_handoff_block``. That made every
+    executor-facing MCP/HTTP call that simply omitted ``mode`` (the common
+    case — the MCP tool schema has always made ``mode`` optional) leak
+    cross-project workspace context into a handoff meant for one project's
+    executor. Per the authoritative aec043cb design decision, omission is
+    now resolved by INTENT, in this order:
+
+      1. An explicit, recognized ``requested_mode`` always wins outright —
+         unconditionally, including ``"full"`` itself. ``"full"`` remains
+         fully available; it is simply never the result of an OMISSION
+         anymore, only of a deliberate, explicit request (the "archival/
+         diagnostic dump" case).
+      2. A genuinely RESUMED session — this ``session_id`` already produced
+         a handoff earlier in the same process (tracked in
+         ``_SESSION_HANDOFF_STATE``) — resolves to ``"delta"``: a bounded,
+         per-session continuation update. Unchanged from the pre-existing
+         auto-switch; still takes priority over role, since "this session
+         already has a handoff to continue from" is a stronger, more
+         specific signal than a role guess.
+      3. A session registered as ``role="executor"`` via ``start_session``
+         (``session_role="executor"``, sourced by the caller from
+         ``meridian.mcp.handler._EXECUTOR_SESSIONS`` — the same in-memory
+         session-role registry the bf51b12e planner-refresh-nudge already
+         relies on; reused here rather than inventing a second concept)
+         resolves to ``"goal"`` — the bounded, executor-facing /goal block:
+         no workspace decisions/notes, no L0/L1/L2, no other project's
+         state (see ``_generate_goal_only_handoff``).
+      4. A session registered as ``role="planner"`` (``session_role=
+         "planner"``, sourced from ``meridian.mcp.handler._PLANNER_SESSIONS``,
+         the symmetric sibling registry) resolves to ``"planner"`` — the
+         directive planning-session prompt, already project-scoped with no
+         workspace decisions/notes (see ``_generate_planner_handoff``).
+      5. Anything else — no ``session_id`` at all, or a session whose role
+         was never registered as executor/planner — has no safe, positive
+         signal to resolve by. Rather than fail the call outright (this is
+         a compatibility-preserving control-plane fix, not a new hard
+         requirement on every pre-existing caller), this degrades to the
+         SAME safe, bounded ``"goal"`` mode used for a known executor: the
+         narrowest, leak-free option available. This still satisfies the
+         one non-negotiable constraint — an omitted mode NEVER silently
+         resolves to ``"full"`` — while remaining usable for a caller that
+         has not (yet) adopted ``start_session(role=...)``.
 
     ``"goal"`` (682005f4) is the 6th mode: it returns ONLY the bare /goal
     block itself — no readiness header, no workspace decisions/notes, no
     L0/L1/L2 context. See ``_generate_goal_only_handoff``.
     """
-    if requested_mode in {"full", "delta", "planner", "starter", "compact", "goal"}:
+    if requested_mode in _VALID_HANDOFF_MODES:
         return requested_mode
     if session_id and session_id in _SESSION_HANDOFF_STATE:
         return "delta"
-    return "full"
+    if session_role == "executor":
+        return "goal"
+    if session_role == "planner":
+        return "planner"
+    # aec043cb — intent unknown: bounded-safe default, never "full".
+    return "goal"
 
 
 def _human_id_clause(identity: str | None) -> str:
@@ -6214,7 +6583,6 @@ def _render_delta_handoff(
             kind = (t.get("kind") or "").upper()
             desc = (t.get("description") or "").strip()[:200]
             lines.append(f"- [{kind}] {desc}")
-    lines += ["", "Next:", quick_start_goal]
     if continuation_manifest is not None:
         # 836ca1d5 — durable continuation manifest: canonical revision_hash/
         # counter (board_snapshot.py) so a resuming session (or load_handoff,
@@ -6223,6 +6591,25 @@ def _render_delta_handoff(
         # one. Compact/sorted-keys JSON, matching canonical_json's own
         # discipline in board_snapshot.py, so the tag's content is
         # deterministic for a given manifest.
+        #
+        # 455cfc36 — deliberately emitted BEFORE "Next:"/quick_start_goal,
+        # not after. quick_start_goal embeds a <goal_token>+SECURITY banner
+        # near ITS OWN top (_mint_and_embed_goal_token), and
+        # format_handoff_mcp_content's truncation NEVER cuts through or
+        # before that banner's end — so anything positioned before the
+        # banner is structurally protected from truncation for free, while
+        # anything after it is not. Confirmed live reproduction: with the
+        # manifest positioned AFTER quick_start_goal (the old order), a
+        # generate_handoff(mode='delta', version='current') call that
+        # correctly resolved scope=current could still return content with a
+        # TRUNCATED marker that had silently dropped the manifest — the one
+        # thing criterion 1 requires never be truncated. Moving it here
+        # costs nothing (the manifest is small and bounded by construction,
+        # see _CONTINUATION_MANIFEST_ID_CAP), unlike quick_start_goal's own
+        # per-item contract detail, which full/delta deliberately leaves
+        # UNBOUNDED and therefore stays fully truncatable, exactly as today
+        # (see generate_handoff's `checkpoint` docstring for why capping
+        # construction there would be wrong).
         lines += [
             "",
             "<continuation_manifest>",
@@ -6231,6 +6618,7 @@ def _render_delta_handoff(
             ),
             "</continuation_manifest>",
         ]
+    lines += ["", "Next:", quick_start_goal]
     if run_timeline is not None:
         # 79491e26 — durable, deterministic run-timeline reconstruction (see
         # build_run_timeline_for_handoff's docstring) embedded the same way
@@ -7269,6 +7657,247 @@ def _render_research_evidence_block(envelope: Any) -> str:
         return ""
 
 
+def render_release_transaction_evidence_xml(summary: "dict[str, Any] | None") -> str:
+    """MDE-3 — render a release-transaction crash-recovery evidence summary
+    (:func:`meridian.db.docx_merge.summarize_release_transactions`'s output)
+    as a machine-readable ``<release_transactions>`` block for a handoff
+    body — "exact evidence in handoff": a receiver sees, without re-querying
+    anything, exactly how many change-set release transactions exist, their
+    state breakdown, and which (if any) are stuck in ``RECOVERY_REQUIRED``
+    and need attention before this project can be considered releasable.
+
+    Purely additive: ``""`` for ``None``/falsy input or a summary with zero
+    transactions, so a project with no release-transaction activity sees
+    zero change from before this existed.
+    """
+    if not summary or not summary.get("transaction_count"):
+        return ""
+
+    def esc(value: "Any") -> str:
+        return _xml_escape(str(value if value is not None else ""), {chr(34): "&quot;"})
+
+    parts = [
+        '<release_transactions '
+        f'count="{esc(summary.get("transaction_count"))}" '
+        f'all_released="{esc(bool(summary.get("all_released")))}">'
+    ]
+    state_counts = summary.get("state_counts") or {}
+    for state in sorted(state_counts):
+        parts.append(f'<state name="{esc(state)}" count="{esc(state_counts[state])}"/>')
+    for entry in summary.get("recovery_required") or []:
+        parts.append(
+            f'<recovery_required transaction_id="{esc(entry.get("transaction_id"))}" '
+            f'change_set_id="{esc(entry.get("change_set_id"))}" '
+            f'file_path="{esc(entry.get("file_path"))}">{esc(entry.get("error"))}'
+            "</recovery_required>"
+        )
+    parts.append("</release_transactions>")
+    return "".join(parts)
+
+
+def render_release_transaction_evidence_markdown(summary: "dict[str, Any] | None") -> str:
+    """MDE-3 rework — the Markdown twin of
+    :func:`render_release_transaction_evidence_xml`, rendering the EXACT
+    SAME :func:`meridian.db.docx_merge.summarize_release_transactions`
+    summary as a human-readable ``## Release Transactions`` section.
+
+    Consumes the identical *summary* dict the XML/JSON renderers do — never
+    a separate query — so all three projections are guaranteed to describe
+    the same evidence. ``""`` for ``None``/falsy input or zero transactions,
+    matching the XML renderer's "purely additive" contract.
+    """
+    if not summary or not summary.get("transaction_count"):
+        return ""
+    lines = [
+        "## Release Transactions",
+        "",
+        f"- Total: {summary.get('transaction_count')}",
+        f"- All released: {bool(summary.get('all_released'))}",
+    ]
+    state_counts = summary.get("state_counts") or {}
+    if state_counts:
+        lines.append("- By state: " + ", ".join(
+            f"{state}={state_counts[state]}" for state in sorted(state_counts)
+        ))
+    recovery = summary.get("recovery_required") or []
+    if recovery:
+        lines.append("")
+        lines.append("**Needs attention (RECOVERY_REQUIRED):**")
+        for entry in recovery:
+            lines.append(
+                f"- `{entry.get('transaction_id')}` — {entry.get('change_set_id')} "
+                f"({entry.get('file_path')}): {entry.get('error')}"
+            )
+    return "\n".join(lines)
+
+
+def render_release_transaction_evidence_json(summary: "dict[str, Any] | None") -> str:
+    """MDE-3 rework — the JSON twin of
+    :func:`render_release_transaction_evidence_xml` / :func:`render_release_
+    transaction_evidence_markdown`: the SAME summary dict, serialized as a
+    deterministic (sorted-key) JSON string. ``""`` for ``None``/falsy input
+    or zero transactions — same "purely additive" contract as its siblings.
+    Callers that want the raw dict (rather than a pre-serialized string —
+    e.g. to embed in a structured MCP response field) should use
+    :func:`meridian.db.docx_merge.summarize_release_transactions`'s own
+    output directly; this function exists for handoff bodies that need a
+    literal JSON TEXT projection (e.g. a fenced code block) alongside the
+    Markdown/XML ones.
+    """
+    if not summary or not summary.get("transaction_count"):
+        return ""
+    return json.dumps(summary, sort_keys=True, default=str)
+
+
+async def _release_transaction_evidence_summary(
+    db: Any, project_id: "str | None",
+) -> "dict[str, Any] | None":
+    """Best-effort fetch of this project's release-transaction evidence
+    summary. Meridian core CAN import ``meridian.db.docx_merge`` directly
+    (unlike the ``extensions/meridian-outputs`` research-evidence surface,
+    this is a same-package sibling module, not an optional external
+    extension) — but the fetch is still fully guarded: any failure (DB
+    hiccup, no transactions ever recorded) degrades to ``None``, never
+    raises, matching every other best-effort evidence surface in this
+    module.
+    """
+    if not project_id:
+        return None
+    try:
+        from .db import docx_merge as _docx_merge_module  # noqa: PLC0415
+
+        transactions = await _docx_merge_module.list_release_transactions(
+            db, project_id=project_id,
+        )
+        if not transactions:
+            return None
+        return _docx_merge_module.summarize_release_transactions(transactions)
+    except Exception:  # noqa: BLE001 — evidence surfacing must never break handoff generation
+        return None
+
+
+def _duck_encode_dataclass_like(obj: Any) -> Any:
+    """MDE-5 — generic, ZERO-import reduction of a dataclass/Enum-shaped
+    object (e.g. a real ``research_evidence.ProvenanceEnvelope`` instance)
+    to plain dict/list/str/int/float/bool/None values.
+
+    Uses ONLY the stdlib ``dataclasses``/``enum`` modules — meridian core
+    still never imports ``extensions/meridian-outputs``'s
+    ``research_evidence`` module itself, exactly the same no-hard-dependency
+    contract ``_render_research_evidence_block`` already established (see
+    its own docstring). Structurally mirrors that module's OWN internal
+    ``_encode()`` helper (same reflection technique), just re-implemented
+    independently here rather than imported. A plain dict/list passes
+    through structurally unchanged (already the canonical shape); anything
+    else (str/int/float/bool/None, or an unrecognized object) is returned
+    as-is rather than raising — this is a best-effort projection for an
+    advisory handoff section, never a strict codec.
+    """
+    if isinstance(obj, _enum.Enum):
+        return obj.value
+    if _dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        # Mirrors research_evidence._encode()'s own extra_fields merge
+        # exactly (a field literally named "extra_fields" is merged into
+        # the result dict rather than nested), so a real ProvenanceEnvelope
+        # instance reduces to the SAME shape envelope_to_dict() would
+        # produce for it.
+        result: "dict[str, Any]" = {}
+        extra: "dict[str, Any]" = {}
+        for f in _dataclasses.fields(obj):
+            if f.name == "extra_fields":
+                extra = _duck_encode_dataclass_like(getattr(obj, f.name)) or {}
+                continue
+            result[f.name] = _duck_encode_dataclass_like(getattr(obj, f.name))
+        if extra:
+            result.update(extra)
+        return result
+    if isinstance(obj, dict):
+        return {str(k): _duck_encode_dataclass_like(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_duck_encode_dataclass_like(v) for v in obj]
+    return obj
+
+
+def _evidence_status_and_pointers_from_envelope(
+    envelope: Any,
+) -> "tuple[dict[str, Any] | None, list[dict[str, Any]]]":
+    """MDE-5 — duck-typed, zero-import projection of an optional research-
+    evidence envelope into ``(evidence_status_summary, trusted_pointers)``:
+    the small, BOUNDED pair a ``<handoff_manifest>`` embeds (never the full
+    envelope, which can be arbitrarily large). Mirrors
+    ``research_evidence.evidence_status_summary``/``trusted_pointers``
+    semantics closely (a real ``ProvenanceEnvelope`` instance produces the
+    exact same numbers reduced through this module's own logic instead —
+    see ``_duck_encode_dataclass_like``), reimplemented independently here
+    rather than imported, matching ``_render_research_evidence_block``'s
+    established no-hard-dependency contract exactly.
+
+    Accepts either a real ``ProvenanceEnvelope``-shaped object OR its
+    canonical dict form (``envelope_to_dict()``'s shape). Returns
+    ``(None, [])`` for anything falsy/unrecognized — purely additive, zero
+    change for a caller that never supplies an envelope. Never raises: a
+    malformed envelope degrades to ``(None, [])``, same as ``_render_
+    research_evidence_block``'s own best-effort posture.
+    """
+    if not envelope:
+        return None, []
+    try:
+        data = envelope if isinstance(envelope, dict) else _duck_encode_dataclass_like(envelope)
+        if not isinstance(data, dict):
+            return None, []
+        records = data.get("records")
+        links = data.get("links")
+        if not isinstance(records, list) or not isinstance(links, list):
+            return None, []
+
+        status_counts: "dict[str, int]" = {}
+        partial_records = redacted_records = authoritative_records = 0
+        trusted: "list[dict[str, Any]]" = []
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            resolver = rec.get("resolver") or {}
+            status = str(resolver.get("status") or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            is_partial = bool(rec.get("partial"))
+            is_redacted = bool(rec.get("redacted"))
+            is_authoritative = status == "verified" and not is_partial and not is_redacted
+            if is_partial:
+                partial_records += 1
+            if is_redacted:
+                redacted_records += 1
+            if is_authoritative:
+                authoritative_records += 1
+                identity = rec.get("identity") or {}
+                trusted.append({
+                    "id": identity.get("id"),
+                    "kind": identity.get("kind"),
+                    "locator": identity.get("locator"),
+                    "label": identity.get("label"),
+                })
+        partial_links = sum(
+            1 for link in links if isinstance(link, dict) and link.get("partial")
+        )
+        trusted.sort(key=lambda p: p.get("id") or "")
+        status_summary = {
+            "envelope_id": data.get("envelope_id"),
+            "generated_at": data.get("generated_at"),
+            "version": data.get("version"),
+            "partial": bool(data.get("partial")),
+            "partial_reason": data.get("partial_reason"),
+            "record_count": len(records),
+            "link_count": len(links),
+            "authoritative_record_count": authoritative_records,
+            "partial_record_count": partial_records,
+            "redacted_record_count": redacted_records,
+            "partial_link_count": partial_links,
+            "status_counts": status_counts,
+        }
+        return status_summary, trusted
+    except Exception:  # noqa: BLE001 — a malformed envelope must never break handoff generation
+        return None, []
+
+
 def _render_custom_handoff(
     template: str,
     *,
@@ -7718,11 +8347,105 @@ async def log_handoff_correction_event(
         pass
 
 
+def _summarize_capability_availability(
+    evaluated: "list[dict[str, Any]]",
+) -> "dict[str, Any]":
+    """MDE-1 — bucket :func:`capability_availability.evaluate_manifest_availability`'s
+    per-capability verdicts into the ``{available, missing, degraded}``
+    capability-id-list shape ``capability_contract.build_capability_contract``'s
+    ``AvailabilityChecker`` interface expects (see
+    ``capability_contract._resolve_availability``'s ``checker`` contract).
+
+    Fail-closed, policy-aware bucketing -- mirrors
+    ``capability_availability._unconfirmed_status``'s own philosophy so this
+    adapter never contradicts the module it's summarizing: a capability
+    whose live status could not actually be confirmed
+    (``STATUS_UNKNOWN`` -- an unrecognized tool reference, a plugin/tool
+    naming mismatch, or the degenerate empty-``required_tools`` case) is
+    NEVER silently reported as ``available``. It is bucketed the SAME way an
+    unconfirmed tunnel-backed tool already is: ``missing`` for a
+    required/optional capability (fail-closed -- an executor must never be
+    told an unresolved capability is ready), ``degraded`` for a
+    ``degraded_ok`` capability (fail-open into a reduced/read-only mode, per
+    that policy's own documented contract).
+
+    ``STATUS_AVAILABLE`` -> available. ``STATUS_DEGRADED`` -> degraded (a
+    fallback rescued it, or the tool could not be confirmed under a
+    ``degraded_ok`` policy). ``STATUS_MISSING`` -> missing.
+
+    Deterministic: each bucket is a **sorted** list of capability ids, never
+    input order -- two evaluations of the identical underlying live state
+    always summarize byte-identically, which is what lets
+    ``capability_contract.contract_hash`` change if and only if the real
+    availability state actually changed.
+    """
+    available: "list[str]" = []
+    missing: "list[str]" = []
+    degraded: "list[str]" = []
+    for entry in evaluated or []:
+        if not isinstance(entry, dict):
+            continue
+        cap_id = entry.get("capability_id")
+        if not cap_id:
+            continue
+        status = entry.get("status")
+        policy = entry.get("availability_policy") or "required"
+        if status == capability_availability_module.STATUS_AVAILABLE:
+            available.append(cap_id)
+        elif status == capability_availability_module.STATUS_DEGRADED:
+            degraded.append(cap_id)
+        elif status == capability_availability_module.STATUS_MISSING:
+            missing.append(cap_id)
+        else:
+            # STATUS_UNKNOWN (or any status this adapter doesn't recognize
+            # yet) -- fail closed rather than silently dropping the
+            # capability out of every bucket, which would make it invisible
+            # to the executable/missing_required check entirely.
+            if policy == "degraded_ok":
+                degraded.append(cap_id)
+            else:
+                missing.append(cap_id)
+    return {
+        "available": sorted(available),
+        "missing": sorted(missing),
+        "degraded": sorted(degraded),
+    }
+
+
+def _availability_checker_from_live_inventory(
+    live_inventory: "dict[str, Any]",
+) -> "Callable[[list[dict[str, Any]]], dict[str, Any]]":
+    """MDE-1 — build a SYNC callable matching
+    ``capability_contract``'s ``AvailabilityChecker`` contract
+    (``Callable[[list[dict]], dict]``, invoked without ``await`` --
+    see ``capability_contract._resolve_availability``), closed over an
+    already-fetched *live_inventory* snapshot (the shape
+    ``meridian.mcp.handlers.project_tools._build_live_inventory`` /
+    ``check_capability_availability`` build and consume).
+
+    Evaluates whichever capability list it is actually called with (the
+    EFFECTIVE, post-profile-merge list ``build_capability_contract`` passes
+    to its injected checker) fresh, every call -- never a value pre-computed
+    against only the raw persisted manifest, which would silently skip
+    availability evaluation for any capability id a profile layer
+    contributed on top of it (see
+    ``capability_contract._resolve_effective_capabilities``).
+    """
+    def _checker(capabilities: "list[dict[str, Any]]") -> "dict[str, Any]":
+        evaluated = capability_availability_module.evaluate_manifest_availability(
+            capabilities, live_inventory,
+        )
+        return _summarize_capability_availability(evaluated)
+    return _checker
+
+
 async def build_effective_capability_contract(
     db: Any, project_id: str, *, board_stale: bool = False,
     version: "str | None" = None, items: "list[dict[str, Any]] | None" = None,
     max_executor_contracts: "int | None" = None,
     max_contract_list_items: "int | None" = None,
+    tenant: "dict[str, Any] | None" = None,
+    live_inventory: "dict[str, Any] | None" = None,
 ) -> "dict[str, Any] | None":
     """98aaccf4 — thin, fully-guarded wrapper over
     ``capability_contract.build_capability_contract`` for the two trusted
@@ -7754,6 +8477,41 @@ async def build_effective_capability_contract(
     caller that passes small explicit caps, since a full per-item
     breakdown was never needed there and was overflowing the compact
     response (593KB observed on a real board, 382KB from this field alone).
+
+    ``tenant`` / ``live_inventory`` (MDE-1) — wire the REAL ac80aaaf
+    availability check (``meridian.capability_availability`` +
+    ``mcp/handlers/project_tools.py::_build_live_inventory`` /
+    ``check_capability_availability``, both already landed and already
+    exposed as importable helpers) into the emitted contract's
+    ``availability``/``executable``/``executable_reasons`` fields, instead
+    of the permanent ``"unknown"`` degrade that resulted from
+    ``capability_contract._resolve_availability``'s own guessed
+    sibling-module auto-discovery (a ``check_availability`` function name
+    that was never actually defined on ``capability_availability`` --
+    see that function's own TODO(ac80aaaf) docstring) never matching this
+    module's real, differently-named, differently-shaped functions. Before
+    this, ``executable`` could structurally never reflect a truly
+    unavailable ``required`` capability for either trusted handoff channel
+    -- see :func:`_availability_checker_from_live_inventory` and
+    :func:`_summarize_capability_availability`.
+
+    Pass ``live_inventory`` directly (as tests do, and as a caller that
+    already built one -- e.g. alongside its own
+    ``check_capability_availability`` call -- should, to avoid a second
+    redundant tunnel probe) to skip the async, I/O-bound tunnel probe this
+    function would otherwise perform; pass ``tenant`` to have this function
+    derive it the SAME way ``check_capability_availability`` itself does.
+    ``live_inventory`` wins if both are given. Omitting BOTH keeps the exact
+    prior degraded (``"unknown"``) availability behavior -- this is purely
+    additive, so every existing caller that passes neither argument is
+    completely unaffected.
+
+    Guarded the SAME way as the rest of this wrapper: any failure deriving
+    the live inventory or building the checker degrades to no checker
+    (the contract falls back to its pre-existing ``"unknown"`` availability
+    result) rather than breaking the mandatory start_session/generate_handoff
+    call -- a tunnel/tenant-probing problem must never make the contract
+    itself unavailable.
     """
     try:
         kwargs: dict[str, Any] = {}
@@ -7761,6 +8519,17 @@ async def build_effective_capability_contract(
             kwargs["max_executor_contracts"] = max_executor_contracts
         if max_contract_list_items is not None:
             kwargs["max_contract_list_items"] = max_contract_list_items
+        _live_inventory = live_inventory
+        if _live_inventory is None and tenant is not None:
+            try:
+                from meridian.mcp.handlers import project_tools as _project_tools_module  # noqa: PLC0415
+                _live_inventory = await _project_tools_module._build_live_inventory(tenant)
+            except Exception:  # noqa: BLE001 — live-inventory probing is best-effort
+                _live_inventory = None
+        if _live_inventory is not None:
+            kwargs["availability_checker"] = _availability_checker_from_live_inventory(
+                _live_inventory
+            )
         return await capability_contract_module.build_capability_contract(
             db, project_id, board_stale=board_stale, version=version, items=items,
             **kwargs,
@@ -8919,6 +9688,8 @@ def build_handoff_manifest(
     stop_conditions: "list[str] | None" = None,
     deploy_policy: "dict[str, Any] | None" = None,
     max_items: int = _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+    evidence_status: "dict[str, Any] | None" = None,
+    trusted_pointers: "list[dict[str, Any]] | None" = None,
 ) -> "dict[str, Any]":
     """acf6f51a — assemble the canonical HandoffManifest as a plain dict with
     a FIXED field order (mirrored exactly by serialize_handoff_manifest_xml).
@@ -8935,6 +9706,18 @@ def build_handoff_manifest(
     ``items`` list (never the truncated view) — a receiver comparing
     ``board_revision`` against a fresh board fetch must see the same digest
     a caller with the full board would compute.
+
+    ``evidence_status``/``trusted_pointers`` (MDE-5) -- optional, ``None``/
+    omitted by default (byte-for-byte unchanged for every existing caller
+    that doesn't pass them). When the caller has a research-evidence
+    envelope (see ``_evidence_status_and_pointers_from_envelope``), these
+    carry the SAME small, bounded ``{status_counts, record_count,
+    authoritative_record_count, ...}`` summary and the list of
+    already-verified ``{id, kind, locator, label}`` pointers a receiver can
+    treat as trustworthy without re-resolving anything -- never the full
+    envelope, which is unbounded. This is what makes a handoff's evidence
+    state machine-readable rather than only ever narrated in the separate
+    "## Research Evidence" Markdown projection.
     """
     ordered_items = list(items)
     truncated = len(ordered_items) > max_items
@@ -8959,6 +9742,8 @@ def build_handoff_manifest(
         "waves": waves or [],
         "stop_conditions": list(stop_conditions or []),
         "deploy_policy": dict(deploy_policy or {}),
+        "evidence_status": dict(evidence_status or {}),
+        "trusted_pointers": list(trusted_pointers or []),
     }
 
 
@@ -9049,6 +9834,37 @@ def serialize_handoff_manifest_xml(manifest: "dict[str, Any]") -> str:
     for key in sorted(deploy):
         parts.append(f'<field name="{esc(key)}">{esc(deploy[key])}</field>')
     parts.append("</deploy_policy>")
+    # MDE-5 -- machine-readable research-evidence status + trusted pointers.
+    # Both default to {}/[] (build_handoff_manifest's own defaults) when the
+    # caller never supplied a research_evidence_envelope, so a manifest with
+    # no evidence renders empty-but-present elements rather than omitting
+    # them -- a receiver's XML parser never has to special-case "field
+    # absent" vs "field empty" for this section.
+    evidence_status = manifest.get("evidence_status") or {}
+    parts.append("<evidence_status>")
+    for key in sorted(evidence_status):
+        value = evidence_status[key]
+        if key == "status_counts" and isinstance(value, dict):
+            parts.append("<status_counts>")
+            for status_key in sorted(value):
+                parts.append(
+                    f'<field name="{esc(status_key)}">{esc(value[status_key])}</field>'
+                )
+            parts.append("</status_counts>")
+        else:
+            parts.append(f'<field name="{esc(key)}">{esc(value)}</field>')
+    parts.append("</evidence_status>")
+    parts.append("<trusted_pointers>")
+    for pointer in manifest.get("trusted_pointers") or []:
+        if not isinstance(pointer, dict):
+            continue
+        parts.append(
+            f'<pointer id="{esc(pointer.get("id"))}" '
+            f'kind="{esc(pointer.get("kind"))}" '
+            f'locator="{esc(pointer.get("locator"))}" '
+            f'label="{esc(pointer.get("label"))}"/>'
+        )
+    parts.append("</trusted_pointers>")
     parts.append("</handoff_manifest>")
 
     xml = "".join(parts)
@@ -9106,6 +9922,19 @@ ACCEPT_RESULT_BOARD_DIVERGENCE = "BOARD_DIVERGENCE"
 ACCEPT_RESULT_TOOL_MANIFEST_DRIFT = "TOOL_MANIFEST_DRIFT"
 ACCEPT_RESULT_BODY_HASH_MISMATCH = "BODY_HASH_MISMATCH"
 ACCEPT_RESULT_CAPABILITY_UNAVAILABLE = "CAPABILITY_UNAVAILABLE"
+# 22f2604d — a presented body's OWN <project_start_config> tag names a
+# project_id/repo_path that disagrees with the identity this envelope is
+# being verified against, even though the goal_token itself (if any) was
+# genuine and correctly scoped. Deliberately distinct from
+# ACCEPT_RESULT_STALE_HANDOFF (that bucket is about the TOKEN's own
+# genuineness/consumption state) and from ACCEPT_RESULT_BODY_HASH_MISMATCH
+# (that requires a body_hash to have been recorded at mint time). This
+# check requires neither: it is a pure self-consistency check on the
+# presented body's declared identity, catching the confirmed incident
+# shape where a genuine token and a foreign project's start-config ended
+# up paired in the same delivered block. See
+# check_project_start_config_identity.
+ACCEPT_RESULT_FOREIGN_PROJECT_CONFIG = "FOREIGN_PROJECT_CONFIG"
 
 # Token-check failure reasons that indicate simple staleness/a sibling
 # already having acted, per AGENTS.md's b763d2ba/ed71ef9b distinction —
@@ -9151,6 +9980,122 @@ def compute_required_tools_hash(items: "list[dict[str, Any]]") -> str:
     return _hash_goal_body(json.dumps(sorted(names), sort_keys=True, separators=(",", ":")))
 
 
+# 22f2604d — identity-binding fail-closed check (confirmed incident: a
+# genuine, correctly-scoped goal_token was paired with a body whose own
+# <project_start_config> tag named a DIFFERENT project than the one the
+# token verified against — "a genuine token returned body_mismatch, and
+# the receiver also saw a project_start_config pointing at the parent
+# Meridian checkout while the actual task was a separate paper project").
+# The receiver correctly refused in that incident; this closes the
+# architecture gap that let such a block be treated as ambiguous rather
+# than mechanically, machine-readably rejected. Existing checks don't
+# cover this: verify_handoff_token's body_hash check (efaa918a) only
+# fires when a body_hash was actually recorded at mint time, and
+# accept_handoff_envelope's own docstring explicitly deferred a
+# project-identity check to "the token's own project_id scoping" — which
+# is exactly the gap here, since a body can be reassembled/wrapped (e.g.
+# a /loop-style wrapper, or a stale sibling handoff pasted alongside a
+# genuine token) WITHOUT ever touching the token or invalidating a
+# body_hash that was never recorded in the first place. This check is
+# orthogonal to token validity: it runs whenever a presented_body is
+# supplied and the token check did not already reject the envelope on
+# its own, separate basis — i.e. token verification passed, or no token
+# was presented at all. When token verification itself fails
+# (STALE_HANDOFF / BODY_HASH_MISMATCH), accept_handoff_envelope returns
+# before reaching this check, since the envelope is already rejected;
+# this check exists to catch what those two cannot, not to re-run
+# unconditionally after a failure they already reported.
+_PROJECT_START_CONFIG_TAG_RE = re.compile(
+    r"<project_start_config\b([^>]*)/?>", re.IGNORECASE
+)
+_PROJECT_START_CONFIG_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+
+
+def _parse_project_start_config(body: "str | None") -> "dict[str, str] | None":
+    """Extract the first ``<project_start_config .../>`` tag's attributes
+    from ``body`` as a plain dict, or ``None`` when no such tag is present.
+
+    Every handoff mode that never emits the tag (``full``/``starter`` — see
+    ``_build_project_start_config_clause``'s own docstring) is a no-op
+    here, never a failure. Deliberately simple attribute-value regex
+    parsing, not a real XML parser: the tag is always emitted by
+    ``_build_project_start_config_clause`` in this exact
+    self-closing-attribute form, and this function only ever READS
+    server-emitted or presented-for-verification text, never executes it.
+    """
+    match = _PROJECT_START_CONFIG_TAG_RE.search(body or "")
+    if not match:
+        return None
+    attrs = dict(_PROJECT_START_CONFIG_ATTR_RE.findall(match.group(1)))
+    return attrs or None
+
+
+def check_project_start_config_identity(
+    presented_body: "str | None",
+    expected_project_id: str,
+    *,
+    expected_repo_path: "str | None" = None,
+) -> "dict[str, Any]":
+    """22f2604d — self-consistency check between a presented body's own
+    ``<project_start_config>`` tag and the identity the CALLER already
+    trusts: ``expected_project_id`` is the same project_id a caller passes
+    to ``verify_handoff_token``/``accept_handoff_envelope`` (its OWN
+    receiving project scope — never a value parsed out of the presented
+    body itself, which would make this check circular and useless).
+    ``expected_repo_path`` — optional, the receiver's own independently-
+    known repo root — is the same discipline: a value the caller already
+    has from its own session/config, not from the body under test.
+
+    Returns ``{"checked": bool, "consistent": bool, "found": dict|None,
+    "reasons": list[str]}``:
+
+    - ``checked=False`` — no ``<project_start_config>`` tag was found in
+      ``presented_body`` (or ``presented_body`` was empty/None). NOT a
+      failure: many handoff modes never emit this tag, and a body that
+      predates this tag's existence is not retroactively suspicious.
+    - ``checked=True, consistent=True`` — the tag was found and every
+      supplied expectation matches it.
+    - ``checked=True, consistent=False`` — the tag was found and at least
+      one supplied expectation disagrees with it; ``reasons`` names
+      exactly which field(s) disagreed.
+
+    Deliberately NOT a substitute for token verification — a caller runs
+    both (see ``accept_handoff_envelope``). This catches a distinct
+    failure mode: a body whose OWN embedded identity tag disagrees with
+    what the caller already trusts, independent of whether a token was
+    presented, was valid, or was checked at all in this call.
+    """
+    found = _parse_project_start_config(presented_body)
+    if found is None:
+        return {"checked": False, "consistent": True, "found": None, "reasons": []}
+    reasons: list[str] = []
+    found_project_id = found.get("project_id")
+    if found_project_id and expected_project_id and found_project_id != expected_project_id:
+        reasons.append(
+            "presented body's <project_start_config project_id="
+            f"{found_project_id!r}> disagrees with the project_id this "
+            f"envelope is being verified against ({expected_project_id!r})"
+        )
+    if expected_repo_path:
+        found_repo_path = found.get("repo_path")
+        if (
+            found_repo_path
+            and found_repo_path != "unset"
+            and found_repo_path != expected_repo_path
+        ):
+            reasons.append(
+                "presented body's <project_start_config repo_path="
+                f"{found_repo_path!r}> disagrees with the receiver's own "
+                f"repo_path ({expected_repo_path!r})"
+            )
+    return {
+        "checked": True,
+        "consistent": not reasons,
+        "found": found,
+        "reasons": reasons,
+    }
+
+
 async def accept_handoff_envelope(
     db: Any,
     project_id: str,
@@ -9162,6 +10107,8 @@ async def accept_handoff_envelope(
     expected_required_tools_hash: "str | None" = None,
     required_tools: "list[str] | None" = None,
     available_tools: "list[str] | None" = None,
+    expected_repo_path: "str | None" = None,
+    delivery_source: str = "chat_paste",
 ) -> "dict[str, Any]":
     """1bd5e810 — canonical receiver-side acceptance check for a handoff
     envelope (a pasted /goal block, a manifest-bound token, or both).
@@ -9182,13 +10129,22 @@ async def accept_handoff_envelope(
        for why these are grouped despite AGENTS.md drawing a real
        spoofing-vs-staleness distinction between them (the raw
        ``token_check.reason`` is always preserved in the response).
-    2. **Capability availability** (``required_tools``/``available_tools``)
+    2. **Identity binding** (``presented_body`` vs this call's OWN
+       ``project_id``/``expected_repo_path``) — delegates to
+       :func:`check_project_start_config_identity`. Runs REGARDLESS of
+       whether step 1 passed, failed, or was never attempted (no
+       ``goal_token`` supplied): a presented body's own
+       ``<project_start_config>`` tag naming a foreign project/repo is
+       ``ACCEPT_RESULT_FOREIGN_PROJECT_CONFIG`` even when the token itself
+       verified ``ok`` — this is the 22f2604d incident's core gap. Skipped
+       (never fails) when ``presented_body`` has no such tag at all.
+    3. **Capability availability** (``required_tools``/``available_tools``)
        — any name in ``required_tools`` absent from ``available_tools``
        (when both are given) is ``ACCEPT_RESULT_CAPABILITY_UNAVAILABLE``.
-    3. **Tool-manifest drift** (``expected_required_tools_hash`` vs a hash
+    4. **Tool-manifest drift** (``expected_required_tools_hash`` vs a hash
        computed from ``live_items``) — see :func:`compute_required_tools_hash`.
        Mismatch is ``ACCEPT_RESULT_TOOL_MANIFEST_DRIFT``.
-    4. **Board revision** (``expected_board_revision`` vs
+    5. **Board revision** (``expected_board_revision`` vs
        :func:`compute_board_revision` of ``live_items``) — mismatch is
        ``ACCEPT_RESULT_BOARD_DIVERGENCE``.
 
@@ -9205,12 +10161,22 @@ async def accept_handoff_envelope(
     This mirrors :func:`verify_board_revision`'s own "pure comparison, no
     fetch" contract.
 
-    Deliberately does NOT compare tenant/project identity as a separate
-    check: when ``goal_token`` is supplied, ``verify_handoff_token``'s own
-    ``project_id`` scoping already fails closed (``wrong_project``, bucketed
-    into ``ACCEPT_RESULT_STALE_HANDOFF`` above) — a caller always passes its
-    OWN receiving project_id here, so a mismatch is inherently caught by
-    that existing check rather than needing a second, redundant comparison.
+    Identity note (22f2604d, supersedes the prior "deliberately does NOT
+    compare tenant/project identity" scope note): step 1's ``wrong_project``
+    check catches a token minted for a DIFFERENT project than this call's
+    ``project_id``. It does NOT catch a token that genuinely belongs to
+    THIS ``project_id`` paired with a body whose OWN
+    ``<project_start_config>`` tag disagrees with that same ``project_id``
+    (e.g. a reassembled/wrapped body) — step 2 exists specifically for
+    that self-consistency gap and is independent of step 1's outcome.
+
+    ``is_trusted_channel`` is always ``False`` and ``delivery_source``
+    always echoes the ``delivery_source`` argument (default
+    ``"chat_paste"``) on every returned dict from this function: calling
+    this function at all means verifying something OTHER than the
+    trusted, project-scoped ``pending_goal``/``load_handoff`` channel (see
+    those functions' own docstrings) — a caller with genuinely trusted
+    content has no need to call this verification path in the first place.
 
     Scope note: this function VALIDATES and REPORTS; it is deliberately NOT
     wired as a hard gate inside claim_sprint_item in this pass (that would
@@ -9233,9 +10199,35 @@ async def accept_handoff_envelope(
                 "result": result,
                 "reasons": [f"handoff token verification failed: reason={reason!r}"],
                 "token_check": token_check,
+                "identity_check": None,
                 "capability_check": None,
                 "tool_manifest_check": None,
                 "board_check": None,
+                "is_trusted_channel": False,
+                "delivery_source": delivery_source,
+            }
+
+    # 22f2604d — identity binding: independent of token validity above.
+    # Runs whenever a presented_body is supplied, even when goal_token was
+    # never given at all, so a foreign project_start_config is caught
+    # whether or not the caller happened to also have a token in hand.
+    identity_check: "dict[str, Any] | None" = None
+    if presented_body:
+        identity_check = check_project_start_config_identity(
+            presented_body, project_id, expected_repo_path=expected_repo_path,
+        )
+        if identity_check["checked"] and not identity_check["consistent"]:
+            return {
+                "accepted": False,
+                "result": ACCEPT_RESULT_FOREIGN_PROJECT_CONFIG,
+                "reasons": list(identity_check["reasons"]),
+                "token_check": token_check,
+                "identity_check": identity_check,
+                "capability_check": None,
+                "tool_manifest_check": None,
+                "board_check": None,
+                "is_trusted_channel": False,
+                "delivery_source": delivery_source,
             }
 
     capability_check: "dict[str, Any] | None" = None
@@ -9252,9 +10244,12 @@ async def accept_handoff_envelope(
                 "result": ACCEPT_RESULT_CAPABILITY_UNAVAILABLE,
                 "reasons": [f"required tool(s) unavailable: {', '.join(missing)}"],
                 "token_check": token_check,
+                "identity_check": identity_check,
                 "capability_check": capability_check,
                 "tool_manifest_check": None,
                 "board_check": None,
+                "is_trusted_channel": False,
+                "delivery_source": delivery_source,
             }
 
     tool_manifest_check: "dict[str, Any] | None" = None
@@ -9274,9 +10269,12 @@ async def accept_handoff_envelope(
                     "changed since this envelope was generated"
                 ],
                 "token_check": token_check,
+                "identity_check": identity_check,
                 "capability_check": capability_check,
                 "tool_manifest_check": tool_manifest_check,
                 "board_check": None,
+                "is_trusted_channel": False,
+                "delivery_source": delivery_source,
             }
 
     board_check: "dict[str, Any] | None" = None
@@ -9296,9 +10294,12 @@ async def accept_handoff_envelope(
                     "longer matches this envelope's declared board_revision"
                 ],
                 "token_check": token_check,
+                "identity_check": identity_check,
                 "capability_check": capability_check,
                 "tool_manifest_check": tool_manifest_check,
                 "board_check": board_check,
+                "is_trusted_channel": False,
+                "delivery_source": delivery_source,
             }
 
     return {
@@ -9306,9 +10307,12 @@ async def accept_handoff_envelope(
         "result": ACCEPT_RESULT_OK,
         "reasons": [],
         "token_check": token_check,
+        "identity_check": identity_check,
         "capability_check": capability_check,
         "tool_manifest_check": tool_manifest_check,
         "board_check": board_check,
+        "is_trusted_channel": False,
+        "delivery_source": delivery_source,
     }
 
 
@@ -9639,6 +10643,7 @@ async def generate_handoff(
     strict_continuation: bool = False,
     continuation_status: dict[str, Any] | None = None,
     selected_item_ids: list[str] | None = None,
+    selected_scope_outcome: "dict[str, Any] | None" = None,
     promotion_readiness: dict[str, Any] | None = None,
     strict_test_evidence: bool = False,
     test_run_evidence: dict[str, Any] | None = None,
@@ -9646,6 +10651,7 @@ async def generate_handoff(
     emit_manifest: bool = False,
     research_evidence_envelope: Any = None,
     proposal_scope: "dict[str, Any] | None" = None,
+    goal_string_out: "dict[str, Any] | None" = None,
 ) -> tuple[str, str, bool]:
     """Fetch all state, render the L0/L1/L2 template, write the file, return both.
 
@@ -9823,6 +10829,25 @@ async def generate_handoff(
     functional change to ``(path, content, amended)`` or to ``content``
     itself — this never touches the rendered template.
 
+    ``goal_string_out`` (455cfc36) — optional output dict, same purely-
+    additive out-param shape as ``evidence_status``/``proposal_scope``
+    above. When given (any dict, typically ``{}``), it is populated with
+    ``{"goal_string": ..., "version": ...}`` where ``goal_string`` is the
+    EXACT canonical, token-embedded ``quick_start_goal`` text this call
+    already rendered into ``content`` — the same complete trusted
+    executable continuation block (``<goal_token>``, execution policy,
+    proposal scope, project-start config) every full/delta handoff embeds,
+    with zero independent re-assembly and zero second token mint. Exists so
+    a caller like ``checkpoint()`` can populate its own compact ``next_goal``
+    field from the SAME canonical payload the returned ``content`` carries,
+    instead of hand-rolling a separate, un-tokenized summary string (the
+    confirmed live gap this closes — see ``handle_checkpoint``). Only
+    populated for ``mode in {"full", "delta"}`` (the only modes that reach
+    the shared ``_mint_and_embed_goal_token`` call site below); a caller
+    that passes ``None`` (every pre-existing call site) sees zero
+    functional change to ``(path, content, amended)`` or to ``content``
+    itself.
+
     ``mode='delta'`` (836ca1d5) additionally embeds a durable continuation
     manifest — see :func:`build_continuation_manifest` — as a
     ``<continuation_manifest>`` JSON tag in the rendered body: the same
@@ -9939,6 +10964,32 @@ async def generate_handoff(
     (it returns before this resolution runs, same as the pre-existing
     ``version``/``HandoffStaleReferenceError`` handling below).
 
+    ``selected_scope_outcome`` (d2fc7465) — optional output dict, same
+    purely-additive out-param shape as ``evidence_status``/
+    ``force_include_rejected`` above: when given (any dict, typically
+    ``{}``) AND ``selected_item_ids`` is also given, populated in place with
+    ``{"selected_item_ids", "closure_item_ids", "closure_hash",
+    "requested_ids", "executable_ids", "excluded_requested",
+    "all_excluded"}``. The first three are copied straight from
+    :func:`_resolve_selected_item_scope`'s own return the moment it resolves
+    — the exact same ids/hash already rendered into the body's
+    ``<selected_item_scope>`` tag, now ALSO available as a structured field
+    for a caller that would rather not parse XML out of ``content``. The
+    remaining four are populated by whichever executable mode actually runs
+    (see ``_build_quick_start_goal``'s own ``selected_scope_outcome``
+    docstring) and report which of the requested ids survived every
+    downstream claimability filter (unprospected/backburner/manual/wave-gate)
+    — this is the "omitted ids, with reasons" signal that was previously
+    surfaced ONLY on total failure (:class:`HandoffScopeNonExecutable`,
+    ``all_excluded=True``); a call that succeeds with a PARTIAL exclusion
+    (some, not all, requested ids dropped) used to leave a caller with no
+    way to learn that short of diffing the rendered ``<sprint_items>`` list
+    by hand. A caller that passes ``None`` (the default — every pre-existing
+    call site) sees ZERO functional change to the returned ``(path, content,
+    amended)`` or to ``content`` itself; a caller that never passes
+    ``selected_item_ids`` sees this dict stay empty (or whatever it already
+    contained) regardless.
+
     ``promotion_readiness`` (24f5146d) — optional output dict, SAME purely-
     additive out-param shape as ``evidence_status``/``continuation_status``
     above: when given (any dict, typically ``{}``), it is populated in place
@@ -10014,6 +11065,11 @@ async def generate_handoff(
         _resolved_max_bytes = max_content_bytes  # type: ignore[assignment]
     if mode == "planner":
         _pl_path, _pl_content = await _generate_planner_handoff(db, project_id, output_dir)
+        # aec043cb — see _mark_session_handoff_produced's docstring: keeps
+        # the resumed-session -> 'delta' auto-switch working now that
+        # 'planner' is reachable via an omitted mode too (a session
+        # registered role='planner'), not just an explicit request.
+        _mark_session_handoff_produced(session_id)
         return (
             _pl_path,
             format_handoff_mcp_content(_pl_content, max_bytes=_resolved_max_bytes),
@@ -10044,12 +11100,29 @@ async def generate_handoff(
     _selected_scope = await _resolve_selected_item_scope(
         db, project_id, selected_item_ids, effective_version=_effective_version,
     )
+    # d2fc7465 — seed the CALLER's own selected_scope_outcome dict (when
+    # given) with the ids/hash _resolve_selected_item_scope just computed, so
+    # they are visible to a caller even for a mode that never reaches the
+    # exclusion-filter step below (or fails before it) — the same dict object
+    # is reused (not copied) so every further write below (by whichever mode
+    # branch actually runs) lands on the SAME dict the caller is holding.
+    if selected_scope_outcome is not None and _selected_scope:
+        selected_scope_outcome.update({
+            "selected_item_ids": _selected_scope.get("selected_item_ids"),
+            "closure_item_ids": _selected_scope.get("closure_item_ids"),
+            "closure_hash": _selected_scope.get("closure_hash"),
+        })
     # fb82e51f — out-param for _build_quick_start_goal's full/delta call below
     # (the starter/goal-only modes compute their own inside their respective
     # helper functions, which already receive _selected_scope as an
     # argument). See HandoffScopeNonExecutable's docstring for the check this
-    # feeds.
-    _selected_scope_outcome: dict[str, Any] = {}
+    # feeds. d2fc7465 — seeded from the caller's own out-param (when given)
+    # rather than always starting fresh, so the closure fields just written
+    # above and the exclusion fields _build_quick_start_goal writes below
+    # land in the SAME dict.
+    _selected_scope_outcome: dict[str, Any] = (
+        selected_scope_outcome if selected_scope_outcome is not None else {}
+    )
     # 2204ce80 — optional, additive "related planning records" lookup. Runs
     # only when the caller opted in on BOTH arguments; see the docstring above.
     if related_records_query is not None and related_records is not None:
@@ -10079,7 +11152,14 @@ async def generate_handoff(
             evidence_status=evidence_status,
             strict_pointer_evidence=strict_pointer_evidence,
             selected_scope=_selected_scope,
+            selected_scope_outcome=_selected_scope_outcome,
             proposal_scope=proposal_scope,
+            # 4f3bd70c — session_id now threaded consistently into EVERY mode's
+            # build_effective_profile_binding call, matching full/delta below
+            # and the MCP wrapper's own sibling profile_binding computation
+            # (previously starter/compact silently resolved the binding with
+            # no session_id at all — see that function's own comment).
+            session_id=session_id,
         )
         return (
             _st_path,
@@ -10104,13 +11184,42 @@ async def generate_handoff(
             strict_pointer_evidence=strict_pointer_evidence,
             force_include_rejected=force_include_rejected,
             selected_scope=_selected_scope,
+            selected_scope_outcome=_selected_scope_outcome,
             emit_manifest=emit_manifest,
             proposal_scope=proposal_scope,
+            # 4f3bd70c — same session_id threading fix as the starter/compact
+            # branch above; goal-only previously had no session_id parameter
+            # at all (see that function's own signature/comment).
+            session_id=session_id,
+            # MDE-5 -- goal mode previously never saw research_evidence_
+            # envelope at all (it returns before the full/delta-only
+            # _render_research_evidence_block append further below in this
+            # function), so a caller's evidence was silently invisible in
+            # exactly the mode documented as "hand straight to a fresh
+            # sub-agent with zero framing". See _generate_goal_only_handoff's
+            # own docstring for what this now renders.
+            research_evidence_envelope=research_evidence_envelope,
+        )
+        # aec043cb — see _mark_session_handoff_produced's docstring: 'goal'
+        # is now the common omitted-mode default, so it must keep the
+        # resumed-session -> 'delta' auto-switch working for THIS session's
+        # next call, exactly as the old 'full' default always did.
+        _mark_session_handoff_produced(session_id)
+        # aec043cb — see _persist_handoff_history_and_pending_goal's own
+        # docstring: 'goal' mode never wired into the handoffs history table
+        # or the trusted pending_goal channel (a latent, inconsequential gap
+        # since 682005f4 — 'goal' was explicit-request-only back then). Now
+        # that it is the common omitted-mode default, it must use the SAME
+        # trusted channel AGENTS.md documents for start_session/load_handoff,
+        # exactly like full/delta always have. content == pending_goal_body
+        # here: the entire goal-only body IS the /goal snippet.
+        _g_amended = await _persist_handoff_history_and_pending_goal(
+            db, project_id, "goal", _g_content, session_id, _g_content,
         )
         return (
             _g_path,
             format_handoff_mcp_content(_g_content, max_bytes=_resolved_max_bytes),
-            False,
+            _g_amended,
         )
     if mode not in {"full", "delta"}:
         raise ValueError(
@@ -10167,8 +11276,25 @@ async def generate_handoff(
     project_notes = await db_module.get_project_notes(db, project_id, bodies=True)
     strategic_notes = _select_strategic_notes(project_notes)
     # v3.1 — workspace decisions + notes apply across all projects.
-    workspace_decisions = await db_module.get_workspace_decisions(db)
-    workspace_notes = await db_module.get_workspace_notes(db)
+    # aec043cb — that "across all projects" scope is exactly why this is
+    # confined to mode == "full" now: full is the explicit, opt-in archival/
+    # diagnostic dump (never an omitted-mode default anymore — see
+    # resolve_handoff_mode), so a caller who deliberately asked for it is
+    # knowingly asking for cross-project context. mode == "delta" (a bounded
+    # per-session continuation update, whether reached explicitly or via the
+    # resumed-session auto-switch) must NOT bulk-inject unrelated workspace
+    # records — a decision or note pinned for a completely different project
+    # (interview notes, thesis findings, anything workspace-wide but
+    # project-irrelevant) has no business in a bounded continuation handoff.
+    # No allowlisted "workspace-policy" channel exists yet for delta/goal/
+    # starter/planner to opt into a narrow slice of this — see the aec043cb
+    # item notes point 4; until one exists, the answer is "none survives".
+    if mode == "full":
+        workspace_decisions = await db_module.get_workspace_decisions(db)
+        workspace_notes = await db_module.get_workspace_notes(db)
+    else:
+        workspace_decisions = []
+        workspace_notes = []
     # 45f519a0 — include_deferred=False so a deferred item is genuinely invisible
     # to executors in the handoff pending-items list, not just gated at claim time.
     # b8f89491 — version=_effective_version scopes the ENTIRE downstream pipeline
@@ -10735,6 +11861,20 @@ async def generate_handoff(
     # starter/compact path via _generate_starter_handoff, which previously
     # built its own quick_start_goal but never called this).
     quick_start_goal = await _mint_and_embed_goal_token(db, project_id, quick_start_goal)
+    # 455cfc36 — expose the EXACT canonical, token-embedded goal string a
+    # caller like checkpoint() can reuse verbatim instead of independently
+    # re-assembling its own next_goal summary (the confirmed live gap: a
+    # hand-rolled f-string with no <goal_token>, no execution_policy, no
+    # proposal_scope — not "a complete trusted executable continuation
+    # block"). Pure ADDITION, mirroring the existing evidence_status/
+    # proposal_scope out-param convention: a caller that passes None (every
+    # pre-existing call site) sees zero functional change. Only reached for
+    # mode in {"full", "delta"} — starter/compact/goal mint their own token
+    # in their own early-return helpers and are not in scope for this
+    # out-param (checkpoint() only ever calls mode="delta").
+    if goal_string_out is not None:
+        goal_string_out["goal_string"] = quick_start_goal
+        goal_string_out["version"] = _effective_version
 
     # Split tasks into L1 (last 10) and L2 (older).
     l1_tasks = tasks[:10]
@@ -11016,6 +12156,28 @@ async def generate_handoff(
     if _research_evidence_block:
         content = f"{content}\n\n{_research_evidence_block}"
 
+    # MDE-3 rework — "exact evidence in handoff" for release transactions
+    # (meridian.db.docx_merge's PREPARED->...->RELEASED state machine)
+    # previously ONLY reached goal mode (_generate_goal_only_handoff). This
+    # is the STANDARD/full handoff body — the mode most sessions actually
+    # read — so it gets the SAME evidence, all three projections (Markdown
+    # for a human reader, an XML tag + a fenced JSON block for a machine
+    # parser), from the SAME summary dict as goal mode. Best-effort and
+    # purely additive: "" input from a project with zero release-transaction
+    # activity means zero change to existing handoff content.
+    _release_evidence = await _release_transaction_evidence_summary(db, project_id)
+    _release_evidence_md = render_release_transaction_evidence_markdown(_release_evidence)
+    if _release_evidence_md:
+        content = f"{content}\n\n{_release_evidence_md}"
+    _release_evidence_xml = render_release_transaction_evidence_xml(_release_evidence)
+    if _release_evidence_xml:
+        content = f"{content}\n{_release_evidence_xml}"
+    _release_evidence_json = render_release_transaction_evidence_json(_release_evidence)
+    if _release_evidence_json:
+        content = (
+            f"{content}\n\n```json release_transactions\n{_release_evidence_json}\n```"
+        )
+
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{handoff_file_stem(project_id)}_handoff.md"
@@ -11041,32 +12203,12 @@ async def generate_handoff(
     # service (regenerate_handoff_correction calls generate_handoff, so
     # generate_handoff routing its own amend decision back through
     # regenerate_handoff_correction would recurse).
-    _amended = False
-    try:
-        _prior_goal = await db_module.get_pending_goal(db, project_id)
-        if _prior_goal is not None:
-            # Prior handoff exists and was never consumed — amend in-place.
-            _amend_result = await db_module.amend_handoff(db, project_id, content, mode)
-            if _amend_result is not None:
-                _amended = True
-            else:
-                # No prior row to amend (e.g. pre-migration DB or the row was
-                # deleted externally) — fall through to fresh record.
-                await db_module.record_handoff(db, project_id, mode, content, session_id)
-        else:
-            # 8819d6b1 — fresh handoff: persist to the history table so the
-            # dashboard / planner can list past handoffs and detect new ones.
-            await db_module.record_handoff(db, project_id, mode, content, session_id)
-    except Exception:  # noqa: BLE001 — never break handoff generation
-        pass
-    # 5efe254b — persist the /goal to the trusted channel so the next
-    # start_session can surface it as an MCP tool result (keyed on project_id)
-    # instead of a spoofable copy-pasted chat string. Read-once (pop). Fully
-    # guarded so a pre-migration DB never breaks handoff generation.
-    try:
-        await db_module.set_pending_goal(db, project_id, quick_start_goal)
-    except Exception:  # noqa: BLE001
-        pass
+    # aec043cb — extracted to _persist_handoff_history_and_pending_goal
+    # (zero behavior change: same calls, same order, same guards) so 'goal'
+    # mode can reuse it too. See that function's own docstring.
+    _amended = await _persist_handoff_history_and_pending_goal(
+        db, project_id, mode, content, session_id, quick_start_goal,
+    )
     # 5abf3e12 — measure & persist this session's goal compliance (did its /goal
     # item list get fully complete_sprint_item()'d?) at the canonical session-end
     # point. N = items this session took on (actor = session id), M = of those,
@@ -11322,7 +12464,9 @@ async def _generate_starter_handoff(
     evidence_status: dict[str, Any] | None = None,
     strict_pointer_evidence: bool = False,
     selected_scope: "dict[str, Any] | None" = None,
+    selected_scope_outcome: "dict[str, Any] | None" = None,
     proposal_scope: "dict[str, Any] | None" = None,
+    session_id: str | None = None,
 ) -> tuple[str, str]:
     """Compact ≤20-line starter block for paste-after-/compact or cold start.
 
@@ -11467,14 +12611,24 @@ async def _generate_starter_handoff(
     )
     # fb82e51f — see HandoffScopeNonExecutable's docstring: a selected_scope
     # that validated cleanly can still collapse to zero executable items once
-    # the exclusion filters below run.
-    _s_selected_scope_outcome: dict[str, Any] = {}
+    # the exclusion filters below run. d2fc7465 — seeded from the caller's
+    # own out-param (when given) rather than always starting fresh, so the
+    # closure fields generate_handoff already wrote land in the SAME dict.
+    _s_selected_scope_outcome: dict[str, Any] = (
+        selected_scope_outcome if selected_scope_outcome is not None else {}
+    )
     # 89a06e40 — resolved ONCE per starter/compact render, threaded into
-    # quick_start_goal's inline <profile_generation> tag below. No session_id
-    # in scope for this mode (see this function's own signature) — resolves
-    # the project/workspace/hosted_default layers only. Best-effort: None on
-    # any failure, per build_effective_profile_binding's own docstring.
-    _s_profile_binding = await build_effective_profile_binding(db, project_id)
+    # quick_start_goal's inline <profile_generation> tag below. 4f3bd70c —
+    # now passes session_id (this function's own new parameter) so
+    # starter/compact resolves the SAME session-scoped layer full/delta and
+    # the MCP wrapper's sibling profile_binding already did; a caller with no
+    # session_id (the default) sees identical behavior to before this fix —
+    # build_effective_profile_binding treats a missing session_id exactly
+    # like before. Best-effort: None on any failure, per
+    # build_effective_profile_binding's own docstring.
+    _s_profile_binding = await build_effective_profile_binding(
+        db, project_id, session_id=session_id,
+    )
     quick_start_goal = _build_quick_start_goal(
         pending,
         execution_mode=_s_execution_mode,
@@ -11591,13 +12745,39 @@ async def _generate_goal_only_handoff(
     strict_pointer_evidence: bool = False,
     force_include_rejected: "list[dict[str, Any]] | None" = None,
     selected_scope: "dict[str, Any] | None" = None,
+    selected_scope_outcome: "dict[str, Any] | None" = None,
     emit_manifest: bool = False,
     proposal_scope: "dict[str, Any] | None" = None,
+    research_evidence_envelope: Any = None,
+    session_id: str | None = None,
 ) -> tuple[str, str]:
     """682005f4 — the 6th handoff mode: return ONLY the bare /goal block.
 
+    ``session_id`` (4f3bd70c) — optional, ``None`` by default (zero behaviour
+    change for a caller that omits it). Threaded into
+    :func:`build_effective_profile_binding` below so ``mode='goal'`` resolves
+    the SAME session-scoped profile layer full/delta and the MCP wrapper's
+    own sibling ``profile_binding`` computation already did — this mode
+    previously had no ``session_id`` parameter at all and always resolved
+    only the project/workspace/hosted_default layers, silently disagreeing
+    with a session-scoped override that WAS in effect elsewhere.
+
     ``strict_evidence``/``evidence_status`` (8a883f60) — threaded straight
     through from ``generate_handoff``; see its docstring.
+
+    ``research_evidence_envelope`` (MDE-5) — optional, ``None`` by default
+    (zero behaviour change). Previously this mode NEVER saw this parameter
+    at all: ``generate_handoff``'s own ``_render_research_evidence_block``
+    append only ran on its full/delta branch, further below in that
+    function, which goal mode returns before ever reaching — so a caller's
+    research evidence was silently invisible in exactly the mode documented
+    as "hand straight to a fresh sub-agent with zero framing". Now: (1) the
+    same "## Research Evidence" Markdown projection full/delta already
+    render is appended here too, and (2) when ``emit_manifest=True``, the
+    envelope is also reduced to a small, bounded ``evidence_status``/
+    ``trusted_pointers`` pair (see ``_evidence_status_and_pointers_from_
+    envelope``) and embedded into the canonical ``<handoff_manifest>`` XML
+    block — machine-readable, not just narrated prose.
     ``freshness_requery`` is always reported ``skipped`` here (this mode,
     like starter/compact, never re-queries pending items right before
     rendering — only full/delta do); the other four capabilities reflect
@@ -11823,16 +13003,24 @@ async def _generate_goal_only_handoff(
     _g_execution_mode = db_module.normalize_execution_mode(project.get("execution_mode"))
     # fb82e51f — see HandoffScopeNonExecutable's docstring: a selected_scope
     # that validated cleanly can still collapse to zero executable items once
-    # the exclusion filters below run.
-    _g_selected_scope_outcome: dict[str, Any] = {}
+    # the exclusion filters below run. d2fc7465 — seeded from the caller's
+    # own out-param (when given) rather than always starting fresh, so the
+    # closure fields generate_handoff already wrote land in the SAME dict.
+    _g_selected_scope_outcome: dict[str, Any] = (
+        selected_scope_outcome if selected_scope_outcome is not None else {}
+    )
     # 89a06e40 — resolved ONCE per goal-only render, threaded into
     # quick_start_goal's inline <profile_generation> tag below. mode="goal"
     # is the ONE handoff mode that returns ONLY this rendered text (no
     # sibling `profile_binding` field for a caller to fall back on — see
     # generate_handoff's own docstring), so this tag is this mode's sole
-    # profile-identity signal. No session_id in scope for this mode (see
-    # this function's own signature). Best-effort: None on any failure.
-    _g_profile_binding = await build_effective_profile_binding(db, project_id)
+    # profile-identity signal. 4f3bd70c — now passes session_id (this
+    # function's own new parameter), matching full/delta/starter/compact so
+    # goal mode never disagrees with a session-scoped profile override that
+    # IS in effect. Best-effort: None on any failure.
+    _g_profile_binding = await build_effective_profile_binding(
+        db, project_id, session_id=session_id,
+    )
     # 7479e427 — always built locally so the <proposal_scope> tag can render
     # below regardless of whether the caller opted into the proposal_scope
     # out-param (mirrored into it afterward when given).
@@ -11914,6 +13102,13 @@ async def _generate_goal_only_handoff(
     # the existing body_hash mechanism covers it too; raises
     # HandoffManifestTooLarge (fail closed, same convention as
     # HandoffScopeNonExecutable just above) rather than truncating.
+    # MDE-5 — reduce the optional research-evidence envelope ONCE, reused by
+    # both the manifest (machine-readable) and the Markdown projection
+    # (human-readable) below. (None, []) when no envelope was supplied —
+    # zero behaviour change for every existing caller.
+    _g_evidence_status, _g_trusted_pointers = _evidence_status_and_pointers_from_envelope(
+        research_evidence_envelope
+    )
     if emit_manifest:
         _g_manifest = build_handoff_manifest(
             handoff_mode="goal",
@@ -11925,10 +13120,49 @@ async def _generate_goal_only_handoff(
             selected_item_ids=(selected_scope or {}).get("selected_item_ids"),
             closure_item_ids=(selected_scope or {}).get("closure_item_ids"),
             waves=(_parallel_groups or {}).get("groups"),
+            evidence_status=_g_evidence_status,
+            trusted_pointers=_g_trusted_pointers,
         )
         quick_start_goal = (
             f"{quick_start_goal}\n{serialize_handoff_manifest_xml(_g_manifest)}"
         )
+    # MDE-5 — the same "## Research Evidence" Markdown projection full/delta
+    # already render (_render_research_evidence_block), now also available
+    # in goal mode — previously invisible here entirely (see this function's
+    # own research_evidence_envelope docstring). Placed pre-mint (part of
+    # the hashed body), same as the manifest splice just above.
+    _g_research_evidence_block = _render_research_evidence_block(research_evidence_envelope)
+    if _g_research_evidence_block:
+        quick_start_goal = f"{quick_start_goal}\n\n{_g_research_evidence_block}"
+    # MDE-3 — "exact evidence in handoff": when emit_manifest=True, also
+    # surface this project's release-transaction crash-recovery evidence
+    # (meridian.db.docx_merge's PREPARED->...->RELEASED state machine) as a
+    # machine-readable <release_transactions> block — a receiver can see,
+    # without a separate query, whether any change-set is stuck in
+    # RECOVERY_REQUIRED before treating this project as cleanly releasable.
+    # Gated on emit_manifest (not unconditional) to avoid an extra DB round
+    # trip on every goal-mode call for projects that never opted into
+    # machine-readable manifests at all; "" for a project with zero
+    # release-transaction activity, so this is zero-behavior-change for
+    # every existing caller/project.
+    if emit_manifest:
+        _g_release_evidence = await _release_transaction_evidence_summary(db, project_id)
+        _g_release_evidence_block = render_release_transaction_evidence_xml(_g_release_evidence)
+        if _g_release_evidence_block:
+            quick_start_goal = f"{quick_start_goal}\n{_g_release_evidence_block}"
+        # MDE-3 rework — the SAME summary also as Markdown + JSON, so goal
+        # mode carries all three projections of identical evidence, not
+        # just XML. Independently guarded ("" input -> no-op) so a project
+        # with zero release-transaction activity sees zero change.
+        _g_release_evidence_md = render_release_transaction_evidence_markdown(_g_release_evidence)
+        if _g_release_evidence_md:
+            quick_start_goal = f"{quick_start_goal}\n\n{_g_release_evidence_md}"
+        _g_release_evidence_json = render_release_transaction_evidence_json(_g_release_evidence)
+        if _g_release_evidence_json:
+            quick_start_goal = (
+                f"{quick_start_goal}\n\n```json release_transactions\n"
+                f"{_g_release_evidence_json}\n```"
+            )
     # f471c4b8 — append the SAME machine-readable project-start-configuration
     # tag full/delta/starter render, BEFORE the token is minted below. This
     # is the mode explicitly documented as "hand straight to a fresh

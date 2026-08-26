@@ -43,6 +43,21 @@ async def handle_checkpoint(
     # Fetch recent commits for reconcile annotations (non-fatal)
     _ckpt_project = await db_module.get_project(db, project_id)
     _commits = await fetch_recent_commits(_ckpt_project or {}, tenant)
+    # 455cfc36 — optional EXPLICIT version override, same semantics as
+    # generate_handoff's own `version` kwarg ("an explicit version argument
+    # always wins; otherwise falls back to the session's own sprint_version").
+    # Confirmed live gap this closes: checkpoint() had NO way to accept a
+    # version at all — its inputSchema never declared the field — so a
+    # caller that genuinely wanted the current/unscoped board (e.g. a stale
+    # session row still carrying an old sprint_version like "v0.2.6") could
+    # not override it; checkpoint silently kept resolving the stale
+    # session-stored scope regardless of what the caller asked for. Resolved
+    # ONCE, up front, and threaded into BOTH the generate_handoff call below
+    # AND the pending/in_progress queries further down so every part of this
+    # response — summary, next_goal, pending_ids, pending_count,
+    # in_progress_items — agrees on the same scope (criterion: "board
+    # snapshot, continuation manifest, and item selection all agree").
+    _explicit_version = args.get("version") or None
     # 7479e427 — unified proposal-run scope out-param: populated by the SAME
     # generate_handoff(mode="delta") call below, so checkpoint()'s own
     # next_goal can agree with the exact executable batch that call's
@@ -51,6 +66,13 @@ async def handle_checkpoint(
     # independently re-deriving a naive, unfiltered id list. See
     # build_proposal_run_scope's own docstring in meridian/handoff.py.
     _proposal_scope: dict[str, Any] = {}
+    # 455cfc36 — populated by the SAME generate_handoff(mode="delta") call
+    # below with the exact canonical, token-embedded goal string already
+    # rendered into `content` — see generate_handoff's `goal_string_out`
+    # docstring. Lets next_goal (built further below) reuse the real
+    # trusted executable continuation block instead of an independently
+    # assembled, un-tokenized summary string.
+    _goal_string_out: dict[str, Any] = {}
     try:
         # 60eed526 — checkpoint=True bounds the RETURNED delta content to
         # _DEFAULT_CHECKPOINT_MAX_BYTES instead of full/delta's generous
@@ -66,12 +88,15 @@ async def handle_checkpoint(
                 identity=resolve_caller_identity(tenant),
                 checkpoint=True,
                 proposal_scope=_proposal_scope,
+                version=_explicit_version,
+                goal_string_out=_goal_string_out,
             ),
             timeout=30.0,
         )
     except asyncio.TimeoutError:
         content = "delta handoff timed out"
         _proposal_scope = {}
+        _goal_string_out = {}
     # 660314c1 — scope pending/in_progress + next_goal to the SAME
     # sprint-version bucket generate_handoff (above) already resolved for this
     # session, via the identical helper (`_resolve_session_sprint_version`) that
@@ -82,7 +107,10 @@ async def handle_checkpoint(
     # different version (v0.2.5, v0.3.x). `None` (a session never version-
     # scoped, or version-scoping not in use for this project) preserves the
     # original unscoped behaviour exactly.
-    _ckpt_version = await handoff_module_local._resolve_session_sprint_version(
+    # 455cfc36 — an explicit `_explicit_version` always wins over the
+    # session-resolved scope, exactly mirroring generate_handoff's own
+    # precedence (and the `goal_string_out["version"]` it reports back).
+    _ckpt_version = _explicit_version or await handoff_module_local._resolve_session_sprint_version(
         db, session_id
     )
     pending_items = await db_module.get_sprint_items(
@@ -117,16 +145,37 @@ async def handle_checkpoint(
     ]
     if _proposal_scope:
         ids_str = ", ".join(i[:8] for i in _scope_ids[:8])
-        next_goal = (
+        next_goal_summary = (
             f'/goal Complete sprint items: {", ".join(_scope_ids[:8])}. '
             f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
         ) if _scope_ids else "/goal Continue work — all sprint items done."
     else:
         ids_str = ", ".join(it["id"][:8] for it in pending_items[:8])
-        next_goal = (
+        next_goal_summary = (
             f'/goal Complete sprint items: {", ".join(it["id"] for it in pending_items[:8])}. '
             f"Done when complete_sprint_item()\'d, tests pass, generate_handoff called."
         ) if pending_items else "/goal Continue work — all sprint items done."
+    # 455cfc36 — prefer the CANONICAL, token-embedded goal string generate_handoff
+    # already rendered (see goal_string_out's docstring) over the short
+    # `next_goal_summary` one-liner above: the confirmed live gap was that
+    # checkpoint()'s next_goal was "a generic string rather than a complete
+    # trusted executable continuation block" — no <goal_token>, no
+    # execution_policy, no proposal_scope clause, nothing a receiver could
+    # run verify_handoff_token against. Bounded via the SAME byte budget
+    # _build_continue_payload's own goal_string already uses, so this can
+    # never reintroduce the oversized-checkpoint regression checkpoint=True
+    # already guards `summary` against. Falls back to the short summary when
+    # generate_handoff timed out (goal_string_out never populated) or ran in
+    # a mode this out-param doesn't cover — never a hard failure.
+    _canonical_goal_string = _goal_string_out.get("goal_string")
+    next_goal = (
+        handoff_module_local.format_handoff_mcp_content(
+            _canonical_goal_string,
+            max_bytes=handoff_module_local._DEFAULT_CONTINUE_GOAL_MAX_BYTES,
+        )
+        if _canonical_goal_string
+        else next_goal_summary
+    )
     # 04f03ee4 — include start_session one-liner so next session can resume immediately
     # 11a91d31 — default to project_name (idiomatic per 8a449ec0); project_id as a comment.
     try:
@@ -162,7 +211,11 @@ async def handle_checkpoint(
                 "session_name": _session_name,
                 "items_done": _items_done,
                 "summary_line": _summary_line,
-                "next_goal": next_goal,
+                # 455cfc36 — the compact one-liner, not the full canonical
+                # `next_goal` (which may now carry a <goal_token>/SECURITY
+                # banner and the full executable block) — this snapshot
+                # feeds a dashboard display card, not an executor.
+                "next_goal": next_goal_summary,
                 "start_fresh": start_fresh,
                 "checkpointed_at": _ckpt_dt.now(_ckpt_tz.utc).strftime(
                     "%Y-%m-%d %H:%M:%S"

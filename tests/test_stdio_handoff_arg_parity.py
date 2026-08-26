@@ -91,6 +91,12 @@ async def test_stdio_generate_handoff_schema_exposes_new_args(db, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stdio_generate_handoff_force_include_ids_reincludes_deferred(db, monkeypatch):
+    """aec043cb — explicit mode='full' here: this test is about
+    force_include_ids arg-threading over the stdio transport, not mode
+    resolution, and the new omitted-mode default ('goal') deliberately never
+    renders item titles at all (only bare ids — see resolve_handoff_mode's
+    docstring), which would make the title-text assertions below meaningless
+    regardless of whether the override actually worked."""
     project = await db_module.create_project(db, "stdio-force-include")
     future = "2099-01-01T00:00:00"
     deferred = await db_module.add_sprint_item(
@@ -103,7 +109,7 @@ async def test_stdio_generate_handoff_force_include_ids_reincludes_deferred(db, 
     # proves the assertion below is actually exercising the override, not a
     # handoff that always shows everything.
     baseline = await _call_generate_handoff(
-        server, {"project_id": project["id"]}
+        server, {"project_id": project["id"], "mode": "full"}
     )
     assert "Stdio deferred task" not in baseline["content"]
 
@@ -111,6 +117,7 @@ async def test_stdio_generate_handoff_force_include_ids_reincludes_deferred(db, 
         server,
         {
             "project_id": project["id"],
+            "mode": "full",
             "force_include_ids": [deferred["id"]],
         },
     )

@@ -77,9 +77,14 @@ async def test_accept_with_no_inputs_is_accepted_noop(db):
         "result": handoff_module.ACCEPT_RESULT_OK,
         "reasons": [],
         "token_check": None,
+        # 22f2604d — identity_check is None (never even attempted) when no
+        # presented_body is supplied at all.
+        "identity_check": None,
         "capability_check": None,
         "tool_manifest_check": None,
         "board_check": None,
+        "is_trusted_channel": False,
+        "delivery_source": "chat_paste",
     }
 
 

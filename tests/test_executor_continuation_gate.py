@@ -491,14 +491,22 @@ async def test_complete_sprint_item_continuation_scoped_to_own_version(db):
 def test_post_handoff_endpoint_strict_continuation_returns_structured_422(client):
     """strict_continuation=True with actionable work remaining returns a
     structured 422 (HANDOFF_CONTINUATION_BLOCKED), mirroring the existing
-    strict_evidence/HANDOFF_EVIDENCE_BLOCKED contract exactly."""
+    strict_evidence/HANDOFF_EVIDENCE_BLOCKED contract exactly.
+
+    aec043cb — explicit mode='full': the continuation gate is a full/delta-
+    mode concern (see HandoffContinuationRequired's docstring); 'full' keeps
+    this test exercising exactly what it always tested rather than the new
+    'goal' omitted-mode default, which doesn't run this check at all."""
     project = client.post("/projects", json={"name": "http-strict-continuation"}).json()
     pid = project["id"]
     client.post(
         f"/projects/{pid}/sprint-items", json={"version": "v1", "title": "pending item"},
     )
 
-    r = client.post(f"/projects/{pid}/handoff", json={"strict_continuation": True})
+    r = client.post(
+        f"/projects/{pid}/handoff",
+        json={"mode": "full", "strict_continuation": True},
+    )
     assert r.status_code == 422
     detail = r.json()["detail"]
     assert detail["error"] == "HANDOFF_CONTINUATION_BLOCKED"
@@ -507,13 +515,16 @@ def test_post_handoff_endpoint_strict_continuation_returns_structured_422(client
 
 
 def test_post_handoff_endpoint_continuation_status_always_returned(client):
+    """aec043cb — explicit mode='full': continuation_status is only built
+    for the full/delta path (see generate_handoff); 'full' keeps this test
+    exercising that path rather than the new 'goal' omitted-mode default."""
     project = client.post("/projects", json={"name": "http-continuation-status"}).json()
     pid = project["id"]
     client.post(
         f"/projects/{pid}/sprint-items", json={"version": "v1", "title": "pending item"},
     )
 
-    r = client.post(f"/projects/{pid}/handoff", json={})
+    r = client.post(f"/projects/{pid}/handoff", json={"mode": "full"})
     assert r.status_code == 200
     body = r.json()
     assert body["continuation_status"]["continuation_required"] is True

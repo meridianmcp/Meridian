@@ -47,8 +47,17 @@ def test_format_content_str_and_dict():
 def test_resolve_handoff_mode_explicit_and_default():
     assert handoff_module.resolve_handoff_mode("planner") == "planner"
     assert handoff_module.resolve_handoff_mode("starter") == "starter"
-    assert handoff_module.resolve_handoff_mode(None) == "full"
-    assert handoff_module.resolve_handoff_mode("nonsense") == "full"
+    # aec043cb — an omitted or unrecognized mode with no session/role context
+    # is genuinely ambiguous intent: it now resolves to the safe, bounded
+    # 'goal' mode (no workspace decisions/notes, no L0/L1/L2), NEVER to
+    # 'full' — full is only ever returned for an explicit, recognized
+    # request. See resolve_handoff_mode's own docstring for the full
+    # intent-based resolution order (continuation -> delta, executor ->
+    # goal, planner -> planner, unknown -> goal).
+    assert handoff_module.resolve_handoff_mode(None) == "goal"
+    assert handoff_module.resolve_handoff_mode("nonsense") == "goal"
+    # explicit 'full' remains fully available — only OMISSION changed.
+    assert handoff_module.resolve_handoff_mode("full") == "full"
 
 
 def test_resolve_handoff_mode_repeat_session_switches_to_delta():
@@ -1925,9 +1934,13 @@ async def test_generate_ai_summary_summarizer_raises_falls_back(db, monkeypatch)
 
 
 def test_post_handoff_endpoint_full(client):
+    # aec043cb — 'full' is now an explicit, deliberate request only (never
+    # an omitted-mode default), so this test asks for it by name. Coverage
+    # for the omitted-mode -> 'goal' default itself lives in
+    # test_post_handoff_endpoint_omitted_mode_defaults_to_goal below.
     project = client.post("/projects", json={"name": "http-full"}).json()
     client.post(f"/projects/{project['id']}/goal", json={"content": "ship http"})
-    r = client.post(f"/projects/{project['id']}/handoff")
+    r = client.post(f"/projects/{project['id']}/handoff", json={"mode": "full"})
     assert r.status_code == 200
     body = r.json()
     assert body["mode"] == "full"
@@ -1935,6 +1948,17 @@ def test_post_handoff_endpoint_full(client):
     assert body["path"].endswith(
         f"{handoff_module.handoff_file_stem(project['id'])}_handoff.md"
     )
+
+
+def test_post_handoff_endpoint_omitted_mode_defaults_to_goal(client):
+    """aec043cb — POSTing with no body/mode and no session context must
+    resolve to the bounded 'goal' mode, never silently to 'full'."""
+    project = client.post("/projects", json={"name": "http-omitted-mode"}).json()
+    client.post(f"/projects/{project['id']}/goal", json={"content": "ship http"})
+    r = client.post(f"/projects/{project['id']}/handoff")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mode"] == "goal"
 
 
 def test_post_handoff_endpoint_404(client):
@@ -1955,7 +1979,9 @@ def test_post_handoff_endpoint_starter_mode(client):
 
 
 def test_post_handoff_endpoint_invalid_json_body(client):
-    """Non-dict / bad JSON body is tolerated → defaults to full mode."""
+    """Non-dict / bad JSON body is tolerated -> defaults to 'goal' mode
+    (aec043cb — never silently 'full', since there is no session context
+    to resolve intent from a malformed body)."""
     project = client.post("/projects", json={"name": "http-badjson"}).json()
     r = client.post(
         f"/projects/{project['id']}/handoff",
@@ -1963,7 +1989,7 @@ def test_post_handoff_endpoint_invalid_json_body(client):
         headers={"Content-Type": "application/json"},
     )
     assert r.status_code == 200
-    assert r.json()["mode"] == "full"
+    assert r.json()["mode"] == "goal"
 
 
 def test_planner_handoff_endpoint(client):
@@ -2032,7 +2058,13 @@ def test_planner_handoff_endpoint_timeout_returns_504(client, monkeypatch):
 def test_post_handoff_endpoint_force_include_ids_threads_through(client):
     """force_include_ids in the POST body re-includes a deferred item that a
     plain call (no override) leaves hidden — proving the REST route actually
-    forwards the field to generate_handoff instead of dropping it."""
+    forwards the field to generate_handoff instead of dropping it.
+
+    aec043cb — explicit mode='full' here: this test is about force_include_ids
+    arg-threading, not mode resolution, and 'goal' mode (the new omitted-mode
+    default) deliberately never renders item titles at all (only bare ids —
+    see resolve_handoff_mode's docstring), which would make this assertion
+    meaningless regardless of whether the override worked."""
     project = client.post("/projects", json={"name": "http-force-include"}).json()
     pid = project["id"]
     future = "2099-01-01T00:00:00"
@@ -2041,13 +2073,13 @@ def test_post_handoff_endpoint_force_include_ids_threads_through(client):
     ))
 
     # Baseline: without force_include_ids the deferred item stays hidden.
-    baseline = client.post(f"/projects/{pid}/handoff")
+    baseline = client.post(f"/projects/{pid}/handoff", json={"mode": "full"})
     assert baseline.status_code == 200
     assert "HTTP deferred task" not in baseline.json()["content"]
 
     r = client.post(
         f"/projects/{pid}/handoff",
-        json={"force_include_ids": [item["id"]]},
+        json={"mode": "full", "force_include_ids": [item["id"]]},
     )
     assert r.status_code == 200
     assert "HTTP deferred task" in r.json()["content"]
@@ -3406,10 +3438,14 @@ def test_format_handoff_mcp_content_truncates_oversized_content():
     assert "limit=1000 bytes" in out
 
 
-async def test_format_handoff_mcp_content_never_truncates_goal_token_banner(db):
-    """Even a budget far smaller than the protected region still keeps the
-    <goal_token>/SECURITY banner (and everything before it) byte-for-byte —
-    integrity-first over strict budget compliance."""
+async def test_format_handoff_mcp_content_never_truncates_executable_goal(db):
+    """An executable /goal is an atomic token-bound payload.
+
+    MDE-10: preserving only the token/banner prefix is insufficient because
+    the body hash covers the complete goal. The shared wire formatter must
+    return the complete goal, even when its generic narrative budget is too
+    small; callers must narrow the handoff at construction time instead.
+    """
     p = await db_module.create_project(db, "budget-token-protect")
     body = '/goal\nstart_session(project_name="x")'
     embedded = await handoff_module._mint_and_embed_goal_token(db, p["id"], body)
@@ -3418,10 +3454,9 @@ async def test_format_handoff_mcp_content_never_truncates_goal_token_banner(db):
     out = handoff_module.format_handoff_mcp_content(padded, max_bytes=10)
     banner_match = handoff_module._GOAL_TOKEN_BANNER_RE.search(embedded)
     assert banner_match is not None
-    protected_prefix = embedded[: banner_match.end()]
-    assert out.startswith(protected_prefix)
-    assert "TRUNCATED" in out
-    assert len(out.encode("utf-8")) < len(padded.encode("utf-8"))
+    assert out == padded
+    assert "TRUNCATED" not in out
+    assert len(out.encode("utf-8")) > 10
 
 
 def test_format_handoff_mcp_content_non_string_passthrough():

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import pytest
 
@@ -654,3 +655,262 @@ def test_rest_start_session_endpoint_continue_mode_includes_profile_binding(clie
     assert "profile_binding" in body
     assert body["profile_binding"] is not None
     assert set(body["profile_binding"].keys()) == _PROFILE_BINDING_KEYS
+
+
+# ===========================================================================
+# MDE-10 — canonical handoff reliability contract (docs/meridian-handoff-
+# contract.md). Regression coverage pinning the specific claims that page
+# makes about generate_handoff's cross-mode behavior, so the doc and the
+# code can never silently drift apart. Does NOT re-test token verification
+# reasons/recovery payloads (see tests/test_dd07ece0_handoff_token.py —
+# already exhaustive) or the manifest/evidence sections individually (see
+# tests/test_handoff_manifest_v2.py, tests/test_mde5_handoff_evidence_
+# manifest.py, tests/test_mde3_handoff_release_evidence.py) — this covers
+# only what those files don't: the mode-aware byte-budget resolution table,
+# and the documented end-to-end block ORDERING with every opt-in section
+# present at once.
+# ===========================================================================
+
+class TestModeAwareMaxContentBytesDefaults:
+    """Pins the exact resolution table docs/meridian-handoff-contract.md's
+    "Bounded payloads" section documents: omitting max_content_bytes
+    resolves per-mode/per-checkpoint, an explicit value always wins."""
+
+    @pytest.mark.asyncio
+    async def test_goal_mode_default_budget_is_12000_bytes(self, db, tmp_path):
+        assert handoff_module._DEFAULT_GOAL_MAX_BYTES == 12_000
+        project = await db_module.create_project(db, "budget-goal-proj")
+        await db_module.set_goal(db, project["id"], "ship it", sprint="v1")
+        await db_module.add_sprint_item(db, project["id"], "v1", "item")
+        _path, content, _amended = await handoff_module.generate_handoff(
+            db, project["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+        )
+        assert len(content.encode("utf-8")) <= handoff_module._DEFAULT_GOAL_MAX_BYTES
+
+    @pytest.mark.asyncio
+    async def test_starter_mode_default_budget_is_16000_bytes(self, db, tmp_path):
+        assert handoff_module._DEFAULT_STARTER_MAX_BYTES == 16_000
+        project = await db_module.create_project(db, "budget-starter-proj")
+        await db_module.set_goal(db, project["id"], "ship it", sprint="v1")
+        await db_module.add_sprint_item(db, project["id"], "v1", "item")
+        _path, content, _amended = await handoff_module.generate_handoff(
+            db, project["id"], str(tmp_path), mode="starter", skip_ai_summary=True,
+        )
+        assert len(content.encode("utf-8")) <= handoff_module._DEFAULT_STARTER_MAX_BYTES
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_true_uses_40000_byte_budget_regardless_of_mode(
+        self, db, tmp_path,
+    ):
+        assert handoff_module._DEFAULT_CHECKPOINT_MAX_BYTES == 40_000
+        project = await db_module.create_project(db, "budget-checkpoint-proj")
+        await db_module.set_goal(db, project["id"], "ship it", sprint="v1")
+        await db_module.add_sprint_item(db, project["id"], "v1", "item")
+        _path, content, _amended = await handoff_module.generate_handoff(
+            db, project["id"], str(tmp_path), mode="full", skip_ai_summary=True,
+            checkpoint=True,
+        )
+        assert len(content.encode("utf-8")) <= handoff_module._DEFAULT_CHECKPOINT_MAX_BYTES
+
+    @pytest.mark.asyncio
+    async def test_explicit_value_always_wins_over_mode_default(self, db, tmp_path):
+        """An explicit budget must be honored, not silently widened back to
+        the mode default -- proven by comparing the SAME board rendered with
+        an explicit small budget vs. the (larger) mode default, and
+        confirming the small-budget render is genuinely smaller and carries
+        the truncation marker. A budget smaller than the protected
+        <goal_token>/SECURITY banner region can legitimately still exceed
+        the raw byte number (format_handoff_mcp_content's own documented
+        "never cut through the banner, even if that means exceeding
+        max_bytes" contract) -- so this does not assert a strict `<=`
+        against a tiny budget; it asserts the override is genuinely applied.
+
+        Uses ``mode="starter"`` rather than ``mode="goal"`` deliberately
+        (2ee0000c/MDE-10): a goal-mode render's top-level content itself IS
+        the token-bound executable payload (starts with ``/goal`` or
+        ``/loop /goal``), and MDE-10 makes ``format_handoff_mcp_content``
+        return that content byte-identically regardless of ``max_bytes`` --
+        wire-level truncation of an already-minted, hash-bound body is
+        exactly the corruption MDE-10 closes (see
+        ``test_format_handoff_mcp_content_never_truncates_executable_goal``
+        in tests/test_cov_handoff.py, and the "Wire-level truncation is
+        never allowed to cut an executable body" section of
+        docs/meridian-handoff-contract.md). Starter mode wraps its own
+        internal ``/goal`` block in a "Done:"/"# Pending" preview, so its
+        top-level content does not match the atomic-goal prefix check and
+        the pre-existing bounded-truncation behavior this test pins remains
+        observable, while the protected banner region is still present to
+        assert on below.
+        """
+        project = await db_module.create_project(db, "budget-explicit-proj")
+        await db_module.set_goal(db, project["id"], "ship it", sprint="v1")
+        for i in range(30):
+            await db_module.add_sprint_item(db, project["id"], "v1", f"item number {i}")
+
+        _path, default_content, _a1 = await handoff_module.generate_handoff(
+            db, project["id"], str(tmp_path), mode="starter", skip_ai_summary=True,
+        )
+        _path, small_content, _a2 = await handoff_module.generate_handoff(
+            db, project["id"], str(tmp_path), mode="starter", skip_ai_summary=True,
+            max_content_bytes=3000,
+        )
+        assert len(small_content.encode("utf-8")) < len(default_content.encode("utf-8"))
+        assert "TRUNCATED (cb00889c bounded handoff profile)" in small_content
+        # The protected <goal_token>/SECURITY banner region survives
+        # truncation byte-identical regardless of the budget.
+        assert "<goal_token>" in small_content
+        assert "<!-- SECURITY:" in small_content
+
+    @pytest.mark.asyncio
+    async def test_explicit_none_opts_out_of_budgeting_entirely(self, db, tmp_path):
+        """None must not be conflated with 'use the mode default' — the
+        sentinel object _MODE_DEFAULT_MAX_BYTES (an actual omitted argument)
+        is the ONLY thing that resolves to a mode default; an explicit None
+        always means 'no budget at all', for every mode."""
+        project = await db_module.create_project(db, "budget-none-proj")
+        await db_module.set_goal(db, project["id"], "ship it", sprint="v1")
+        for i in range(20):
+            await db_module.add_sprint_item(db, project["id"], "v1", f"item {i}")
+        _path, content, _amended = await handoff_module.generate_handoff(
+            db, project["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+            max_content_bytes=None,
+        )
+        # Not asserting a specific size (board-dependent) -- just that this
+        # call succeeds and returns real content without raising, proving
+        # None is accepted as "opt out", not coerced into an int budget.
+        assert content
+        assert "/goal" in content
+
+
+class TestCanonicalGoalBlockStructure:
+    """Pins the documented block ORDERING from docs/meridian-handoff-
+    contract.md's 'Anatomy of a /goal block' section, with every opt-in
+    section (manifest, research evidence, release-transaction evidence)
+    present at once -- the worst-case, fullest-featured block a receiving
+    executor might actually see."""
+
+    @pytest.mark.asyncio
+    async def test_full_block_sections_appear_in_documented_order(self, db, tmp_path):
+        import sys
+        from pathlib import Path as _Path
+
+        sys.path.insert(0, str(_Path(__file__).parent.parent / "extensions" / "meridian-outputs"))
+        from meridian_outputs import research_evidence as RE  # noqa: PLC0415
+
+        from meridian.db import docx_merge as DM  # noqa: PLC0415
+
+        project = await db_module.create_project(db, "golden-structure-proj")
+        await db_module.set_goal(db, project["id"], "ship it", sprint="v1")
+        await db_module.add_sprint_item(db, project["id"], "v1", "the item")
+
+        env = RE.build_envelope(
+            [RE.EvidenceRecord(
+                identity=RE.EvidenceIdentity(id="r1", kind=RE.EvidenceKind.CLAIM, locator="doc://x"),
+                timestamps=RE.EvidenceTimestamps(observed_at="t", updated_at="t"),
+                resolver=RE.ResolverState(status=RE.ResolverStatus.VERIFIED, confidence=1.0),
+            )],
+            envelope_id="golden-env", generated_at="2026-01-01T00:00:00Z",
+        )
+        rt = await DM.open_release_transaction(db, "cs-1", "x.docx", project_id=project["id"])
+        await DM.resolve_release_recovery(db, rt["transaction_id"], "X", project_id=project["id"])
+
+        _path, content, _amended = await handoff_module.generate_handoff(
+            db, project["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+            emit_manifest=True, research_evidence_envelope=env,
+            max_content_bytes=None,
+        )
+
+        def _pos(pattern: str) -> int:
+            # Anchored to the START of a line (re.MULTILINE): every real
+            # structural tag in a rendered /goal block opens its own line.
+            # A plain, unanchored search would also match the SECURITY
+            # banner's own PROSE mention of some of these same tag names
+            # (e.g. "...cross-check <sprint_items> against a live
+            # get_sprint_items() call..." inside the banner comment itself)
+            # -- anchoring to line-start is what tells the two apart.
+            m = re.search(r"^" + pattern, content, re.MULTILINE)
+            assert m is not None, f"expected to find {pattern!r} at a line start in the rendered block"
+            return m.start()
+
+        token_pos = _pos(r"<goal_token>")
+        banner_pos = _pos(r"<!-- SECURITY:")
+        directive_pos = _pos(r"<executor_directive>")
+        sprint_items_pos = _pos(r"<sprint_items>")
+        manifest_pos = _pos(r"<handoff_manifest\b")
+        evidence_pos = _pos(r"# Provenance Envelope")
+        release_pos = _pos(r"<release_transactions\b")
+        start_config_pos = _pos(r"<project_start_config\b")
+        proposal_scope_pos = _pos(r"<proposal_scope\b")
+
+        # Documented order: token -> banner -> directive block -> item list
+        # -> manifest -> research evidence -> release transactions ->
+        # project_start_config -> proposal_scope.
+        assert content.startswith("/goal") or content.startswith("/loop /goal")
+        assert token_pos < banner_pos < directive_pos < sprint_items_pos
+        assert sprint_items_pos < manifest_pos < evidence_pos < release_pos
+        assert release_pos < start_config_pos < proposal_scope_pos
+
+    @pytest.mark.asyncio
+    async def test_every_documented_section_is_covered_by_the_token_body_hash(
+        self, db, tmp_path,
+    ):
+        """Everything from <goal_token> through <proposal_scope> (this
+        test's 'full block' from the test above) must verify as a single
+        unit -- tampering ANYWHERE in that range must invalidate the
+        token, proving the documented 'assembled before the token is
+        minted' ordering claim is load-bearing, not just cosmetic."""
+        import sys
+        from pathlib import Path as _Path
+
+        sys.path.insert(0, str(_Path(__file__).parent.parent / "extensions" / "meridian-outputs"))
+        from meridian_outputs import research_evidence as RE  # noqa: PLC0415
+
+        from meridian.db import docx_merge as DM  # noqa: PLC0415
+
+        project = await db_module.create_project(db, "golden-hash-proj")
+        await db_module.set_goal(db, project["id"], "ship it", sprint="v1")
+        await db_module.add_sprint_item(db, project["id"], "v1", "the item")
+        env = RE.build_envelope(
+            [RE.EvidenceRecord(
+                identity=RE.EvidenceIdentity(id="r1", kind=RE.EvidenceKind.CLAIM, locator="doc://x"),
+                timestamps=RE.EvidenceTimestamps(observed_at="t", updated_at="t"),
+                resolver=RE.ResolverState(status=RE.ResolverStatus.VERIFIED, confidence=1.0),
+            )],
+            envelope_id="golden-env-2", generated_at="2026-01-01T00:00:00Z",
+        )
+        rt = await DM.open_release_transaction(db, "cs-2", "y.docx", project_id=project["id"])
+        await DM.resolve_release_recovery(db, rt["transaction_id"], "Y", project_id=project["id"])
+
+        _path, content, _amended = await handoff_module.generate_handoff(
+            db, project["id"], str(tmp_path), mode="goal", skip_ai_summary=True,
+            emit_manifest=True, research_evidence_envelope=env,
+            max_content_bytes=None,
+        )
+        m = re.search(r"<goal_token>([^<]+)</goal_token>", content)
+        token = m.group(1).strip()
+        body = handoff_module.strip_goal_token_banner(content)
+
+        # Tampering checks run FIRST, while the token is still unconsumed:
+        # body_mismatch deliberately does NOT consume the token (see
+        # verify_handoff_token's own docstring), so these must all report
+        # body_mismatch without affecting the token's later genuine
+        # verification below.
+        for needle, replacement in [
+            ("<sprint_items>", "<sprint_items_TAMPERED>"),
+            ("RECOVERY_REQUIRED", "RELEASED"),
+            ("r1", "r1-tampered"),
+        ]:
+            if needle not in body:
+                continue
+            tampered_body = body.replace(needle, replacement, 1)
+            result = await handoff_module.verify_handoff_token(
+                db, token, project["id"], body=tampered_body,
+            )
+            assert result["valid"] is False, f"tampering {needle!r} must invalidate the token"
+            assert result["reason"] == "body_mismatch"
+
+        # The token is still unconsumed and the CORRECT body still verifies
+        # -- proving body_mismatch really is non-consuming, not a side
+        # effect of this test's ordering.
+        genuine = await handoff_module.verify_handoff_token(db, token, project["id"], body=body)
+        assert genuine["valid"] is True

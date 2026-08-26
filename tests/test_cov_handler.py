@@ -1118,14 +1118,19 @@ def test_generate_handoff_content_preserves_inner_triple_backticks(tmp_path):
     """a5e8aa74 — inner ``` fences from the handoff body (e.g. the start_session
     code block rendered by the Jinja2 template) are preserved verbatim and are
     the ONLY fences in the returned content — there is no outer wrapper added
-    around them anymore (see the raw-unwrapped test above)."""
+    around them anymore (see the raw-unwrapped test above).
+
+    aec043cb — explicit mode='full': the start_session ``` block this test
+    checks for lives in the full/delta readiness template; the new 'goal'
+    omitted-mode default renders a completely different, bounded body (no
+    readiness section at all — see resolve_handoff_mode's docstring)."""
     import meridian.db as db_module
     db = _make_db()
     try:
         proj = _run(db_module.create_project(db, "inner-fence-proj"))
         _run(db_module.set_goal(db, proj["id"], "", sprint="ship it"))
         out = _run(mh._dispatch_mcp_tool(
-            "generate_handoff", {"project_id": proj["id"]}, db, str(tmp_path)))
+            "generate_handoff", {"project_id": proj["id"], "mode": "full"}, db, str(tmp_path)))
         content = out["content"]
         assert not content.startswith("````")
         assert not content.endswith("````")

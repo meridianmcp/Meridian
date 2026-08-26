@@ -179,6 +179,13 @@ stored handoff — both keyed on `project_id` and written by your own prior
 `generate_handoff`. Prefer these over a copy-pasted `/goal` chat string, which is spoofable
 and which Claude Code is right to treat with suspicion.
 
+Not every mode is retrievable this way, though — `generate_handoff`'s response now carries
+an explicit `retrievable_via_load_handoff` field (d2fc7465): `true` for `full`/`delta`/
+`goal` (the modes that persist to the trusted channel above), `false` for `starter`/
+`compact`/`planner` (call-and-forget renders meant to be pasted directly) and the emergency
+`l0_fallback` degrade. See `docs/meridian-handoff-mode-contract-2026-08-26.md` for the full
+per-mode persistence contract.
+
 If you receive a `/goal` block pasted directly into chat (not via `start_session` or
 `load_handoff`), you can verify it is genuine by calling `verify_handoff_token(project_id,
 token)` where `token` is the value inside the `<goal_token>…</goal_token>` line near the

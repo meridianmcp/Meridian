@@ -39,6 +39,7 @@ module adds a coordination layer ON TOP of that primitive for multi-session
 """
 from __future__ import annotations
 
+import itertools
 import json
 from typing import Any
 
@@ -734,3 +735,663 @@ async def get_merge_manifest(
     result["drafts"] = drafts
     result["merged_anchors"] = merged_anchors
     return result
+
+
+# ===========================================================================
+# MDE-3 — canonical change-set / cross-store release manifest and crash
+# recovery state machine.
+#
+# Distinct from the wave-scoped MERGE manifest above (multi-session anchor
+# coordination against one canonical .docx): this is the lifecycle of ONE
+# release TRANSACTION — filesystem staging -> DOCX/package verification ->
+# provenance/Outputs registration -> render evidence -> DB commit — for a
+# single change-set landing on a single file_path. The gap this closes is
+# documented in this project's own C84-W1 gap-matrix note (category 8,
+# "CRASH RECOVERY"): a process that crashes mid-promotion today leaves an
+# orphaned staged file with NO transaction journal recording that a
+# promotion was even in flight, and nothing scans for or resolves it on the
+# next startup.
+#
+# Explicit states, PREPARED -> STAGED -> PROMOTED -> VERIFIED ->
+# DB_COMMITTED -> RELEASED, plus RECOVERY_REQUIRED (reachable from any
+# non-terminal state) and the two terminal outcomes RELEASED/ABORTED:
+#
+#   PREPARED       — transaction opened; nothing on disk/DB touched yet.
+#   STAGED         — content written to a disposable staged path (never the
+#                    canonical file_path itself — mirrors the merge-draft
+#                    isolation rule above).
+#   PROMOTED       — the staged content has been atomically swapped into
+#                    file_path (e.g. via os.replace).
+#   VERIFIED       — the promoted file_path was independently re-verified
+#                    (structural/hash check) after promotion.
+#   DB_COMMITTED   — the corresponding DB-side commit (sprint item, output
+#                    registration, provenance record, ...) has landed.
+#   RELEASED       — terminal success: every step above is durably recorded.
+#   RECOVERY_REQUIRED — a crash/failure was detected; :func:`resolve_release
+#                    _recovery` must run before the transaction can proceed.
+#   ABORTED        — terminal: recovery determined the promotion never
+#                    landed and the transaction was safely abandoned.
+#
+# Storage: reuses the EXISTING, already-migrated ``action_audit_log`` table
+# (same pattern ``meridian.code_intel_receipt`` already established — no new
+# table, no new SQLite/Postgres migration, no db/__init__.py or
+# pg_adapter.py changes needed). Each state transition writes ONE new
+# append-only event carrying the transaction's FULL current snapshot (not a
+# delta), so reconstructing "what is this transaction's state right now" is
+# just "read the newest event for this transaction_id" — an authoritative,
+# durable, cross-process journal a recovering session can read on restart
+# without trusting anything about the crashed process's own in-memory state.
+# This journal itself IS the "cross-store receipt": it is written
+# independently of the filesystem promotion it describes, and records
+# whatever evidence the caller supplies about the OTHER stores it touched
+# (provenance_registered, render_evidence, db_commit_ref) without this
+# module reaching into those stores directly — coordinating those stores is
+# the caller's job (e.g. docs_intel.py's promotion path); this module is the
+# durable ledger they report into.
+# ===========================================================================
+
+RELEASE_STATE_PREPARED = "PREPARED"
+RELEASE_STATE_STAGED = "STAGED"
+RELEASE_STATE_PROMOTED = "PROMOTED"
+RELEASE_STATE_VERIFIED = "VERIFIED"
+RELEASE_STATE_DB_COMMITTED = "DB_COMMITTED"
+RELEASE_STATE_RELEASED = "RELEASED"
+RELEASE_STATE_RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
+RELEASE_STATE_ABORTED = "ABORTED"
+
+#: Forward order of the "happy path" states — used to validate that a
+#: transition only ever advances exactly one step (or re-asserts the current
+#: step, for idempotent resume), never skips ahead.
+_RELEASE_STATE_ORDER = [
+    RELEASE_STATE_PREPARED,
+    RELEASE_STATE_STAGED,
+    RELEASE_STATE_PROMOTED,
+    RELEASE_STATE_VERIFIED,
+    RELEASE_STATE_DB_COMMITTED,
+    RELEASE_STATE_RELEASED,
+]
+_TERMINAL_RELEASE_STATES = frozenset({RELEASE_STATE_RELEASED, RELEASE_STATE_ABORTED})
+_ALL_RELEASE_STATES = frozenset(_RELEASE_STATE_ORDER) | {
+    RELEASE_STATE_RECOVERY_REQUIRED, RELEASE_STATE_ABORTED,
+}
+
+RELEASE_EVENT_TYPE = "release_transaction_state"
+
+#: Strictly-increasing, in-process ordering counter for release-transaction
+#: snapshots. ``action_audit_log.created_at`` has only whole-second
+#: precision (see db/workspace.py's own "Ordering note" on this exact
+#: table); an observed real gotcha on this codebase's own CI/dev machines is
+#: that even ``time.monotonic_ns()`` can return the SAME value for two
+#: calls microseconds apart (coarse OS timer-tick resolution), so a plain
+#: itertools.count() is used instead — guaranteed strictly increasing and
+#: unique per call, with zero dependency on clock resolution. Same
+#: within-process-only caveat as every other such tiebreaker in this
+#: codebase: never compared across processes, never persisted as a
+#: wall-clock claim.
+_release_seq_counter = itertools.count()
+
+
+def _next_release_seq() -> int:
+    return next(_release_seq_counter)
+
+#: Batch size for reconstructing transaction state from action_audit_log.
+#: Best-effort/advisory posture, matching every other action_audit_log-backed
+#: lookup in this codebase (e.g. code_intel_receipt.find_recent_prospect_
+#: receipt): a change-set/file_path pair with more than this many recorded
+#: transitions in the lookback window is a real, if unlikely, scaling edge —
+#: documented here rather than silently mishandled.
+_RELEASE_SCAN_LIMIT = 500
+
+
+def valid_release_transition(current: "str | None", target: str) -> bool:
+    """True iff *target* is a legal next state from *current*.
+
+    Idempotent resume: re-asserting the SAME state the transaction is
+    already in is always valid (a crashed/retried caller re-running its own
+    last successful step must never be rejected as an invalid transition).
+    ``RECOVERY_REQUIRED`` and ``ABORTED`` are BOTH reachable directly from
+    any non-terminal state (a failure can be flagged, or an in-flight
+    transaction explicitly abandoned, at any point before RELEASED). From
+    ``RECOVERY_REQUIRED`` the two forward outcomes
+    :func:`resolve_release_recovery` can reach are resuming into
+    ``DB_COMMITTED``/``RELEASED`` (current hash matched the expected
+    post-promotion content — the file-level work already succeeded, only
+    the DB-side bookkeeping needs finishing) — the "current hash matches
+    base, so abort" outcome goes straight to ``ABORTED`` (also legal
+    directly from ``RECOVERY_REQUIRED``, covered by the blanket
+    non-terminal-state rule above). No state ever transitions OUT of a
+    terminal state (RELEASED/ABORTED).
+    """
+    if current is None:
+        return target == RELEASE_STATE_PREPARED
+    if current == target:
+        return True
+    if current in _TERMINAL_RELEASE_STATES:
+        return False
+    if target in (RELEASE_STATE_RECOVERY_REQUIRED, RELEASE_STATE_ABORTED):
+        # A failure can be flagged, or an in-flight transaction explicitly
+        # abandoned, from ANY non-terminal state -- not only after first
+        # passing through RECOVERY_REQUIRED (e.g. an explicit cancellation
+        # of a PREPARED transaction that never touched anything).
+        return True
+    if current == RELEASE_STATE_RECOVERY_REQUIRED:
+        return target in (RELEASE_STATE_DB_COMMITTED, RELEASE_STATE_RELEASED)
+    if current not in _RELEASE_STATE_ORDER or target not in _RELEASE_STATE_ORDER:
+        return False
+    return _RELEASE_STATE_ORDER.index(target) == _RELEASE_STATE_ORDER.index(current) + 1
+
+
+def _release_detail(row: "dict[str, Any]") -> "dict[str, Any]":
+    try:
+        parsed = json.loads(row.get("detail") or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+async def _scan_release_events(
+    db: aiosqlite.Connection,
+    *,
+    project_id: "str | None",
+    tenant_id: "str | None",
+    limit: int = _RELEASE_SCAN_LIMIT,
+) -> "list[dict[str, Any]]":
+    """Newest-first raw action_audit_log rows for RELEASE_EVENT_TYPE.
+
+    action_audit_log's ``created_at`` has only whole-second precision (see
+    ``db/workspace.py``'s own "Ordering note" a few hundred lines up from
+    ``record_action_audit_event`` — the SAME table, the SAME documented gap)
+    — nowhere near fine-grained enough to order two transitions of the same
+    transaction recorded within one second of each other, a routine
+    occurrence in both tests and real usage. Re-sorted here by
+    ``(created_at, _seq)`` descending, mirroring that module's own
+    established tiebreaker convention (in spirit, not literally — see
+    ``_next_release_seq``'s own docstring for why a plain counter is used
+    here instead of ``time.monotonic_ns()``): every snapshot this module
+    writes embeds a strictly-increasing ``"_seq"``, used ONLY to break
+    same-second ties — never compared across processes or trusted as a
+    wall-clock claim.
+    """
+    from . import workspace as _workspace  # noqa: PLC0415 — defer to avoid the
+
+    # db/__init__.py <-> workspace.py circular-import ordering issue, same
+    # pattern _migrate_docx_merge_manifests's own callers use elsewhere in
+    # this package.
+    try:
+        rows = await _workspace.get_action_audit_log(
+            db, project_id=project_id, tenant_id=tenant_id,
+            event_type=RELEASE_EVENT_TYPE, limit=limit,
+        )
+    except Exception:  # noqa: BLE001 — an unverifiable read must never raise
+        return []
+    return sorted(
+        rows,
+        key=lambda r: (r.get("created_at") or "", _release_detail(r).get("_seq", 0)),
+        reverse=True,
+    )
+
+
+def _latest_snapshot_per_transaction(
+    rows: "list[dict[str, Any]]",
+) -> "dict[str, dict[str, Any]]":
+    """Reduce newest-first audit rows to ONE latest snapshot per transaction_id.
+
+    Each event carries the FULL current snapshot (see module docstring), so
+    the first (newest, since ``rows`` is newest-first) row seen for a given
+    ``transaction_id`` is authoritative for that transaction.
+    """
+    latest: "dict[str, dict[str, Any]]" = {}
+    for row in rows:
+        detail = _release_detail(row)
+        tid = detail.get("transaction_id")
+        if not tid or tid in latest:
+            continue
+        detail["_audit_row_id"] = row.get("id")
+        detail["_recorded_at"] = row.get("created_at")
+        latest[tid] = detail
+    return latest
+
+
+async def open_release_transaction(
+    db: aiosqlite.Connection,
+    change_set_id: str,
+    file_path: str,
+    *,
+    session_id: "str | None" = None,
+    base_hash: "str | None" = None,
+    project_id: "str | None" = None,
+    tenant_id: "str | None" = None,
+) -> "dict[str, Any]":
+    """Open (or resume) a release transaction for *change_set_id*/*file_path*.
+
+    Idempotent/resumable: if a NON-terminal transaction already exists for
+    this exact (change_set_id, file_path) pair, it is returned as-is
+    (``resumed: True``) rather than opening a duplicate — a crashed or
+    retried caller re-entering this function picks up its own prior
+    transaction_id instead of starting a parallel, conflicting one. Returns
+    a fresh ``PREPARED`` transaction (``resumed: False``) otherwise.
+    """
+    change_set_id = (change_set_id or "").strip()
+    normalized = _normalize_file_path(file_path)
+    if not change_set_id or not normalized:
+        return {
+            "opened": False, "reason": "invalid",
+            "message": "change_set_id and file_path are both required",
+        }
+
+    existing = await find_open_release_transaction(
+        db, change_set_id, normalized, project_id=project_id, tenant_id=tenant_id,
+    )
+    if existing is not None:
+        return {**existing, "opened": True, "resumed": True}
+
+    from . import workspace as _workspace  # noqa: PLC0415
+
+    transaction_id = _new_id()
+    snapshot = {
+        "transaction_id": transaction_id,
+        "change_set_id": change_set_id,
+        "file_path": normalized,
+        "session_id": session_id,
+        "state": RELEASE_STATE_PREPARED,
+        "base_hash": base_hash,
+        "staged_path": None,
+        "staged_hash": None,
+        "post_hash": None,
+        "provenance_registered": False,
+        "render_evidence": None,
+        "db_commit_ref": None,
+        "error": None,
+        "recovery_action": None,
+        "history": [RELEASE_STATE_PREPARED],
+        "_seq": _next_release_seq(),
+    }
+    await _workspace.record_action_audit_event(
+        db, RELEASE_EVENT_TYPE, tenant_id=tenant_id, project_id=project_id,
+        actor=session_id, detail=json.dumps(snapshot),
+    )
+    return {**snapshot, "opened": True, "resumed": False}
+
+
+async def find_open_release_transaction(
+    db: aiosqlite.Connection,
+    change_set_id: str,
+    file_path: str,
+    *,
+    project_id: "str | None" = None,
+    tenant_id: "str | None" = None,
+) -> "dict[str, Any] | None":
+    """The latest NON-terminal transaction for (change_set_id, file_path),
+    or ``None``. Used by :func:`open_release_transaction` for resumability
+    and by a recovering caller to rediscover in-flight work after a crash."""
+    change_set_id = (change_set_id or "").strip()
+    normalized = _normalize_file_path(file_path)
+    rows = await _scan_release_events(db, project_id=project_id, tenant_id=tenant_id)
+    latest = _latest_snapshot_per_transaction(rows)
+    for snapshot in latest.values():
+        if (
+            snapshot.get("change_set_id") == change_set_id
+            and snapshot.get("file_path") == normalized
+            and snapshot.get("state") not in _TERMINAL_RELEASE_STATES
+        ):
+            return snapshot
+    return None
+
+
+async def get_release_transaction(
+    db: aiosqlite.Connection,
+    transaction_id: str,
+    *,
+    project_id: "str | None" = None,
+    tenant_id: "str | None" = None,
+) -> "dict[str, Any] | None":
+    """The latest recorded snapshot for *transaction_id*, or ``None`` if no
+    such transaction has ever been recorded (in the scanned lookback
+    window — see ``_RELEASE_SCAN_LIMIT``)."""
+    rows = await _scan_release_events(db, project_id=project_id, tenant_id=tenant_id)
+    for row in rows:
+        detail = _release_detail(row)
+        if detail.get("transaction_id") == transaction_id:
+            detail["_audit_row_id"] = row.get("id")
+            detail["_recorded_at"] = row.get("created_at")
+            return detail
+    return None
+
+
+async def advance_release_state(
+    db: aiosqlite.Connection,
+    transaction_id: str,
+    target_state: str,
+    *,
+    session_id: "str | None" = None,
+    project_id: "str | None" = None,
+    tenant_id: "str | None" = None,
+    staged_path: "str | None" = None,
+    staged_hash: "str | None" = None,
+    post_hash: "str | None" = None,
+    provenance_registered: "bool | None" = None,
+    render_evidence: "Any" = None,
+    db_commit_ref: "str | None" = None,
+    error: "str | None" = None,
+) -> "dict[str, Any]":
+    """Advance *transaction_id* to *target_state*, fail-closed on an invalid
+    transition.
+
+    Never silently skips a step or resurrects a terminal transaction: an
+    illegal transition (skipping a state, moving out of RELEASED/ABORTED, an
+    unrecognized target) is refused (``advanced: False, reason:
+    "invalid_transition"``) rather than recorded — the single mechanism this
+    module relies on for "no partial release is ever presented as
+    complete." Idempotent resume: calling with the transaction's OWN current
+    state is always accepted and simply re-records the (possibly updated)
+    field values without complaint. Any of the optional per-field kwargs
+    left at their default (``None``) preserve the transaction's PRIOR value
+    for that field — only fields the caller actually passes are updated.
+    """
+    if target_state not in _ALL_RELEASE_STATES:
+        return {
+            "advanced": False, "reason": "unknown_state",
+            "message": f"{target_state!r} is not a recognized release state.",
+        }
+    current = await get_release_transaction(
+        db, transaction_id, project_id=project_id, tenant_id=tenant_id,
+    )
+    if current is None:
+        return {
+            "advanced": False, "reason": "no_such_transaction",
+            "message": f"No release transaction found for id {transaction_id!r}.",
+        }
+    current_state = current.get("state")
+    if not valid_release_transition(current_state, target_state):
+        return {
+            "advanced": False, "reason": "invalid_transition",
+            "current_state": current_state, "target_state": target_state,
+            "message": (
+                f"{current_state!r} -> {target_state!r} is not a legal release "
+                "transition — refusing to record it. This is the fail-closed "
+                "guard against ever presenting a partial release as complete."
+            ),
+        }
+
+    from . import workspace as _workspace  # noqa: PLC0415
+
+    history = list(current.get("history") or [])
+    if not history or history[-1] != target_state:
+        history.append(target_state)
+    snapshot = {
+        "transaction_id": transaction_id,
+        "change_set_id": current.get("change_set_id"),
+        "file_path": current.get("file_path"),
+        "session_id": session_id or current.get("session_id"),
+        "state": target_state,
+        "base_hash": current.get("base_hash"),
+        "staged_path": staged_path if staged_path is not None else current.get("staged_path"),
+        "staged_hash": staged_hash if staged_hash is not None else current.get("staged_hash"),
+        "post_hash": post_hash if post_hash is not None else current.get("post_hash"),
+        "provenance_registered": (
+            provenance_registered if provenance_registered is not None
+            else current.get("provenance_registered", False)
+        ),
+        "render_evidence": render_evidence if render_evidence is not None else current.get("render_evidence"),
+        "db_commit_ref": db_commit_ref if db_commit_ref is not None else current.get("db_commit_ref"),
+        "error": error if error is not None else (
+            None if target_state not in (RELEASE_STATE_RECOVERY_REQUIRED,) else current.get("error")
+        ),
+        "recovery_action": current.get("recovery_action"),
+        "history": history,
+        "_seq": _next_release_seq(),
+    }
+    await _workspace.record_action_audit_event(
+        db, RELEASE_EVENT_TYPE, tenant_id=tenant_id, project_id=project_id,
+        actor=session_id or current.get("session_id"),
+        detail=json.dumps(snapshot),
+    )
+    return {**snapshot, "advanced": True, "previous_state": current_state}
+
+
+async def resolve_release_recovery(
+    db: aiosqlite.Connection,
+    transaction_id: str,
+    current_hash: "str | None",
+    *,
+    session_id: "str | None" = None,
+    project_id: "str | None" = None,
+    tenant_id: "str | None" = None,
+) -> "dict[str, Any]":
+    """The crash-recovery DECISION function: compare *current_hash* (the
+    caller's freshly-computed hash of the transaction's ``file_path`` as it
+    actually exists on disk right now) against the transaction's own
+    recorded ``base_hash``/``post_hash``.
+
+    * ``current_hash == base_hash`` -> ``action: "abort"``. The promotion
+      never actually landed (or was cleanly rolled back before the crash) —
+      the canonical file is exactly as it was before this transaction ever
+      touched it, so it is safe to declare the transaction ABORTED. No file
+      write happens here; the CALLER is responsible for reclaiming any
+      orphaned staged file at ``staged_path``.
+    * ``current_hash == post_hash`` -> ``action: "finish_db_commit"``. The
+      promotion genuinely succeeded (the file already holds the expected
+      post-transaction content) but the crash happened before DB_COMMITTED/
+      RELEASED was recorded — safe to resume forward and finish the
+      remaining DB-side bookkeeping; nothing filesystem-side needs redoing.
+    * Neither matches (including when either recorded hash is ``None``, or
+      *current_hash* itself couldn't be computed) -> ``action:
+      "require_human"``. The file is in a state this function cannot prove
+      is safe — it NEVER guesses, and NEVER restores a stale backup
+      automatically. The transaction is recorded as ``RECOVERY_REQUIRED``
+      either way (if not already) so the ambiguity itself is durably
+      journaled, not silently retried forever.
+
+    Always returns a dict with ``action`` set to one of the three values
+    above (or ``"no_such_transaction"`` if *transaction_id* is unknown), and
+    records the decision via :func:`advance_release_state` before returning
+    (idempotent: re-resolving an already-decided ``RECOVERY_REQUIRED``
+    transaction with the SAME current_hash reproduces the SAME decision).
+    """
+    current = await get_release_transaction(
+        db, transaction_id, project_id=project_id, tenant_id=tenant_id,
+    )
+    if current is None:
+        return {"action": "no_such_transaction", "transaction_id": transaction_id}
+
+    state = current.get("state")
+    if state in _TERMINAL_RELEASE_STATES:
+        return {
+            "action": "already_terminal", "state": state,
+            "transaction_id": transaction_id,
+            "message": f"Transaction is already terminal ({state}) — nothing to recover.",
+        }
+
+    base_hash = current.get("base_hash")
+    post_hash = current.get("post_hash")
+    if current_hash is not None and base_hash is not None and current_hash == base_hash:
+        action = "abort"
+        target_state = RELEASE_STATE_ABORTED
+    elif current_hash is not None and post_hash is not None and current_hash == post_hash:
+        action = "finish_db_commit"
+        target_state = (
+            RELEASE_STATE_RELEASED if state == RELEASE_STATE_DB_COMMITTED
+            else RELEASE_STATE_DB_COMMITTED
+        )
+    else:
+        action = "require_human"
+        target_state = RELEASE_STATE_RECOVERY_REQUIRED
+
+    # Ensure the transaction is AT LEAST flagged RECOVERY_REQUIRED before
+    # attempting the resolving transition (a transition out of
+    # RECOVERY_REQUIRED is only legal FROM that state — see
+    # valid_release_transition) — a no-op if it's already there.
+    if state != RELEASE_STATE_RECOVERY_REQUIRED and target_state != RELEASE_STATE_RECOVERY_REQUIRED:
+        await advance_release_state(
+            db, transaction_id, RELEASE_STATE_RECOVERY_REQUIRED,
+            session_id=session_id, project_id=project_id, tenant_id=tenant_id,
+            error=(
+                f"crash recovery invoked: current_hash={current_hash!r} vs "
+                f"base_hash={base_hash!r}/post_hash={post_hash!r}"
+            ),
+        )
+
+    result = await advance_release_state(
+        db, transaction_id, target_state,
+        session_id=session_id, project_id=project_id, tenant_id=tenant_id,
+        error=None if action != "require_human" else (
+            f"UNRESOLVED: current_hash={current_hash!r} matches neither "
+            f"base_hash={base_hash!r} nor post_hash={post_hash!r} — human "
+            "recovery required, refusing to guess or restore a stale backup."
+        ),
+    )
+    return {
+        "action": action,
+        "transaction_id": transaction_id,
+        "state": result.get("state", target_state),
+        "advanced": result.get("advanced", False),
+        "current_hash": current_hash,
+        "base_hash": base_hash,
+        "post_hash": post_hash,
+    }
+
+
+async def check_release_staleness(
+    db: aiosqlite.Connection,
+    transaction_id: str,
+    *,
+    wave_id: "str | None" = None,
+    element_id: "str | None" = None,
+    expected_base_revision: "str | None" = None,
+    source_path: "str | None" = None,
+    embed_sha256: "str | None" = None,
+    embed_mtime: "float | None" = None,
+    project_id: "str | None" = None,
+    tenant_id: "str | None" = None,
+) -> "dict[str, Any]":
+    """MDE-3 rework — connect the release-transaction promotion gate to the
+    REAL anchor/output-hash staleness signals that already exist elsewhere
+    in this codebase, instead of the generic ``base_hash``/``post_hash``
+    equality :func:`resolve_release_recovery` uses (that check answers
+    "did MY OWN promotion land", not "is the thing I'm about to promote
+    stale relative to a DIFFERENT anchor/source it's tied to" — a real,
+    distinct gap).
+
+    Two independent checks, each SKIPPED (not failed) when its own inputs
+    are not supplied — this function never invents a staleness verdict from
+    data it wasn't given:
+
+    * **Anchor/revision staleness** — delegates to the EXISTING
+      :func:`check_merge_stale_or_overlap` (the same gate
+      ``merge_docx_draft``'s wave-merge coordination already uses) when
+      *wave_id* and *element_id* are both given. Catches a stale draft base
+      revision or a DIFFERENT session having already merged this exact
+      anchor — the "real anchor" half of the acceptance gap.
+    * **Output-hash staleness** — delegates to the EXISTING
+      :mod:`meridian.embedded_staleness`'s ``check_embedded_staleness`` (the
+      same sha256-vs-live-source comparison ``check_embedded_staleness``
+      the MCP tool already exposes standalone) when *source_path* is given.
+      Catches this release's content having been embedded from a
+      meridian-outputs-tracked source that has since changed — the "real
+      output hash" half.
+
+    Returns ``{"blocked": bool, "reasons": [str, ...], "anchor_check":
+    dict|None, "output_check": dict|None}``. ``blocked=True`` on ANY hard
+    staleness signal (``check_merge_stale_or_overlap`` returning non-None,
+    or ``check_embedded_staleness`` reporting ``stale=True``) — the caller
+    (:func:`meridian.routes.tunnel.call_tunnel_tool_with_release_tracking`)
+    is expected to fail the promotion CLOSED (advance to
+    ``RECOVERY_REQUIRED``/``ABORTED`` rather than ``RELEASED``) when this
+    returns ``blocked=True``, never silently proceed. Never raises — an
+    unresolvable underlying check (e.g. no manifest, unreadable source)
+    degrades to a documented ``reasons`` entry rather than blocking on an
+    infrastructure failure; only a POSITIVE staleness/conflict signal from
+    either delegate blocks.
+    """
+    reasons: "list[str]" = []
+    anchor_check: "dict[str, Any] | None" = None
+    output_check: "dict[str, Any] | None" = None
+
+    if wave_id and element_id:
+        current = await get_release_transaction(
+            db, transaction_id, project_id=project_id, tenant_id=tenant_id,
+        )
+        file_path = (current or {}).get("file_path")
+        session_id = (current or {}).get("session_id")
+        if file_path and session_id:
+            anchor_check = await check_merge_stale_or_overlap(
+                db, wave_id, file_path, session_id, element_id,
+                expected_base_revision=expected_base_revision,
+            )
+            if anchor_check is not None:
+                reasons.append(
+                    f"anchor_stale: {anchor_check.get('reason')} "
+                    f"({anchor_check.get('message')})"
+                )
+        else:
+            reasons.append(
+                "anchor_check_skipped: transaction has no recorded "
+                "file_path/session_id to check against"
+            )
+
+    if source_path:
+        from ..embedded_staleness import check_embedded_staleness  # noqa: PLC0415
+        output_check = check_embedded_staleness(
+            "docx_release", source_path=source_path,
+            embed_sha256=embed_sha256, embed_mtime=embed_mtime,
+        )
+        if output_check.get("stale") is True:
+            reasons.append(f"output_hash_stale: {output_check.get('reason')}")
+
+    return {
+        "blocked": bool(
+            (anchor_check is not None)
+            or (output_check is not None and output_check.get("stale") is True)
+        ),
+        "reasons": reasons,
+        "anchor_check": anchor_check,
+        "output_check": output_check,
+    }
+
+
+async def list_release_transactions(
+    db: aiosqlite.Connection,
+    *,
+    project_id: "str | None" = None,
+    tenant_id: "str | None" = None,
+    state: "str | None" = None,
+    limit: int = _RELEASE_SCAN_LIMIT,
+) -> "list[dict[str, Any]]":
+    """Read-only: every distinct transaction's latest snapshot (optionally
+    filtered to one ``state``), newest-recorded first. Used both for
+    ``RECOVERY_REQUIRED`` startup scanning and for handoff evidence
+    (:func:`summarize_release_transactions`)."""
+    rows = await _scan_release_events(db, project_id=project_id, tenant_id=tenant_id, limit=limit)
+    latest = _latest_snapshot_per_transaction(rows)
+    transactions = list(latest.values())
+    if state is not None:
+        transactions = [t for t in transactions if t.get("state") == state]
+    transactions.sort(key=lambda t: t.get("_recorded_at") or "", reverse=True)
+    return transactions
+
+
+def summarize_release_transactions(transactions: "list[dict[str, Any]]") -> "dict[str, Any]":
+    """Pure, DB-free reduction of :func:`list_release_transactions`'s output
+    into the small, bounded evidence summary a handoff embeds (MDE-3: "exact
+    evidence in handoff"): counts by state, and the transaction_ids of any
+    that need attention (RECOVERY_REQUIRED)."""
+    counts: "dict[str, int]" = {}
+    recovery_needed: "list[dict[str, Any]]" = []
+    for t in transactions:
+        state = t.get("state") or "UNKNOWN"
+        counts[state] = counts.get(state, 0) + 1
+        if state == RELEASE_STATE_RECOVERY_REQUIRED:
+            recovery_needed.append({
+                "transaction_id": t.get("transaction_id"),
+                "change_set_id": t.get("change_set_id"),
+                "file_path": t.get("file_path"),
+                "error": t.get("error"),
+            })
+    return {
+        "transaction_count": len(transactions),
+        "state_counts": counts,
+        "recovery_required": recovery_needed,
+        "all_released": bool(transactions) and all(
+            t.get("state") in (RELEASE_STATE_RELEASED, RELEASE_STATE_ABORTED) for t in transactions
+        ),
+    }

@@ -431,12 +431,12 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "(hosted HTTP MCP, stdio, and the REST /handoff route).",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
-         "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"]},
+         "mode": {"type": "string", "enum": ["full", "delta", "planner", "starter", "goal"], "description": "(aec043cb) Optional — omitting mode is now INTENT-BASED, never a silent 'full'. Omission resolves to: 'delta' if session_id already produced a handoff this session (resumed/continuation); else 'goal' if session_id was started with role='executor'; else 'planner' if role='planner'; else 'goal' (the safe, bounded default — no workspace decisions/notes, no other project's state) when intent can't otherwise be determined. 'full' — the unbounded, whole-workspace archival/diagnostic dump, including cross-project workspace decisions/notes — is now returned ONLY for an explicit mode='full' request, never for an omitted one. (d2fc7465) Persistence differs by mode too, and is now explicit on the response: only 'full'/'delta'/'goal' write to the `handoffs` history table and the trusted pending_goal channel load_handoff() reads back — 'planner'/'starter'/'compact' are call-and-forget renders meant to be pasted directly, never the canonical stored handoff. The response's `retrievable_via_load_handoff` field states this per-call rather than requiring a caller to infer it from mode name."},
          "session_id": {"type": "string", "description": "Optional session id for auto-delta on repeated calls in the same session."},
          "root_dir": {"type": "string", "description": "Optional request-local absolute source-tree root used by live pointer resolution's local semantic fallback when no code tunnel is available. Never persisted."},
          "version": {"type": "string", "description": "(b8f89491) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this handoff to — applies to every mode (full/delta/starter/compact/goal), not just starter. Wins over the calling session's own stored sprint_version. Omit to fall back to session_id's scope, or to the whole project's cross-version backlog when neither is set."},
          "force_include_ids": {"type": "array", "items": {"type": "string"}, "description": "(45f519a0, validated by 3cab355a) Optional list of sprint-item ids to force-include in the pending list even when their deferred_until is in the future. This is a one-off visibility override for this handoff call only — deferred_until is NOT cleared, so claim_sprint_item's own deferral gate is unaffected. Use when a human wants a backburnered item back in scope for one planning run without permanently re-enabling claiming. Every id is validated: it must belong to this project, match the effective version scope (when one applies), and be genuinely todo/pending — an unknown/cross-project/cross-version/not-pending id is rejected (reported in the response's force_include_rejected list, never silently dropped) rather than honoured. Accepted ids are also exempt from the code-pointer enrichment cap, so a requested item always gets prospected regardless of how large the pending board is."},
-         "selected_item_ids": {"type": "array", "items": {"type": "string"}, "description": "(cffb9323) Optional explicit INCLUDE-ONLY item scope for a safe, isolated parallel-follow-up handoff — the opposite direction from force_include_ids (which WIDENS the pending list). When given, the pending batch on EVERY mode (full/delta/starter/compact/goal) is narrowed to exactly these ids plus their dependency closure (any depends_on ancestor still todo/pending in this project/version) — nothing else from the eligible backlog is included. Every requested id is validated (must exist, belong to this project, match the effective version scope when one applies, and be genuinely todo/pending — not already in_progress under another session, not done/failed/skipped): if ANY id fails validation, generate_handoff raises rather than silently falling back to the unfiltered backlog. The dependency-closure ids and a stable hash of that closure are rendered in a <selected_item_scope> tag inside the /goal block, bound into the same token body-hash as the rest of the content."},
+         "selected_item_ids": {"type": "array", "items": {"type": "string"}, "description": "(cffb9323) Optional explicit INCLUDE-ONLY item scope for a safe, isolated parallel-follow-up handoff — the opposite direction from force_include_ids (which WIDENS the pending list). When given, the pending batch on EVERY mode (full/delta/starter/compact/goal) is narrowed to exactly these ids plus their dependency closure (any depends_on ancestor still todo/pending in this project/version) — nothing else from the eligible backlog is included. Every requested id is validated (must exist, belong to this project, match the effective version scope when one applies, and be genuinely todo/pending — not already in_progress under another session, not done/failed/skipped): if ANY id fails validation, generate_handoff raises rather than silently falling back to the unfiltered backlog. The dependency-closure ids and a stable hash of that closure are rendered in a <selected_item_scope> tag inside the /goal block, bound into the same token body-hash as the rest of the content. (d2fc7465) The SAME closure ids/hash, plus which of the requested ids survived every downstream claimability filter (unprospected/backburner/manual/wave_gate_pending, each with a reason) and why, are ALSO returned as a structured `selected_scope` field on the response — the parse-free counterpart to the embedded tag, and the only place to learn about a PARTIAL exclusion (some, not all, requested ids dropped); a TOTAL exclusion instead raises HANDOFF_SCOPE_NON_EXECUTABLE. `selected_scope` is null when selected_item_ids was never passed."},
          "skip_ai_summary": {"type": "boolean", "description": "65c8b426 — skip the optional AI (Haiku) narrative calls (session summaries, ai_summary blurb, sprint retrospective). Default true on the MCP path for fast, reliable handoffs. Pass false to include AI-generated narrative sugar when you have budget and time."},
          "strict_evidence": {"type": "boolean", "description": "(8a883f60) Opt-in, off by default — mirrors complete_sprint_item's strict_evidence shape exactly. When true, a failed/degraded pointer-enrichment/freshness/wave-gate/graph-search capability makes this call refuse to render or persist a handoff at all, returning {error: HANDOFF_EVIDENCE_BLOCKED, evidence_status, evidence_errors, message} instead. Leave false/omitted for today's graceful-degrade behavior (handoff_evidence_status is still returned either way)."},
          "strict_pointer_evidence": {"type": "boolean", "description": "(eb8b6894) Opt-in, off by default, separate from strict_evidence above. When true, the claimable/goal batch's UNPROSPECTED exclusion requires a pending item's durable pointer(s) to have actually RESOLVED (resolve_pointer succeeded), not merely be PRESENT as a row — a structurally-valid-but-unresolved pointer no longer silently satisfies the gate. Never raises/blocks the whole handoff (unlike strict_evidence): an affected item is simply excluded from the claimable batch, the same way today's presence-only UNPROSPECTED gate already excludes items. Every pending item's pointer_resolution_status (structural_valid/target_resolved/provenance_verified/resolution_source/strict_satisfied) is always returned regardless of this flag — it only changes which items make the claimable cut."},
@@ -496,42 +496,59 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "input (same underlying meridian.handoff.accept_handoff_envelope every "
         "transport calls). Every input is optional and independently gated — supply "
         "whatever you have; an omitted check is skipped, never failed. "
-        "Returns {accepted: bool, result: 'ok'|'STALE_HANDOFF'|'BOARD_DIVERGENCE'|"
-        "'TOOL_MANIFEST_DRIFT'|'BODY_HASH_MISMATCH'|'CAPABILITY_UNAVAILABLE', "
-        "reasons: [str], token_check, capability_check, tool_manifest_check, "
-        "board_check}. Checks run in this order, short-circuiting on first failure: "
+        "Returns {accepted: bool, result: 'ok'|'STALE_HANDOFF'|'FOREIGN_PROJECT_CONFIG'|"
+        "'BOARD_DIVERGENCE'|'TOOL_MANIFEST_DRIFT'|'BODY_HASH_MISMATCH'|"
+        "'CAPABILITY_UNAVAILABLE', reasons: [str], token_check, identity_check, "
+        "capability_check, tool_manifest_check, board_check, "
+        "is_trusted_channel: false, delivery_source: str}. Checks run in this "
+        "order, short-circuiting on first failure: "
         "(1) token — token/presented_body via the same verify_handoff_token check; "
         "a body_mismatch reason maps to BODY_HASH_MISMATCH, every other invalid "
         "reason (not_found/wrong_project/already_consumed/expired) maps to "
         "STALE_HANDOFF — the raw token_check.reason sub-field always preserves "
         "which one, since AGENTS.md treats not_found/wrong_project as real spoofing "
         "signals and already_consumed/expired as usually just a sibling session "
-        "having already acted. (2) capability — required_tools vs available_tools: "
+        "having already acted. (2) identity binding (22f2604d) — presented_body's "
+        "own <project_start_config> tag vs THIS call's project_id/"
+        "expected_repo_path, via meridian.handoff.check_project_start_config_identity; "
+        "runs whenever step (1) did not already reject the envelope on its own "
+        "basis — i.e. token verification passed or no token was presented — so a "
+        "body whose embedded identity disagrees with project_id is "
+        "FOREIGN_PROJECT_CONFIG even when the token itself verified ok. This catches "
+        "a genuine token paired with a foreign project's start-config, which step "
+        "(1)'s wrong_project check alone cannot (that only catches a token minted "
+        "for a DIFFERENT project_id, not a body whose own tag disagrees with a "
+        "token that legitimately matches project_id). It does NOT re-run after "
+        "step (1) already failed (STALE_HANDOFF/BODY_HASH_MISMATCH) — that failure "
+        "is independently sufficient to reject the envelope. "
+        "(3) capability — required_tools vs available_tools: "
         "any required name missing from available_tools is CAPABILITY_UNAVAILABLE. "
-        "(3) tool-manifest drift — expected_required_tools_hash vs a hash computed "
+        "(4) tool-manifest drift — expected_required_tools_hash vs a hash computed "
         "live from live_items' own tool_requirements fields (see "
         "meridian.handoff.compute_required_tools_hash): mismatch is "
-        "TOOL_MANIFEST_DRIFT. (4) board revision — expected_board_revision "
+        "TOOL_MANIFEST_DRIFT. (5) board revision — expected_board_revision "
         "(acf6f51a's manifest <handoff_manifest board_revision=...>) vs a hash "
         "computed live from live_items via meridian.handoff.compute_board_revision: "
         "mismatch is BOARD_DIVERGENCE. live_items is YOUR OWN get_sprint_items(...) "
         "result — this tool never queries the board itself, so you control exactly "
         "which project/version/status filter \"live\" means; pass the same filter "
         "used when the compared handoff/manifest was generated. "
-        "Deliberately does not check project/tenant identity separately: when "
-        "token is supplied, verify_handoff_token's own project_id scoping already "
-        "fails closed into STALE_HANDOFF on a mismatch. "
+        "is_trusted_channel is always false here (calling this tool at all means "
+        "verifying something other than the trusted pending_goal/load_handoff "
+        "channel — see those tools' own docs). "
         "Scope note: this is a validation/report tool, not a hard gate — it is not "
         "wired into claim_sprint_item in this pass.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "goal_token": {"type": "string", "description": "Optional: the token value from the <goal_token>…</goal_token> line in the /goal block being accepted."},
-         "presented_body": {"type": "string", "description": "Optional: the full pasted /goal block (token + SECURITY banner included), checked against the token's stored body_hash — same contract as verify_handoff_token's presented_body."},
+         "presented_body": {"type": "string", "description": "Optional: the full pasted /goal block (token + SECURITY banner included), checked against the token's stored body_hash AND against project_id/expected_repo_path via its own <project_start_config> tag — same contract as verify_handoff_token's presented_body, plus the 22f2604d identity-binding check."},
          "live_items": {"type": "array", "items": {"type": "object"}, "description": "Optional: your own get_sprint_items(...) result (the exact items/filter the compared handoff/manifest was generated from) — required for the tool-manifest-drift and board-revision checks; omit to skip both."},
          "expected_board_revision": {"type": "string", "description": "Optional: the board_revision value from a manifest's <handoff_manifest board_revision=\"...\"> attribute, or any prior meridian.handoff.compute_board_revision(...) result to compare live_items against."},
          "expected_required_tools_hash": {"type": "string", "description": "Optional: a prior meridian.handoff.compute_required_tools_hash(...) result to compare against live_items' current tool_requirements."},
          "required_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names the handoff declared as required. Paired with available_tools to detect CAPABILITY_UNAVAILABLE."},
-         "available_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names actually available to you right now (e.g. from a live tools/list). Paired with required_tools."}},
+         "available_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names actually available to you right now (e.g. from a live tools/list). Paired with required_tools."},
+         "expected_repo_path": {"type": "string", "description": "Optional (22f2604d): YOUR OWN independently-known repo root (e.g. from your own meridian.toml/cwd) — never a value read out of presented_body itself. Compared against presented_body's <project_start_config repo_path=...>; a disagreement is FOREIGN_PROJECT_CONFIG."},
+         "delivery_source": {"type": "string", "description": "Optional (22f2604d): a label for how you received this content (default 'chat_paste'). Echoed back verbatim; purely informational bookkeeping alongside the always-false is_trusted_channel."}},
          "required": []}},
     {"name": "record_handoff_correction", "description":
         "3af86d28 — record a corrective handoff when a blocked executor session "
@@ -762,11 +779,14 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
     {"name": "checkpoint", "description":
         "Save progress mid-session. Runs auto_capture (buckets done tasks into a note), "
         "generates a delta handoff, and returns a compact summary with what was done, "
-        "what's pending, and the suggested next /goal string. Call before context fills "
-        "up or before ending a session.",
+        "what's pending, and the suggested next /goal string (now the same canonical, "
+        "token-embedded continuation block generate_handoff renders — verify it with "
+        "verify_handoff_token exactly like any other /goal block). Call before context "
+        "fills up or before ending a session.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
-         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
+         "version": {"type": "string", "description": "(455cfc36) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this checkpoint to — wins over the calling session's own stored sprint_version, exactly like generate_handoff's own version kwarg. Omit to fall back to the session's resolved scope (unchanged default behavior)."}},
          "required": ["session_id"]}},
     {"name": "request_hitl", "description":
         "Surface a question to the human-in-the-loop queue. ALWAYS use this to ask "

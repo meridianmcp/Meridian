@@ -19,6 +19,10 @@ dependencies = [
     "authlib>=1.3",
     "itsdangerous>=2.1",
     "resend>=0.7",
+    # 0bfde7ad — optional Redis push augmentation. The bridge remains fail-open
+    # when MERIDIAN_REDIS_URL is unset or Redis is unavailable, but the package
+    # must be present in Docker/Fly installs built from pyproject.toml.
+    "redis>=5.0",
     "bcrypt>=4.0",
     "slowapi>=0.1",
     # Tree-sitter core + grammars — symbol-level parallel protection (4bac57ff).

@@ -192,8 +192,9 @@ def test_http_accept_handoff_capability_unavailable(client):
     assert data["capability_check"]["missing_tools"] == ["Serena"]
     # Same top-level shape as the MCP/stdio result.
     assert set(data.keys()) == {
-        "accepted", "result", "reasons", "token_check",
+        "accepted", "result", "reasons", "token_check", "identity_check",
         "capability_check", "tool_manifest_check", "board_check",
+        "is_trusted_channel", "delivery_source",
     }
 
 

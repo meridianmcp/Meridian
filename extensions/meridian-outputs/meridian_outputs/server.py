@@ -20,12 +20,17 @@ these in; item bd5b8d79 added ``provenance_status``; item 0ea8fd3c added
 ``serialize_provenance_envelope``/``parse_provenance_envelope`` bridge; see
 each sibling module's docstring for the gap it closes).
 
-Non-goals (item 0ea8fd3c, carried over from research_evidence.py's own
-docstring): this server does NOT expose ``validate_output_semantics``,
-``write_artifact_registry``, or ``resolve_artifact_registry`` tools -- an
-artifact registry (cross-envelope persistence/lookup) and output-semantic
-validation are different, not-yet-built capabilities with their own sprint
-items. Nothing below should be read as a promise that those three exist.
+Item e1c979e3 added the artifact registry that research_evidence.py's own
+docstring (item 0ea8fd3c) had explicitly flagged as NOT YET BUILT: a
+durable, relocation-safe artifact identity store, exposed here as
+``register_artifact``/``resolve_artifact``/``verify_artifact_hash``/
+``bind_artifact_source_edge``/``get_artifact_sources``/
+``get_source_artifacts``/``list_registered_artifacts``/
+``reconcile_legacy_artifact_outputs`` -- see
+:mod:`meridian_outputs.artifact_registry` for the full contract. Output-
+semantic validation (``validate_output_semantics``) remains a separate,
+not-yet-built capability with its own sprint item; nothing below should be
+read as a promise that it exists.
 
 This is the wave-1 stopgap for local outputs indexing.  The hosted-aware
 smart-routing layer (item 1365e01a) is deliberately out of scope here.
@@ -47,6 +52,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import (
     annotate,
+    artifact_registry,
     classify,
     fingerprint,
     outputs_local,
@@ -567,6 +573,45 @@ def parse_provenance_envelope(
 
 
 @mcp.tool()
+def get_evidence_status_and_trusted_pointers(
+    envelope: dict[str, Any], limit: int | None = None,
+) -> dict[str, Any]:
+    """MDE-5 -- the small, BOUNDED projection a handoff embeds instead of the
+    full envelope: a machine-readable evidence status summary plus the
+    subset of records safe to treat as already-verified ("trusted pointers")
+    without re-resolving anything.
+
+    ``envelope`` is the canonical dict shape (same as every other tool on
+    this surface -- ``get_provenance_status_envelope``'s return value, or
+    ``research_evidence.envelope_to_dict``'s). This is the SAME data
+    ``meridian.handoff.generate_handoff(research_evidence_envelope=...,
+    emit_manifest=True)`` embeds into a goal-mode ``<handoff_manifest>``'s
+    ``<evidence_status>``/``<trusted_pointers>`` elements when a caller
+    passes an envelope through -- exposed here directly too, so a caller
+    that only has this server (not meridian core) can get the same
+    projection without round-tripping through a handoff.
+
+    Args:
+      envelope:  The canonical envelope dict to summarize.
+      limit:     Optional cap on the number of trusted pointers returned
+                 (never silent -- compare ``len(trusted_pointers)`` against
+                 ``status["authoritative_record_count"]`` to detect capping).
+
+    Returns:
+      ``{"status": <evidence_status_summary() dict>, "trusted_pointers":
+      [<id, kind, locator, label>, ...]}``.
+
+    Raises:
+      research_evidence.EnvelopeValidationError: ``envelope`` is malformed.
+    """
+    env = research_evidence.envelope_from_dict(envelope)
+    return {
+        "status": research_evidence.evidence_status_summary(env),
+        "trusted_pointers": research_evidence.trusted_pointers(env, limit=limit),
+    }
+
+
+@mcp.tool()
 def classify_outputs(
     paths: list[str],
 ) -> dict[str, Any]:
@@ -707,6 +752,204 @@ def bind_artifact_provenance(
     """
     return provenance.bind_artifact_provenance(
         outputs_dir, artifacts, fuzzy_limit=fuzzy_limit,
+    )
+
+
+@mcp.tool()
+def register_artifact(
+    outputs_dir: str,
+    kind: str,
+    canonical_path: str | None = None,
+    expected_sha256: str | None = None,
+    generator: str | None = None,
+    run_id: str | None = None,
+    source_locator: str | None = None,
+    role: str | None = None,
+    lifecycle_state: str = artifact_registry.ACTIVE,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Bind (create or update) a stable, relocation-safe public artifact
+    identity (item e1c979e3).
+
+    The public ``artifact_id`` is minted deterministically from PORTABLE
+    signals only (``kind`` + content hash + ``generator`` +
+    ``source_locator``) -- never from ``canonical_path`` -- so re-registering
+    the same logical artifact after it has been moved/copied/renamed yields
+    the identical id. ``canonical_path`` is stored only as redacted, local
+    metadata (see ``strip_local_metadata`` for a shareable projection).
+
+    Args:
+      outputs_dir:      Absolute path to the outputs directory.
+      kind:              Artifact kind, e.g. "figure"/"table"/"equation"/
+                        "output"/"document". Required.
+      canonical_path:    Current on-disk location, if known -- hashed
+                        best-effort to derive the identity's content hash.
+      expected_sha256:  Optional caller-asserted hash, verified against the
+                        freshly-computed hash and against any hash already on
+                        file for this id; a mismatch against either refuses
+                        the write.
+      generator:         The script/tool that produced this artifact.
+      run_id:            Optional run/session identifier.
+      source_locator:    Portable source locator (relative path, dataset
+                        name, DOI, sprint-item id, ...).
+      role:              "canonical" or "archival", if known.
+      lifecycle_state:   One of "active"/"quarantined"/"deprecated"/
+                        "deleted" (default "active").
+      metadata:          Opaque extra fields, shallow-merged on update.
+
+    Returns:
+      The stored record dict plus ``created`` (True on first registration).
+
+    Raises:
+      ValueError (artifact_registry.RegistryError): missing required
+      arguments, an invalid lifecycle_state, no portable identity signal to
+      anchor the id to, or a contradicting hash -- fail-closed, never a
+      silently-wrong registration.
+    """
+    return artifact_registry.register_artifact(
+        outputs_dir, kind, canonical_path=canonical_path,
+        expected_sha256=expected_sha256, generator=generator, run_id=run_id,
+        source_locator=source_locator, role=role, lifecycle_state=lifecycle_state,
+        metadata=metadata,
+    )
+
+
+@mcp.tool()
+def resolve_artifact(
+    outputs_dir: str,
+    artifact_id: str | None = None,
+    canonical_path: str | None = None,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Resolve an artifact by public id or by local path, with an explicit
+    resolved/ambiguous/unresolved/orphaned/hash_mismatch outcome -- never a
+    silent basename/fuzzy guess (item e1c979e3).
+
+    Args:
+      outputs_dir:      Absolute path to the outputs directory.
+      artifact_id:      Direct lookup by public id, when known.
+      canonical_path:    Resolve by content hash (strongest) or exact prior
+                        local-path sighting (weaker) when ``artifact_id``
+                        isn't known.
+      expected_sha256:  Optional hash to verify the resolved record against.
+
+    Returns:
+      ``{status, artifact_id, record, evidence, candidates, reason}`` -- see
+      ``artifact_registry.resolve_artifact`` for the full status semantics.
+      ``status="ambiguous"`` always carries every candidate id in
+      ``candidates`` and a ``None`` record -- never narrowed to a guess.
+    """
+    return artifact_registry.resolve_artifact(
+        outputs_dir, artifact_id=artifact_id, canonical_path=canonical_path,
+        expected_sha256=expected_sha256,
+    )
+
+
+@mcp.tool()
+def verify_artifact_hash(
+    outputs_dir: str, artifact_id: str, path: str | None = None,
+) -> dict[str, Any]:
+    """Recompute a registered artifact's content hash from disk and compare
+    it to what is on file (item e1c979e3).
+
+    Args:
+      outputs_dir:  Absolute path to the outputs directory.
+      artifact_id:  The registered artifact to verify.
+      path:         Explicit path to hash; defaults to the artifact's most
+                    recently seen local path sighting.
+
+    Returns:
+      ``{artifact_id, verified, current_hash, registered_hash, path,
+      reason}``. ``verified`` is True only when both hashes are present and
+      equal -- a missing registered hash or unreadable path is never
+      reported as verified.
+    """
+    return artifact_registry.verify_artifact_hash(outputs_dir, artifact_id, path=path)
+
+
+@mcp.tool()
+def bind_artifact_source_edge(
+    outputs_dir: str,
+    artifact_id: str,
+    source_locator: str,
+    relation: str = "produced_by",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Record a typed source<->artifact edge for a registered artifact
+    (item e1c979e3). Idempotent for the same (artifact_id, source_locator,
+    relation) triple.
+
+    Args:
+      outputs_dir:      Absolute path to the outputs directory.
+      artifact_id:      Must already be registered (``register_artifact``).
+      source_locator:    Portable locator for the source side of the edge.
+      relation:          Free-text edge verb (default "produced_by").
+      metadata:          Opaque extra fields, shallow-merged on update.
+
+    Returns:
+      The stored edge dict {edge_id, artifact_id, source_locator, relation,
+      created_at, metadata}.
+
+    Raises:
+      ValueError (artifact_registry.RegistryError): ``artifact_id`` was
+      never registered, or ``source_locator``/``relation`` is empty.
+    """
+    return artifact_registry.bind_source_edge(
+        outputs_dir, artifact_id, source_locator, relation=relation, metadata=metadata,
+    )
+
+
+@mcp.tool()
+def get_artifact_sources(outputs_dir: str, artifact_id: str) -> list[dict[str, Any]]:
+    """Artifact -> its bound sources (item e1c979e3). Sorted, deterministic."""
+    return artifact_registry.get_artifact_sources(outputs_dir, artifact_id)
+
+
+@mcp.tool()
+def get_source_artifacts(outputs_dir: str, source_locator: str) -> list[dict[str, Any]]:
+    """Source -> the artifacts it produced (item e1c979e3). Sorted, deterministic."""
+    return artifact_registry.get_source_artifacts(outputs_dir, source_locator)
+
+
+@mcp.tool()
+def list_registered_artifacts(
+    outputs_dir: str, kind: str | None = None, lifecycle_state: str | None = None,
+) -> list[dict[str, Any]]:
+    """All registered artifacts, optionally filtered by kind/lifecycle_state
+    (item e1c979e3). Sorted by artifact_id."""
+    return artifact_registry.list_artifacts(outputs_dir, kind=kind, lifecycle_state=lifecycle_state)
+
+
+@mcp.tool()
+def reconcile_legacy_artifact_outputs(
+    outputs_dir: str,
+    legacy_entries: list[dict[str, Any]] | None = None,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Migration/reconciliation report for legacy outputs against the
+    artifact registry (item e1c979e3).
+
+    Defaults to reconciling everything already known to
+    ``annotate.list_provenance`` (the common "predates the registry" case)
+    when ``legacy_entries`` is omitted.
+
+    Args:
+      outputs_dir:      Absolute path to the outputs directory.
+      legacy_entries:   Explicit ``{kind, canonical_path, expected_sha256,
+                        generator, source_locator, role}`` dicts to
+                        reconcile, or omit to use the provenance ledger.
+      dry_run:          Preview only (default True) -- nothing is written;
+                        entries that would be newly registered are listed
+                        under ``would_register`` with their would-be id.
+
+    Returns:
+      ``{outputs_dir, dry_run, scanned, already_registered,
+      registered|would_register, ambiguous, errors, skipped_unanchored}`` --
+      see ``artifact_registry.reconcile_legacy_outputs`` for full semantics.
+      An ambiguous or unanchored legacy entry is never silently registered.
+    """
+    return artifact_registry.reconcile_legacy_outputs(
+        outputs_dir, legacy_entries, dry_run=dry_run,
     )
 
 

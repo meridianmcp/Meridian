@@ -141,6 +141,7 @@ async def handle_start_session(
     _mcp_tenant_id: Any,
     *,
     executor_sessions: "set[str]",
+    planner_sessions: "set[str] | None" = None,
 ) -> Any:
     """MCP tool: start_session.
 
@@ -205,11 +206,20 @@ async def handle_start_session(
     # bf51b12e — register executor sessions in-memory so the planner
     # context-refresh hook skips them (the nudge is planner-only). Best-effort:
     # any failure here must never break start_session.
+    # aec043cb — mirror the same registration for role='planner' into
+    # planner_sessions, so resolve_handoff_mode can later resolve an omitted
+    # handoff mode for this session to 'planner' instead of a generic
+    # default. Symmetric with the executor branch above; same best-effort
+    # contract (a failure here must never break start_session), and a
+    # caller that doesn't pass planner_sessions (e.g. a pre-existing direct
+    # test call) sees zero behaviour change — this is purely additive.
     try:
-        if args.get("role") == "executor" and isinstance(result, dict):
+        if isinstance(result, dict):
             _sid = result.get("session_id") or result.get("session", {}).get("id")
-            if _sid:
+            if _sid and args.get("role") == "executor":
                 executor_sessions.add(_sid)
+            elif _sid and args.get("role") == "planner" and planner_sessions is not None:
+                planner_sessions.add(_sid)
     except Exception:  # noqa: BLE001 — non-fatal
         pass
     # b9d1b606 / b2a417ad / bc2e5ff0 — expand fs proxy roots so the executor's
@@ -321,6 +331,16 @@ async def handle_start_session(
             )
             if _pg_meta:
                 result["pending_goal"] = _pg_meta["goal"]
+                # 22f2604d — explicit, machine-readable trust marker
+                # (requirement 4): this value came straight from the
+                # `projects.pending_goal` column for THIS resolved `_pid`
+                # (pop_pending_goal_with_meta), never from text parsed out
+                # of a pasted chat block — mirrors load_handoff's own
+                # is_trusted_channel/delivery_source fields so a receiver
+                # can branch on the same field regardless of which trusted
+                # tool delivered the goal.
+                result["pending_goal_trusted"] = True
+                result["pending_goal_delivery_source"] = "mcp_start_session"
                 if _pg_meta["stale"]:
                     result["pending_goal_stale"] = True
                     result["pending_goal_age_hours"] = _pg_meta["age_hours"]

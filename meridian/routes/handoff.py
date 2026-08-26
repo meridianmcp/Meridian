@@ -147,9 +147,25 @@ async def generate_handoff_endpoint(
     except Exception:
         body = {}
     session_id = body.get("session_id")
+    _session_id = session_id if isinstance(session_id, str) else None
+    # aec043cb — same in-memory role registry the MCP transports use (lazy
+    # import: meridian.mcp.handler imports meridian.server, which imports
+    # this module at startup, so a module-level import here would be
+    # circular — mirrors the existing lazy-import pattern this module's
+    # own generate_handoff dispatch already uses elsewhere, e.g. handler.py's
+    # `from ..routes import tunnel as _tunnel_mod`). Best-effort: a failed
+    # import must never break this endpoint, it only means the role hint
+    # falls back to None and resolve_handoff_mode uses its own safe default.
+    _session_role: "str | None" = None
+    try:
+        from ..mcp import handler as _mcp_handler  # noqa: PLC0415
+        _session_role = _mcp_handler._session_role_hint(_session_id)
+    except Exception:  # noqa: BLE001 — role hint is best-effort only
+        _session_role = None
     mode = handoff_module.resolve_handoff_mode(
         body.get("mode"),
-        session_id if isinstance(session_id, str) else None,
+        _session_id,
+        session_role=_session_role,
     )
     # b8f89491 — optional explicit sprint-version scope, same contract as the
     # MCP path: wins over the session's own stored sprint_version; None (no
@@ -173,6 +189,11 @@ async def generate_handoff_endpoint(
     _raw_sel = body.get("selected_item_ids")
     if isinstance(_raw_sel, list):
         _selected_item_ids = [str(x) for x in _raw_sel if x]
+    # d2fc7465 — mirror handler.py's out-param: closure ids/hash plus, once
+    # generation finishes, which requested ids survived every downstream
+    # claimability filter and why. See handoff.generate_handoff's
+    # selected_scope_outcome docstring.
+    _selected_scope_outcome: dict[str, Any] = {}
     _strict_evidence = bool(body.get("strict_evidence"))
     _strict_pointer_evidence = bool(body.get("strict_pointer_evidence"))
     # 3cab355a — mirror handler.py's out-param: one entry per requested
@@ -199,6 +220,7 @@ async def generate_handoff_endpoint(
                 version=_version if isinstance(_version, str) else None,
                 force_include_ids=_force_include_ids,
                 selected_item_ids=_selected_item_ids,
+                selected_scope_outcome=_selected_scope_outcome,
                 strict_evidence=_strict_evidence,
                 strict_pointer_evidence=_strict_pointer_evidence,
                 force_include_rejected=_force_include_rejected,
@@ -315,12 +337,26 @@ async def generate_handoff_endpoint(
         # MCP transports; see format_handoff_mcp_content's docstring.
         "path": path, "content": handoff_module.format_handoff_mcp_content(content),
         "mode": mode,
+        # d2fc7465 — same explicit persistence contract the MCP transport
+        # returns; see handoff_module.handoff_mode_is_retrievable's docstring.
+        # `_board_stale` also guards this: on the 90s-timeout emergency L0
+        # fallback above, `mode` is (pre-existingly, unlike the MCP transport's
+        # honest 'l0_fallback' relabel) left as the ORIGINALLY requested mode
+        # (often 'full'), which would otherwise make this field claim
+        # retrievability for a render that never actually reached
+        # _persist_handoff_history_and_pending_goal.
+        "retrievable_via_load_handoff": (
+            not _board_stale and handoff_module.handoff_mode_is_retrievable(mode)
+        ),
         "capability_contract": capability_contract,
         "profile_binding": profile_binding,
         "proposal_evidence": proposal_evidence,
         "docx_integrity": docx_integrity,
         "force_include_rejected": _force_include_rejected,
         "continuation_status": _continuation_status,
+        # d2fc7465 — same structured selected-scope signal the MCP transport
+        # returns; see handler.py's own "selected_scope" field comment.
+        "selected_scope": _selected_scope_outcome or None,
     }
 
 
@@ -452,6 +488,11 @@ async def accept_handoff_endpoint(
         expected_required_tools_hash=body.get("expected_required_tools_hash"),
         required_tools=body.get("required_tools"),
         available_tools=body.get("available_tools"),
+        # 22f2604d — same identity-binding params the MCP transport passes
+        # through; keeps REST/MCP/stdio producing identical results for
+        # identical input (this endpoint's own docstring contract).
+        expected_repo_path=body.get("expected_repo_path"),
+        delivery_source=body.get("delivery_source") or "chat_paste",
     )
 
 

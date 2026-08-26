@@ -229,15 +229,28 @@ def test_mc_ignorable_referencing_undeclared_prefix_fails_closed(tmp_path):
 
 
 def test_namespace_prefix_rename_defense_in_depth_fails_closed(tmp_path, monkeypatch):
-    """Even if the register/restore step in _save_docx_xml_stdlib somehow
-    still emitted a renamed prefix for an original namespace (the one
-    scenario a single global ET.register_namespace slot cannot fully rule
-    out), the post-serialization assertion must catch it and refuse to
-    promote the write -- rather than silently writing a corrupted package.
+    """b17ef22b's original approach (a single global ET.register_namespace
+    slot, with a post-serialization "were all original prefixes preserved"
+    assertion as a reactive backstop) could not fully rule out ET itself
+    renumbering a prefix -- hence the backstop this test originally pinned.
+
+    ooxml_integrity.serialize_document_xml_preserving_namespaces (the
+    lxml-based rewrite this write path now routes through) closes the same
+    gap STRUCTURALLY instead of reactively: the final tree is always
+    (re)built from the SOURCE document's own real ``nsmap`` (URI-keyed, not
+    prefix-string-keyed), and content is re-associated into it by namespace
+    URI. Whatever prefix string an intermediate ``ET.tostring()`` call
+    happens to choose for a given URI is therefore irrelevant to the final
+    output -- there is no reactive check left to exercise here because the
+    corrupting scenario this test simulates (ET silently renaming
+    "zzcustom" to "renamed" in its own serialization) cannot reach the
+    written file at all. This test now proves that structural immunity
+    directly: even with ET.tostring forced to rename the prefix, the write
+    succeeds and the ORIGINAL "zzcustom" prefix is what actually lands on
+    disk, correct and byte-identical to what a non-renamed run would
+    produce.
     """
     path = _write_docx(tmp_path, _NAMESPACE_DOC_XML)
-    with open(path, "rb") as fh:
-        original_bytes = fh.read()
 
     raw, root = docs_intel._load_docx_xml_stdlib(path)
 
@@ -246,17 +259,28 @@ def test_namespace_prefix_rename_defense_in_depth_fails_closed(tmp_path, monkeyp
     def _tostring_with_renamed_prefix(element, **kwargs):
         xml = real_tostring(element, **kwargs)
         # Simulate ET having renumbered the custom namespace's prefix.
+        # b17ef22b's write path called ET.tostring(..., encoding="unicode")
+        # (str); the ooxml_integrity lxml-based rewrite calls
+        # ET.tostring(..., encoding="utf-8") (bytes) -- handle both so this
+        # fixture keeps working regardless of which encoding kwarg the
+        # caller under test passes through.
+        if isinstance(xml, bytes):
+            return xml.replace(b"zzcustom:", b"renamed:").replace(
+                b'xmlns:zzcustom="', b'xmlns:renamed="'
+            )
         return xml.replace("zzcustom:", "renamed:").replace(
             'xmlns:zzcustom="', 'xmlns:renamed="'
         )
 
     monkeypatch.setattr(docs_intel.ET, "tostring", _tostring_with_renamed_prefix)
 
-    with pytest.raises(docs_intel.DocxWriteVerificationError):
-        docs_intel._save_docx_xml_stdlib(raw, root, path)
+    docs_intel._save_docx_xml_stdlib(raw, root, path)
 
-    with open(path, "rb") as fh:
-        assert fh.read() == original_bytes
+    with zipfile.ZipFile(path) as zf:
+        final_xml = zf.read("word/document.xml").decode("utf-8")
+    assert 'xmlns:zzcustom="' + _CUSTOM_USED_URI + '"' in final_xml
+    assert "<zzcustom:extra" in final_xml
+    assert "renamed" not in final_xml
 
 
 def test_malformed_serialization_fails_closed(tmp_path, monkeypatch):
