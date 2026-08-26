@@ -468,6 +468,11 @@ async def accept_handoff_endpoint(
         expected_required_tools_hash=body.get("expected_required_tools_hash"),
         required_tools=body.get("required_tools"),
         available_tools=body.get("available_tools"),
+        # 22f2604d — same identity-binding params the MCP transport passes
+        # through; keeps REST/MCP/stdio producing identical results for
+        # identical input (this endpoint's own docstring contract).
+        expected_repo_path=body.get("expected_repo_path"),
+        delivery_source=body.get("delivery_source") or "chat_paste",
     )
 
 

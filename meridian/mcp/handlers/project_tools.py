@@ -331,6 +331,16 @@ async def handle_start_session(
             )
             if _pg_meta:
                 result["pending_goal"] = _pg_meta["goal"]
+                # 22f2604d — explicit, machine-readable trust marker
+                # (requirement 4): this value came straight from the
+                # `projects.pending_goal` column for THIS resolved `_pid`
+                # (pop_pending_goal_with_meta), never from text parsed out
+                # of a pasted chat block — mirrors load_handoff's own
+                # is_trusted_channel/delivery_source fields so a receiver
+                # can branch on the same field regardless of which trusted
+                # tool delivered the goal.
+                result["pending_goal_trusted"] = True
+                result["pending_goal_delivery_source"] = "mcp_start_session"
                 if _pg_meta["stale"]:
                     result["pending_goal_stale"] = True
                     result["pending_goal_age_hours"] = _pg_meta["age_hours"]

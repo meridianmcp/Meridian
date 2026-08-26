@@ -9878,6 +9878,19 @@ ACCEPT_RESULT_BOARD_DIVERGENCE = "BOARD_DIVERGENCE"
 ACCEPT_RESULT_TOOL_MANIFEST_DRIFT = "TOOL_MANIFEST_DRIFT"
 ACCEPT_RESULT_BODY_HASH_MISMATCH = "BODY_HASH_MISMATCH"
 ACCEPT_RESULT_CAPABILITY_UNAVAILABLE = "CAPABILITY_UNAVAILABLE"
+# 22f2604d — a presented body's OWN <project_start_config> tag names a
+# project_id/repo_path that disagrees with the identity this envelope is
+# being verified against, even though the goal_token itself (if any) was
+# genuine and correctly scoped. Deliberately distinct from
+# ACCEPT_RESULT_STALE_HANDOFF (that bucket is about the TOKEN's own
+# genuineness/consumption state) and from ACCEPT_RESULT_BODY_HASH_MISMATCH
+# (that requires a body_hash to have been recorded at mint time). This
+# check requires neither: it is a pure self-consistency check on the
+# presented body's declared identity, catching the confirmed incident
+# shape where a genuine token and a foreign project's start-config ended
+# up paired in the same delivered block. See
+# check_project_start_config_identity.
+ACCEPT_RESULT_FOREIGN_PROJECT_CONFIG = "FOREIGN_PROJECT_CONFIG"
 
 # Token-check failure reasons that indicate simple staleness/a sibling
 # already having acted, per AGENTS.md's b763d2ba/ed71ef9b distinction —
@@ -9923,6 +9936,117 @@ def compute_required_tools_hash(items: "list[dict[str, Any]]") -> str:
     return _hash_goal_body(json.dumps(sorted(names), sort_keys=True, separators=(",", ":")))
 
 
+# 22f2604d — identity-binding fail-closed check (confirmed incident: a
+# genuine, correctly-scoped goal_token was paired with a body whose own
+# <project_start_config> tag named a DIFFERENT project than the one the
+# token verified against — "a genuine token returned body_mismatch, and
+# the receiver also saw a project_start_config pointing at the parent
+# Meridian checkout while the actual task was a separate paper project").
+# The receiver correctly refused in that incident; this closes the
+# architecture gap that let such a block be treated as ambiguous rather
+# than mechanically, machine-readably rejected. Existing checks don't
+# cover this: verify_handoff_token's body_hash check (efaa918a) only
+# fires when a body_hash was actually recorded at mint time, and
+# accept_handoff_envelope's own docstring explicitly deferred a
+# project-identity check to "the token's own project_id scoping" — which
+# is exactly the gap here, since a body can be reassembled/wrapped (e.g.
+# a /loop-style wrapper, or a stale sibling handoff pasted alongside a
+# genuine token) WITHOUT ever touching the token or invalidating a
+# body_hash that was never recorded in the first place. This check is
+# orthogonal to token validity: it runs whenever a presented_body is
+# supplied, regardless of whether goal_token verification passed, failed,
+# or was never attempted in this call.
+_PROJECT_START_CONFIG_TAG_RE = re.compile(
+    r"<project_start_config\b([^>]*)/?>", re.IGNORECASE
+)
+_PROJECT_START_CONFIG_ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
+
+
+def _parse_project_start_config(body: "str | None") -> "dict[str, str] | None":
+    """Extract the first ``<project_start_config .../>`` tag's attributes
+    from ``body`` as a plain dict, or ``None`` when no such tag is present.
+
+    Every handoff mode that never emits the tag (``full``/``starter`` — see
+    ``_build_project_start_config_clause``'s own docstring) is a no-op
+    here, never a failure. Deliberately simple attribute-value regex
+    parsing, not a real XML parser: the tag is always emitted by
+    ``_build_project_start_config_clause`` in this exact
+    self-closing-attribute form, and this function only ever READS
+    server-emitted or presented-for-verification text, never executes it.
+    """
+    match = _PROJECT_START_CONFIG_TAG_RE.search(body or "")
+    if not match:
+        return None
+    attrs = dict(_PROJECT_START_CONFIG_ATTR_RE.findall(match.group(1)))
+    return attrs or None
+
+
+def check_project_start_config_identity(
+    presented_body: "str | None",
+    expected_project_id: str,
+    *,
+    expected_repo_path: "str | None" = None,
+) -> "dict[str, Any]":
+    """22f2604d — self-consistency check between a presented body's own
+    ``<project_start_config>`` tag and the identity the CALLER already
+    trusts: ``expected_project_id`` is the same project_id a caller passes
+    to ``verify_handoff_token``/``accept_handoff_envelope`` (its OWN
+    receiving project scope — never a value parsed out of the presented
+    body itself, which would make this check circular and useless).
+    ``expected_repo_path`` — optional, the receiver's own independently-
+    known repo root — is the same discipline: a value the caller already
+    has from its own session/config, not from the body under test.
+
+    Returns ``{"checked": bool, "consistent": bool, "found": dict|None,
+    "reasons": list[str]}``:
+
+    - ``checked=False`` — no ``<project_start_config>`` tag was found in
+      ``presented_body`` (or ``presented_body`` was empty/None). NOT a
+      failure: many handoff modes never emit this tag, and a body that
+      predates this tag's existence is not retroactively suspicious.
+    - ``checked=True, consistent=True`` — the tag was found and every
+      supplied expectation matches it.
+    - ``checked=True, consistent=False`` — the tag was found and at least
+      one supplied expectation disagrees with it; ``reasons`` names
+      exactly which field(s) disagreed.
+
+    Deliberately NOT a substitute for token verification — a caller runs
+    both (see ``accept_handoff_envelope``). This catches a distinct
+    failure mode: a body whose OWN embedded identity tag disagrees with
+    what the caller already trusts, independent of whether a token was
+    presented, was valid, or was checked at all in this call.
+    """
+    found = _parse_project_start_config(presented_body)
+    if found is None:
+        return {"checked": False, "consistent": True, "found": None, "reasons": []}
+    reasons: list[str] = []
+    found_project_id = found.get("project_id")
+    if found_project_id and expected_project_id and found_project_id != expected_project_id:
+        reasons.append(
+            "presented body's <project_start_config project_id="
+            f"{found_project_id!r}> disagrees with the project_id this "
+            f"envelope is being verified against ({expected_project_id!r})"
+        )
+    if expected_repo_path:
+        found_repo_path = found.get("repo_path")
+        if (
+            found_repo_path
+            and found_repo_path != "unset"
+            and found_repo_path != expected_repo_path
+        ):
+            reasons.append(
+                "presented body's <project_start_config repo_path="
+                f"{found_repo_path!r}> disagrees with the receiver's own "
+                f"repo_path ({expected_repo_path!r})"
+            )
+    return {
+        "checked": True,
+        "consistent": not reasons,
+        "found": found,
+        "reasons": reasons,
+    }
+
+
 async def accept_handoff_envelope(
     db: Any,
     project_id: str,
@@ -9934,6 +10058,8 @@ async def accept_handoff_envelope(
     expected_required_tools_hash: "str | None" = None,
     required_tools: "list[str] | None" = None,
     available_tools: "list[str] | None" = None,
+    expected_repo_path: "str | None" = None,
+    delivery_source: str = "chat_paste",
 ) -> "dict[str, Any]":
     """1bd5e810 — canonical receiver-side acceptance check for a handoff
     envelope (a pasted /goal block, a manifest-bound token, or both).
@@ -9954,13 +10080,22 @@ async def accept_handoff_envelope(
        for why these are grouped despite AGENTS.md drawing a real
        spoofing-vs-staleness distinction between them (the raw
        ``token_check.reason`` is always preserved in the response).
-    2. **Capability availability** (``required_tools``/``available_tools``)
+    2. **Identity binding** (``presented_body`` vs this call's OWN
+       ``project_id``/``expected_repo_path``) — delegates to
+       :func:`check_project_start_config_identity`. Runs REGARDLESS of
+       whether step 1 passed, failed, or was never attempted (no
+       ``goal_token`` supplied): a presented body's own
+       ``<project_start_config>`` tag naming a foreign project/repo is
+       ``ACCEPT_RESULT_FOREIGN_PROJECT_CONFIG`` even when the token itself
+       verified ``ok`` — this is the 22f2604d incident's core gap. Skipped
+       (never fails) when ``presented_body`` has no such tag at all.
+    3. **Capability availability** (``required_tools``/``available_tools``)
        — any name in ``required_tools`` absent from ``available_tools``
        (when both are given) is ``ACCEPT_RESULT_CAPABILITY_UNAVAILABLE``.
-    3. **Tool-manifest drift** (``expected_required_tools_hash`` vs a hash
+    4. **Tool-manifest drift** (``expected_required_tools_hash`` vs a hash
        computed from ``live_items``) — see :func:`compute_required_tools_hash`.
        Mismatch is ``ACCEPT_RESULT_TOOL_MANIFEST_DRIFT``.
-    4. **Board revision** (``expected_board_revision`` vs
+    5. **Board revision** (``expected_board_revision`` vs
        :func:`compute_board_revision` of ``live_items``) — mismatch is
        ``ACCEPT_RESULT_BOARD_DIVERGENCE``.
 
@@ -9977,12 +10112,22 @@ async def accept_handoff_envelope(
     This mirrors :func:`verify_board_revision`'s own "pure comparison, no
     fetch" contract.
 
-    Deliberately does NOT compare tenant/project identity as a separate
-    check: when ``goal_token`` is supplied, ``verify_handoff_token``'s own
-    ``project_id`` scoping already fails closed (``wrong_project``, bucketed
-    into ``ACCEPT_RESULT_STALE_HANDOFF`` above) — a caller always passes its
-    OWN receiving project_id here, so a mismatch is inherently caught by
-    that existing check rather than needing a second, redundant comparison.
+    Identity note (22f2604d, supersedes the prior "deliberately does NOT
+    compare tenant/project identity" scope note): step 1's ``wrong_project``
+    check catches a token minted for a DIFFERENT project than this call's
+    ``project_id``. It does NOT catch a token that genuinely belongs to
+    THIS ``project_id`` paired with a body whose OWN
+    ``<project_start_config>`` tag disagrees with that same ``project_id``
+    (e.g. a reassembled/wrapped body) — step 2 exists specifically for
+    that self-consistency gap and is independent of step 1's outcome.
+
+    ``is_trusted_channel`` is always ``False`` and ``delivery_source``
+    always echoes the ``delivery_source`` argument (default
+    ``"chat_paste"``) on every returned dict from this function: calling
+    this function at all means verifying something OTHER than the
+    trusted, project-scoped ``pending_goal``/``load_handoff`` channel (see
+    those functions' own docstrings) — a caller with genuinely trusted
+    content has no need to call this verification path in the first place.
 
     Scope note: this function VALIDATES and REPORTS; it is deliberately NOT
     wired as a hard gate inside claim_sprint_item in this pass (that would
@@ -10005,9 +10150,35 @@ async def accept_handoff_envelope(
                 "result": result,
                 "reasons": [f"handoff token verification failed: reason={reason!r}"],
                 "token_check": token_check,
+                "identity_check": None,
                 "capability_check": None,
                 "tool_manifest_check": None,
                 "board_check": None,
+                "is_trusted_channel": False,
+                "delivery_source": delivery_source,
+            }
+
+    # 22f2604d — identity binding: independent of token validity above.
+    # Runs whenever a presented_body is supplied, even when goal_token was
+    # never given at all, so a foreign project_start_config is caught
+    # whether or not the caller happened to also have a token in hand.
+    identity_check: "dict[str, Any] | None" = None
+    if presented_body:
+        identity_check = check_project_start_config_identity(
+            presented_body, project_id, expected_repo_path=expected_repo_path,
+        )
+        if identity_check["checked"] and not identity_check["consistent"]:
+            return {
+                "accepted": False,
+                "result": ACCEPT_RESULT_FOREIGN_PROJECT_CONFIG,
+                "reasons": list(identity_check["reasons"]),
+                "token_check": token_check,
+                "identity_check": identity_check,
+                "capability_check": None,
+                "tool_manifest_check": None,
+                "board_check": None,
+                "is_trusted_channel": False,
+                "delivery_source": delivery_source,
             }
 
     capability_check: "dict[str, Any] | None" = None
@@ -10024,9 +10195,12 @@ async def accept_handoff_envelope(
                 "result": ACCEPT_RESULT_CAPABILITY_UNAVAILABLE,
                 "reasons": [f"required tool(s) unavailable: {', '.join(missing)}"],
                 "token_check": token_check,
+                "identity_check": identity_check,
                 "capability_check": capability_check,
                 "tool_manifest_check": None,
                 "board_check": None,
+                "is_trusted_channel": False,
+                "delivery_source": delivery_source,
             }
 
     tool_manifest_check: "dict[str, Any] | None" = None
@@ -10046,9 +10220,12 @@ async def accept_handoff_envelope(
                     "changed since this envelope was generated"
                 ],
                 "token_check": token_check,
+                "identity_check": identity_check,
                 "capability_check": capability_check,
                 "tool_manifest_check": tool_manifest_check,
                 "board_check": None,
+                "is_trusted_channel": False,
+                "delivery_source": delivery_source,
             }
 
     board_check: "dict[str, Any] | None" = None
@@ -10068,9 +10245,12 @@ async def accept_handoff_envelope(
                     "longer matches this envelope's declared board_revision"
                 ],
                 "token_check": token_check,
+                "identity_check": identity_check,
                 "capability_check": capability_check,
                 "tool_manifest_check": tool_manifest_check,
                 "board_check": board_check,
+                "is_trusted_channel": False,
+                "delivery_source": delivery_source,
             }
 
     return {
@@ -10078,9 +10258,12 @@ async def accept_handoff_envelope(
         "result": ACCEPT_RESULT_OK,
         "reasons": [],
         "token_check": token_check,
+        "identity_check": identity_check,
         "capability_check": capability_check,
         "tool_manifest_check": tool_manifest_check,
         "board_check": board_check,
+        "is_trusted_channel": False,
+        "delivery_source": delivery_source,
     }
 
 

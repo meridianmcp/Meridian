@@ -3561,6 +3561,15 @@ async def _handle_task_tools(
             _correction = None
         return {
             "pending_goal": _pending,
+            # 22f2604d — explicit, machine-readable trust marker (requirement
+            # 4): load_handoff always returns the exact stored,
+            # project-scoped payload straight from this project's own DB
+            # rows (get_handoffs/get_pending_goal, both keyed on `_pid`
+            # above) — never text parsed out of a pasted chat block. A
+            # receiver can branch on this field instead of having to infer
+            # trust level from which tool happened to be called.
+            "is_trusted_channel": True,
+            "delivery_source": "mcp_load_handoff",
             "handoff": (
                 {
                     # f46372e8 — route the stored body through the SAME
@@ -3720,6 +3729,18 @@ async def _handle_task_tools(
             expected_required_tools_hash=args.get("expected_required_tools_hash"),
             required_tools=args.get("required_tools"),
             available_tools=args.get("available_tools"),
+            # 22f2604d — optional receiver-side repo root, from the
+            # caller's OWN session/config (e.g. its meridian.toml/cwd),
+            # never parsed out of presented_body itself; enables the
+            # foreign-repo-root leg of check_project_start_config_identity.
+            expected_repo_path=args.get("expected_repo_path"),
+            # 22f2604d — this MCP tool call is, by construction, verifying
+            # something OTHER than the trusted pending_goal/load_handoff
+            # channel (a pasted chat block by far the most common case);
+            # a caller MAY override with a more specific label (e.g.
+            # "task_notification") but the default already reflects the
+            # untrusted-by-default posture requirement 4 asks for.
+            delivery_source=args.get("delivery_source") or "chat_paste",
         )
     if name == "export_ai_log":
         # c0168425 — implementation follow-up to ea972129's design: read-only,

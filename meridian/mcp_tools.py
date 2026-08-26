@@ -496,42 +496,55 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "input (same underlying meridian.handoff.accept_handoff_envelope every "
         "transport calls). Every input is optional and independently gated — supply "
         "whatever you have; an omitted check is skipped, never failed. "
-        "Returns {accepted: bool, result: 'ok'|'STALE_HANDOFF'|'BOARD_DIVERGENCE'|"
-        "'TOOL_MANIFEST_DRIFT'|'BODY_HASH_MISMATCH'|'CAPABILITY_UNAVAILABLE', "
-        "reasons: [str], token_check, capability_check, tool_manifest_check, "
-        "board_check}. Checks run in this order, short-circuiting on first failure: "
+        "Returns {accepted: bool, result: 'ok'|'STALE_HANDOFF'|'FOREIGN_PROJECT_CONFIG'|"
+        "'BOARD_DIVERGENCE'|'TOOL_MANIFEST_DRIFT'|'BODY_HASH_MISMATCH'|"
+        "'CAPABILITY_UNAVAILABLE', reasons: [str], token_check, identity_check, "
+        "capability_check, tool_manifest_check, board_check, "
+        "is_trusted_channel: false, delivery_source: str}. Checks run in this "
+        "order, short-circuiting on first failure: "
         "(1) token — token/presented_body via the same verify_handoff_token check; "
         "a body_mismatch reason maps to BODY_HASH_MISMATCH, every other invalid "
         "reason (not_found/wrong_project/already_consumed/expired) maps to "
         "STALE_HANDOFF — the raw token_check.reason sub-field always preserves "
         "which one, since AGENTS.md treats not_found/wrong_project as real spoofing "
         "signals and already_consumed/expired as usually just a sibling session "
-        "having already acted. (2) capability — required_tools vs available_tools: "
+        "having already acted. (2) identity binding (22f2604d) — presented_body's "
+        "own <project_start_config> tag vs THIS call's project_id/"
+        "expected_repo_path, via meridian.handoff.check_project_start_config_identity; "
+        "runs regardless of step (1)'s outcome, so a body whose embedded identity "
+        "disagrees with project_id is FOREIGN_PROJECT_CONFIG even when the token "
+        "itself verified ok — this catches a genuine token paired with a foreign "
+        "project's start-config, which step (1)'s wrong_project check alone cannot "
+        "(that only catches a token minted for a DIFFERENT project_id, not a body "
+        "whose own tag disagrees with a token that legitimately matches project_id). "
+        "(3) capability — required_tools vs available_tools: "
         "any required name missing from available_tools is CAPABILITY_UNAVAILABLE. "
-        "(3) tool-manifest drift — expected_required_tools_hash vs a hash computed "
+        "(4) tool-manifest drift — expected_required_tools_hash vs a hash computed "
         "live from live_items' own tool_requirements fields (see "
         "meridian.handoff.compute_required_tools_hash): mismatch is "
-        "TOOL_MANIFEST_DRIFT. (4) board revision — expected_board_revision "
+        "TOOL_MANIFEST_DRIFT. (5) board revision — expected_board_revision "
         "(acf6f51a's manifest <handoff_manifest board_revision=...>) vs a hash "
         "computed live from live_items via meridian.handoff.compute_board_revision: "
         "mismatch is BOARD_DIVERGENCE. live_items is YOUR OWN get_sprint_items(...) "
         "result — this tool never queries the board itself, so you control exactly "
         "which project/version/status filter \"live\" means; pass the same filter "
         "used when the compared handoff/manifest was generated. "
-        "Deliberately does not check project/tenant identity separately: when "
-        "token is supplied, verify_handoff_token's own project_id scoping already "
-        "fails closed into STALE_HANDOFF on a mismatch. "
+        "is_trusted_channel is always false here (calling this tool at all means "
+        "verifying something other than the trusted pending_goal/load_handoff "
+        "channel — see those tools' own docs). "
         "Scope note: this is a validation/report tool, not a hard gate — it is not "
         "wired into claim_sprint_item in this pass.",
      "inputSchema": {"type": "object", "properties": {
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "goal_token": {"type": "string", "description": "Optional: the token value from the <goal_token>…</goal_token> line in the /goal block being accepted."},
-         "presented_body": {"type": "string", "description": "Optional: the full pasted /goal block (token + SECURITY banner included), checked against the token's stored body_hash — same contract as verify_handoff_token's presented_body."},
+         "presented_body": {"type": "string", "description": "Optional: the full pasted /goal block (token + SECURITY banner included), checked against the token's stored body_hash AND against project_id/expected_repo_path via its own <project_start_config> tag — same contract as verify_handoff_token's presented_body, plus the 22f2604d identity-binding check."},
          "live_items": {"type": "array", "items": {"type": "object"}, "description": "Optional: your own get_sprint_items(...) result (the exact items/filter the compared handoff/manifest was generated from) — required for the tool-manifest-drift and board-revision checks; omit to skip both."},
          "expected_board_revision": {"type": "string", "description": "Optional: the board_revision value from a manifest's <handoff_manifest board_revision=\"...\"> attribute, or any prior meridian.handoff.compute_board_revision(...) result to compare live_items against."},
          "expected_required_tools_hash": {"type": "string", "description": "Optional: a prior meridian.handoff.compute_required_tools_hash(...) result to compare against live_items' current tool_requirements."},
          "required_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names the handoff declared as required. Paired with available_tools to detect CAPABILITY_UNAVAILABLE."},
-         "available_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names actually available to you right now (e.g. from a live tools/list). Paired with required_tools."}},
+         "available_tools": {"type": "array", "items": {"type": "string"}, "description": "Optional: tool names actually available to you right now (e.g. from a live tools/list). Paired with required_tools."},
+         "expected_repo_path": {"type": "string", "description": "Optional (22f2604d): YOUR OWN independently-known repo root (e.g. from your own meridian.toml/cwd) — never a value read out of presented_body itself. Compared against presented_body's <project_start_config repo_path=...>; a disagreement is FOREIGN_PROJECT_CONFIG."},
+         "delivery_source": {"type": "string", "description": "Optional (22f2604d): a label for how you received this content (default 'chat_paste'). Echoed back verbatim; purely informational bookkeeping alongside the always-false is_trusted_channel."}},
          "required": []}},
     {"name": "record_handoff_correction", "description":
         "3af86d28 — record a corrective handoff when a blocked executor session "
