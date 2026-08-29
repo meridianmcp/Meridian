@@ -5063,6 +5063,29 @@ def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
     return (item.get("title") or "").lstrip().upper().startswith("MANUAL")
 
 
+def _is_hard_blocked_sprint_item(item: dict[str, Any]) -> bool:
+    """524e73e6 — mirrors the EXACT semantics of
+    ``handoff._is_hard_blocked_sprint_item``: True for
+    ``blocker_kind in ('superseded', 'systemic_invalidated_run')``
+    (f89d440f/cc3864bd — see ``_VALID_SPRINT_BLOCKER_KINDS`` above), a HARD
+    gate enforced inside ``claim_sprint_item`` itself. These items must be
+    excluded from ``get_parallelizable_groups``'s resource-conflict-free
+    batch advertisement too — same reasoning as ``_is_manual_sprint_item``'s
+    own exclusion there: a superseded/invalidated item would otherwise be
+    advertised as parallel-safe even though claim_sprint_item will
+    deterministically refuse it.
+
+    NOTE: This helper MUST be kept in sync with
+    ``meridian.handoff._is_hard_blocked_sprint_item`` (db/__init__.py is
+    imported BY handoff.py, so we cannot import handoff here without a
+    circular import — hence the deliberate duplication, same convention as
+    ``_is_manual_sprint_item`` above).
+    """
+    if not isinstance(item, dict):
+        return False
+    return item.get("blocker_kind") in ("superseded", "systemic_invalidated_run")
+
+
 # ---------------------------------------------------------------------------
 # dcfbe55c — macro-wave projection: presentation/orchestration layer ONLY.
 #
@@ -5710,6 +5733,13 @@ async def get_parallelizable_groups(
     # 5a85a78f — also filter out milestone_type='human' and MANUAL-titled items;
     # get_sprint_items only gates on blocker_kind, not the other two manual signals.
     items = [it for it in items if not _is_manual_sprint_item(it)]
+    # 524e73e6 — also exclude blocker_kind in ('superseded',
+    # 'systemic_invalidated_run'): a hard gate claim_sprint_item enforces,
+    # but get_sprint_items's include_manual_blocker only ever strips
+    # 'manual'. Without this, a superseded/invalidated item could still be
+    # advertised here as a parallel-safe batch member even though claiming
+    # it will deterministically fail.
+    items = [it for it in items if not _is_hard_blocked_sprint_item(it)]
     if version is not None:
         items = [it for it in items if it.get("version") == version]
     claimable_statuses = {"pending", "todo"}
