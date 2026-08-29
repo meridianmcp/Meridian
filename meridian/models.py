@@ -236,6 +236,16 @@ class GoalState(BaseModel):
     ambient_tasks: list[dict[str, Any]] | None = None
     north_star: str | None = None
     sprint: str | None = None
+    # P0 VERIFY (106519eb) — db.get_goal already computes these two fields for a
+    # subproject that borrows its parent's north_star (3b6ff466), but this response
+    # model previously didn't declare them: FastAPI's response_model validation
+    # silently stripped them before the JSON ever reached a caller, so the
+    # inherited-vs-own distinction that db.get_goal computes never survived the
+    # HTTP boundary (see tests/test_core.py's north_star inheritance tests, which
+    # all asserted directly against db_module.get_goal and so never caught this).
+    # Declaring them here is the actual fix — no db/route logic changes needed.
+    north_star_inherited: bool | None = None
+    north_star_source_project_id: str | None = None
     # v0.6.1 — XML-serialised goal envelope. Mirrors the same fields
     # under one wire format so MCP consumers can hand the whole thing
     # to Claude as a single block with structured cache hints.

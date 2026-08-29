@@ -7871,6 +7871,56 @@ async def test_context_block_and_planning_brief_show_inherited_north_star(db):
     assert goal["north_star_inherited"] is True
 
 
+def test_goal_route_surfaces_north_star_inheritance_over_http(client):
+    """P0 VERIFY (106519eb) — regression test for a real gap found while
+    auditing the 'Make subproject of' feature: db.get_goal computes
+    north_star_inherited / north_star_source_project_id (3b6ff466), but the
+    GET /projects/{id}/goal route's response_model=GoalState previously did
+    not declare those two fields, so FastAPI's response_model validation
+    silently stripped them before the JSON reached any HTTP caller (the
+    dashboard included). Every prior inheritance test asserted directly
+    against db_module.get_goal and so never exercised this route, which is
+    exactly how the gap went unnoticed. This test goes over HTTP end to end.
+    """
+    parent = client.post("/projects", json={"name": "http-ns-parent"}).json()
+    client.post(
+        f"/projects/{parent['id']}/goal",
+        json={"content": "pg", "north_star": "HTTP inherited star"},
+    )
+    child = client.post(
+        "/projects",
+        json={"name": "http-ns-child", "parent_project_id": parent["id"]},
+    ).json()
+    client.post(f"/projects/{child['id']}/goal", json={"content": "cg"})
+
+    r = client.get(f"/projects/{child['id']}/goal")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["north_star"] == "HTTP inherited star"
+    # The whole point: the response must let a caller tell an inherited value
+    # apart from an explicit one, and name the source project.
+    assert body["north_star_inherited"] is True
+    assert body["north_star_source_project_id"] == parent["id"]
+
+    # Once the child sets its own north_star, it must stop being flagged
+    # inherited over the same HTTP path.
+    client.post(
+        f"/projects/{child['id']}/goal",
+        json={"content": "cg2", "north_star": "Child's own HTTP star"},
+    )
+    r2 = client.get(f"/projects/{child['id']}/goal")
+    body2 = r2.json()
+    assert body2["north_star"] == "Child's own HTTP star"
+    assert body2["north_star_inherited"] is False
+    assert body2["north_star_source_project_id"] is None
+
+    # A top-level project (no parent) must not carry a stray inherited flag.
+    r3 = client.get(f"/projects/{parent['id']}/goal")
+    body3 = r3.json()
+    assert body3["north_star_inherited"] is False
+    assert body3["north_star_source_project_id"] is None
+
+
 def test_migrate_project_parent_id_survives_pre_column_projects_table():
     """3b6ff466 — existing-DB upgrade (spirit of the pre-tenant_id blog test).
 

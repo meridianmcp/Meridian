@@ -11762,6 +11762,8 @@ Current: ${current || "(none)"}`,
 
               <span id="goal-ns-lock-${project.id}" style="opacity:0.5;font-size:11px"></span>
 
+              <span id="goal-ns-inherited-${project.id}" style="display:none;opacity:0.75;font-size:11px;color:var(--accent)" title=""></span>
+
             </div>
 
           </div>
@@ -16052,6 +16054,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       p3._serverSprint = goal.sprint || "";
       const nsLock = document.getElementById(`goal-ns-lock-${projectId}`);
       if (nsLock) nsLock.textContent = goal.north_star ? "locked" : "unlocked";
+      const nsInherited = document.getElementById(`goal-ns-inherited-${projectId}`);
+      if (nsInherited) {
+        if (goal.north_star_inherited && goal.north_star_source_project_id) {
+          const sourceProj = (state.projects || []).find(
+            (pr) => pr.id === goal.north_star_source_project_id
+          );
+          const sourceName = sourceProj ? sourceProj.name : "parent project";
+          nsInherited.textContent = `\u2B06 inherited from "${sourceName}"`;
+          nsInherited.title = "This north star is borrowed from the parent project \u2014 set one on this project to override it.";
+          nsInherited.style.display = "";
+        } else {
+          nsInherited.textContent = "";
+          nsInherited.style.display = "none";
+        }
+      }
       p3._lastSaved = text;
       if (nsTA) {
         nsTA.classList.remove("dirty");

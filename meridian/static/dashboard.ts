@@ -3747,6 +3747,8 @@ function buildTabBody(project: any) {
 
               <span id="goal-ns-lock-${project.id}" style="opacity:0.5;font-size:11px"></span>
 
+              <span id="goal-ns-inherited-${project.id}" style="display:none;opacity:0.75;font-size:11px;color:var(--accent)" title=""></span>
+
             </div>
 
           </div>
@@ -10456,6 +10458,28 @@ async function refreshGoal(projectId: any) {
     const nsLock = document.getElementById(`goal-ns-lock-${projectId}`);
 
     if (nsLock) nsLock.textContent = goal.north_star ? 'locked' : 'unlocked';
+
+    // P0 VERIFY (106519eb) — the north star shown for a subproject with none of
+    // its own is borrowed from goal.north_star_source_project_id (0fed6a42 /
+    // 3b6ff466 inheritance). Without this badge the textarea looks identical to
+    // an explicit child value, so nothing distinguishes "inherited from parent"
+    // from "this child's own override" — surface the source project's name.
+    const nsInherited = document.getElementById(`goal-ns-inherited-${projectId}`);
+    if (nsInherited) {
+      if (goal.north_star_inherited && goal.north_star_source_project_id) {
+        const sourceProj = (state.projects || []).find(
+          (pr: any) => pr.id === goal.north_star_source_project_id,
+        );
+        const sourceName = sourceProj ? sourceProj.name : 'parent project';
+        nsInherited.textContent = `⬆ inherited from "${sourceName}"`;
+        nsInherited.title = 'This north star is borrowed from the parent project — ' +
+          'set one on this project to override it.';
+        nsInherited.style.display = '';
+      } else {
+        nsInherited.textContent = '';
+        nsInherited.style.display = 'none';
+      }
+    }
 
     p._lastSaved = text;
 
