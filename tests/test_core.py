@@ -361,6 +361,34 @@ async def test_handoff_custom_template(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_handoff_template_rejects_oversized_value(db):
+    """47ac68a0 — every block a custom handoff_template interpolates is
+    already bounded at RENDER time (recent_tasks[:10], decisions[:10], etc.),
+    but the raw template string itself had no bound at WRITE time: an
+    arbitrarily large template was persisted unbounded and re-rendered
+    unbounded into every full-mode handoff (generate_handoff's own on-disk
+    file write / handoffs table / pending_goal persistence are explicitly
+    NOT covered by format_handoff_mcp_content's wire-level max_bytes
+    budget). update_workspace_settings must now reject an oversized template
+    outright rather than silently persisting it."""
+    too_big = "x" * (db_module._HANDOFF_TEMPLATE_MAX_CHARS + 1)
+    with pytest.raises(ValueError):
+        await db_module.update_workspace_settings(db, handoff_template=too_big)
+    # Rejected write must not have persisted anything.
+    assert (await db_module.get_workspace_settings(db))["handoff_template"] is None
+
+    # A template right at the boundary is accepted unchanged.
+    at_limit = "y" * db_module._HANDOFF_TEMPLATE_MAX_CHARS
+    await db_module.update_workspace_settings(db, handoff_template=at_limit)
+    assert (await db_module.get_workspace_settings(db))["handoff_template"] == at_limit
+
+    # Clean up so this test doesn't leak a global (singleton) template into
+    # whichever test runs next in the same DB.
+    await db_module.update_workspace_settings(db, handoff_template="")
+    assert (await db_module.get_workspace_settings(db))["handoff_template"] is None
+
+
+@pytest.mark.asyncio
 async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_path):
     p = await db_module.create_project(db, "alpha-queue")
     await db_module.set_goal(db, p["id"], "ship the queue")

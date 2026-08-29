@@ -1847,8 +1847,23 @@ _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS = 15
 # keeps the surviving content syntactically complete for whatever it does
 # include (see docs/meridian-handoff-contract.md's "Wire-level truncation"
 # section).
+#
+# 47ac68a0 — the opening-tag pattern originally required a bare ``<tag>``
+# with NO attributes, so it silently failed to match (and therefore left
+# UNPROTECTED) every structural tag that is actually rendered WITH
+# attributes: ``<execution_policy execution_mode=... >``,
+# ``<selected_item_scope requested=... >``, the outer
+# ``<handoff_manifest schema_version=... >`` wrapper (only its attribute-free
+# inner children were ever protected), and ``<proposal_scope id=... >``. A
+# byte cut could land inside any of those four and leave a dangling open tag
+# or drop the manifest's closing tag — exactly the "dropping...
+# execution_policy" / "syntactically incomplete" failure this safety net
+# exists to prevent. ``[^<>]*`` allows an attribute run on the opening tag
+# (every attribute value in this file is written via ``_xml_escape``, which
+# already escapes ``<``/``>``/``&``, so an attribute value can never itself
+# contain an unescaped ``<`` or ``>`` to confuse this scan).
 _STRUCTURAL_TAG_RE = re.compile(
-    r"<([a-zA-Z][a-zA-Z0-9_]*)>.*?</\1>", re.DOTALL,
+    r"<([a-zA-Z][a-zA-Z0-9_]*)(?:\s[^<>]*)?>.*?</\1>", re.DOTALL,
 )
 
 

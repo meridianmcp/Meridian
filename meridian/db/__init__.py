@@ -12403,6 +12403,8 @@ from .workspace import (  # noqa: F401
     _VALID_WS_SPRINT_STATUSES,
     _ws_tenant_clause,
     _ws_settings_key,
+    # 47ac68a0 — handoff_template write-time length bound
+    _HANDOFF_TEMPLATE_MAX_CHARS,
     # Public workspace-note functions
     add_workspace_note,
     get_workspace_notes,
