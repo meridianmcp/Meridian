@@ -11,6 +11,7 @@ from fastapi.responses import Response
 from .._deps import (
     _db,
     _data_dir,
+    _enforcement_context,
     _get_tenant_from_request,
     _hosted_mode,
     _scoped_project_ids_for_request,
@@ -19,6 +20,7 @@ from .._deps import (
 from .. import db as db_module
 from .. import goal_md as goal_md_module
 from ..executor_config import normalize_executor_config
+from ..roles import PERM_SETTINGS, has_perm
 from ..models import (
     GoalModeSet,
     ProjectOrganizationSet,
@@ -694,7 +696,29 @@ async def delete_projects_batch(
     checked across the whole batch (409) before anything is deleted — a
     guard violation or an unknown id aborts the entire batch, not just the
     offending project.
+
+    3f4ba195 — explicit PERM_SETTINGS guard (authorization-bypass fix).
+    ``_required_perm_for_request`` (meridian/_deps.py) maps whole-project
+    deletion to PERM_SETTINGS only via its ``path.startswith("/projects/")``
+    branch, which the bare ``/projects`` path this batch route answers on
+    never satisfies — it silently fell through to the PERM_WRITE default,
+    so a cross-workspace 'member' (PERM_WRITE but not PERM_SETTINGS) could
+    delete an owner's project through this batch form even though the
+    identical action via the singular ``DELETE /projects/{project_id}``
+    route is correctly owner/admin-gated by that same middleware mapping.
+    Rather than change the generic path-prefix mapping in ``_deps.py``
+    (out of scope for this fix), enforce the same requirement explicitly
+    here — independent of the middleware's coarser default — mirroring the
+    inline ``_require_workspace_perm`` guard ``routes/export.py`` uses for
+    ``POST /account/delete``. A no-op for self-hosted / same-workspace /
+    non-member callers, exactly like the middleware itself (``ctx is None``).
     """
+    ctx = await _enforcement_context(request)
+    if ctx is not None and not has_perm(ctx[2], PERM_SETTINGS):
+        raise HTTPException(
+            403,
+            f"Workspace role '{ctx[2]}' lacks permission '{PERM_SETTINGS}'",
+        )
     project_ids = list(dict.fromkeys(project_id))  # de-dupe, preserve order
     db = await _db(request)
     missing = [pid for pid in project_ids if await db_module.get_project(db, pid) is None]

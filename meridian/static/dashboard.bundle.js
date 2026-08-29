@@ -2491,8 +2491,16 @@
       // export my data + danger zone
       `settings-notifications-card-${projectId}`,
       // ntfy / webhook / email
-      `workspace-section-${projectId}`
+      `workspace-section-${projectId}`,
       // workspace defaults + decisions/notes
+      // 3f4ba195 — the Tunnel Plugins card's "Reset to defaults"/"Add" actions
+      // carry an admin-only CSS class with no matching rule or JS toggle
+      // anywhere, so without this entry a guest role saw and could trigger
+      // them (PUT /tunnel/plugins requires only PERM_WRITE server-side, which
+      // a 'member' has). Hiding the whole card here is consistent with how
+      // every other admin-only card above is gated.
+      `tunnel-plugins-section-${projectId}`
+      // tunnel plugin config
     ].forEach((id) => {
       const el2 = document.getElementById(id);
       if (el2) el2.style.display = "none";

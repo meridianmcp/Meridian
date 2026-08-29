@@ -7573,6 +7573,67 @@ def test_delete_project_in_progress_guard(client):
     assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
 
 
+def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypatch):
+    """3f4ba195 — DELETE /projects (batch form) must require PERM_SETTINGS,
+    the same as its singular sibling DELETE /projects/{project_id}.
+
+    Regression coverage for an authorization-bypass: ``_required_perm_for_request``
+    (meridian/_deps.py) only maps whole-project deletion to PERM_SETTINGS via a
+    ``path.startswith("/projects/")`` check, which the bare ``/projects`` path
+    this batch route answers on never satisfies — it silently fell through to
+    the PERM_WRITE default. That let a cross-workspace 'member' (who has
+    PERM_WRITE but not PERM_SETTINGS) delete another owner's project through
+    the batch endpoint, even though the identical action via the singular
+    endpoint has always been correctly owner/admin-gated.
+    """
+    import asyncio
+    from datetime import datetime, timezone
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    # Defensively blank a real Neon admin URL a dev .env might supply — the
+    # owner tenant below is 'admin' plan specifically so the cross-workspace
+    # DB switch resolves back to this same in-memory test DB instead.
+    monkeypatch.setenv("MERIDIAN_AUTH_DB", "")
+
+    db = client.app.state.db
+
+    async def _setup():
+        owner = await db_module.upsert_tenant(db, "batchdel-owner@example.com")
+        await db.execute("UPDATE tenants SET plan='admin' WHERE id=?", (owner["id"],))
+        member = await db_module.upsert_tenant(db, "batchdel-member@example.com")
+        raw, _ = await db_module.create_api_token(db, member["id"])
+        proj = await db_module.create_project(db, "batchdel-owner-proj")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("batchdel-wm", owner["id"], "batchdel-member@example.com",
+             "member", "read", now),
+        )
+        await db.commit()
+        return owner["id"], raw, proj["id"]
+
+    owner_id, member_token, pid = asyncio.run(_setup())
+    hdr = {"Authorization": f"Bearer {member_token}", "X-Workspace-Tenant-Id": owner_id}
+
+    # A 'member' has PERM_WRITE but not PERM_SETTINGS — the batch delete
+    # of the owner's project must be rejected.
+    r = client.delete("/projects", params={"project_id": [pid]}, headers=hdr)
+    assert r.status_code == 403, f"expected 403, got {r.status_code}: {r.text}"
+    assert "settings" in r.text.lower()
+
+    # The project must survive the rejected attempt.
+    assert client.get(f"/projects/{pid}").status_code == 200
+
+    # Sanity: the batch endpoint still works normally for a same-workspace /
+    # self-hosted caller (no cross-workspace header → no gate, per
+    # _enforcement_context's own no-header fast path).
+    r2 = client.delete("/projects", params={"project_id": [pid]})
+    assert r2.status_code == 200, r2.text
+    assert client.get(f"/projects/{pid}").status_code == 404
+
+
 def test_dashboard_js_has_project_mgmt(client):
     """dashboard.js has rename/delete helpers and kebab menu logic."""
     js = dashboard_source()
@@ -7580,6 +7641,38 @@ def test_dashboard_js_has_project_mgmt(client):
     assert "_deleteProject" in js
     assert "_openTabMenu" in js
     assert "project_renamed" in js
+
+
+def test_settings_role_visibility_hides_tunnel_plugins_card_for_guests():
+    """3f4ba195 — _applySettingsRoleVisibility's guest hide-list must include
+    the Tunnel Plugins card container.
+
+    Regression coverage for a UI-honesty gap: the "Reset to defaults"/"Add"
+    buttons in the Tunnel Plugins card (dashboard-plugins.ts) carry an
+    admin-only CSS class with no matching stylesheet rule and no JS toggle
+    anywhere in the dashboard, so a 'member'/'viewer' role previously saw
+    and could click them even though only owner/admin should — and could
+    successfully execute a tenant-wide tunnel-config reset (PUT
+    /tunnel/plugins only requires PERM_WRITE server-side, which a member
+    has). Every other admin-only settings card is hidden wholesale for
+    guests via this same id list; the Tunnel Plugins card's container id
+    was simply missing from it.
+    """
+    js = dashboard_source()
+    start = js.index("function _applySettingsRoleVisibility")
+    end = js.index("\n}", start)
+    body = js[start:end]
+    assert "tunnel-plugins-section-${projectId}" in body, (
+        "tunnel-plugins-section-${projectId} must be in the "
+        "_applySettingsRoleVisibility hide-list"
+    )
+    # It must be part of the same hidden-id array as the other admin-only
+    # cards, not merely present somewhere else in the function body.
+    hide_list_start = body.index("[")
+    hide_list_end = body.index("].forEach")
+    hide_list = body[hide_list_start:hide_list_end]
+    assert "tunnel-plugins-section-${projectId}" in hide_list
+    assert "settings-account-danger-${projectId}" in hide_list
 
 
 def test_pg_create_tables_has_sprint_item_group_columns():
