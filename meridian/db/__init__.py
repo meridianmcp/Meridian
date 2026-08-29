@@ -12117,6 +12117,7 @@ from .sprint_items import (  # noqa: F401
     fan_out_sprint_items,
     find_cross_project_dependency_mismatches,
     get_blocking_dependency_for_sprint_item,
+    get_dependency_frontier,
     get_sprint_item_blocking_gates,
     get_open_task_for_sprint_item,
     get_parallelizable_groups,

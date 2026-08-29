@@ -40,6 +40,7 @@ from . import capability_availability as capability_availability_module
 from . import capability_contract as capability_contract_module
 from . import continuation_gate as continuation_gate_module
 from . import db as db_module
+from . import dependency_graph as _dependency_graph  # 83a7586d (fan-out/fan-in frontier)
 from . import docx_integrity_gate as docx_integrity_gate_module
 from .db import ai_log as ai_log_module
 from . import executor_contract as executor_contract_module
@@ -2770,24 +2771,42 @@ def _partition_into_waves(
     dependencies collapse to wave 0 so nothing is ever dropped. Input order is
     preserved within each wave. The sage/topological wave model — run each wave
     fully before the next.
+
+    83a7586d — fan-out/fan-in aware: ``depends_on`` may declare MULTIPLE
+    predecessor ids (a JSON array — see
+    ``meridian.dependency_graph.parse_predecessor_ids``) instead of the
+    legacy single scalar id. An item's depth is now ``1 + max(depth of every
+    IN-SET predecessor)`` (0 when it has none in-set), so a fan-in item is
+    correctly placed AFTER every one of its declared predecessors that's
+    part of THIS SAME items list — not just its first/only one — instead of
+    being misread as a depth-0 root (which would place it too early,
+    alongside items it must not start before). A legacy single-id item sees
+    byte-for-byte the same result as before (exactly one predecessor to
+    walk, same as today). Each recursive branch uses its OWN immutable
+    ancestor-path set (never a shared mutable one) so a diamond shape (two
+    predecessors sharing a common ancestor) is never misclassified as a
+    cycle — only a genuine cycle (an id revisited on the SAME path) collapses
+    to a root.
     """
     by_id = {it["id"]: it for it in items if it.get("id")}
     wave_of: dict[str, int] = {}
 
-    def _depth(iid: str, seen: set[str]) -> int:
+    def _depth(iid: str, seen: frozenset[str]) -> int:
         if iid in wave_of:
             return wave_of[iid]
         if iid in seen:  # dependency cycle — treat as a root
             return 0
-        seen.add(iid)
         it = by_id.get(iid)
-        dep = it.get("depends_on") if it else None
-        depth = (_depth(dep, seen) + 1) if (dep and dep in by_id) else 0
+        preds = [
+            p for p in _dependency_graph.parse_predecessor_ids(it.get("depends_on") if it else None)
+            if p in by_id
+        ]
+        depth = (max(_depth(p, seen | {iid}) for p in preds) + 1) if preds else 0
         wave_of[iid] = depth
         return depth
 
     for iid in by_id:
-        _depth(iid, set())
+        _depth(iid, frozenset())
     if not wave_of:
         return []
     max_wave = max(wave_of.values())
@@ -3551,6 +3570,44 @@ def _build_quick_start_goal(
             item for item in pending_sprint_items
             if item.get("version") == version
         ]
+    # 83a7586d — attach the machine-readable fan-out/fan-in FRONTIER signal
+    # to every pending item, sourced from get_parallelizable_groups()'s own
+    # (now multi-parent-aware) `blocked` list — the SAME live-DB-backed
+    # computation the macro-wave/batch rendering below already trusts to
+    # decide what's genuinely dispatch-safe (see
+    # meridian.dependency_graph.evaluate_frontier /
+    # meridian.db.sprint_items.get_dependency_frontier). This does NOT
+    # independently re-derive dependency state (which would risk drifting
+    # from claim_sprint_item's own DEPENDENCY_NOT_SATISFIED enforcement) —
+    # it is purely additive metadata: a fan-in barrier item that isn't yet
+    # ready is annotated frontier_ready=False with its still-blocking
+    # predecessor ids/statuses, so ANY renderer or programmatic consumer of
+    # pending_sprint_items — not just the wave/batch prose below, but also
+    # the plain "Pending Sprint Items" section every full/delta/starter
+    # render carries outside the /goal block itself — sees the real
+    # claimability signal, distinct from the macro-wave DISPLAY label.
+    # Every mode (starter/delta/goal/full) funnels through this one shared
+    # function, so annotating here covers all of them from a single site.
+    # Fail-open: when parallel_groups itself is unavailable (e.g.
+    # get_parallelizable_groups raised upstream), every item defaults to
+    # frontier_ready=True — the same fail-open posture every other
+    # parallel_groups consumer in this function already uses.
+    _frontier_blocked_by_id = {
+        _fb["id"]: _fb
+        for _fb in (parallel_groups or {}).get("blocked") or []
+        if _fb.get("id")
+    }
+    for _fitem in pending_sprint_items:
+        _fb = _frontier_blocked_by_id.get(_fitem.get("id"))
+        if _fb is not None:
+            _fitem["frontier_ready"] = False
+            _fitem["frontier_blocking_predecessors"] = _fb.get("blocking_predecessors") or (
+                [{"id": _fb.get("depends_on"), "status": _fb.get("blocked_by_status")}]
+                if _fb.get("depends_on") else []
+            )
+        else:
+            _fitem.setdefault("frontier_ready", True)
+            _fitem.setdefault("frontier_blocking_predecessors", [])
     # 76dde31f (665 follow-up) — capture the version-scoped pending-item list
     # HERE, before any of the manual/backburner/unprospected/wave-gate
     # exclusions below narrow `pending_sprint_items` down to just today's
@@ -3720,6 +3777,53 @@ def _build_quick_start_goal(
             "real run_verification result. This is enforced at claim time, not "
             "just this prose note. -->"
         )
+    # 83a7586d — DEPENDENCY / FAN-IN BARRIER: exclude items whose frontier
+    # isn't ready AND at least one blocking predecessor is genuinely OUTSIDE
+    # this goal's own pending batch — mirroring the wave-gate exclusion
+    # immediately above. A not-ready item whose blocking predecessor(s) ARE
+    # ALSO in this same batch is deliberately KEPT: this is the pre-existing
+    # dependency-CLOSURE contract (a legacy single-parent chain, or
+    # selected_item_ids pulling in a still-pending ancestor) — completing
+    # the in-batch predecessor first, via the dependency-order/wave
+    # rendering below (now fan-in aware — see _partition_into_waves), is
+    # exactly how that closure is meant to work, and must not regress into
+    # a hard exclusion. claim_sprint_item's DEPENDENCY_NOT_SATISFIED gate
+    # still structurally refuses an early claim regardless of how this
+    # prose renders, so safety never depends on getting this ordering
+    # exactly right — only the QUALITY of the guidance does.
+    _pending_ids_for_dep_check = {
+        it.get("id") for it in pending_sprint_items if it.get("id")
+    }
+    _excluded_dependency_blocked: list[dict[str, Any]] = []
+    _kept_after_dep_check: list[dict[str, Any]] = []
+    for _it in pending_sprint_items:
+        if _it.get("frontier_ready") is False:
+            _blk_ids = {
+                _b.get("id") for _b in (_it.get("frontier_blocking_predecessors") or [])
+                if _b.get("id")
+            }
+            if not _blk_ids or not _blk_ids.issubset(_pending_ids_for_dep_check):
+                _excluded_dependency_blocked.append(_it)
+                continue
+        _kept_after_dep_check.append(_it)
+    if _excluded_dependency_blocked:
+        pending_sprint_items = _kept_after_dep_check
+        for _it in _excluded_dependency_blocked:
+            if _it.get("id"):
+                _scope_exclusion_reason_by_id.setdefault(_it["id"], "dependency_not_satisfied")
+    _excluded_dependency_note = ""
+    if _excluded_dependency_blocked:
+        _dep_exc_ids = ", ".join(it["id"] for it in _excluded_dependency_blocked if it.get("id"))
+        _dep_exc_n = len(_excluded_dependency_blocked)
+        _excluded_dependency_note = (
+            f'\n<excluded_dependency_not_satisfied count="{_dep_exc_n}">'
+            f"{_xml_escape(_dep_exc_ids)}"
+            "</excluded_dependency_not_satisfied>"
+            "\n<!-- These items are structurally blocked by claim_sprint_item "
+            "until every declared predecessor (a single depends_on parent, or "
+            "every id in a fan-out/fan-in barrier) is terminal. This is "
+            "enforced at claim time, not just this prose note. -->"
+        )
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
     # fb82e51f — record the selected-scope outcome now that every exclusion
     # filter above (manual/backburner/unprospected/wave-gate) has run and
@@ -3854,6 +3958,7 @@ def _build_quick_start_goal(
             f"{_backburner_note}"
             f"{_excluded_unprospected_note}"
             f"{_excluded_wave_gate_note}"
+            f"{_excluded_dependency_note}"
         )
     directive = (
         _INTERACTIVE_GOAL_DIRECTIVE
@@ -4212,6 +4317,7 @@ def _build_quick_start_goal(
         f"{_backburner_note}"
         f"{_excluded_unprospected_note}"
         f"{_excluded_wave_gate_note}"
+        f"{_excluded_dependency_note}"
     )
 
 

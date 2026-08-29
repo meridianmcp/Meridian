@@ -108,6 +108,7 @@ from meridian.db import (  # noqa: PLC0415
     get_project_blocker_policy,
 )
 from .. import blocker_policy as _blocker_policy  # b108f2e0 (typed blocker triage)
+from .. import dependency_graph as _dependency_graph  # 83a7586d (fan-out/fan-in frontier)
 
 
 # Fields whose change is (a) what the revision hash is sensitive to and
@@ -512,20 +513,31 @@ def find_stale_reference_ids(item_index: dict[str, dict[str, Any]]) -> list[dict
     (plus ``"merged_into"`` for the merged_away reason), sorted by
     ``(item_id, depends_on)`` for deterministic error messages. Empty list
     means every dependency edge in ``item_index`` resolves.
+
+    83a7586d — fan-out/fan-in aware: ``depends_on`` may declare MULTIPLE
+    predecessor ids (a JSON array — see
+    ``meridian.dependency_graph.parse_predecessor_ids``) instead of the
+    legacy single scalar id. Each declared predecessor id is checked
+    independently and reported by its own id (never the raw JSON blob), so
+    a fan-in item with, say, two valid same-project predecessors and one
+    missing one reports exactly the one bad id — not a false "the whole
+    depends_on value is missing" verdict that would otherwise make
+    generate_handoff's fail-closed HandoffStaleReferenceError gate (ee8a6af1)
+    refuse EVERY fan-in item outright. A legacy single-id row sees
+    byte-for-byte the same result as before (exactly one id to check, same
+    as today).
     """
     stale: list[dict[str, Any]] = []
     for item_id, entry in item_index.items():
-        target = entry.get("depends_on")
-        if not target:
-            continue
-        target_entry = item_index.get(target)
-        if target_entry is None:
-            stale.append({"item_id": item_id, "depends_on": target, "reason": "missing"})
-        elif target_entry.get("merged_into"):
-            stale.append({
-                "item_id": item_id,
-                "depends_on": target,
-                "reason": "merged_away",
-                "merged_into": target_entry["merged_into"],
-            })
+        for target in _dependency_graph.parse_predecessor_ids(entry.get("depends_on")):
+            target_entry = item_index.get(target)
+            if target_entry is None:
+                stale.append({"item_id": item_id, "depends_on": target, "reason": "missing"})
+            elif target_entry.get("merged_into"):
+                stale.append({
+                    "item_id": item_id,
+                    "depends_on": target,
+                    "reason": "merged_away",
+                    "merged_into": target_entry["merged_into"],
+                })
     return sorted(stale, key=lambda s: (s["item_id"], s["depends_on"]))

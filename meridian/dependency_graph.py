@@ -206,3 +206,231 @@ def find_all_dependency_cycles(items: list[dict[str, Any]]) -> list[list[str]]:
 
     found.sort(key=lambda c: c[0])
     return found
+
+
+# ---------------------------------------------------------------------------
+# 83a7586d — fan-out/fan-in dependency FRONTIER (machine-readable barrier
+# representation), additive alongside everything above.
+#
+# THE GAP: every function above (and every existing consumer of
+# ``depends_on`` across the codebase — ``_topo_depth_map``,
+# ``get_blocking_dependency_for_sprint_item``, ``get_sprint_items``'s
+# ``show_blocked`` filter, ``_dependency_frontier_snapshot``,
+# ``executor_contract._resolve_dependency_state``) treats this schema as a
+# FUNCTIONAL graph: exactly one ``depends_on`` predecessor per node, full
+# stop. That is correct and unchanged for a legacy single-parent chain, but
+# it has no way to express a genuine fan-in "barrier" item — one that must
+# not be claimed until SEVERAL predecessors are all terminal (a join/gate
+# node converging multiple upstream branches).
+#
+# THE REPRESENTATION (purely additive — no DB migration, no new column):
+# ``depends_on`` keeps its existing TEXT shape. A legacy row stores a bare
+# id (``"abc123"``) exactly as before — completely unaffected. A fan-in
+# barrier item stores a JSON array of ids in that SAME column
+# (``'["abc123", "def456", "ghi789"]'``) — see :func:`parse_predecessor_ids`
+# / :func:`encode_predecessor_ids`. Every reader in THIS module (and the new
+# claim-time gate / planner check built on it — see
+# ``meridian.db.sprint_items.get_dependency_frontier``) understands both
+# shapes transparently; every reader NOT updated for this item (dashboard
+# TS, ``executor_contract.py``, etc.) simply fails CLOSED on a fan-in row —
+# a JSON-array string is never a valid item id, so the legacy single-lookup
+# code path just doesn't find a match and treats it as blocked/unknown,
+# never as falsely satisfied. Safe by construction, not by discipline.
+#
+# THE FRONTIER (distinct from a macro-wave DISPLAY label): "ready" here
+# means "every declared predecessor is ACTUALLY terminal right now" — the
+# real dependency-topology answer. A macro-wave/batch grouping (see
+# ``meridian.db.sprint_items.get_parallelizable_groups`` /
+# ``pack_groups_into_macro_waves``) is a resource-conflict-free PRESENTATION
+# packing computed independently; it must never be read as a claimability
+# proof for a fan-in item's dependency edges. This module stays a DB-free
+# leaf: :func:`evaluate_frontier` takes a caller-supplied predecessor lookup
+# (the async DB-aware fetch — including this project's autonomous
+# stale-claim reconciliation for a blocking in_progress predecessor — lives
+# in ``meridian.db.sprint_items.get_dependency_frontier``), and
+# :func:`compute_frontier` is the pure whole-board convenience wrapper for
+# tests / callers that already hold a full item snapshot in memory.
+# ---------------------------------------------------------------------------
+
+#: Sprint-item statuses considered terminal for dependency-satisfaction
+#: purposes. Mirrors ``meridian.db.sprint_items.get_sprint_items``'s own
+#: ``_terminal`` set (``show_blocked=False`` filter) exactly — kept as one
+#: named constant here so every frontier consumer agrees on the same set.
+TERMINAL_SPRINT_STATUSES = frozenset({"done", "skipped", "failed", "pushed"})
+
+
+def parse_predecessor_ids(depends_on: Any) -> list[str]:
+    """Return every predecessor id a ``depends_on`` value declares.
+
+    Three input shapes, all handled transparently:
+
+      * Falsy (``None``, ``""``) — no dependency: returns ``[]``.
+      * A bare string that is NOT a JSON array (every legacy row, e.g.
+        ``"abc123"``) — a single-parent edge: returns ``["abc123"]``,
+        byte-for-byte the same "one predecessor" meaning every existing
+        single-parent reader already assumes.
+      * A JSON array string (``'["a", "b", "c"]'``) or an actual
+        ``list``/``tuple``/``set`` — a fan-out/fan-in BARRIER declaration:
+        returns every non-empty id, de-duplicated, order preserved.
+
+    Never raises: a malformed JSON-ish string (starts with ``[`` but fails
+    to parse, or parses to something that isn't a list) falls back to
+    treating the whole string as a single literal id — the same fail-closed
+    posture as any other unrecognized id (it simply won't match a real item,
+    so a caller's lookup treats it as an unresolved/missing predecessor
+    rather than silently dropping the dependency entirely).
+    """
+    if not depends_on:
+        return []
+    if isinstance(depends_on, (list, tuple, set)):
+        raw_ids: list[Any] = list(depends_on)
+    elif isinstance(depends_on, str):
+        s = depends_on.strip()
+        if not s:
+            return []
+        raw_ids = None
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, list):
+                raw_ids = parsed
+        if raw_ids is None:
+            raw_ids = [s]
+    else:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_ids:
+        iid = str(raw).strip()
+        if iid and iid not in seen:
+            seen.add(iid)
+            out.append(iid)
+    return out
+
+
+def encode_predecessor_ids(ids: "Any") -> "str | None":
+    """Inverse of :func:`parse_predecessor_ids`.
+
+    Encodes a predecessor-id sequence back into the ``depends_on`` TEXT
+    shape: zero ids -> ``None`` (no dependency); exactly one id -> that bare
+    id string (stays byte-for-byte legacy-compatible, e.g. for
+    ``update_sprint_item``/``patch_sprint_item`` callers that only ever set
+    a single parent); two or more -> a JSON array string (the fan-in barrier
+    shape). De-duplicates, preserving first-seen order.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in (ids or []):
+        iid = str(raw).strip()
+        if iid and iid not in seen:
+            seen.add(iid)
+            out.append(iid)
+    if not out:
+        return None
+    if len(out) == 1:
+        return out[0]
+    return json.dumps(out)
+
+
+def evaluate_frontier(
+    item: dict[str, Any],
+    predecessor_lookup: dict[str, "dict[str, Any] | None"],
+    *,
+    terminal_statuses: "frozenset[str] | set[str] | None" = None,
+) -> dict[str, Any]:
+    """Pure single-item frontier evaluation.
+
+    ``predecessor_lookup`` is a caller-supplied ``{predecessor_id:
+    item_dict_or_None}`` mapping for every id ``item``'s ``depends_on`` edge
+    declares (see :func:`parse_predecessor_ids`) — this function never looks
+    beyond what it's given, so it works identically whether the caller built
+    the lookup from a live DB fetch (``meridian.db.sprint_items.
+    get_dependency_frontier``) or a hand-built test fixture / in-memory
+    board snapshot (:func:`compute_frontier`).
+
+    Returns::
+
+        {
+          "predecessor_ids": [...],   # every declared predecessor id, in order (0, 1, or N)
+          "ready": bool,               # True iff EVERY predecessor is satisfied
+                                        # (vacuously True when there are none)
+          "blocking": [                # unsatisfied predecessors, in declared order
+              {"id": ..., "status": ..., "reason": ...}, ...
+          ],
+          "predecessor_statuses": {id: status_or_None},
+        }
+
+    A predecessor absent from ``predecessor_lookup`` (or mapped to ``None``)
+    is treated as ``status=None`` and reported as blocking with
+    ``status="missing"`` — the fan-in-aware generalization of
+    ``get_blocking_dependency_for_sprint_item``'s existing "(missing sprint
+    item)" convention for a dangling single-parent edge.
+
+    A ``"failed"`` predecessor is satisfied UNLESS ``item``'s own
+    ``failure_mode`` is ``"stop"`` (default ``"continue"`` when unset) —
+    reused verbatim from the SAME carve-out already applied independently by
+    ``get_sprint_items(show_blocked=False)``, ``get_parallelizable_groups``,
+    and ``executor_contract._resolve_dependency_state`` (never re-derived a
+    fourth time with a risk of drifting from the other three).
+    """
+    terms = terminal_statuses if terminal_statuses is not None else TERMINAL_SPRINT_STATUSES
+    failure_mode = item.get("failure_mode") or "continue"
+    predecessor_ids = parse_predecessor_ids(item.get("depends_on"))
+    statuses: dict[str, "str | None"] = {}
+    blocking: list[dict[str, Any]] = []
+    for pid in predecessor_ids:
+        parent = predecessor_lookup.get(pid)
+        status = parent.get("status") if isinstance(parent, dict) else None
+        statuses[pid] = status
+        if status is None:
+            blocking.append({"id": pid, "status": "missing", "reason": "predecessor not found"})
+            continue
+        if status not in terms:
+            blocking.append({"id": pid, "status": status, "reason": "not yet terminal"})
+            continue
+        if status == "failed" and failure_mode == "stop":
+            blocking.append({
+                "id": pid, "status": status,
+                "reason": "predecessor failed and failure_mode='stop'",
+            })
+            continue
+        # satisfied: done / skipped / pushed, or failed with failure_mode='continue'
+    return {
+        "predecessor_ids": predecessor_ids,
+        "ready": not blocking,
+        "blocking": blocking,
+        "predecessor_statuses": statuses,
+    }
+
+
+def compute_frontier(
+    items: list[dict[str, Any]],
+    *,
+    terminal_statuses: "frozenset[str] | set[str] | None" = None,
+) -> dict[str, dict[str, Any]]:
+    """Whole-board convenience wrapper around :func:`evaluate_frontier`.
+
+    Builds the predecessor lookup FROM ``items`` itself — no DB access, this
+    module stays a leaf — so this is only accurate when ``items`` already
+    contains every predecessor a caller cares about (e.g. a full live
+    ``get_sprint_items`` scan). A predecessor id not present in ``items`` is
+    reported as ``status="missing"``/blocking, exactly as
+    :func:`evaluate_frontier` documents — this is the right behavior for a
+    genuinely-deleted/foreign id, but means a CALLER that passes only a
+    filtered subset (e.g. "pending items only", where an already-DONE
+    predecessor has been filtered OUT precisely because it finished) will
+    see that predecessor reported as missing rather than satisfied. Use
+    ``meridian.db.sprint_items.get_dependency_frontier`` (live DB lookups)
+    instead of this function whenever the item set at hand might not
+    include every real predecessor.
+
+    Returns ``{item_id: evaluate_frontier(...)}`` for every item that has an
+    ``id``.
+    """
+    by_id = {it["id"]: it for it in items if it.get("id")}
+    return {
+        iid: evaluate_frontier(it, by_id, terminal_statuses=terminal_statuses)
+        for iid, it in by_id.items()
+    }

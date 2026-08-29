@@ -938,7 +938,19 @@ def test_build_quick_start_goal_legacy_dict_without_macro_waves_key_unaffected()
 
 def test_build_quick_start_goal_macro_wave_framing_preserves_leftover_handling():
     """The leftover/blocked-item cross-reference logic (a1996fbf) must keep
-    working identically whether or not macro-wave framing is engaged."""
+    working identically whether or not macro-wave framing is engaged.
+
+    83a7586d — 'blocked1' declares a blocker (``zzz9999``) that is NOT part
+    of this goal's own item list at all — exactly the "truly external"
+    dependency case the new fan-out/fan-in frontier gate hard-excludes
+    (structured ``<excluded_dependency_not_satisfied>`` tag) BEFORE the
+    macro-wave/leftover machinery below ever runs, superseding the older
+    inline "blocked1 blocked on zzz9999" free-text framing a1996fbf added
+    for this exact scenario (still-relevant for an item kept because its
+    blocker IS in this same batch — see the fan-in dependency-closure
+    coverage in test_83a7586d_dependency_frontier.py). Wave/batch framing
+    itself is unaffected — that's what this test still exists to pin.
+    """
     items = [
         {"id": "blocked1", "version": None},
         {"id": "a1", "version": None}, {"id": "b2", "version": None},
@@ -962,8 +974,11 @@ def test_build_quick_start_goal_macro_wave_framing_preserves_leftover_handling()
     goal = h._build_quick_start_goal(items, parallel_groups=parallel_groups)
     assert "Wave 1 [batch 1: a1, b2; batch 2: c3]" in goal
     assert "Wave 2 [batch 3: d4; batch 4: e5]" in goal
-    assert "blocked1 blocked on zzz9999" in goal
-    assert "status: pending" in goal
+    # 83a7586d — structured exclusion, not the old inline "blocked on" prose:
+    # blocked1 is named in the machine-readable tag (never silently dropped)
+    # but the two Wave/batch strings above (the claimable listing) already
+    # prove it's absent from there.
+    assert '<excluded_dependency_not_satisfied count="1">blocked1</excluded_dependency_not_satisfied>' in goal
 
 
 @pytest.mark.asyncio

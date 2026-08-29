@@ -2578,6 +2578,90 @@ def _is_deferred(item: dict[str, Any]) -> bool:
     return dt > _dt_cls.utcnow()
 
 
+async def get_dependency_frontier(
+    db: aiosqlite.Connection,
+    item: dict[str, Any],
+    *,
+    reconcile_stale_predecessors: bool = False,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """83a7586d — live, DB-backed fan-out/fan-in frontier check for ONE item.
+
+    Fetches every predecessor id ``item['depends_on']`` declares (a legacy
+    single id, OR a fan-in barrier's JSON id array — see
+    ``meridian.dependency_graph.parse_predecessor_ids``) and evaluates
+    whether each is terminal/satisfied RIGHT NOW via
+    ``meridian.dependency_graph.evaluate_frontier``. Returns that function's
+    ``{predecessor_ids, ready, blocking, predecessor_statuses}`` shape.
+
+    This is the canonical multi-parent-aware replacement for the legacy
+    single-parent ``get_blocking_dependency_for_sprint_item`` at every call
+    site that needs REAL fan-in barrier enforcement — currently
+    ``claim_sprint_item``'s DEPENDENCY_NOT_SATISFIED gate below and
+    ``get_parallelizable_groups``'s eligibility check.
+    ``get_blocking_dependency_for_sprint_item`` itself is left completely
+    unchanged: it has callers outside this item's declared scope (e.g.
+    ``executor_contract._resolve_dependency_state``) that still expect its
+    original single-parent contract, and a JSON-array ``depends_on`` value
+    simply fails closed there (never matches a real item id, so it reads as
+    an unresolved/missing dependency rather than a falsely-satisfied one).
+
+    Zero-predecessor items (the overwhelming majority) short-circuit with no
+    DB access at all: ``{"predecessor_ids": [], "ready": True, "blocking":
+    [], "predecessor_statuses": {}}``.
+
+    ``reconcile_stale_predecessors=True`` (used by ``claim_sprint_item``)
+    additionally runs :func:`classify_stale_claim` /
+    :func:`_reset_stale_claim` — the SAME autonomous stale-claim
+    reconciliation already applied to an item's OWN abandoned in_progress
+    claim (56e9b3c7) — against any BLOCKING ``in_progress`` predecessor, so a
+    fan-in item is never PERMANENTLY wedged behind a predecessor whose
+    claiming session died: a proven-stale predecessor is auto-reset to
+    ``pending`` (still not ``done``, so the fan-in item stays blocked THIS
+    call) rather than sitting ``in_progress`` forever with no live claimant
+    able to finish or reclaim it. An ``"active"``/``"ambiguous"`` verdict
+    changes nothing, exactly as ``claim_sprint_item``'s own self-claim
+    reconciliation already behaves.
+
+    Multi-project isolation: a predecessor id that resolves to a REAL item
+    belonging to a DIFFERENT project is treated exactly like a nonexistent
+    one (``status=None``, reported "missing") — mirroring
+    ``board_snapshot.find_stale_reference_ids``'s documented isolation
+    contract ("a foreign-project id is indistinguishable from — and
+    correctly treated the same as — a nonexistent one"). This item's own
+    project's live board can never be satisfied (or its enforcement
+    influenced) by another project's item status, and a foreign predecessor
+    is never touched by the stale-claim reconciliation below either.
+    """
+    predecessor_ids = _dependency_graph.parse_predecessor_ids(item.get("depends_on"))
+    if not predecessor_ids:
+        return {"predecessor_ids": [], "ready": True, "blocking": [], "predecessor_statuses": {}}
+    _own_project_id = item.get("project_id")
+    lookup: dict[str, "dict[str, Any] | None"] = {}
+    for pid in predecessor_ids:
+        parent = await get_sprint_item(db, pid)
+        if parent is not None and _own_project_id and parent.get("project_id") != _own_project_id:
+            parent = None  # foreign-project id — isolate, treat as missing
+        if (
+            reconcile_stale_predecessors
+            and parent is not None
+            and parent.get("status") == "in_progress"
+        ):
+            try:
+                verdict = await classify_stale_claim(db, parent)
+            except Exception:  # noqa: BLE001 — classification must never wedge a frontier check
+                verdict = {"classification": "ambiguous"}
+            if verdict.get("classification") == "stale":
+                reconciled = await _reset_stale_claim(
+                    db, parent.get("project_id") or item.get("project_id"),
+                    pid, verdict, actor=actor,
+                )
+                if reconciled is not None:
+                    parent = await get_sprint_item(db, pid)
+        lookup[pid] = parent
+    return _dependency_graph.evaluate_frontier(item, lookup)
+
+
 async def claim_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -2710,6 +2794,55 @@ async def claim_sprint_item(
                 "update_sprint_item on a corrected board revision."
                 + (f" Notes: {_notes}" if _notes else "")
             ),
+            "item_id": item_id,
+        }
+    # 83a7586d — DEPENDENCY / FAN-IN BARRIER GATE: refuse to claim an item
+    # until every predecessor its depends_on edge declares (a legacy single
+    # id, or a fan-in JSON array — see
+    # meridian.dependency_graph.parse_predecessor_ids) is terminal, and, for
+    # a failed predecessor, satisfied per this item's own failure_mode
+    # (default 'continue' — the same carve-out get_parallelizable_groups /
+    # get_sprint_items(show_blocked=False) already use).
+    #
+    # This closes a real, confirmed gap: before this item, NOTHING at claim
+    # time enforced depends_on at all — only listing-time filters
+    # (get_sprint_items(show_blocked=False), get_parallelizable_groups)
+    # existed, and both are opt-in/advisory to whatever calls them, not
+    # claim-enforced. (See the corrected docstring on
+    # _dependency_frontier_snapshot below, which previously asserted this
+    # enforcement already existed here — it did not.) A receiving executor
+    # handed an item's id directly (a stale goal block, a flattened
+    # macro-wave render, prior session memory) could previously claim it
+    # before its real predecessor(s) were done; this gate makes that
+    # structurally impossible, mirroring the existing DEFERRED/SUPERSEDED/
+    # WAVE_GATE_PENDING pattern below.
+    #
+    # Fail-open: any unexpected error while resolving the frontier lets the
+    # claim proceed rather than permanently wedging the board — the same
+    # contract every other structural gate in this function already uses.
+    try:
+        _frontier = await get_dependency_frontier(
+            db, item, reconcile_stale_predecessors=True, actor=actor,
+        )
+    except Exception:  # noqa: BLE001 — dependency gate must never wedge the board
+        _frontier = {"ready": True, "blocking": [], "predecessor_ids": []}
+    if not _frontier.get("ready", True):
+        _blocking = _frontier.get("blocking") or []
+        _blocking_desc = "; ".join(
+            f"{_b.get('id')} (status: {_b.get('status')})" for _b in _blocking
+        )
+        return {
+            "blocked": True,
+            "error": "DEPENDENCY_NOT_SATISFIED",
+            "reason": (
+                "Sprint item has unsatisfied depends_on predecessor(s) — it "
+                "cannot be claimed until every declared predecessor is "
+                "terminal (done/skipped/pushed, or failed with this item's "
+                f"failure_mode='continue'). Still blocking: {_blocking_desc}."
+            ),
+            "predecessor_ids": _frontier.get("predecessor_ids"),
+            "blocking_predecessors": _blocking,
+            "depends_on": item.get("depends_on"),
             "item_id": item_id,
         }
     # 74a8f420 — WAVE GATE STRUCTURAL ENFORCEMENT: an item whose wave sits
@@ -4418,32 +4551,31 @@ async def get_sprint_items(
         items = [it for it in items if not _is_deferred(it)]
     if show_blocked:
         return items
-    # Build status lookup for dependency filtering
-    _terminal = {"done", "skipped", "failed", "pushed"}
-    by_id = {it["id"]: it for it in items}
-    # Fetch any parents not in this result set (e.g. filtered by status)
-    all_statuses: dict[str, str] = {it["id"]: it["status"] for it in items}
-    missing_parents = {
-        it["depends_on"] for it in items
-        if it.get("depends_on") and it["depends_on"] not in all_statuses
-    }
-    for parent_id in missing_parents:
-        parent = await get_sprint_item(db, parent_id)
-        if parent:
-            all_statuses[parent["id"]] = parent["status"]
-    result = []
+    # 83a7586d — fan-out/fan-in-aware dependency filter (was single-parent
+    # only). Build an {id: item} lookup from this result set, then fetch any
+    # DECLARED predecessor not already in it (legacy single id OR every id in
+    # a fan-in JSON array — see meridian.dependency_graph.
+    # parse_predecessor_ids) — mirrors the pre-existing "missing_parents"
+    # batch-fetch pattern, generalized to N predecessors per item instead of
+    # exactly one. A legacy item sees byte-for-byte the same outcome as
+    # before (evaluate_frontier's failure_mode='continue' carve-out matches
+    # this function's previous inline check exactly).
+    all_items_by_id: dict[str, dict[str, Any]] = {it["id"]: it for it in items}
+    needed_ids: set[str] = set()
     for it in items:
-        pid = it.get("depends_on")
-        if not pid:
-            result.append(it)
-            continue
-        parent_status = all_statuses.get(pid, "")
-        if parent_status not in _terminal:
-            continue  # blocked: parent not finished
-        if parent_status == "failed" and it.get("failure_mode") == "stop":
-            continue  # chain stopped
-        result.append(it)
-    return result
+        needed_ids.update(_dependency_graph.parse_predecessor_ids(it.get("depends_on")))
+    for parent_id in (needed_ids - set(all_items_by_id)):
+        parent = await get_sprint_item(db, parent_id)
+        # Multi-project isolation: a real item belonging to a DIFFERENT
+        # project is never treated as satisfying this project's dependency —
+        # mirrors board_snapshot.find_stale_reference_ids' documented
+        # contract (a foreign-project id reads the same as a nonexistent one).
+        if parent and parent.get("project_id") == project_id:
+            all_items_by_id[parent["id"]] = parent
+    return [
+        it for it in items
+        if _dependency_graph.evaluate_frontier(it, all_items_by_id)["ready"]
+    ]
 
 
 def _item_is_unprospected(it: dict[str, Any], *, enrichment_failure_only: bool = False) -> bool:
@@ -5600,22 +5732,30 @@ async def get_parallelizable_groups(
             continue
         if it.get("claimed_at"):
             continue  # already in flight
-        parent_block = await get_blocking_dependency_for_sprint_item(db, it["id"])
-        if parent_block is not None:
-            # Parent failed + this item's failure_mode='continue' → still runnable.
-            if (
-                parent_block.get("status") == "failed"
-                and (it.get("failure_mode") or "continue") == "continue"
-            ):
-                pass
-            else:
-                blocked.append({
-                    "id": it["id"],
-                    "title": it.get("title", ""),
-                    "depends_on": it.get("depends_on"),
-                    "blocked_by_status": parent_block.get("status"),
-                })
-                continue
+        # 83a7586d — fan-out/fan-in-aware frontier check (replaces the old
+        # single-parent get_blocking_dependency_for_sprint_item lookup here).
+        # A legacy single-id depends_on item sees byte-for-byte the same
+        # outcome as before (evaluate_frontier applies the identical
+        # failure_mode='continue' carve-out for a single predecessor); a
+        # fan-in item (JSON id array) is now correctly evaluated against
+        # ALL of its declared predecessors instead of being permanently
+        # misread as blocked-on-a-missing-item forever.
+        _frontier = await get_dependency_frontier(db, it)
+        if not _frontier.get("ready", True):
+            _blocking_list = _frontier.get("blocking") or []
+            _first_blocking = _blocking_list[0] if _blocking_list else {}
+            blocked.append({
+                "id": it["id"],
+                "title": it.get("title", ""),
+                "depends_on": it.get("depends_on"),
+                "blocked_by_status": _first_blocking.get("status"),
+                # Additive: full multi-predecessor detail. Existing callers
+                # that only read depends_on/blocked_by_status (the legacy
+                # single-parent shape) see zero behavior change.
+                "predecessor_ids": _frontier.get("predecessor_ids"),
+                "blocking_predecessors": _blocking_list,
+            })
+            continue
         _res = parse_touches_resources(it.get("touches_resources"))
         enriched = {
             **it,
@@ -6231,15 +6371,28 @@ async def _dependency_frontier_snapshot(
     and whether that dependency was satisfied AT RESERVATION TIME, for the
     integration-queue manifest's audit trail.
 
-    claim_sprint_item's own dependency gate already refuses to claim an item
-    whose depends_on parent isn't done, so by the time claim_parallel_batch
-    reaches this point every item in the batch necessarily has a satisfied
-    (or absent) dependency — this function does not itself enforce
-    anything; it records the fact for later audit/integration-order use.
-    One extra lookup per DISTINCT out-of-batch dependency id (an in-batch
-    dependency is resolved from ``items_by_id`` with no extra query;
-    repeated out-of-batch ids are cached so a shared parent is only fetched
-    once).
+    83a7586d — CORRECTION: this docstring previously asserted "claim_sprint_
+    item's own dependency gate already refuses to claim an item whose
+    depends_on parent isn't done, so by the time claim_parallel_batch reaches
+    this point every item in the batch necessarily has a satisfied
+    dependency." That was FALSE at the time it was written — no such gate
+    existed anywhere in claim_sprint_item (confirmed by direct read; see
+    83a7586d's discovery notes) — and is only true now because this same
+    item added that gate (see the DEPENDENCY_NOT_SATISFIED check in
+    claim_sprint_item, using meridian.db.sprint_items.
+    get_dependency_frontier / meridian.dependency_graph.evaluate_frontier,
+    which is also fan-out/fan-in-barrier aware, not just single-parent).
+    This function itself still does not enforce anything — it only records,
+    for audit, the (now genuinely guaranteed-satisfied-or-absent) dependency
+    state at reservation time. One extra lookup per DISTINCT out-of-batch
+    dependency id (an in-batch dependency is resolved from ``items_by_id``
+    with no extra query; repeated out-of-batch ids are cached so a shared
+    parent is only fetched once). NOTE: this snapshot itself still only
+    records the legacy single ``depends_on`` scalar shape (not the full
+    multi-predecessor fan-in list) — it is a pre-existing audit record whose
+    shape is left unchanged by 83a7586d; a fan-in item's manifest entry here
+    under-reports its true predecessor set even though the actual claim gate
+    correctly enforces all of them.
     """
     frontier: dict[str, dict[str, Any]] = {}
     dep_cache: dict[str, "dict[str, Any] | None"] = {}
@@ -6348,7 +6501,8 @@ async def claim_parallel_batch(
     STALE_PLAN_GENERATION, UNDECLARED_RESOURCE_IN_BATCH,
     BATCH_COMPOSITION_CONFLICT, BATCH_MANIFEST_EXISTS, ITEM_CLAIM_CONFLICT,
     <claim_sprint_item's own blocked "error" values e.g. DEFERRED/SUPERSEDED/
-    WAVE_GATE_PENDING/UNPROSPECTED>, BATCH_RESOURCE_CONFLICT.
+    WAVE_GATE_PENDING/UNPROSPECTED/DEPENDENCY_NOT_SATISFIED>,
+    BATCH_RESOURCE_CONFLICT.
 
     704edefe — the persisted ``manifest`` is now a genuine reservation +
     integration-queue record, not just "which items/resources were
@@ -8106,6 +8260,17 @@ async def find_cross_project_dependency_mismatches(
     An empty list means no mismatches found — not "not checked"; the scan
     always covers every item currently in ``project_id`` with a non-null
     ``depends_on``.
+
+    83a7586d — fan-out/fan-in aware: ``depends_on`` may declare MULTIPLE
+    predecessor ids (a JSON array — see
+    ``meridian.dependency_graph.parse_predecessor_ids``) instead of the
+    legacy single scalar id. Each declared predecessor id is checked
+    independently, so a fan-in item with one legitimate same-project
+    predecessor and one illegitimate cross-project predecessor still gets
+    flagged for the bad one — previously the whole JSON-array string would
+    look like one unresolvable id and get silently skipped as "dangling",
+    hiding a real cross-project mismatch from this audit. A legacy
+    single-id row sees byte-for-byte the same result as before.
     """
     mismatches: list[dict[str, Any]] = []
     async with db.execute(
@@ -8115,20 +8280,18 @@ async def find_cross_project_dependency_mismatches(
         rows = await cur.fetchall()
     for row in rows:
         row_d = _row_to_dict(row)
-        dep_id = row_d.get("depends_on")
-        if not dep_id:
-            continue
-        dep_item = await get_sprint_item(db, dep_id)
-        if dep_item is None:
-            continue  # dangling depends_on is a different, pre-existing concern
-        dep_project_id = dep_item.get("project_id")
-        if dep_project_id != project_id:
-            mismatches.append({
-                "item_id": row_d.get("id"),
-                "item_project_id": project_id,
-                "depends_on_id": dep_id,
-                "depends_on_project_id": dep_project_id,
-            })
+        for dep_id in _dependency_graph.parse_predecessor_ids(row_d.get("depends_on")):
+            dep_item = await get_sprint_item(db, dep_id)
+            if dep_item is None:
+                continue  # dangling depends_on is a different, pre-existing concern
+            dep_project_id = dep_item.get("project_id")
+            if dep_project_id != project_id:
+                mismatches.append({
+                    "item_id": row_d.get("id"),
+                    "item_project_id": project_id,
+                    "depends_on_id": dep_id,
+                    "depends_on_project_id": dep_project_id,
+                })
     return mismatches
 
 

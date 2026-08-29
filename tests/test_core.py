@@ -6174,14 +6174,24 @@ def test_build_quick_start_goal_parallel_batches():
 
 def test_build_quick_start_goal_leftover_shows_real_external_blocker():
     """a1996fbf — a leftover item whose real depends_on is a DIFFERENT item
-    that never appears in this goal's item list must render the real
-    depends_on id + blocked_by_status explicitly, instead of the generic
-    "once their dependencies clear" phrase. That generic phrasing implies the
-    blocker is just in-goal batch order, which is misleading (and unsafe: an
+    that never appears in this goal's item list must never be presented as
+    merely waiting on in-goal batch order (misleading, and unsafe: an
     executor could be misled into attempting a change that's genuinely not
     safe yet) when the true blocker is a completely separate, unlisted item.
-    get_parallelizable_groups already resolves this via its "blocked" list —
-    this test pins that the goal text actually surfaces it."""
+    get_parallelizable_groups already resolves this via its "blocked" list.
+
+    83a7586d — superseded the original inline "blocked on b75c4160 (status:
+    pending)" free-text framing this test used to pin: a genuinely-external
+    blocker (not part of this goal's own item list at all) is now
+    hard-excluded via the structured, machine-readable
+    ``<excluded_dependency_not_satisfied>`` tag BEFORE the leftover/macro-wave
+    rendering below ever runs — a strictly stronger version of the same
+    underlying guarantee this test's docstring describes (the item can no
+    longer even reach the claimable batch, not just get relabeled within
+    it). See test_83a7586d_dependency_frontier.py for the fan-in/dependency-
+    closure coverage (an item KEPT because its blocker IS in the same batch
+    still gets the original in-batch "once their dependencies clear"
+    phrasing, unaffected by this)."""
     from meridian import handoff as h
     items = [
         {"id": "cd9c2bf7", "version": None},
@@ -6205,8 +6215,10 @@ def test_build_quick_start_goal_leftover_shows_real_external_blocker():
     }
     goal = h._build_quick_start_goal(items, parallel_groups=groups)
     assert "cd9c2bf7" in goal
-    assert "blocked on b75c4160" in goal
-    assert "status: pending" in goal
+    assert (
+        '<excluded_dependency_not_satisfied count="1">cd9c2bf7'
+        "</excluded_dependency_not_satisfied>" in goal
+    )
     # Must NOT present this as merely waiting on in-goal batch order.
     assert "once their dependencies clear: cd9c2bf7" not in goal
 
