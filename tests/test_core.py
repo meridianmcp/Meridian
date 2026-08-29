@@ -5215,6 +5215,137 @@ def test_workspace_settings_partial_patch_preserves_other_field(client):
     assert final["sprint_name_default"] == "keep-me"
 
 
+# ---------------------------------------------------------------------------
+# 7855e580 — Workspace Save Defaults: 50-turn refresh floor + non-empty
+# handoff_template can never be silently erased by an ordinary Save click.
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_settings_patch_readback_exact_values(client):
+    """A straightforward read-back: PATCH persists exactly what was submitted,
+    and a fresh GET returns those same values (not a stale/rounded copy)."""
+    template = "# Custom Handoff\nGoal: {{version_goal}}"
+    patched = client.patch(
+        "/workspace/settings",
+        json={
+            "refresh_interval_turns": 50,
+            "auto_refresh_enabled": True,
+            "handoff_template": template,
+        },
+    ).json()
+    assert patched["refresh_interval_turns"] == 50
+    assert patched["auto_refresh_enabled"] is True
+    assert patched["handoff_template"] == template
+    again = client.get("/workspace/settings").json()
+    assert again["refresh_interval_turns"] == 50
+    assert again["auto_refresh_enabled"] is True
+    assert again["handoff_template"] == template
+
+
+def test_workspace_settings_blank_handoff_template_does_not_erase_default(client):
+    """P0 (7855e580): an ordinary Save Defaults click that submits a blank
+    handoff_template — e.g. because the textarea hadn't finished loading the
+    real value yet — must never silently erase the workspace's canonical
+    non-empty template. PATCH /workspace/settings treats a blank/whitespace
+    string the same as the field being omitted (no change), distinct from the
+    MCP update_workspace_settings tool's direct db-layer call, which still
+    honors an explicit "" as a real clear (see test_handoff_custom_template)."""
+    template = "# Custom Handoff\nGoal: {{version_goal}}"
+    seeded = client.patch(
+        "/workspace/settings",
+        json={"handoff_template": template, "refresh_interval_turns": 50},
+    ).json()
+    assert seeded["handoff_template"] == template
+
+    # Ordinary Save Defaults click with the template field blank (and other
+    # fields present, mirroring a real form submit) must preserve it.
+    resaved = client.patch(
+        "/workspace/settings",
+        json={
+            "handoff_template": "",
+            "hitl_auto_answer_default": True,
+            "refresh_interval_turns": 50,
+        },
+    ).json()
+    assert resaved["handoff_template"] == template
+    assert resaved["hitl_auto_answer_default"] is True
+
+    # A whitespace-only value is treated the same way as an empty string.
+    resaved2 = client.patch(
+        "/workspace/settings", json={"handoff_template": "   "},
+    ).json()
+    assert resaved2["handoff_template"] == template
+
+    final = client.get("/workspace/settings").json()
+    assert final["handoff_template"] == template
+    assert final["refresh_interval_turns"] == 50
+
+
+def test_workspace_settings_refresh_interval_default_is_50_when_present(client):
+    """Round-trip contract for the canonical 50-turn refresh default: once the
+    workspace row has refresh_interval_turns=50 set (as this deployment's row
+    already does per the 7855e580 handoff), it must read back as 50 exactly —
+    the UI's corrected fallback (10 -> 50) must never appear to *downgrade*
+    an already-persisted 50 on save."""
+    client.patch("/workspace/settings", json={"refresh_interval_turns": 50})
+    # A save that omits refresh_interval_turns entirely (field untouched)
+    # must not reset it back down.
+    client.patch("/workspace/settings", json={"sprint_name_default": "untouched-probe"})
+    final = client.get("/workspace/settings").json()
+    assert final["refresh_interval_turns"] == 50
+    assert final["sprint_name_default"] == "untouched-probe"
+
+
+def test_dashboard_settings_ts_refresh_interval_ui_fallback_is_50():
+    """Contract test for the served UI default (7855e580): the dashboard's
+    Workspace Save Defaults form must never fall back to the stale 10-turn
+    value — neither when first rendering the refresh-interval input before
+    the /workspace/settings fetch resolves, nor in the save handler's own
+    parse-fallback for an unreadable input value. Asserted directly against
+    the TypeScript source (not just the compiled bundle) so a future edit to
+    either fallback trips this test immediately, independent of a rebuild."""
+    ts_path = (
+        Path(__file__).parent.parent / "meridian" / "static" / "dashboard-settings.ts"
+    )
+    src = ts_path.read_text(encoding="utf-8")
+
+    load_fallback = (
+        "refreshIntervalIn.value = s.refresh_interval_turns != null "
+        "? s.refresh_interval_turns : 50;"
+    )
+    assert load_fallback in src, (
+        "expected the load-time refresh-interval fallback to render 50, not 10"
+    )
+    assert "s.refresh_interval_turns != null ? s.refresh_interval_turns : 10" not in src
+
+    save_fallback = (
+        "const raw = refreshIntervalIn ? parseInt(refreshIntervalIn.value, 10) : 50;"
+    )
+    assert save_fallback in src, (
+        "expected the save-handler parse fallback to default to 50, not 10"
+    )
+    assert "return isNaN(raw) ? 50 : Math.min(50, Math.max(1, raw));" in src
+    assert "return isNaN(raw) ? 10 : Math.min(50, Math.max(1, raw));" not in src
+
+
+def test_dashboard_bundle_js_refresh_interval_fallback_matches_source():
+    """The SERVED bundle (dashboard.bundle.js) must be rebuilt from the fixed
+    source, not just the .ts file — a stale bundle would ship the old 10-turn
+    fallback to real users regardless of what the source says (7855e580)."""
+    bundle_path = (
+        Path(__file__).parent.parent / "meridian" / "static" / "dashboard.bundle.js"
+    )
+    src = bundle_path.read_text(encoding="utf-8")
+    assert "refresh_interval_turns != null ? " in src
+    # esbuild renames the destructured settings variable (e.g. s3) but leaves
+    # the fallback literal alone; match on the literal rather than the name.
+    assert " : 50;" in src
+    idx = src.index("refresh_interval_turns != null ? ")
+    window = src[idx: idx + 200]
+    assert ": 50;" in window
+    assert ": 10;" not in window
+
+
 @pytest.mark.asyncio
 async def test_workspace_settings_db_defaults(db):
     """get_workspace_settings returns a usable dict even with no row written."""

@@ -4556,7 +4556,7 @@ project_id = "${displayPid}"`;
             if (codeIntelCb) codeIntelCb.checked = !!s3.code_intel_enabled_default;
             if (loopCb) loopCb.checked = s3.loop_enabled_default !== false;
             if (autoRefreshCb) autoRefreshCb.checked = !!s3.auto_refresh_enabled;
-            if (refreshIntervalIn) refreshIntervalIn.value = s3.refresh_interval_turns != null ? s3.refresh_interval_turns : 10;
+            if (refreshIntervalIn) refreshIntervalIn.value = s3.refresh_interval_turns != null ? s3.refresh_interval_turns : 50;
             const activeTriggers = Array.isArray(s3.refresh_triggers) ? s3.refresh_triggers : null;
             for (const t3 of REFRESH_TRIGGERS) {
               if (triggerCbs[t3]) triggerCbs[t3].checked = activeTriggers ? activeTriggers.includes(t3) : true;
@@ -4569,13 +4569,20 @@ project_id = "${displayPid}"`;
           saveBtn.disabled = true;
           try {
             const nudgeVal = nudgeIn ? parseInt(nudgeIn.value, 10) : 5;
-            await api("/workspace/settings", {
+            const saved = await api("/workspace/settings", {
               method: "PATCH",
               body: JSON.stringify({
                 hitl_auto_answer_default: !!(hitlCb && hitlCb.checked),
                 sprint_name_default: sprintIn && sprintIn.value.trim() || "",
                 display_name: displayIn && displayIn.value.trim() || "",
                 log_task_sprint_nudge_threshold: isNaN(nudgeVal) ? 5 : Math.max(0, nudgeVal),
+                // 7855e580 — the HTTP PATCH route treats a blank/whitespace-only
+                // handoff_template the same as "field omitted" (no change), so an
+                // ordinary Save Defaults click can never silently erase the
+                // workspace's canonical non-empty template just because the
+                // textarea happened to render blank (e.g. the settings fetch
+                // hadn't resolved yet). Sending the trimmed value unconditionally
+                // is safe either way — see routes/workspace.py.
                 handoff_template: handoffTplIn && handoffTplIn.value.trim() || "",
                 // 0bf67524 — "" clears the default; a value seeds new projects.
                 execution_mode_default: execModeIn ? execModeIn.value : "",
@@ -4585,12 +4592,16 @@ project_id = "${displayPid}"`;
                 // bf51b12e — planner context-refresh config.
                 auto_refresh_enabled: !!(autoRefreshCb && autoRefreshCb.checked),
                 refresh_interval_turns: (() => {
-                  const raw = refreshIntervalIn ? parseInt(refreshIntervalIn.value, 10) : 10;
-                  return isNaN(raw) ? 10 : Math.min(50, Math.max(1, raw));
+                  const raw = refreshIntervalIn ? parseInt(refreshIntervalIn.value, 10) : 50;
+                  return isNaN(raw) ? 50 : Math.min(50, Math.max(1, raw));
                 })(),
                 refresh_triggers: REFRESH_TRIGGERS.filter((t3) => triggerCbs[t3] && triggerCbs[t3].checked)
               })
             });
+            if (saved && typeof saved === "object") {
+              if (refreshIntervalIn) refreshIntervalIn.value = saved.refresh_interval_turns != null ? saved.refresh_interval_turns : 50;
+              if (handoffTplIn) handoffTplIn.value = saved.handoff_template || "";
+            }
             if (saveStatus) saveStatus.textContent = "Saved.";
             setTimeout(() => {
               if (saveStatus) saveStatus.textContent = "";
