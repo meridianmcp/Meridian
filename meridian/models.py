@@ -782,3 +782,69 @@ class ProjectFamilyView(BaseModel):
     members: list[ChildTemplateSnapshot] = Field(default_factory=list)
 
 
+class HandoffFamilyContext(BaseModel):
+    """ea49362c — OPTIONAL, UNWIRED illustrative shape for the family-context
+    block a future ``generate_handoff(..., include_family_context=True)``
+    (see ``docs/meridian-project-family-integration-contract.md`` section a)
+    would attach to a handoff response as a sibling field next to
+    ``content`` — exactly like ``build_effective_capability_contract``'s and
+    ``build_effective_profile_binding``'s existing pattern in
+    ``meridian/handoff.py``. Nothing in ``meridian/handoff.py`` constructs or
+    references this class today; this item makes no functional change to
+    that module. See the integration contract doc for the full rationale,
+    the test matrix, and everything this shape deliberately leaves open.
+
+    Deliberately reuses ``template_id`` (not a new ``family_id`` field) as
+    the family identifier -- see the integration contract's naming-collision
+    note: ``workspace_proposals.family_id`` (``meridian/db/proposal_lineage.py``)
+    is a pre-existing, unrelated proposal-lineage grouping concept, and this
+    class must never be confused with it.
+
+    Every field is ``None``/empty for a project with no family (integration
+    contract section e) -- there is no required field here a family-less
+    project could not trivially satisfy with its default, and no code
+    constructs this model at all in that case (the field is simply absent
+    from the response, not an empty instance).
+    """
+
+    child_project_id: str = Field(
+        ..., description="This project's id -- matches ChildTemplateSnapshot.child_project_id."
+    )
+    template_id: str | None = Field(
+        default=None,
+        description="The family identifier: the ProjectTemplate this project has adopted from, if any. "
+        "None means this project has no family. Matches ChildTemplateSnapshot.template_id / "
+        "ProjectFamilyView.template_id -- deliberately NOT named family_id (collision, see class docstring).",
+    )
+    adopted_revision_id: str | None = Field(
+        default=None,
+        description="The template_revision this project is currently pinned to -- "
+        "ChildTemplateSnapshot.adopted_revision_id, surfaced verbatim (5060eea1 section f/g).",
+    )
+    latest_revision_id: str | None = Field(
+        default=None,
+        description="ProjectTemplate.latest_revision_id at the time this context was built, so a receiver "
+        "can tell 'behind' (adopted_revision_id != latest_revision_id) without a second lookup "
+        "(5060eea1 section f, 'is this child behind' is a derived, read-time fact).",
+    )
+    inherited_vs_local: list[ConfigDiffEntry] = Field(
+        default_factory=list,
+        description="Reuses ConfigDiffEntry (5060eea1 section d) verbatim: each entry's `source` field "
+        "('template' vs 'override') IS the inherited-vs-local provenance signal for that key. "
+        "No new diff shape is introduced by this contract.",
+    )
+    executable_capability_status: Literal["executable", "non_executable", "unknown"] = Field(
+        default="unknown",
+        description="Mirrors the executable/executable_reasons vocabulary build_effective_capability_contract "
+        "already emits (meridian/handoff.py) -- NOT a new status vocabulary. 'unknown' is the default "
+        "for a project with no family, or when availability could not be checked.",
+    )
+    executable_reasons: list[str] = Field(default_factory=list)
+    pending_promotion_revision_ids: list[str] = Field(
+        default_factory=list,
+        description="Candidate template revisions newer than adopted_revision_id that a human has not yet "
+        "adopted or rejected for this child -- the 'pending promotion decisions' ea49362c's own "
+        "acceptance notes name. Never auto-populated by silently adopting anything.",
+    )
+
+
