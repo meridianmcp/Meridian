@@ -40,6 +40,7 @@ from . import capability_availability as capability_availability_module
 from . import capability_contract as capability_contract_module
 from . import continuation_gate as continuation_gate_module
 from . import db as db_module
+from . import dependency_graph as _dependency_graph  # 83a7586d (fan-out/fan-in frontier)
 from . import docx_integrity_gate as docx_integrity_gate_module
 from .db import ai_log as ai_log_module
 from . import executor_contract as executor_contract_module
@@ -1846,8 +1847,23 @@ _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS = 15
 # keeps the surviving content syntactically complete for whatever it does
 # include (see docs/meridian-handoff-contract.md's "Wire-level truncation"
 # section).
+#
+# 47ac68a0 — the opening-tag pattern originally required a bare ``<tag>``
+# with NO attributes, so it silently failed to match (and therefore left
+# UNPROTECTED) every structural tag that is actually rendered WITH
+# attributes: ``<execution_policy execution_mode=... >``,
+# ``<selected_item_scope requested=... >``, the outer
+# ``<handoff_manifest schema_version=... >`` wrapper (only its attribute-free
+# inner children were ever protected), and ``<proposal_scope id=... >``. A
+# byte cut could land inside any of those four and leave a dangling open tag
+# or drop the manifest's closing tag — exactly the "dropping...
+# execution_policy" / "syntactically incomplete" failure this safety net
+# exists to prevent. ``[^<>]*`` allows an attribute run on the opening tag
+# (every attribute value in this file is written via ``_xml_escape``, which
+# already escapes ``<``/``>``/``&``, so an attribute value can never itself
+# contain an unescaped ``<`` or ``>`` to confuse this scan).
 _STRUCTURAL_TAG_RE = re.compile(
-    r"<([a-zA-Z][a-zA-Z0-9_]*)>.*?</\1>", re.DOTALL,
+    r"<([a-zA-Z][a-zA-Z0-9_]*)(?:\s[^<>]*)?>.*?</\1>", re.DOTALL,
 )
 
 
@@ -2770,24 +2786,42 @@ def _partition_into_waves(
     dependencies collapse to wave 0 so nothing is ever dropped. Input order is
     preserved within each wave. The sage/topological wave model — run each wave
     fully before the next.
+
+    83a7586d — fan-out/fan-in aware: ``depends_on`` may declare MULTIPLE
+    predecessor ids (a JSON array — see
+    ``meridian.dependency_graph.parse_predecessor_ids``) instead of the
+    legacy single scalar id. An item's depth is now ``1 + max(depth of every
+    IN-SET predecessor)`` (0 when it has none in-set), so a fan-in item is
+    correctly placed AFTER every one of its declared predecessors that's
+    part of THIS SAME items list — not just its first/only one — instead of
+    being misread as a depth-0 root (which would place it too early,
+    alongside items it must not start before). A legacy single-id item sees
+    byte-for-byte the same result as before (exactly one predecessor to
+    walk, same as today). Each recursive branch uses its OWN immutable
+    ancestor-path set (never a shared mutable one) so a diamond shape (two
+    predecessors sharing a common ancestor) is never misclassified as a
+    cycle — only a genuine cycle (an id revisited on the SAME path) collapses
+    to a root.
     """
     by_id = {it["id"]: it for it in items if it.get("id")}
     wave_of: dict[str, int] = {}
 
-    def _depth(iid: str, seen: set[str]) -> int:
+    def _depth(iid: str, seen: frozenset[str]) -> int:
         if iid in wave_of:
             return wave_of[iid]
         if iid in seen:  # dependency cycle — treat as a root
             return 0
-        seen.add(iid)
         it = by_id.get(iid)
-        dep = it.get("depends_on") if it else None
-        depth = (_depth(dep, seen) + 1) if (dep and dep in by_id) else 0
+        preds = [
+            p for p in _dependency_graph.parse_predecessor_ids(it.get("depends_on") if it else None)
+            if p in by_id
+        ]
+        depth = (max(_depth(p, seen | {iid}) for p in preds) + 1) if preds else 0
         wave_of[iid] = depth
         return depth
 
     for iid in by_id:
-        _depth(iid, set())
+        _depth(iid, frozenset())
     if not wave_of:
         return []
     max_wave = max(wave_of.values())
@@ -2868,6 +2902,35 @@ def _is_manual_sprint_item(item: dict[str, Any]) -> bool:
     if item.get("blocker_kind") == "manual" or item.get("milestone_type") == "human":
         return True
     return (item.get("title") or "").lstrip().upper().startswith("MANUAL")
+
+
+def _is_hard_blocked_sprint_item(item: dict[str, Any]) -> bool:
+    """524e73e6 — True for an item hard-gated by ``claim_sprint_item`` itself
+    via ``blocker_kind in ('superseded', 'systemic_invalidated_run')``
+    (f89d440f / cc3864bd — see ``_VALID_SPRINT_BLOCKER_KINDS`` in
+    ``db/sprint_items.py``): its whole premise has been replaced by other
+    work, or the wave run that owned it was systemically invalidated, and it
+    must NEVER be re-executed even by a direct ``claim_sprint_item(item_id=
+    ...)`` call.
+
+    Confirmed gap this closes: unlike ``blocker_kind == 'manual'``
+    (``_is_manual_sprint_item`` above), a superseded/invalidated item was
+    never filtered out of ``get_sprint_items``'s ``include_manual_blocker``
+    gate, ``get_parallelizable_groups``, or this module's own claimable-batch
+    exclusions — so every handoff mode (starter/goal/full/delta) could hand
+    an executor an item_id that will deterministically fail at claim time
+    with ``HARD_BLOCKED`` (exactly the failure mode f89d440f's own code
+    comment warns a stale goal block can produce). Excluded alongside the
+    manual/backburner exclusions in ``_build_quick_start_goal`` so all four
+    modes agree.
+
+    NOTE: mirrored in ``meridian.db.sprint_items._is_hard_blocked_sprint_item``
+    (db/__init__.py is imported BY handoff.py, so we cannot import handoff
+    there without a circular import — the same deliberate-duplication
+    convention ``_is_manual_sprint_item`` already established)."""
+    if not isinstance(item, dict):
+        return False
+    return item.get("blocker_kind") in ("superseded", "systemic_invalidated_run")
 
 
 def _build_manual_todo_note(manual_items: list[dict[str, Any]]) -> str:
@@ -3551,6 +3614,44 @@ def _build_quick_start_goal(
             item for item in pending_sprint_items
             if item.get("version") == version
         ]
+    # 83a7586d — attach the machine-readable fan-out/fan-in FRONTIER signal
+    # to every pending item, sourced from get_parallelizable_groups()'s own
+    # (now multi-parent-aware) `blocked` list — the SAME live-DB-backed
+    # computation the macro-wave/batch rendering below already trusts to
+    # decide what's genuinely dispatch-safe (see
+    # meridian.dependency_graph.evaluate_frontier /
+    # meridian.db.sprint_items.get_dependency_frontier). This does NOT
+    # independently re-derive dependency state (which would risk drifting
+    # from claim_sprint_item's own DEPENDENCY_NOT_SATISFIED enforcement) —
+    # it is purely additive metadata: a fan-in barrier item that isn't yet
+    # ready is annotated frontier_ready=False with its still-blocking
+    # predecessor ids/statuses, so ANY renderer or programmatic consumer of
+    # pending_sprint_items — not just the wave/batch prose below, but also
+    # the plain "Pending Sprint Items" section every full/delta/starter
+    # render carries outside the /goal block itself — sees the real
+    # claimability signal, distinct from the macro-wave DISPLAY label.
+    # Every mode (starter/delta/goal/full) funnels through this one shared
+    # function, so annotating here covers all of them from a single site.
+    # Fail-open: when parallel_groups itself is unavailable (e.g.
+    # get_parallelizable_groups raised upstream), every item defaults to
+    # frontier_ready=True — the same fail-open posture every other
+    # parallel_groups consumer in this function already uses.
+    _frontier_blocked_by_id = {
+        _fb["id"]: _fb
+        for _fb in (parallel_groups or {}).get("blocked") or []
+        if _fb.get("id")
+    }
+    for _fitem in pending_sprint_items:
+        _fb = _frontier_blocked_by_id.get(_fitem.get("id"))
+        if _fb is not None:
+            _fitem["frontier_ready"] = False
+            _fitem["frontier_blocking_predecessors"] = _fb.get("blocking_predecessors") or (
+                [{"id": _fb.get("depends_on"), "status": _fb.get("blocked_by_status")}]
+                if _fb.get("depends_on") else []
+            )
+        else:
+            _fitem.setdefault("frontier_ready", True)
+            _fitem.setdefault("frontier_blocking_predecessors", [])
     # 76dde31f (665 follow-up) — capture the version-scoped pending-item list
     # HERE, before any of the manual/backburner/unprospected/wave-gate
     # exclusions below narrow `pending_sprint_items` down to just today's
@@ -3570,6 +3671,40 @@ def _build_quick_start_goal(
     # see that out-param's docstring above; zero cost/behavior change for
     # every caller that doesn't opt in.
     _scope_exclusion_reason_by_id: dict[str, str] = {}
+    # 524e73e6 — HARD-BLOCKED EXCLUSION: blocker_kind in ('superseded',
+    # 'systemic_invalidated_run') is enforced as a hard gate inside
+    # claim_sprint_item (f89d440f/cc3864bd) but was never filtered out of the
+    # claimable /goal batch here or by get_sprint_items — see
+    # _is_hard_blocked_sprint_item's docstring for the confirmed gap this
+    # closes. Runs BEFORE the manual/backburner split below so a hard-blocked
+    # item is never even considered for the "maintainer's own todo" note —
+    # its premise is gone, not merely pending a human/real-world action.
+    _hard_blocked_items = [
+        it for it in pending_sprint_items if _is_hard_blocked_sprint_item(it)
+    ]
+    pending_sprint_items = [
+        it for it in pending_sprint_items if not _is_hard_blocked_sprint_item(it)
+    ]
+    for _it in _hard_blocked_items:
+        if _it.get("id"):
+            _scope_exclusion_reason_by_id.setdefault(
+                _it["id"], _it.get("blocker_kind") or "superseded",
+            )
+    _hard_blocked_note = ""
+    if _hard_blocked_items:
+        _hb_ids = ", ".join(it["id"] for it in _hard_blocked_items if it.get("id"))
+        _hb_n = len(_hard_blocked_items)
+        _hard_blocked_note = (
+            f'\n<excluded_superseded count="{_hb_n}">'
+            f"{_xml_escape(_hb_ids)}"
+            "</excluded_superseded>"
+            "\n<!-- These items are hard-gated by claim_sprint_item "
+            "(blocker_kind=superseded or systemic_invalidated_run) and must "
+            "NOT be claimed or executed under any circumstances -- their "
+            "premise has been replaced or the wave run that owned them was "
+            "systemically invalidated. This is enforced at claim time, not "
+            "just this prose note. -->"
+        )
     # 3a02041a — split MANUAL/human items out of the executable list so they are
     # never named under the "claim and execute" directive; they're surfaced
     # separately as the maintainer's own todo (no completion-pressure language).
@@ -3720,6 +3855,53 @@ def _build_quick_start_goal(
             "real run_verification result. This is enforced at claim time, not "
             "just this prose note. -->"
         )
+    # 83a7586d — DEPENDENCY / FAN-IN BARRIER: exclude items whose frontier
+    # isn't ready AND at least one blocking predecessor is genuinely OUTSIDE
+    # this goal's own pending batch — mirroring the wave-gate exclusion
+    # immediately above. A not-ready item whose blocking predecessor(s) ARE
+    # ALSO in this same batch is deliberately KEPT: this is the pre-existing
+    # dependency-CLOSURE contract (a legacy single-parent chain, or
+    # selected_item_ids pulling in a still-pending ancestor) — completing
+    # the in-batch predecessor first, via the dependency-order/wave
+    # rendering below (now fan-in aware — see _partition_into_waves), is
+    # exactly how that closure is meant to work, and must not regress into
+    # a hard exclusion. claim_sprint_item's DEPENDENCY_NOT_SATISFIED gate
+    # still structurally refuses an early claim regardless of how this
+    # prose renders, so safety never depends on getting this ordering
+    # exactly right — only the QUALITY of the guidance does.
+    _pending_ids_for_dep_check = {
+        it.get("id") for it in pending_sprint_items if it.get("id")
+    }
+    _excluded_dependency_blocked: list[dict[str, Any]] = []
+    _kept_after_dep_check: list[dict[str, Any]] = []
+    for _it in pending_sprint_items:
+        if _it.get("frontier_ready") is False:
+            _blk_ids = {
+                _b.get("id") for _b in (_it.get("frontier_blocking_predecessors") or [])
+                if _b.get("id")
+            }
+            if not _blk_ids or not _blk_ids.issubset(_pending_ids_for_dep_check):
+                _excluded_dependency_blocked.append(_it)
+                continue
+        _kept_after_dep_check.append(_it)
+    if _excluded_dependency_blocked:
+        pending_sprint_items = _kept_after_dep_check
+        for _it in _excluded_dependency_blocked:
+            if _it.get("id"):
+                _scope_exclusion_reason_by_id.setdefault(_it["id"], "dependency_not_satisfied")
+    _excluded_dependency_note = ""
+    if _excluded_dependency_blocked:
+        _dep_exc_ids = ", ".join(it["id"] for it in _excluded_dependency_blocked if it.get("id"))
+        _dep_exc_n = len(_excluded_dependency_blocked)
+        _excluded_dependency_note = (
+            f'\n<excluded_dependency_not_satisfied count="{_dep_exc_n}">'
+            f"{_xml_escape(_dep_exc_ids)}"
+            "</excluded_dependency_not_satisfied>"
+            "\n<!-- These items are structurally blocked by claim_sprint_item "
+            "until every declared predecessor (a single depends_on parent, or "
+            "every id in a fan-out/fan-in barrier) is terminal. This is "
+            "enforced at claim time, not just this prose note. -->"
+        )
     item_ids = [item["id"] for item in pending_sprint_items if item.get("id")]
     # fb82e51f — record the selected-scope outcome now that every exclusion
     # filter above (manual/backburner/unprospected/wave-gate) has run and
@@ -3850,10 +4032,12 @@ def _build_quick_start_goal(
             "</completion_criteria>\n"
             f"<stop_conditions>Stop after {_turns} turns "
             f"{_xml_escape(_hitl_clause)}</stop_conditions>"
+            f"{_hard_blocked_note}"
             f"{_manual_note}"
             f"{_backburner_note}"
             f"{_excluded_unprospected_note}"
             f"{_excluded_wave_gate_note}"
+            f"{_excluded_dependency_note}"
         )
     directive = (
         _INTERACTIVE_GOAL_DIRECTIVE
@@ -3868,6 +4052,79 @@ def _build_quick_start_goal(
     # the dependency order into one ordered id list so the executor runs straight
     # through without treating a wave boundary as a stopping point.
     waves = _partition_into_waves(pending_sprint_items)
+    # 524e73e6 — DEPENDENCY WAVE BOUNDARY: wave 0 is exactly the set of
+    # items whose frontier is ready (see the 83a7586d annotation above --
+    # _partition_into_waves places an item in a LATER wave only when it has
+    # an in-batch predecessor that isn't yet terminal, which is precisely
+    # frontier_ready=False; a frontier_ready=True item can never have a
+    # still-pending in-set predecessor, so it is always depth 0). This makes
+    # wave 0 the authoritative "safe to dispatch right now" set and every
+    # later wave an explicit, machine-checkable boundary: blocked until its
+    # listed predecessor(s) — always part of THIS SAME pending batch, never
+    # a genuinely external id (those are hard-excluded above via
+    # _excluded_dependency_note) — reach a terminal state.
+    _claimable_wave = waves[0] if waves else []
+    _claimable_wave_ids = {it.get("id") for it in _claimable_wave if it.get("id")}
+    # 524e73e6 — structured, machine-readable wave-boundary tag: a receiving
+    # executor (or any programmatic consumer) can derive the exact permitted
+    # parallel set without interpreting prose. Emitted ONLY when there is a
+    # real dependency boundary (len(waves) > 1) -- a flat/no-dependency board
+    # (every existing legacy single-wave fixture) renders byte-for-byte the
+    # same as before this item, preserving starter mode's hard ≤20-non-empty-
+    # line budget (see _generate_starter_handoff's own f471c4b8 comment) and
+    # every other mode's existing size/backward-compat guarantees.
+    # board_revision (acf6f51a's compute_board_revision, reused rather than
+    # re-derived) is attached as an attribute so a receiver can detect, via a
+    # fresh get_sprint_items() re-fetch + verify_board_revision(), whether
+    # THIS wave/frontier state has gone stale (e.g. a predecessor completed,
+    # or a new item was inserted) before trusting the boundary below --
+    # proportionate re-frontiering support for starter/full/delta, which
+    # (unlike goal mode's opt-in emit_manifest) have no manifest machinery.
+    _dependency_waves_clause = ""
+    if len(waves) > 1:
+        # Derive each blocked wave's "blocked_on" set directly from the SAME
+        # depends_on parsing _partition_into_waves itself used (restricted to
+        # ids that are part of this waves structure at all) rather than from
+        # frontier_blocking_predecessors -- that annotation is only populated
+        # when a real parallel_groups["blocked"] entry exists for the item
+        # (see the 83a7586d annotation above), so a caller that never passes
+        # parallel_groups (a hand-built test fixture, or any future caller
+        # that has waves but no resource-conflict data) would otherwise get a
+        # correct wave PARTITION but an empty/misleading blocked_on
+        # attribute. Recomputing from depends_on keeps this tag self-
+        # consistent with the wave boundary it is describing regardless.
+        _all_wave_ids = {
+            it.get("id") for _w in waves for it in _w if it.get("id")
+        }
+        _dw_entries: list[str] = []
+        for _dw_i, _dw in enumerate(waves):
+            _dw_ids = [it.get("id") for it in _dw if it.get("id")]
+            if not _dw_ids:
+                continue
+            if _dw_i == 0:
+                _dw_entries.append(
+                    f'<wave n="1" status="claimable">'
+                    f'{_xml_escape(", ".join(_dw_ids))}</wave>'
+                )
+            else:
+                _dw_blockers = sorted({
+                    _p
+                    for _dwit in _dw
+                    for _p in _dependency_graph.parse_predecessor_ids(_dwit.get("depends_on"))
+                    if _p in _all_wave_ids
+                })
+                _dw_entries.append(
+                    f'<wave n="{_dw_i + 1}" status="blocked_until_terminal" '
+                    f'blocked_on="{_xml_escape(", ".join(_dw_blockers), {chr(34): "&quot;"})}">'
+                    f'{_xml_escape(", ".join(_dw_ids))}</wave>'
+                )
+        if _dw_entries:
+            _dependency_waves_clause = (
+                f'\n<dependency_waves active_wave="1" total_waves="{len(waves)}" '
+                f'board_revision="{_xml_escape(compute_board_revision(pending_sprint_items), {chr(34): "&quot;"})}">'
+                + "".join(_dw_entries)
+                + "</dependency_waves>"
+            )
     # e20db0be — when get_parallelizable_groups() resolved resource-conflict-free
     # batches (each batch's items touch disjoint files/symbols), advertise them as
     # parallel-safe. Unlike _partition_into_waves (depends_on ordering only), these
@@ -3903,7 +4160,22 @@ def _build_quick_start_goal(
             for _wave in _macro_waves:
                 _wave_batch_labels: list[str] = []
                 for _g in _wave.get("batches") or []:
-                    _gids = [it.get("id") for it in _g if it.get("id") in _item_id_set]
+                    # 524e73e6 — also require wave-0 (frontier-ready) membership:
+                    # get_parallelizable_groups' own "eligible" set already only
+                    # contains frontier-ready items (a not-ready item is routed to
+                    # its "blocked" list instead — see that function's docstring),
+                    # so this is normally a no-op; it is defense-in-depth against a
+                    # caller-supplied parallel_groups dict (e.g. a test fixture, or
+                    # a snapshot computed a moment before pending_sprint_items) that
+                    # disagrees with THIS call's own dependency-frontier annotation.
+                    # An item this excludes falls straight through to the
+                    # dependency-wave rendering below instead of being silently
+                    # dropped.
+                    _gids = [
+                        it.get("id") for it in _g
+                        if it.get("id") in _item_id_set
+                        and it.get("id") in _claimable_wave_ids
+                    ]
                     _batched.update(_gids)
                     if _gids:
                         _batches.append(f"batch {len(_batches) + 1}: {', '.join(_gids)}")
@@ -3914,8 +4186,13 @@ def _build_quick_start_goal(
                     )
         else:
             for _i, _g in enumerate(_pgroups):
-                # Only ids in this /goal's (possibly version-scoped) item list.
-                _gids = [it.get("id") for it in _g if it.get("id") in _item_id_set]
+                # Only ids in this /goal's (possibly version-scoped) item list,
+                # AND in the immediately-claimable dependency wave — see above.
+                _gids = [
+                    it.get("id") for it in _g
+                    if it.get("id") in _item_id_set
+                    and it.get("id") in _claimable_wave_ids
+                ]
                 _batched.update(_gids)
                 if _gids:
                     _batches.append(f"batch {len(_batches) + 1}: {', '.join(_gids)}")
@@ -3932,32 +4209,63 @@ def _build_quick_start_goal(
         #      implies the blocker is accounted for in-goal, when the real
         #      blocker is a separate, unlisted prerequisite the executor has
         #      never heard of and may attempt to work around.
-        # get_parallelizable_groups already resolves this distinction in the
-        # SAME call — its "blocked" list carries the real depends_on id +
-        # blocked_by_status for exactly case 2 — so cross-reference it here
-        # instead of rendering every leftover id identically.
+        # 524e73e6 — classification FIX: the original check here asked
+        # "does get_parallelizable_groups' own 'blocked' list mention this
+        # id at all" — but that list is EXACTLY the source of the
+        # frontier_ready=False annotation above (3a02041a/83a7586d), and the
+        # dependency-exclusion filter earlier in this function only ever
+        # KEEPS a frontier-blocked item when ALL of its blocking
+        # predecessors are already part of THIS SAME pending batch. So every
+        # item that could reach this leftover code while frontier_ready is
+        # False is, by construction, an in-batch case — the old check
+        # mislabeled every single one of them as "outside this goal," which
+        # is never true for a kept item. The real question is simply: is
+        # this leftover id in the claimable wave (wave 0) or a later,
+        # dependency-blocked wave? Use that directly instead of
+        # cross-referencing the blocked list's mere presence.
         _blocked_by_id = {
             _b["id"]: _b
             for _b in (parallel_groups or {}).get("blocked") or []
             if _b.get("id")
         }
-        _leftover_external = [iid for iid in _leftover if iid in _blocked_by_id]
-        _leftover_batch_order = [iid for iid in _leftover if iid not in _blocked_by_id]
+        _leftover_batch_order = [iid for iid in _leftover if iid in _claimable_wave_ids]
+        _leftover_blocked = [iid for iid in _leftover if iid not in _claimable_wave_ids]
         _left_parts: list[str] = []
         if _leftover_batch_order:
             _left_parts.append(
                 "; then, once their dependencies clear: "
                 f"{', '.join(_leftover_batch_order)}"
             )
-        if _leftover_external:
-            _ext_txt = "; ".join(
-                f"{iid} blocked on {_blocked_by_id[iid].get('depends_on') or '?'} "
-                "(status: "
-                f"{_blocked_by_id[iid].get('blocked_by_status') or 'unknown'})"
-                for iid in _leftover_external
-            )
+        if _leftover_blocked:
+            # Render per dependency-wave predecessor detail (frontier_blocking_
+            # predecessors — fan-in-aware, unlike the legacy single-parent
+            # depends_on/blocked_by_status pair _blocked_by_id carries) so a
+            # mixed fan-in (some blockers in-batch, some genuinely elsewhere)
+            # only names the blocker(s) actually worth watching. Falls back to
+            # _blocked_by_id's legacy single-parent detail only if the
+            # annotation is somehow missing (defensive; should not happen).
+            _blocked_item_by_id = {
+                it.get("id"): it for it in pending_sprint_items if it.get("id")
+            }
+            _ext_parts = []
+            for iid in _leftover_blocked:
+                _bit = _blocked_item_by_id.get(iid) or {}
+                _preds = _bit.get("frontier_blocking_predecessors") or []
+                if _preds:
+                    _blk_txt = ", ".join(
+                        f"{p.get('id')} (status: {p.get('status') or 'unknown'})"
+                        for p in _preds if p.get("id")
+                    )
+                else:
+                    _fb = _blocked_by_id.get(iid) or {}
+                    _blk_txt = (
+                        f"{_fb.get('depends_on') or '?'} "
+                        f"(status: {_fb.get('blocked_by_status') or 'unknown'})"
+                    )
+                _ext_parts.append(f"{iid} blocked on {_blk_txt}")
             _left_parts.append(
-                f"; blocked on an item outside this goal (not listed above): {_ext_txt}"
+                "; DO NOT dispatch yet -- blocked on a predecessor still "
+                f"pending in this same goal: {'; '.join(_ext_parts)}"
             )
         _left_txt = "".join(_left_parts)
         if _use_macro_waves and _wave_strs:
@@ -4098,7 +4406,8 @@ def _build_quick_start_goal(
         "live board (the ids below are a snapshot and may have shifted)."
         "</first_step>\n"
         f"{_build_executor_item_ids_clause(pending_sprint_items)}\n"
-        f"<sprint_items>{_xml_escape(items_clause.strip())}{_pointer_lines_block}</sprint_items>\n"
+        f"<sprint_items>{_xml_escape(items_clause.strip())}{_pointer_lines_block}</sprint_items>"
+        f"{_dependency_waves_clause}\n"
         # 0d5453bc — explicit per-item vs end-of-megasprint split: targeted tests
         # only per item; the full suite is a single gate at the very end. This
         # prevents the anti-pattern of running the full suite 6x for one item.
@@ -4208,10 +4517,12 @@ def _build_quick_start_goal(
         # items with poll/backoff guidance, straight from the SAME
         # parallel_groups dict already threaded through this function.
         + _build_scheduler_lease_clause(parallel_groups)
-        + f"{_manual_note}"
+        + f"{_hard_blocked_note}"
+        f"{_manual_note}"
         f"{_backburner_note}"
         f"{_excluded_unprospected_note}"
         f"{_excluded_wave_gate_note}"
+        f"{_excluded_dependency_note}"
     )
 
 
@@ -12505,6 +12816,25 @@ async def _generate_starter_handoff(
     render — see that function's docstring.
     """
     project_id = project["id"]
+    # 524e73e6 — investigated matching full/delta/goal's include_human=False,
+    # include_deferred=False on this fetch (a confirmed minor inconsistency:
+    # starter's "recently completed"/"top-3 pending preview" sections, built
+    # from this same unfiltered list via _prepare_pending_sprint_items, can
+    # show a human-milestone/manual-blocker/deferred item those other modes'
+    # equivalent sections never do). NOT applied: this same
+    # sprint_items_all list also feeds `pending` -> _build_quick_start_goal,
+    # and starter's mode-dependent MANUAL-exclusion-note behavior is an
+    # existing, deliberately-designed contract test pins verbatim
+    # (test_682005f4_goal_only_handoff.py::
+    # test_project_start_config_coexists_with_required_tool_and_exclusions --
+    # "starter fetches sprint items with the default include_human=True, so
+    # _build_quick_start_goal's own MANUAL filter sees the item and surfaces
+    # it via the same <exclusions> note"). Filtering this fetch would
+    # silently swallow that surfaced note for starter instead of just
+    # de-leaking the preview text. A correct fix needs a SEPARATE filtered
+    # fetch (or in-memory filter) for the completed/preview sections only,
+    # leaving `pending` sourced from the unfiltered list -- left as a
+    # follow-up rather than risking that regression under this item's scope.
     sprint_items_all = await db_module.get_sprint_items(
         db, project_id, version=version,
     )
@@ -13119,7 +13449,21 @@ async def _generate_goal_only_handoff(
             origin_identity=resolve_origin_identity(project),
             selected_item_ids=(selected_scope or {}).get("selected_item_ids"),
             closure_item_ids=(selected_scope or {}).get("closure_item_ids"),
-            waves=(_parallel_groups or {}).get("groups"),
+            # 524e73e6 — FIX: this previously passed
+            # (_parallel_groups or {}).get("groups"), which is the
+            # RESOURCE-CONFLICT-FREE batch partition (disjoint files/
+            # symbols) -- a completely different concept from a DEPENDENCY
+            # wave, and the only reason two items ever land in different
+            # "groups" entries is a resource conflict, not a depends_on
+            # ordering requirement. A manifest consumer reading "waves" as
+            # dependency order would draw exactly the wrong conclusion.
+            # _partition_into_waves(pending_sprint_items) is the real
+            # depends_on-based topological layering (same function
+            # _build_quick_start_goal itself uses for the dependency-wave
+            # boundary) -- recomputed here (pure, deterministic, no DB
+            # access) against the SAME pending_sprint_items this manifest's
+            # own "items"/"board_revision" fields are built from.
+            waves=_partition_into_waves(pending_sprint_items),
             evidence_status=_g_evidence_status,
             trusted_pointers=_g_trusted_pointers,
         )

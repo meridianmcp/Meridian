@@ -51,8 +51,19 @@ from meridian import handoff as handoff_module
 # pytest.ini sets asyncio_mode = auto — no explicit @pytest.mark.asyncio or
 # module-level pytestmark needed; async def tests are picked up automatically.
 
-_OPEN_TAG_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9_]*)>")
+# 47ac68a0 — these two must accept an ATTRIBUTE-BEARING opening tag
+# (`<execution_policy execution_mode="...">`, `<selected_item_scope
+# requested="...">`, the outer `<handoff_manifest schema_version="...">`
+# wrapper, `<proposal_scope proposal_id="...">`), not just a bare `<tag>`:
+# the production regex (`handoff._STRUCTURAL_TAG_RE`) had exactly this same
+# bare-tag-only blind spot, so a dangling-tag check built on the old
+# bare-tag-only pattern here could never have caught it either. Self-closing
+# tags (`<executor_item_ids count="0" />`) are stripped out before the
+# open/close balance check below — they never have (or need) a separate
+# closing tag, so counting their opener as "open" would be a false positive.
+_OPEN_TAG_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9_]*)(?:\s[^<>]*)?>")
 _CLOSE_TAG_RE = re.compile(r"</([a-zA-Z][a-zA-Z0-9_]*)>")
+_SELF_CLOSING_TAG_RE = re.compile(r"<[a-zA-Z][a-zA-Z0-9_]*(?:\s[^<>]*)?/>")
 _MARKER_META_RE = re.compile(r"machine_readable=(\{.*?\})\s*-->")
 
 
@@ -60,8 +71,8 @@ _XML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
 
 
 def _assert_no_dangling_tags(text: str) -> None:
-    """Every top-level <tag> opened in `text` must have a matching </tag> —
-    the concrete, checkable form of "no string slicing that can cut
+    """Every top-level <tag ...> opened in `text` must have a matching
+    </tag> — the concrete, checkable form of "no string slicing that can cut
     XML/JSON/goal tags." A truncated render may legitimately DROP a whole
     tag, but must never leave a half-open one.
 
@@ -70,9 +81,11 @@ def _assert_no_dangling_tags(text: str) -> None:
     and including any <goal_token>/SECURITY banner above", "with the
     <goal_token> value above") without those mentions being real structural
     markup that needs a closing tag — checking inside a comment would be a
-    false positive, not a real dangling-tag defect.
+    false positive, not a real dangling-tag defect. Self-closing tags are
+    stripped next for the same reason (see module comment above).
     """
     stripped = _XML_COMMENT_RE.sub("", text)
+    stripped = _SELF_CLOSING_TAG_RE.sub("", stripped)
     opens = [m.group(1) for m in _OPEN_TAG_RE.finditer(stripped)]
     closes = [m.group(1) for m in _CLOSE_TAG_RE.finditer(stripped)]
     from collections import Counter  # noqa: PLC0415
@@ -158,6 +171,133 @@ def test_snap_to_safe_boundary_respects_protected_end():
     spans = [(0, 30)]
     safe = handoff_module._snap_to_safe_boundary(15, spans, protected_end=20)
     assert safe == 20
+
+
+# ---------------------------------------------------------------------------
+# 47ac68a0 — _STRUCTURAL_TAG_RE attribute-blindness regression.
+#
+# The pattern originally required a bare `<tag>` with no attributes, so it
+# never matched (and therefore never protected) the structural tags that are
+# ACTUALLY rendered with attributes: <execution_policy execution_mode=...>,
+# <selected_item_scope requested=...>, the outer <handoff_manifest
+# schema_version=...> wrapper, and <proposal_scope proposal_id=...>. These
+# tests build the exact strings the real render helpers produce (not
+# hand-rolled approximations) and confirm each is now recognized as a
+# protected span, and survives (whole, never dangling) a forced truncation
+# that lands inside it.
+# ---------------------------------------------------------------------------
+
+
+def test_structural_tag_spans_finds_attribute_bearing_tags():
+    execution_policy = handoff_module._build_execution_policy_clause(
+        {"execution_mode": "autonomous", "max_planning_turns": 5,
+         "required_first_action": "claim_sprint_item"}
+    )
+    selected_scope = handoff_module._build_selected_scope_clause(
+        {"selected_item_ids": ["a", "b"], "closure_item_ids": ["a", "b"],
+         "closure_hash": "deadbeef"}
+    )
+    manifest_xml = handoff_module.serialize_handoff_manifest_xml(
+        handoff_module.build_handoff_manifest(
+            handoff_mode="full", project_id="p1", items=[],
+        )
+    )
+    proposal_scope = handoff_module._build_proposal_scope_clause(
+        {"proposal_id": "prop-1", "content_hash": "hash1", "executable": True,
+         "items": [{"id": "a"}]},
+    )
+    for label, tag_name, rendered in (
+        ("execution_policy", "execution_policy", execution_policy),
+        ("selected_item_scope", "selected_item_scope", selected_scope),
+        ("handoff_manifest", "handoff_manifest", manifest_xml),
+        ("proposal_scope", "proposal_scope", proposal_scope),
+    ):
+        assert rendered, f"{label}: fixture produced an empty render"
+        # Sanity: the tag really is attribute-bearing (opening tag has a
+        # space before its closing '>'), otherwise this test would not be
+        # exercising the bug it claims to.
+        assert re.search(rf"<{tag_name}\s", rendered), (
+            f"{label}: fixture tag has no attributes — not testing the bug"
+        )
+        spans = handoff_module._structural_tag_spans(rendered)
+        assert len(spans) >= 1, (
+            f"{label}: attribute-bearing <{tag_name}> was NOT recognized as "
+            "a protected structural span (the 47ac68a0 regression)"
+        )
+        start_b, end_b = spans[0]
+        assert end_b == len(rendered.encode("utf-8")), (
+            f"{label}: protected span must cover the tag through its "
+            "closing tag"
+        )
+
+
+def test_format_handoff_mcp_content_protects_execution_policy_tag():
+    """A byte cut landing inside a real <execution_policy ...> tag (the
+    concrete failure named in the item's own acceptance criteria) must drop
+    the whole tag, never leave a dangling `<execution_policy ...` fragment.
+
+    The exact byte offset at which the truncation actually lands inside the
+    tag depends on the marker's own (unrelated) byte length — reserving room
+    for it shifts the effective cut point — so a single hand-picked budget
+    is fragile. Sweep a wide range of forced budgets instead: whatever that
+    offset is, the sweep crosses it, and the invariant must hold at every
+    point along the way, not just one lucky value.
+    """
+    execution_policy = handoff_module._build_execution_policy_clause(
+        {"execution_mode": "autonomous", "max_planning_turns": 5,
+         "required_first_action": "claim_sprint_item",
+         "no_confirmation": True}
+    )
+    assert "<execution_policy" in execution_policy
+    # NOTE: the `* 10` below must apply to ONLY the padding literal — adjacent
+    # string literals concatenate at parse time before `*` is applied, so
+    # `f"{x}\n" "text" * 10` would (surprisingly) repeat `x` along with the
+    # text. Building the padding as its own literal first avoids that trap.
+    _padding = (
+        "More trailing narrative that is not structurally significant, "
+        "padded out so there is real content after the tag to trim. "
+    ) * 10
+    content = "# Handoff\n\nSome narrative text up top.\n" f"{execution_policy}\n" + _padding
+    total = len(content.encode("utf-8"))
+    for budget in range(40, total, 20):
+        out = handoff_module.format_handoff_mcp_content(content, max_bytes=budget)
+        _assert_no_dangling_tags(out)
+        # Whole-or-nothing, specifically for this tag: the word
+        # "execution_policy" appears nowhere else in this fixture, so an
+        # open tag with no matching close is unambiguously a dangling
+        # fragment — exactly what the buggy bare-tag regex produces.
+        if "<execution_policy" in out:
+            assert "</execution_policy>" in out, (
+                f"budget={budget}: dangling <execution_policy ...> with no "
+                "matching close tag"
+            )
+
+
+def test_format_handoff_mcp_content_protects_handoff_manifest_wrapper():
+    """A cut landing inside <handoff_manifest ...>'s own opening tag (not
+    just its attribute-free inner children) must drop the whole manifest,
+    never a truncated wrapper missing its closing tag. Same budget-sweep
+    rationale as the execution_policy test above."""
+    manifest_xml = handoff_module.serialize_handoff_manifest_xml(
+        handoff_module.build_handoff_manifest(
+            handoff_mode="full", project_id="p1",
+            items=[{"id": f"item-{i}", "status": "pending"} for i in range(20)],
+        )
+    )
+    assert manifest_xml.startswith("<handoff_manifest ")
+    # See the string-literal-concatenation-before-`*` note in the
+    # execution_policy test above for why the padding is built separately.
+    _padding = "Trailing narrative padding text repeated for byte budget. " * 15
+    content = "# Handoff\n\n" f"{manifest_xml}\n" + _padding
+    total = len(content.encode("utf-8"))
+    for budget in range(40, total, 25):
+        out = handoff_module.format_handoff_mcp_content(content, max_bytes=budget)
+        _assert_no_dangling_tags(out)
+        if "<handoff_manifest" in out:
+            assert out.count("</handoff_manifest>") == 1, (
+                f"budget={budget}: <handoff_manifest> present without its "
+                "single matching closing tag"
+            )
 
 
 # ---------------------------------------------------------------------------

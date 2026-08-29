@@ -236,6 +236,16 @@ class GoalState(BaseModel):
     ambient_tasks: list[dict[str, Any]] | None = None
     north_star: str | None = None
     sprint: str | None = None
+    # P0 VERIFY (106519eb) — db.get_goal already computes these two fields for a
+    # subproject that borrows its parent's north_star (3b6ff466), but this response
+    # model previously didn't declare them: FastAPI's response_model validation
+    # silently stripped them before the JSON ever reached a caller, so the
+    # inherited-vs-own distinction that db.get_goal computes never survived the
+    # HTTP boundary (see tests/test_core.py's north_star inheritance tests, which
+    # all asserted directly against db_module.get_goal and so never caught this).
+    # Declaring them here is the actual fix — no db/route logic changes needed.
+    north_star_inherited: bool | None = None
+    north_star_source_project_id: str | None = None
     # v0.6.1 — XML-serialised goal envelope. Mirrors the same fields
     # under one wire format so MCP consumers can hand the whole thing
     # to Claude as a single block with structured cache hints.
@@ -451,6 +461,390 @@ class WorktreeCreate(BaseModel):
             "manifest for audit purposes only, never validated against disk. "
             "Defaults to project_id when omitted."
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Project family / template revisions — DESIGN ONLY (5060eea1, parent
+# ddcf6984). See docs/meridian-project-family-template-revisions-design.md
+# for the full design this implements as data contracts.
+#
+# These classes are PURELY ADDITIVE and INTENTIONALLY UNWIRED: no route, MCP
+# tool, or handler constructs or returns any of them. No table backing them
+# exists (see the design doc's section (j) for the proposed, not-yet-written
+# schema). They exist so the API shapes for create/fork/override/preview/
+# adopt/reject/rollback have a concrete, reviewable, type-checked form ahead
+# of any real implementation item.
+# ---------------------------------------------------------------------------
+
+
+class ProjectTemplateCreate(BaseModel):
+    """Request shape for creating a brand-new template (design doc section k,
+    "create"). Implicitly creates the template's first revision
+    (revision_number=1) from ``fields`` — there is no separate "create an
+    empty template" operation in this design.
+    """
+
+    name: str = Field(..., min_length=1, description="Template display name.")
+    description: str | None = Field(default=None, description="Human-readable summary of what this template provisions.")
+    fields: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Full configuration payload for revision 1. See design doc section (i): must never contain "
+        "secrets or machine-local absolute paths — validated the same way meridian.capability_manifest "
+        "validates provenance/manifest fields (not yet wired here; design only).",
+    )
+    schema_version: int = Field(default=1, ge=1, description="Initial schema_version — see design doc section (e).")
+    provenance: dict[str, Any] | str | None = Field(
+        default=None,
+        description="Where this template came from (a doc section, an admin note, a URL). Same typing convention "
+        "as meridian.capability_manifest capability provenance.",
+    )
+    created_by_human_id: str | None = Field(default=None, description="Optional creator identifier.")
+
+
+class ProjectTemplate(BaseModel):
+    """A template lineage (design doc section k, "create" response; also the
+    response for "fork"). ``latest_revision_id`` is the ONLY mutable pointer
+    in this whole design — see design doc section (f), Supersession.
+    """
+
+    id: str
+    name: str
+    description: str | None = None
+    schema_version: int = 1
+    latest_revision_id: str | None = Field(
+        default=None,
+        description="Stable revision id ('{template_id}:r{revision_number}') of the newest revision. "
+        "None only in the impossible-in-practice case of a template with zero revisions.",
+    )
+    latest_revision_number: int = Field(default=0, ge=0)
+    forked_from_template_id: str | None = Field(
+        default=None, description="Set when this template was created via 'fork' (design doc section k)."
+    )
+    forked_from_revision_id: str | None = Field(
+        default=None, description="The specific source revision this template's first revision was forked from."
+    )
+    created_by_human_id: str | None = None
+    created_at: str
+
+
+class TemplateRevisionCreate(BaseModel):
+    """Request shape for adding a new immutable revision to an existing
+    template (design doc section k, "create" — the revision-on-existing-
+    template case). ``fields`` is a full replacement of the payload, not a
+    delta — same "replace, not merge" contract as
+    ``meridian.db.profile_layers.set_profile_layer``.
+    """
+
+    template_id: str
+    fields: dict[str, Any] = Field(default_factory=dict)
+    schema_version: int | None = Field(
+        default=None,
+        ge=1,
+        description="Omit to inherit the template's current schema_version unchanged. Set explicitly to bump it "
+        "— see design doc section (e) for what should trigger a bump.",
+    )
+    changelog: str | None = Field(default=None, description="Human-authored summary of what changed and why.")
+    provenance: dict[str, Any] | str | None = None
+    actor: str | None = Field(default=None, description="Who/what created this revision, for the audit trail.")
+
+
+class TemplateRevisionSnapshot(BaseModel):
+    """One immutable template revision (design doc sections a, b, f, g).
+    Never mutated after creation except for ``superseded_by_revision_id``,
+    which is set exactly once, when a later revision is created.
+    """
+
+    id: str
+    revision_id: str = Field(..., description="Stable id: '{template_id}:r{revision_number}'. See design doc section (a).")
+    template_id: str
+    revision_number: int = Field(..., ge=1)
+    schema_version: int = Field(..., ge=1)
+    fields: dict[str, Any]
+    content_hash: str = Field(..., description="'sha256:...' canonical hash — see design doc section (b).")
+    changelog: str | None = None
+    provenance: dict[str, Any] | str | None = None
+    superseded_by_revision_id: str | None = Field(
+        default=None, description="None means this IS the current latest revision."
+    )
+    rollback_of_revision_id: str | None = Field(
+        default=None,
+        description="Set only when this revision was minted by a template-level rollback (design doc section g) "
+        "— records which older revision's payload this one intentionally reproduces.",
+    )
+    created_at: str
+
+
+class TemplateForkRequest(BaseModel):
+    """Request shape for 'fork' (design doc section k): branch a specific
+    source revision into a brand-new, independent template lineage.
+    ``field_overrides`` (if given) is applied on top of the source
+    revision's payload to produce the new template's own first revision —
+    the fork is not required to be byte-identical to its source.
+    """
+
+    source_template_id: str
+    source_revision_id: str = Field(..., description="Must belong to source_template_id.")
+    new_template_name: str = Field(..., min_length=1)
+    description: str | None = None
+    field_overrides: dict[str, Any] | None = Field(
+        default=None, description="Fields to change relative to the source revision's payload at fork time."
+    )
+    actor: str | None = None
+
+
+class TemplateOverrideSet(BaseModel):
+    """Request shape for 'override' (design doc section k, c): set a child's
+    entire local override layer for one template. Wholesale-replaces the
+    child's stored ``fields``/``reset_fields`` — same "replace, not merge"
+    contract as ``set_profile_layer``, not a delta.
+    """
+
+    child_project_id: str
+    template_id: str
+    fields: dict[str, Any] = Field(default_factory=dict)
+    reset_fields: list[str] = Field(
+        default_factory=list,
+        description="Keys to explicitly retract from the template base rather than inherit. See design doc "
+        "section (c), rule 2, for precedence vs. fields.",
+    )
+    expected_override_revision: int | None = Field(
+        default=None, description="Optimistic concurrency — mirrors profile_layers' expected_revision."
+    )
+    actor: str | None = None
+
+
+class ChildTemplateOverride(BaseModel):
+    """A child's persisted local override layer (design doc section c)."""
+
+    child_project_id: str
+    template_id: str
+    fields: dict[str, Any] = Field(default_factory=dict)
+    reset_fields: list[str] = Field(default_factory=list)
+    override_revision: int = Field(default=0, ge=0)
+    content_hash: str
+    updated_at: str | None = None
+
+
+class ConfigDiffEntry(BaseModel):
+    """One entry of a structural config diff (design doc section d). Used
+    both for revision-to-revision diffs and for a child's effective-vs-
+    template-base diff (the shape ``preview`` returns).
+    """
+
+    path: str = Field(..., description="Top-level field name, e.g. 'build.timeout_seconds'.")
+    op: Literal["added", "removed", "changed"]
+    base_value: Any | None = Field(default=None, description="Value on the 'from' side. None + op=='added' means absent.")
+    new_value: Any | None = Field(default=None, description="Value on the 'to' side. None + op=='removed' means absent.")
+    source: Literal["template", "override"] = Field(
+        default="template",
+        description="For a child effective-vs-base diff: whether this delta comes from the child's own override "
+        "layer or from the template revision itself changing. Always 'template' for a pure "
+        "revision-to-revision diff. See design doc section (d).",
+    )
+
+
+class TemplateAdoptionPreviewRequest(BaseModel):
+    """Request shape for 'preview' (design doc section k): dry-run the
+    effective-config diff a child would see if it adopted ``candidate_revision_id``,
+    without changing any stored state.
+    """
+
+    child_project_id: str
+    candidate_revision_id: str
+
+
+class TemplateOverridePreview(BaseModel):
+    """Response shape for 'preview' (design doc sections d, h). Never
+    mutates anything — pure dry-run.
+    """
+
+    child_project_id: str
+    template_id: str
+    current_revision_id: str | None = Field(
+        default=None, description="The child's currently-adopted revision. None if the child has never adopted anything."
+    )
+    candidate_revision_id: str
+    current_effective_hash: str | None = None
+    candidate_effective_hash: str
+    diff: list[ConfigDiffEntry] = Field(default_factory=list)
+    conflicts: list[str] = Field(
+        default_factory=list,
+        description="Field paths where the child's override is flagged incompatible with the candidate revision "
+        "— only populated when schema_version_change is True AND the override declares an affected key. "
+        "See design doc section (h).",
+    )
+    compatible: bool = Field(default=True, description="False whenever conflicts is non-empty.")
+    schema_version_change: bool = Field(
+        default=False, description="True when candidate_revision's schema_version differs from current_revision's."
+    )
+
+
+class TemplateAdoptRequest(BaseModel):
+    """Request shape for 'adopt' (design doc sections f, h, k): pin a child to
+    a specific revision. Refused when preview-equivalent conflict detection
+    finds a non-empty conflict set, unless ``force_accept_conflicts`` is set
+    together with a non-empty ``override_reason`` — same acknowledged-override
+    pattern as ``override_merge_approval`` / ``override_code_intel_receipt``.
+    """
+
+    child_project_id: str
+    revision_id: str
+    expected_snapshot_revision: int | None = Field(
+        default=None, description="Optimistic concurrency on the child's snapshot row."
+    )
+    force_accept_conflicts: bool = False
+    override_reason: str | None = Field(
+        default=None, description="Required when force_accept_conflicts is True — persisted for audit."
+    )
+    actor: str | None = None
+
+
+class TemplateRejectRequest(BaseModel):
+    """Request shape for 'reject' (design doc section k): a child explicitly
+    declines a proposed revision without changing its currently-adopted one.
+    Recorded in ``ChildTemplateSnapshot.declined_revision_ids`` so the same
+    revision isn't re-offered as a fresh suggestion.
+    """
+
+    child_project_id: str
+    revision_id: str
+    reason: str | None = None
+    actor: str | None = None
+
+
+class ChildTemplateRollbackRequest(BaseModel):
+    """Request shape for child-side rollback (design doc section g): re-point
+    a child at a revision it previously adopted. Never touches the child's
+    override layer or any template data — pure re-pointing of
+    ``adopted_revision_id``.
+    """
+
+    child_project_id: str
+    target_revision_id: str = Field(..., description="Must belong to the same template_id the child is already associated with.")
+    expected_snapshot_revision: int | None = None
+    actor: str | None = None
+
+
+class TemplateRevisionRollbackRequest(BaseModel):
+    """Request shape for template-side rollback (design doc section g):
+    mint a brand-new revision whose payload reproduces an older revision's
+    payload exactly. NEVER mutates or resurrects the old revision_id — see
+    design doc section (a) immutability guarantee. Distinct from
+    ``ChildTemplateRollbackRequest`` because it targets a different resource
+    (the template's revision ledger, not one child's pointer).
+    """
+
+    template_id: str
+    target_revision_id: str = Field(..., description="An existing, past revision_id of this template to reproduce.")
+    changelog: str | None = None
+    actor: str | None = None
+
+
+class ChildTemplateSnapshot(BaseModel):
+    """The durable per-child adoption record (design doc sections f, g) —
+    the "child snapshot" this sprint item is named for. Returned by adopt,
+    reject, and both rollback operations.
+    """
+
+    child_project_id: str
+    template_id: str
+    adopted_revision_id: str | None = Field(
+        default=None, description="None if this child has never successfully adopted a revision."
+    )
+    adopted_at: str | None = None
+    snapshot_revision: int = Field(
+        default=0, ge=0, description="This snapshot's own optimistic-concurrency counter."
+    )
+    effective_content_hash: str | None = Field(
+        default=None,
+        description="Content hash of the fully-resolved effective config at the moment of the last adopt/rollback "
+        "— the frozen audit record. See design doc section (b).",
+    )
+    declined_revision_ids: list[str] = Field(default_factory=list)
+    last_action: Literal["adopted", "rejected", "rolled_back"] | None = None
+    updated_at: str | None = None
+
+
+class ProjectFamilyView(BaseModel):
+    """Read-only aggregate: one template plus every child that has ever
+    adopted one of its revisions (design doc "Composition with the legacy
+    parent_project_id mechanism"). NOT a stored entity — no
+    ``project_family`` table exists or is proposed; this is a join,
+    computed at read time over ``child_template_snapshots``. Deliberately
+    unrelated to ``Project.parent_project_id`` — see the design doc for why
+    the two groupings are orthogonal.
+    """
+
+    template_id: str
+    template_name: str
+    latest_revision_id: str | None = None
+    members: list[ChildTemplateSnapshot] = Field(default_factory=list)
+
+
+class HandoffFamilyContext(BaseModel):
+    """ea49362c — OPTIONAL, UNWIRED illustrative shape for the family-context
+    block a future ``generate_handoff(..., include_family_context=True)``
+    (see ``docs/meridian-project-family-integration-contract.md`` section a)
+    would attach to a handoff response as a sibling field next to
+    ``content`` — exactly like ``build_effective_capability_contract``'s and
+    ``build_effective_profile_binding``'s existing pattern in
+    ``meridian/handoff.py``. Nothing in ``meridian/handoff.py`` constructs or
+    references this class today; this item makes no functional change to
+    that module. See the integration contract doc for the full rationale,
+    the test matrix, and everything this shape deliberately leaves open.
+
+    Deliberately reuses ``template_id`` (not a new ``family_id`` field) as
+    the family identifier -- see the integration contract's naming-collision
+    note: ``workspace_proposals.family_id`` (``meridian/db/proposal_lineage.py``)
+    is a pre-existing, unrelated proposal-lineage grouping concept, and this
+    class must never be confused with it.
+
+    Every field is ``None``/empty for a project with no family (integration
+    contract section e) -- there is no required field here a family-less
+    project could not trivially satisfy with its default, and no code
+    constructs this model at all in that case (the field is simply absent
+    from the response, not an empty instance).
+    """
+
+    child_project_id: str = Field(
+        ..., description="This project's id -- matches ChildTemplateSnapshot.child_project_id."
+    )
+    template_id: str | None = Field(
+        default=None,
+        description="The family identifier: the ProjectTemplate this project has adopted from, if any. "
+        "None means this project has no family. Matches ChildTemplateSnapshot.template_id / "
+        "ProjectFamilyView.template_id -- deliberately NOT named family_id (collision, see class docstring).",
+    )
+    adopted_revision_id: str | None = Field(
+        default=None,
+        description="The template_revision this project is currently pinned to -- "
+        "ChildTemplateSnapshot.adopted_revision_id, surfaced verbatim (5060eea1 section f/g).",
+    )
+    latest_revision_id: str | None = Field(
+        default=None,
+        description="ProjectTemplate.latest_revision_id at the time this context was built, so a receiver "
+        "can tell 'behind' (adopted_revision_id != latest_revision_id) without a second lookup "
+        "(5060eea1 section f, 'is this child behind' is a derived, read-time fact).",
+    )
+    inherited_vs_local: list[ConfigDiffEntry] = Field(
+        default_factory=list,
+        description="Reuses ConfigDiffEntry (5060eea1 section d) verbatim: each entry's `source` field "
+        "('template' vs 'override') IS the inherited-vs-local provenance signal for that key. "
+        "No new diff shape is introduced by this contract.",
+    )
+    executable_capability_status: Literal["executable", "non_executable", "unknown"] = Field(
+        default="unknown",
+        description="Mirrors the executable/executable_reasons vocabulary build_effective_capability_contract "
+        "already emits (meridian/handoff.py) -- NOT a new status vocabulary. 'unknown' is the default "
+        "for a project with no family, or when availability could not be checked.",
+    )
+    executable_reasons: list[str] = Field(default_factory=list)
+    pending_promotion_revision_ids: list[str] = Field(
+        default_factory=list,
+        description="Candidate template revisions newer than adopted_revision_id that a human has not yet "
+        "adopted or rejected for this child -- the 'pending promotion decisions' ea49362c's own "
+        "acceptance notes name. Never auto-populated by silently adopting anything.",
     )
 
 

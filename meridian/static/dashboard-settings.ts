@@ -156,6 +156,13 @@ function _applySettingsRoleVisibility(projectId: any, guest: any) {
     `settings-account-danger-${projectId}`,     // export my data + danger zone
     `settings-notifications-card-${projectId}`, // ntfy / webhook / email
     `workspace-section-${projectId}`,           // workspace defaults + decisions/notes
+    // 3f4ba195 — the Tunnel Plugins card's "Reset to defaults"/"Add" actions
+    // carry an admin-only CSS class with no matching rule or JS toggle
+    // anywhere, so without this entry a guest role saw and could trigger
+    // them (PUT /tunnel/plugins requires only PERM_WRITE server-side, which
+    // a 'member' has). Hiding the whole card here is consistent with how
+    // every other admin-only card above is gated.
+    `tunnel-plugins-section-${projectId}`,      // tunnel plugin config
   ].forEach(id => { const el = document.getElementById(id); if (el) el.style.display = 'none'; });
   // Keep the team-members list visible (read-only), but drop the invite form.
   const inviteForm = document.getElementById(`settings-invite-form-${projectId}`);
@@ -2917,7 +2924,13 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
         // bf51b12e — context-refresh config. refresh_triggers is a list, or
         // null ⇒ the default set (all six triggers on).
         if (autoRefreshCb) autoRefreshCb.checked = !!s.auto_refresh_enabled;
-        if (refreshIntervalIn) refreshIntervalIn.value = s.refresh_interval_turns != null ? s.refresh_interval_turns : 10;
+        // 7855e580 — canonical workspace default is 50 turns, not 10. This
+        // fallback only ever renders while the /workspace/settings fetch is
+        // in flight or on a fetch failure — the effective persisted value
+        // still wins once loaded — but it must never show a value BELOW the
+        // deployment's actual floor, or a user who saves before the real
+        // value lands silently downgrades 50 -> 10.
+        if (refreshIntervalIn) refreshIntervalIn.value = s.refresh_interval_turns != null ? s.refresh_interval_turns : 50;
         const activeTriggers: string[] | null = Array.isArray(s.refresh_triggers) ? s.refresh_triggers : null;
         for (const t of REFRESH_TRIGGERS) {
           if (triggerCbs[t]) triggerCbs[t].checked = activeTriggers ? activeTriggers.includes(t) : true;
@@ -2939,7 +2952,7 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
         const nudgeVal = nudgeIn ? parseInt(nudgeIn.value, 10) : 5;
 
-        await api('/workspace/settings', {
+        const saved = await api('/workspace/settings', {
 
           method: 'PATCH',
 
@@ -2953,6 +2966,13 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
             log_task_sprint_nudge_threshold: isNaN(nudgeVal) ? 5 : Math.max(0, nudgeVal),
 
+            // 7855e580 — the HTTP PATCH route treats a blank/whitespace-only
+            // handoff_template the same as "field omitted" (no change), so an
+            // ordinary Save Defaults click can never silently erase the
+            // workspace's canonical non-empty template just because the
+            // textarea happened to render blank (e.g. the settings fetch
+            // hadn't resolved yet). Sending the trimmed value unconditionally
+            // is safe either way — see routes/workspace.py.
             handoff_template: (handoffTplIn && handoffTplIn.value.trim()) || '',
 
             // 0bf67524 — "" clears the default; a value seeds new projects.
@@ -2966,14 +2986,27 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
             // bf51b12e — planner context-refresh config.
             auto_refresh_enabled: !!(autoRefreshCb && autoRefreshCb.checked),
             refresh_interval_turns: (() => {
-              const raw = refreshIntervalIn ? parseInt(refreshIntervalIn.value, 10) : 10;
-              return isNaN(raw) ? 10 : Math.min(50, Math.max(1, raw));
+              // 7855e580 — canonical default is 50 (see the load-time fallback
+              // above); only hit when the input is missing/unparseable.
+              const raw = refreshIntervalIn ? parseInt(refreshIntervalIn.value, 10) : 50;
+              return isNaN(raw) ? 50 : Math.min(50, Math.max(1, raw));
             })(),
             refresh_triggers: REFRESH_TRIGGERS.filter(t => triggerCbs[t] && triggerCbs[t].checked),
 
           }),
 
         });
+
+        // 7855e580 — read back the PATCH response (the route returns the
+        // freshly re-fetched, persisted row, not an echo of what was sent)
+        // and reconcile the form against it, so the UI always reflects what
+        // actually landed in the DB rather than what the user happened to
+        // type — a save that got silently coerced/rejected on a field is
+        // visible immediately instead of only on the next tab switch.
+        if (saved && typeof saved === 'object') {
+          if (refreshIntervalIn) refreshIntervalIn.value = saved.refresh_interval_turns != null ? saved.refresh_interval_turns : 50;
+          if (handoffTplIn) handoffTplIn.value = saved.handoff_template || '';
+        }
 
         if (saveStatus) saveStatus.textContent = 'Saved.';
 

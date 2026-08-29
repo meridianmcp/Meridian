@@ -2491,8 +2491,16 @@
       // export my data + danger zone
       `settings-notifications-card-${projectId}`,
       // ntfy / webhook / email
-      `workspace-section-${projectId}`
+      `workspace-section-${projectId}`,
       // workspace defaults + decisions/notes
+      // 3f4ba195 — the Tunnel Plugins card's "Reset to defaults"/"Add" actions
+      // carry an admin-only CSS class with no matching rule or JS toggle
+      // anywhere, so without this entry a guest role saw and could trigger
+      // them (PUT /tunnel/plugins requires only PERM_WRITE server-side, which
+      // a 'member' has). Hiding the whole card here is consistent with how
+      // every other admin-only card above is gated.
+      `tunnel-plugins-section-${projectId}`
+      // tunnel plugin config
     ].forEach((id) => {
       const el2 = document.getElementById(id);
       if (el2) el2.style.display = "none";
@@ -4556,7 +4564,7 @@ project_id = "${displayPid}"`;
             if (codeIntelCb) codeIntelCb.checked = !!s3.code_intel_enabled_default;
             if (loopCb) loopCb.checked = s3.loop_enabled_default !== false;
             if (autoRefreshCb) autoRefreshCb.checked = !!s3.auto_refresh_enabled;
-            if (refreshIntervalIn) refreshIntervalIn.value = s3.refresh_interval_turns != null ? s3.refresh_interval_turns : 10;
+            if (refreshIntervalIn) refreshIntervalIn.value = s3.refresh_interval_turns != null ? s3.refresh_interval_turns : 50;
             const activeTriggers = Array.isArray(s3.refresh_triggers) ? s3.refresh_triggers : null;
             for (const t3 of REFRESH_TRIGGERS) {
               if (triggerCbs[t3]) triggerCbs[t3].checked = activeTriggers ? activeTriggers.includes(t3) : true;
@@ -4569,13 +4577,20 @@ project_id = "${displayPid}"`;
           saveBtn.disabled = true;
           try {
             const nudgeVal = nudgeIn ? parseInt(nudgeIn.value, 10) : 5;
-            await api("/workspace/settings", {
+            const saved = await api("/workspace/settings", {
               method: "PATCH",
               body: JSON.stringify({
                 hitl_auto_answer_default: !!(hitlCb && hitlCb.checked),
                 sprint_name_default: sprintIn && sprintIn.value.trim() || "",
                 display_name: displayIn && displayIn.value.trim() || "",
                 log_task_sprint_nudge_threshold: isNaN(nudgeVal) ? 5 : Math.max(0, nudgeVal),
+                // 7855e580 — the HTTP PATCH route treats a blank/whitespace-only
+                // handoff_template the same as "field omitted" (no change), so an
+                // ordinary Save Defaults click can never silently erase the
+                // workspace's canonical non-empty template just because the
+                // textarea happened to render blank (e.g. the settings fetch
+                // hadn't resolved yet). Sending the trimmed value unconditionally
+                // is safe either way — see routes/workspace.py.
                 handoff_template: handoffTplIn && handoffTplIn.value.trim() || "",
                 // 0bf67524 — "" clears the default; a value seeds new projects.
                 execution_mode_default: execModeIn ? execModeIn.value : "",
@@ -4585,12 +4600,16 @@ project_id = "${displayPid}"`;
                 // bf51b12e — planner context-refresh config.
                 auto_refresh_enabled: !!(autoRefreshCb && autoRefreshCb.checked),
                 refresh_interval_turns: (() => {
-                  const raw = refreshIntervalIn ? parseInt(refreshIntervalIn.value, 10) : 10;
-                  return isNaN(raw) ? 10 : Math.min(50, Math.max(1, raw));
+                  const raw = refreshIntervalIn ? parseInt(refreshIntervalIn.value, 10) : 50;
+                  return isNaN(raw) ? 50 : Math.min(50, Math.max(1, raw));
                 })(),
                 refresh_triggers: REFRESH_TRIGGERS.filter((t3) => triggerCbs[t3] && triggerCbs[t3].checked)
               })
             });
+            if (saved && typeof saved === "object") {
+              if (refreshIntervalIn) refreshIntervalIn.value = saved.refresh_interval_turns != null ? saved.refresh_interval_turns : 50;
+              if (handoffTplIn) handoffTplIn.value = saved.handoff_template || "";
+            }
             if (saveStatus) saveStatus.textContent = "Saved.";
             setTimeout(() => {
               if (saveStatus) saveStatus.textContent = "";
@@ -11751,6 +11770,8 @@ Current: ${current || "(none)"}`,
 
               <span id="goal-ns-lock-${project.id}" style="opacity:0.5;font-size:11px"></span>
 
+              <span id="goal-ns-inherited-${project.id}" style="display:none;opacity:0.75;font-size:11px;color:var(--accent)" title=""></span>
+
             </div>
 
           </div>
@@ -16041,6 +16062,21 @@ get_context_block(project_id="${PROJECT_QUOTE}", mode="full")`;
       p3._serverSprint = goal.sprint || "";
       const nsLock = document.getElementById(`goal-ns-lock-${projectId}`);
       if (nsLock) nsLock.textContent = goal.north_star ? "locked" : "unlocked";
+      const nsInherited = document.getElementById(`goal-ns-inherited-${projectId}`);
+      if (nsInherited) {
+        if (goal.north_star_inherited && goal.north_star_source_project_id) {
+          const sourceProj = (state.projects || []).find(
+            (pr) => pr.id === goal.north_star_source_project_id
+          );
+          const sourceName = sourceProj ? sourceProj.name : "parent project";
+          nsInherited.textContent = `\u2B06 inherited from "${sourceName}"`;
+          nsInherited.title = "This north star is borrowed from the parent project \u2014 set one on this project to override it.";
+          nsInherited.style.display = "";
+        } else {
+          nsInherited.textContent = "";
+          nsInherited.style.display = "none";
+        }
+      }
       p3._lastSaved = text;
       if (nsTA) {
         nsTA.classList.remove("dirty");

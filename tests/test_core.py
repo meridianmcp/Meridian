@@ -361,6 +361,34 @@ async def test_handoff_custom_template(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_handoff_template_rejects_oversized_value(db):
+    """47ac68a0 — every block a custom handoff_template interpolates is
+    already bounded at RENDER time (recent_tasks[:10], decisions[:10], etc.),
+    but the raw template string itself had no bound at WRITE time: an
+    arbitrarily large template was persisted unbounded and re-rendered
+    unbounded into every full-mode handoff (generate_handoff's own on-disk
+    file write / handoffs table / pending_goal persistence are explicitly
+    NOT covered by format_handoff_mcp_content's wire-level max_bytes
+    budget). update_workspace_settings must now reject an oversized template
+    outright rather than silently persisting it."""
+    too_big = "x" * (db_module._HANDOFF_TEMPLATE_MAX_CHARS + 1)
+    with pytest.raises(ValueError):
+        await db_module.update_workspace_settings(db, handoff_template=too_big)
+    # Rejected write must not have persisted anything.
+    assert (await db_module.get_workspace_settings(db))["handoff_template"] is None
+
+    # A template right at the boundary is accepted unchanged.
+    at_limit = "y" * db_module._HANDOFF_TEMPLATE_MAX_CHARS
+    await db_module.update_workspace_settings(db, handoff_template=at_limit)
+    assert (await db_module.get_workspace_settings(db))["handoff_template"] == at_limit
+
+    # Clean up so this test doesn't leak a global (singleton) template into
+    # whichever test runs next in the same DB.
+    await db_module.update_workspace_settings(db, handoff_template="")
+    assert (await db_module.get_workspace_settings(db))["handoff_template"] is None
+
+
+@pytest.mark.asyncio
 async def test_handoff_lists_pending_sprint_items_in_dependency_order(db, tmp_path):
     p = await db_module.create_project(db, "alpha-queue")
     await db_module.set_goal(db, p["id"], "ship the queue")
@@ -5215,6 +5243,137 @@ def test_workspace_settings_partial_patch_preserves_other_field(client):
     assert final["sprint_name_default"] == "keep-me"
 
 
+# ---------------------------------------------------------------------------
+# 7855e580 — Workspace Save Defaults: 50-turn refresh floor + non-empty
+# handoff_template can never be silently erased by an ordinary Save click.
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_settings_patch_readback_exact_values(client):
+    """A straightforward read-back: PATCH persists exactly what was submitted,
+    and a fresh GET returns those same values (not a stale/rounded copy)."""
+    template = "# Custom Handoff\nGoal: {{version_goal}}"
+    patched = client.patch(
+        "/workspace/settings",
+        json={
+            "refresh_interval_turns": 50,
+            "auto_refresh_enabled": True,
+            "handoff_template": template,
+        },
+    ).json()
+    assert patched["refresh_interval_turns"] == 50
+    assert patched["auto_refresh_enabled"] is True
+    assert patched["handoff_template"] == template
+    again = client.get("/workspace/settings").json()
+    assert again["refresh_interval_turns"] == 50
+    assert again["auto_refresh_enabled"] is True
+    assert again["handoff_template"] == template
+
+
+def test_workspace_settings_blank_handoff_template_does_not_erase_default(client):
+    """P0 (7855e580): an ordinary Save Defaults click that submits a blank
+    handoff_template — e.g. because the textarea hadn't finished loading the
+    real value yet — must never silently erase the workspace's canonical
+    non-empty template. PATCH /workspace/settings treats a blank/whitespace
+    string the same as the field being omitted (no change), distinct from the
+    MCP update_workspace_settings tool's direct db-layer call, which still
+    honors an explicit "" as a real clear (see test_handoff_custom_template)."""
+    template = "# Custom Handoff\nGoal: {{version_goal}}"
+    seeded = client.patch(
+        "/workspace/settings",
+        json={"handoff_template": template, "refresh_interval_turns": 50},
+    ).json()
+    assert seeded["handoff_template"] == template
+
+    # Ordinary Save Defaults click with the template field blank (and other
+    # fields present, mirroring a real form submit) must preserve it.
+    resaved = client.patch(
+        "/workspace/settings",
+        json={
+            "handoff_template": "",
+            "hitl_auto_answer_default": True,
+            "refresh_interval_turns": 50,
+        },
+    ).json()
+    assert resaved["handoff_template"] == template
+    assert resaved["hitl_auto_answer_default"] is True
+
+    # A whitespace-only value is treated the same way as an empty string.
+    resaved2 = client.patch(
+        "/workspace/settings", json={"handoff_template": "   "},
+    ).json()
+    assert resaved2["handoff_template"] == template
+
+    final = client.get("/workspace/settings").json()
+    assert final["handoff_template"] == template
+    assert final["refresh_interval_turns"] == 50
+
+
+def test_workspace_settings_refresh_interval_default_is_50_when_present(client):
+    """Round-trip contract for the canonical 50-turn refresh default: once the
+    workspace row has refresh_interval_turns=50 set (as this deployment's row
+    already does per the 7855e580 handoff), it must read back as 50 exactly —
+    the UI's corrected fallback (10 -> 50) must never appear to *downgrade*
+    an already-persisted 50 on save."""
+    client.patch("/workspace/settings", json={"refresh_interval_turns": 50})
+    # A save that omits refresh_interval_turns entirely (field untouched)
+    # must not reset it back down.
+    client.patch("/workspace/settings", json={"sprint_name_default": "untouched-probe"})
+    final = client.get("/workspace/settings").json()
+    assert final["refresh_interval_turns"] == 50
+    assert final["sprint_name_default"] == "untouched-probe"
+
+
+def test_dashboard_settings_ts_refresh_interval_ui_fallback_is_50():
+    """Contract test for the served UI default (7855e580): the dashboard's
+    Workspace Save Defaults form must never fall back to the stale 10-turn
+    value — neither when first rendering the refresh-interval input before
+    the /workspace/settings fetch resolves, nor in the save handler's own
+    parse-fallback for an unreadable input value. Asserted directly against
+    the TypeScript source (not just the compiled bundle) so a future edit to
+    either fallback trips this test immediately, independent of a rebuild."""
+    ts_path = (
+        Path(__file__).parent.parent / "meridian" / "static" / "dashboard-settings.ts"
+    )
+    src = ts_path.read_text(encoding="utf-8")
+
+    load_fallback = (
+        "refreshIntervalIn.value = s.refresh_interval_turns != null "
+        "? s.refresh_interval_turns : 50;"
+    )
+    assert load_fallback in src, (
+        "expected the load-time refresh-interval fallback to render 50, not 10"
+    )
+    assert "s.refresh_interval_turns != null ? s.refresh_interval_turns : 10" not in src
+
+    save_fallback = (
+        "const raw = refreshIntervalIn ? parseInt(refreshIntervalIn.value, 10) : 50;"
+    )
+    assert save_fallback in src, (
+        "expected the save-handler parse fallback to default to 50, not 10"
+    )
+    assert "return isNaN(raw) ? 50 : Math.min(50, Math.max(1, raw));" in src
+    assert "return isNaN(raw) ? 10 : Math.min(50, Math.max(1, raw));" not in src
+
+
+def test_dashboard_bundle_js_refresh_interval_fallback_matches_source():
+    """The SERVED bundle (dashboard.bundle.js) must be rebuilt from the fixed
+    source, not just the .ts file — a stale bundle would ship the old 10-turn
+    fallback to real users regardless of what the source says (7855e580)."""
+    bundle_path = (
+        Path(__file__).parent.parent / "meridian" / "static" / "dashboard.bundle.js"
+    )
+    src = bundle_path.read_text(encoding="utf-8")
+    assert "refresh_interval_turns != null ? " in src
+    # esbuild renames the destructured settings variable (e.g. s3) but leaves
+    # the fallback literal alone; match on the literal rather than the name.
+    assert " : 50;" in src
+    idx = src.index("refresh_interval_turns != null ? ")
+    window = src[idx: idx + 200]
+    assert ": 50;" in window
+    assert ": 10;" not in window
+
+
 @pytest.mark.asyncio
 async def test_workspace_settings_db_defaults(db):
     """get_workspace_settings returns a usable dict even with no row written."""
@@ -6043,14 +6202,24 @@ def test_build_quick_start_goal_parallel_batches():
 
 def test_build_quick_start_goal_leftover_shows_real_external_blocker():
     """a1996fbf — a leftover item whose real depends_on is a DIFFERENT item
-    that never appears in this goal's item list must render the real
-    depends_on id + blocked_by_status explicitly, instead of the generic
-    "once their dependencies clear" phrase. That generic phrasing implies the
-    blocker is just in-goal batch order, which is misleading (and unsafe: an
+    that never appears in this goal's item list must never be presented as
+    merely waiting on in-goal batch order (misleading, and unsafe: an
     executor could be misled into attempting a change that's genuinely not
     safe yet) when the true blocker is a completely separate, unlisted item.
-    get_parallelizable_groups already resolves this via its "blocked" list —
-    this test pins that the goal text actually surfaces it."""
+    get_parallelizable_groups already resolves this via its "blocked" list.
+
+    83a7586d — superseded the original inline "blocked on b75c4160 (status:
+    pending)" free-text framing this test used to pin: a genuinely-external
+    blocker (not part of this goal's own item list at all) is now
+    hard-excluded via the structured, machine-readable
+    ``<excluded_dependency_not_satisfied>`` tag BEFORE the leftover/macro-wave
+    rendering below ever runs — a strictly stronger version of the same
+    underlying guarantee this test's docstring describes (the item can no
+    longer even reach the claimable batch, not just get relabeled within
+    it). See test_83a7586d_dependency_frontier.py for the fan-in/dependency-
+    closure coverage (an item KEPT because its blocker IS in the same batch
+    still gets the original in-batch "once their dependencies clear"
+    phrasing, unaffected by this)."""
     from meridian import handoff as h
     items = [
         {"id": "cd9c2bf7", "version": None},
@@ -6074,8 +6243,10 @@ def test_build_quick_start_goal_leftover_shows_real_external_blocker():
     }
     goal = h._build_quick_start_goal(items, parallel_groups=groups)
     assert "cd9c2bf7" in goal
-    assert "blocked on b75c4160" in goal
-    assert "status: pending" in goal
+    assert (
+        '<excluded_dependency_not_satisfied count="1">cd9c2bf7'
+        "</excluded_dependency_not_satisfied>" in goal
+    )
     # Must NOT present this as merely waiting on in-goal batch order.
     assert "once their dependencies clear: cd9c2bf7" not in goal
 
@@ -7442,6 +7613,67 @@ def test_delete_project_in_progress_guard(client):
     assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
 
 
+def test_batch_delete_projects_requires_settings_perm_not_write(client, monkeypatch):
+    """3f4ba195 — DELETE /projects (batch form) must require PERM_SETTINGS,
+    the same as its singular sibling DELETE /projects/{project_id}.
+
+    Regression coverage for an authorization-bypass: ``_required_perm_for_request``
+    (meridian/_deps.py) only maps whole-project deletion to PERM_SETTINGS via a
+    ``path.startswith("/projects/")`` check, which the bare ``/projects`` path
+    this batch route answers on never satisfies — it silently fell through to
+    the PERM_WRITE default. That let a cross-workspace 'member' (who has
+    PERM_WRITE but not PERM_SETTINGS) delete another owner's project through
+    the batch endpoint, even though the identical action via the singular
+    endpoint has always been correctly owner/admin-gated.
+    """
+    import asyncio
+    from datetime import datetime, timezone
+
+    monkeypatch.setenv("MERIDIAN_HOSTED", "true")
+    # Defensively blank a real Neon admin URL a dev .env might supply — the
+    # owner tenant below is 'admin' plan specifically so the cross-workspace
+    # DB switch resolves back to this same in-memory test DB instead.
+    monkeypatch.setenv("MERIDIAN_AUTH_DB", "")
+
+    db = client.app.state.db
+
+    async def _setup():
+        owner = await db_module.upsert_tenant(db, "batchdel-owner@example.com")
+        await db.execute("UPDATE tenants SET plan='admin' WHERE id=?", (owner["id"],))
+        member = await db_module.upsert_tenant(db, "batchdel-member@example.com")
+        raw, _ = await db_module.create_api_token(db, member["id"])
+        proj = await db_module.create_project(db, "batchdel-owner-proj")
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        await db.execute(
+            "INSERT INTO workspace_members "
+            "(id, tenant_id, email, role, github_access, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("batchdel-wm", owner["id"], "batchdel-member@example.com",
+             "member", "read", now),
+        )
+        await db.commit()
+        return owner["id"], raw, proj["id"]
+
+    owner_id, member_token, pid = asyncio.run(_setup())
+    hdr = {"Authorization": f"Bearer {member_token}", "X-Workspace-Tenant-Id": owner_id}
+
+    # A 'member' has PERM_WRITE but not PERM_SETTINGS — the batch delete
+    # of the owner's project must be rejected.
+    r = client.delete("/projects", params={"project_id": [pid]}, headers=hdr)
+    assert r.status_code == 403, f"expected 403, got {r.status_code}: {r.text}"
+    assert "settings" in r.text.lower()
+
+    # The project must survive the rejected attempt.
+    assert client.get(f"/projects/{pid}").status_code == 200
+
+    # Sanity: the batch endpoint still works normally for a same-workspace /
+    # self-hosted caller (no cross-workspace header → no gate, per
+    # _enforcement_context's own no-header fast path).
+    r2 = client.delete("/projects", params={"project_id": [pid]})
+    assert r2.status_code == 200, r2.text
+    assert client.get(f"/projects/{pid}").status_code == 404
+
+
 def test_dashboard_js_has_project_mgmt(client):
     """dashboard.js has rename/delete helpers and kebab menu logic."""
     js = dashboard_source()
@@ -7449,6 +7681,38 @@ def test_dashboard_js_has_project_mgmt(client):
     assert "_deleteProject" in js
     assert "_openTabMenu" in js
     assert "project_renamed" in js
+
+
+def test_settings_role_visibility_hides_tunnel_plugins_card_for_guests():
+    """3f4ba195 — _applySettingsRoleVisibility's guest hide-list must include
+    the Tunnel Plugins card container.
+
+    Regression coverage for a UI-honesty gap: the "Reset to defaults"/"Add"
+    buttons in the Tunnel Plugins card (dashboard-plugins.ts) carry an
+    admin-only CSS class with no matching stylesheet rule and no JS toggle
+    anywhere in the dashboard, so a 'member'/'viewer' role previously saw
+    and could click them even though only owner/admin should — and could
+    successfully execute a tenant-wide tunnel-config reset (PUT
+    /tunnel/plugins only requires PERM_WRITE server-side, which a member
+    has). Every other admin-only settings card is hidden wholesale for
+    guests via this same id list; the Tunnel Plugins card's container id
+    was simply missing from it.
+    """
+    js = dashboard_source()
+    start = js.index("function _applySettingsRoleVisibility")
+    end = js.index("\n}", start)
+    body = js[start:end]
+    assert "tunnel-plugins-section-${projectId}" in body, (
+        "tunnel-plugins-section-${projectId} must be in the "
+        "_applySettingsRoleVisibility hide-list"
+    )
+    # It must be part of the same hidden-id array as the other admin-only
+    # cards, not merely present somewhere else in the function body.
+    hide_list_start = body.index("[")
+    hide_list_end = body.index("].forEach")
+    hide_list = body[hide_list_start:hide_list_end]
+    assert "tunnel-plugins-section-${projectId}" in hide_list
+    assert "settings-account-danger-${projectId}" in hide_list
 
 
 def test_pg_create_tables_has_sprint_item_group_columns():
@@ -7738,6 +8002,56 @@ async def test_context_block_and_planning_brief_show_inherited_north_star(db):
     # shared source dict carries the inherited value.
     assert goal["north_star"] == "Inherited brief star"
     assert goal["north_star_inherited"] is True
+
+
+def test_goal_route_surfaces_north_star_inheritance_over_http(client):
+    """P0 VERIFY (106519eb) — regression test for a real gap found while
+    auditing the 'Make subproject of' feature: db.get_goal computes
+    north_star_inherited / north_star_source_project_id (3b6ff466), but the
+    GET /projects/{id}/goal route's response_model=GoalState previously did
+    not declare those two fields, so FastAPI's response_model validation
+    silently stripped them before the JSON reached any HTTP caller (the
+    dashboard included). Every prior inheritance test asserted directly
+    against db_module.get_goal and so never exercised this route, which is
+    exactly how the gap went unnoticed. This test goes over HTTP end to end.
+    """
+    parent = client.post("/projects", json={"name": "http-ns-parent"}).json()
+    client.post(
+        f"/projects/{parent['id']}/goal",
+        json={"content": "pg", "north_star": "HTTP inherited star"},
+    )
+    child = client.post(
+        "/projects",
+        json={"name": "http-ns-child", "parent_project_id": parent["id"]},
+    ).json()
+    client.post(f"/projects/{child['id']}/goal", json={"content": "cg"})
+
+    r = client.get(f"/projects/{child['id']}/goal")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["north_star"] == "HTTP inherited star"
+    # The whole point: the response must let a caller tell an inherited value
+    # apart from an explicit one, and name the source project.
+    assert body["north_star_inherited"] is True
+    assert body["north_star_source_project_id"] == parent["id"]
+
+    # Once the child sets its own north_star, it must stop being flagged
+    # inherited over the same HTTP path.
+    client.post(
+        f"/projects/{child['id']}/goal",
+        json={"content": "cg2", "north_star": "Child's own HTTP star"},
+    )
+    r2 = client.get(f"/projects/{child['id']}/goal")
+    body2 = r2.json()
+    assert body2["north_star"] == "Child's own HTTP star"
+    assert body2["north_star_inherited"] is False
+    assert body2["north_star_source_project_id"] is None
+
+    # A top-level project (no parent) must not carry a stray inherited flag.
+    r3 = client.get(f"/projects/{parent['id']}/goal")
+    body3 = r3.json()
+    assert body3["north_star_inherited"] is False
+    assert body3["north_star_source_project_id"] is None
 
 
 def test_migrate_project_parent_id_survives_pre_column_projects_table():

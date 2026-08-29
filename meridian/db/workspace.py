@@ -1905,6 +1905,24 @@ _WORKSPACE_SETTINGS_ID = "singleton"
 # .claude/hooks/ via the existing custom_hooks (273287cb) infra.
 _VALID_CLAIM_VERIFICATION_MODES: frozenset[str] = frozenset({"off", "advisory", "strict"})
 
+# 47ac68a0 — cap on the raw handoff_template value at WRITE time. Every
+# block it interpolates at render time is already individually bounded
+# (recent_tasks[:10], decisions[:10], pending_items[:30], notes[:10] — see
+# handoff._render_custom_handoff), but the template string itself had no
+# length bound anywhere on the write path (this function and the
+# /workspace/settings PATCH route both did only `.strip() or None`). An
+# arbitrarily large template was therefore persisted unbounded to
+# workspace_settings and re-rendered unbounded into every full-mode
+# handoff's `content` — format_handoff_mcp_content's wire-level max_bytes
+# budget still caps what MCP itself returns, but generate_handoff's on-disk
+# file write and the handoffs table/pending_goal persistence are explicitly
+# NEVER bounded by that budget (see generate_handoff's own docstring), so an
+# oversized template was stored and re-served unbounded outside the wire
+# layer. 50_000 chars is generous for a genuine custom template (the
+# rendered full-mode default handoff itself typically runs well under this)
+# while still ruling out unbounded growth.
+_HANDOFF_TEMPLATE_MAX_CHARS = 50_000
+
 
 def _ws_settings_key(tenant_id: str | None) -> str:
     """Row key for the workspace_settings singleton.
@@ -2074,6 +2092,16 @@ async def update_workspace_settings(
     clears the execution-mode default (new projects revert to their own default);
     ``code_intel_enabled_default`` accepts a bool/0/1 or the string ``""`` to clear.
 
+    ``handoff_template`` (7855e580; length bound 47ac68a0) — ``""``/whitespace-
+    only clears the custom template (reverts to the server default full-mode
+    render). Raises ``ValueError`` when the stripped value exceeds
+    :data:`_HANDOFF_TEMPLATE_MAX_CHARS` — every block it interpolates
+    (recent_tasks, decisions, pending_items, notes) is already bounded at
+    render time, but the raw template itself previously had no bound at
+    write time, so an oversized template could be persisted and re-rendered
+    unbounded into every handoff (see :data:`_HANDOFF_TEMPLATE_MAX_CHARS`'s
+    own comment for the full incident).
+
     ``claim_verification_mode`` (4ef6ce5e) — ``"off"`` / ``"advisory"`` /
     ``"strict"``, case-insensitive; ``""`` clears back to the default
     (``"off"``). Unlike ``manual_issue_screening_enabled``, this is a PLAIN
@@ -2118,9 +2146,18 @@ async def update_workspace_settings(
         updates.append("log_task_sprint_nudge_threshold = ?")
         params.append(max(0, int(log_task_sprint_nudge_threshold)))
     if handoff_template is not None:
-        updates.append("handoff_template = ?")
         # Empty string clears the custom template (reverts to server default).
-        params.append(handoff_template.strip() or None)
+        _template = handoff_template.strip() or None
+        # 47ac68a0 — bound the raw template at write time; see
+        # _HANDOFF_TEMPLATE_MAX_CHARS above for why this is needed even
+        # though every block it interpolates is separately bounded already.
+        if _template is not None and len(_template) > _HANDOFF_TEMPLATE_MAX_CHARS:
+            raise ValueError(
+                f"handoff_template must be at most {_HANDOFF_TEMPLATE_MAX_CHARS} "
+                f"characters, got {len(_template)}"
+            )
+        updates.append("handoff_template = ?")
+        params.append(_template)
     if execution_mode_default is not None:
         updates.append("execution_mode_default = ?")
         # Empty string clears the default; otherwise normalize to a valid posture.

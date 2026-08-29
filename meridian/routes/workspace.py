@@ -152,18 +152,32 @@ async def get_workspace_settings_endpoint(request: Request) -> dict[str, Any]:
 async def update_workspace_settings_endpoint(
     body: dict[str, Any], request: Request
 ) -> dict[str, Any]:
-    """Patch workspace-global defaults. Only the fields passed are changed."""
+    """Patch workspace-global defaults. Only the fields passed are changed.
+
+    handoff_template (7855e580): a blank/whitespace-only value here is treated
+    as "field left untouched," never as an explicit clear-to-server-default.
+    This dashboard endpoint is the one an ordinary Save Defaults click hits —
+    e.g. while the settings form's own GET is still in flight, its template
+    textarea renders empty — and that must never be able to silently wipe out
+    a workspace's real, already-configured non-empty handoff_template. A
+    genuine explicit clear (empty string forwarded verbatim) is still
+    available through the MCP update_workspace_settings tool, which calls
+    db.update_workspace_settings directly and does not go through this route.
+    """
     nudge_thresh = body.get("log_task_sprint_nudge_threshold")
     interval = body.get("refresh_interval_turns")
     trigger_min_interval = body.get("refresh_trigger_min_interval")
     asw_mins = body.get("active_session_warning_minutes")
+    handoff_template = body.get("handoff_template")
+    if handoff_template is not None and not handoff_template.strip():
+        handoff_template = None
     return await db_module.update_workspace_settings(
         await _db(request),
         hitl_auto_answer_default=body.get("hitl_auto_answer_default"),
         sprint_name_default=body.get("sprint_name_default"),
         display_name=body.get("display_name"),
         log_task_sprint_nudge_threshold=int(nudge_thresh) if nudge_thresh is not None else None,
-        handoff_template=body.get("handoff_template"),
+        handoff_template=handoff_template,
         # 0bf67524 — cascade defaults seeded onto new projects.
         execution_mode_default=body.get("execution_mode_default"),
         code_intel_enabled_default=body.get("code_intel_enabled_default"),
