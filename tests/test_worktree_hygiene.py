@@ -11,6 +11,7 @@ import pytest
 from meridian.worktree_hygiene import (
     DEFAULT_PROTECTED_PATTERNS,
     WorktreeRecord,
+    inspect_orphan_directories,
     _validate_archive_root,
     apply_cleanup,
     build_cleanup_plan,
@@ -114,6 +115,34 @@ def test_archive_root_must_be_outside_repo(tmp_path: Path) -> None:
 def test_record_serialization_is_json_safe() -> None:
     record = _record("C:/clean")
     assert json.loads(json.dumps(record.to_dict()))["path"] == "C:/clean"
+
+
+def test_orphan_discovery_skips_registered_children(tmp_path: Path) -> None:
+    root = tmp_path / "scratch"
+    root.mkdir()
+    registered = root / "registered"
+    registered.mkdir()
+    orphan = root / "orphan"
+    orphan.mkdir()
+    (orphan / "result.txt").write_text("result\n", encoding="utf-8")
+
+    found = inspect_orphan_directories([root], known_paths=[registered])
+
+    assert [item.path for item in found] == [str(orphan.resolve())]
+    assert found[0].file_count == 1
+    assert found[0].size_bytes == (orphan / "result.txt").stat().st_size
+
+
+def test_orphan_plan_requires_explicit_ack_for_nonempty_directory(tmp_path: Path) -> None:
+    orphan = tmp_path / "orphan"
+    orphan.mkdir()
+    (orphan / "result.txt").write_text("result\n", encoding="utf-8")
+    record = inspect_orphan_directories([tmp_path])[0]
+
+    plan = build_cleanup_plan([], orphan_directories=[record])
+
+    assert plan["safe_orphan_removable_count"] == 0
+    assert plan["orphan_nonempty"][0]["path"] == str(orphan.resolve())
 
 
 def test_apply_archives_dirty_tree_removes_registration_and_keeps_branch(

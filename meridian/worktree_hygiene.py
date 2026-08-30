@@ -18,6 +18,8 @@ Usage::
         --archive-dir E:/MeridianData/worktree-quarantine
     python -m meridian.worktree_hygiene --repo-root . --apply \
         --archive-dir E:/MeridianData/worktree-quarantine --allow-dirty
+    python -m meridian.worktree_hygiene --repo-root . --orphan-root \
+        C:/Users/me/.codex/worktrees --json
 """
 
 from __future__ import annotations
@@ -52,6 +54,22 @@ class WorktreeRecord:
     exists: bool
     dirty_count: int
     locked: bool
+    protected: bool
+    protected_reason: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class OrphanDirectoryRecord:
+    """A directory under an operator-supplied worktree scratch root."""
+
+    path: str
+    root: str
+    exists: bool
+    file_count: int
+    size_bytes: int
     protected: bool
     protected_reason: str | None = None
 
@@ -159,10 +177,54 @@ def inspect_worktrees(
     return records
 
 
+def inspect_orphan_directories(
+    roots: Iterable[str | Path],
+    *,
+    known_paths: Iterable[str] = (),
+    protected_patterns: Sequence[str] = DEFAULT_PROTECTED_PATTERNS,
+) -> list[OrphanDirectoryRecord]:
+    """Find unregistered child directories under explicitly named roots.
+
+    ``roots`` is intentionally caller-supplied.  A local `.codex/worktrees`
+    directory can contain another repository's scratch state, so Meridian
+    must not infer that every app-level scratch directory belongs to this
+    repository.  Registered paths are excluded even if their names do not
+    match a protected pattern.
+    """
+
+    known = {str(Path(path).resolve()) for path in known_paths}
+    found: list[OrphanDirectoryRecord] = []
+    for raw_root in roots:
+        root = Path(raw_root).resolve()
+        if not root.is_dir():
+            continue
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            path = child.resolve()
+            if str(path) in known:
+                continue
+            files = [item for item in path.rglob("*") if item.is_file()]
+            reason = _protected_reason(str(path), None, protected_patterns)
+            found.append(
+                OrphanDirectoryRecord(
+                    path=str(path),
+                    root=str(root),
+                    exists=True,
+                    file_count=len(files),
+                    size_bytes=sum(item.stat().st_size for item in files),
+                    protected=reason is not None,
+                    protected_reason=reason,
+                )
+            )
+    return found
+
+
 def build_cleanup_plan(
     records: Sequence[WorktreeRecord],
     *,
     keep_paths: Iterable[str] = (),
+    orphan_directories: Sequence[OrphanDirectoryRecord] = (),
 ) -> dict[str, Any]:
     """Classify records without changing disk state.
 
@@ -178,6 +240,9 @@ def build_cleanup_plan(
     missing: list[dict[str, Any]] = []
     dirty: list[dict[str, Any]] = []
     removable: list[dict[str, Any]] = []
+    orphan_protected: list[dict[str, Any]] = []
+    orphan_empty: list[dict[str, Any]] = []
+    orphan_nonempty: list[dict[str, Any]] = []
 
     for record in records:
         item = record.to_dict()
@@ -193,6 +258,16 @@ def build_cleanup_plan(
         else:
             removable.append(item)
 
+    for orphan in orphan_directories:
+        item = orphan.to_dict()
+        if orphan.protected or orphan.path in keep:
+            item["keep_reason"] = orphan.protected_reason or "explicit keep path"
+            orphan_protected.append(item)
+        elif orphan.file_count:
+            orphan_nonempty.append(item)
+        else:
+            orphan_empty.append(item)
+
     return {
         "total": len(records),
         "root": root,
@@ -203,6 +278,11 @@ def build_cleanup_plan(
         "removable": removable,
         "safe_removable_count": len(removable),
         "dirty_candidate_count": len(dirty),
+        "orphan_total": len(orphan_directories),
+        "orphan_protected": orphan_protected,
+        "orphan_empty": orphan_empty,
+        "orphan_nonempty": orphan_nonempty,
+        "safe_orphan_removable_count": len(orphan_empty),
     }
 
 
@@ -250,6 +330,26 @@ def archive_worktree_snapshot(
     return destination
 
 
+def archive_orphan_snapshot(
+    orphan: OrphanDirectoryRecord,
+    archive_root: Path,
+    *,
+    archive_name: str,
+) -> Path:
+    """Archive an unregistered scratch directory before removing it."""
+
+    destination = archive_root / "orphans" / archive_name
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "metadata.json").write_text(
+        json.dumps(orphan.to_dict(), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    source = Path(orphan.path)
+    if source.exists() and orphan.file_count:
+        shutil.copytree(source, destination / "files", dirs_exist_ok=True)
+    return destination
+
+
 def _validate_archive_root(repo_root: Path, archive_root: Path) -> Path:
     repo_root = repo_root.resolve()
     archive_root = archive_root.resolve()
@@ -269,12 +369,16 @@ def apply_cleanup(
     archive_root: Path,
     keep_paths: Iterable[str] = (),
     allow_dirty: bool = False,
+    orphan_directories: Sequence[OrphanDirectoryRecord] = (),
+    allow_orphans: bool = False,
 ) -> dict[str, Any]:
     """Archive and remove the current plan; never delete branch refs."""
 
     repo_root = repo_root.resolve()
     archive_root = _validate_archive_root(repo_root, archive_root)
-    plan = build_cleanup_plan(records, keep_paths=keep_paths)
+    plan = build_cleanup_plan(
+        records, keep_paths=keep_paths, orphan_directories=orphan_directories
+    )
     archive_root.mkdir(parents=True, exist_ok=True)
     removed: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -308,6 +412,43 @@ def apply_cleanup(
                 }
             )
 
+    orphan_skipped = [
+        {**item, "reason": "non-empty orphan; rerun with --allow-orphans"}
+        for item in plan["orphan_nonempty"]
+        if not allow_orphans
+    ]
+    orphan_candidates = list(plan["orphan_empty"])
+    if allow_orphans:
+        orphan_candidates.extend(plan["orphan_nonempty"])
+    orphan_removed: list[dict[str, Any]] = []
+    for index, item in enumerate(
+        sorted(orphan_candidates, key=lambda value: len(value["path"]), reverse=True),
+        start=1,
+    ):
+        orphan = OrphanDirectoryRecord(
+            **{key: item[key] for key in OrphanDirectoryRecord.__dataclass_fields__}
+        )
+        archive_orphan_snapshot(
+            orphan,
+            archive_root,
+            archive_name=f"{index:04d}-{re.sub(r'[^A-Za-z0-9._-]+', '_', orphan.path).strip('_')}",
+        )
+        source = Path(orphan.path)
+        try:
+            if orphan.file_count:
+                shutil.rmtree(source)
+            else:
+                source.rmdir()
+        except OSError as exc:
+            orphan_skipped.append({**item, "reason": str(exc)})
+        else:
+            if not source.exists():
+                orphan_removed.append({"path": orphan.path, "root": orphan.root})
+            else:
+                orphan_skipped.append({**item, "reason": "directory still exists"})
+
+    skipped.extend(orphan_skipped)
+
     prune = _run_git(repo_root, ["worktree", "prune"])
     return {
         "archive_root": str(archive_root),
@@ -315,6 +456,8 @@ def apply_cleanup(
         "skipped": skipped,
         "removed_count": len(removed),
         "skipped_count": len(skipped),
+        "orphan_removed": orphan_removed,
+        "orphan_removed_count": len(orphan_removed),
         "prune_returncode": prune.returncode,
     }
 
@@ -338,6 +481,17 @@ def _parser() -> argparse.ArgumentParser:
         "--keep-path", action="append", default=[], help="Additional path to retain"
     )
     parser.add_argument(
+        "--orphan-root",
+        action="append",
+        default=[],
+        help="Explicit scratch root whose unregistered child directories should be inventoried",
+    )
+    parser.add_argument(
+        "--allow-orphans",
+        action="store_true",
+        help="Allow archived unregistered scratch directories to be removed",
+    )
+    parser.add_argument(
         "--protect-pattern",
         action="append",
         default=[],
@@ -351,13 +505,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.allow_dirty and not args.apply:
         _parser().error("--allow-dirty requires --apply")
+    if args.allow_orphans and not args.apply:
+        _parser().error("--allow-orphans requires --apply")
     if args.apply and not args.archive_dir:
         _parser().error("--apply requires --archive-dir outside the repository")
 
     repo_root = Path(args.repo_root).resolve()
     patterns = (*DEFAULT_PROTECTED_PATTERNS, *args.protect_pattern)
     records = inspect_worktrees(repo_root, protected_patterns=patterns)
-    result: dict[str, Any] = build_cleanup_plan(records, keep_paths=args.keep_path)
+    orphan_roots = args.orphan_root or [str(repo_root / ".claude" / "worktrees")]
+    orphan_directories = inspect_orphan_directories(
+        orphan_roots,
+        known_paths=(record.path for record in records),
+        protected_patterns=patterns,
+    )
+    result: dict[str, Any] = build_cleanup_plan(
+        records,
+        keep_paths=args.keep_path,
+        orphan_directories=orphan_directories,
+    )
     if args.apply:
         result = apply_cleanup(
             repo_root,
@@ -365,6 +531,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             archive_root=Path(args.archive_dir),
             keep_paths=args.keep_path,
             allow_dirty=args.allow_dirty,
+            orphan_directories=orphan_directories,
+            allow_orphans=args.allow_orphans,
         )
     result["repo_root"] = str(repo_root)
     result["mode"] = "apply" if args.apply else "dry-run"

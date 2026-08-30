@@ -23,6 +23,20 @@ pixi run python -m meridian.worktree_hygiene --repo-root . `
   --keep-path C:\path\to\important-worktree
 ```
 
+Unregistered scratch directories are not inferred globally because an app
+directory such as `.codex/worktrees` can contain another repository's state.
+Opt into an explicit scratch root when auditing it:
+
+```powershell
+pixi run worktree-hygiene --repo-root . `
+  --orphan-root C:\Users\me\.codex\worktrees --json
+```
+
+Non-empty orphan directories require `--allow-orphans` in an apply run and
+are copied into the archive before removal. Empty orphan directories may be
+removed by an apply run. The command never deletes a directory merely because
+it is under a broad home-directory path.
+
 Applying a plan requires an archive outside the repository. Clean worktrees
 can be removed with `--apply`; dirty worktrees require the additional
 `--allow-dirty` acknowledgment. The archive contains metadata, status,
