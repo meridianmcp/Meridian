@@ -1910,7 +1910,9 @@ async def _sprint_item_resource_claim_gate(
         if resource.startswith("file:"):
             file_path = resource[len("file:"):]
             pre_held = await _session_holds_file_lock(db, file_path, session_id)
-            result = await db_module.claim_file(db, file_path, session_id, mode="write")
+            result = await db_module.claim_file(
+                db, file_path, session_id, mode="write", item_id=item_id,
+            )
             if result.get("claimed"):
                 lock_scope.append({
                     "resource": resource, "scope": "file", "file_path": file_path,
@@ -1962,7 +1964,8 @@ async def _sprint_item_resource_claim_gate(
                     db, file_path, symbol_name, session_id
                 )
                 symbol_result = await db_module.claim_symbol(
-                    db, session_id, file_path, symbol_name, content
+                    db, session_id, file_path, symbol_name, content,
+                    item_id=item_id,
                 )
                 if symbol_result.get("claimed"):
                     lock_scope.append({
@@ -2036,7 +2039,9 @@ async def _sprint_item_resource_claim_gate(
                 )
 
             pre_held_file = await _session_holds_file_lock(db, file_path, session_id)
-            file_result = await db_module.claim_file(db, file_path, session_id, mode="write")
+            file_result = await db_module.claim_file(
+                db, file_path, session_id, mode="write", item_id=item_id,
+            )
             _fallback_approved = (
                 True if (strict_resource_locking and allow_file_fallback) else None
             )
@@ -4636,15 +4641,18 @@ async def _handle_file_claims(
         # whole-file lock when the content can't be parsed into symbols.
         _symbol = args.get("symbol")
         _content = args.get("content")
+        _item_id = args.get("item_id")
         if _symbol and _content is not None:
             result = await db_module.claim_symbol(
-                db, args["session_id"], args["file_path"], _symbol, _content
+                db, args["session_id"], args["file_path"], _symbol, _content,
+                item_id=_item_id,
             )
             if result.get("reason") == "unparseable":
                 # 771c00d7 — still surface code-anchored notes (symbol-scoped) on
                 # the whole-file fallback so the executor never misses a warning.
                 return await db_module.claim_file(
-                    db, args["file_path"], args["session_id"], symbol=_symbol
+                    db, args["file_path"], args["session_id"], symbol=_symbol,
+                    item_id=_item_id,
                 )
             # 771c00d7 — attach symbol-scoped code notes to the symbol claim too,
             # resolving the project from the session (same as claim_file does).
@@ -4655,7 +4663,7 @@ async def _handle_file_claims(
         # ffa03655 — read|write claim grain (default write/exclusive).
         return await db_module.claim_file(
             db, args["file_path"], args["session_id"], symbol=_symbol,
-            mode=args.get("mode", "write"),
+            mode=args.get("mode", "write"), item_id=_item_id,
         )
     if name == "get_file_claims":
         return await db_module.get_file_claims(

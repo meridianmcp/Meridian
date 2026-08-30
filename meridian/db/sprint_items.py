@@ -6252,8 +6252,18 @@ async def _claim_batch_resource(
     resource: str,
     session_id: str,
     resource_contents: dict[str, Any] | None,
+    item_id: str | None = None,
 ) -> dict[str, Any]:
     """Acquire ONE declared resource for the atomic batch gate.
+
+    c027922d — ``item_id`` (the sprint item this resource is declared under,
+    always known by the caller in this batch loop) is passed straight through
+    to claim_file/claim_symbol so the touches_resources amendment side-effect
+    attributes to the RIGHT item. This is the exact shape the c027922d bug was
+    found in: one session claiming 2+ sprint items concurrently in the same
+    batch, each with disjoint declared resources — without item_id, the old
+    "most recently claimed in_progress item" heuristic could append a resource
+    meant for an older item onto whichever sibling item was claimed last.
 
     Self-contained mirror of meridian.mcp.handler._sprint_item_resource_claim
     _gate's per-resource acquisition logic (file:/symbol: via claim_file/
@@ -6313,7 +6323,7 @@ async def _claim_batch_resource(
         legacy_shorthand = file_path != resource[len("file:"):]
         pre = await get_file_claims(db, file_path)
         pre_held = bool((pre.get("file_lock") or {}).get("session_id") == session_id)
-        result = await claim_file(db, file_path, session_id, mode="write")
+        result = await claim_file(db, file_path, session_id, mode="write", item_id=item_id)
         if result.get("claimed"):
             outcome = {
                 "acquired": True, "scope": "file", "resource": resource,
@@ -6360,7 +6370,9 @@ async def _claim_batch_resource(
                 c.get("symbol_name") == symbol_name and c.get("session_id") == session_id
                 for c in symbol_claims
             )
-            symbol_result = await claim_symbol(db, session_id, file_path, symbol_name, content)
+            symbol_result = await claim_symbol(
+                db, session_id, file_path, symbol_name, content, item_id=item_id,
+            )
             if symbol_result.get("claimed"):
                 return {
                     "acquired": True, "scope": "symbol", "resource": resource,
@@ -6390,7 +6402,9 @@ async def _claim_batch_resource(
         pre_held_file = bool(
             (file_claims.get("file_lock") or {}).get("session_id") == session_id
         )
-        file_result = await claim_file(db, file_path, session_id, mode="write")
+        file_result = await claim_file(
+            db, file_path, session_id, mode="write", item_id=item_id,
+        )
         if file_result.get("claimed"):
             return {
                 "acquired": True, "scope": "file", "resource": resource,
@@ -6954,7 +6968,9 @@ async def claim_parallel_batch(
         claimed_items.append((iid, orig_status, orig_actor))
 
         for resource in item_resources[iid]:
-            outcome = await _claim_batch_resource(db, resource, claim_session, resource_contents)
+            outcome = await _claim_batch_resource(
+                db, resource, claim_session, resource_contents, item_id=iid,
+            )
             if not outcome.get("acquired"):
                 # 2a176d6d (finding 3) — a resource with claim_granularity
                 # "unresolved" (bare symbol:<name>, no '::' file scope) was
