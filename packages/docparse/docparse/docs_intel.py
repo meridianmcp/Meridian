@@ -786,8 +786,34 @@ def _paragraph_style(p: ET.Element) -> str | None:
     return pstyle.get(_q(_W, "val")) if pstyle is not None else None
 
 
+_TAB_TAG = _q(_W, "tab")
+_BR_TAG = _q(_W, "br")
+_CR_TAG = _q(_W, "cr")
+_T_TAG = _q(_W, "t")
+
+
 def _paragraph_text(p: ET.Element) -> str:
-    return "".join(t.text or "" for t in p.iter(_q(_W, "t")))
+    """Concatenate w:t descendant text within *p*, in document order,
+    converting <w:tab/> to a literal tab and <w:br/>/<w:cr/> to a newline --
+    matching python-docx's own .text convention.
+
+    PAPER-S4 (ooxml-graph-paper) -- this previously dropped <w:tab/>/<w:br/>
+    entirely (iterating only w:t via p.iter(_q(_W, "t"))), reconstructing a
+    tab-separated run like "(a)\\tsome text" as "(a)some text" with no
+    separator at all. Independently found and root-caused via the paper
+    project's own gold-extractor fix (tools/independent_gold_extractor.py's
+    _local_text) -- fixing gold alone exposed that native's real extraction
+    shared the identical bug (task_945705a3).
+    """
+    parts: list[str] = []
+    for child in p.iter():
+        if child.tag == _T_TAG:
+            parts.append(child.text or "")
+        elif child.tag == _TAB_TAG:
+            parts.append("\t")
+        elif child.tag in (_BR_TAG, _CR_TAG):
+            parts.append("\n")
+    return "".join(parts)
 
 
 def _build_synth_id_map(body: ET.Element) -> dict[int, str]:
