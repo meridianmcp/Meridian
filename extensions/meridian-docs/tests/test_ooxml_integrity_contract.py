@@ -167,6 +167,55 @@ def test_validate_rejects_dangling_document_relationship_reference():
     assert "word/document.xml" in _issue_parts(report, "dangling_relationship_reference")
 
 
+def test_validate_rejects_dangling_reference_when_rels_part_is_missing():
+    """PAPER-S9 (2026-08-30) found validate_docx_package returned ok=True on
+    an r:id reference whose owning .rels part declares zero relationships:
+    the old `if not rel_ids: continue` guard skipped the check entirely
+    instead of treating an unresolvable reference as dangling."""
+    parts = _package_parts()
+    del parts["word/_rels/document.xml.rels"]
+
+    report = ooxml_integrity.validate_docx_package(_zip_bytes(parts))
+
+    assert report["ok"] is False
+    assert "dangling_relationship_reference" in _issue_codes(report)
+    assert "word/document.xml" in _issue_parts(report, "dangling_relationship_reference")
+
+
+def test_validate_rejects_dangling_reference_when_rels_part_is_empty():
+    parts = _package_parts()
+    rels_name = "word/_rels/document.xml.rels"
+    parts[rels_name] = f'<?xml version="1.0" encoding="UTF-8"?>\n<pr:Relationships xmlns:pr="{PKG_REL}"/>'.encode("utf-8")
+
+    report = ooxml_integrity.validate_docx_package(_zip_bytes(parts))
+
+    assert report["ok"] is False
+    assert "dangling_relationship_reference" in _issue_codes(report)
+    assert "word/document.xml" in _issue_parts(report, "dangling_relationship_reference")
+
+
+def test_validate_rejects_duplicate_zip_part_name():
+    """PAPER-S9 (2026-08-30) found validate_docx_package returned ok=True on
+    a ZIP containing word/document.xml written twice with different content
+    -- benchmark-preregistration-v0.md's own failure taxonomy names this
+    "last-write-wins on read, never healed on write", but nothing checked
+    for it before this fix."""
+    raw = _zip_bytes(_package_parts())
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        parts = {info.filename: archive.read(info.filename) for info in archive.infolist()}
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in parts.items():
+            archive.writestr(name, payload)
+        archive.writestr("word/document.xml", parts["word/document.xml"] + b"<!-- second copy -->")
+
+    report = ooxml_integrity.validate_docx_package(stream.getvalue())
+
+    assert report["ok"] is False
+    assert "duplicate_zip_part" in _issue_codes(report)
+    assert "word/document.xml" in _issue_parts(report, "duplicate_zip_part")
+
+
 def test_validate_rejects_stale_content_type_override():
     parts = _package_parts()
     content_types = "[Content_Types].xml"
