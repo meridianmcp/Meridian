@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import posixpath
+import random
 import re
 import shutil
 import socket
@@ -3393,8 +3394,41 @@ class OutputsFtsIndex:
             dir_path, exc,
         )
 
+    def _index_db_file_size(self) -> int | None:
+        """On-disk size of the DuckDB index file, or None if unreadable
+        (not yet created, or a transient stat failure). Deliberately does
+        NOT also walk the Tantivy directory (unlike get_cache_quota_status,
+        built for quota enforcement and willing to pay a full os.walk of
+        the whole .meridian-outputs-cache/ dir) -- a single os.path.getsize
+        call is the cheap, always-safe-to-call-every-rebuild() telemetry
+        this method exists for; a full cache-tree size belongs to that
+        other, explicitly opt-in tool.
+        """
+        try:
+            return os.path.getsize(self._db_path)
+        except OSError:
+            return None
+
+    def _current_process_rss_bytes(self) -> int | None:
+        """Current process resident set size, or None if psutil is
+        unavailable/fails -- same fail-soft, lazy-import convention as
+        _initial_adaptive_batch's own psutil usage elsewhere in this class.
+        """
+        try:
+            import psutil  # noqa: PLC0415 -- optional, already used elsewhere here
+            return int(psutil.Process(os.getpid()).memory_info().rss)
+        except (ImportError, OSError, AttributeError):
+            return None
+        except Exception:  # noqa: BLE001 -- best-effort telemetry only
+            _log.debug(
+                "OutputsFtsIndex._current_process_rss_bytes: psutil call "
+                "failed", exc_info=True,
+            )
+            return None
+
     def rebuild(
         self, *, max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
+        staleness_mode: str = "fast", staleness_sample_rate: float = 0.1,
     ) -> int:
         """Incrementally rebuild the table + FTS index.  Returns row count.
 
@@ -3657,6 +3691,66 @@ class OutputsFtsIndex:
             if self._manifest.get(p) != sig or p not in self._row_cache:
                 self._pending_stale[p] = sig
 
+        # 89612890 -- opt-in content-based staleness, layered ON TOP of the
+        # fast mtime/size check above (which stays the documented default
+        # and is NEVER disabled by this). Fast staleness cannot detect a
+        # same-size+same-mtime content rewrite (a backdated mtime, or a
+        # coarse-resolution filesystem) -- by construction, `sig` compares
+        # equal to what's stored and the file never enters `_pending_stale`.
+        # "strict" content-verifies every file the fast check just cleared;
+        # "sampled" verifies a random subset (staleness_sample_rate) to
+        # bound the cost on a large tree while still catching some of this
+        # class of miss. Synchronous, not dispatched to Phase 1's
+        # ThreadPoolExecutor -- this is Phase 0, before the analysis_limit
+        # backlog-bounding below even runs, and is expected to cost real
+        # I/O proportional to how much of `newly_seen` this call clears;
+        # that cost is exactly what opting into a non-"fast" mode means.
+        if staleness_mode != "fast":
+            for p in newly_seen:
+                # Code review: this loop does real synchronous file I/O
+                # (open + full read + hash) per path, dispatched to NO
+                # thread pool, with NO deadline check -- reproducing,
+                # for content hashing, the exact "no deadline awareness ->
+                # runs to completion regardless of budget" bug class
+                # Phase 1's own ThreadPoolExecutor dispatch was fixed for
+                # (see phase1_deadline_hit below). Bounded by the SAME
+                # phase1_deadline the walk itself respects (5845cc6d's own
+                # reasoning: a sub-deadline here too, so this can never
+                # consume the whole budget and starve Phase 1/2 of a
+                # chance to run at all) -- checked once per path, same
+                # granularity as _ResumableFileWalk.drain()'s own check.
+                if (
+                    phase1_deadline is not None
+                    and time.monotonic() > phase1_deadline
+                ):
+                    break
+                if p in self._pending_stale:
+                    continue  # already confirmed stale by the fast check
+                if (
+                    staleness_mode == "sampled"
+                    and random.random() >= staleness_sample_rate
+                ):
+                    continue
+                fresh_hash = self._hasher(p)
+                if fresh_hash is None:
+                    continue  # unreadable now -- leave to the stat-based path
+                cached_row = self._row_cache.get(p)
+                stored_hash = cached_row.sha256 if cached_row is not None else None
+                if stored_hash is None or stored_hash != fresh_hash:
+                    # Either a genuine content mismatch, or no baseline hash
+                    # exists yet for this path (e.g. it was only ever
+                    # indexed under "fast" mode before, or has a unique
+                    # size the default size-prefilter never bothered to
+                    # hash). Both cases route through the SAME normal
+                    # Phase 1/2 analysis+write path below (not an ad-hoc
+                    # in-memory patch) so `_needs_hash`'s own staleness_mode
+                    # check above actually computes and DURABLY persists a
+                    # real hash this call -- establishing (or correcting)
+                    # the baseline a FUTURE call can trust, rather than
+                    # silently updating _row_cache in memory only and
+                    # leaving the on-disk row's content untouched.
+                    self._pending_stale[p] = self._manifest.get(p, (None, None))
+
         # b85394bd -- BOUNDED ANALYSIS INTAKE: `self._pending_stale` may hold
         # far more than one call should take on at once (discovery capacity
         # is now effectively unbounded per call -- see `walk_batch` above --
@@ -3680,6 +3774,15 @@ class OutputsFtsIndex:
         self.last_rebuild_metrics["analysis_backlog_deferred"] = (
             len(stale_all) - len(stale)
         )
+        # 89612890 -- captured HERE (before Phase 2's write mutates
+        # _row_cache) since "was this path already indexed before this
+        # call" can only be answered before that mutation happens: a path
+        # already in _row_cache is a genuine RE-analysis (content/stat
+        # changed since it was last indexed); one that isn't is a brand-new
+        # discovery. `rows_changed` (set at the tail of this method) counts
+        # both together -- this distinguishes them.
+        files_reanalyzed_this_call = sum(1 for p in stale if p in self._row_cache)
+        files_new_this_call = len(stale) - files_reanalyzed_this_call
 
         # Parallel per-file analysis for stale paths (fingerprint + hash + stat).
         # Workers run before the write lock is taken so heavy I/O (e.g. hashing
@@ -3715,6 +3818,16 @@ class OutputsFtsIndex:
                 # cheapest to skip. Confirmed via
                 # TestHashAlgoVersionUpgrade::test_legacy_db_triggers_full_rehash_on_upgrade.
                 if self._pending_hash_upgrade:
+                    return True
+                # 89612890 -- strict/sampled staleness needs a REAL,
+                # durably-persisted content hash for every file it might
+                # need to compare against a future call, not just the
+                # size-collision subset the fast/default path bothers to
+                # hash. Without this, a unique-size file would never get a
+                # baseline hash at all (see the size-prefilter's own
+                # rationale above), and content-based staleness could never
+                # be established for it, regardless of staleness_mode.
+                if staleness_mode != "fast":
                     return True
                 sz = stale_sigs.get(p, (None, None))[1]
                 return sz is None or size_counts.get(sz, 0) > 1
@@ -4200,6 +4313,23 @@ class OutputsFtsIndex:
                 "partial": bool(self.last_rebuild_partial),
                 "fts_pending": bool(self._fts_pending),
             })
+            # 89612890 -- bounded-scale-run telemetry: files examined/re-
+            # analyzed, queue depth, checkpoint/recovery state, index size,
+            # and process RSS, all in the SAME per-call metrics dict a scale
+            # run already reads (last_rebuild_metrics / search_outputs's
+            # "discovery" key) instead of requiring a separate
+            # get_convergence_state() call to piece the picture together.
+            self.last_rebuild_metrics.update({
+                "files_examined": len(newly_seen),
+                "files_reanalyzed": files_reanalyzed_this_call,
+                "files_new": files_new_this_call,
+                "queue_depth": len(self._pending_stale),
+                "checkpoint_walk_epoch": self._walk_epoch,
+                "checkpoint_walk_pass_complete": bool(self._walk_pass_confirmed_complete),
+                "checkpoint_scan_boundary": self._scan_boundary,
+                "index_db_bytes": self._index_db_file_size(),
+                "process_rss_bytes": self._current_process_rss_bytes(),
+            })
             return len(rows)
         finally:
             self._write_lock.release()
@@ -4495,6 +4625,71 @@ class OutputsFtsIndex:
     # ------------------------------------------------------------------
     # Explicit convergence state (item 6af1518d, requirement 1 & 2)
     # ------------------------------------------------------------------
+
+    def get_directory_progress(self) -> dict[str, Any]:
+        """Per-top-level-directory walk/backlog progress (item 89612890).
+
+        A directory-granular VIEW built entirely from existing state (one
+        :meth:`get_convergence_state` call per immediate child directory of
+        ``outputs_dir``) -- no change to the underlying walk's own
+        traversal algorithm or persisted schema.
+
+        Scope decision, stated plainly: this does NOT make a restarted walk
+        skip re-``os.scandir``-ing directories it has already fully passed
+        -- doing that safely runs into the same rehydration-timing hazard
+        fa600e42's own walk-error fix had to solve (see
+        ``_walk_error_confirmed_fresh`` and its docstring on
+        :meth:`_rehydrate_walk_state_from_disk`): on a genuinely fresh
+        process, in the documented real production call order, the first
+        :meth:`_connect` (and therefore rehydration) does not run until
+        mid-Phase-2 of :meth:`rebuild`, well AFTER Phase 0 would need to
+        know a skip-set to seed a resumed walk correctly. Reading persisted
+        state early enough to seed that skip-set would mean either
+        reordering ``_connect()`` ahead of Phase 0 (reintroducing the exact
+        "clobbered same-call discoveries" bug sprint item 6b5ecdc5 fixed by
+        deferring that same ordering) or duplicating rehydration's own DB
+        read outside its documented merge logic -- both the kind of
+        "major... redesign" this program's own qualification explicitly
+        defers. What this method DOES give a caller: real, directory-
+        granular insight into what remains converged vs. still pending,
+        without altering how the walk itself resumes.
+
+        Cost, stated plainly (code review): each directory's
+        :meth:`get_convergence_state` call does a full linear scan over
+        ``self._pending_stale`` when scoped to a subtree -- this method
+        calls it once per top-level directory, making the total cost
+        O(directories x pending-backlog-size), uncapped. Fine for
+        occasional, human-triggered inspection; not a substitute for a
+        cheap per-call telemetry field a caller would poll frequently on a
+        large tree with a sizeable backlog.
+        """
+        try:
+            top_level = sorted(
+                e.name for e in os.scandir(self.outputs_dir)
+                if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")
+            )
+        except OSError:
+            return {
+                "outputs_dir": self.outputs_dir, "directories": [],
+                "error": "could not list outputs_dir",
+            }
+
+        directories = []
+        for name in top_level:
+            sub_state = self.get_convergence_state(
+                subtree=os.path.join(self.outputs_dir, name),
+            )
+            directories.append({
+                "name": name,
+                "converged": sub_state.converged,
+                "pending_stale_count": sub_state.pending_count,
+            })
+        return {
+            "outputs_dir": self.outputs_dir,
+            "walk_pass_complete": bool(self._walk_pass_confirmed_complete),
+            "scan_boundary": self._scan_boundary,
+            "directories": directories,
+        }
 
     def get_convergence_state(self, subtree: str | None = None) -> "ConvergenceState":
         """Return an explicit, structured convergence-state snapshot.
@@ -5508,8 +5703,18 @@ def search_outputs(
     include_archival: bool = True,
     max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
     subtree: str | None = None,
+    staleness_mode: str = "fast",
+    staleness_sample_rate: float = 0.1,
 ) -> dict[str, Any]:
     """BM25 search over a local outputs tree.
+
+    ``staleness_mode`` (item 89612890, optional, default ``"fast"``): the
+    documented default is stat-based (mtime+size) staleness, which cannot
+    detect a same-size+same-mtime content rewrite. ``"strict"`` content-
+    hash-verifies every file the fast check just cleared this call;
+    ``"sampled"`` verifies a random ``staleness_sample_rate`` fraction of
+    them. Both cost real, opt-in-only extra I/O proportional to how much of
+    the tree this call re-examines -- see :meth:`OutputsFtsIndex.rebuild`.
 
     ``subtree`` (item 6af1518d requirement 4, optional): scope indexing AND
     searching to a sub-path of ``outputs_dir`` without requiring a full
@@ -5596,7 +5801,11 @@ def search_outputs(
         result["subtree"] = subtree
     else:
         index = _get_cached_index(outputs_dir)
-    result["total_indexed"] = index.rebuild(max_seconds=max_seconds)
+    result["total_indexed"] = index.rebuild(
+        max_seconds=max_seconds,
+        staleness_mode=staleness_mode,
+        staleness_sample_rate=staleness_sample_rate,
+    )
     # b1789c0d -- expose cumulative row count from the DB (which may be
     # larger than total_indexed on a partial rebuild that resumes prior work)
     # so callers can distinguish "cold tree, indexing in progress" from

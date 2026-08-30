@@ -16,6 +16,7 @@ Covers:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -47,6 +48,37 @@ def _make_dir(tmp_path: Path, files: dict[str, str]) -> str:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
     return str(tmp_path)
+
+
+@contextlib.contextmanager
+def inject_db_write_failure(exc: Exception | None = None):
+    """Shared helper (89612890) consolidating the previously hand-rolled,
+    independently-duplicated ``_boom``/``patch.object(_ensure_schema, ...)``
+    pattern already used across several tests in this file (e.g. around
+    ``test_rebuild_surfaces_db_write_error_instead_of_silent_debug_log``,
+    ``test_db_write_failure_does_not_permanently_drop_file_from_index``).
+    Injects a DB-write-path failure by patching
+    ``OutputsFtsIndex._ensure_schema`` (the first call inside Phase 2's
+    write_lock-held section) to raise ``exc``.
+
+    Windows limitation, documented rather than silently worked around
+    (89612890): a REAL OS-level disk-full or permission-denied condition is
+    not reliably triggerable on Windows without admin rights (no quota-
+    based disk-full trigger available to an ordinary process, no reliable
+    owner-process-blocking chmod equivalent). Every failure this helper --
+    and every existing test using the pattern it consolidates -- injects is
+    therefore a Python-level exception at the call boundary, not a genuine
+    OS-level write failure. That is an accepted, indeterminate-on-Windows
+    limitation of this test suite, not a problem this helper solves.
+    """
+    if exc is None:
+        exc = RuntimeError("simulated disk-full / connection failure")
+
+    def _boom(self, con):  # noqa: ANN001 -- matches _ensure_schema's real signature
+        raise exc
+
+    with patch.object(OL.OutputsFtsIndex, "_ensure_schema", _boom):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -6100,3 +6132,328 @@ class TestResearchGraphOutputIdentity:
     def test_return_shape_has_exactly_the_documented_keys(self) -> None:
         out = OL.research_graph_output_identity(path="/tmp/x.png")
         assert set(out.keys()) == {"node_type", "identity_key", "revision", "external_ref"}
+
+
+# ---------------------------------------------------------------------------
+# Fast-vs-strict/sampled staleness (sprint item 89612890)
+# ---------------------------------------------------------------------------
+
+class TestStalenessModes:
+    @duckdb_required
+    def test_fast_mode_misses_same_size_same_mtime_content_change(
+        self, tmp_path: Path,
+    ) -> None:
+        """The documented default cannot catch this class of change --
+        confirms the premise the strict/sampled modes exist to close."""
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            st = os.stat(f)
+            # Overwrite with DIFFERENT content, same length, then force the
+            # mtime back to its exact original value -- a real, deliberately
+            # constructed same-size+same-mtime content change, not reliant
+            # on filesystem timestamp coarseness.
+            f.write_text("col\nbbbb\n", encoding="utf-8")
+            os.utime(f, (st.st_atime, st.st_mtime))
+            assert os.stat(f).st_size == st.st_size
+
+            idx.rebuild(staleness_mode="fast")
+            content = idx.get_content(str(f))
+            assert content is not None and "bbbb" not in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_strict_mode_detects_same_size_same_mtime_content_change(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            # First pass under strict mode establishes a real content-hash
+            # baseline (this file has a unique size, so a normal "fast"
+            # rebuild would never hash it at all -- see _needs_hash).
+            idx.rebuild(staleness_mode="strict")
+
+            st = os.stat(f)
+            f.write_text("col\nbbbb\n", encoding="utf-8")
+            os.utime(f, (st.st_atime, st.st_mtime))
+            assert os.stat(f).st_size == st.st_size
+
+            idx.rebuild(staleness_mode="strict")
+            content = idx.get_content(str(f))
+            assert content is not None and "bbbb" in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_sampled_mode_with_rate_one_behaves_like_strict(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild(staleness_mode="sampled", staleness_sample_rate=1.0)
+            st = os.stat(f)
+            f.write_text("col\nbbbb\n", encoding="utf-8")
+            os.utime(f, (st.st_atime, st.st_mtime))
+
+            idx.rebuild(staleness_mode="sampled", staleness_sample_rate=1.0)
+            content = idx.get_content(str(f))
+            assert content is not None and "bbbb" in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_sampled_mode_with_rate_zero_behaves_like_fast(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild(staleness_mode="sampled", staleness_sample_rate=0.0)
+            st = os.stat(f)
+            f.write_text("col\nbbbb\n", encoding="utf-8")
+            os.utime(f, (st.st_atime, st.st_mtime))
+
+            idx.rebuild(staleness_mode="sampled", staleness_sample_rate=0.0)
+            content = idx.get_content(str(f))
+            assert content is not None and "bbbb" not in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_strict_mode_is_opt_in_default_stays_fast(self, tmp_path: Path) -> None:
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()  # no staleness_mode given
+            st = os.stat(f)
+            f.write_text("col\nbbbb\n", encoding="utf-8")
+            os.utime(f, (st.st_atime, st.st_mtime))
+
+            idx.rebuild()  # still no staleness_mode given -- must stay "fast"
+            content = idx.get_content(str(f))
+            assert content is not None and "bbbb" not in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_strict_mode_content_check_respects_deadline(
+        self, tmp_path: Path,
+    ) -> None:
+        """Code-review fix: the content-check loop must never run past its
+        own share of the budget, matching every other I/O-heavy stage in
+        rebuild() (the walk, Phase 1's ThreadPoolExecutor dispatch). An
+        already-expired deadline (max_seconds=0) must make the loop skip
+        content-checking entirely rather than hashing every file
+        regardless of budget."""
+        n = 200
+        for i in range(n):
+            (tmp_path / f"f{i:04d}.csv").write_text(f"col\nvalue{i}\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild(staleness_mode="strict")  # establish baselines, warm pass
+            hash_calls = {"count": 0}
+            real_hasher = idx._hasher
+
+            def _counting_hasher(p: str) -> str | None:
+                hash_calls["count"] += 1
+                return real_hasher(p)
+
+            idx._hasher = _counting_hasher
+            # An already-past deadline (max_seconds=0) must make the
+            # phase1_deadline check stop the loop almost immediately, not
+            # process the whole tree regardless of budget. A handful of
+            # calls (clock-granularity slop on very fast iterations) is
+            # tolerated; hashing anywhere near the full 200-file tree is
+            # exactly the unbounded-cost bug this fix closes.
+            idx.rebuild(staleness_mode="strict", max_seconds=0.0)
+            assert hash_calls["count"] < n // 4, (
+                f"content-check loop hashed {hash_calls['count']}/{n} files "
+                "despite an already-expired deadline -- it must respect "
+                "phase1_deadline like every other I/O-heavy stage in "
+                "rebuild(), not run unbounded regardless of budget"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_strict_mode_reachable_via_module_level_search_outputs(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        OL.search_outputs(str(tmp_path), "col", staleness_mode="strict")
+        st = os.stat(f)
+        f.write_text("col\nbbbb\n", encoding="utf-8")
+        os.utime(f, (st.st_atime, st.st_mtime))
+
+        OL.search_outputs(str(tmp_path), "col", staleness_mode="strict")
+        idx = OL._get_cached_index(str(tmp_path))
+        content = idx.get_content(str(f))
+        assert content is not None and "bbbb" in content
+
+
+# ---------------------------------------------------------------------------
+# Directory-level progress diagnostic (sprint item 89612890)
+# ---------------------------------------------------------------------------
+
+class TestDirectoryProgress:
+    @duckdb_required
+    def test_reports_one_entry_per_top_level_directory(self, tmp_path: Path) -> None:
+        (tmp_path / "run_a").mkdir()
+        (tmp_path / "run_a" / "x.csv").write_text("col\n1\n", encoding="utf-8")
+        (tmp_path / "run_b").mkdir()
+        (tmp_path / "run_b" / "y.csv").write_text("col\n2\n", encoding="utf-8")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            progress = idx.get_directory_progress()
+            names = {d["name"] for d in progress["directories"]}
+            assert names == {"run_a", "run_b"}
+            assert all(d["converged"] for d in progress["directories"])
+            assert all(d["pending_stale_count"] == 0 for d in progress["directories"])
+        finally:
+            idx.close()
+
+    def test_missing_outputs_dir_degrades_to_error_not_raise(
+        self, tmp_path: Path,
+    ) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path / "does_not_exist"))
+        try:
+            progress = idx.get_directory_progress()
+            assert progress["directories"] == []
+            assert "error" in progress
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_hidden_directories_excluded(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "run_a").mkdir()
+        (tmp_path / "run_a" / "x.csv").write_text("col\n1\n", encoding="utf-8")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            progress = idx.get_directory_progress()
+            names = {d["name"] for d in progress["directories"]}
+            assert names == {"run_a"}
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
+# Write-failure injection (sprint item 89612890) -- shared helper
+# ---------------------------------------------------------------------------
+
+class TestInjectDbWriteFailureHelper:
+    @duckdb_required
+    def test_shared_helper_surfaces_db_write_error(self, tmp_path: Path) -> None:
+        (tmp_path / "a.csv").write_text("col\n1\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            with inject_db_write_failure():
+                idx.rebuild()
+            assert idx.last_db_write_error is not None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_shared_helper_accepts_a_custom_exception(self, tmp_path: Path) -> None:
+        (tmp_path / "a.csv").write_text("col\n1\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            with inject_db_write_failure(PermissionError("access denied")):
+                idx.rebuild()
+            assert "access denied" in (idx.last_db_write_error or "")
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
+# Bounded scale-run telemetry (sprint item 89612890)
+# ---------------------------------------------------------------------------
+
+class TestScaleTelemetry:
+    @duckdb_required
+    def test_last_rebuild_metrics_carries_the_new_telemetry_fields(
+        self, tmp_path: Path,
+    ) -> None:
+        # index_db_bytes needs a REAL on-disk DB file -- the bare
+        # OutputsFtsIndex(outputs_dir) constructor used elsewhere in this
+        # file defaults to an in-memory DB (fine for FTS/search-only
+        # tests); production code reaches a real on-disk file via
+        # _get_cached_index, so that's what this specific assertion needs.
+        (tmp_path / "a.csv").write_text("col\n1\n", encoding="utf-8")
+        idx = OL._get_cached_index(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            for key in (
+                "files_examined", "files_reanalyzed", "files_new",
+                "queue_depth", "checkpoint_walk_epoch",
+                "checkpoint_walk_pass_complete", "checkpoint_scan_boundary",
+                "index_db_bytes",
+            ):
+                assert key in m, f"missing scale-telemetry field {key!r}"
+            # _get_cached_index auto-creates a .gitignore at outputs_dir's
+            # root to protect its own .meridian-outputs-cache/ subdirectory
+            # -- a real, pre-existing side effect (files, unlike
+            # directories, are not hidden-name-filtered by the walk), so
+            # both it and a.csv are genuinely new this call.
+            assert m["files_new"] == 2
+            assert m["files_reanalyzed"] == 0
+            assert isinstance(m["index_db_bytes"], int)
+            assert m["index_db_bytes"] > 0
+            # process_rss_bytes is present but best-effort (None if psutil
+            # unavailable) -- only assert the key exists, not a specific type.
+            assert "process_rss_bytes" in m
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_files_reanalyzed_distinguishes_from_files_new(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "a.csv"
+        f.write_text("col\n1\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["files_new"] == 1
+            assert idx.last_rebuild_metrics["files_reanalyzed"] == 0
+
+            f.write_text("col\n2\n", encoding="utf-8")  # genuine mtime+size change
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["files_new"] == 0
+            assert idx.last_rebuild_metrics["files_reanalyzed"] == 1
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_rss_helper_degrades_gracefully_without_psutil(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            import builtins
+            real_import = builtins.__import__
+
+            def _no_psutil(name, *args, **kwargs):
+                if name == "psutil":
+                    raise ImportError("simulated: psutil not installed")
+                return real_import(name, *args, **kwargs)
+
+            monkeypatch.setattr(builtins, "__import__", _no_psutil)
+            assert idx._current_process_rss_bytes() is None
+        finally:
+            idx.close()
