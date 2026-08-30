@@ -429,7 +429,7 @@ class _RawStdioClient:
         self.proc.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
         await self.proc.stdin.drain()
 
-    async def _read_response(self, expected_id: int, timeout: float = 25.0) -> dict:
+    async def _read_response(self, expected_id: int, timeout: float = 45.0) -> dict:
         assert self.proc.stdout is not None
         while True:
             line = await asyncio.wait_for(self.proc.stdout.readline(), timeout=timeout)
@@ -491,7 +491,15 @@ async def _run_subprocess_session(tmp_path, run_calls):
     )
     client = _RawStdioClient(proc)
     try:
-        data = await asyncio.wait_for(run_calls(client), timeout=30.0)
+        # 75s, not 30s: this session runs CONCURRENTLY with a sibling session
+        # (see the asyncio.gather call below) so both spawn a full
+        # `python -m meridian --mcp` cold start at once. On a loaded Windows
+        # dev host, two concurrent full server cold-starts (module imports +
+        # DB init) plus initialize + several tool-call round trips have been
+        # observed to take ~47-67s end to end -- comfortably inside 75s, but
+        # not the original 30s. This is a wall-clock generosity fix only;
+        # it does not change what the test asserts.
+        data = await asyncio.wait_for(run_calls(client), timeout=75.0)
     finally:
         if proc.stdin is not None:
             proc.stdin.close()
