@@ -99,6 +99,65 @@ def script_content_hash(script_path: str) -> str | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Explicit digest metadata (fa600e42) -- see :func:`_digest_hex`'s docstring
+# for the compatibility path this exists to support.
+# ---------------------------------------------------------------------------
+
+_DIGEST_ALGORITHM = "sha256"
+_DIGEST_VERSION = 1
+
+
+def _make_content_digest(hex_digest: str) -> dict[str, Any]:
+    """Wrap a bare hex digest with explicit algorithm/version metadata.
+
+    A bare hex string alone doesn't say WHICH algorithm produced it, or
+    whether the computation scheme has since changed -- a caller comparing
+    two digests from different points in time has no way to tell whether a
+    mismatch means "content changed" or "we started hashing differently."
+    This is purely ADDITIVE: :func:`script_content_hash` and every existing
+    bare-string field it feeds (``ScriptTaggedFingerprint.script_hash``,
+    ``StalenessResult.tagged_script_hash``/``current_script_hash``) are
+    UNCHANGED, so every existing caller and every ledger row written before
+    this field existed keeps working exactly as before.
+    """
+    return {
+        "digest": hex_digest,
+        "algorithm": _DIGEST_ALGORITHM,
+        "version": _DIGEST_VERSION,
+    }
+
+
+def script_content_digest(script_path: str) -> dict[str, Any] | None:
+    """Explicit-metadata form of :func:`script_content_hash`.
+
+    Returns ``{"digest": <hex>, "algorithm": "sha256", "version": 1}``, or
+    ``None`` on the same fail-soft conditions as :func:`script_content_hash`
+    (unreadable/missing script).
+    """
+    digest = script_content_hash(script_path)
+    return _make_content_digest(digest) if digest is not None else None
+
+
+def _digest_hex(value: Any) -> str | None:
+    """Read a digest value written by either the OLD bare-string ledger
+    scheme or the NEW ``{"digest", "algorithm", "version"}`` scheme.
+
+    The compatibility path this item's acceptance criteria calls for: a
+    ``fingerprint_ledger.json`` entry written before this change stores a
+    bare hex string directly under ``script_hash``; one written after ALSO
+    carries the structured ``content_digest`` dict. Callers that only need
+    the raw hex for equality comparison go through this so neither format
+    has to special-case the other, and an old row is never misread just
+    because it predates this field.
+    """
+    if isinstance(value, dict):
+        return value.get("digest")
+    if isinstance(value, str):
+        return value
+    return None
+
+
 def _resolve_script_path(
     generating_script: str, *, search_root: str | None,
 ) -> str | None:
@@ -138,6 +197,7 @@ class ScriptTaggedFingerprint:
     script_path: str | None
     script_hash: str | None
     tagged_at: str
+    content_digest: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -176,6 +236,16 @@ def tag_output(
     resolved = script_path
     if resolved is None and fp.generating_script:
         resolved = _resolve_script_path(fp.generating_script, search_root=search_root)
+    # fa600e42 -- hash the script file ONCE and derive both the bare
+    # script_hash field and the structured content_digest from that SAME
+    # value, rather than calling script_content_hash and
+    # script_content_digest separately (the latter internally re-hashes).
+    # Two independent reads/hashes of the same file for one tag_output call
+    # cost double the I/O for no benefit, and -- more importantly -- open a
+    # window where the script's on-disk content could change between the
+    # two reads, recording two DIFFERENT hashes for what is supposed to be
+    # a single "at this moment" snapshot.
+    _script_hash = script_content_hash(resolved) if resolved else None
     tagged = ScriptTaggedFingerprint(
         path=output_path,
         kind=fp.kind,
@@ -183,7 +253,8 @@ def tag_output(
         json_keys=fp.json_keys,
         generating_script=fp.generating_script,
         script_path=resolved,
-        script_hash=script_content_hash(resolved) if resolved else None,
+        script_hash=_script_hash,
+        content_digest=_make_content_digest(_script_hash) if _script_hash is not None else None,
         tagged_at=datetime.now(timezone.utc).isoformat(),
     )
     _write_ledger_entry(outputs_dir, tagged)
@@ -250,7 +321,10 @@ def check_staleness(outputs_dir: str) -> list[StalenessResult]:
     for path in sorted(ledger):
         entry = ledger[path]
         script_path = entry.get("script_path")
-        tagged_hash = entry.get("script_hash")
+        # fa600e42 -- tolerant of either the OLD bare-string ``script_hash``
+        # field (rows written before content_digest existed) or the NEW
+        # structured ``content_digest`` field; see _digest_hex's docstring.
+        tagged_hash = _digest_hex(entry.get("content_digest")) or entry.get("script_hash")
         if not script_path:
             results.append(StalenessResult(
                 path=path, script_path=None, tagged_script_hash=tagged_hash,
@@ -307,6 +381,13 @@ def find_stale_by_script(outputs_dir: str, script_path: str) -> list[str]:
         entry_script = entry.get("script_path")
         if not entry_script or os.path.abspath(entry_script) != script_abspath:
             continue
-        if entry.get("script_hash") != current_hash:
+        # fa600e42 -- same compatibility read as check_staleness (see
+        # _digest_hex's docstring): a ledger row's recorded hash may live
+        # under the OLD bare-string script_hash field or the NEW structured
+        # content_digest field. Reading only script_hash here (as before
+        # this item) would let a NEW-style row that somehow lacks
+        # script_hash disagree with check_staleness about the same data.
+        tagged_hash = _digest_hex(entry.get("content_digest")) or entry.get("script_hash")
+        if tagged_hash != current_hash:
             stale.append(path)
     return stale

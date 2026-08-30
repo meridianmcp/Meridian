@@ -1209,7 +1209,16 @@ class IndexFileLock:
 _MAX_CONTENT_CHARS = 200_000
 _ARCHIVAL_SUFFIX_RE = re.compile(r"_old(?:_\d+)?$", re.IGNORECASE)
 
-_TEXT_CONTENT_SUFFIXES: frozenset[str] = frozenset({".csv", ".json"})
+# fa600e42 -- bounded plaintext allowlist. Only genuinely text-shaped
+# formats get their BODY content read and indexed (see _classify_suffix /
+# _content_for_fts below): a deliberate allowlist, not a denylist, so a new
+# or unexpected suffix defaults to metadata-only rather than having its raw
+# bytes decoded and indexed by accident. Secret-shaped files never reach
+# this check at all -- is_secret_path (below) excludes them earlier, during
+# the walk itself.
+_TEXT_CONTENT_SUFFIXES: frozenset[str] = frozenset(
+    {".csv", ".json", ".txt", ".md", ".log"}
+)
 _METADATA_ONLY_SUFFIXES: frozenset[str] = frozenset({".npy"})
 
 _SCRIPT_HINT_KEYS: tuple[str, ...] = (
@@ -1327,6 +1336,17 @@ def _canonical_storage_path(path: Any) -> str:
 
 
 def _classify_suffix(path: str) -> str:
+    # fa600e42 -- MERIDIAN_NOTES.md is a reserved, human-authored annotation
+    # file, separately ingested by _ingest_meridian_notes into the
+    # annotations table (a directory-level note, not a per-file output).
+    # Widening _TEXT_CONTENT_SUFFIXES to include .md must not ALSO pull
+    # this one reserved filename into the regular body-indexing pipeline --
+    # that would surface its identical text twice (once as an ordinary
+    # output row, once as a directory annotation) and misrepresent a human
+    # note as generated output content. This preserves MERIDIAN_NOTES.md's
+    # exact pre-fa600e42 classification; every other .md file is unaffected.
+    if os.path.basename(path) == MERIDIAN_NOTES_FILENAME:
+        return "binary_metadata"
     suffix = os.path.splitext(path)[1].lower()
     if suffix in _TEXT_CONTENT_SUFFIXES:
         return "text_content"
@@ -1335,9 +1355,24 @@ def _classify_suffix(path: str) -> str:
     return "binary_metadata"
 
 
+def _sanitize_text_content(text: str) -> str:
+    """Strip embedded NUL bytes from decoded file text before it is indexed
+    (fa600e42).
+
+    A text-content file can legally decode as valid UTF-8 while still
+    containing an embedded NUL byte (e.g. a corrupted or binary-ish .log
+    line) -- but DuckDB TEXT columns and the FTS index both reject/choke on
+    an embedded NUL. Stripping (not replacing with a placeholder) keeps the
+    surrounding text searchable. This only ever touches the FTS-facing body
+    copy; the file's real on-disk bytes are still what gets fingerprinted/
+    hashed elsewhere, so this has no effect on identity or staleness checks.
+    """
+    return text.replace("\x00", "") if "\x00" in text else text
+
+
 def _read_text_capped(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        return fh.read(_MAX_CONTENT_CHARS)
+        return _sanitize_text_content(fh.read(_MAX_CONTENT_CHARS))
 
 
 def _sha256_file(path: str) -> str | None:
@@ -1777,9 +1812,11 @@ def _analyse_file(
                 # worst case for UTF-8) then slice the DECODED text --
                 # avoids decoding a huge file unnecessarily, never cuts a
                 # multi-byte char differently than the original read did.
-                text = data[: _MAX_CONTENT_CHARS * 4].decode(
-                    "utf-8", errors="replace"
-                )[:_MAX_CONTENT_CHARS]
+                text = _sanitize_text_content(
+                    data[: _MAX_CONTENT_CHARS * 4].decode(
+                        "utf-8", errors="replace"
+                    )[:_MAX_CONTENT_CHARS]
+                )
                 suffix = os.path.splitext(path)[1].lower()
                 if suffix == ".csv":
                     columns, script = _extract_csv(text)
@@ -2293,6 +2330,15 @@ class OutputsFtsIndex:
         # never converge, so this must be surfaced rather than silently
         # swallowed at DEBUG level.
         self._last_walk_error: str | None = None
+        # fa600e42 -- True once Phase 0 has established a fresh, this-
+        # instance in-memory answer for _last_walk_error (via the "brand
+        # new pass is starting" reset in rebuild()), so
+        # _rehydrate_walk_state_from_disk's "fill only if still None" merge
+        # rule (see its own docstring) knows NOT to treat that reset as
+        # "nothing known yet, go trust whatever is on disk" -- see the
+        # reset site in rebuild() for the full explanation of why this
+        # exists.
+        self._walk_error_confirmed_fresh: bool = False
         # Best current estimate of the total file count under outputs_dir --
         # set from the authoritative len(all_paths) each time a walk pass
         # completes. None until the very first pass has ever completed.
@@ -2644,6 +2690,14 @@ class OutputsFtsIndex:
           -- fill only if this call hasn't already produced a value
           (still ``None``); a value Phase 0/1 already set this call is by
           definition more current than anything persisted from before.
+          ``_last_walk_error`` additionally checks
+          ``_walk_error_confirmed_fresh`` (fa600e42): Phase 0's own
+          "brand new pass is starting" reset deliberately sets this field
+          to ``None`` to optimistically clear a resolved historical error
+          -- without the flag, that reset would be indistinguishable from
+          "nothing observed yet" and this rule would immediately reload
+          the stale pre-reset value right back in, undoing the reset
+          within the very same call.
         * ``_walk_epoch`` -- take the max of the two: a purely monotonic,
           purely diagnostic counter (nothing in the convergence contract
           branches on it), so "genuinely newer" is simply "numerically
@@ -2727,7 +2781,15 @@ class OutputsFtsIndex:
         # this call hasn't already produced a value (see docstring).
         if self._scan_boundary is None:
             self._scan_boundary = values.get("walk_scan_boundary")
-        if self._last_walk_error is None:
+        # fa600e42 -- _walk_error_confirmed_fresh guards against this merge
+        # blindly reloading a stale persisted error that Phase 0's own
+        # "brand new pass is starting" reset (in rebuild()) has ALREADY
+        # deliberately cleared THIS instance -- see that reset site's
+        # comment for the full explanation. Without this guard, the reset
+        # (which makes the field None) would be indistinguishable from
+        # "never observed anything yet," and this rule would immediately
+        # undo it by reloading whatever was on disk before the reset.
+        if self._last_walk_error is None and not self._walk_error_confirmed_fresh:
             self._last_walk_error = values.get("walk_last_error")
         if self._expected_count is None:
             expected_raw = values.get("walk_expected_count")
@@ -3263,7 +3325,7 @@ class OutputsFtsIndex:
             directory = os.path.dirname(p)
             try:
                 with open(p, "r", encoding="utf-8", errors="replace") as fh:
-                    text = fh.read(_MAX_CONTENT_CHARS)
+                    text = _sanitize_text_content(fh.read(_MAX_CONTENT_CHARS))
             except OSError:
                 _log.debug("_ingest_meridian_notes: could not read %r", p,
                             exc_info=True)
@@ -3445,6 +3507,40 @@ class OutputsFtsIndex:
                 # BEFORE any paths are drained, so even a crash during this
                 # very first drain() records the correct epoch on restart.
                 self._walk_epoch += 1
+                # fa600e42 -- clear a stale error from a PRIOR, already-
+                # completed pass optimistically: it no longer describes this
+                # fresh pass's state (distinguishing "active" from
+                # "historical" walk failure). If the same directory is
+                # still unreadable, _record_walk_error (this walk's
+                # on_error callback) re-sets it the moment this new pass
+                # hits it again -- so a genuinely persistent problem never
+                # goes silent, but a problem that has since been fixed
+                # actually clears instead of reporting non-convergence
+                # forever. Sibling per-call resets: last_db_write_error /
+                # last_lock_error at the top of rebuild() above -- this one
+                # resets per-PASS instead of per-call because the walk
+                # itself (unlike Phase 2's write) can legitimately span
+                # multiple rebuild() calls.
+                #
+                # _walk_error_confirmed_fresh is set alongside this reset
+                # for a subtle but critical reason (code-review fix,
+                # fa600e42): on a genuinely fresh instance, self._connect()
+                # -- and therefore _rehydrate_walk_state_from_disk -- has
+                # NOT run yet at this point in rebuild() (see that method's
+                # own docstring: in the real production call order, the
+                # first _connect() doesn't happen until mid-Phase-2 of this
+                # SAME call, well after this reset). Rehydration's merge
+                # rule for this field is "fill only if still None" -- so
+                # without this flag, the very reset meant to clear a
+                # resolved error would instead look EXACTLY like "nothing
+                # known yet," and rehydration would immediately reload the
+                # stale pre-restart error right back in and re-persist it,
+                # completely undoing this fix on every fresh-process
+                # restart. The flag tells rehydration "Phase 0 already
+                # established a current answer this instance -- do not
+                # override it with whatever was on disk before."
+                self._last_walk_error = None
+                self._walk_error_confirmed_fresh = True
                 self._walk_state = _ResumableFileWalk(
                     self.outputs_dir, exclude_patterns=self._exclude_patterns,
                     max_batch=walk_batch, on_error=self._record_walk_error,
