@@ -12153,6 +12153,7 @@ from .sprint_items import (  # noqa: F401
     start_sprint_item,
     # 56e9b3c7 — autonomous stale-claim reconciliation
     classify_stale_claim,
+    clear_stale_claim_metadata,
     reconcile_stale_claims,
     RECONCILE_STALE_CLAIM_AUDIT_EVENT,
     RECONCILE_ACTIVE,
