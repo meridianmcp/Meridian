@@ -204,6 +204,7 @@ test = "python scripts/run_tests.py tests/ -q --tb=short --ignore=tests/test_dem
 test-pg = "python scripts/run_tests.py tests/ -q --tb=short --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py -m \"not subprocess_isolated\" && python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short && python scripts/run_tests.py --serial tests/ -q --tb=short -m subprocess_isolated"
 test-cov = "python scripts/run_tests.py tests/ -q --tb=short --ignore=tests/test_demo_ux.py --ignore=tests/test_rate_limit_serial.py -m \"not subprocess_isolated\" --cov=meridian --cov-config=.coveragerc && python scripts/run_tests.py --serial tests/test_rate_limit_serial.py -q --tb=short --cov=meridian --cov-config=.coveragerc --cov-append && python scripts/run_tests.py --serial tests/ -q --tb=short -m subprocess_isolated --cov=meridian --cov-config=.coveragerc --cov-append --cov-report=term-missing --cov-fail-under=80"
 test-fast = "python scripts/run_tests.py tests/test_core.py tests/test_new_v25.py tests/test_hosted.py tests/test_github.py tests/test_milestones.py tests/test_md_anchors.py tests/test_security.py tests/test_ui.py tests/test_executor_runs.py tests/test_error_alerting.py tests/test_v2_hosted.py -q --tb=short"
+worktree-hygiene = "python -m meridian.worktree_hygiene --repo-root ."
 build-exe = "pyinstaller meridian.spec --clean"
 build-connect = "pyinstaller meridian-connect.spec --clean"
 smoke-bundle = "node scripts/smoke_bundle.mjs"

@@ -15,7 +15,8 @@ pixi run python -m meridian.worktree_hygiene --repo-root . --json
 ```
 
 The plan protects paths or branches containing `docs`, `outputs`, `ooxml`,
-`paper`, or `dissertation`. Add project-specific retention paths explicitly:
+`paper`, `dissertation`, or `megasprint-clean`. Add project-specific retention
+paths explicitly:
 
 ```powershell
 pixi run python -m meridian.worktree_hygiene --repo-root . `

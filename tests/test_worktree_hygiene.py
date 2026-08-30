@@ -103,6 +103,7 @@ def test_explicit_keep_path_is_respected() -> None:
 def test_default_protection_pattern_covers_outputs_and_docs_branches() -> None:
     assert any("outputs" in pattern for pattern in DEFAULT_PROTECTED_PATTERNS)
     assert any("docs" in pattern for pattern in DEFAULT_PROTECTED_PATTERNS)
+    assert any("megasprint-clean" in pattern for pattern in DEFAULT_PROTECTED_PATTERNS)
 
 
 def test_archive_root_must_be_outside_repo(tmp_path: Path) -> None:

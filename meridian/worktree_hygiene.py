@@ -38,7 +38,7 @@ from typing import Any, Iterable, Sequence
 # cleanup command is repo-wide and document/output worktrees are explicitly
 # valuable even when their owning session is no longer visible.
 DEFAULT_PROTECTED_PATTERNS: tuple[str, ...] = (
-    r"(?i)(?:^|[/\\_-])(docs|outputs|ooxml|paper|dissertation)(?:[/\\_-]|$)",
+    r"(?i)(?:^|[/\\_-])(docs|outputs|ooxml|paper|dissertation|megasprint-clean)(?:[/\\_-]|$)",
 )
 
 
