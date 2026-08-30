@@ -1233,6 +1233,49 @@ def insert_cross_reference(
 
 
 @mcp.tool()
+def remove_cross_reference(
+    docx_path: str,
+    anchor_para_id: str,
+    index_db_path: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Remove the first REF-field cross-reference from a paragraph.
+
+    The missing removal counterpart to insert_cross_reference above (which had
+    no way to undo its own insert). Locates the first REF complex field
+    (fldChar begin...end, excluding PAGEREF/NOTEREF) in the paragraph at
+    anchor_para_id, removes all of that field's constituent runs, and re-packs
+    the ZIP. Every other run in the paragraph -- other text, other fields --
+    is left untouched. Mirrors remove_citation exactly, one field family over.
+
+    Pass the SAME anchor_para_id the matching insert_cross_reference call
+    used; this re-locates that paragraph and re-scans it rather than
+    remembering anything about the original insert.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor_para_id:  w14:paraId or p{N} of the paragraph to edit -- the
+                       same id the matching insert_cross_reference call used.
+      index_db_path:   If supplied, sidecar is invalidated after write.
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard
+                       (check_docs_write_conflict in meridian/routes/
+                       tunnel.py). Not forwarded to docs_intel; has no effect
+                       when this tool is invoked outside Meridian's tunnel
+                       (e.g. standalone `uvx meridian-docs`).
+
+    Returns:
+      {status, anchor_para_id, bookmark_name, display_text, docx_path}
+      or {error: <message>} on failure (file NOT mutated on error).
+    """
+    return docs_intel.remove_cross_reference(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        index_db_path=index_db_path,
+    )
+
+
+@mcp.tool()
 def insert_citation(
     docx_path: str,
     anchor_para_id: str,
