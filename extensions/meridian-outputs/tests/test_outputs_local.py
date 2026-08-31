@@ -4152,6 +4152,44 @@ class TestDuckDBMemoryLimit:
         finally:
             idx.close()
 
+    @duckdb_required
+    def test_connect_disables_preserve_insertion_order(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task_ecb96ac9 round 2: a configured memory_limit alone was not
+        sufficient -- confirmed live, DuckDB hit its own limit cleanly but
+        the ROLLBACK of that failed operation also ran out of memory within
+        the same budget, reproducing the identical unrecoverable failure.
+        `preserve_insertion_order=false` is DuckDB's own first suggestion in
+        that exact error message; must actually be applied on connect."""
+        import duckdb
+
+        real_connect = duckdb.connect
+        captured: list[str] = []
+
+        class _ExecuteSpyCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                captured.append(sql)
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect", lambda *a, **kw: _ExecuteSpyCon(real_connect(*a, **kw)),
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._connect()
+        finally:
+            idx.close()
+        matches = [sql for sql in captured if "preserve_insertion_order" in sql.lower()]
+        assert matches, f"expected a preserve_insertion_order PRAGMA, got: {captured!r}"
+        assert "false" in matches[0].lower()
+
     def test_connect_tantivy_passes_resolved_heap_size_to_writer(
         self, tmp_path: Path,
     ) -> None:

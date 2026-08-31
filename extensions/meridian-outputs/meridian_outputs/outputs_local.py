@@ -2519,6 +2519,30 @@ class OutputsFtsIndex:
                     "OutputsFtsIndex._connect: could not set memory_limit=%dMB",
                     self._duckdb_memory_limit_bytes // (1024 * 1024), exc_info=True,
                 )
+            # task_ecb96ac9 follow-on, round 2 -- a configured memory_limit
+            # alone was not sufficient: confirmed live, DuckDB hit its OWN
+            # limit cleanly (a normal, expected "Out of Memory Error: failed
+            # to pin block" with its own tuning suggestions attached) but the
+            # ROLLBACK of that failed operation ALSO ran out of memory within
+            # the same already-nearly-full budget, producing the identical
+            # unrecoverable "database has been invalidated" failure a bare
+            # ceiling was supposed to prevent. `preserve_insertion_order`
+            # defaults to true in DuckDB, which buffers extra bookkeeping to
+            # guarantee row order is preserved through inserts/updates --
+            # real memory cost this class never relies on (no query here
+            # depends on outputs_index's physical row order; lookups are by
+            # `path`, a unique key). Disabling it is DuckDB's own first
+            # suggestion in that exact error message and reduces the PEAK
+            # memory a large write actually needs, rather than just moving
+            # where the ceiling sits -- addressing the pressure, not only
+            # the limit.
+            try:
+                self._con.execute("PRAGMA preserve_insertion_order=false")
+            except Exception:  # noqa: BLE001
+                _log.warning(
+                    "OutputsFtsIndex._connect: could not disable "
+                    "preserve_insertion_order", exc_info=True,
+                )
             # 77443d83 -- a fresh instance always assumed _fts_built started
             # False. With Tantivy this is now cheap either way (_rebuild_fts
             # only ever commits its pending delta, never a full re-index), but
