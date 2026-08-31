@@ -56,7 +56,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
-from . import ooxml_integrity, render_gate
+from . import ooxml_integrity, render_gate, render_policy
 
 # OOXML namespaces.
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -2914,6 +2914,24 @@ def _enforce_render_verification(
     deliberate follow-up, not part of this change -- see
     ``render_gate``'s own module docstring, "1e6150ef" section.
     """
+    active_policy = render_policy.current_render_policy()
+    if active_policy is not None and not active_policy.render:
+        # Draft/batch workflows still pass through the structural verification
+        # immediately above this helper. They explicitly defer expensive
+        # visual work until finalize/promotion instead of rendering once per
+        # mutation. ``None`` outside a policy scope preserves the legacy
+        # write-time render gate for existing direct callers.
+        return None, {
+            "render_status": "deferred",
+            "render_verified": False,
+            "render_deferred": True,
+            "render_policy": active_policy.policy,
+            "render_reason": (
+                "visual rendering deferred by the active document-workflow "
+                f"policy {active_policy.policy!r}"
+            ),
+        }
+
     try:
         render_result = render_gate.check_render_capability(write_dest)
     except Exception as exc:  # noqa: BLE001 -- a broken checker must fail closed, never crash the write or masquerade as verified
@@ -7895,6 +7913,19 @@ def latex_to_omml_local(latex: str | None) -> str | None:
     """
     if not isinstance(latex, str) or not latex.strip():
         return None
+    # Prefer Meridian's bounded, loss-aware bridge for the constructs it can
+    # represent natively.  Keep the historical latex2mathml fallback below
+    # for unsupported/legacy input so this is additive rather than a silent
+    # compatibility break.  The bridge imports docs_intel only at call time,
+    # avoiding a module-import cycle.
+    try:
+        from .latex_bridge import latex_to_omml as _bridge_latex_to_omml
+
+        bridged = _bridge_latex_to_omml(latex)
+        if bridged.success and bridged.value:
+            return bridged.value
+    except Exception:  # noqa: BLE001 - preserve the existing fallback contract
+        pass
     try:
         import latex2mathml.converter as _l2m  # noqa: PLC0415 — optional dep
     except Exception:  # noqa: BLE001

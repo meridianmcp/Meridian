@@ -43,8 +43,16 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from . import docs_intel
+from . import document_workspace
+from . import equation_graph
+from . import latex_bridge
 from . import local_ingest
+from . import nomenclature
+from . import notation_manifest as notation_manifest_module
+from . import notation_audit
+from . import script_census
 from . import render_gate
+from . import render_policy as render_policy_module
 
 mcp = FastMCP("meridian-docs")
 
@@ -523,6 +531,79 @@ def check_release_render_gate(
         allow_degraded_override=allow_degraded_override,
         override_reason=override_reason, override_by=override_by,
     )
+
+
+@mcp.tool()
+def inspect_render_policy(
+    policy: str | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a validated, JSON-safe render policy without touching a DOCX.
+
+    ``None`` selects the structural-first draft policy.  The named policies
+    are ``structural``, ``targeted``, ``publication``, and ``release``.
+    Structural validation is always enabled; visual rendering, rasterization,
+    TMS, and release enforcement are explicit policy fields.
+    """
+    try:
+        return render_policy_module.validate_render_policy(policy)
+    except (TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+def create_document_workspace(
+    workspace_id: str,
+    project_id: str,
+    source_snapshot_sha256: str,
+    scope: dict[str, Any] | None = None,
+    profile: str | dict[str, Any] = "default",
+    status: str = "active",
+    parent_workspace_id: str | None = None,
+    supersedes_workspace_id: str | None = None,
+) -> dict[str, Any]:
+    """Create a JSON-safe scoped document-workspace record.
+
+    This is metadata-only: it does not open, modify, render, or index a DOCX.
+    The source hash binds later approval/remapping to the exact saved document
+    snapshot that the proposal inspected.
+    """
+    try:
+        workspace = document_workspace.DocumentWorkspace(
+            workspace_id=workspace_id,
+            project_id=project_id,
+            source_snapshot_sha256=source_snapshot_sha256,
+            scope=scope,
+            profile=profile,
+            status=status,
+            parent_workspace_id=parent_workspace_id,
+            supersedes_workspace_id=supersedes_workspace_id,
+        )
+        return {
+            "status": "created",
+            "workspace": workspace.to_dict(),
+            "workspace_json": workspace.to_json(),
+        }
+    except (TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+def validate_document_workspace_lineage(
+    workspaces: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Validate a scoped workspace collection as a deterministic DAG.
+
+    The operation is read-only and metadata-only. It rejects missing or
+    cross-project parent/supersedes references, duplicate IDs, and cycles.
+    """
+    try:
+        records = [document_workspace.DocumentWorkspace.from_dict(item) for item in workspaces]
+        return {
+            "status": "valid",
+            "workspace_ids": list(document_workspace.validate_lineage(records)),
+        }
+    except (TypeError, ValueError) as exc:
+        return {"status": "invalid", "error": str(exc)}
 
 
 @mcp.tool()
@@ -2854,6 +2935,108 @@ def audit_equation_integrity(document_path: str) -> dict[str, Any]:
     equation_number_scope_ambiguous, reference_structure_mismatch.
     """
     return docs_intel.audit_equation_integrity(document_path)
+
+
+@mcp.tool()
+def lint_nomenclature(
+    document_path: str,
+    notation_manifest: dict[str, Any] | None = None,
+    rules: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read-only, deterministic nomenclature lint for a DOCX.
+
+    A project-owned notation manifest is required for meaningful results.
+    The operation reports missing/unused symbols, aliases, flattened
+    subscripts, case mismatches, and role collisions. ``rules`` is an
+    optional project-owned severity policy (error/warning/ignore per finding
+    type). It never rewrites the document and never silently invents
+    scientific definitions.
+    """
+    return nomenclature.lint_nomenclature(document_path, notation_manifest, rules)
+
+
+@mcp.tool()
+def validate_notation_manifest(
+    notation_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate a project notation registry without reading or editing a DOCX.
+
+    The registry extends the existing nomenclature shape with stable symbol
+    IDs, semantic kind, scope, index classes, typography, and explicit reuse.
+    It detects duplicate identities, overlapping role/kind collisions, and
+    disjoint-scope glyph reuse. It never renames symbols or modifies a file.
+    """
+    return notation_manifest_module.validate_notation_manifest(notation_manifest)
+
+
+@mcp.tool()
+def audit_equation_notation(
+    document_path: str,
+    notation_manifest: dict[str, Any],
+    max_occurrences: int = 50000,
+) -> dict[str, Any]:
+    """Bind native OMML equation occurrences to semantic notation roles.
+
+    This is a read-only proposal audit. It records exact equation locators,
+    visible numbers, nearest headings, scope matches, canonical/alias/
+    flattened-alias evidence, declared typography, and explicit OMML style
+    observations. It blocks overlapping active roles and reports disjoint-scope
+    reuse for review; it never renames symbols or edits the DOCX.
+    """
+    return notation_audit.audit_equation_notation(
+        document_path,
+        notation_manifest,
+        max_occurrences=max_occurrences,
+    )
+
+
+@mcp.tool()
+def census_equation_scripts(document_path: str, max_unique_terms: int = 50000) -> dict[str, Any]:
+    """Read-only inventory of every native OMML subscript/superscript term."""
+    return script_census.census_equation_scripts(
+        document_path,
+        max_unique_terms=max_unique_terms,
+    )
+
+
+@mcp.tool()
+def convert_equation(
+    source: str,
+    source_format: str,
+    target_format: str,
+) -> dict[str, Any]:
+    """Loss-aware interchange for supported LaTeX and native OMML.
+
+    ``source_format`` is ``latex`` or ``omml`` and ``target_format`` is
+    ``latex``, ``omml``, or ``ir``. The bounded IR is an inspection/editing
+    representation; native OMML remains authoritative for DOCX. Unsupported
+    constructs are returned explicitly in ``unsupported`` and ``warnings``
+    rather than silently flattened. This tool never edits a document.
+    """
+    return latex_bridge.convert_equation(source, source_format, target_format).as_dict()
+
+
+@mcp.tool()
+def build_equation_graph(
+    document_path: str,
+    notation_manifest: dict[str, Any] | None = None,
+    max_nodes: int = 10000,
+) -> dict[str, Any]:
+    """Build a read-only deterministic equation inventory and dependency graph.
+
+    The graph distinguishes line-separated/display equations, inline equations,
+    and table-embedded equations; links manifest-declared symbols; reports
+    duplicate numbers, duplicate structures, placement conflicts, and unresolved
+    lexical equation references; includes exact Word ``SEQ``/``REF`` field and
+    bookmark observations; and validates the explicit equation dependency edges
+    as a DAG. Heuristic references and definition candidates are labeled as such.
+    Native OMML remains authoritative and the document is never edited.
+    """
+    return equation_graph.build_equation_graph(
+        document_path,
+        notation_manifest,
+        max_nodes=max_nodes,
+    )
 
 
 @mcp.tool()
