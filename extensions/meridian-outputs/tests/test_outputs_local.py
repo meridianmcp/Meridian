@@ -4067,10 +4067,10 @@ class TestDuckDBMemoryLimit:
         assert OL._default_duckdb_memory_limit_bytes(tantivy_heap) == expected
 
     def test_explicit_constructor_arg_takes_precedence_over_env_var(self, monkeypatch) -> None:
-        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "4096")
+        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "8192")
         assert (
-            OL._resolve_duckdb_memory_limit_bytes(1024 * 1024 * 1024, 512 * 1024 * 1024)
-            == 1024 * 1024 * 1024
+            OL._resolve_duckdb_memory_limit_bytes(2048 * 1024 * 1024, 512 * 1024 * 1024)
+            == 2048 * 1024 * 1024
         )
 
     def test_explicit_arg_below_floor_falls_back_to_default(self, monkeypatch) -> None:
@@ -4082,8 +4082,8 @@ class TestDuckDBMemoryLimit:
         )
 
     def test_index_resolves_memory_limit_from_constructor(self, tmp_path: Path) -> None:
-        idx = OL.OutputsFtsIndex(str(tmp_path), duckdb_memory_limit_bytes=1024 * 1024 * 1024)
-        assert idx._duckdb_memory_limit_bytes == 1024 * 1024 * 1024
+        idx = OL.OutputsFtsIndex(str(tmp_path), duckdb_memory_limit_bytes=2048 * 1024 * 1024)
+        assert idx._duckdb_memory_limit_bytes == 2048 * 1024 * 1024
 
     @duckdb_required
     def test_connect_applies_memory_limit_pragma(
@@ -4110,14 +4110,14 @@ class TestDuckDBMemoryLimit:
         monkeypatch.setattr(
             duckdb, "connect", lambda *a, **kw: _ExecuteSpyCon(real_connect(*a, **kw)),
         )
-        idx = OL.OutputsFtsIndex(str(tmp_path), duckdb_memory_limit_bytes=1024 * 1024 * 1024)
+        idx = OL.OutputsFtsIndex(str(tmp_path), duckdb_memory_limit_bytes=2048 * 1024 * 1024)
         try:
             idx._connect()
         finally:
             idx.close()
         pragma_calls = [sql for sql in captured if "memory_limit" in sql.lower()]
         assert pragma_calls, f"expected a memory_limit PRAGMA, got: {captured!r}"
-        assert "1024MB" in pragma_calls[0]
+        assert "2048MB" in pragma_calls[0]
 
     @duckdb_required
     def test_connect_survives_pragma_failure(

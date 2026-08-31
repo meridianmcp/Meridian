@@ -2085,13 +2085,29 @@ _DEFAULT_DUCKDB_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 _DUCKDB_MEMORY_LIMIT_ENV_VAR = "MERIDIAN_OUTPUTS_DUCKDB_MEMORY_LIMIT_MB"
 #: Kept free (beyond the Tantivy writer's own heap) for this process's
 #: Python heap and general OS headroom before DuckDB's share is computed.
-_DUCKDB_MEMORY_RESERVE_BYTES = 1 * 1024 * 1024 * 1024
-#: DuckDB gets at most this fraction of whatever's left after reserves --
-#: deliberately a MINORITY share, since the machine this was found on runs
-#: many other concurrent processes and DuckDB claiming "everything free
-#: right now" is exactly what starved the rest of the system.
-_DUCKDB_MEMORY_LIMIT_SHARE = 0.6
-_DUCKDB_MEMORY_LIMIT_FLOOR_BYTES = 512 * 1024 * 1024
+#: 768MB, not the original 1GB -- this process's own observed peak Python
+#: heap across four real qualification-run attempts never exceeded ~700MB.
+_DUCKDB_MEMORY_RESERVE_BYTES = 768 * 1024 * 1024
+#: DuckDB gets at most this fraction of whatever's left after reserves.
+#: Recalibrated from an original 0.6 after FOUR real crashes at the
+#: original share confirmed it was too conservative for this workload, not
+#: too generous: DuckDB's own working set (buffer pool, WAL) genuinely
+#: grows with on-disk table size, and by ~60-70k indexed rows it had
+#: already consumed nearly all of a ~1.9GB budget from ordinary operation
+#: alone -- leaving no margin for a new batch's transient needs, let alone
+#: a rollback if one was needed. A larger MAJORITY share still leaves the
+#: reserve above untouched for the OS/other processes; it stops being
+#: quite so tight that normal growth alone exhausts it before the corpus
+#: is anywhere near fully indexed.
+_DUCKDB_MEMORY_LIMIT_SHARE = 0.8
+#: 1.5GB, not the original 512MB -- the original floor was never actually
+#: the binding constraint in any of the four crashes (the resolved value
+#: was always well above it), but 512MB is now a KNOWN-insufficient value
+#: for this workload at real scale, confirmed live at ~1.9GB. Raising the
+#: floor stops _resolve_duckdb_memory_limit_bytes from ever configuring a
+#: value that's already known not to work, even under low-availability
+#: conditions or a badly-chosen explicit override.
+_DUCKDB_MEMORY_LIMIT_FLOOR_BYTES = 1536 * 1024 * 1024
 _DUCKDB_MEMORY_LIMIT_CEILING_BYTES = 16 * 1024 * 1024 * 1024
 
 
