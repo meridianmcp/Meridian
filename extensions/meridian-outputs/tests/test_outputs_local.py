@@ -2711,6 +2711,166 @@ class TestParallelRebuildCorrectness:
 
 
 # ---------------------------------------------------------------------------
+# Legacy-path migration throttling (task_ecb96ac9 follow-on, perf)
+# ---------------------------------------------------------------------------
+
+class TestLegacyMigrationThrottle:
+    """The legacy-path migration scan was running unconditionally on every
+    rebuild() call -- an O(rows already indexed) cost that compounds badly
+    at real scale (confirmed live: ~100k-row rescans on every single call of
+    the SUT_Compressed qualification run, finding nothing to fix on nearly
+    all of them). Throttled to: the first call always scans, a scan that
+    finds+fixes something forces an immediate recheck next call (stays
+    vigilant for an active concurrent writer or a still-completing first
+    pass), and otherwise at most one scan per
+    _LEGACY_MIGRATION_RECHECK_INTERVAL calls -- bounding staleness rather
+    than eliminating the check."""
+
+    @staticmethod
+    def _spy_migration(idx: "OL.OutputsFtsIndex", results: list) -> list:
+        """Replaces the instance's migration method with a spy that records
+        each call and returns the next value from `results` (repeating the
+        last value once exhausted) instead of touching a real DuckDB
+        connection -- isolates the throttle's call-counting logic from the
+        migration function's own behavior."""
+        calls: list[int] = []
+
+        def spy(con: Any) -> bool:
+            calls.append(len(calls) + 1)
+            idx_in_results = min(len(calls) - 1, len(results) - 1)
+            return results[idx_in_results]
+
+        idx._migrate_legacy_storage_paths_locked = spy
+        return calls
+
+    def test_first_call_always_scans(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        calls = self._spy_migration(idx, [False])
+        try:
+            idx.rebuild()
+        finally:
+            idx.close()
+        assert len(calls) == 1
+
+    def test_clean_scan_throttles_subsequent_calls(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        calls = self._spy_migration(idx, [False])
+        try:
+            for _ in range(5):
+                idx.rebuild()
+        finally:
+            idx.close()
+        assert len(calls) == 1, "a clean first scan must throttle every call after it"
+
+    def test_periodic_recheck_after_interval(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        calls = self._spy_migration(idx, [False])
+        interval = OL.OutputsFtsIndex._LEGACY_MIGRATION_RECHECK_INTERVAL
+        try:
+            for _ in range(interval + 1):
+                idx.rebuild()
+            assert len(calls) == 1, "the interval must not have elapsed yet"
+            idx.rebuild()
+            assert len(calls) == 2, "one more call must cross the recheck interval"
+        finally:
+            idx.close()
+
+    def test_found_migration_forces_immediate_recheck(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        calls = self._spy_migration(idx, [True, False])
+        try:
+            idx.rebuild()
+            assert len(calls) == 1
+            idx.rebuild()
+            assert len(calls) == 2, (
+                "a scan that found+fixed something must force an immediate "
+                "recheck next call, not throttle"
+            )
+            idx.rebuild()
+            assert len(calls) == 2, "the clean 2nd scan must throttle the 3rd call"
+        finally:
+            idx.close()
+
+    def test_failed_scan_forces_immediate_retry_not_full_cooldown(
+        self, tmp_path: Path,
+    ) -> None:
+        """A scan that RAISES must not be treated as a verified-clean pass --
+        that would buy a DB state we never actually confirmed the full
+        recheck-interval cooldown. It must force a retry on the very next
+        call instead, same as a scan that found real duplicates."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        call_count = [0]
+
+        def flaky(con: Any) -> bool:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("simulated transient DB error")
+            return False
+
+        idx._migrate_legacy_storage_paths_locked = flaky
+        try:
+            idx.rebuild()  # call 1: scan raises
+            assert call_count[0] == 1
+            idx.rebuild()  # call 2: must retry immediately, not throttle
+            assert call_count[0] == 2, (
+                "a failed scan must force an immediate recheck next call, "
+                "not the full recheck-interval cooldown"
+            )
+            idx.rebuild()  # call 3: the now-clean scan on call 2 throttles this one
+            assert call_count[0] == 2
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_duplicate_introduced_mid_throttle_is_eventually_caught(
+        self, tmp_path: Path,
+    ) -> None:
+        """Real end-to-end correctness check (no spy): a legacy-spelling
+        duplicate row inserted directly into the DB -- standing in for a
+        concurrent second process's write, without actually opening a second
+        concurrent connection to the same file -- while this instance is
+        throttled must still get cleaned up within the recheck interval, not
+        silently missed forever."""
+        f = tmp_path / "data.csv"
+        f.write_text("x\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-throttle.duckdb")
+        absolute_path = os.path.abspath(os.path.normpath(str(f)))
+        legacy_path = os.path.relpath(absolute_path, start=os.getcwd())
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            assert idx.rebuild() == 1  # first call: real scan, establishes throttle
+            rows = idx._con.execute("SELECT path FROM outputs_index").fetchall()
+            assert rows == [(absolute_path,)]
+
+            # Stand in for a concurrent second process's write via this
+            # instance's own already-open connection -- avoids the separate
+            # question of whether DuckDB allows two concurrent connections to
+            # one file, which isn't what this test is checking.
+            idx._con.execute(
+                "INSERT INTO outputs_index (path, content, mtime, sha256, size, "
+                "generating_script, kind, is_archival, canonical_path, "
+                "csv_columns, json_keys) "
+                "SELECT ?, content, mtime, sha256, size, generating_script, kind, "
+                "is_archival, canonical_path, csv_columns, json_keys "
+                "FROM outputs_index WHERE path = ?",
+                [legacy_path, absolute_path],
+            )
+
+            interval = OL.OutputsFtsIndex._LEGACY_MIGRATION_RECHECK_INTERVAL
+            for _ in range(interval + 1):
+                idx.rebuild()
+
+            rows = idx._con.execute("SELECT path FROM outputs_index").fetchall()
+            assert rows == [(absolute_path,)], (
+                "the duplicate must be cleaned up within the recheck interval, "
+                "not permanently missed"
+            )
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
 # rebuild() Phase 1 deadline enforcement (sprint item d9c76caa)
 # ---------------------------------------------------------------------------
 

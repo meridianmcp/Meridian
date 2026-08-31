@@ -2205,6 +2205,11 @@ class OutputsFtsIndex:
     # list small even if a corpus has an unusually large number of
     # duplicate-path groups, independent of _ADAPTIVE_* batch sizing above.
     _MIGRATION_CONTENT_CHUNK = 200
+    # How many rebuild() calls the legacy-path migration scan may be skipped
+    # for after a clean (nothing-to-fix) pass, bounding how stale a
+    # concurrent-writer-introduced duplicate can get before it's caught
+    # again (see rebuild()'s call site for the full throttling rationale).
+    _LEGACY_MIGRATION_RECHECK_INTERVAL = 25
     """Persistent DuckDB FTS index over a local outputs directory.
 
     Same logic as the main-repo OutputsFtsIndex, but:
@@ -2486,6 +2491,14 @@ class OutputsFtsIndex:
         # process died" from an arbitrarily older one; nothing in the
         # convergence-state contract branches on its value.
         self._walk_epoch = 0
+        # task_ecb96ac9 follow-on (perf) -- see _LEGACY_MIGRATION_RECHECK_
+        # INTERVAL and rebuild()'s call site. _ever_scanned starting False
+        # forces the full migration scan on this instance's first rebuild()
+        # call; _found_last_time starting True is only consulted after that
+        # first real scan overwrites it, so its initial value is inert.
+        self._legacy_migration_ever_scanned = False
+        self._legacy_migration_calls_since_scan = 0
+        self._legacy_migration_found_last_time = True
 
     def _connect(self) -> Any:
         if self._con is None:
@@ -4161,20 +4174,66 @@ class OutputsFtsIndex:
             # Repair caches written by pre-canonicalization versions before
             # the normal staleness pass. This runs under the write lease so a
             # repair cannot race another process's row update.
-            try:
-                legacy_paths_migrated = (
-                    self._migrate_legacy_storage_paths_locked(self._connect())
+            #
+            # Throttled (task_ecb96ac9 follow-on, perf): the scan itself is
+            # memory-safe (excludes content), but it's still O(rows already
+            # indexed) EVERY call -- confirmed live on the SUT_Compressed
+            # qualification run: by ~98k indexed rows this was re-scanning
+            # nearly 100k rows of metadata every single call to find
+            # duplicates that essentially never exist once a process's own
+            # writes are already canonical. Legacy duplicates only arise from
+            # genuinely pre-canonicalization on-disk data (a one-time,
+            # first-scan concern) or a concurrent SECOND process racing a
+            # write for the same path (an ongoing but comparatively rare
+            # concern) -- neither needs re-verifying on literally every call.
+            # Run it on the first call, skip up to
+            # _LEGACY_MIGRATION_RECHECK_INTERVAL calls after a clean scan,
+            # and re-run immediately (not throttled) the call right after any
+            # scan that actually found+fixed something, since that signals
+            # either a still-completing first pass or an active concurrent
+            # writer -- either way, worth staying vigilant rather than
+            # reverting straight back to the full throttle. This bounds the
+            # staleness window for the concurrent-writer case rather than
+            # eliminating the check permanently.
+            run_legacy_migration = (
+                not self._legacy_migration_ever_scanned
+                or self._legacy_migration_found_last_time
+                or self._legacy_migration_calls_since_scan
+                >= self._LEGACY_MIGRATION_RECHECK_INTERVAL
+            )
+            if run_legacy_migration:
+                migration_failed = False
+                try:
+                    legacy_paths_migrated = (
+                        self._migrate_legacy_storage_paths_locked(self._connect())
+                    )
+                except Exception as _path_migration_exc:  # noqa: BLE001
+                    legacy_paths_migrated = False
+                    migration_failed = True
+                    self.last_db_write_error = (
+                        f"{type(_path_migration_exc).__name__}: "
+                        f"{_path_migration_exc}"
+                    )
+                    _log.warning(
+                        "OutputsFtsIndex.rebuild: legacy path migration failed",
+                        exc_info=True,
+                    )
+                self._legacy_migration_ever_scanned = True
+                # A failed attempt must NOT be treated as a verified-clean
+                # scan -- that would buy it the full recheck-interval
+                # cooldown for a DB state we never actually confirmed,
+                # exactly backwards from Phase 2's own "resubmit next call"
+                # retry philosophy for write failures elsewhere in this
+                # method. Forcing found_last_time=True makes the NEXT call
+                # retry immediately instead, same as a scan that genuinely
+                # found (and needs to keep watching for) real duplicates.
+                self._legacy_migration_found_last_time = (
+                    True if migration_failed else legacy_paths_migrated
                 )
-            except Exception as _path_migration_exc:  # noqa: BLE001
+                self._legacy_migration_calls_since_scan = 0
+            else:
                 legacy_paths_migrated = False
-                self.last_db_write_error = (
-                    f"{type(_path_migration_exc).__name__}: "
-                    f"{_path_migration_exc}"
-                )
-                _log.warning(
-                    "OutputsFtsIndex.rebuild: legacy path migration failed",
-                    exc_info=True,
-                )
+                self._legacy_migration_calls_since_scan += 1
             self._ingest_meridian_notes(all_paths)
             rows, changed, paths_to_delete, new_rows = (
                 self._apply_precomputed(
