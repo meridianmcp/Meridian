@@ -7273,7 +7273,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         {
             "name": "patch_file",
             "description": (
-                "Make a targeted edit to a file in the project's connected GitHub repo: "
+                "Make a targeted edit to a file in the project's connected GitHub repository: "
                 "replace an exact substring (old_str) with new_str and commit it. old_str "
                 "must match the current file contents exactly (including whitespace) and "
                 "appear exactly once. Sends only the changed snippet, so it edits very "
@@ -7332,7 +7332,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "search_commits",
-            "description": "Search recent commits by message substring. Fetches up to 100 recent commits and filters by case-insensitive match. Returns helpful error if no GitHub repo is connected.",
+            "description": "Search recent commits in the project's connected GitHub repository by message substring. Fetches up to 100 recent commits and filters by case-insensitive match. Returns helpful error if no GitHub repo is connected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7357,7 +7357,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "get_workflow_runs",
-            "description": "List recent GitHub Actions workflow runs with status/conclusion/url. Optionally filter by workflow file name (e.g. deploy.yml).",
+            "description": "List recent GitHub Actions workflow runs for the project's connected GitHub repository, with status/conclusion/url. Optionally filter by workflow file name (e.g. deploy.yml).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7370,7 +7370,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "get_workflow_run_logs",
-            "description": "Return the failed job steps for a GitHub Actions run, with the last 50 log lines per failed job. Use to see why CI is red.",
+            "description": "Return the failed job steps for a GitHub Actions run belonging to the project's connected GitHub repository, with the last 50 log lines per failed job. Use to see why CI is red.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7382,7 +7382,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "trigger_workflow",
-            "description": "Fire a GitHub Actions workflow_dispatch event. ref defaults to the project's configured branch (or main). inputs is an optional object of workflow inputs.",
+            "description": "Fire a GitHub Actions workflow_dispatch event in the project's connected GitHub repository. ref defaults to the project's configured branch (or main). inputs is an optional object of workflow inputs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7396,7 +7396,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "git_diff",
-            "description": "Compare two refs (base...head) in the connected repo. Returns changed files with additions/deletions/patch and the total commit count.",
+            "description": "Compare two refs (base...head) in the project's connected GitHub repository. Returns changed files with additions/deletions/patch and the total commit count.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7418,7 +7418,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "list_issues",
-            "description": "List issues in the connected repo. Returns number, title, state, labels, created_at, url, and a body preview. Pull requests are excluded.",
+            "description": "List issues in the project's connected GitHub repository. Returns number, title, state, labels, created_at, url, and a body preview. Pull requests are excluded.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7432,7 +7432,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "create_issue",
-            "description": "Open a new issue in the connected repo. Returns the created issue number and url.",
+            "description": "Open a new issue in the project's connected GitHub repository. Returns the created issue number and url.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7446,7 +7446,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "get_issue",
-            "description": "Read a single issue plus its comments from the connected repo.",
+            "description": "Read a single issue plus its comments from the project's connected GitHub repository.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

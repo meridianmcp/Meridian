@@ -666,3 +666,110 @@ def test_mcp_tools_list_no_github_tools_when_disconnected(tmp_path, monkeypatch)
         tool_names = {tool["name"] for tool in r.json()["result"]["tools"]}
         assert "read_file" not in tool_names
         assert "get_commits" not in tool_names
+
+
+# ---------------------------------------------------------------------------
+# f1c6dd63 — GitHub tool descriptions must disclose connected-repo scope
+# ---------------------------------------------------------------------------
+
+_REPO_SCOPED_GITHUB_TOOLS = (
+    "read_file",
+    "patch_file",
+    "list_files",
+    "search_code",
+    "get_commits",
+    "search_commits",
+    "get_commit",
+    "git_diff",
+    "list_branches",
+    "get_workflow_runs",
+    "get_workflow_run_logs",
+    "trigger_workflow",
+    "list_issues",
+    "create_issue",
+    "get_issue",
+)
+
+
+def test_github_tool_descriptions_disclose_connected_repo_scope():
+    """git_diff/list_branches/get_workflow_runs/trigger_workflow/list_issues/
+    create_issue must explicitly say they operate on the project's connected
+    GitHub repository (Anthropic MCP Directory disclosure requirement,
+    f1c6dd63). Checked against the actual generated tool list returned by
+    _github_tools_for_tenant, not just the source literal in isolation.
+    """
+    tenant = {"github_pat": db_module.encrypt_field("ghp_x")}
+    tools_by_name = {t["name"]: t for t in server_module._github_tools_for_tenant(tenant)}
+
+    for name in _REPO_SCOPED_GITHUB_TOOLS:
+        assert name in tools_by_name, f"{name} missing from generated GitHub tool list"
+        description = tools_by_name[name]["description"]
+        assert "connected GitHub repository" in description, (
+            f"{name} description does not disclose connected-repo scope: {description!r}"
+        )
+        # None of these six tools accept an owner/repo override today, so the
+        # description must claim scoping to the connected repo outright --
+        # not a hedged "defaults to" that would imply a broader reach than
+        # the tool actually has. If an owner/repo param is ever added, this
+        # assertion (and the description wording) must be revisited together.
+        props = tools_by_name[name]["inputSchema"]["properties"]
+        assert "owner" not in props
+        assert "repo" not in props
+
+
+def test_mcp_tools_list_github_tool_descriptions_disclose_connected_repo(tmp_path, monkeypatch):
+    """Same disclosure check against the live /mcp tools/list JSON-RPC
+    response (not just the in-process generator), per f1c6dd63's acceptance
+    criterion to verify the actual tools/list output.
+    """
+
+    class _MockAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, **kwargs):
+            class _Response:
+                status_code = 200
+
+                def json(self):
+                    return {"login": "u"}
+
+            return _Response()
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda **kwargs: _MockAsyncClient())
+
+    mod, client = _github_client(tmp_path, monkeypatch)
+
+    with client:
+        async def _setup():
+            db = client.app.state.db
+            tenant = await db_module.upsert_tenant(db, "gh_disclosure@example.com")
+            raw, _ = await db_module.create_api_token(db, tenant["id"])
+            proj = await db_module.create_project(db, "gh-disclosure-proj")
+            return raw, proj["id"]
+
+        token, pid = asyncio.run(_setup())
+
+        client.post(
+            f"/projects/{pid}/github/connect",
+            json={"pat": "ghp_test", "repo": "a/b"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        r = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200
+        tools_by_name = {tool["name"]: tool for tool in r.json()["result"]["tools"]}
+
+        for name in _REPO_SCOPED_GITHUB_TOOLS:
+            assert name in tools_by_name, f"{name} missing from live tools/list output"
+            description = tools_by_name[name]["description"]
+            assert "connected GitHub repository" in description, (
+                f"{name} live tools/list description missing disclosure: {description!r}"
+            )

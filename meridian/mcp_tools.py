@@ -138,12 +138,18 @@ _TOOL_EXAMPLES: dict[str, str] = {
 # persistence contract in tools/list so clients can explain it before use.
 _PERSISTENCE_NOTICE = (
     "Persistent-state disclosure: on hosted Meridian, supplied text and "
-    "project/session metadata are sent to and stored in Meridian's service; "
-    "self-hosted deployments keep them in the configured local SQLite/Postgres "
-    "database. This data is visible in the dashboard/API and later project "
-    "context or handoffs. Delete individual tasks, notes, or decisions where "
-    "supported, or delete the project/account using the documented controls. "
-    "Do not include secrets."
+    "project/session metadata -- including task log entries, pinned "
+    "decisions, sprint items, notes, handoff/goal state, and HITL queue "
+    "items -- are sent to and stored in Meridian's service, in an isolated "
+    "per-tenant Postgres database (Neon); self-hosted deployments keep the "
+    "same categories in the configured local SQLite/Postgres database. This "
+    "data is visible in the dashboard and API, and may resurface in later "
+    "project context or handoffs. Notes and pinned decisions can be deleted "
+    "individually; task log entries and sprint items can be deleted via the "
+    "dashboard/API (not exposed as an agent-facing tool); HITL queue items "
+    "and handoff state have no per-record delete. Full removal of any of "
+    "this data is available via project or account deletion, using the "
+    "documented controls. Do not include secrets."
 )
 
 
