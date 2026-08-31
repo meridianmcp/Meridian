@@ -104,6 +104,17 @@ meridian-codeindex = { path = "extensions/meridian-codeindex", editable = true }
 # under investigation for 52cbe5d8 until this was caught and fixed.
 tantivy = ">=0.22"
 xxhash = ">=3.4"
+# task_ecb96ac9 follow-on (perf) -- same gap as tantivy/xxhash above (52cbe5d8):
+# declared in extensions/meridian-outputs/pyproject.toml (e8a2f710) as the
+# backing dependency for OutputsFtsIndex.rebuild()'s Phase-2 bulk-insert fast
+# path, but never added HERE, so it was silently absent in every worktree's
+# shared pixi env. Confirmed live: a real qualification run against the
+# SUT_Compressed corpus spent 94% of total rebuild() time in the write phase
+# (70.5s of 74.8s for a single 1954-row batch) because it was silently falling
+# back to the slow parameter-bound insert path this whole time -- the code's
+# own comment at that call site measured the pyarrow path at ~150x faster for
+# a comparable batch size.
+pyarrow = ">=14.0"
 mcp = ">=1.0"
 anthropic = ">=0.40"
 python-dotenv = ">=1.0"

@@ -2711,6 +2711,68 @@ class TestParallelRebuildCorrectness:
 
 
 # ---------------------------------------------------------------------------
+# Phase-2 bulk-insert path (task_ecb96ac9 follow-on, perf)
+# ---------------------------------------------------------------------------
+
+class TestBulkInsertPath:
+    """e8a2f710 added a pyarrow zero-copy bulk-insert fast path (measured
+    ~150x faster than the parameter-bound fallback for a comparable batch),
+    but pyarrow was never added to this repo's shared pixi.toml (the same
+    gap 52cbe5d8 already fixed once for tantivy/xxhash) -- confirmed live,
+    it was silently absent in every worktree, so this branch had ZERO test
+    coverage: every rebuild() in the whole suite always took the fallback
+    path. Both branches must produce identical, correct results."""
+
+    @duckdb_required
+    def test_pyarrow_and_fallback_paths_produce_identical_rows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("term,value\nalpha,1", encoding="utf-8")
+        (tmp_path / "b.json").write_text('{"beta": 2}', encoding="utf-8")
+        (tmp_path / "c.txt").write_text("gamma content", encoding="utf-8")
+
+        def _index_rows(db_path: str) -> list[tuple]:
+            idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+            try:
+                count = idx.rebuild()
+                rows = idx._con.execute(
+                    "SELECT path, content, sha256, size, kind, csv_columns, "
+                    "json_keys FROM outputs_index ORDER BY path"
+                ).fetchall()
+                return count, rows
+            finally:
+                idx.close()
+
+        pyarrow_db = str(tmp_path.parent / f"{tmp_path.name}-pyarrow.duckdb")
+        count_pyarrow, rows_pyarrow = _index_rows(pyarrow_db)
+        assert count_pyarrow == 3
+
+        monkeypatch.setitem(sys.modules, "pyarrow", None)
+        fallback_db = str(tmp_path.parent / f"{tmp_path.name}-fallback.duckdb")
+        count_fallback, rows_fallback = _index_rows(fallback_db)
+        assert count_fallback == 3
+
+        assert rows_pyarrow == rows_fallback, (
+            "the pyarrow bulk-insert path and the parameter-bound fallback "
+            "must persist identical rows for the same input files"
+        )
+
+    def test_missing_pyarrow_falls_back_without_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression for the exact gap that made this branch untested for
+        so long: pyarrow being ABSENT must never raise, just silently take
+        the documented fallback path."""
+        monkeypatch.setitem(sys.modules, "pyarrow", None)
+        (tmp_path / "a.txt").write_text("content", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx.rebuild() == 1
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
 # Legacy-path migration throttling (task_ecb96ac9 follow-on, perf)
 # ---------------------------------------------------------------------------
 
