@@ -673,12 +673,21 @@ def test_mcp_tools_list_no_github_tools_when_disconnected(tmp_path, monkeypatch)
 # ---------------------------------------------------------------------------
 
 _REPO_SCOPED_GITHUB_TOOLS = (
+    "read_file",
+    "patch_file",
+    "list_files",
+    "search_code",
+    "get_commits",
+    "search_commits",
+    "get_commit",
     "git_diff",
     "list_branches",
     "get_workflow_runs",
+    "get_workflow_run_logs",
     "trigger_workflow",
     "list_issues",
     "create_issue",
+    "get_issue",
 )
 
 

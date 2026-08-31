@@ -55,10 +55,13 @@ an external form.
 ## Third-party connections (for the form's integrations/permissions field)
 
 Meridian's only first-party third-party connection today is the optional
-GitHub integration (personal access token, read-only repo tools). The full
-description — what scopes are requested, how the token is stored, what it's
-used for — is public at `docs/github-integration.md`; summarize from there
-rather than duplicating the details here.
+GitHub integration (personal access token, repository and GitHub Actions/Issues
+tools). The integration exposes read tools plus three explicit write tools:
+`patch_file` (targeted commit), `trigger_workflow` (workflow dispatch), and
+`create_issue` (open an issue). The full description — what scopes are requested,
+how the token is stored, and what each operation does — is public at
+`docs/github-integration.md`; summarize from there rather than duplicating the
+details here.
 
 Other MCP tunnel connectors a given deployment may wire up (e.g. Context7)
 are user-configured, not something Meridian itself connects to by default,
