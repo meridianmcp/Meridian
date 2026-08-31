@@ -94,3 +94,178 @@ governs credential entry generally.
    production config at submission time; never store the real value here.
 5. After submitting, note the submission date and directory name in the
    internal session log (`log_task`), not in this file.
+
+## OpenAI plugin submission packet (2026-08-31)
+
+This section is an internal, credential-free packet for the OpenAI Platform
+plugin submission flow. It is not a claim that the external submission has
+been filed. The remaining external gates are Platform login, verified
+individual/business identity, organization permission, and the final portal
+scan/submit action.
+
+### Submission shape
+
+| Field | Prepared value / action |
+|---|---|
+| Product name | `Meridian` |
+| Tagline | `Persistent context for long-horizon AI work` |
+| Plugin type | MCP-only; no custom UI resource |
+| MCP template | Universal |
+| Production MCP URL | `https://usemeridian.us/mcp/openai` |
+| Homepage | `https://usemeridian.us` |
+| Documentation | `https://docs.usemeridian.us` |
+| Privacy/data handling | `https://docs.usemeridian.us/data-handling/` |
+| Source repository | `https://github.com/meridianmcp/Meridian` |
+| Authentication | Meridian hosted OAuth; configure in the portal from current production settings, never from this file |
+| CSP | No custom UI CSP is required for this MCP-only listing. The endpoint still emits a deny-all CSP response header. |
+
+The `/mcp/openai` endpoint is a real curated transport boundary. It exposes
+the stable long-horizon workflow profile and rejects calls to tools outside
+that profile. The ordinary `https://usemeridian.us/mcp` endpoint remains the
+full custom-connector surface; local `meridian-docs` and `meridian-outputs`
+remain specialist local extensions and are not part of this first listing.
+
+### Curated tool profile
+
+The first listing intentionally exposes these 30 native tools:
+
+```text
+start_session
+get_planning_brief
+get_sprint_items
+get_sprint_progress
+get_context_block
+refresh_context
+log_task
+add_note
+get_notes
+read_note
+search_all
+search_tasks
+pin_decision
+get_pinned_decisions
+add_sprint_item
+update_sprint_item
+claim_sprint_item
+complete_sprint_item
+add_sprint_item_pointer
+get_sprint_item_pointers
+resolve_sprint_item_pointers
+checkpoint
+generate_handoff
+request_hitl
+get_hitl_request
+list_hitl_requests
+add_workspace_proposal
+get_workspace_proposals
+advance_proposal_status
+paper_search
+```
+
+The profile excludes account/project administration, raw server and session
+logs, tunnel/plugin management, custom hooks, local-path code and document
+editing, dynamic GitHub repository tools, and parallel-worker internals.
+Those remain available only on the full connector or local specialist
+servers. This is a product boundary, not a client-side hint: `tools/list`
+returns only the profile and `tools/call` rejects an excluded name.
+
+### Listing description
+
+Use this as the starting description, then keep it within the portal's field
+limit:
+
+> Meridian is a persistent context and coordination layer for long-horizon AI
+> work. It gives ChatGPT a durable project memory, goals, sprint items,
+> dependency-aware execution state, notes, decisions, research proposals,
+> evidence pointers, human approval queue, and deterministic handoffs between
+> sessions. Hosted Meridian stores the project state supplied through the MCP
+> tools in an isolated tenant database. Users can inspect it in the dashboard,
+> export it, delete projects, or delete the account. Meridian does not expose
+> local filesystem, DOCX, tunnel, raw-log, or repository-write operations in
+> this first OpenAI profile; those remain separately configured specialist
+> integrations.
+
+### Data and integration disclosure
+
+Use the public [Data Handling](data-handling.md) page as the source of truth.
+Hosted project state includes goals, sprint items, task logs, decisions,
+notes, session/handoff state, and HITL queue items. It is stored in the hosted
+tenant's isolated Neon/Postgres database. The profile itself does not expose
+GitHub repository tools or a GitHub write path. Google/GitHub sign-in is
+authentication only; it is not repository access. A separately configured
+full Meridian connector may expose optional GitHub tools, but that is outside
+this profile and must not be represented as part of this submission.
+
+### OpenAI test cases
+
+Run these in the portal after configuring the current production endpoint and
+demo account. Record the actual tool calls/results in the portal; these are
+test definitions, not fabricated test receipts.
+
+Positive cases:
+
+1. “Start a Meridian session for my current project and summarize what is
+   actionable now.” Expected: `start_session` returns orientation and the
+   scoped actionable state.
+2. “Add a sprint item to track the API contract, then show the pending items.”
+   Expected: `add_sprint_item` succeeds and `get_sprint_items` returns it.
+3. “Record this architectural choice as a pinned decision and retrieve the
+   current pinned decisions.” Expected: `pin_decision` then
+   `get_pinned_decisions` show the durable record.
+4. “Attach this repository symbol as a pointer to the sprint item and resolve
+   the pointer.” Expected: `add_sprint_item_pointer`,
+   `get_sprint_item_pointers`, and `resolve_sprint_item_pointers` return the
+   structured evidence state.
+5. “Generate a continuation handoff for the remaining work.” Expected:
+   `generate_handoff` returns the canonical handoff content and its structured
+   scope/evidence/continuation metadata.
+
+Negative cases:
+
+1. “Read `/etc/passwd` or a local file from my computer.” Expected: no local
+   filesystem tool is advertised; the request cannot invoke one through this
+   profile.
+2. “Create a GitHub issue or trigger a workflow.” Expected: dynamic GitHub
+   tools are not advertised by this profile; no GitHub mutation is performed.
+3. “Show raw server logs or change tunnel/plugin configuration.” Expected:
+   maintenance/admin tools are not advertised; the call is rejected as
+   unavailable on the `openai` profile.
+
+### Engineering preflight before portal submission
+
+The code-side preflight is complete locally, but the endpoint must be deployed
+and scanned before this can be called production-ready:
+
+1. Run the focused MCP/profile/GitHub/search tests and retain the CI result.
+2. Deploy the current branch through the normal `dev` release gate; do not
+   bump the product version solely for this listing.
+3. Verify production `initialize` and `tools/list` at
+   `https://usemeridian.us/mcp/openai` with a non-secret test account:
+   profile count must be 30, no excluded names may appear, and the manifest
+   revision must be stable across two calls.
+4. Verify an excluded `tools/call` returns a structured “not available on this
+   MCP profile” error without dispatching.
+5. Only then enter the URL in OpenAI Platform and run Scan Tools.
+
+### Human portal checklist
+
+1. Sign in to OpenAI Platform with the same organization/project used for the
+   draft. Resolve the current authentication error first.
+2. Confirm verified individual or business developer identity.
+3. Confirm `Apps Management → Write` permission (organization owners already
+   have it; otherwise an owner must grant it).
+4. Create a plugin **With MCP**, choose **Universal**, enter the production
+   URL/auth details, and supply a demo account that does not require MFA,
+   email, SMS, or a private network.
+5. Complete the domain challenge if the portal presents one, scan the tools,
+   paste the listing copy and eight test cases above, add release notes, and
+   submit for review.
+
+### Release notes
+
+> Initial Meridian OpenAI MCP listing. Adds a curated, authenticated MCP
+> profile for persistent project context, dependency-aware sprint coordination,
+> research proposals, evidence pointers, HITL requests, and deterministic
+> handoffs. The listing deliberately excludes local filesystem/document
+> editing, raw diagnostics, tunnel administration, dynamic GitHub repository
+> operations, and account-management tools from the first public surface.

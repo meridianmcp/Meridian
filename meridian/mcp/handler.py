@@ -1161,6 +1161,7 @@ async def _handle_mcp_request(
     token_type: str = "readwrite",
     enforce_role: str | None = None,
     scoped_project_ids: "list[str] | None" = None,
+    allowed_tool_names: "frozenset[str] | None" = None,
 ) -> dict[str, Any]:
     """Dispatch one JSON-RPC 2.0 MCP request and return the response dict.
 
@@ -1284,6 +1285,11 @@ async def _handle_mcp_request(
                         "detail": str(exc)[:200],
                     }
         from ..tool_manifest import build_tool_manifest  # noqa: PLC0415
+        # A named public profile is an actual transport boundary, not merely
+        # advisory role metadata.  Filter after native/GitHub/tunnel assembly
+        # so no optional tenant or plugin tool can leak into the profile.
+        if allowed_tool_names is not None:
+            tools = [tool for tool in tools if tool.get("name") in allowed_tool_names]
         manifest = build_tool_manifest(tools)
         manifest_meta: dict = {
             "revision": manifest["revision"],
@@ -1338,6 +1344,12 @@ async def _handle_mcp_request(
         # rewritten.
         if isinstance(name, str) and name.startswith("meridian."):
             name = name.removeprefix("meridian.")
+        if allowed_tool_names is not None and name not in allowed_tool_names:
+            return _server._jsonrpc_err(
+                req_id,
+                -32601,
+                f"tool '{name}' is not available on this MCP profile",
+            )
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
         # 95499c3e / decision 6fe5210c — Option A project-scope enforcement for
