@@ -2065,6 +2065,88 @@ def _resolve_tantivy_heap_bytes(explicit: int | None) -> int:
     return _default_tantivy_heap_bytes()
 
 
+# task_ecb96ac9 follow-on -- DuckDB has no default memory ceiling of its own
+# (it will try to use up to ~80% of total system RAM). Confirmed live: a real
+# whole-root run (632k+ files) crashed with an unrecoverable
+# "Out of Memory Error: Allocation failure" where even the ROLLBACK of the
+# failed operation also hit an allocation failure, permanently invalidating
+# the connection ("database has been invalidated") -- every subsequent
+# rebuild() call failed identically on the same dead connection. The system
+# was already down to single-digit GB free (other concurrent processes on a
+# shared machine) before this connection even opened, so DuckDB's unbounded
+# default let it keep growing until the OS itself had nothing left to give,
+# a much harder failure mode than DuckDB hitting its own configured limit
+# (an expected, internally-handled condition its query executor is built to
+# recover from, unlike a bare malloc() returning nothing). Setting an
+# explicit `memory_limit` gives DuckDB a ceiling to self-manage against
+# *before* system-wide exhaustion, at the cost of DuckDB reporting an
+# out-of-memory error somewhat sooner than it otherwise might.
+_DEFAULT_DUCKDB_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+_DUCKDB_MEMORY_LIMIT_ENV_VAR = "MERIDIAN_OUTPUTS_DUCKDB_MEMORY_LIMIT_MB"
+#: Kept free (beyond the Tantivy writer's own heap) for this process's
+#: Python heap and general OS headroom before DuckDB's share is computed.
+_DUCKDB_MEMORY_RESERVE_BYTES = 1 * 1024 * 1024 * 1024
+#: DuckDB gets at most this fraction of whatever's left after reserves --
+#: deliberately a MINORITY share, since the machine this was found on runs
+#: many other concurrent processes and DuckDB claiming "everything free
+#: right now" is exactly what starved the rest of the system.
+_DUCKDB_MEMORY_LIMIT_SHARE = 0.6
+_DUCKDB_MEMORY_LIMIT_FLOOR_BYTES = 512 * 1024 * 1024
+_DUCKDB_MEMORY_LIMIT_CEILING_BYTES = 16 * 1024 * 1024 * 1024
+
+
+def _default_duckdb_memory_limit_bytes(tantivy_heap_bytes: int) -> int:
+    """Resolve the default DuckDB `memory_limit` (bytes) from the
+    environment (MB) or, absent that, from currently AVAILABLE system
+    memory -- checked fresh at connect time, not total capacity, since a
+    shared machine's free memory at any given moment is the real constraint
+    (see module comment above). Mirrors _default_tantivy_heap_bytes's
+    env-var-in-MB convention and _initial_adaptive_batch's psutil
+    lazy-import/fail-soft convention."""
+    raw = os.environ.get(_DUCKDB_MEMORY_LIMIT_ENV_VAR)
+    if raw is not None and raw.strip():
+        try:
+            env_bytes = int(raw.strip()) * 1024 * 1024
+        except ValueError:
+            _log.warning(
+                "%s=%r is not a valid integer (MB) -- falling back to "
+                "availability-based default", _DUCKDB_MEMORY_LIMIT_ENV_VAR, raw,
+            )
+        else:
+            # An in-range value passes straight through; an out-of-range one
+            # (0, negative, or absurdly large) gets clamped rather than
+            # silently defeating the floor/ceiling the rest of this
+            # mechanism exists to enforce -- a fat-fingered env var (e.g.
+            # "=0") must not be able to reproduce the exact starvation this
+            # whole safety net was built to prevent.
+            return max(
+                _DUCKDB_MEMORY_LIMIT_FLOOR_BYTES,
+                min(env_bytes, _DUCKDB_MEMORY_LIMIT_CEILING_BYTES),
+            )
+    try:
+        import psutil  # noqa: PLC0415
+        available = int(psutil.virtual_memory().available)
+    except (ImportError, OSError, AttributeError):
+        return _DEFAULT_DUCKDB_MEMORY_LIMIT_BYTES
+    usable = available - tantivy_heap_bytes - _DUCKDB_MEMORY_RESERVE_BYTES
+    limit = int(usable * _DUCKDB_MEMORY_LIMIT_SHARE)
+    return max(_DUCKDB_MEMORY_LIMIT_FLOOR_BYTES, min(limit, _DUCKDB_MEMORY_LIMIT_CEILING_BYTES))
+
+
+def _resolve_duckdb_memory_limit_bytes(explicit: int | None, tantivy_heap_bytes: int) -> int:
+    """Precedence: explicit constructor arg (bytes) > env var (MB) >
+    availability-based default. Mirrors _resolve_tantivy_heap_bytes."""
+    if explicit is not None:
+        if explicit >= _DUCKDB_MEMORY_LIMIT_FLOOR_BYTES:
+            return explicit
+        _log.warning(
+            "OutputsFtsIndex: duckdb_memory_limit_bytes=%r must be >= %dMB -- "
+            "falling back to availability-based default", explicit,
+            _DUCKDB_MEMORY_LIMIT_FLOOR_BYTES // (1024 * 1024),
+        )
+    return _default_duckdb_memory_limit_bytes(tantivy_heap_bytes)
+
+
 # ---------------------------------------------------------------------------
 # 9a18a2b2 -- Tantivy single-writer lock conflict handling
 # ---------------------------------------------------------------------------
@@ -2197,6 +2279,7 @@ class OutputsFtsIndex:
         max_workers: int | None = None,
         exclude_patterns: tuple[str, ...] | None = None,
         tantivy_heap_bytes: int | None = None,
+        duckdb_memory_limit_bytes: int | None = None,
         max_batch: int | None = None,
         write_chunk: int | None = None,
         session_id: str | None = None,
@@ -2224,6 +2307,19 @@ class OutputsFtsIndex:
         # MERIDIAN_OUTPUTS_TANTIVY_HEAP_MB env var > 512MB default (up from
         # tantivy's own undersized default, measured ~3x faster commits).
         self._tantivy_heap_bytes = _resolve_tantivy_heap_bytes(tantivy_heap_bytes)
+        # task_ecb96ac9 follow-on -- see _default_duckdb_memory_limit_bytes's
+        # module comment: DuckDB has no default ceiling of its own, which let
+        # a real whole-root run take the OS's last available memory and
+        # invalidate its own connection past recovery. Resolved once here
+        # (not adaptively re-resolved per call, unlike _adaptive_batch --
+        # memory_limit is a per-connection PRAGMA, not something DuckDB lets
+        # you cheaply re-tune mid-session). Relies on this instance never
+        # surviving a close()+reconnect cycle with stale memory conditions --
+        # true today: _get_cached_index() always .close()s an evicted
+        # instance and constructs a fresh one, which re-resolves this value.
+        self._duckdb_memory_limit_bytes = _resolve_duckdb_memory_limit_bytes(
+            duckdb_memory_limit_bytes, self._tantivy_heap_bytes,
+        )
         # 3535b9ad -- walk batch cap: explicit param > MERIDIAN_OUTPUTS_MAX_BATCH
         # env var > class default (1bce8c41: an effectively-unbounded default,
         # time-primary -- see _ResumableFileWalk._MAX_BATCH). This value feeds
@@ -2395,6 +2491,21 @@ class OutputsFtsIndex:
         if self._con is None:
             import duckdb  # noqa: PLC0415
             self._con = duckdb.connect(self._db_path)
+            # task_ecb96ac9 follow-on -- give DuckDB an explicit ceiling to
+            # self-manage against (see _default_duckdb_memory_limit_bytes's
+            # module comment for why: no ceiling let a real run exhaust
+            # system memory catastrophically). Best-effort: a PRAGMA failure
+            # here must never block opening the connection at all -- an
+            # unconfigured DuckDB (its own unbounded default) is strictly
+            # better than no usable connection.
+            try:
+                limit_mb = max(1, self._duckdb_memory_limit_bytes // (1024 * 1024))
+                self._con.execute(f"PRAGMA memory_limit='{limit_mb}MB'")
+            except Exception:  # noqa: BLE001
+                _log.warning(
+                    "OutputsFtsIndex._connect: could not set memory_limit=%dMB",
+                    self._duckdb_memory_limit_bytes // (1024 * 1024), exc_info=True,
+                )
             # 77443d83 -- a fresh instance always assumed _fts_built started
             # False. With Tantivy this is now cheap either way (_rebuild_fts
             # only ever commits its pending delta, never a full re-index), but

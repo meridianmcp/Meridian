@@ -3828,6 +3828,170 @@ class TestTantivyHeapSize:
         idx = OL.OutputsFtsIndex(str(tmp_path))
         assert idx._tantivy_heap_bytes == 512 * 1024 * 1024
 
+
+class TestDuckDBMemoryLimit:
+    """task_ecb96ac9 follow-on: a real whole-root run (632k+ files) crashed
+    with an unrecoverable DuckDB "Out of Memory Error: Allocation failure"
+    where even the rollback of the failed operation also hit an allocation
+    failure, permanently invalidating the connection. DuckDB had no
+    configured memory_limit, so it kept growing until the OS itself had
+    nothing left to give -- a much harder failure than DuckDB hitting its
+    own configured ceiling. See _default_duckdb_memory_limit_bytes's module
+    docstring for the full reasoning."""
+
+    def test_missing_psutil_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", None)
+        assert (
+            OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024)
+            == OL._DEFAULT_DUCKDB_MEMORY_LIMIT_BYTES
+        )
+
+    @staticmethod
+    def _fake_psutil(available_bytes: int) -> MagicMock:
+        fake = MagicMock()
+        fake.virtual_memory.return_value = MagicMock(available=available_bytes)
+        return fake
+
+    def test_healthy_memory_computes_conservative_share(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        tantivy_heap = 512 * 1024 * 1024
+        usable = 20 * 1024**3 - tantivy_heap - OL._DUCKDB_MEMORY_RESERVE_BYTES
+        expected = int(usable * OL._DUCKDB_MEMORY_LIMIT_SHARE)
+        assert OL._default_duckdb_memory_limit_bytes(tantivy_heap) == expected
+
+    def test_low_memory_uses_floor(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(100 * 1024 * 1024))
+        assert (
+            OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024)
+            == OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES
+        )
+
+    def test_high_memory_uses_ceiling(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(200 * 1024**3))
+        assert (
+            OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024)
+            == OL._DUCKDB_MEMORY_LIMIT_CEILING_BYTES
+        )
+
+    def test_env_var_overrides_availability_based_default(self, monkeypatch) -> None:
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "4096")
+        assert OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024) == 4096 * 1024 * 1024
+
+    def test_out_of_range_env_var_is_clamped_not_passed_through(self, monkeypatch) -> None:
+        """A VALID integer env var that's out of range (0, negative, or
+        absurdly large) must still be clamped -- it must not bypass the
+        floor/ceiling the way an in-range value legitimately does."""
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "0")
+        assert (
+            OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024)
+            == OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES
+        )
+        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "999999999")
+        assert (
+            OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024)
+            == OL._DUCKDB_MEMORY_LIMIT_CEILING_BYTES
+        )
+
+    def test_invalid_env_var_falls_back_to_availability_based_default(self, monkeypatch) -> None:
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "not-a-number")
+        tantivy_heap = 512 * 1024 * 1024
+        usable = 20 * 1024**3 - tantivy_heap - OL._DUCKDB_MEMORY_RESERVE_BYTES
+        expected = int(usable * OL._DUCKDB_MEMORY_LIMIT_SHARE)
+        assert OL._default_duckdb_memory_limit_bytes(tantivy_heap) == expected
+
+    def test_explicit_constructor_arg_takes_precedence_over_env_var(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "4096")
+        assert (
+            OL._resolve_duckdb_memory_limit_bytes(1024 * 1024 * 1024, 512 * 1024 * 1024)
+            == 1024 * 1024 * 1024
+        )
+
+    def test_explicit_arg_below_floor_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", None)
+        assert (
+            OL._resolve_duckdb_memory_limit_bytes(1024, 512 * 1024 * 1024)
+            == OL._DEFAULT_DUCKDB_MEMORY_LIMIT_BYTES
+        )
+
+    def test_index_resolves_memory_limit_from_constructor(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), duckdb_memory_limit_bytes=1024 * 1024 * 1024)
+        assert idx._duckdb_memory_limit_bytes == 1024 * 1024 * 1024
+
+    @duckdb_required
+    def test_connect_applies_memory_limit_pragma(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The resolved limit must actually reach a real PRAGMA call on
+        connect, not just be stored on the instance and never used."""
+        import duckdb
+
+        real_connect = duckdb.connect
+        captured: list[str] = []
+
+        class _ExecuteSpyCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                captured.append(sql)
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect", lambda *a, **kw: _ExecuteSpyCon(real_connect(*a, **kw)),
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path), duckdb_memory_limit_bytes=1024 * 1024 * 1024)
+        try:
+            idx._connect()
+        finally:
+            idx.close()
+        pragma_calls = [sql for sql in captured if "memory_limit" in sql.lower()]
+        assert pragma_calls, f"expected a memory_limit PRAGMA, got: {captured!r}"
+        assert "1024MB" in pragma_calls[0]
+
+    @duckdb_required
+    def test_connect_survives_pragma_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A PRAGMA failure (any reason) must never block opening the
+        connection -- an unconfigured DuckDB is strictly better than no
+        usable connection at all."""
+        import duckdb
+
+        real_connect = duckdb.connect
+
+        class _FailingPragmaCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                if "memory_limit" in sql.lower():
+                    raise RuntimeError("simulated PRAGMA failure")
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect", lambda *a, **kw: _FailingPragmaCon(real_connect(*a, **kw)),
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            con = idx._connect()
+            assert con is not None
+        finally:
+            idx.close()
+
     def test_connect_tantivy_passes_resolved_heap_size_to_writer(
         self, tmp_path: Path,
     ) -> None:
