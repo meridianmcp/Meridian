@@ -32,12 +32,12 @@ You can also bring your own database (**BYODB**): paste your own Neon connection
 
 ## GitHub: an optional, separate connection
 
-Connecting a GitHub repository is **entirely optional** and unrelated to signing in. It only applies if you explicitly set it up in a project's Settings tab to give AI sessions read access to your code (file reads, code search, commit history).
+Connecting a GitHub repository is **entirely optional** and unrelated to signing in. It only applies if you explicitly set it up in a project's Settings tab to give AI sessions access to your code and repository metadata (file reads, code search, commit history, GitHub Actions, and issues).
 
 If you use it, here's what actually happens, per the [GitHub Integration guide](github-integration.md):
 
 - Your personal access token (PAT) is **encrypted at rest** (AES-256 / Fernet) before storage — the raw token is never logged or returned by any API response.
-- The integration is **read-only by default**: the tools it exposes only call read endpoints on the GitHub API. Meridian doesn't push commits, open PRs, or modify your repo through this connection.
+- Read tools are read-only. Three separate tools can make explicit repository-adjacent writes when an AI session invokes them and the PAT has the required permission: `patch_file` commits a targeted file replacement, `trigger_workflow` dispatches a GitHub Actions workflow, and `create_issue` opens an issue. Meridian does not invoke these writes merely because a repository is connected.
 - The connection is scoped to your account, and you can **revoke it at any time** — either by disconnecting in Settings or by revoking the PAT directly on GitHub.
 
 If you never connect a repo, none of this applies — Meridian has no GitHub access at all.
@@ -82,5 +82,5 @@ See the [API Reference](api-reference.md) for full request/response details and 
 |---|---|---|
 | **Where data lives** | Your local SQLite file or your own Postgres | Isolated Neon Postgres per workspace (or your own via BYODB) |
 | **Who can access it** | Only you | You; Meridian staff do not access project data in normal operation |
-| **GitHub access** | Only if you configure it, read-only, revokable | Only if you configure it, read-only, revokable |
+| **GitHub access** | Only if you configure it; read tools plus explicitly invoked write tools; revokable | Only if you configure it; read tools plus explicitly invoked write tools; revokable |
 | **How to delete it** | Delete your local files/DB | Dashboard delete flows, or the API endpoints above |
