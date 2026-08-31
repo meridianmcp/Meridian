@@ -10085,19 +10085,42 @@ def remove_bibliography_entry(
     docx_path: str,
     citation_key: str,
     index_db_path: str | None = None,
+    *,
+    remove_heading_if_empty: bool = False,
 ) -> dict[str, Any]:
     """1258794a — Remove a bibliography entry paragraph from a .docx.
 
     Locates the entry by the ``bibkey_<key>`` bookmark and removes the entire
     paragraph.
 
+    d4a1c3e9 — ``insert_bibliography_entry`` locates-or-CREATES a "References"
+    heading the first time it runs on a document that does not already have
+    one; this function only ever removed the entry paragraph, never that
+    shared heading, on the reasoning that removing one entry should not
+    silently delete a whole section other content might still reference. That
+    is still the DEFAULT behaviour (``remove_heading_if_empty=False``), but a
+    real caller (found live: PAPER-S7's benchmark harness, comparing this
+    against a generic-tool control arm on a genuine forward+inverse round-trip
+    task) legitimately wants "remove the entry, and if that was the LAST
+    entry, remove the now-empty heading too" as a single, opt-in, atomic
+    operation, so a fresh document ends up in exactly its original state
+    after an insert+remove cycle. Pass ``remove_heading_if_empty=True`` for
+    that behaviour; the heading is removed if and only if no OTHER
+    bibliography entry remains under it (checked via
+    ``_bibliography_entries_range`` after the target entry is already gone,
+    never by assuming this was the only entry).
+
     Args:
         docx_path:     Absolute path to the .docx file (mutated in place).
         citation_key:  The citation key of the entry to remove.
         index_db_path: If supplied, sidecar is invalidated after the write.
+        remove_heading_if_empty: If true, and removing this entry leaves the
+                       References/Bibliography heading with no remaining
+                       entries under it, remove that heading paragraph too.
+                       Default false preserves the original behaviour.
 
     Returns:
-        ``{status, citation_key, docx_path}``
+        ``{status, citation_key, docx_path, heading_removed}``
         or ``{"error": <message>}`` on failure.
     """
     if not citation_key or not str(citation_key).strip():
@@ -10123,6 +10146,16 @@ def remove_bibliography_entry(
     _entry_idx, entry_elem = entry_result
     body.remove(entry_elem)
 
+    heading_removed = False
+    if remove_heading_if_empty:
+        heading_result = _find_references_heading(body)
+        if heading_result is not None:
+            heading_idx, heading_elem = heading_result
+            start, end = _bibliography_entries_range(body, heading_idx)
+            if start == end:
+                body.remove(heading_elem)
+                heading_removed = True
+
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)
     except OSError as exc:
@@ -10134,6 +10167,7 @@ def remove_bibliography_entry(
         "status": "removed",
         "citation_key": clean_key,
         "docx_path": docx_path,
+        "heading_removed": heading_removed,
     }
 
 

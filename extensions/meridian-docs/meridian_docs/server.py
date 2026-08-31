@@ -1814,6 +1814,7 @@ def remove_bibliography_entry(
     docx_path: str,
     citation_key: str,
     index_db_path: str | None = None,
+    remove_heading_if_empty: bool = False,
     session_id: str | None = None,
 ) -> dict:
     """1258794a — Remove a bibliography entry paragraph from a .docx.
@@ -1826,6 +1827,10 @@ def remove_bibliography_entry(
       docx_path:     Absolute path to the .docx file (mutated in place).
       citation_key:  The citation key of the entry to remove.
       index_db_path: If supplied, sidecar is invalidated after write.
+      remove_heading_if_empty: d4a1c3e9 — if true, and this was the LAST
+                     entry under the References/Bibliography heading, also
+                     remove that now-empty heading paragraph. Default false
+                     preserves the original entry-only behaviour.
       session_id:    273df573 — identifies the calling Meridian session to
                      the tunnel-layer DOCX region-claim guard
                      (check_docs_write_conflict in meridian/routes/
@@ -1834,13 +1839,14 @@ def remove_bibliography_entry(
                      (e.g. standalone `uvx meridian-docs`).
 
     Returns:
-      {status, citation_key, docx_path}
+      {status, citation_key, docx_path, heading_removed}
       or {error: <message>} on failure.
     """
     return docs_intel.remove_bibliography_entry(
         docx_path=docx_path,
         citation_key=citation_key,
         index_db_path=index_db_path,
+        remove_heading_if_empty=remove_heading_if_empty,
     )
 
 
