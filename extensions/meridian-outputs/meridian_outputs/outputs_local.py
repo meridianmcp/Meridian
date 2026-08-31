@@ -2118,6 +2118,11 @@ class OutputsFtsIndex:
     _ADAPTIVE_LOW_AVAILABLE_BYTES = 2 * 1024**3
     _ADAPTIVE_MAX_FTS_SECONDS = 8.0
     _ADAPTIVE_MAX_WRITE_SECONDS = 24.0
+    # Bound on how many winner paths go into one `IN (...)` content lookup
+    # during legacy-path migration (task_ecb96ac9) -- keeps the parameter
+    # list small even if a corpus has an unusually large number of
+    # duplicate-path groups, independent of _ADAPTIVE_* batch sizing above.
+    _MIGRATION_CONTENT_CHUNK = 200
     """Persistent DuckDB FTS index over a local outputs directory.
 
     Same logic as the main-repo OutputsFtsIndex, but:
@@ -3084,15 +3089,49 @@ class OutputsFtsIndex:
         The migration is deliberately limited to path identity.  It does not
         re-walk or re-hash files, and it preserves the established display
         spelling by using :func:`_canonical_storage_path` for the winner.
+
+        Memory (task_ecb96ac9): the scan deliberately excludes ``content``
+        (the full extracted-text FTS body) from the bulk read.  At whole-root
+        scale (632k files / 433 GiB, the SUT_Compressed qualification
+        corpus) fetching it for every row reproduced the same allocator-
+        failure pattern as the historical row-cache content-retention bug
+        (see the 96k-file incident this class's adaptive batching already
+        exists to avoid). Dedup only needs path identity plus a
+        ``content IS NOT NULL`` presence flag; the repair itself only ever
+        DELETEs losing rows and UPDATEs the winner's ``path`` column, so
+        content never round-trips through Python for the DB repair. The
+        bulk scan is chunked through :meth:`_adaptive_batch_limit`, the same
+        memory/commit-pressure-aware limit the normal write path uses, so
+        peak memory tracks available RAM instead of corpus size. Content is
+        fetched afterward, in small bounded batches
+        (``_MIGRATION_CONTENT_CHUNK``), only for the winning rows that need
+        it staged into the Tantivy FTS upsert delta.
+
+        Deliberately reads ``self._adaptive_batch`` directly rather than
+        calling :meth:`_adaptive_batch_limit`: that method also *adjusts*
+        ``self._adaptive_batch`` from ``self.last_rebuild_metrics``, and this
+        method runs (from :meth:`rebuild`) after ``analysis_seconds``/
+        ``classification_seconds`` are recorded but before ``fts_seconds``/
+        ``write_seconds`` exist yet -- the missing keys default to ``0``,
+        which always satisfies the "fast, healthy" branch and would double
+        the shared write-path batch size on every single call, regardless of
+        real memory or commit pressure. A plain read has no such side effect.
         """
         self._ensure_schema(con)
-        relation = con.execute(
-            "SELECT path, content, mtime, sha256, size, generating_script, "
-            "kind, is_archival, canonical_path, csv_columns, json_keys "
-            "FROM outputs_index"
+        cursor = con.execute(
+            "SELECT path, mtime, sha256, size, generating_script, kind, "
+            "is_archival, canonical_path, csv_columns, json_keys, "
+            "(content IS NOT NULL) AS has_content FROM outputs_index"
         )
-        columns = [c[0] for c in relation.description]
-        raw_rows = [dict(zip(columns, row)) for row in relation.fetchall()]
+        columns = [c[0] for c in cursor.description]
+        raw_rows: list[dict[str, Any]] = []
+        batch_limit = self._adaptive_batch
+        while True:
+            chunk = cursor.fetchmany(batch_limit)
+            if not chunk:
+                break
+            raw_rows.extend(dict(zip(columns, row)) for row in chunk)
+
         groups: dict[str, list[dict[str, Any]]] = {}
         for row in raw_rows:
             raw_path = row.get("path")
@@ -3102,7 +3141,11 @@ class OutputsFtsIndex:
             row["_canonical_storage_path"] = canonical
             groups.setdefault(_normalize_output_path(canonical), []).append(row)
 
-        affected: list[tuple[list[dict[str, Any]], dict[str, Any]]] = []
+        # Each tuple is (group, winner-with-corrected-path, winner's
+        # original/pre-repair path) -- the original path is kept alongside
+        # the winner dict so the transaction below can UPDATE by it without
+        # re-deriving it from the (already-mutated) winner dict.
+        affected: list[tuple[list[dict[str, Any]], dict[str, Any], str]] = []
         for group in groups.values():
             canonical = min(
                 row["_canonical_storage_path"] for row in group
@@ -3111,45 +3154,38 @@ class OutputsFtsIndex:
                 group,
                 key=lambda row: (
                     row.get("path") == canonical,
-                    row.get("content") is not None,
+                    bool(row.get("has_content")),
                     row.get("sha256") is not None,
                     row.get("mtime") or 0,
                     row.get("size") or 0,
                     str(row.get("path") or ""),
                 ),
             )
-            if len(group) > 1 or winner.get("path") != canonical:
+            winner_original_path = winner.get("path")
+            if len(group) > 1 or winner_original_path != canonical:
                 winner = dict(winner)
                 winner["path"] = canonical
-                affected.append((group, winner))
+                affected.append((group, winner, winner_original_path))
 
         if not affected:
             return False
 
-        old_paths = [
-            row["path"]
-            for group, _winner in affected
-            for row in group
-            if row.get("path")
-        ]
-        winners = [winner for _group, winner in affected]
         con.execute("BEGIN TRANSACTION")
         try:
-            for path in old_paths:
-                con.execute("DELETE FROM outputs_index WHERE path = ?", [path])
-            for row in winners:
-                con.execute(
-                    "INSERT INTO outputs_index (path, content, mtime, sha256, "
-                    "size, generating_script, kind, is_archival, canonical_path, "
-                    "csv_columns, json_keys) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        row["path"], row.get("content"), row.get("mtime"),
-                        row.get("sha256"), row.get("size"),
-                        row.get("generating_script"), row.get("kind"),
-                        row.get("is_archival"), row.get("canonical_path"),
-                        row.get("csv_columns"), row.get("json_keys"),
-                    ],
-                )
+            for group, winner, winner_original_path in affected:
+                for row in group:
+                    other_path = row.get("path")
+                    if other_path and other_path != winner_original_path:
+                        con.execute(
+                            "DELETE FROM outputs_index WHERE path = ?",
+                            [other_path],
+                        )
+                canonical_path = winner["path"]
+                if winner_original_path != canonical_path:
+                    con.execute(
+                        "UPDATE outputs_index SET path = ? WHERE path = ?",
+                        [canonical_path, winner_original_path],
+                    )
         except BaseException:
             try:
                 con.execute("ROLLBACK")
@@ -3162,32 +3198,42 @@ class OutputsFtsIndex:
         else:
             con.execute("COMMIT")
 
+        winners = [winner for _group, winner, _orig in affected]
+
         # Reconcile this process's metadata cache as well as the durable table.
         # _connect() may have rehydrated the old duplicate spellings before
         # rebuild() acquired the write lease.
-        affected_old = set(old_paths)
+        affected_old = {
+            row.get("path")
+            for group, _winner, winner_original_path in affected
+            for row in group
+            if row.get("path") and row.get("path") != winner_original_path
+        }
+        affected_old.update(
+            winner_original_path for _group, _winner, winner_original_path in affected
+        )
         for path in affected_old:
             self._row_cache.pop(path, None)
             self._manifest.pop(path, None)
             self._pending_stale.pop(path, None)
-        for row in winners:
+        for winner in winners:
             parsed = OutputRow(
-                path=row["path"],
+                path=winner["path"],
                 content=None,
-                mtime=row.get("mtime"),
-                sha256=row.get("sha256"),
-                size=row.get("size"),
-                generating_script=row.get("generating_script"),
-                kind=row.get("kind") or "",
-                is_archival=bool(row.get("is_archival")),
-                canonical_path=row.get("canonical_path"),
+                mtime=winner.get("mtime"),
+                sha256=winner.get("sha256"),
+                size=winner.get("size"),
+                generating_script=winner.get("generating_script"),
+                kind=winner.get("kind") or "",
+                is_archival=bool(winner.get("is_archival")),
+                canonical_path=winner.get("canonical_path"),
                 csv_columns=(
-                    json.loads(row["csv_columns"])
-                    if row.get("csv_columns") else None
+                    json.loads(winner["csv_columns"])
+                    if winner.get("csv_columns") else None
                 ),
                 json_keys=(
-                    json.loads(row["json_keys"])
-                    if row.get("json_keys") else None
+                    json.loads(winner["json_keys"])
+                    if winner.get("json_keys") else None
                 ),
             )
             self._row_cache[parsed.path] = parsed
@@ -3195,25 +3241,39 @@ class OutputsFtsIndex:
 
         # Remove every legacy spelling from Tantivy, then insert the canonical
         # winner. _rebuild_fts() commits this delta in one small transaction.
+        # Content is looked up here, in bounded batches, only for the winning
+        # paths -- the one place this migration still needs real body text.
         self._pending_tantivy_deletes.update(affected_old)
-        for row in winners:
+        winner_paths = [winner["path"] for winner in winners]
+        content_by_path: dict[str, Any] = {}
+        chunk_size = self._MIGRATION_CONTENT_CHUNK
+        for start in range(0, len(winner_paths), chunk_size):
+            chunk_paths = winner_paths[start:start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk_paths)
+            content_rows = con.execute(
+                f"SELECT path, content FROM outputs_index "
+                f"WHERE path IN ({placeholders})",
+                chunk_paths,
+            ).fetchall()
+            content_by_path.update(content_rows)
+        for winner in winners:
             parsed = OutputRow(
-                path=row["path"],
-                content=row.get("content"),
-                mtime=row.get("mtime"),
-                sha256=row.get("sha256"),
-                size=row.get("size"),
-                generating_script=row.get("generating_script"),
-                kind=row.get("kind") or "",
-                is_archival=bool(row.get("is_archival")),
-                canonical_path=row.get("canonical_path"),
+                path=winner["path"],
+                content=content_by_path.get(winner["path"]),
+                mtime=winner.get("mtime"),
+                sha256=winner.get("sha256"),
+                size=winner.get("size"),
+                generating_script=winner.get("generating_script"),
+                kind=winner.get("kind") or "",
+                is_archival=bool(winner.get("is_archival")),
+                canonical_path=winner.get("canonical_path"),
                 csv_columns=(
-                    json.loads(row["csv_columns"])
-                    if row.get("csv_columns") else None
+                    json.loads(winner["csv_columns"])
+                    if winner.get("csv_columns") else None
                 ),
                 json_keys=(
-                    json.loads(row["json_keys"])
-                    if row.get("json_keys") else None
+                    json.loads(winner["json_keys"])
+                    if winner.get("json_keys") else None
                 ),
             )
             self._pending_tantivy_upserts[parsed.path] = parsed

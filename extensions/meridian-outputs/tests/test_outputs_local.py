@@ -2527,6 +2527,166 @@ class TestParallelRebuildCorrectness:
         finally:
             repaired.close()
 
+    @duckdb_required
+    def test_legacy_migration_scan_excludes_content_column(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression test for task_ecb96ac9: the SUT_Compressed whole-root
+        qualification run (632k files / 433 GiB) hit an allocator failure
+        inside the legacy-path migration because its dedup scan selected the
+        full extracted-text `content` column for every row before doing any
+        grouping. The scan must only ever select a `content IS NOT NULL`
+        presence flag, never the bare `content` column.
+        """
+        class _ExecuteSpy:
+            """Proxies a DuckDB connection, recording SQL text.
+
+            DuckDB's connection object is a C extension type with read-only
+            attributes, so `.execute` cannot be monkeypatched directly on it
+            -- this wraps it instead and is passed in place of the real
+            connection to the (test-only) direct call below.
+            """
+
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+                self.captured: list[str] = []
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                self.captured.append(sql)
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        spy = _ExecuteSpy(idx._connect())
+        try:
+            idx._migrate_legacy_storage_paths_locked(spy)
+        finally:
+            idx.close()
+
+        scan_sql = next(
+            sql for sql in spy.captured
+            if sql.strip().upper().startswith("SELECT")
+            and "OUTPUTS_INDEX" in sql.upper()
+        )
+        select_clause = scan_sql.split("FROM", 1)[0]
+        columns = [
+            c.strip().lower()
+            for c in select_clause.split("SELECT", 1)[1].split(",")
+        ]
+        assert not any(c == "content" for c in columns), (
+            f"bare `content` column must not be selected in the dedup scan: {columns!r}"
+        )
+        assert any("content is not null" in c for c in columns), (
+            f"expected a `content IS NOT NULL` presence flag in the scan: {columns!r}"
+        )
+
+    @duckdb_required
+    def test_legacy_migration_dedup_chunked_preserves_winner_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Dedup must still pick the canonical-spelling row and stage its
+        real content for Tantivy even when both the row-scan batch limit and
+        the winner-content lookup chunk are forced down to 1 -- i.e. the new
+        chunked reads (task_ecb96ac9) must not drop or scramble rows across
+        chunk boundaries, for multiple independent duplicate-path groups.
+
+        Note: the winner here is decided by the pre-existing, unchanged
+        `path == canonical` tie-break (highest priority in the selection
+        key) rather than by content/mtime/sha256 richness -- the "rich"/
+        "stale" naming reflects the deliberately-chosen setup (canonical
+        spelling paired with the richer values), not an independent
+        richness-based assertion.
+        """
+        import duckdb
+
+        db_path = str(tmp_path / "chunked.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx._ensure_schema(idx._connect())
+        idx.close()
+
+        con = duckdb.connect(db_path)
+        try:
+            for name, rich_content, stale_content in [
+                ("a.csv", "rich-A-content", "stale-A-content"),
+                ("b.csv", "rich-B-content", "stale-B-content"),
+            ]:
+                absolute_path = os.path.abspath(str(tmp_path / name))
+                legacy_path = os.path.relpath(absolute_path, start=os.getcwd())
+                con.execute(
+                    "INSERT INTO outputs_index (path, content, mtime, sha256, "
+                    "size, generating_script, kind, is_archival, "
+                    "canonical_path, csv_columns, json_keys) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, 'data', false, ?, NULL, NULL)",
+                    [absolute_path, rich_content, 200.0, "richsha", 10, absolute_path],
+                )
+                con.execute(
+                    "INSERT INTO outputs_index (path, content, mtime, sha256, "
+                    "size, generating_script, kind, is_archival, "
+                    "canonical_path, csv_columns, json_keys) "
+                    "VALUES (?, ?, ?, NULL, ?, NULL, 'data', false, ?, NULL, NULL)",
+                    [legacy_path, stale_content, 50.0, 5, absolute_path],
+                )
+        finally:
+            con.close()
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            monkeypatch.setattr(idx, "_adaptive_batch_limit", lambda: 1)
+            monkeypatch.setattr(type(idx), "_MIGRATION_CONTENT_CHUNK", 1)
+            con = idx._connect()
+            assert idx._migrate_legacy_storage_paths_locked(con) is True
+
+            rows = con.execute(
+                "SELECT path, content FROM outputs_index ORDER BY path"
+            ).fetchall()
+            assert len(rows) == 2
+            surviving = {path: content for path, content in rows}
+            expected_a = os.path.abspath(str(tmp_path / "a.csv"))
+            expected_b = os.path.abspath(str(tmp_path / "b.csv"))
+            assert surviving[expected_a] == "rich-A-content"
+            assert surviving[expected_b] == "rich-B-content"
+
+            assert idx._pending_tantivy_upserts[expected_a].content == "rich-A-content"
+            assert idx._pending_tantivy_upserts[expected_b].content == "rich-B-content"
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_legacy_migration_does_not_perturb_adaptive_batch(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression for a bug caught reviewing task_ecb96ac9's own fix:
+        the migration must read `self._adaptive_batch` directly, not call
+        `_adaptive_batch_limit()`. That method both reads AND *adjusts*
+        `self._adaptive_batch` from `self.last_rebuild_metrics`; the
+        migration runs (from `rebuild()`) after `analysis_seconds`/
+        `classification_seconds` are recorded but before `fts_seconds`/
+        `write_seconds` exist yet, so the missing keys default to 0 and
+        always satisfy the "fast, healthy" branch -- doubling the shared
+        write-path batch size on every single rebuild(), regardless of real
+        memory or commit pressure, which is the opposite of what the
+        adaptive mechanism exists to do.
+        """
+        f = tmp_path / "data.csv"
+        f.write_text("x\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            after_first = idx._adaptive_batch
+            idx.rebuild()
+            after_second = idx._adaptive_batch
+            idx.rebuild()
+            after_third = idx._adaptive_batch
+            assert after_first == after_second == after_third, (
+                "adaptive_batch drifted across rebuild() calls with no real "
+                f"fts/write pressure signal: {after_first}, {after_second}, "
+                f"{after_third}"
+            )
+        finally:
+            idx.close()
+
     def test_worker_failure_falls_back_gracefully(self, tmp_path: Path) -> None:
         """If a worker raises, the file is re-analysed synchronously and indexed."""
         f = tmp_path / "ok.csv"
