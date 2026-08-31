@@ -337,7 +337,7 @@ class TestIncompleteEvidenceFailsClosed:
 
         idx = OL._get_cached_index(str(tmp_path))
         idx.rebuild()
-        idx.rebuild = lambda max_seconds=None: len(idx._row_cache)
+        idx.rebuild = lambda *a, **kw: len(idx._row_cache)
         idx._pending_stale["/still/not/discovered/output.csv"] = (None, None)
         idx.last_rebuild_partial = True
 

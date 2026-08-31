@@ -77,7 +77,16 @@ _LEDGER_FILENAME = "provenance_ledger.json"
 # In-process only (no cross-process portalocker layer) -- see module
 # docstring: this ledger is a lower-stakes, mostly-single-writer sidecar, not
 # the shared FTS index, mirroring fingerprint.py's own lock choice/rationale.
-_write_lock = threading.Lock()
+#
+# fa600e42 -- RLock, not Lock: _write_ledger_entry acquires this lock and
+# THEN calls _read_ledger (its own read-modify-write pattern); _read_ledger
+# now ALSO acquires this same lock internally (to guard the fa600e42 cache
+# dict added below). A plain, non-reentrant Lock re-acquired by the same
+# thread in that nested call blocks forever -- confirmed live (a real test
+# run hung indefinitely on the very first record_provenance call once the
+# cache was added). RLock allows the same thread to re-enter safely while
+# still serializing genuinely concurrent threads exactly as before.
+_write_lock = threading.RLock()
 
 
 def _normalize_path(path: str) -> str:
@@ -114,14 +123,43 @@ def _ledger_path(outputs_dir: str) -> str:
     return os.path.join(_cache_dir(outputs_dir), _LEDGER_FILENAME)
 
 
+# fa600e42 -- path -> (mtime, size, parsed ledger dict). Avoids re-reading
+# and re-JSON-parsing an UNCHANGED ledger file on every call: originally a
+# non-issue (this ledger had no caller that read it in a loop), but
+# provenance_status.get_provenance_status's new relocation-detection tier
+# now calls list_provenance() (which goes through this function) on every
+# lookup that doesn't hit an exact record, including from real batch/loop
+# callers (bind_artifact_provenance, build_provenance_envelope) that can
+# call it once per path against a project with a large accumulated ledger
+# -- an O(N) re-parse of the same unchanged file for an N-path batch,
+# without this cache. Staleness signature is the SAME mtime+size check this
+# whole package already relies on throughout outputs_local.py for file-
+# change detection -- not a new class of risk this package doesn't already
+# accept elsewhere. Guarded by the same _write_lock ledger writes already
+# use, so a reader can never observe a torn read of the cache tuple.
+_ledger_read_cache: dict[str, tuple[float, int, dict[str, dict[str, Any]]]] = {}
+
+
 def _read_ledger(outputs_dir: str) -> dict[str, dict[str, Any]]:
     path = _ledger_path(outputs_dir)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    with _write_lock:
+        cached = _ledger_read_cache.get(path)
+        if cached is not None and cached[0] == st.st_mtime and cached[1] == st.st_size:
+            return dict(cached[2])
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    with _write_lock:
+        _ledger_read_cache[path] = (st.st_mtime, st.st_size, data)
+    return dict(data)
 
 
 def _write_ledger_entry(outputs_dir: str, key: str, record: dict[str, Any]) -> None:
