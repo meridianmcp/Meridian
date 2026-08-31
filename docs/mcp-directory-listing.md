@@ -127,23 +127,46 @@ remain specialist local extensions and are not part of this first listing.
 
 ### Curated tool profile
 
-The first listing intentionally exposes these 30 native tools:
+The first listing intentionally exposes this 64-tool native profile. It is
+large enough to support real project, research, sprint, wave, and handoff
+work while remaining below the 70-tool review target:
 
 ```text
+create_project
+get_project_by_name
 start_session
+get_goal
+set_goal
+set_north_star
+get_session_brief
 get_planning_brief
-get_sprint_items
 get_sprint_progress
+get_sprint_items
 get_context_block
 refresh_context
+load_handoff
+verify_handoff_token
+accept_handoff
+generate_handoff
 log_task
+get_tasks
+search_tasks
+search_all
+checkpoint
 add_note
 get_notes
 read_note
-search_all
-search_tasks
 pin_decision
+update_decision
 get_pinned_decisions
+validate_assumption
+capture_research_finding
+add_workspace_proposal
+get_workspace_proposals
+advance_proposal_status
+promote_proposal
+preview_proposal_promotion
+set_sprint
 add_sprint_item
 update_sprint_item
 claim_sprint_item
@@ -151,23 +174,39 @@ complete_sprint_item
 add_sprint_item_pointer
 get_sprint_item_pointers
 resolve_sprint_item_pointers
-checkpoint
-generate_handoff
+add_sprint_note
+get_sprint_notes
+get_parallelizable_groups
+assign_sprint_waves
+complete_wave_gate
+start_wave_run
+finalize_wave_run
+resume_wave
+analyze_sprint
 request_hitl
 get_hitl_request
 list_hitl_requests
-add_workspace_proposal
-get_workspace_proposals
-advance_proposal_status
 paper_search
+social_search
+github_search
+search_synthesis
+get_capability_manifest
+get_effective_capability_profile
+add_workspace_note
+get_workspace_notes
+pin_workspace_decision
+get_workspace_decisions
 ```
 
-The profile excludes account/project administration, raw server and session
-logs, tunnel/plugin management, custom hooks, local-path code and document
-editing, dynamic GitHub repository tools, and parallel-worker internals.
-Those remain available only on the full connector or local specialist
-servers. This is a product boundary, not a client-side hint: `tools/list`
-returns only the profile and `tools/call` rejects an excluded name.
+The profile excludes account/token administration, destructive project
+administration, raw server and session logs, tunnel/plugin management, custom
+hooks, local-path code and document editing, dynamic connected-repository
+GitHub tools, and low-level worker internals. Public read-only research search
+includes GitHub search, but it does not grant access to a user's connected
+repository. The excluded tools remain available only on the full connector or
+local specialist servers.
+This is a product boundary, not a client-side hint: `tools/list` returns only
+the profile and `tools/call` rejects an excluded name.
 
 ### Listing description
 
@@ -191,10 +230,12 @@ Use the public [Data Handling](data-handling.md) page as the source of truth.
 Hosted project state includes goals, sprint items, task logs, decisions,
 notes, session/handoff state, and HITL queue items. It is stored in the hosted
 tenant's isolated Neon/Postgres database. The profile itself does not expose
-GitHub repository tools or a GitHub write path. Google/GitHub sign-in is
+connected-repository GitHub tools or a GitHub write path. It does expose
+read-only public GitHub search as a research source. Google/GitHub sign-in is
 authentication only; it is not repository access. A separately configured
-full Meridian connector may expose optional GitHub tools, but that is outside
-this profile and must not be represented as part of this submission.
+full Meridian connector may expose optional connected GitHub tools, but that
+is outside this profile and must not be represented as part of this
+submission.
 
 ### OpenAI test cases
 
@@ -241,7 +282,7 @@ and scanned before this can be called production-ready:
    bump the product version solely for this listing.
 3. Verify production `initialize` and `tools/list` at
    `https://usemeridian.us/mcp/openai` with a non-secret test account:
-   profile count must be 30, no excluded names may appear, and the manifest
+   profile count must be 64, no excluded names may appear, and the manifest
    revision must be stable across two calls.
 4. Verify an excluded `tools/call` returns a structured “not available on this
    MCP profile” error without dispatching.

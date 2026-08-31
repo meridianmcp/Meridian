@@ -17,7 +17,8 @@ def test_openai_profile_is_known_and_subset_of_native_tools() -> None:
     native_names = {tool["name"] for tool in _MCP_TOOLS_LIST}
     assert get_tool_allowlist("openai") == OPENAI_PUBLIC_TOOL_NAMES
     assert OPENAI_PUBLIC_TOOL_NAMES <= native_names
-    assert len(OPENAI_PUBLIC_TOOL_NAMES) <= 30
+    assert len(OPENAI_PUBLIC_TOOL_NAMES) == 64
+    assert len(OPENAI_PUBLIC_TOOL_NAMES) < 70
 
 
 def test_unknown_profile_fails_closed() -> None:
