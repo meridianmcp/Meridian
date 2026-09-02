@@ -32,6 +32,15 @@ semantic validation (``validate_output_semantics``) remains a separate,
 not-yet-built capability with its own sprint item; nothing below should be
 read as a promise that it exists.
 
+Item a4cb12bf added ``inspect_local_file``, a single bounded local
+inspect/read router for ONE file (XML/JSON/CSV/XLSX/DOCX) that dispatches to
+the ``meridian-file-inspection`` and ``meridian-docs`` sibling packages over
+real (subprocess-spawned) MCP client sessions rather than importing them
+directly -- see :mod:`meridian_outputs.file_inspector` for the full routing
+table, the two-tier launch strategy, and the ``local_only``/``unavailable``
+convention it introduces. This tool never touches ``search_outputs``/
+``register_output_paths``, which remain exactly as they were.
+
 This is the wave-1 stopgap for local outputs indexing.  The hosted-aware
 smart-routing layer (item 1365e01a) is deliberately out of scope here.
 
@@ -54,6 +63,7 @@ from . import (
     annotate,
     artifact_registry,
     classify,
+    file_inspector,
     fingerprint,
     outputs_local,
     provenance,
@@ -283,6 +293,102 @@ def get_convergence_state(
       one that confirmed a genuinely empty directory.
     """
     return outputs_local.get_convergence_state(outputs_dir, subtree=subtree)
+
+
+@mcp.tool()
+def inspect_local_file(
+    path: str,
+    operation: str = "shape",
+    format: str = "auto",
+    allowed_root: str | None = None,
+    allow_symlinks: bool = False,
+    selector: str | None = None,
+    max_bytes: int = file_inspector.DEFAULT_MAX_BYTES,
+    timeout_seconds: float = file_inspector.DEFAULT_TIMEOUT_SECONDS,
+    preview_chars: int | None = None,
+    max_sample_rows: int | None = None,
+) -> dict[str, Any]:
+    """One bounded local inspect/read workflow for a single file -- XML,
+    JSON, CSV, XLSX, or DOCX -- without a tunnel and without a duplicate
+    parser (item a4cb12bf).
+
+    Routes ``path`` to whichever existing capability already understands
+    its format -- ``extensions/meridian-file-inspection``'s ``inspect_file``
+    (raw XML, generic JSON) or ``inspect_tabular_file`` (CSV, XLSX,
+    row-shaped JSON), or ``extensions/meridian-docs``'s ``document_outline``/
+    ``read_document_snapshot`` (DOCX/DOTX/DOCM/DOTM) -- each spawned as its
+    own short-lived local MCP stdio server (never a direct cross-package
+    import; see ``file_inspector`` module docstring for why) and normalizes
+    every answer into ONE canonical envelope. ``search_outputs``/
+    ``register_output_paths`` are unaffected by this tool -- output-tree
+    indexing/search stays exactly as it was.
+
+    This tool never makes a network or tunnel call of its own -- every
+    response carries ``"local_only": true``. When the required sibling
+    process cannot even be reached (missing package directory, no
+    compatible Python/``uvx`` on PATH, a crash before it can answer, or the
+    whole attempt exceeding its wall-clock budget), ``state`` is
+    ``"unavailable"`` (distinct from ``"failed"``, which means a sibling DID
+    run and reported a real parse/policy error) and ``errors`` carries a
+    stable ``"unavailable"`` code -- never a raised exception, never a hang.
+
+    Args:
+      path:              Path to the single file to inspect.
+      operation:         ``"metadata"`` (identity/size/hash/state only, no
+                          content), ``"shape"`` (default -- structure
+                          without content previews/samples), or
+                          ``"preview"`` (the full underlying bounded
+                          response, content included). For DOCX, metadata/
+                          shape genuinely request a smaller bounded page of
+                          headings (cheaper, not just post-filtered);
+                          preview reads paragraph content via
+                          ``read_document_snapshot``.
+      format:            ``"auto"`` (default, sniffed -- never from
+                          extension alone except to disambiguate DOCX from
+                          XLSX, which share the same ZIP magic bytes),
+                          ``"xml"``, ``"json"``, ``"csv"``, ``"xlsx"``, or
+                          ``"docx"``.
+      allowed_root:       Optional directory the resolved ``path`` must
+                          fall under -- a path escaping it is refused as
+                          ``denied``/``outside_allowed_root``.
+      allow_symlinks:     Set True to permit inspecting a symlink target
+                          (default False).
+      selector:           Optional bounded dotted/bracket JSON selector,
+                          forwarded to ``inspect_file`` when the path
+                          routes there; ignored otherwise.
+      max_bytes:          Maximum source file size in bytes (default
+                          10 MiB) -- checked before any sibling is spawned.
+      timeout_seconds:    Wall-clock budget forwarded to the sibling's own
+                          parse-time bound (default 5.0s) -- the subprocess
+                          spawn/handshake itself gets its own separate,
+                          fixed overhead allowance on top of this.
+      preview_chars:      Optional override forwarded to the underlying
+                          tool's own ``preview_chars``.
+      max_sample_rows:    Optional override forwarded to
+                          ``inspect_tabular_file``'s ``max_sample_rows``
+                          (tabular routes only).
+
+    Returns:
+      ``{schema_version, source_ref, format, mime, size_bytes,
+      source_sha256, parser_id, parser_version, result_hash, state, shape,
+      bounds, warnings, errors, provenance_ref, local_only, operation,
+      route}``. ``source_ref`` is a REDACTED portable reference, never the
+      raw machine-local absolute path. ``state`` is one of ``"complete"``/
+      ``"partial"``/``"failed"``/``"unavailable"``. ``route`` is one of
+      ``"generic"``/``"tabular"``/``"docs"`` -- which sibling answered.
+    """
+    return file_inspector.inspect_local_file(
+        path,
+        operation=operation,
+        format=format,
+        allowed_root=allowed_root,
+        allow_symlinks=allow_symlinks,
+        selector=selector,
+        max_bytes=max_bytes,
+        timeout_seconds=timeout_seconds,
+        preview_chars=preview_chars,
+        max_sample_rows=max_sample_rows,
+    )
 
 
 @mcp.tool()

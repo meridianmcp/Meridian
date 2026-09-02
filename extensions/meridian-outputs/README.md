@@ -39,6 +39,32 @@ Or add to your MCP client config:
 | `npy_metadata` | Read a `.npy` header (shape/dtype/size) without loading the array |
 | `file_fingerprint` | Cheap content signature (CSV columns, JSON keys, generating-script hint) |
 
+### Local file inspection router (item a4cb12bf)
+
+`inspect_local_file` is one bounded local inspect/read workflow for a single
+XML, JSON, CSV, XLSX, or DOCX file — without a tunnel and without a second
+parser. It routes to whichever existing capability already understands the
+file's format (`meridian-file-inspection`'s `inspect_file`/
+`inspect_tabular_file`, or `meridian-docs`'s `document_outline`/
+`read_document_snapshot`), spawning each as its own short-lived local MCP
+stdio server rather than importing it directly (these are independently
+`uvx`-installable packages — see `meridian_outputs/file_inspector.py`'s
+module docstring for why a direct import isn't viable in production), and
+normalizes every answer into one canonical envelope.
+
+Every response carries `"local_only": true` (this tool never makes a
+network/tunnel call of its own) and an `operation` tier — `"metadata"`
+(identity/size/hash only), `"shape"` (default — structure without content
+previews/samples), or `"preview"` (the full bounded response). When the
+required sibling process can't even be reached, `state` is the new
+`"unavailable"` value (distinct from `"failed"`, which means a sibling ran
+and reported a real parse error) — never a raised exception, never a hang.
+`search_outputs`/`register_output_paths` are untouched by this addition.
+
+| Tool | Description |
+|------|-------------|
+| `inspect_local_file` | Route one file to the matching bounded inspector (XML/JSON/CSV/XLSX/DOCX) and return a single canonical envelope, with explicit `local_only`/`unavailable` state |
+
 ### Annotations & provenance
 
 | Tool | Description |
