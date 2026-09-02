@@ -4448,10 +4448,14 @@ class OutputsFtsIndex:
                     # actually runs -- here or lazily from search() -- it
                     # commits the full outstanding delta as one small Tantivy
                     # transaction, never a full re-index.
-                    replacement_paths = {r.path for r in new_rows}
+                    #
+                    # task_ecb96ac9 follow-on (perf) -- was a set comprehension
+                    # over new_rows followed by a separate for-loop over the
+                    # same new_rows: 2 passes for what a single loop already
+                    # does in one, on top of the pyarrow-path loop above.
                     self._pending_tantivy_deletes.update(paths_to_delete)
-                    self._pending_tantivy_deletes.update(replacement_paths)
                     for r in new_rows:
+                        self._pending_tantivy_deletes.add(r.path)
                         self._pending_tantivy_upserts[r.path] = r
                     # b1789c0d / d9c76caa -- _rebuild_fts() has no deadline
                     # check of its own. On a huge cold tree, calling it
