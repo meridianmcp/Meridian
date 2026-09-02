@@ -4357,24 +4357,57 @@ class OutputsFtsIndex:
                         except ImportError:
                             _pa = None
                         if _pa is not None:
-                            _arrow_table = _pa.table({
-                                "path": [r.path for r in new_rows],
-                                "content": [r.content for r in new_rows],
-                                "mtime": [r.mtime for r in new_rows],
-                                "sha256": [r.sha256 for r in new_rows],
-                                "size": [r.size for r in new_rows],
-                                "generating_script": [r.generating_script for r in new_rows],
-                                "kind": [r.kind for r in new_rows],
-                                "is_archival": [r.is_archival for r in new_rows],
-                                "canonical_path": [r.canonical_path for r in new_rows],
-                                "csv_columns": [
+                            # task_ecb96ac9 follow-on (perf) -- the previous
+                            # version built each of these 11 columns with its
+                            # OWN separate `for r in new_rows` comprehension:
+                            # 11 full Python-level passes over the batch
+                            # instead of 1. Confirmed live at real scale
+                            # (SUT_Compressed, 82 calls / 303,104 files): even
+                            # with the pyarrow fast path active, write_seconds
+                            # was still 79.1% of total rebuild() time --
+                            # collapsing to a single pass removes 10 of those
+                            # 11 redundant iterations (and the equivalent
+                            # redundancy in json.dumps() calls, unchanged
+                            # either way) for any batch this large.
+                            _paths: list[str] = []
+                            _contents: list[str | None] = []
+                            _mtimes: list[float | None] = []
+                            _sha256s: list[str | None] = []
+                            _sizes: list[int | None] = []
+                            _generating_scripts: list[str | None] = []
+                            _kinds: list[str] = []
+                            _is_archivals: list[bool] = []
+                            _canonical_paths: list[str | None] = []
+                            _csv_columns_json: list[str | None] = []
+                            _json_keys_json: list[str | None] = []
+                            for r in new_rows:
+                                _paths.append(r.path)
+                                _contents.append(r.content)
+                                _mtimes.append(r.mtime)
+                                _sha256s.append(r.sha256)
+                                _sizes.append(r.size)
+                                _generating_scripts.append(r.generating_script)
+                                _kinds.append(r.kind)
+                                _is_archivals.append(r.is_archival)
+                                _canonical_paths.append(r.canonical_path)
+                                _csv_columns_json.append(
                                     json.dumps(r.csv_columns) if r.csv_columns else None
-                                    for r in new_rows
-                                ],
-                                "json_keys": [
+                                )
+                                _json_keys_json.append(
                                     json.dumps(r.json_keys) if r.json_keys else None
-                                    for r in new_rows
-                                ],
+                                )
+                            _arrow_table = _pa.table({
+                                "path": _paths,
+                                "content": _contents,
+                                "mtime": _mtimes,
+                                "sha256": _sha256s,
+                                "size": _sizes,
+                                "generating_script": _generating_scripts,
+                                "kind": _kinds,
+                                "is_archival": _is_archivals,
+                                "canonical_path": _canonical_paths,
+                                "csv_columns": _csv_columns_json,
+                                "json_keys": _json_keys_json,
                             })
                             con.register("_outputs_index_bulk_insert", _arrow_table)
                             try:
