@@ -1,0 +1,194 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://usemeridian.us/schemas/meridian-outputs/run-manifest.schema.json",
+  "title": "meridian-outputs canonical run manifest",
+  "description": "Sprint item 37ce5537. One ledger record (keyed by run_id) persisted by meridian_outputs.run_manifest.start_run_manifest / finalize_run_manifest under <outputs_dir>/.meridian-outputs-cache/run_manifest_ledger.json. See extensions/meridian-outputs/meridian_outputs/run_manifest.py's module docstring for the full composition/reference contract this schema documents. This schema describes the record's SHAPE for documentation and external validation; the Python module is the authoritative implementation.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "run_id",
+    "scope",
+    "command_identity",
+    "package_identity",
+    "repo_identity",
+    "input_identity",
+    "bounds",
+    "ledger_locations",
+    "expected_counts",
+    "allow_partial",
+    "phase",
+    "output_identity",
+    "artifact_ids",
+    "unknown_artifact_ids",
+    "status_reason",
+    "convergence_at_start",
+    "convergence_at_finish",
+    "manifest_hash",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Caller-supplied unique id for this run. The ledger key."
+    },
+    "scope": {
+      "type": "object",
+      "required": ["project_id", "version", "sprint_item_id"],
+      "properties": {
+        "project_id": { "type": ["string", "null"] },
+        "version": { "type": ["string", "null"] },
+        "sprint_item_id": { "type": ["string", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "command_identity": {
+      "type": "object",
+      "required": ["tool_name", "args"],
+      "properties": {
+        "tool_name": { "type": "string", "minLength": 1 },
+        "args": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "package_identity": {
+      "type": "object",
+      "required": ["name", "version", "python_version", "platform"],
+      "properties": {
+        "name": { "type": "string", "const": "meridian_outputs" },
+        "version": { "type": "string" },
+        "python_version": { "type": "string" },
+        "platform": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "repo_identity": {
+      "type": "object",
+      "required": ["repo_dir", "head", "dirty_files"],
+      "description": "git_state is best-effort local capture (run_manifest.capture_git_state) -- head/dirty_files are None/[] when repo_dir was not given or is not a git repo.",
+      "properties": {
+        "repo_dir": { "type": ["string", "null"] },
+        "head": { "type": ["string", "null"] },
+        "dirty_files": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "input_identity": {
+      "type": "object",
+      "required": ["file_hashes", "file_set_hash"],
+      "properties": {
+        "file_hashes": {
+          "type": "object",
+          "description": "path -> sha256 hex digest, or null for a missing/unreadable path (a valid state, never an error).",
+          "additionalProperties": { "type": ["string", "null"] }
+        },
+        "file_set_hash": {
+          "type": "string",
+          "description": "sha256 over the whole sorted {path: hash} set."
+        }
+      },
+      "additionalProperties": false
+    },
+    "output_identity": {
+      "type": ["object", "null"],
+      "description": "null until finalize_run_manifest runs.",
+      "required": ["file_hashes", "file_set_hash", "missing_or_unreadable"],
+      "properties": {
+        "file_hashes": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "null"] }
+        },
+        "file_set_hash": { "type": "string" },
+        "missing_or_unreadable": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Output paths that could not be re-hashed at finalize time -- fail-closed signal, never silently dropped."
+        }
+      },
+      "additionalProperties": false
+    },
+    "bounds": {
+      "type": "object",
+      "description": "Best-effort snapshot of the indexing bounds actually in effect at start_run_manifest time. Any field may be null if it could not be introspected.",
+      "required": [
+        "max_workers",
+        "max_batch",
+        "adaptive_max_batch",
+        "adaptive_max_fts_seconds",
+        "adaptive_max_write_seconds",
+        "tantivy_heap_bytes",
+        "duckdb_memory_limit_bytes"
+      ],
+      "properties": {
+        "max_workers": { "type": ["integer", "null"] },
+        "max_batch": { "type": ["integer", "null"] },
+        "adaptive_max_batch": { "type": ["integer", "null"] },
+        "adaptive_max_fts_seconds": { "type": ["number", "null"] },
+        "adaptive_max_write_seconds": { "type": ["number", "null"] },
+        "tantivy_heap_bytes": { "type": ["integer", "null"] },
+        "duckdb_memory_limit_bytes": { "type": ["integer", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "ledger_locations": {
+      "type": "object",
+      "description": "On-disk paths of this ledger plus every sibling ledger this package maintains -- REFERENCES only, never copies of their content.",
+      "required": ["run_manifest", "provenance_ledger", "fingerprint_ledger", "artifact_registry"],
+      "properties": {
+        "run_manifest": { "type": "string" },
+        "provenance_ledger": { "type": "string" },
+        "fingerprint_ledger": { "type": "string" },
+        "artifact_registry": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "expected_counts": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "output_schema_domains": {
+      "type": ["object", "null"],
+      "description": "Reserved for future raw/dse domain tagging parity with meridian.executor_contract's output_schema; unused by this module today."
+    },
+    "allow_partial": { "type": "boolean" },
+    "external_manifest_hash": {
+      "type": ["string", "null"],
+      "description": "Optional cross-reference to an externally (e.g. meridian.executor_contract) built execution-manifest hash. Stored verbatim, never re-derived or verified by this module."
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["in_progress", "complete", "failed", "partial"]
+    },
+    "artifact_ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "artifact_registry public artifact ids validated (via get_artifact) at finalize time -- referenced, never duplicated."
+    },
+    "unknown_artifact_ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Caller-declared artifact ids that did NOT resolve in the registry at finalize time -- presence here downgrades an attempted phase=\"complete\" to \"partial\"."
+    },
+    "status_reason": { "type": ["string", "null"] },
+    "convergence_at_start": {
+      "type": ["object", "null"],
+      "description": "outputs_local.get_convergence_state() snapshot taken at start_run_manifest time; null if it could not be read."
+    },
+    "convergence_at_finish": {
+      "type": ["object", "null"],
+      "description": "Same shape as convergence_at_start, taken at finalize_run_manifest time; null until finalize runs (or if it could not be read)."
+    },
+    "manifest_hash": {
+      "type": "string",
+      "description": "sha256 over the deterministic identity fields only (excludes created_at/updated_at/manifest_hash/phase/output_identity/artifact_ids/unknown_artifact_ids/status_reason/convergence_at_start/convergence_at_finish/bounds -- bounds is excluded because its duckdb_memory_limit_bytes field is derived from live available-system-memory at call time, not a stable identity input). Stable across finalize_run_manifest calls; a same-run_id manifest with a different hash is refused."
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": false
+}

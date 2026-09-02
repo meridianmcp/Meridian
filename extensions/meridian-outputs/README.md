@@ -136,6 +136,50 @@ always surfaced together, never silently narrowed to one.
 | `list_registered_artifacts` | All registered artifacts, optionally filtered by kind/lifecycle_state |
 | `reconcile_legacy_artifact_outputs` | Migration/reconciliation report for legacy outputs (defaults to the `record_provenance` ledger); dry-run preview or real registration; ambiguous/unanchored entries are never silently registered |
 
+### Canonical run manifest (item 37ce5537)
+
+`meridian_outputs.run_manifest` composes this package's existing modules
+behind one run-scoped receipt — it introduces exactly ONE new ledger
+(`<outputs_dir>/.meridian-outputs-cache/run_manifest_ledger.json`, keyed by
+`run_id`) and duplicates none of the state the sibling ledgers above already
+own: hashes come from `fingerprint.script_content_hash`, artifact references
+are validated (never re-derived) against `artifact_registry`, and the
+convergence snapshot comes from `outputs_local.get_convergence_state`.
+
+A run manifest binds, in one place: project/repo identity (including a
+best-effort local `git_state` capture — this package cannot import
+`meridian.executor_contract` across the package boundary, see the module's
+own docstring), package/tool version, command identity, input/output file
+hashes, the indexing bounds actually in effect (max workers, batch caps,
+adaptive thresholds, DuckDB/Tantivy memory), every sibling ledger's on-disk
+location, referenced artifact ids, and an explicit `phase`
+(`in_progress`/`complete`/`failed`/`partial`).
+
+`start_run_manifest` persists an `in_progress` receipt immediately — an
+interrupted run's manifest is resumable, never lost. Its `manifest_hash` is
+a deterministic identity fingerprint (excludes wall-clock and
+lifecycle/outcome fields): identical identity inputs on unchanged
+repo/runtime state hash identically every time, and a same-`run_id` call
+with a genuinely different identity is refused rather than silently
+overwritten — a new run needs a new `run_id`. `finalize_run_manifest`
+re-hashes every declared output path and validates every declared artifact
+id RIGHT NOW (fail-closed): anything that doesn't check out downgrades an
+attempted `"complete"` to `"partial"` automatically, and `manifest_hash`
+never changes across finalize. `get_run_manifest_envelope` represents the
+finished (or still-partial) manifest as a `RUN`-kind `EvidenceRecord` — the
+`EvidenceKind.RUN` slot `research_evidence.py` already reserved but nothing
+populated until this item — so it round-trips through the exact same
+lossless JSON/XML envelope machinery as every other provenance answer in
+this package, with no second codec.
+
+| Tool | Description |
+|------|-------------|
+| `start_run_manifest` | Persist an in-progress canonical run manifest: project/repo/package/command identity, input hashes, indexing bounds in effect, sibling-ledger locations, convergence snapshot. Idempotent; refuses a same-`run_id`/different-identity collision |
+| `finalize_run_manifest` | Bind exact (re-hashed now) output paths and validated artifact-id references to a started run, and mark its final phase — fails closed to `partial` on anything unverified |
+| `get_run_manifest` | Look up the current run-manifest record for a `run_id`, whatever phase it's in |
+| `list_run_manifests` | List every run-manifest record started under an outputs directory |
+| `get_run_manifest_envelope` | Typed, lossless `RUN`-kind `ProvenanceEnvelope` for one run manifest |
+
 ## Security
 
 - Secret files are excluded before indexing (`.env*`, `*.key`, `*secret*`,
