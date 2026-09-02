@@ -106,6 +106,22 @@ _write_lock = threading.RLock()
 _VALID_START_PHASE = "in_progress"
 _VALID_FINAL_STATUSES = ("complete", "failed", "partial")
 
+# PROV-CANONICAL (7d9b8251) -- an in_progress manifest whose updated_at (or
+# created_at, if updated_at is somehow absent) is more recent than this many
+# seconds ago is treated as genuinely live ("safe to poll/retry" ->
+# ResolverStatus.PENDING_RETRY); older than this, it is treated as a stale,
+# likely orphaned/crashed receipt (-> ResolverStatus.UNAVAILABLE, unchanged
+# from the pre-PROV-CANONICAL behavior). This module has no heartbeat
+# mechanism of its own (see module docstring: the ONLY durable state it
+# owns is the ledger record itself) -- age-since-last-write is the sole,
+# best-effort liveness signal available without inventing a second polling
+# channel. Chosen conservatively generous (30 minutes) for a local
+# Outputs-indexing run; a caller with a tighter/looser liveness contract
+# for its own workload can still read the raw `phase`/`updated_at` fields
+# directly and re-derive its own verdict -- this constant only affects the
+# EvidenceRecord bridge, never the ledger itself.
+_STALE_IN_PROGRESS_SECONDS = 1800.0
+
 
 class RunManifestError(ValueError):
     """Raised for a structurally-invalid run-manifest call: a missing
@@ -664,6 +680,24 @@ def list_run_manifests(outputs_dir: str) -> "list[dict[str, Any]]":
 # RUN-kind EvidenceRecord bridge (the previously-unused EvidenceKind.RUN slot)
 # ---------------------------------------------------------------------------
 
+def _in_progress_age_seconds(manifest: dict[str, Any]) -> "float | None":
+    """Best-effort seconds since ``manifest["updated_at"]`` (falls back to
+    ``created_at`` if that's somehow absent). ``None`` when neither
+    timestamp is present or parseable -- callers must treat that as "cannot
+    confirm liveness" (conservatively: NOT alive), never as "assume alive".
+    Never raises."""
+    raw = manifest.get("updated_at") or manifest.get("created_at")
+    if not raw:
+        return None
+    try:
+        ts = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
+
+
 def run_manifest_to_evidence_record(manifest: dict[str, Any]) -> "research_evidence.EvidenceRecord":
     """Represent one run-manifest ledger record as a ``RUN``-kind
     :class:`research_evidence.EvidenceRecord` -- the slot that module's own
@@ -674,12 +708,22 @@ def run_manifest_to_evidence_record(manifest: dict[str, Any]) -> "research_evide
     envelope machinery once wrapped this way.
 
     Resolver-status mapping (mirrors ``provenance_status``'s own explicit
-    "never let a caller infer status from field presence" discipline):
+    "never let a caller infer status from field presence" discipline).
+    PROV-CANONICAL (7d9b8251) revised the ``in_progress``/``failed``
+    branches below -- see :class:`research_evidence.ResolverStatus`'s own
+    docstring for why ``PENDING_RETRY``/``FAILED`` were added:
+
       * ``phase == "complete"`` AND no missing outputs AND no unknown
         artifact ids -> ``VERIFIED``.
-      * ``phase == "in_progress"`` -> ``UNAVAILABLE`` (not yet finalized --
-        the resumable partial-receipt case).
-      * ``phase == "failed"`` -> ``DEGRADED``.
+      * ``phase == "in_progress"`` AND last updated within
+        :data:`_STALE_IN_PROGRESS_SECONDS` -> ``PENDING_RETRY`` (genuinely
+        still executing -- safe to poll/retry, distinct from a dead one).
+      * ``phase == "in_progress"`` but stale (older than the threshold, or
+        no parseable timestamp at all -- fail-closed, never assumed alive)
+        -> ``UNAVAILABLE`` (likely an orphaned/crashed run).
+      * ``phase == "failed"`` -> ``FAILED`` (a first-class terminal-failure
+        signal -- PRE-PROV-CANONICAL this was ``DEGRADED``, which conflated
+        "confirmed dead" with "still usable but imperfect").
       * ``phase == "partial"`` (or any forward-compatible unknown phase) ->
         ``AMBIGUOUS``.
 
@@ -702,14 +746,33 @@ def run_manifest_to_evidence_record(manifest: dict[str, Any]) -> "research_evide
             reason="run manifest finalized with all declared outputs/artifacts verified",
         )
     elif phase == _VALID_START_PHASE:
-        resolver = research_evidence.ResolverState(
-            status=research_evidence.ResolverStatus.UNAVAILABLE,
-            confidence=0.2,
-            reason="run manifest not yet finalized -- interrupted/still-running receipt",
-        )
+        age = _in_progress_age_seconds(manifest)
+        if age is not None and age <= _STALE_IN_PROGRESS_SECONDS:
+            resolver = research_evidence.ResolverState(
+                status=research_evidence.ResolverStatus.PENDING_RETRY,
+                confidence=0.3,
+                reason=(
+                    "run manifest still in_progress and recently updated "
+                    f"({age:.0f}s ago) -- likely actively executing, safe to "
+                    "poll/retry rather than treat as dead"
+                ),
+            )
+        else:
+            staleness = (
+                f"last updated {age:.0f}s ago" if age is not None
+                else "updated_at/created_at missing or unparseable"
+            )
+            resolver = research_evidence.ResolverState(
+                status=research_evidence.ResolverStatus.UNAVAILABLE,
+                confidence=0.15,
+                reason=(
+                    f"run manifest in_progress but stale ({staleness}) -- "
+                    "likely an orphaned/crashed run, not actively executing"
+                ),
+            )
     elif phase == "failed":
         resolver = research_evidence.ResolverState(
-            status=research_evidence.ResolverStatus.DEGRADED,
+            status=research_evidence.ResolverStatus.FAILED,
             confidence=0.1,
             reason=manifest.get("status_reason") or "run reported failed",
         )

@@ -275,13 +275,38 @@ class TestGetListRunManifests:
 # ---------------------------------------------------------------------------
 
 class TestRunManifestToEvidenceRecord:
-    def test_in_progress_is_unavailable_and_partial(self, tmp_path: Path) -> None:
+    def test_fresh_in_progress_is_pending_retry_and_partial(self, tmp_path: Path) -> None:
+        """PROV-CANONICAL (7d9b8251): a JUST-started (fresh updated_at) run
+        is genuinely live -- PENDING_RETRY, not UNAVAILABLE (which is now
+        reserved for a STALE in_progress receipt; see the next test)."""
         rec = RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
         evidence = RM.run_manifest_to_evidence_record(rec)
         assert evidence.identity.kind == RE.EvidenceKind.RUN
         assert evidence.identity.id == "run:r1"
+        assert evidence.resolver.status == RE.ResolverStatus.PENDING_RETRY
+        assert evidence.partial is True
+        assert not evidence.is_authoritative
+
+    def test_stale_in_progress_is_unavailable_and_partial(self, tmp_path: Path) -> None:
+        """PROV-CANONICAL (7d9b8251): an in_progress receipt whose
+        updated_at is long in the past (crashed/orphaned run, never
+        finalized) is UNAVAILABLE -- distinct from a fresh one."""
+        rec = RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
+        rec["updated_at"] = "2020-01-01T00:00:00+00:00"
+        evidence = RM.run_manifest_to_evidence_record(rec)
         assert evidence.resolver.status == RE.ResolverStatus.UNAVAILABLE
         assert evidence.partial is True
+
+    def test_in_progress_with_unparseable_timestamp_fails_closed_to_unavailable(
+        self, tmp_path: Path,
+    ) -> None:
+        """No parseable liveness signal -> treated as NOT alive (fail
+        closed), never optimistically assumed to be PENDING_RETRY."""
+        rec = RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
+        rec["updated_at"] = "not-a-timestamp"
+        rec["created_at"] = "also-not-a-timestamp"
+        evidence = RM.run_manifest_to_evidence_record(rec)
+        assert evidence.resolver.status == RE.ResolverStatus.UNAVAILABLE
 
     def test_clean_complete_is_verified_and_not_partial(self, tmp_path: Path) -> None:
         RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
@@ -291,11 +316,15 @@ class TestRunManifestToEvidenceRecord:
         assert evidence.partial is False
         assert evidence.is_authoritative
 
-    def test_failed_is_degraded(self, tmp_path: Path) -> None:
+    def test_failed_is_failed_status(self, tmp_path: Path) -> None:
+        """PROV-CANONICAL (7d9b8251): a reported-failed run is the new
+        first-class ResolverStatus.FAILED, not DEGRADED (which pre-dates
+        this item and conflated "terminally failed" with "usable but
+        imperfect")."""
         RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
         rec = RM.finalize_run_manifest(str(tmp_path), "r1", status="failed", reason="boom")
         evidence = RM.run_manifest_to_evidence_record(rec)
-        assert evidence.resolver.status == RE.ResolverStatus.DEGRADED
+        assert evidence.resolver.status == RE.ResolverStatus.FAILED
         assert evidence.partial is True
         assert evidence.partial_reason == "boom"
 
@@ -372,7 +401,10 @@ class TestBuildRunManifestEnvelope:
         RM.start_run_manifest(str(tmp_path), run_id="r1", command_name="build")
         env = RM.build_run_manifest_envelope(str(tmp_path), "r1")
         md = env.to_markdown()
-        assert "UNAVAILABLE" in md
+        # A fresh in_progress run is PENDING_RETRY (see
+        # TestRunManifestToEvidenceRecord.test_fresh_in_progress_is_pending_retry_and_partial)
+        # -- still non-authoritative, so still flagged in the projection.
+        assert "PENDING_RETRY" in md
 
 
 # ---------------------------------------------------------------------------
