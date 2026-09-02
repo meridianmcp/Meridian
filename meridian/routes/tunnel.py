@@ -634,6 +634,78 @@ async def _resolve_tenant_from_token(auth_db: Any, token: str | None) -> dict | 
 
 
 # ---------------------------------------------------------------------------
+# ff9d2963 — shared, single-source-of-truth token extraction for the tunnel's
+# two auth surfaces (WS query-param legacy fallback vs. plain-HTTP header-only).
+#
+# The 4 WebSocket endpoints below MUST keep accepting `?token=` as a fallback:
+# the local tunnel binary (tunnel_client.py's `_ws_url`/`_ws_code_url`/
+# `_ws_extract_url`/`_ws_office_url`) cannot always pass the token as a real
+# Authorization header, because the `websockets` client library renamed its
+# header kwarg across the version range this project supports
+# (`extra_headers` on 12.x/13.x, `additional_headers` on 14.x+) and
+# `pyproject.toml` pins only `websockets>=12.0` (open-ended) — a hardcoded
+# kwarg name would break for whichever major version the host machine has
+# installed. This is a genuine, load-bearing constraint, not an oversight, so
+# the fallback is kept but made explicit ("legacy-gated"): every connection
+# that authenticates via the query param is logged (never the raw token
+# itself) so the volume of legacy-path usage stays visible in ops ahead of
+# eventually closing the gap client-side (e.g. detecting the installed
+# `websockets.connect` signature at runtime and always sending a header).
+#
+# The 3 plain-HTTP endpoints (`/tunnel/active-repo`, `/tunnel/refresh`,
+# `/tunnel/manifest`) have no such constraint — httpx has no
+# equivalent header-kwarg-naming problem, and every internal caller
+# (`tunnel_client.py`'s `_fetch_tunnel_manifest`, the MCP handler's direct
+# in-process calls to `send_active_repo_control`/`refresh_tunnel_manifest`)
+# already sends a real `Authorization: Bearer` header. A durable bearer token
+# in a URL query string is a straightforward, avoidable leak (access logs,
+# browser history, `Referer` headers) with no offsetting benefit for these
+# three routes, so `_resolve_http_bearer_token` below never falls back to it.
+# ---------------------------------------------------------------------------
+
+def _extract_ws_auth_token(ws: "WebSocket") -> tuple[str, bool]:
+    """Resolve a WS tunnel connection's bearer token: header first, then the
+    legacy `?token=` query param. Returns ``(raw_token, used_query_fallback)``
+    so the caller can log the legacy path without ever logging the token."""
+    auth_header = ws.headers.get("authorization", "")
+    if auth_header:
+        return auth_header, False
+    token_param = ws.query_params.get("token", "")
+    return token_param, bool(token_param)
+
+
+def _log_ws_legacy_auth(label: str, tenant_id: str, used_query_fallback: bool) -> None:
+    """Redacted, opt-in log line for the legacy WS query-token auth path.
+
+    Never logs the token value — only that the fallback fired, for a
+    tenant-id truncated to 8 chars (matching this module's existing
+    "tenant %s connected" convention) — so ops can track/alert on legacy
+    usage without this line itself becoming a new leak surface."""
+    if used_query_fallback:
+        _log.info(
+            "tunnel-%s: tenant %s authenticated via legacy ?token= query "
+            "param (Authorization header preferred; see ff9d2963)",
+            label, tenant_id[:8],
+        )
+
+
+def _resolve_http_bearer_token(request: "Request") -> str:
+    """Extract a bearer token from the Authorization header ONLY.
+
+    ff9d2963: unlike the WS endpoints, the 3 plain-HTTP tunnel routes never
+    fall back to `?token=` — see the module note above for why the fallback
+    is unnecessary here and actively harmful (durable secret in the request
+    path/access logs). A request that only supplies `?token=` resolves to an
+    empty string here, which `_resolve_tenant_from_token` treats as invalid
+    (401), exactly as if no credential had been supplied at all.
+    """
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[len("Bearer "):].strip()
+    return auth_header
+
+
+# ---------------------------------------------------------------------------
 # /tunnel/{tenant_id}  — WebSocket: binary client holds this open
 # ---------------------------------------------------------------------------
 
@@ -653,10 +725,9 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
     # Accept the socket early so we can send a close frame with a reason.
     await ws.accept()
 
-    # Authenticate: header first, then query param
-    auth_header = ws.headers.get("authorization", "")
-    token_param = ws.query_params.get("token", "")
-    raw_token = auth_header or token_param
+    # Authenticate: header first, then legacy query param (see module note
+    # above `_extract_ws_auth_token`).
+    raw_token, used_query_fallback = _extract_ws_auth_token(ws)
 
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None or tenant.get("id") != tenant_id:
@@ -666,6 +737,8 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
     if not _is_tunnel_allowed(tenant):
         await ws.close(code=4403, reason="tunnel requires Pro plan")
         return
+
+    _log_ws_legacy_auth("fs", tenant_id, used_query_fallback)
 
     # Evict any stale socket for this tenant (e.g. binary restarted)
     old_ws = _tunnel_sockets.pop(tenant_id, None)
@@ -780,9 +853,7 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
     auth_db = ws.app.state.db
     await ws.accept()
 
-    auth_header = ws.headers.get("authorization", "")
-    token_param = ws.query_params.get("token", "")
-    raw_token = auth_header or token_param
+    raw_token, used_query_fallback = _extract_ws_auth_token(ws)
 
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None or tenant.get("id") != tenant_id:
@@ -807,6 +878,7 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
     # this only for the FS slot (tunnel_ws); this is the equivalent for code.
     owner_instance = record_tenant_owner_instance(tenant_id)
     _log.info("tunnel-code: tenant %s connected", tenant_id[:8])
+    _log_ws_legacy_auth("code", tenant_id, used_query_fallback)
 
     try:
         while True:
@@ -872,9 +944,7 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
     auth_db = ws.app.state.db
     await ws.accept()
 
-    auth_header = ws.headers.get("authorization", "")
-    token_param = ws.query_params.get("token", "")
-    raw_token = auth_header or token_param
+    raw_token, used_query_fallback = _extract_ws_auth_token(ws)
 
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None or tenant.get("id") != tenant_id:
@@ -899,6 +969,7 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
     # Fly). af5b5739 wired this only for the FS slot; this is the extract fix.
     owner_instance = record_tenant_owner_instance(tenant_id)
     _log.info("tunnel-extract: tenant %s connected", tenant_id[:8])
+    _log_ws_legacy_auth("extract", tenant_id, used_query_fallback)
 
     try:
         while True:
@@ -973,9 +1044,7 @@ async def _serve_tunnel_ws(
     auth_db = ws.app.state.db
     await ws.accept()
 
-    auth_header = ws.headers.get("authorization", "")
-    token_param = ws.query_params.get("token", "")
-    raw_token = auth_header or token_param
+    raw_token, used_query_fallback = _extract_ws_auth_token(ws)
 
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None or tenant.get("id") != tenant_id:
@@ -1005,6 +1074,7 @@ async def _serve_tunnel_ws(
     # word, dc, docs, zotero, and custom slots (p0-p3).
     owner_instance = record_tenant_owner_instance(tenant_id)
     _log.info("tunnel-%s: tenant %s connected", label, tenant_id[:8])
+    _log_ws_legacy_auth(label, tenant_id, used_query_fallback)
 
     try:
         while True:
@@ -1153,10 +1223,7 @@ async def set_tunnel_active_repo(request: Request) -> Response:
             media_type="application/json",
         )
 
-    auth_header = request.headers.get("authorization", "")
-    raw_token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else auth_header
-    if not raw_token:
-        raw_token = request.query_params.get("token", "")
+    raw_token = _resolve_http_bearer_token(request)
     auth_db = request.app.state.db
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None:
@@ -1248,10 +1315,7 @@ async def refresh_tunnel_tools_route(request: Request) -> Response:
     if not _hosted_mode():
         return _json_response({"error": "tunnel requires hosted mode"}, status_code=503)
 
-    auth_header = request.headers.get("authorization", "")
-    raw_token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else auth_header
-    if not raw_token:
-        raw_token = request.query_params.get("token", "")
+    raw_token = _resolve_http_bearer_token(request)
     auth_db = request.app.state.db
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None:
@@ -1279,10 +1343,7 @@ async def get_tunnel_manifest_route(request: Request) -> Response:
     if not _hosted_mode():
         return _json_response({"error": "tunnel requires hosted mode"}, status_code=503)
 
-    auth_header = request.headers.get("authorization", "")
-    raw_token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else auth_header
-    if not raw_token:
-        raw_token = request.query_params.get("token", "")
+    raw_token = _resolve_http_bearer_token(request)
     auth_db = request.app.state.db
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None:

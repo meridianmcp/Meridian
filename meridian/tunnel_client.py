@@ -44,6 +44,7 @@ from . import process_registry as _process_registry
 from . import serena_pool as _serena_pool
 from . import tunnel_lifecycle as _tunnel_lifecycle
 from .repo_scope import RepoScopeError, validate_repo_scope
+from .secret_redaction import redact as _redact_secret_text
 from .serena_pool import SerenaDaemonPool, SERENA_POOL_BASE_PORT
 
 DEFAULT_BASE_URL = "https://usemeridian.us"
@@ -1826,6 +1827,26 @@ def _is_clean_server_close(exc: BaseException) -> bool:
     return code in _CLEAN_RECONNECT_CLOSE_CODES
 
 
+def _safe_disconnect_reason(exc: BaseException) -> str:
+    """Stringify a reconnect-loop exception for a stderr print, with any
+    embedded bearer token scrubbed first (ff9d2963).
+
+    The WS tunnel URL still carries the token as a ``?token=`` query param
+    (see the module note above ``_ws_url`` — a genuine ``websockets``
+    header-kwarg-version constraint, not an oversight) and several
+    ``websockets`` exceptions stringify by embedding the URI verbatim — e.g.
+    ``websockets.exceptions.InvalidURI.__str__`` returns
+    ``f"{self.uri} isn't a valid URI: {self.msg}"``. Printing ``str(exc)``
+    directly would leak the live token into this process's stderr (captured
+    by any log aggregator, terminal scrollback, or bug-report paste) on every
+    reconnect attempt that hits one of those exception types. Reuses the same
+    ``sk_meridian_...`` pattern the server-side diagnostics redactor and the
+    DB write-path guard already share (``meridian/secret_redaction.py``)
+    rather than a bespoke regex, so all three stay in sync automatically.
+    """
+    return _redact_secret_text(str(exc))
+
+
 async def _run_connection_lazy(
     ws_url: str,
     proxy: "SlotProxy",
@@ -2183,14 +2204,16 @@ async def _reconnect_loop_lazy(
                 # _proc_watchdog's healthy-tick reset.
                 backoff = 1.0
                 print(
-                    f"tunnel:{label}: disconnected (server restart, {exc}); "
+                    f"tunnel:{label}: disconnected (server restart, "
+                    f"{_safe_disconnect_reason(exc)}); "
                     f"reconnecting in {backoff:.0f}s",
                     file=sys.stderr,
                     flush=True,
                 )
             else:
                 print(
-                    f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
+                    f"tunnel:{label}: disconnected ({_safe_disconnect_reason(exc)}); "
+                    f"reconnecting in {backoff:.0f}s",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -2368,14 +2391,16 @@ async def _reconnect_loop_extract_pool(
                 # climbing it, mirroring _proc_watchdog's healthy-tick reset.
                 backoff = 1.0
                 print(
-                    f"tunnel:{label}: disconnected (server restart, {exc}); "
+                    f"tunnel:{label}: disconnected (server restart, "
+                    f"{_safe_disconnect_reason(exc)}); "
                     f"reconnecting in {backoff:.0f}s",
                     file=sys.stderr,
                     flush=True,
                 )
             else:
                 print(
-                    f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
+                    f"tunnel:{label}: disconnected ({_safe_disconnect_reason(exc)}); "
+                    f"reconnecting in {backoff:.0f}s",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -4496,9 +4521,15 @@ async def _browser_auth_flow(base_url: str) -> str:
 def _ws_url(base_url: str, tenant_id: str, token: str) -> str:
     """Build the tunnel WebSocket URL with the token as a query param.
 
-    The token is passed via ``?token=`` (which the server accepts) rather than
-    an Authorization header so we don't depend on the ``websockets`` version's
-    header kwarg name (``extra_headers`` vs ``additional_headers``).
+    The token is passed via ``?token=`` (which the server accepts as an
+    explicitly legacy-gated, redacted-in-logs fallback — see
+    ``meridian/routes/tunnel.py``'s ``_extract_ws_auth_token`` module note,
+    ff9d2963) rather than an Authorization header, because we don't depend on
+    the ``websockets`` version's header kwarg name (``extra_headers`` on
+    12.x/13.x vs ``additional_headers`` on 14.x+ — ``pyproject.toml`` pins
+    only ``websockets>=12.0``, open-ended). Any code that stringifies a
+    connection exception built from this URL (e.g. reconnect-loop logging)
+    MUST redact it first — see :func:`_safe_disconnect_reason`.
     """
     base = base_url.rstrip("/")
     if base.startswith("https://"):
@@ -6421,14 +6452,16 @@ async def _reconnect_loop(
                 # climbing it, mirroring _proc_watchdog's healthy-tick reset.
                 backoff = 1.0
                 print(
-                    f"tunnel:{label}: disconnected (server restart, {exc}); "
+                    f"tunnel:{label}: disconnected (server restart, "
+                    f"{_safe_disconnect_reason(exc)}); "
                     f"reconnecting in {backoff:.0f}s",
                     file=sys.stderr,
                     flush=True,
                 )
             else:
                 print(
-                    f"tunnel:{label}: disconnected ({exc}); reconnecting in {backoff:.0f}s",
+                    f"tunnel:{label}: disconnected ({_safe_disconnect_reason(exc)}); "
+                    f"reconnecting in {backoff:.0f}s",
                     file=sys.stderr,
                     flush=True,
                 )

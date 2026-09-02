@@ -163,6 +163,35 @@ def test_ws_url_quotes_token():
     assert "a%2Fb%2Bc%20d" in url
 
 
+# ---------------------------------------------------------------------------
+# ff9d2963 — _safe_disconnect_reason: the WS query-string token (_ws_url,
+# above) must never reach stderr un-redacted via a reconnect-loop exception
+# string. Confirmed real leak: websockets.exceptions.InvalidURI.__str__
+# returns f"{self.uri} isn't a valid URI: {self.msg}", embedding the full
+# ?token=... URL verbatim.
+# ---------------------------------------------------------------------------
+
+def test_safe_disconnect_reason_redacts_token_in_invalid_uri():
+    import websockets.exceptions as _wse
+
+    fake_token = "sk_meridian_" + "a" * 32  # fixture only, never a real credential
+    bad_uri = f"wss://usemeridian.us/tunnel/t1?token={fake_token}"
+    exc = _wse.InvalidURI(bad_uri, "not a valid URI")
+
+    # Sanity: confirm the exception really does embed the token verbatim,
+    # i.e. this test exercises a real leak vector, not a hypothetical one.
+    assert fake_token in str(exc)
+
+    reason = tc._safe_disconnect_reason(exc)
+    assert fake_token not in reason
+    assert "[REDACTED:meridian-token]" in reason
+
+
+def test_safe_disconnect_reason_passes_through_benign_exception_unchanged():
+    exc = RuntimeError("connection reset by peer")
+    assert tc._safe_disconnect_reason(exc) == "connection reset by peer"
+
+
 def test_permanent_url_targets_mcp_transport_endpoint():
     # Must point at the /mcp transport, NOT the proxy root (which 404s).
     assert (

@@ -529,6 +529,68 @@ def test_reconnect_loop_resets_backoff_on_clean_1012_but_climbs_on_real_failure(
 
 
 # ---------------------------------------------------------------------------
+# ff9d2963 — reconnect-loop stderr prints must never leak the live bearer
+# token embedded in the WS query-string URL (_ws_url). A websockets exception
+# whose __str__ embeds the full connection URI (confirmed real:
+# websockets.exceptions.InvalidURI) must come out redacted on stderr.
+# ---------------------------------------------------------------------------
+
+def test_reconnect_loop_redacts_bearer_token_in_disconnect_print(monkeypatch, capsys):
+    import websockets.exceptions as _wse
+
+    fake_token = "sk_meridian_" + "a" * 32  # fixture only, never a real credential
+    bad_uri = f"wss://usemeridian.us/tunnel/t1?token={fake_token}"
+    attempts = {"n": 0}
+
+    async def fake_run_connection(ws_url, port, label, tool_prefix=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise _wse.InvalidURI(bad_uri, "not a valid URI")
+        raise asyncio.CancelledError
+
+    async def fake_sleep(n):
+        pass
+
+    monkeypatch.setattr(tc, "_run_connection", fake_run_connection)
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tc._reconnect_loop("wss://x", 8808, "fs"))
+
+    err = capsys.readouterr().err
+    assert fake_token not in err, f"raw bearer token leaked into stderr: {err!r}"
+    assert "[REDACTED:meridian-token]" in err
+
+
+def test_reconnect_loop_lazy_redacts_bearer_token_in_disconnect_print(monkeypatch, capsys):
+    import websockets.exceptions as _wse
+
+    fake_token = "sk_meridian_" + "b" * 32  # fixture only, never a real credential
+    bad_uri = f"wss://usemeridian.us/tunnel/t1?token={fake_token}"
+    attempts = {"n": 0}
+    proxy = object()  # opaque -- _run_connection_lazy is mocked below
+
+    async def fake_run_connection_lazy(ws_url, proxy_, label, tool_prefix=None, known_repo_paths=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise _wse.InvalidURI(bad_uri, "not a valid URI")
+        raise asyncio.CancelledError
+
+    async def fake_sleep(n):
+        pass
+
+    monkeypatch.setattr(tc, "_run_connection_lazy", fake_run_connection_lazy)
+    monkeypatch.setattr(tc.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(tc._reconnect_loop_lazy("wss://x", proxy, "fs"))
+
+    err = capsys.readouterr().err
+    assert fake_token not in err, f"raw bearer token leaked into stderr: {err!r}"
+    assert "[REDACTED:meridian-token]" in err
+
+
+# ---------------------------------------------------------------------------
 # SlotProxy + lazy-spawn coroutines (3649a61a) — lazy plugin spawning
 # ---------------------------------------------------------------------------
 
