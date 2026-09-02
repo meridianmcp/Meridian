@@ -341,6 +341,74 @@ class TestScanDotenvCredential:
 # scan() -- edge cases
 # ---------------------------------------------------------------------------
 
+class TestScanMeridianToken:
+    """ba31dedf — Meridian's own bearer token shape. Confirmed gap: none of
+    stripe-live-key, openai-anthropic-key, or dotenv-credential fired on a
+    bare `"BEARER_TOKEN": "sk_meridian_..."` JSON/TOML/env pair (the exact
+    shape AGENTS.md's hosted-tier config, tunnel_client's generated configs,
+    and meridian_connect.py's installer all produce) before this pattern was
+    added."""
+
+    # Fixture value only -- never a real credential. Deliberately shaped like
+    # the real thing (prefix + length) so it exercises the actual regex.
+    _FAKE = "sk_meridian_" + "abcdefghijklmnopqrstuvwxyz123456"  # noqa: S105
+
+    def test_detects_bare_meridian_token(self):
+        matches = scan(self._FAKE)
+        assert any(m.name == "meridian-token" for m in matches), matches
+
+    def test_detects_meridian_token_in_bearer_header_prose(self):
+        text = f"Authorization: Bearer {self._FAKE}"
+        matches = scan(text)
+        assert any(m.name == "meridian-token" for m in matches), matches
+
+    def test_detects_meridian_token_in_json_env_pair(self):
+        """The exact confirmed-gap shape: a bare JSON `"BEARER_TOKEN": "..."`
+        pair, quoted/colon-joined rather than a bare KEY=value assignment --
+        this is what slipped past every pre-existing pattern."""
+        text = f'{{"env": {{"BEARER_TOKEN": "{self._FAKE}"}}}}'
+        matches = scan(text)
+        assert any(m.name == "meridian-token" for m in matches), matches
+
+    def test_detects_meridian_token_in_generated_mcp_json_snippet(self):
+        """A realistic generated-config sample matching tunnel_client's own
+        `_tunnel_mcp_entries` shape."""
+        text = (
+            '{\n'
+            '  "mcpServers": {\n'
+            '    "meridian": {\n'
+            '      "type": "http",\n'
+            '      "url": "https://usemeridian.us/mcp",\n'
+            f'      "headers": {{"Authorization": "Bearer {self._FAKE}"}}\n'
+            '    }\n'
+            '  }\n'
+            '}\n'
+        )
+        matches = scan(text)
+        assert any(m.name == "meridian-token" for m in matches), matches
+
+    def test_does_not_match_short_meridian_prefix(self):
+        text = "sk_meridian_short"
+        matches = [m for m in scan(text) if m.name == "meridian-token"]
+        assert not matches
+
+    def test_does_not_confuse_stripe_key_for_meridian_token(self):
+        text = "sk_live_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcd"
+        matches = [m for m in scan(text) if m.name == "meridian-token"]
+        assert not matches
+
+    def test_redact_masks_meridian_token(self):
+        result = redact(self._FAKE)
+        assert self._FAKE not in result
+        assert "[REDACTED:meridian-token]" in result
+
+    def test_check_for_secrets_rejects_meridian_token(self):
+        # Bare value (no KEY= wrapper) to test this pattern in isolation, per
+        # the module docstring's convention for the other pattern classes.
+        with pytest.raises(ValueError, match="meridian-token"):
+            check_for_secrets(f"Use {self._FAKE} to authenticate", context="x")
+
+
 class TestScanEdgeCases:
     def test_empty_string_returns_empty(self):
         assert scan("") == []

@@ -1949,6 +1949,38 @@ def test_run_tunnel_non_pro_plan_returns_1(monkeypatch):
     assert rc == 1
 
 
+# ---------------------------------------------------------------------------
+# ba31dedf — repo-scope guard: reject a DEFAULTED (unset --repo) home
+# directory; never second-guess an EXPLICIT --repo argument.
+# ---------------------------------------------------------------------------
+
+def test_run_tunnel_rejects_home_directory_when_repo_path_defaulted(monkeypatch, tmp_path, capsys):
+    """An unset --repo defaults to Path.cwd() (see the top of run_tunnel) --
+    when that default IS the home directory, the tunnel must fail closed
+    rather than silently scoping every connector to the whole home tree."""
+    monkeypatch.setattr(tc, "_force_utf8_io", lambda: None)
+    monkeypatch.setattr(tc, "_resolve_token", lambda t: "sk_tok")
+    monkeypatch.setattr(
+        tc, "_fetch_me",
+        AsyncMock(return_value={"tenant_id": "t1", "plan": "pro"}),
+    )
+    monkeypatch.setattr(tc.Path, "cwd", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(tc.Path, "home", staticmethod(lambda: tmp_path))
+    rc = _run_tunnel(token="sk_tok", base_url="https://x", repo_path=None)
+    assert rc == 1
+    assert "repo scope" in capsys.readouterr().err
+
+
+# NOTE: the companion "an EXPLICIT --repo equal to home is never rejected"
+# case is exercised end-to-end (through the full plugin-resolution/spawn
+# path, plan="pro", rc==0) by
+# test_run_tunnel_code_slot_wired_with_dedicated_cache_and_reuse further
+# below, which reuses one tmp_path as both the patched Path.home() and an
+# explicit repo_path -- exactly the collision this scoping decision (guard
+# the DEFAULTED case only, via _repo_path_from_cli) had to resolve without
+# breaking that pre-existing test.
+
+
 def test_run_tunnel_cached_token_rejected_then_browser_fails(monkeypatch):
     """Cached token path: /me actually rejects (401), re-auth via browser also
     cancelled → 2."""

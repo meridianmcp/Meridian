@@ -60,6 +60,16 @@ SECRET_PATTERNS: list[_Pattern] = [
     _p("aws-access-key-id", r"AKIA[0-9A-Z]{16}"),
     # Stripe LIVE secret key (not test keys)
     _p("stripe-live-key", r"sk_live_[A-Za-z0-9]{24,}"),
+    # Meridian's own bearer token (ba31dedf). Underscore-delimited, unlike the
+    # hyphenated openai-anthropic-key pattern below, so it needs its own entry --
+    # a bare `"BEARER_TOKEN": "sk_meridian_..."` JSON/TOML/env pair otherwise slips
+    # past every existing pattern here (confirmed: none of stripe-live-key,
+    # openai-anthropic-key, or dotenv-credential's `KEY=value`-shaped match fire on
+    # it, since the value is quoted/colon-joined, not a bare `=` assignment, and the
+    # prefix uses `_` not `-`). See docs/meridian-storage-and-file-inspector-contract
+    # investigation notes / ba31dedf launch-matrix sprint item for the audit that
+    # found this gap across three independent config-generation code paths.
+    _p("meridian-token", r"sk_meridian_[A-Za-z0-9_-]{16,}"),
     # GitHub tokens: personal access, OAuth, server-to-server, refresh, user
     _p("github-token", r"gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,}"),
     # Slack tokens

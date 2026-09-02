@@ -43,6 +43,7 @@ from . import process_lifecycle as _process_lifecycle
 from . import process_registry as _process_registry
 from . import serena_pool as _serena_pool
 from . import tunnel_lifecycle as _tunnel_lifecycle
+from .repo_scope import RepoScopeError, validate_repo_scope
 from .serena_pool import SerenaDaemonPool, SERENA_POOL_BASE_PORT
 
 DEFAULT_BASE_URL = "https://usemeridian.us"
@@ -6605,6 +6606,72 @@ def _is_our_mcp_entry(key: str, value: object, base_url: str, tenant_id: str) ->
     return url in ours
 
 
+# ba31dedf — placeholder-only token for credential-free config generation.
+# Mirrors the exact string routes/github.py:push_mcp_template already commits
+# to a connected repo's template.mcp.json (the closest existing analog) so
+# there is exactly one "this is a placeholder, fill it in" convention across
+# the codebase, not two competing ones.
+_PLACEHOLDER_TOKEN = "sk_meridian_YOUR_KEY_HERE"
+
+
+def generate_credential_free_mcp_config(
+    base_url: "str | None" = None,
+    *,
+    mode: str = "hosted",
+    repo_path: "str | None" = None,
+) -> dict:
+    """Build a CREDENTIAL-FREE local MCP client config (ba31dedf).
+
+    Unlike :func:`_tunnel_mcp_entries` / :func:`_install_mcp_json` below
+    (which inject the CALLER'S OWN already-authenticated bearer token into
+    their OWN local, gitignored ``.mcp.json``/``.cursor/mcp.json`` so
+    ``meridian --tunnel`` actually authenticates on this machine), this
+    generator NEVER embeds a real credential. It exists for surfaces where the
+    output might be shared, screenshotted, pasted into docs/chat, or committed
+    before a human fills in their own token: onboarding docs, a dashboard
+    "copy config" action for a machine that hasn't authenticated yet, or a
+    template pushed to a connected repo (see ``routes/github.py:push_mcp_template``,
+    the existing analog this mirrors).
+
+    Round-trips clean through ``secret_redaction.scan()`` — see
+    ``tests/test_repo_scope.py``'s config-generation coverage.
+
+    *mode*:
+      - ``"hosted"`` (default) — the ``npx mcp-remote`` hosted-tier shape
+        from AGENTS.md, with a placeholder ``BEARER_TOKEN``.
+      - ``"self_hosted"`` — the ``pixi run python -m meridian --mcp``
+        from-source shape (self-hosted local MCP has no bearer auth at all,
+        so there is no token to placeholder — only ``cwd`` varies).
+
+    *repo_path*, when given, is validated via
+    :func:`meridian.repo_scope.validate_repo_scope` before being written into
+    the self-hosted config's ``cwd`` — a path that resolves to the caller's
+    home directory (or an ancestor of it) is refused (raises
+    :class:`meridian.repo_scope.RepoScopeError`), the same fail-closed rule
+    :func:`run_tunnel` enforces for its own ``--repo`` argument. Omitted,
+    ``cwd`` falls back to an explanatory placeholder the user must edit.
+    """
+    resolved_base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
+    if mode == "self_hosted":
+        entry: dict[str, Any] = {
+            "command": "pixi",
+            "args": ["run", "python", "-m", "meridian", "--mcp"],
+            "cwd": str(validate_repo_scope(repo_path)) if repo_path else "/path/to/Meridian",
+        }
+        return {"mcpServers": {"meridian": entry}}
+    if mode != "hosted":
+        raise ValueError(f"unknown config mode: {mode!r} (expected 'hosted' or 'self_hosted')")
+    return {
+        "mcpServers": {
+            "meridian": {
+                "command": "npx",
+                "args": ["-y", "mcp-remote", f"{resolved_base_url}/mcp"],
+                "env": {"BEARER_TOKEN": _PLACEHOLDER_TOKEN},
+            }
+        }
+    }
+
+
 def _tunnel_mcp_entries(
     base_url: str, tenant_id: str,
     custom: "list[dict] | None" = None,
@@ -6956,6 +7023,28 @@ async def run_tunnel(
             file=sys.stderr,
         )
         return 1
+
+    # ba31dedf — explicit repo-scope requirement: reject an UNSET --repo that
+    # defaulted (at the top of this function) to Path.cwd() when that default
+    # resolved to the user's home directory (or an ancestor of it) rather than
+    # a real project checkout — the confirmed bug ("zero rejection of home
+    # directory... running the tunnel from a bare shell session in $HOME
+    # silently scoped the filesystem/code-intel connectors to the user's
+    # ENTIRE home tree"). Deliberately scoped to the DEFAULTED case only
+    # (``not _repo_path_from_cli``) — an explicit ``--repo`` argument is the
+    # caller's own deliberate choice and is never second-guessed here, same
+    # as the CLI-always-wins precedent already established for
+    # serena_repo_path/code_dirs a few lines below. Checked after auth/plan
+    # resolve (not immediately after the default above) so an early auth
+    # failure keeps its existing exit code regardless of what repo_path
+    # resolved to. Fails closed: no silent fallback to operating over the
+    # whole home tree.
+    if not _repo_path_from_cli:
+        try:
+            repo_path = str(validate_repo_scope(repo_path))
+        except RepoScopeError as exc:
+            print(f"error: repo scope: {exc}", file=sys.stderr)
+            return 1
 
     # Resolve the tenant's tunnel plugin registry (3-slot model). The server's
     # /me response returns the already-resolved list (defaults + per-tenant

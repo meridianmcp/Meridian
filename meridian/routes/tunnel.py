@@ -2479,6 +2479,136 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
     }
 
 
+def build_launch_matrix(
+    tenant: "dict | None",
+    hostname: "str | None",
+    projects: "list[dict]",
+) -> dict:
+    """Read-only, repeatable launch matrix (ba31dedf).
+
+    Joins the tenant/slot diagnostic layer (:func:`build_tunnel_diagnostics` --
+    process state, health, config fingerprint) with Meridian PROJECT
+    registration, the one dimension that layer doesn't have. Does no DB I/O of
+    its own: *projects* is the caller-supplied list of in-scope project rows
+    (each a dict with at least ``"id"``/``"name"``/``"executor_config"``, the
+    shape ``db.get_project``/``db.list_projects`` already return), so this
+    stays a pure, trivially unit-testable join reusable from an HTTP route, an
+    MCP tool, or a test.
+
+    Emits one row per ``(project, slot)`` pair covering exactly the columns
+    the sprint item's acceptance criteria name: local stdio launcher status,
+    hosted/tunnel route, effective repo scope, project id, plugin
+    version/digest (reusing :func:`resolve_plugins`'s existing
+    ``stale_override`` reconciliation -- never re-implemented here),
+    active/invocable state, last health result, fallback, and failure class --
+    plus the config-digest/health-timestamp diagnostics criterion, both
+    already computed by :func:`build_tunnel_diagnostics` and surfaced here
+    under explicit names.
+
+    **Cross-project scope mismatch fails closed:** when two or more projects
+    in *projects* register the identical ``executor_config.repo_path``, every
+    row for those projects is marked ``repo_scope_status:
+    "cross_project_mismatch"`` and ``active_invocable`` is forced ``False``
+    regardless of the underlying slot's health -- this function cannot know
+    which of the ambiguous projects a given machine is actually serving, so it
+    never reports one as cleanly healthy. Same fail-closed treatment for a
+    registered repo path that is itself a bare home directory (see
+    :func:`meridian.repo_scope.looks_like_bare_home_directory`).
+    """
+    from .. import repo_scope as _repo_scope  # noqa: PLC0415
+
+    diagnostics = build_tunnel_diagnostics(tenant, hostname)
+    config_digest = diagnostics.get("connector_manifest", {}).get("manifest_hash")
+    health_timestamp = diagnostics.get("generated_at")
+    tenant_id = diagnostics.get("tenant_id")
+
+    # Plugin reconciliation (stale_override / newer_default_*) — resolved
+    # independently of build_tunnel_diagnostics's internal call so this
+    # function never depends on that function's private locals. Pure, no
+    # side effects, cheap to call twice.
+    plugins_by_slot: dict[str, dict] = {}
+    if tenant is not None:
+        parsed = _current_tunnel_config(tenant, hostname)
+        plugins_by_slot = {
+            p["slot"]: p for p in resolve_plugins(parsed) if isinstance(p, dict)
+        }
+
+    def _repo_path_of(project: dict) -> "str | None":
+        exec_cfg = project.get("executor_config") or {}
+        if isinstance(exec_cfg, str):
+            try:
+                exec_cfg = json.loads(exec_cfg) or {}
+            except Exception:  # noqa: BLE001 — malformed stored config, treat as unset
+                exec_cfg = {}
+        return (exec_cfg.get("repo_path") or "").strip() or None
+
+    # First pass: detect repo paths claimed by more than one project.
+    repo_path_owners: dict[str, list[str]] = {}
+    for project in projects:
+        rp = _repo_path_of(project)
+        if rp:
+            repo_path_owners.setdefault(rp, []).append(project.get("id"))
+
+    slots = dict(diagnostics.get("slots") or {})
+    rows: list[dict] = []
+    for project in projects:
+        project_id = project.get("id")
+        registered_repo_path = _repo_path_of(project)
+
+        if registered_repo_path and _repo_scope.looks_like_bare_home_directory(registered_repo_path):
+            scope_status = "rejected_home_directory"
+        elif registered_repo_path and len(repo_path_owners.get(registered_repo_path, [])) > 1:
+            scope_status = "cross_project_mismatch"
+        elif registered_repo_path:
+            scope_status = "ok"
+        else:
+            scope_status = "not_configured"
+
+        iter_slots = slots or {"_no_tenant": {}}
+        for slot, slot_diag in iter_slots.items():
+            plugin = plugins_by_slot.get(slot) or {}
+            label = slot_diag.get("state")
+            failure_class = None if label in (None, "healthy") else label
+            process_active = bool(slot_diag.get("process_active"))
+            rows.append({
+                "project_id": project_id,
+                "project_name": project.get("name"),
+                "slot": slot,
+                "local_launcher_status": label,
+                "hosted_route": (
+                    f"/tunnel-{slot}/{tenant_id}"
+                    if tenant_id and slot != "_no_tenant" else None
+                ),
+                "effective_repo_scope": registered_repo_path,
+                "repo_scope_status": scope_status,
+                "plugin_command": plugin.get("command") or (slot_diag.get("dashboard_configured") or {}).get("command"),
+                "plugin_stale_override": bool(plugin.get("stale_override")),
+                "plugin_newer_default_command": plugin.get("newer_default_command"),
+                "config_digest": config_digest,
+                "health_timestamp": health_timestamp,
+                # Fail closed: never "invocable" on an ambiguous/rejected scope,
+                # regardless of what the underlying slot health reports.
+                "active_invocable": (
+                    process_active and label == "healthy" and scope_status in ("ok", "not_configured")
+                ),
+                "last_health_result": {
+                    "state": label,
+                    "last_error": slot_diag.get("last_error"),
+                },
+                "fallback": slot_diag.get("remediation"),
+                "failure_class": failure_class,
+            })
+
+    return {
+        "run_id": diagnostics.get("run_id"),
+        "generated_at": diagnostics.get("generated_at"),
+        "tenant_id": tenant_id,
+        "config_digest": config_digest,
+        "health_timestamp": health_timestamp,
+        "rows": rows,
+    }
+
+
 @router.get("/tunnel/diagnostics/{tenant_id}")
 async def tunnel_diagnostics(tenant_id: str, request: Request) -> Response:
     """Layered, read-only tunnel/connector diagnostics for one tenant (f1e0df55).
@@ -2494,6 +2624,28 @@ async def tunnel_diagnostics(tenant_id: str, request: Request) -> Response:
     tenant = await _get_tenant_from_request(request)
     hostname = (request.query_params.get("hostname") or "").strip() or None
     return _json_response(build_tunnel_diagnostics(tenant, hostname))
+
+
+@router.get("/tunnel/launch-matrix/{tenant_id}")
+async def tunnel_launch_matrix(tenant_id: str, request: Request) -> Response:
+    """Read-only, repeatable launch matrix across every in-scope project (ba31dedf).
+
+    Same auth/hostname-resolution contract as ``/tunnel/diagnostics/{tenant_id}``
+    (``tenant_id`` in the path is documentary only); joins that diagnostic
+    snapshot with this request's project set — see :func:`build_launch_matrix`
+    for the full field-by-field contract. A DB error while listing projects
+    degrades to an empty project set (diagnostics-only response) rather than
+    failing the request — matches ``get_tunnel_filesystem_roots``'s existing
+    best-effort convention for this same tenant/project join.
+    """
+    tenant = await _get_tenant_from_request(request)
+    hostname = (request.query_params.get("hostname") or "").strip() or None
+    try:
+        db = await _db(request)
+        projects = await db_module.list_projects(db)
+    except Exception:  # noqa: BLE001 — unprovisioned/unreachable DB → diagnostics-only
+        projects = []
+    return _json_response(build_launch_matrix(tenant, hostname, projects))
 
 
 @router.post("/tunnel/plugins/custom")

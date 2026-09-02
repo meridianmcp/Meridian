@@ -5809,6 +5809,22 @@ async def _handle_tunnel_tools(
         repo_path = str(args.get("repo_path") or "").strip()
         if not repo_path:
             raise ValueError("repo_path is required")
+        # ba31dedf — explicit repo-scope requirement, matching the rigor the
+        # worktree_id branch above already gets. This handler runs on the
+        # SERVER; Path.home() here is the server's own home directory, not
+        # the remote tunnel client's, so filesystem-resolving validation
+        # (meridian.repo_scope.validate_repo_scope) can't be used -- instead
+        # this is a string-shape check for a BARE home directory (no
+        # subdirectory beneath it), which is exactly the "operate over my
+        # whole home tree" failure mode this criterion targets. Fails closed:
+        # a bare home-directory string is rejected outright, never silently
+        # accepted as a project scope.
+        from ..repo_scope import looks_like_bare_home_directory  # noqa: PLC0415
+        if looks_like_bare_home_directory(repo_path):
+            raise ValueError(
+                f"repo_path looks like a bare home directory ({repo_path!r}), "
+                "not a project checkout -- pass the specific project repo path"
+            )
         if tenant is None:
             raise ValueError("set_active_repo requires an authenticated tenant (tunnel mode)")
         tenant_id = tenant.get("id", "")
