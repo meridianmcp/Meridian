@@ -1,25 +1,33 @@
 # meridian-file-inspection
 
 Standalone local MCP server exposing a tunnel-independent, bounded
-single-file XML/JSON inspector.
+single-file XML/JSON/CSV/XLSX inspector.
 
 Runs **fully locally** against one file on your machine. No hosted Meridian
-call is made, no tunnel or Serena dependency, no network access, no writes,
-no database/cache persistence. See
+call is made, no tunnel or Serena dependency, no writes, no database/cache
+persistence. See
 `docs/meridian-storage-and-file-inspector-contract-2026-08-31.md` in the
-main repo for the design contract this package implements (Wave 0).
+main repo for the design contract this package implements (Wave 0 + Wave 1).
+The only network access either tool can ever make is a one-time,
+explicitly-opted-in fetch of DuckDB's `excel` extension for `.xlsx` files
+(see `inspect_tabular_file` below) — everything else is fully offline.
 
 ## Scope
 
 This is a **read-only inspection facade over one file**, not a second
 parser/index/database:
 
-- **XML** — secure, hardened streaming parse and bounded structural summary.
-- **JSON** — bounded structural summary and capped preview.
-- **Out of scope here** (see the design doc): CSV/XLSX (planned
-  `LOCAL-FILE-INSPECTION-TABULAR`, Wave 1, via DuckDB), DOCX/OOXML (delegates
-  to `meridian-docs` — this package never parses a DOCX ZIP itself), and
-  output indexing/search (stays in `meridian-outputs`).
+- **XML** — secure, hardened streaming parse and bounded structural summary
+  (`inspect_file`).
+- **JSON (generic)** — bounded structural summary and capped preview
+  (`inspect_file`).
+- **CSV / JSON (tabular) / XLSX** — bounded schema/sample/row-count
+  inspection through DuckDB (`inspect_tabular_file`, item 28ef2710, Wave 1).
+- **Out of scope here** (see the design doc): DOCX/OOXML (delegates to
+  `meridian-docs` — this package never parses a DOCX ZIP itself) and output
+  indexing/search (stays in `meridian-outputs`). XLS/XLSB/ODS are also out
+  of scope — only `.xlsx` is supported, pending a real benchmark corpus
+  justifying a Calamine/fastexcel compatibility adapter.
 
 ## Install
 
@@ -45,6 +53,7 @@ Or add to your MCP client config:
 | Tool | Description |
 |------|-------------|
 | `inspect_file` | Inspect exactly one local XML or JSON file and return a bounded, deterministic structural summary — never full file content |
+| `inspect_tabular_file` | Inspect exactly one local CSV, JSON, or XLSX file's TABULAR shape (schema, bounded row sample, row count) through DuckDB — never full file content |
 
 ## Response envelope
 
@@ -89,6 +98,40 @@ this tool returns is persisted by it; `provenance_ref` is always `null` — a
 caller that wants to bind an inspection to a run/artifact passes this
 envelope's `result_hash`/`source_sha256` to `meridian-outputs`
 (`record_provenance` / `bind_artifact_provenance`) itself.
+
+### `inspect_tabular_file` shape (CSV/JSON/XLSX)
+
+Same envelope as above, with `format` one of `"csv"`/`"json"`/`"xlsx"`,
+`parser_id` one of `"duckdb-csv"`/`"duckdb-json"`/`"duckdb-excel"`, and
+`shape` containing:
+
+```json
+{
+  "row_count": {"value": 1234, "exact": true},
+  "column_count": 5,
+  "columns": [{"name": "id", "type": "BIGINT"}],
+  "truncated_columns": false,
+  "sample_rows": [{"id": 1}],
+  "truncated_sample": false
+}
+```
+
+`row_count.exact` is `false` only when the count query itself timed out or
+errored (`row_count.value` is then `null`) — an inexact count is never
+presented as exact. Two additional error-code reasons apply only to
+`inspect_tabular_file`:
+
+| Reason | Meaning |
+|--------|---------|
+| `max_decompressed_bytes_exceeded` (`limit_exceeded`) | An `.xlsx` file's ZIP central directory declares a total uncompressed member size over `max_decompressed_bytes` — refused before any decompression, the zip-bomb guard |
+| `xlsx_extension_unavailable` (`denied`) | DuckDB's `excel` core extension isn't cached locally and `allow_extension_network_install` wasn't set — refused rather than making an implicit network call |
+
+DuckDB's `.xlsx` support lives in a separate extension that DuckDB will
+otherwise fetch over the network on first use — the ONLY network access
+either tool in this package can ever make, and only when explicitly opted
+into via `allow_extension_network_install=True`. Pre-cache it once instead
+(e.g. `pixi run python -c "import duckdb; duckdb.connect().execute('INSTALL excel')"`)
+to keep `inspect_tabular_file` fully offline afterward.
 
 ## Security
 
@@ -159,16 +202,22 @@ with `availability_policy: "degraded_ok"`, e.g.:
 }
 ```
 
+The same `degraded_ok` posture applies to `inspect_tabular_file` — a
+missing/unavailable DuckDB `excel` extension for `.xlsx` degrades that one
+format (reported via `denied`/`xlsx_extension_unavailable`), never blocks
+CSV/JSON tabular inspection or any other capability.
+
 ## Tests
 
 ```bash
-pixi run python -m pytest tests/test_local_file_inspection.py -p no:xdist -q --timeout=60
+pixi run python -m pytest tests/test_local_file_inspection.py tests/test_local_file_inspection_tabular.py -p no:xdist -q --timeout=60
 ```
 
-The test file lives in the main repo's `tests/` directory (not under this
-package) and imports `meridian_file_inspection` directly via a `sys.path`
+Both test files live in the main repo's `tests/` directory (not under this
+package) and import `meridian_file_inspection` directly via a `sys.path`
 insertion rather than as a declared `pixi.toml` dependency — this package's
-only two dependencies (`mcp`, `lxml`) are already direct dependencies of the
-root `meridian` pixi environment, so the real hardened parser can be
-exercised (including a genuine malicious-shaped XXE/DTD fixture) without
-adding anything to `pixi.toml`/`pixi.lock`.
+dependencies (`mcp`, `lxml`, `duckdb`) are already direct dependencies of
+the root `meridian` pixi environment, so the real hardened parser (and, for
+the tabular tests, the real DuckDB engine) can be exercised (including a
+genuine malicious-shaped XXE/DTD fixture and a genuine zip-bomb-shaped XLSX
+fixture) without adding anything to `pixi.toml`/`pixi.lock`.
