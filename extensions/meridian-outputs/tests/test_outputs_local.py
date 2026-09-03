@@ -3154,6 +3154,170 @@ class TestResumableFileWalkDeadlineAwareness:
         assert walk.drain(None) == []
 
 
+class TestResumeAfterCrossProcess:
+    """fa600e42 follow-up: a fresh _ResumableFileWalk/OutputsFtsIndex must be
+    able to pick up where a PRIOR process's walk left off (via a persisted
+    scan boundary), instead of always re-walking the tree from the top.
+
+    Confirmed live (2026-09-03): a periodic-restart harness that reconstructs
+    OutputsFtsIndex against the same db_path/outputs_dir every N calls made
+    literally zero net forward progress past whatever a single process's own
+    call budget could reach -- 8+ consecutive segments each rediscovered the
+    exact same already-indexed files (rows_changed=0) and never advanced,
+    because _scan_boundary was tracked for convergence REPORTING only and
+    never fed back into a freshly-constructed walk to skip already-covered
+    ground.
+    """
+
+    def test_walk_safe_output_files_resume_after_skips_covered_ground(
+        self, tmp_path: Path,
+    ) -> None:
+        names = [f"f{i:03d}.csv" for i in range(20)]
+        for name in names:
+            (tmp_path / name).write_text("col\n1", encoding="utf-8")
+        full = sorted(OL._iter_safe_output_files(str(tmp_path)))
+        boundary = full[9]  # simulate a prior pass that got exactly halfway
+        resumed = list(
+            OL._walk_safe_output_files(str(tmp_path), resume_after=boundary)
+        )
+        assert sorted(resumed) == full[10:]
+
+    def test_walk_safe_output_files_resume_after_prunes_earlier_subdirs(
+        self, tmp_path: Path,
+    ) -> None:
+        # Subdirectories sorting entirely before the boundary must be
+        # skipped WITHOUT being scandir()'d at all -- not merely filtered
+        # out of their yielded results.
+        (tmp_path / "aaa_early").mkdir()
+        (tmp_path / "aaa_early" / "x.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "mid.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "zzz_late").mkdir()
+        (tmp_path / "zzz_late" / "y.csv").write_text("col\n1", encoding="utf-8")
+
+        scanned_dirs: list[str] = []
+        real_scandir = os.scandir
+
+        def _tracking_scandir(path):  # noqa: ANN001
+            scanned_dirs.append(os.fspath(path))
+            return real_scandir(path)
+
+        boundary = str(tmp_path / "mid.csv")
+        with patch("os.scandir", side_effect=_tracking_scandir):
+            resumed = list(
+                OL._walk_safe_output_files(str(tmp_path), resume_after=boundary)
+            )
+        assert resumed == [str(tmp_path / "zzz_late" / "y.csv")]
+        assert not any(
+            "aaa_early" in d for d in scanned_dirs
+        ), f"pruned subtree was scandir()'d anyway: {scanned_dirs!r}"
+
+    def test_resumable_file_walk_resume_after_matches_direct_walk(
+        self, tmp_path: Path,
+    ) -> None:
+        for i in range(15):
+            (tmp_path / f"h{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+        full = sorted(OL._iter_safe_output_files(str(tmp_path)))
+        boundary = full[6]
+        walk = OL._ResumableFileWalk(str(tmp_path), resume_after=boundary)
+        chunk = walk.drain(None)
+        assert sorted(chunk) == full[7:]
+
+    def test_outputsftsindex_second_instance_resumes_past_first_boundary(
+        self, tmp_path: Path,
+    ) -> None:
+        """End-to-end simulation of the actual periodic-restart bug: two
+        SEPARATE OutputsFtsIndex instances against the same db_path/
+        outputs_dir (simulating a process restart), the second seeded with
+        the first's _scan_boundary via initial_scan_boundary. The second
+        instance's walk must reach genuinely new ground, not rediscover
+        what the first already covered."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(40):
+            (outputs_dir / f"r{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        # Force a partial pass: cap the walk so it stops partway through
+        # the tree, mirroring one periodic-restart segment's own budget.
+        idx1._max_batch = 10
+        idx1.rebuild(max_seconds=30.0)
+        boundary = idx1._scan_boundary
+        assert boundary is not None, "first instance's pass should still be in progress"
+        first_total = len(idx1._row_cache)
+        assert 0 < first_total < 40, "first instance should have made partial, not full, progress"
+        idx1.close()
+
+        # Simulate the restart: a genuinely NEW instance against the same
+        # db_path, seeded with the boundary the (now-gone) prior process's
+        # walk had reached.
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path, initial_scan_boundary=boundary,
+        )
+        idx2._max_batch = 10
+        idx2.rebuild(max_seconds=30.0)
+        second_call_metrics = dict(idx2.last_rebuild_metrics)
+        # The core regression: without the fix, this call's walk restarts
+        # from the top and rediscovers exactly the same `first_total` files
+        # idx1 already found, so files_new/rows_changed come back 0 and
+        # idx2's row count never exceeds first_total. With the fix, it
+        # picks up past idx1's boundary and reaches genuinely new ground.
+        assert second_call_metrics.get("files_new", 0) > 0, (
+            "second instance rediscovered only already-indexed files -- "
+            "cross-process walk resume is not working"
+        )
+        assert second_call_metrics.get("rows_changed", 0) > 0
+        # Checked post-rebuild (not via last_rebuild_metrics, which is
+        # computed in Phase 0 before this call's own _connect() rehydrates
+        # idx1's rows into _row_cache) -- the real, ground-truth outcome:
+        # idx2 now knows about idx1's original rows PLUS genuinely new ones.
+        assert len(idx2._row_cache) > first_total
+
+    def test_boundary_resumed_pass_does_not_delete_pre_boundary_rows_on_completion(
+        self, tmp_path: Path,
+    ) -> None:
+        """Code-review-caught regression: a boundary-resumed pass that
+        reaches full exhaustion within the resuming instance must NOT treat
+        pre-boundary files as removed just because ITS OWN walk never
+        revisited them. Forces get_convergence_state() to connect (and
+        rehydrate _manifest) BEFORE the first rebuild() call, matching the
+        exact sequence that reproduced this live."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(6):
+            (outputs_dir / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path, max_batch=3)
+        idx1.rebuild(max_seconds=30.0)
+        boundary = idx1._scan_boundary
+        assert boundary is not None
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path, max_batch=3,
+            initial_scan_boundary=boundary,
+        )
+        # Connects (and rehydrates _manifest) BEFORE any rebuild() call --
+        # this is what made self._manifest non-empty while self._walk_
+        # accumulated only held post-boundary paths, the exact ordering
+        # that triggered the false "removed" detection.
+        pre_state = idx2.get_convergence_state()
+        assert pre_state.converged is False
+        idx2.rebuild(max_seconds=30.0)
+        # max_batch=3 with exactly 3 remaining files drains them all but
+        # can't yet distinguish "drained exactly max_batch" from "more
+        # remain" (see _ResumableFileWalk.drain()) -- one more call
+        # confirms exhaustion and triggers the walk_complete branch under
+        # test.
+        idx2.rebuild(max_seconds=30.0)
+        assert idx2.get_convergence_state().converged is True
+        assert len(idx2._row_cache) == 6, (
+            "boundary-resumed pass wrongly deleted pre-boundary rows on completion"
+        )
+        idx2.close()
+
+
 class TestRebuildWalkDeadlineAwareness:
     """rebuild()-level regression coverage for 6ba77ada: a walk that alone
     exceeds max_seconds must not prevent rebuild() from returning promptly
@@ -3167,9 +3331,10 @@ class TestRebuildWalkDeadlineAwareness:
         real_walk = OL._walk_safe_output_files
 
         def slow_walk(outputs_dir: str, *, exclude_patterns: tuple = (),
-                       on_error=None):
+                       on_error=None, resume_after=None):
             for p in real_walk(
                 outputs_dir, exclude_patterns=exclude_patterns, on_error=on_error,
+                resume_after=resume_after,
             ):
                 time.sleep(delay)
                 yield p

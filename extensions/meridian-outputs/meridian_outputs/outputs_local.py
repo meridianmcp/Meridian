@@ -234,11 +234,28 @@ def _matches_exclude_pattern(
 def _walk_safe_output_files(
     outputs_dir: str, *, exclude_patterns: tuple[str, ...] = (),
     on_error: Callable[[str, OSError], None] | None = None,
+    resume_after: str | None = None,
 ):
     """Generator yielding regular files under ``outputs_dir`` that pass the
     secret-file exclusion filter AND the (optional) user exclude-pattern
     list, in deterministic (sorted-directories, sorted-files) order -- the
     same order :func:`_iter_safe_output_files` has always returned.
+
+    ``resume_after`` (fa600e42 follow-up -- see ``OutputsFtsIndex``'s
+    ``initial_scan_boundary`` constructor param): when given, this is the
+    last path a PRIOR pass's walk yielded (e.g. from a checkpointed
+    ``_scan_boundary`` surviving a process restart) -- every path at or
+    before it in this same deterministic sorted-DFS order is skipped, and
+    any subtree that sorts entirely before it is pruned WITHOUT being
+    scandir()'d at all. This is the exact heuristic :func:`_subtree_scanned_
+    past` already uses for convergence reporting, applied here to actually
+    SKIP re-walked ground instead of merely detecting it after the fact.
+    Without this, a fresh walk (new process, no live generator to resume)
+    always restarts from the top of the tree; if a whole pass never
+    completes within one process's lifetime (e.g. a periodic-restart
+    harness), every restart re-treads exactly the ground the previous one
+    covered and none further, forever -- confirmed live, see
+    docs/meridian-outputs-hardening-fa600e42-manifest.md.
 
     ``on_error`` (item 6af1518d, requirement 1 -- convergence state's "last
     error" field): optional callback invoked as ``on_error(dir_path, exc)``
@@ -277,9 +294,20 @@ def _walk_safe_output_files(
     order -- the same sorted, depth-first, current-dir-files-before-
     subdirs order os.walk()'s own sorted-dirs recursion always produced.
     """
+    resume_norm = (
+        _normalize_output_path(resume_after) or resume_after.replace("\\", "/")
+        if resume_after else None
+    )
     stack: list[str] = [outputs_dir]
     while stack:
         root = stack.pop()
+        if resume_norm is not None:
+            root_norm = _normalize_output_path(root) or root.replace("\\", "/")
+            if _subtree_scanned_past(resume_norm, root_norm):
+                # Entire subtree sorts before resume_norm in this walk's own
+                # deterministic sorted-DFS order -- a prior pass already
+                # covered it in full. Skip without even listing it.
+                continue
         try:
             with os.scandir(root) as it:
                 entries = list(it)
@@ -322,6 +350,13 @@ def _walk_safe_output_files(
         stack.extend(e.path for e in reversed(dir_entries))
         for entry in file_entries:
             p = entry.path
+            if resume_norm is not None:
+                p_norm = _normalize_output_path(p) or p.replace("\\", "/")
+                if p_norm <= resume_norm:
+                    # Already yielded by the prior pass this resumes (or is
+                    # the boundary path itself, whose yield is what set the
+                    # boundary in the first place).
+                    continue
             if is_secret_path(p):
                 _log.debug("outputs_local: skipping secret-pattern file %r", p)
                 continue
@@ -474,9 +509,11 @@ class _ResumableFileWalk:
         self, outputs_dir: str, *, exclude_patterns: tuple[str, ...] = (),
         max_batch: int | None = None,
         on_error: Callable[[str, OSError], None] | None = None,
+        resume_after: str | None = None,
     ) -> None:
         self._iterator = _walk_safe_output_files(
             outputs_dir, exclude_patterns=exclude_patterns, on_error=on_error,
+            resume_after=resume_after,
         )
         self.exhausted = False
         self.max_batch = self._resolve_max_batch(max_batch)
@@ -2304,6 +2341,7 @@ class OutputsFtsIndex:
         max_batch: int | None = None,
         write_chunk: int | None = None,
         session_id: str | None = None,
+        initial_scan_boundary: str | None = None,
     ) -> None:
         # Persist one canonical spelling for the tree and its cache.  Without
         # this, a process that first indexes an absolute root and a later
@@ -2397,6 +2435,10 @@ class OutputsFtsIndex:
         # holds every path discovered so far in the CURRENT in-progress pass.
         self._walk_state: "_ResumableFileWalk | None" = None
         self._walk_accumulated: list[str] = []
+        # fa600e42 follow-up -- see the call site in rebuild()'s Phase 0
+        # that sets this per-pass, and the walk_complete branch below that
+        # consults it.
+        self._walk_pass_resumed_from_boundary: bool = False
         # 6ba77ada -- backlog of paths confirmed stale (by the staleness
         # check below) but not yet successfully analysed + written. Persists
         # across calls so a straggler is retried, not lost or re-detected
@@ -2444,7 +2486,28 @@ class OutputsFtsIndex:
         # pass). Used both as a raw progress signal and, via
         # _subtree_scanned_past(), to answer subtree-scoped convergence
         # queries without a second walk.
-        self._scan_boundary: str | None = None
+        #
+        # fa600e42 follow-up -- ALSO now the resume-ahead hint rebuild()'s
+        # Phase 0 passes to a freshly-constructed _ResumableFileWalk (see
+        # that call site). Normal in-process operation never needs
+        # initial_scan_boundary (the live walk generator just keeps
+        # resuming itself); it exists for a caller that reconstructs
+        # OutputsFtsIndex against the SAME db_path/outputs_dir in a NEW
+        # process mid-pass (e.g. a periodic-restart harness, or a genuine
+        # server restart during a huge-tree convergence) and wants the
+        # fresh instance's walk to pick up past where the last one got to,
+        # instead of re-walking from the top of the tree every single
+        # restart -- confirmed live to otherwise cap total achievable
+        # progress at whatever ONE process's lifetime can cover, forever,
+        # regardless of how many restarts follow (see
+        # docs/meridian-outputs-hardening-fa600e42-manifest.md). The
+        # caller is responsible for sourcing this (e.g. from the previous
+        # process's last checkpoint) -- reading it back off THIS instance's
+        # own on-disk state isn't done here because that requires a live
+        # DB connection, and _connect() (by design) doesn't run until
+        # Phase 2 of the first rebuild() call, well after Phase 0 would
+        # already need this value.
+        self._scan_boundary: str | None = initial_scan_boundary
         # Most recent directory the walk could not list (permission denied,
         # removed mid-walk, etc.), if any -- see _walk_safe_output_files's
         # on_error hook. Distinct from last_db_write_error (a PERSISTENCE
@@ -3799,11 +3862,39 @@ class OutputsFtsIndex:
                 # override it with whatever was on disk before."
                 self._last_walk_error = None
                 self._walk_error_confirmed_fresh = True
+                # fa600e42 follow-up -- self._scan_boundary is already
+                # available here even on a freshly-restarted process's very
+                # first rebuild() call: either seeded at construction time
+                # via initial_scan_boundary (the periodic-restart harness's
+                # fix -- see OutputsFtsIndex.__init__), or None for a
+                # genuinely first-ever pass / one that already completed
+                # (both correctly reset it to None -- see the walk_complete
+                # branch below). NOT sourced from _rehydrate_walk_state_from_
+                # disk here, deliberately: that only runs inside _connect(),
+                # which (by design -- see rebuild()'s write-lock ordering)
+                # doesn't happen until Phase 2 of this SAME call, well after
+                # this walk object would already be constructed.
                 self._walk_state = _ResumableFileWalk(
                     self.outputs_dir, exclude_patterns=self._exclude_patterns,
                     max_batch=walk_batch, on_error=self._record_walk_error,
+                    resume_after=self._scan_boundary,
                 )
                 self._walk_accumulated = []
+                # fa600e42 follow-up, code-review fix -- whether THIS pass
+                # started from a boundary (skipping ground a DIFFERENT,
+                # possibly now-gone process's walk already covered) rather
+                # than the true top of the tree. Recorded once at pass-start
+                # and consulted below when the pass completes: a boundary-
+                # resumed pass's own self._walk_accumulated only ever holds
+                # paths discovered AFTER the boundary, so treating it alone
+                # as "the full picture" at completion would make every
+                # pre-boundary path look removed and DELETE it -- confirmed
+                # live (TestWalkStateDurability::
+                # test_restart_resumes_interrupted_walk_without_rehashing):
+                # a second instance resumed from the first's boundary lost
+                # the first instance's already-durably-indexed rows the
+                # moment its own (now much shorter) remaining walk exhausted.
+                self._walk_pass_resumed_from_boundary = self._scan_boundary is not None
             else:
                 # The walk persists across calls; discovery capacity is
                 # static (own knob), so this only re-applies it in case a
@@ -3839,9 +3930,31 @@ class OutputsFtsIndex:
             # detection is safe. Reset resumable state so the NEXT rebuild()
             # call starts a fresh pass and keeps catching future on-disk
             # changes.
-            all_paths: list[str] = sorted(self._walk_accumulated)
+            #
+            # fa600e42 follow-up, code-review fix -- EXCEPT when this pass
+            # was resumed from a boundary (self._walk_pass_resumed_from_
+            # boundary): self._walk_accumulated then only holds paths
+            # discovered AFTER that boundary, not the ones a prior (possibly
+            # now-gone) process's walk already confirmed pre-boundary.
+            # Treating self._walk_accumulated alone as "the full picture" in
+            # that case would make every still-present pre-boundary path
+            # look removed below. Union with self._manifest's current keys
+            # instead -- exactly the same optimistic "assume still present"
+            # rule the walk-still-in-progress branch already uses, applied
+            # here because a boundary-resumed pass never actually
+            # reconfirmed that portion of the tree ITSELF. Safe even before
+            # self._manifest has been rehydrated from disk this instance
+            # (empty on both sides of the removed_paths set-difference
+            # below, so nothing is falsely flagged as removed either way).
+            if self._walk_pass_resumed_from_boundary:
+                all_paths: list[str] = sorted(
+                    set(self._manifest) | set(self._walk_accumulated)
+                )
+            else:
+                all_paths = sorted(self._walk_accumulated)
             self._walk_state = None
             self._walk_accumulated = []
+            self._walk_pass_resumed_from_boundary = False
             removed_paths: set[str] = set(self._manifest) - set(all_paths)
             # A path that vanished from disk can never become un-stale --
             # drop it from the backlog so it isn't retried forever.
