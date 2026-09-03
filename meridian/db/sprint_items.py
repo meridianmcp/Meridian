@@ -3404,8 +3404,16 @@ async def _reset_stale_claim(
         return None
 
     new_stall_count = int(item.get("stall_count") or 0) + 1
+    # f007e59e — also clear `actor`, not just `claimed_at`. The prior owner is
+    # already durably captured below as `prior_actor` in the audit detail
+    # (record_action_audit_event, written before this function returns), so
+    # clearing the live column here does not erase that history — it just
+    # stops a released item from still looking claimed to anything that reads
+    # the live `actor` column (get_parallelizable_groups' eligibility loop
+    # already only reads `status`/`claimed_at`, but other live-state readers
+    # may reasonably treat a non-null `actor` the same way).
     await db.execute(
-        "UPDATE sprint_items SET claimed_at = NULL, stall_count = ? "
+        "UPDATE sprint_items SET claimed_at = NULL, actor = NULL, stall_count = ? "
         "WHERE id = ? AND project_id = ?",
         (new_stall_count, item_id, project_id),
     )
@@ -3586,6 +3594,97 @@ async def reconcile_stale_claims(
     }
 
 
+async def clear_stale_claim_metadata(
+    db: aiosqlite.Connection,
+    project_id: str,
+    item_id: str,
+    *,
+    actor: str | None = None,
+) -> dict[str, Any] | None:
+    """f007e59e — one-off repair for an item that is ALREADY sitting in a
+    non-active status (pending/todo/indeterminate — see
+    ``_PATCH_SPRINT_ITEM_ALLOWED_STATUSES``) but still carries stale live
+    claim metadata (``claimed_at`` / ``actor``) left over from before its
+    status was reset. This is the exact shape confirmed live for items
+    68b7bd9a and f1c6dd63: ``patch_sprint_item``'s stuck-claim recovery path,
+    prior to this fix, flipped status back to ``pending`` without ever
+    clearing those columns and wrote no audit record at all.
+
+    Unlike ``patch_sprint_item``'s own new in_progress-to-reset auto-clear
+    (this file, f007e59e — fires only on a LIVE in_progress -> reset
+    *transition*), this function targets an item that has ALREADY landed in
+    the reset state with leftover metadata. Re-issuing
+    ``update_sprint_item(status='pending', force=true)`` against such an item
+    is a no-op write (status doesn't actually change) and clears nothing —
+    so this is the correct standalone remediation call for exactly that
+    already-happened case, e.g. a one-off operator fix for a production row
+    stuck in this state before this deploy.
+
+    Refuses (raises ``ValueError``) if the item's CURRENT status is not one
+    of ``_PATCH_SPRINT_ITEM_ALLOWED_STATUSES`` (i.e. is ``in_progress`` or a
+    terminal status) — this function must NEVER be used to rip live claim
+    metadata out from under a claim that might still be active. Resetting an
+    ``in_progress`` claim is ``claim_sprint_item``'s /
+    ``classify_stale_claim``'s / ``_reset_stale_claim``'s job, which
+    independently verify liveness (heartbeat, worktree activity, task-log
+    evidence) before touching anything — this function deliberately has no
+    such check because it only ever runs against a status that is already
+    provably non-active.
+
+    No-ops (returns the item unchanged, writes nothing — not even an audit
+    record) if there is no stale metadata to clear (``claimed_at`` and
+    ``actor`` are both already null) — calling this on an already-clean item
+    is always safe and idempotent.
+
+    Otherwise atomically writes a ``RECONCILE_STALE_CLAIM_AUDIT_EVENT`` audit
+    record (``item_id``, ``prior_actor``, ``prior_claimed_at``) BEFORE
+    nulling the live columns, mirroring ``patch_sprint_item``'s own
+    reset-audit contract, so history is preserved rather than silently
+    erased (hard constraint: never delete claim-history evidence without an
+    audit trail).
+    """
+    item = await get_sprint_item(db, item_id)
+    if item is None or item.get("project_id") != project_id:
+        return None
+    current_status = item.get("status") or "pending"
+    if current_status not in _PATCH_SPRINT_ITEM_ALLOWED_STATUSES:
+        raise ValueError(
+            f"clear_stale_claim_metadata refuses to touch an item with status "
+            f"{current_status!r} — only {sorted(_PATCH_SPRINT_ITEM_ALLOWED_STATUSES)} "
+            "are eligible. An in_progress or terminal-status item's claim must "
+            "go through claim_sprint_item's classify_stale_claim / "
+            "_reset_stale_claim liveness check instead."
+        )
+    prior_actor = item.get("actor")
+    prior_claimed_at = item.get("claimed_at")
+    if prior_actor is None and prior_claimed_at is None:
+        return item  # nothing stale to clear — safe, auditless no-op
+
+    from meridian.db import record_action_audit_event  # noqa: PLC0415
+    detail = json.dumps({
+        "item_id": item_id,
+        "prior_actor": prior_actor,
+        "prior_claimed_at": prior_claimed_at,
+        "prior_status": current_status,
+        "reset_via": "clear_stale_claim_metadata",
+    })
+    try:
+        await record_action_audit_event(
+            db, RECONCILE_STALE_CLAIM_AUDIT_EVENT,
+            project_id=project_id, actor=actor, detail=detail,
+        )
+    except Exception:  # noqa: BLE001 — an audit-log hiccup must not block the cleanup
+        pass
+    await db.execute(
+        "UPDATE sprint_items SET claimed_at = NULL, actor = NULL "
+        "WHERE id = ? AND project_id = ?",
+        (item_id, project_id),
+    )
+    await db.commit()
+    _invalidate_sprint_items_cache(project_id)
+    return await get_sprint_item(db, item_id)
+
+
 async def fail_sprint_item(
     db: aiosqlite.Connection,
     project_id: str,
@@ -3651,6 +3750,7 @@ async def patch_sprint_item(
     planned_output: Any = _UNSET,
     artifact_policy: Any = _UNSET,
     github_channel: Any = _UNSET,
+    actor: str | None = None,
 ) -> dict[str, Any] | None:
     """Update editable fields of a sprint item.
 
@@ -3750,6 +3850,27 @@ async def patch_sprint_item(
     nightly-only noise but is now confirmed reproducing on stable — the
     signal it needs a real fix before general release. A bad value raises
     ValueError, like blocker_kind.
+
+    ``actor`` (f007e59e) identifies the session/caller making this edit, for
+    audit attribution only — it is NEVER written to the item's own ``actor``
+    column (that column records who holds/held the *claim*; this parameter
+    records who performed the administrative edit, which is often a different
+    identity, e.g. a human operator clearing another session's stuck claim).
+    It matters for exactly one case: when this call transitions a currently
+    ``in_progress`` item to one of the administrative-reset statuses
+    (pending/todo/indeterminate) — the documented stuck-claim recovery path,
+    ``update_sprint_item(status='pending', force=true)`` (dcbd55a0) — this
+    function now ALSO atomically clears the live claim columns ``claimed_at``
+    and ``actor`` and writes a ``RECONCILE_STALE_CLAIM_AUDIT_EVENT`` audit
+    record (``item_id``, ``prior_actor``, ``prior_claimed_at``) before nulling
+    them. Previously this path (unlike ``_reset_stale_claim``) left both
+    columns stale with no audit trail at all — the exact, confirmed cause of
+    the ``get_parallelizable_groups`` eligibility bug (f007e59e): a
+    ``status='pending'`` item with a leftover ``claimed_at`` looked
+    permanently "already in flight" to that planner. Mirrors
+    ``_reset_stale_claim``'s atomic contract (clear-then-audit, never silently
+    erase) without touching its file/resource-lock release, which only
+    applies to claims made through the live ``claim_sprint_item`` path.
     """
     # 6a17e735 / ARCH 1B — separate the status change (routed through
     # _transition_status for guaranteed cache bust + live event) from the
@@ -3782,6 +3903,18 @@ async def patch_sprint_item(
                 f"does not. Allowed here: {sorted(_PATCH_SPRINT_ITEM_ALLOWED_STATUSES)}."
             )
         status_value = status
+
+    # f007e59e — capture claim state BEFORE any write below, purely to detect
+    # (after the transition below succeeds) whether this call is resetting a
+    # genuinely in_progress/claimed item versus patching an already-pending
+    # one. Read-only; never mutates. Must run before ns_fields Phase 1 too,
+    # since prior_claim_state has to reflect the state strictly before this
+    # call's own writes.
+    _prior_claim_state: dict[str, Any] | None = None
+    if status_value is not None:
+        _pre = await get_sprint_item(db, item_id)
+        if _pre is not None and _pre.get("project_id") == project_id:
+            _prior_claim_state = _pre
 
     # Build non-status field lists (no status/completed_at entries here).
     ns_fields: list[str] = []
@@ -3977,6 +4110,46 @@ async def patch_sprint_item(
             # Item vanished between the non-status write and this call — very
             # unlikely but handle it consistently.
             return None
+
+        # f007e59e — administrative stale-claim reset. This call just took a
+        # genuinely in_progress (i.e. actually claimed) item back to an
+        # administrative-reset status — the update_sprint_item(status='pending',
+        # force=true) stuck-claim recovery path (dcbd55a0). Mirror
+        # _reset_stale_claim's atomic contract: write an audit record capturing
+        # the prior owner BEFORE nulling the live claim columns, so history is
+        # preserved rather than silently erased, then clear claimed_at/actor —
+        # the exact columns get_parallelizable_groups' eligibility loop (and any
+        # other "is this live-claimed" reader) consults. Skipped entirely for a
+        # patch that was already pending/todo/indeterminate (a genuine no-op —
+        # nothing was actually claimed, so there is nothing to reset or audit).
+        if _prior_claim_state is not None and _prior_claim_state.get("status") == "in_progress":
+            _prior_actor = _prior_claim_state.get("actor")
+            _prior_claimed_at = _prior_claim_state.get("claimed_at")
+            if _prior_actor is not None or _prior_claimed_at is not None:
+                from meridian.db import record_action_audit_event  # noqa: PLC0415
+                _detail = json.dumps({
+                    "item_id": item_id,
+                    "prior_actor": _prior_actor,
+                    "prior_claimed_at": _prior_claimed_at,
+                    "prior_status": "in_progress",
+                    "new_status": status_value,
+                    "reset_via": "patch_sprint_item",
+                })
+                try:
+                    await record_action_audit_event(
+                        db, RECONCILE_STALE_CLAIM_AUDIT_EVENT,
+                        project_id=project_id, actor=actor, detail=_detail,
+                    )
+                except Exception:  # noqa: BLE001 — an audit-log hiccup must not block the reset
+                    pass
+                await db.execute(
+                    "UPDATE sprint_items SET claimed_at = NULL, actor = NULL "
+                    "WHERE id = ? AND project_id = ?",
+                    (item_id, project_id),
+                )
+                await db.commit()
+                _invalidate_sprint_items_cache(project_id)
+                result = await get_sprint_item(db, item_id)
 
     if result is None:
         result = await get_sprint_item(db, item_id)
@@ -5747,11 +5920,19 @@ async def get_parallelizable_groups(
     blocked: list[dict[str, Any]] = []
     # df573218 — surface currently-claimed work so an orchestrator sees the live
     # parallelism state (and knows an item it planned was grabbed by another).
+    # f007e59e — status alone (not an additional independent `claimed_at`
+    # check) decides membership here too, for the identical reason as the
+    # eligibility loop below: a `status='pending'` item with a stale, leftover
+    # `claimed_at` is NOT running — treating it as running here as well as
+    # (previously) excluding it from `eligible`/`groups` produced a genuinely
+    # self-contradictory report. Confirmed live against production items
+    # 68b7bd9a-f3b8-4994-a63d-4cf9fff43424 and f1c6dd63-8c9b-4006-8dcc-3845e3915cd2:
+    # both showed status='pending' with a stale claimed_at/actor and were
+    # reported here as "running" (via this now-removed second clause) while
+    # simultaneously missing from `groups` — read-only-verified 2026-08-29.
     running: list[dict[str, Any]] = []
     for it in items:
-        if it.get("status") == "in_progress" or (
-            (it.get("status") or "pending") in claimable_statuses and it.get("claimed_at")
-        ):
+        if it.get("status") == "in_progress":
             running.append({
                 "id": it["id"],
                 "title": it.get("title", ""),
@@ -5760,8 +5941,21 @@ async def get_parallelizable_groups(
             })
         if (it.get("status") or "pending") not in claimable_statuses:
             continue
-        if it.get("claimed_at"):
-            continue  # already in flight
+        # f007e59e — status (checked immediately above) is the atomically-
+        # maintained, authoritative "is this claimed" signal: claim_sprint_item
+        # only ever moves an item to in_progress inside the same transaction
+        # that stamps claimed_at (see _transition_status's claimed_at_now), and
+        # only ever refuses a re-claim by status (see the `blocked` set there),
+        # never by inspecting claimed_at independently. A SECOND, independent
+        # gate here on a merely-truthy `claimed_at` double-counts that signal —
+        # and unlike `status`, `claimed_at` is not guaranteed to be cleared by
+        # every administrative reset path (patch_sprint_item's stuck-claim
+        # recovery historically left it stale; see patch_sprint_item's f007e59e
+        # note). A `status='pending'` item with a stale, leftover `claimed_at`
+        # from a since-reset claim would be permanently invisible to
+        # eligible/groups even though it is genuinely free to claim — the
+        # reported bug. Do not resurrect this check without also making every
+        # reset/requeue path atomically clear claimed_at alongside status.
         # 83a7586d — fan-out/fan-in-aware frontier check (replaces the old
         # single-parent get_blocking_dependency_for_sprint_item lookup here).
         # A legacy single-id depends_on item sees byte-for-byte the same
@@ -6058,8 +6252,18 @@ async def _claim_batch_resource(
     resource: str,
     session_id: str,
     resource_contents: dict[str, Any] | None,
+    item_id: str | None = None,
 ) -> dict[str, Any]:
     """Acquire ONE declared resource for the atomic batch gate.
+
+    c027922d — ``item_id`` (the sprint item this resource is declared under,
+    always known by the caller in this batch loop) is passed straight through
+    to claim_file/claim_symbol so the touches_resources amendment side-effect
+    attributes to the RIGHT item. This is the exact shape the c027922d bug was
+    found in: one session claiming 2+ sprint items concurrently in the same
+    batch, each with disjoint declared resources — without item_id, the old
+    "most recently claimed in_progress item" heuristic could append a resource
+    meant for an older item onto whichever sibling item was claimed last.
 
     Self-contained mirror of meridian.mcp.handler._sprint_item_resource_claim
     _gate's per-resource acquisition logic (file:/symbol: via claim_file/
@@ -6119,7 +6323,7 @@ async def _claim_batch_resource(
         legacy_shorthand = file_path != resource[len("file:"):]
         pre = await get_file_claims(db, file_path)
         pre_held = bool((pre.get("file_lock") or {}).get("session_id") == session_id)
-        result = await claim_file(db, file_path, session_id, mode="write")
+        result = await claim_file(db, file_path, session_id, mode="write", item_id=item_id)
         if result.get("claimed"):
             outcome = {
                 "acquired": True, "scope": "file", "resource": resource,
@@ -6166,7 +6370,9 @@ async def _claim_batch_resource(
                 c.get("symbol_name") == symbol_name and c.get("session_id") == session_id
                 for c in symbol_claims
             )
-            symbol_result = await claim_symbol(db, session_id, file_path, symbol_name, content)
+            symbol_result = await claim_symbol(
+                db, session_id, file_path, symbol_name, content, item_id=item_id,
+            )
             if symbol_result.get("claimed"):
                 return {
                     "acquired": True, "scope": "symbol", "resource": resource,
@@ -6196,7 +6402,9 @@ async def _claim_batch_resource(
         pre_held_file = bool(
             (file_claims.get("file_lock") or {}).get("session_id") == session_id
         )
-        file_result = await claim_file(db, file_path, session_id, mode="write")
+        file_result = await claim_file(
+            db, file_path, session_id, mode="write", item_id=item_id,
+        )
         if file_result.get("claimed"):
             return {
                 "acquired": True, "scope": "file", "resource": resource,
@@ -6760,7 +6968,9 @@ async def claim_parallel_batch(
         claimed_items.append((iid, orig_status, orig_actor))
 
         for resource in item_resources[iid]:
-            outcome = await _claim_batch_resource(db, resource, claim_session, resource_contents)
+            outcome = await _claim_batch_resource(
+                db, resource, claim_session, resource_contents, item_id=iid,
+            )
             if not outcome.get("acquired"):
                 # 2a176d6d (finding 3) — a resource with claim_granularity
                 # "unresolved" (bare symbol:<name>, no '::' file scope) was

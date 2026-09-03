@@ -633,12 +633,28 @@ async def test_run_targeted_tests_shell_pipe_can_mask_exit_code_list_form_cannot
     underlying command does not have this problem -- see
     test_run_targeted_tests_propagates_real_nonzero_exit_code above.
     """
+    import os
+
     py = sys.executable
     if sys.platform == "win32":
         # cmd.exe's `find` mirrors POSIX `tail`/`grep` for this purpose: its
         # own exit status (0 = found a match, 1 = did not) replaces the
         # piped command's real exit code as the shell's reported status.
-        shell_cmd = f'"{py}" -c "import sys; sys.exit(3)" | find /c ""'
+        #
+        # Use an UNAMBIGUOUS path to the real Windows find.exe rather than
+        # a bare `find` -- on a dev machine with Git for Windows installed,
+        # `C:\Program Files\Git\usr\bin\find.exe` (GNU findutils) resolves
+        # ahead of `C:\Windows\System32\find.exe` on PATH. GNU find given
+        # `/c ""` interprets `/c` as a search path (Git Bash's own path
+        # translation maps it to the C: drive root) and silently launches a
+        # full recursive scan of the entire drive instead of erroring or
+        # counting lines -- reproduced directly: it does not deadlock, it
+        # is a genuinely slow, unbounded, wrong operation that can run for
+        # hours, which is why this test previously appeared to hang rather
+        # than fail fast.
+        _system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        _win_find = os.path.join(_system_root, "System32", "find.exe")
+        shell_cmd = f'"{py}" -c "import sys; sys.exit(3)" | "{_win_find}" /c ""'
     else:
         shell_cmd = f'"{py}" -c "import sys; sys.exit(3)" | tail -n 5'
 

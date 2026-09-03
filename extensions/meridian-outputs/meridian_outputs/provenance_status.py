@@ -35,16 +35,27 @@ staleness ledger; no new hash scheme) into one ranked answer:
   1. ``"exact"``              -- an exact ``annotate`` record exists. Most
                                   authoritative; comes with a ``staleness``
                                   block (existence + content-hash check).
-  2. ``"directory_fallback"`` -- no exact record, but a directory-level
-                                  ``MERIDIAN_NOTES.md`` annotation (from
-                                  ``outputs_local``) covers this path.
-                                  Explicitly weaker -- never returned in the
-                                  same shape as an exact hit.
-  3. ``"unregistered"``       -- no exact record, no directory fallback, but
-                                  ``outputs_local``'s own index has DISCOVERED
-                                  this exact path (a real output that simply
-                                  never had provenance recorded for it).
-  4. ``"unknown"``            -- none of the above: this path has never been
+  2. ``"relocated"``          -- no exact record for THIS path, but its
+                                  current on-disk content hash matches
+                                  exactly one OTHER path's recorded
+                                  ``content_hash`` -- the file was moved or
+                                  renamed since provenance was recorded, and
+                                  identity is confirmed by content, not path.
+  3. ``"ambiguous"``          -- same as ``"relocated"``, but the content
+                                  hash matches MORE THAN ONE other recorded
+                                  path -- which prior record this file
+                                  actually originated from cannot be
+                                  determined from content alone.
+  4. ``"directory_fallback"`` -- no exact record, no relocation match, but a
+                                  directory-level ``MERIDIAN_NOTES.md``
+                                  annotation (from ``outputs_local``) covers
+                                  this path. Explicitly weaker -- never
+                                  returned in the same shape as an exact hit.
+  5. ``"unregistered"``       -- none of the above, but ``outputs_local``'s
+                                  own index has DISCOVERED this exact path (a
+                                  real output that simply never had
+                                  provenance recorded for it).
+  6. ``"unknown"``            -- none of the above: this path has never been
                                   discovered by the outputs walker at all.
 
 Neither :func:`annotate.get_provenance` nor
@@ -100,6 +111,41 @@ module returned before item d3374b0e (``path``, ``provenance_type``,
 ``record``, ``directory_note``, ``staleness``) keeps the exact same shape and
 values for every scenario the original implementation covered.
 
+Relocation / ambiguity classification (sprint item fa600e42)
+--------------------------------------------------------------
+Two new ranked statuses, :data:`RELOCATED` and :data:`AMBIGUOUS`, close a gap
+the original four/five-state machine could not express: a file with no exact
+``annotate`` record for ITS OWN path can still have its identity confirmed by
+CONTENT, if some OTHER path's recorded ``content_hash`` matches this file's
+current on-disk hash exactly (:func:`_relocation_candidates`, scanning
+``annotate.list_provenance``'s full ledger -- the same ledger
+:func:`annotate.get_provenance`'s exact-match tier already reads). Ranked
+between :data:`EXACT`/:data:`STALE_BY_SCRIPT` and :data:`DIRECTORY_FALLBACK`:
+a confirmed-by-hash relocation is a stronger signal than a directory-wide
+note (which confirms nothing about THIS file's specific identity), but it is
+still an inference on top of an exact record, never as authoritative as one.
+
+  - Exactly one hash-matching candidate -> :data:`RELOCATED`. The matching
+    record is returned as ``record`` (same shape as :data:`EXACT`'s), and
+    ``staleness`` reports the hash match explicitly rather than reusing
+    :func:`_staleness` unmodified -- that helper's existence check targets
+    the RECORDED path, which for a relocated file is the OLD location and
+    may legitimately no longer exist; that must never be misread as "stale."
+  - Two or more hash-matching candidates -> :data:`AMBIGUOUS`. ``record`` is
+    ``None`` (no single answer); the candidates are listed verbatim under a
+    new ``candidates`` key so a caller can inspect/resolve manually.
+  - Zero matches -> falls through to :data:`DIRECTORY_FALLBACK`/
+    :data:`UNREGISTERED`/:data:`UNKNOWN` exactly as before this item.
+
+Caveat, stated plainly: this is a content-hash-equality heuristic, the same
+kind of identity assumption :func:`outputs_local.classify_canonical_archival`
+already relies on elsewhere in this package -- two UNRELATED files that
+happen to share byte-identical content (e.g. two empty files, or two copies
+of the same boilerplate) will also match. This is a known, accepted
+limitation of hash-based identity, not an oversight; :data:`AMBIGUOUS` exists
+specifically to surface (not silently resolve) the multi-candidate case
+where this limitation actually bites.
+
 Typed research-evidence bridge (sprint item 0ea8fd3c)
 ------------------------------------------------------
 :mod:`research_evidence` (same package) defines a canonical, lossless
@@ -128,6 +174,15 @@ The ``provenance_type`` -> :class:`~research_evidence.ResolverStatus` mapping
     when there simply isn't enough hash data to say either way (e.g. no
     content hash was ever captured) -- never silently reported as verified
     just because an exact record exists.
+  - :data:`RELOCATED` -> ``VERIFIED`` (confidence 0.75, lower than a
+    same-path :data:`EXACT` match's 0.95) -- content identity IS confirmed
+    by hash, just at a different path than originally recorded; the reason
+    string names the matched prior path.
+  - :data:`AMBIGUOUS` (this module's ``provenance_type``, not to be confused
+    with the identically-named :class:`~research_evidence.ResolverStatus`
+    member several OTHER branches below also map to) -> ``AMBIGUOUS``, low
+    confidence -- multiple prior records share this file's content hash, so
+    which one it originated from cannot be determined.
   - :data:`DIRECTORY_FALLBACK` -> ``DEGRADED`` -- a real signal, but a
     directory-wide one, never as strong as a file-specific exact record.
   - :data:`UNREGISTERED` -> ``HELD`` (a known, indexed path whose provenance
@@ -157,6 +212,8 @@ from . import annotate, fingerprint, outputs_local, research_evidence
 
 __all__ = [
     "EXACT",
+    "RELOCATED",
+    "AMBIGUOUS",
     "DIRECTORY_FALLBACK",
     "UNREGISTERED",
     "UNKNOWN",
@@ -168,6 +225,8 @@ __all__ = [
 ]
 
 EXACT = "exact"
+RELOCATED = "relocated"
+AMBIGUOUS = "ambiguous"
 DIRECTORY_FALLBACK = "directory_fallback"
 UNREGISTERED = "unregistered"
 UNKNOWN = "unknown"
@@ -308,6 +367,35 @@ def _directory_fallback(outputs_dir: str, path: str) -> dict[str, Any] | None:
     return None
 
 
+def _relocation_candidates(outputs_dir: str, path: str) -> list[dict[str, Any]]:
+    """Ledger records (fa600e42) whose ``content_hash`` matches ``path``'s
+    CURRENT on-disk content, excluding any record already keyed to ``path``
+    itself (that case is handled by the :data:`EXACT` tier above, before
+    this is ever called).
+
+    Returns ``[]`` when ``path`` doesn't exist on disk, can't be hashed, or
+    matches nothing -- all three collapse to "no relocation evidence," which
+    is the correct fallthrough to :data:`DIRECTORY_FALLBACK`/
+    :data:`UNREGISTERED`/:data:`UNKNOWN`. See the module docstring's
+    "Relocation / ambiguity classification" section for the identity-hash
+    caveat.
+    """
+    if not os.path.isfile(path):
+        return []
+    current_hash = fingerprint.script_content_hash(path)
+    if current_hash is None:
+        return []
+    query_key = annotate._normalize_path(path)
+    matches: list[dict[str, Any]] = []
+    for record in annotate.list_provenance(outputs_dir):
+        if record.get("content_hash") != current_hash:
+            continue
+        if annotate._normalize_path(record.get("path") or "") == query_key:
+            continue
+        matches.append(record)
+    return matches
+
+
 def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
     """The richer, authoritative answer to "what do we know about this
     file's provenance", composed from both underlying systems and ranked by
@@ -336,6 +424,15 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
           record; ``staleness`` is populated (see :func:`_staleness`).
           ``script_staleness`` is ``None`` (never fingerprint-tagged) or
           not stale.
+        - :data:`RELOCATED` -- no exact record for THIS path, but exactly
+          one OTHER recorded path's ``content_hash`` matches this file's
+          current content (fa600e42). ``record`` is that matching record;
+          ``staleness`` reports the hash match (not a same-path existence
+          check -- see :func:`_relocation_candidates`).
+        - :data:`AMBIGUOUS` -- same as :data:`RELOCATED`, but MORE THAN ONE
+          other recorded path matches by content hash (fa600e42). ``record``
+          is ``None``; the matches are listed verbatim under a new
+          ``candidates`` key.
         - :data:`DIRECTORY_FALLBACK` -- ``directory_note`` is the covering
           ``MERIDIAN_NOTES.md`` annotation; ``staleness`` is ``None`` (a
           directory-level note has no single file to check staleness
@@ -383,6 +480,45 @@ def get_provenance_status(outputs_dir: str, path: str) -> dict[str, Any]:
             "script_staleness": script_staleness,
             "archival": indexed["archival"],
             "convergence": indexed["convergence"],
+            "inconclusive": False,
+        }
+
+    relocation_matches = _relocation_candidates(outputs_dir, path)
+    if len(relocation_matches) == 1:
+        match = relocation_matches[0]
+        current_hash = match.get("content_hash")
+        return {
+            "path": path,
+            "provenance_type": RELOCATED,
+            "record": match,
+            "directory_note": None,
+            "staleness": {
+                "exists_on_disk": True,
+                "recorded_content_hash": current_hash,
+                "current_content_hash": current_hash,
+                "stale": False,
+                "reason": (
+                    "content hash matches a provenance record for a "
+                    f"different path ({match.get('path')!r}); file "
+                    "appears to have been relocated/renamed"
+                ),
+            },
+            "script_staleness": _stale_by_script_result(outputs_dir, path),
+            "archival": indexed["archival"],
+            "convergence": indexed["convergence"],
+            "inconclusive": False,
+        }
+    if len(relocation_matches) > 1:
+        return {
+            "path": path,
+            "provenance_type": AMBIGUOUS,
+            "record": None,
+            "directory_note": None,
+            "staleness": None,
+            "script_staleness": None,
+            "archival": indexed["archival"],
+            "convergence": indexed["convergence"],
+            "candidates": relocation_matches,
             "inconclusive": False,
         }
 
@@ -618,6 +754,31 @@ def _resolver_state_for_provenance_status(
                 or "content hash matches the hash recorded at provenance time"
             ),
         )
+    if ptype == RELOCATED:
+        record = status.get("record") or {}
+        return research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.VERIFIED,
+            confidence=0.75,
+            reason=(
+                staleness.get("reason")
+                or (
+                    "content hash matches a provenance record for a "
+                    f"different path ({record.get('path')!r}); file "
+                    "appears to have been relocated/renamed"
+                )
+            ),
+        )
+    if ptype == AMBIGUOUS:
+        candidates = status.get("candidates") or []
+        return research_evidence.ResolverState(
+            status=research_evidence.ResolverStatus.AMBIGUOUS,
+            confidence=0.2,
+            reason=(
+                f"content hash matches {len(candidates)} distinct prior "
+                "provenance records -- cannot confirm which one this file "
+                "originated from"
+            ),
+        )
     if ptype == DIRECTORY_FALLBACK:
         return research_evidence.ResolverState(
             status=research_evidence.ResolverStatus.DEGRADED,
@@ -739,7 +900,7 @@ def evidence_record_from_provenance_status(
             )
         )
 
-    partial = ptype in (UNREGISTERED, UNKNOWN)
+    partial = ptype in (UNREGISTERED, UNKNOWN, AMBIGUOUS)
     partial_reason: "str | None" = None
     if ptype == UNREGISTERED:
         partial_reason = (
@@ -752,6 +913,13 @@ def evidence_record_from_provenance_status(
             partial_reason += (
                 "; the index has not yet converged, so this may change"
             )
+    elif ptype == AMBIGUOUS:
+        candidate_count = len(status.get("candidates") or [])
+        partial_reason = (
+            f"content hash matches {candidate_count} distinct prior "
+            "provenance records -- cannot confirm which one this file "
+            "originated from"
+        )
 
     external_ids: "dict[str, str]" = {}
     canonical_path = (archival or {}).get("canonical_path")
@@ -786,6 +954,11 @@ def evidence_record_from_provenance_status(
             "convergence": status.get("convergence"),
             "inconclusive": bool(status.get("inconclusive")),
             "manifest_status": status.get("manifest_status"),
+            # fa600e42 -- AMBIGUOUS's candidate list must round-trip losslessly
+            # too, per this function's own documented guarantee ("nothing is
+            # dropped on the floor"). None for every other provenance_type,
+            # matching how the other optional keys above already behave.
+            "candidates": status.get("candidates"),
         },
     )
 

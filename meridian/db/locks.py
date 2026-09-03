@@ -185,14 +185,30 @@ async def _amend_sprint_item_resources_for_session(
     db: aiosqlite.Connection,
     session_id: str,
     new_resource_id: str,
+    item_id: str | None = None,
 ) -> dict[str, Any] | None:
     """2593a5fe — append a newly-claimed resource to the active sprint item's
     touches_resources if it is not already declared, and set resources_amended=1.
 
     Called as a best-effort side-effect of claim_file and claim_symbol when the
-    claim succeeds. Finds the sprint item this session currently holds in_progress
-    (via sprint_items.actor = session_id) and checks whether ``new_resource_id``
-    is already in its touches_resources declaration.
+    claim succeeds.
+
+    c027922d — ``item_id``, when given, pins WHICH in_progress sprint item this
+    particular claim belongs to: the lookup becomes ``WHERE id = ? AND actor = ?
+    AND status = 'in_progress'`` instead of guessing. This closes the
+    cross-item pollution bug: a session holding 2+ concurrently in_progress
+    items (the batch-claim / parallel-item shape) has more than one candidate
+    row, and the old "whichever this session touched most recently
+    (``ORDER BY claimed_at DESC LIMIT 1``)" heuristic silently attributed a
+    claim meant for an OLDER item to whichever item happened to be most
+    recently (re-)claimed — see c027922d findings. When ``item_id`` is
+    omitted, the original heuristic is kept unchanged (existing callers that
+    have no item context yet — e.g. a bare MCP ``claim_file`` call with no
+    ``item_id`` argument — see zero behavior change, including the legitimate
+    single-item mid-execution-pivot widening case from acf6f51a).
+
+    Finds the target sprint item and checks whether ``new_resource_id`` is
+    already in its touches_resources declaration.
 
     If the resource IS already declared — no-op (returns None).
     If the resource is NEW:
@@ -206,7 +222,9 @@ async def _amend_sprint_item_resources_for_session(
     "item_id": ..., "item_wave": ...}`` when an amendment was made AND the item
     has an existing wave label, so the caller can include this as a visible signal
     in the claim response. Returns None when no amendment was needed (resource
-    already present) or when there is no active sprint item for this session.
+    already present) or when there is no active sprint item for this session
+    (or, with ``item_id`` given, no matching in_progress row for that item under
+    this session).
 
     Never raises — all errors are swallowed so this side-effect never blocks
     a file/symbol claim.
@@ -216,14 +234,28 @@ async def _amend_sprint_item_resources_for_session(
             parse_touches_resources,
             serialize_touches_resources,
         )
-        # Find the sprint item this session currently holds in_progress.
-        async with db.execute(
-            "SELECT id, touches_resources, wave FROM sprint_items "
-            "WHERE actor = ? AND status = 'in_progress' "
-            "ORDER BY claimed_at DESC LIMIT 1",
-            (session_id,),
-        ) as cur:
-            row = await cur.fetchone()
+        if item_id:
+            # c027922d — explicit item context: look up THAT row directly,
+            # scoped to this session and still in_progress. No ORDER BY /
+            # LIMIT guessing across sibling in_progress items.
+            async with db.execute(
+                "SELECT id, touches_resources, wave FROM sprint_items "
+                "WHERE id = ? AND actor = ? AND status = 'in_progress'",
+                (item_id, session_id),
+            ) as cur:
+                row = await cur.fetchone()
+        else:
+            # Fallback heuristic (pre-c027922d behavior, unchanged): find
+            # *some* sprint item this session currently holds in_progress.
+            # Correct by construction only when the session holds at most one
+            # concurrently in_progress item.
+            async with db.execute(
+                "SELECT id, touches_resources, wave FROM sprint_items "
+                "WHERE actor = ? AND status = 'in_progress' "
+                "ORDER BY claimed_at DESC LIMIT 1",
+                (session_id,),
+            ) as cur:
+                row = await cur.fetchone()
         item = _row_to_dict(row)
         if not item or not item.get("id"):
             return None
@@ -291,6 +323,7 @@ async def claim_file(
     symbol: str | None = None,
     ttl_hours: int = _FILE_LOCK_TTL_HOURS,
     mode: str = "write",
+    item_id: str | None = None,
 ) -> dict[str, Any]:
     """Claim a file path for a session, auto-releasing expired locks first.
 
@@ -307,6 +340,15 @@ async def claim_file(
     writes). ``read`` is a SHARED claim: many sessions can hold a read claim on
     the same file concurrently (zero false contention for parallel reader agents),
     blocked only by another session's exclusive write lock.
+
+    c027922d — ``item_id`` is an OPTIONAL explicit sprint-item context for the
+    touches_resources amendment side-effect (see
+    :func:`_amend_sprint_item_resources_for_session`). Pass the sprint item
+    this claim is actually being made for whenever it is known (e.g. from
+    ``claim_sprint_item``'s return value, or an executor's currently-claimed
+    item) so a session holding 2+ concurrently in_progress items never has a
+    claim misattributed to the wrong one. Omitted, the pre-existing
+    single-candidate heuristic is used unchanged.
     """
     normalized = _normalize_file_path(file_path)
     if not normalized:
@@ -422,7 +464,7 @@ async def claim_file(
     # was not in the original declaration (mid-execution pivot detection).
     # Best-effort: errors never block the claim. Use "file:<path>" as resource id.
     _resource_hint = await _amend_sprint_item_resources_for_session(
-        db, session_id, f"file:{normalized}"
+        db, session_id, f"file:{normalized}", item_id=item_id
     )
     result: dict[str, Any] = {
         "claimed": True,
@@ -974,6 +1016,7 @@ async def claim_symbol(
     file_path: str,
     symbol: str,
     content: str,
+    item_id: str | None = None,
 ) -> dict[str, Any]:
     """Claim a single class/function/method by line range within a file.
 
@@ -983,6 +1026,12 @@ async def claim_symbol(
     whose ranges are free — so the caller can immediately pick a non-colliding
     symbol. Returns ``reason='unparseable'`` (unsupported/syntax-error/missing
     grammar) so callers can fall back to whole-file ``claim_file``.
+
+    c027922d — ``item_id`` is an OPTIONAL explicit sprint-item context passed
+    straight through to :func:`_amend_sprint_item_resources_for_session` (see
+    ``claim_file``'s docstring for the full rationale: it disambiguates which
+    in_progress sprint item a claim's touches_resources amendment belongs to
+    when a session holds more than one concurrently).
     """
     from ..symbols import extract_symbols
 
@@ -1159,7 +1208,7 @@ async def claim_symbol(
     # was not in the original declaration (mid-execution pivot detection).
     # Use "symbol:<path>::<symbol>" as resource id for symbol-level precision.
     _sym_resource_hint = await _amend_sprint_item_resources_for_session(
-        db, session_id, f"symbol:{normalized}::{symbol}"
+        db, session_id, f"symbol:{normalized}::{symbol}", item_id=item_id
     )
     sym_result: dict[str, Any] = {
         "claimed": True,

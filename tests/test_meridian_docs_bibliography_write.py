@@ -905,6 +905,85 @@ class TestRemoveBibliographyEntry:
         assert "error" in res
         assert open(docx, "rb").read() == original
 
+    def test_remove_last_entry_with_flag_also_removes_heading(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REFS)
+
+        res = docs_intel.remove_bibliography_entry(
+            docx_path=docx,
+            citation_key="smith2020",
+            remove_heading_if_empty=True,
+        )
+        assert "error" not in res, res.get("error")
+        assert res["heading_removed"] is True
+        xml_after = _read_doc_xml(docx)
+        assert "bibkey_smith2020" not in xml_after
+        assert "References" not in xml_after
+        assert "Body text." in xml_after
+
+    def test_remove_default_behaviour_leaves_heading_in_place(self, tmp_path):
+        """The flag defaults to False -- unchanged behaviour for every
+        existing caller that never asked for heading cleanup."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REFS)
+
+        res = docs_intel.remove_bibliography_entry(
+            docx_path=docx,
+            citation_key="smith2020",
+        )
+        assert "error" not in res, res.get("error")
+        assert res["heading_removed"] is False
+        xml_after = _read_doc_xml(docx)
+        assert "References" in xml_after
+
+    def test_remove_one_of_several_entries_keeps_heading_even_with_flag(self, tmp_path):
+        """remove_heading_if_empty must never remove the heading while a
+        SIBLING entry still remains under it."""
+        docx = str(tmp_path / "doc.docx")
+        two_entry_xml = _DOC_XML_WITH_REFS.replace(
+            "  </w:body>",
+            '    <w:p w14:paraId="BB0004">\n'
+            '      <w:pPr><w:pStyle w:val="Bibliography"/></w:pPr>\n'
+            '      <w:bookmarkStart w:id="0" w:name="bibkey_jones2021"/>\n'
+            '      <w:r><w:t xml:space="preserve">Jones, B. (2021). New paper.</w:t></w:r>\n'
+            '      <w:bookmarkEnd w:id="0"/>\n'
+            "    </w:p>\n"
+            "  </w:body>",
+        )
+        _write_docx(docx, two_entry_xml)
+
+        res = docs_intel.remove_bibliography_entry(
+            docx_path=docx,
+            citation_key="smith2020",
+            remove_heading_if_empty=True,
+        )
+        assert "error" not in res, res.get("error")
+        assert res["heading_removed"] is False
+        xml_after = _read_doc_xml(docx)
+        assert "References" in xml_after
+        assert "bibkey_jones2021" in xml_after
+        assert "bibkey_smith2020" not in xml_after
+
+    def test_remove_with_flag_but_no_heading_present_is_a_no_op_for_heading(self, tmp_path):
+        """A document whose entry has no References heading at all (e.g. an
+        entry inserted by some other path) must not error just because
+        remove_heading_if_empty was requested."""
+        no_heading_xml = _DOC_XML_WITH_REFS.replace(
+            '      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>\n'
+            "      <w:r><w:t>References</w:t></w:r>\n",
+            "      <w:r><w:t>Not a heading.</w:t></w:r>\n",
+        )
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, no_heading_xml)
+
+        res = docs_intel.remove_bibliography_entry(
+            docx_path=docx,
+            citation_key="smith2020",
+            remove_heading_if_empty=True,
+        )
+        assert "error" not in res, res.get("error")
+        assert res["heading_removed"] is False
+
 
 # ---------------------------------------------------------------------------
 # sync_bibliography

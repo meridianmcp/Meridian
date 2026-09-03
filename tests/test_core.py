@@ -18902,6 +18902,62 @@ async def test_set_active_repo_also_expands_fs_roots(db, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# ba31dedf — set_active_repo repo-scope guard: reject a bare home directory,
+# matching the rigor the worktree_id branch already gets.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("home_path", ["/home/user", "C:\\Users\\me"])
+async def test_set_active_repo_rejects_bare_home_directory(db, tmp_path, monkeypatch, home_path):
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    from meridian.routes import tunnel as tunnel_mod
+
+    called = False
+
+    async def _should_never_be_called(tenant_id: str, repo_path: str):
+        nonlocal called
+        called = True
+        return {"status": "ok", "repo_path": repo_path}
+
+    monkeypatch.setattr(tunnel_mod, "send_active_repo_control", _should_never_be_called)
+
+    fake_tenant = {"id": "tenant-test-scope"}
+    with pytest.raises(ValueError, match="bare home directory"):
+        await _dispatch_mcp_tool(
+            "set_active_repo",
+            {"repo_path": home_path},
+            db, str(tmp_path), tenant=fake_tenant,
+        )
+    assert called is False, "must fail closed before ever reaching the tunnel"
+
+
+@pytest.mark.asyncio
+async def test_set_active_repo_still_accepts_project_subdirectory_under_home(db, tmp_path, monkeypatch):
+    """Regression guard: the fix above must not become over-broad and start
+    rejecting ordinary project checkouts that merely live under a home
+    directory (the overwhelmingly common case)."""
+    from meridian.mcp.handler import _dispatch_mcp_tool
+    from meridian.routes import tunnel as tunnel_mod
+
+    async def _ok(tenant_id: str, repo_path: str):
+        return {"status": "ok", "repo_path": repo_path}
+
+    async def _ok_fs(tenant_id: str, roots: list[str]):
+        return {"status": "ok", "roots": roots}
+
+    monkeypatch.setattr(tunnel_mod, "send_active_repo_control", _ok)
+    monkeypatch.setattr(tunnel_mod, "send_add_fs_roots_control", _ok_fs)
+
+    fake_tenant = {"id": "tenant-test-scope-2"}
+    result = await _dispatch_mcp_tool(
+        "set_active_repo",
+        {"repo_path": "/home/user/repo"},
+        db, str(tmp_path), tenant=fake_tenant,
+    )
+    assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
 # 0b061f45 — Multi-account GitHub OAuth DB layer
 # ---------------------------------------------------------------------------
 

@@ -221,6 +221,7 @@ Claim exclusive edit rights on a file path for this session. Locks auto-expire a
 | `mode` | string | optional | Claim grain (ffa03655). 'write' (default) = EXCLUSIVE: blocks other writers and is blocked by any other session's read claim. 'read' = SHARED: many sessions can read-claim the same file at once (no false contention for parallel reader agents), blocked only by another session's write lock. |
 | `symbol` | string | optional | Optional symbol to claim (class/function/method name, e.g. 'AuthRouter' or 'AuthRouter.login'). Requires `content`. |
 | `content` | string | optional | Full source of the file, required when `symbol` is given so the server can resolve the symbol's line range. |
+| `item_id` | string | optional | Optional sprint item id this claim is being made for (c027922d). When your session holds 2+ sprint items in_progress concurrently, pass this so the touches_resources amendment side-effect is attributed to the right item instead of guessed. |
 
 **Example:**
 ```

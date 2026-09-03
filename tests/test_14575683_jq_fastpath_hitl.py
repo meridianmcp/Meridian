@@ -48,11 +48,22 @@ def _jq_available_on_linux_darwin() -> bool:
     checks for its fast path."""
     if shutil.which("bash") is None:
         return False
-    result = subprocess.run(
-        ["bash", "-c",
-         'command -v jq >/dev/null 2>&1 && case "$(uname -s 2>/dev/null)" in Linux|Darwin) echo yes ;; esac'],
-        capture_output=True, text=True, timeout=10,
-    )
+    try:
+        result = subprocess.run(
+            ["bash", "-c",
+             'command -v jq >/dev/null 2>&1 && case "$(uname -s 2>/dev/null)" in Linux|Darwin) echo yes ;; esac'],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        # This probe runs unconditionally at COLLECTION time (it decides a
+        # module-level skipif). A slow/contended host can make even a
+        # trivial subprocess spawn exceed the timeout or fail with a
+        # resource error (observed: WinError 1455, paging file too small,
+        # under heavy concurrent load) -- letting either propagate turns
+        # into an uncaught collection ERROR that masks every test in this
+        # module, which is worse than the skip this probe exists to decide.
+        # Fail closed toward "assume unavailable" instead.
+        return False
     return result.stdout.strip() == "yes"
 
 

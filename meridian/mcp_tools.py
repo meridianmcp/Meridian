@@ -3095,13 +3095,17 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "lists which symbols are still safe to claim. Unparseable content falls "
         "back to a whole-file lock. The response includes a `code_notes` list of "
         "code-anchored project notes (kind='code') for this file/symbol — read "
-        "them before editing.",
+        "them before editing. Pass `item_id` (the sprint item you're claiming this "
+        "file/symbol for) whenever you know it — it disambiguates the "
+        "touches_resources amendment side-effect (c027922d) when your session "
+        "holds more than one sprint item in_progress at once.",
      "inputSchema": {"type": "object", "properties": {
          "session_id": {"type": "string"},
          "file_path": {"type": "string"},
          "mode": {"type": "string", "enum": ["read", "write"], "description": "Claim grain (ffa03655). 'write' (default) = EXCLUSIVE: blocks other writers and is blocked by any other session's read claim. 'read' = SHARED: many sessions can read-claim the same file at once (no false contention for parallel reader agents), blocked only by another session's write lock."},
          "symbol": {"type": "string", "description": "Optional symbol to claim (class/function/method name, e.g. 'AuthRouter' or 'AuthRouter.login'). Requires `content`."},
-         "content": {"type": "string", "description": "Full source of the file, required when `symbol` is given so the server can resolve the symbol's line range."}},
+         "content": {"type": "string", "description": "Full source of the file, required when `symbol` is given so the server can resolve the symbol's line range."},
+         "item_id": {"type": "string", "description": "Optional sprint item id this claim is being made for (c027922d). When your session holds 2+ sprint items in_progress concurrently, pass this so the touches_resources amendment side-effect is attributed to the right item instead of guessed."}},
          "required": ["session_id", "file_path"]}},
     {"name": "store_finding", "description":
         "PARALLEL COORDINATION (c35370cc): persist a per-task intermediate result to the "
@@ -3514,6 +3518,12 @@ _READ_ONLY_TOOLS = {
     "preview_proposal_promotion",
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
+
+# MCP directory metadata: these tools contact a public third-party service
+# rather than only reading Meridian's own state.  Keep this separate from the
+# read-only set: a GitHub/paper/social search can be read-only for Meridian
+# while still operating in an external open world.
+_OPEN_WORLD_TOOLS = {"paper_search", "social_search", "github_search"}
 
 # ---------------------------------------------------------------------------
 # a749f87c — Deterministic tool pre-selection metadata.
@@ -4267,7 +4277,7 @@ for _tool in _MCP_TOOLS_LIST:
         "title": _title,
         "readOnlyHint": _is_read_only,
         "destructiveHint": _is_destructive,
-        "openWorldHint": False,
+        "openWorldHint": _tool["name"] in _OPEN_WORLD_TOOLS,
         "idempotentHint": _is_read_only,
     }
     # a749f87c — stamp declared category + role_relevance onto every tool entry

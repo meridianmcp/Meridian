@@ -57,7 +57,7 @@ def test_search_outputs_degraded_true_with_nonempty_hits_when_partial(
     assert first["degraded"] is False
 
     idx = OL._get_cached_index(outputs_dir)
-    monkeypatch.setattr(idx, "rebuild", lambda max_seconds=None: len(idx._row_cache))
+    monkeypatch.setattr(idx, "rebuild", lambda *a, **kw: len(idx._row_cache))
     idx._pending_stale["/still/pending/fake.csv"] = (None, None)
     idx.last_rebuild_partial = True
 

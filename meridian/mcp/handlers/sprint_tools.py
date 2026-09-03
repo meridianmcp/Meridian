@@ -542,6 +542,15 @@ async def handle_update_sprint_item(
     # {nightly, stable, graduated} to set it.
     if "github_channel" in args:
         _patch_kwargs["github_channel"] = args.get("github_channel")
+    # f007e59e — identify the caller for audit attribution when this update
+    # performs an administrative stale-claim reset (in_progress -> pending/
+    # todo/indeterminate via status=, dcbd55a0's stuck-claim recovery path).
+    # Same fallback pattern already used for claim/complete elsewhere in this
+    # handler (e.g. _claim_actor below claim_sprint_item): prefer an explicit
+    # actor, fall back to session_id. Harmless to pass even when this call
+    # isn't a claim reset at all — patch_sprint_item only uses it to attribute
+    # the audit record it writes in that one specific case.
+    _patch_kwargs["actor"] = args.get("actor") or args.get("session_id")
     try:
         item = await db_module.patch_sprint_item(
             db, args["project_id"], args["item_id"], **_patch_kwargs

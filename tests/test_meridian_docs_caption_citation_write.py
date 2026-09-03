@@ -1615,3 +1615,195 @@ class TestInsertCrossReference:
         paras = docs_intel.parse_docx(docx)
         joined = " ".join(p.get("text", "") for p in paras)
         assert "Figure 1" in joined
+
+
+# ---------------------------------------------------------------------------
+# Cross-reference: remove
+# ---------------------------------------------------------------------------
+
+# A document with a REF cross-reference field (surrounded by other text runs
+# in the same paragraph), a plain paragraph with no field at all, and a
+# PAGEREF field -- a different, unrelated field type that happens to share
+# the "REF" substring and must NOT be treated as a removable cross-reference.
+_DOC_XML_WITH_REF = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="FFEE0001">
+      <w:r><w:t xml:space="preserve">As shown in </w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve"> REF _Ref100000000 \\h </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>Figure 1</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+      <w:r><w:t xml:space="preserve">, the loss curve flattens.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="FFEE0002">
+      <w:r><w:t>Plain paragraph, no cross-reference.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="FFEE0003">
+      <w:r><w:t xml:space="preserve">See page </w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve"> PAGEREF _Ref100000000 \\h </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>3</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+      <w:r><w:t>.</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+
+
+class TestRemoveCrossReference:
+    def test_remove_cross_reference(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REF)
+
+        # Note: the fixture also has a PAGEREF field (FFEE0003) whose
+        # instrText contains the substring "REF _Ref100000000" (the tail of
+        # "PAGEREF ..."), so assertions below use a leading space to pin the
+        # match to the REF field specifically, plus a begin-fldChar count to
+        # confirm exactly one field (the PAGEREF one) survives.
+        xml_before = _read_doc_xml(docx)
+        assert " REF _Ref100000000 \\h " in xml_before
+        assert xml_before.count('fldCharType="begin"') == 2  # REF + PAGEREF
+
+        res = docs_intel.remove_cross_reference(
+            docx_path=docx,
+            anchor_para_id="FFEE0001",
+        )
+
+        assert "error" not in res, f"unexpected error: {res.get('error')}"
+        assert res["status"] == "removed"
+        assert res["anchor_para_id"] == "FFEE0001"
+        assert res["bookmark_name"] == "_Ref100000000"
+        assert res["display_text"] == "Figure 1"
+        assert res["docx_path"] == docx
+
+        xml_after = _read_doc_xml(docx)
+        assert " REF _Ref100000000 \\h " not in xml_after
+        # The unrelated PAGEREF field in the OTHER paragraph is untouched.
+        assert " PAGEREF _Ref100000000 \\h " in xml_after
+        assert xml_after.count('fldCharType="begin"') == 1
+
+    def test_remove_cross_reference_preserves_surrounding_text(self, tmp_path):
+        """Other runs in the SAME paragraph (leading/trailing text) survive --
+        only the field's own 5 runs are removed."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REF)
+
+        res = docs_intel.remove_cross_reference(docx_path=docx, anchor_para_id="FFEE0001")
+        assert "error" not in res
+
+        xml_after = _read_doc_xml(docx)
+        assert "As shown in" in xml_after
+        assert "the loss curve flattens" in xml_after
+
+    def test_remove_cross_reference_no_field(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REF)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.remove_cross_reference(
+            docx_path=docx,
+            anchor_para_id="FFEE0002",  # plain paragraph
+        )
+        assert "error" in res
+        assert open(docx, "rb").read() == original
+
+    def test_remove_cross_reference_ignores_pageref_field(self, tmp_path):
+        """PAGEREF is a different field type that shares the "REF" substring --
+        it must not be mistaken for a removable REF cross-reference."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REF)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.remove_cross_reference(
+            docx_path=docx,
+            anchor_para_id="FFEE0003",  # PAGEREF only, no REF field
+        )
+        assert "error" in res
+        assert open(docx, "rb").read() == original
+
+    def test_remove_cross_reference_missing_file(self, tmp_path):
+        res = docs_intel.remove_cross_reference(
+            docx_path=str(tmp_path / "gone.docx"),
+            anchor_para_id="FFEE0001",
+        )
+        assert "error" in res
+
+    def test_remove_cross_reference_unknown_para_id(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REF)
+        original = open(docx, "rb").read()
+
+        res = docs_intel.remove_cross_reference(
+            docx_path=docx,
+            anchor_para_id="NOPE",
+        )
+        assert "error" in res
+        assert open(docx, "rb").read() == original
+
+    def test_insert_then_remove_cross_reference_round_trip(self, tmp_path):
+        """Full lifecycle using the real insert path (not a hand-typed
+        fixture) to build the field being removed: insert_caption ->
+        insert_cross_reference -> remove_cross_reference."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+
+        cap = docs_intel.insert_caption(
+            docx_path=docx, anchor_para_id="AABB0002", kind="Figure", label_text="X",
+        )
+        assert "error" not in cap
+
+        ins = docs_intel.insert_cross_reference(
+            docx_path=docx,
+            anchor_para_id="AABB0003",
+            bookmark_name=cap["ref_bookmark"],
+        )
+        assert "error" not in ins
+
+        xml_mid = _read_doc_xml(docx)
+        assert f"REF {cap['ref_bookmark']} \\h" in xml_mid
+
+        rem = docs_intel.remove_cross_reference(
+            docx_path=docx,
+            anchor_para_id="AABB0003",
+        )
+        assert "error" not in rem, f"unexpected error: {rem.get('error')}"
+        assert rem["bookmark_name"] == cap["ref_bookmark"]
+        assert rem["display_text"] == "Figure 1"
+
+        xml_final = _read_doc_xml(docx)
+        assert f"REF {cap['ref_bookmark']}" not in xml_final
+        # The anchor paragraph's own original text survives the removal.
+        assert "A second body paragraph." in xml_final
+
+        # The package is still well-formed and parseable after the round trip.
+        paras = docs_intel.parse_docx(docx)
+        assert any(p.get("para_id") == "AABB0003" for p in paras)
+
+    def test_remove_cross_reference_invalidates_sidecar(self, tmp_path):
+        """remove_cross_reference with index_db_path clears sidecar mtime,
+        mirroring test_insert_citation_invalidates_sidecar above."""
+        docx = str(tmp_path / "doc.docx")
+        db = str(tmp_path / "index.db")
+        _write_docx(docx, _DOC_XML_WITH_REF)
+
+        docs_intel.index_docx(docx, db)
+
+        res = docs_intel.remove_cross_reference(
+            docx_path=docx,
+            anchor_para_id="FFEE0001",
+            index_db_path=db,
+        )
+        assert "error" not in res
+
+        conn = sqlite3.connect(db)
+        row = conn.execute(
+            "SELECT value FROM docx_index_meta WHERE key='source_mtime'"
+        ).fetchone()
+        conn.close()
+        assert row is None or row[0] is None
