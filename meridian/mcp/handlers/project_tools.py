@@ -190,7 +190,13 @@ async def handle_start_session(
         return {"error": "project_id (or project_name) is required"}
     _sname = (args.get("session_name") or "").strip()
     if not _sname:
-        _sname = await db_module.generate_default_session_name(db, _pid)
+        # <infra-fix> — a mode="continue" caller is resuming to dispatch/orchestrate
+        # rather than claim a sprint item itself; the first-pending-item guess is
+        # misleading for that case (see generate_default_session_name docstring).
+        _neutral_name = str(args.get("mode") or "").strip().lower() == "continue"
+        _sname = await db_module.generate_default_session_name(
+            db, _pid, neutral=_neutral_name,
+        )
     result = await _server._start_session_composite(
         db,
         _pid,

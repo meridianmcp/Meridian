@@ -3951,9 +3951,10 @@ async def keepalive_tunnel_sessions(app: Any) -> "list[str]":
         if conn is None:
             continue  # no MCP activity yet → nothing to keep alive
         try:
-            sid = await db_module.touch_latest_active_session(conn)
-            if sid:
-                refreshed.append(sid)
+            # <infra-fix> — now returns every genuinely-recent-activity session
+            # refreshed this tick (list), not a single "most recent" winner.
+            sids = await db_module.touch_latest_active_session(conn)
+            refreshed.extend(sids)
         except Exception:  # noqa: BLE001 — a failed bump must not kill the loop
             _log.debug("tunnel keepalive: touch failed for tenant %s", tenant_id[:8])
     return refreshed
