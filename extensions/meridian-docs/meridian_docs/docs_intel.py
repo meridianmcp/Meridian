@@ -7025,6 +7025,143 @@ def insert_cross_reference(
     }
 
 
+def _scan_ref_field(
+    para_elem: ET.Element,
+) -> tuple[int, int, str, str] | None:
+    """Scan a paragraph for the first REF cross-reference complex field.
+
+    Mirrors :func:`_scan_citation_field`, adapted to the REF field shape
+    :func:`insert_cross_reference` builds (via :func:`_build_complex_field_runs`
+    with instruction ``"REF <bookmark> \\h"``) instead of a CSL_CITATION field.
+    The instruction's first whitespace-separated token must be exactly ``REF``
+    -- this deliberately excludes ``PAGEREF`` / ``NOTEREF`` fields, which are a
+    different (unrelated) field type that happens to share the "REF" substring.
+
+    Returns ``(begin_idx, end_idx, instruction, display_text)`` where
+    ``begin_idx`` / ``end_idx`` are indices into ``list(para_elem)`` for the
+    first (fldCharType=begin) and last (fldCharType=end) run of the field.
+    Returns ``None`` when no REF field is found.
+    """
+    children = list(para_elem)
+    w_r = _q(_W, "r")
+    w_fldChar = _q(_W, "fldChar")
+    w_instrText = _q(_W, "instrText")
+    w_fldCharType = _q(_W, "fldCharType")
+    w_t = _q(_W, "t")
+
+    i = 0
+    while i < len(children):
+        el = children[i]
+        if el.tag == w_r:
+            fc = el.find(w_fldChar)
+            if fc is not None and fc.get(w_fldCharType) == "begin":
+                j = i + 1
+                instr_parts: list[str] = []
+                display_parts: list[str] = []
+                past_sep = False
+                while j < len(children):
+                    el2 = children[j]
+                    if el2.tag == w_r:
+                        fc2 = el2.find(w_fldChar)
+                        if fc2 is not None:
+                            ftype = fc2.get(w_fldCharType)
+                            if ftype == "separate":
+                                past_sep = True
+                            elif ftype == "end":
+                                instr = "".join(instr_parts).strip()
+                                if instr.split()[:1] == ["REF"]:
+                                    return (
+                                        i,
+                                        j,
+                                        instr,
+                                        "".join(display_parts),
+                                    )
+                                break
+                        it = el2.find(w_instrText)
+                        if it is not None and not past_sep:
+                            instr_parts.append(it.text or "")
+                        t_el = el2.find(w_t)
+                        if t_el is not None and past_sep:
+                            display_parts.append(t_el.text or "")
+                    j += 1
+        i += 1
+    return None
+
+
+def remove_cross_reference(
+    docx_path: str,
+    anchor_para_id: str,
+    index_db_path: str | None = None,
+) -> dict[str, Any]:
+    """Remove the first REF-field cross-reference from a paragraph.
+
+    The missing removal counterpart to :func:`insert_cross_reference` (which
+    had no way to undo its own insert): locates the first REF complex field
+    (fldChar begin...end, excluding PAGEREF/NOTEREF -- see
+    :func:`_scan_ref_field`) in the paragraph identified by ``anchor_para_id``,
+    removes all of that field's constituent runs, and re-packs the ZIP.  Every
+    other run in the paragraph -- other text, other fields -- is left
+    untouched.  Mirrors :func:`remove_citation` exactly, one field family over.
+
+    Callers pass the SAME ``anchor_para_id`` the matching
+    :func:`insert_cross_reference` call used; this function re-locates that
+    paragraph and re-scans it rather than remembering anything about the
+    original insert.
+
+    Args:
+        docx_path:       Absolute path to the .docx file (mutated in place).
+        anchor_para_id:  ``w14:paraId`` (or ``p{N}``) of the paragraph to edit --
+                         the same id the matching ``insert_cross_reference``
+                         call used.
+        index_db_path:   If supplied, sidecar is invalidated after the write.
+
+    Returns:
+        ``{status, anchor_para_id, bookmark_name, display_text, docx_path}``
+        or ``{"error": <message>}`` on failure (file is NOT mutated on error).
+    """
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    result = _find_para_by_id(root, anchor_para_id)
+    if result is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+
+    _body, para_elem, _cidx = result
+
+    scan = _scan_ref_field(para_elem)
+    if scan is None:
+        return {
+            "error": f"no REF cross-reference field found in paragraph {anchor_para_id!r}"
+        }
+
+    begin_idx, end_idx, instr, display_text = scan
+    instr_tokens = instr.split()
+    bookmark_name = instr_tokens[1] if len(instr_tokens) > 1 else None
+
+    children = list(para_elem)
+    for idx in range(end_idx, begin_idx - 1, -1):
+        para_elem.remove(children[idx])
+
+    try:
+        _save_docx_xml_stdlib(raw, root, docx_path)
+    except OSError as exc:
+        return {"error": f"could not write {docx_path}: {exc}"}
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "removed",
+        "anchor_para_id": anchor_para_id,
+        "bookmark_name": bookmark_name,
+        "display_text": display_text,
+        "docx_path": docx_path,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Citation complex-field builder
 # ---------------------------------------------------------------------------
@@ -9948,19 +10085,42 @@ def remove_bibliography_entry(
     docx_path: str,
     citation_key: str,
     index_db_path: str | None = None,
+    *,
+    remove_heading_if_empty: bool = False,
 ) -> dict[str, Any]:
     """1258794a — Remove a bibliography entry paragraph from a .docx.
 
     Locates the entry by the ``bibkey_<key>`` bookmark and removes the entire
     paragraph.
 
+    d4a1c3e9 — ``insert_bibliography_entry`` locates-or-CREATES a "References"
+    heading the first time it runs on a document that does not already have
+    one; this function only ever removed the entry paragraph, never that
+    shared heading, on the reasoning that removing one entry should not
+    silently delete a whole section other content might still reference. That
+    is still the DEFAULT behaviour (``remove_heading_if_empty=False``), but a
+    real caller (found live: PAPER-S7's benchmark harness, comparing this
+    against a generic-tool control arm on a genuine forward+inverse round-trip
+    task) legitimately wants "remove the entry, and if that was the LAST
+    entry, remove the now-empty heading too" as a single, opt-in, atomic
+    operation, so a fresh document ends up in exactly its original state
+    after an insert+remove cycle. Pass ``remove_heading_if_empty=True`` for
+    that behaviour; the heading is removed if and only if no OTHER
+    bibliography entry remains under it (checked via
+    ``_bibliography_entries_range`` after the target entry is already gone,
+    never by assuming this was the only entry).
+
     Args:
         docx_path:     Absolute path to the .docx file (mutated in place).
         citation_key:  The citation key of the entry to remove.
         index_db_path: If supplied, sidecar is invalidated after the write.
+        remove_heading_if_empty: If true, and removing this entry leaves the
+                       References/Bibliography heading with no remaining
+                       entries under it, remove that heading paragraph too.
+                       Default false preserves the original behaviour.
 
     Returns:
-        ``{status, citation_key, docx_path}``
+        ``{status, citation_key, docx_path, heading_removed}``
         or ``{"error": <message>}`` on failure.
     """
     if not citation_key or not str(citation_key).strip():
@@ -9986,6 +10146,16 @@ def remove_bibliography_entry(
     _entry_idx, entry_elem = entry_result
     body.remove(entry_elem)
 
+    heading_removed = False
+    if remove_heading_if_empty:
+        heading_result = _find_references_heading(body)
+        if heading_result is not None:
+            heading_idx, heading_elem = heading_result
+            start, end = _bibliography_entries_range(body, heading_idx)
+            if start == end:
+                body.remove(heading_elem)
+                heading_removed = True
+
     try:
         _save_docx_xml_stdlib(raw, root, docx_path)
     except OSError as exc:
@@ -9997,6 +10167,7 @@ def remove_bibliography_entry(
         "status": "removed",
         "citation_key": clean_key,
         "docx_path": docx_path,
+        "heading_removed": heading_removed,
     }
 
 

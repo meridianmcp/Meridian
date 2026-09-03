@@ -248,7 +248,17 @@ def validate_docx_package(source: str | bytes | bytearray, *, include_warnings: 
     try:
         if archive.testzip() is not None:
             issues.append(PackageIssue("zip_crc_error", "a ZIP member failed CRC validation"))
-        names = set(archive.namelist())
+        name_list = archive.namelist()
+        for duplicate in sorted({n for n, count in Counter(name_list).items() if count > 1}):
+            issues.append(
+                PackageIssue(
+                    "duplicate_zip_part",
+                    f"part {duplicate!r} occurs more than once in the ZIP "
+                    "(last-write-wins on read, never healed on write)",
+                    duplicate,
+                )
+            )
+        names = set(name_list)
         for required in ("[Content_Types].xml", "_rels/.rels", "word/document.xml"):
             if required not in names:
                 issues.append(PackageIssue("missing_required_part", f"required part {required} is missing", required))
@@ -263,9 +273,11 @@ def validate_docx_package(source: str | bytes | bytearray, *, include_warnings: 
         for part in _xml_parts(names):
             if part.endswith(".rels"):
                 continue
+            # Deliberately do NOT skip when rel_ids is empty: a part that
+            # carries an r:id/r:embed attribute despite its .rels part being
+            # missing or declaring zero relationships is exactly the dangling
+            # case this check exists to catch, not a reason to exit early.
             rel_ids = {row["Id"] for row in records.get(_rels_for_part(part), [])}
-            if not rel_ids:
-                continue
             try:
                 root = ET.fromstring(archive.read(part))
             except (KeyError, ET.ParseError):

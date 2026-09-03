@@ -1035,7 +1035,7 @@ async def site_password_gate(request: Request, call_next):
     if not site_pw:
         return await call_next(request)
     path = request.url.path
-    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/setup/health", "/static", "/sw.js", "/manifest.webmanifest", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
+    if path in ("/health", "/failover-status", "/mcp/health", "/__gate__", "/config", "/setup/health", "/static", "/sw.js", "/manifest.webmanifest", "/mcp/tools-doc", "/mcp/quickstart", "/mcp/sse", "/mcp", "/mcp/openai", "/.well-known/oauth-authorization-server", "/.well-known/oauth-protected-resource", "/hooks/session-start", "/hooks/stop") or path.startswith("/static/") or path.startswith("/oauth/") or path.startswith("/status/") or path == "/demo" or path.startswith("/demo/"):
         return await call_next(request)
     # Demo cookie bypasses site password gate — demo users don't go through __gate__
     if request.cookies.get(_DEMO_CONTEXT_COOKIE):
@@ -1145,7 +1145,7 @@ async def _request_id_middleware(request: Request, call_next):
     request.state.request_id = req_id
     # Peek at body for MCP initialize — must be done before call_next consumes it
     _is_mcp_init = False
-    if request.url.path in ("/mcp", "/mcp/sse") and request.method == "POST":
+    if request.url.path in ("/mcp", "/mcp/sse", "/mcp/openai") and request.method == "POST":
         try:
             _raw = await request.body()
             if b'"initialize"' in _raw:
@@ -5241,10 +5241,20 @@ def _execution_mode_directive(mode: str | None) -> str:
 # 72e12ed8 — HITL auto-answer directive surfaced in the start_session orientation
 # so executors know whether request_hitl resolves inline or blocks for a human.
 # 67f118c3 — this directive is prepended to agent_instructions, so for modes 1/2
-# it must ALSO override the unconditional "request_hitl is mandatory for any human
-# question" rule baked into DEFAULT_AGENT_INSTRUCTIONS. Without the override, the
-# injected body contradicts the /goal's mode>=1 "Do NOT file HITLs" clause and
-# sessions still file unwanted mid-sprint HITLs. Mode 0 keeps the mandatory wording.
+# it must ALSO soften the unconditional "request_hitl is mandatory for any human
+# question" rule baked into DEFAULT_AGENT_INSTRUCTIONS: with auto-answer on, that
+# rule's own premise (filing always means waiting on a human) no longer holds, so
+# stating it as an absolute would make sessions file unwanted mid-sprint HITLs for
+# questions that would just resolve inline anyway. Mode 0 keeps the mandatory
+# wording verbatim, since there auto-answer is off and the premise holds.
+#
+# <infra-fix> — reworded modes 1/2 to drop the "OVERRIDE ... does NOT apply"
+# framing. That phrasing repeatedly got misread, by both human reviewers and
+# executor sessions across many runs, as an adversarial prompt-injection attempt
+# targeting the request_hitl rule — when it has always been this server's own
+# first-party code describing a real, project-configured setting. Same guidance,
+# stated as a fact about how auto-answer changes the cost of filing rather than
+# as an "override" of a rule stated elsewhere.
 _HITL_MODE_DIRECTIVES = {
     0: ("HITL: auto-answer OFF — request_hitl queues for a human and "
         "urgency='blocking' pauses you until answered. Still ALWAYS use request_hitl "
@@ -5252,17 +5262,17 @@ _HITL_MODE_DIRECTIVES = {
     1: ("HITL: auto-answer SAFE — request_hitl resolves immediately for "
         "non-destructive questions and returns the answer inline (it does not "
         "block). Use it freely; require_human=true still routes to a human. "
-        "OVERRIDE: auto-answer is ON, so filing a request_hitl is NOT mandatory — "
-        "the 'request_hitl is the ONLY human-decision channel / MUST go through "
-        "request_hitl' rule below does NOT apply mid-sprint. Prefer to skip blocked "
-        "items and continue; only file a HITL when you genuinely need a human."),
+        "Because auto-answer is on, filing a request_hitl here is not mandatory "
+        "the way it is when auto-answer is off — it resolves inline rather than "
+        "blocking, so prefer to skip blocked items and continue when a human "
+        "genuinely isn't needed; file request_hitl whenever you are unsure."),
     2: ("HITL: auto-answer AGGRESSIVE — request_hitl resolves immediately and "
         "returns the answer inline for nearly all questions. Use it freely; "
         "require_human=true still forces a human reply. "
-        "OVERRIDE: auto-answer is ON, so filing a request_hitl is NOT mandatory — "
-        "the 'request_hitl is the ONLY human-decision channel / MUST go through "
-        "request_hitl' rule below does NOT apply mid-sprint. Prefer to skip blocked "
-        "items and continue; only file a HITL when you genuinely need a human."),
+        "Because auto-answer is on, filing a request_hitl here is not mandatory "
+        "the way it is when auto-answer is off — it resolves inline rather than "
+        "blocking, so prefer to skip blocked items and continue when a human "
+        "genuinely isn't needed; file request_hitl whenever you are unsure."),
 }
 
 
@@ -7232,6 +7242,7 @@ _GITHUB_READ_ONLY = frozenset({
     "get_commit", "get_workflow_runs", "get_workflow_run_logs",
     "git_diff", "list_branches", "list_issues", "get_issue",
 })
+_GITHUB_DESTRUCTIVE = frozenset({"patch_file", "trigger_workflow", "create_issue"})
 _GITHUB_TITLE_OVERRIDES: dict[str, str] = {
     "read_file": "Read File",
     "patch_file": "Patch File",
@@ -7273,7 +7284,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         {
             "name": "patch_file",
             "description": (
-                "Make a targeted edit to a file in the project's connected GitHub repo: "
+                "Make a targeted edit to a file in the project's connected GitHub repository: "
                 "replace an exact substring (old_str) with new_str and commit it. old_str "
                 "must match the current file contents exactly (including whitespace) and "
                 "appear exactly once. Sends only the changed snippet, so it edits very "
@@ -7332,7 +7343,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "search_commits",
-            "description": "Search recent commits by message substring. Fetches up to 100 recent commits and filters by case-insensitive match. Returns helpful error if no GitHub repo is connected.",
+            "description": "Search recent commits in the project's connected GitHub repository by message substring. Fetches up to 100 recent commits and filters by case-insensitive match. Returns helpful error if no GitHub repo is connected.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7370,7 +7381,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "get_workflow_run_logs",
-            "description": "Return the failed job steps for a GitHub Actions run, with the last 50 log lines per failed job. Use to see why CI is red.",
+            "description": "Return the failed job steps for a GitHub Actions run belonging to the project's connected GitHub repository, with the last 50 log lines per failed job. Use to see why CI is red.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7446,7 +7457,7 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         },
         {
             "name": "get_issue",
-            "description": "Read a single issue plus its comments from the connected repo.",
+            "description": "Read a single issue plus its comments from the project's connected GitHub repository.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7464,8 +7475,12 @@ def _github_tools_for_tenant(tenant: dict) -> list[dict[str, Any]]:
         _t["annotations"] = {
             "title": _gh_title,
             "readOnlyHint": _ro,
-            "destructiveHint": False,
-            "openWorldHint": False,
+            # Every GitHub tool contacts the user's external repository.  The
+            # three tools in _GITHUB_DESTRUCTIVE also mutate that repository or
+            # trigger an external workflow and must be surfaced as destructive
+            # to MCP directory reviewers and clients.
+            "destructiveHint": _t["name"] in _GITHUB_DESTRUCTIVE,
+            "openWorldHint": True,
             "idempotentHint": _ro,
         }
     return _tools
@@ -7713,6 +7728,34 @@ async def remote_mcp(request: Request) -> Any:
         return _JR({"jsonrpc": "2.0", "id": _req_id_from_body, "error": {"code": -32603, "message": "internal error — please retry"}})
 
 
+@app.post("/mcp/openai")
+async def remote_mcp_openai(request: Request) -> Any:
+    """Curated MCP endpoint for the OpenAI plugin directory submission."""
+    try:
+        return await _remote_mcp_inner(request, tool_profile="openai")
+    except Exception as _e:
+        import logging as _log
+        _req_id = getattr(request.state, "request_id", "unknown")
+        _log.getLogger("meridian.server").exception(
+            "unhandled exception in remote_mcp_openai (request_id=%s)",
+            _req_id,
+            exc_info=_e,
+        )
+        try:
+            _body = await request.body()
+            _req_id_from_body = __import__("json").loads(_body).get("id")
+        except Exception:
+            _req_id_from_body = None
+        from fastapi.responses import JSONResponse as _JR
+        return _JR(
+            {
+                "jsonrpc": "2.0",
+                "id": _req_id_from_body,
+                "error": {"code": -32603, "message": "internal error — please retry"},
+            }
+        )
+
+
 async def _log_connection_event(
     db: Any,
     *,
@@ -7760,7 +7803,11 @@ def _mcp_profile_log(request_id: str, stages: "list[tuple[str, float]]") -> None
     _MCP_PROFILE_LOGGER.info("[mcp_perf] request_id=%s %s total=%.3fms", request_id, parts, total_ms)
 
 
-async def _remote_mcp_inner(request: Request) -> Any:
+async def _remote_mcp_inner(
+    request: Request,
+    *,
+    tool_profile: str | None = None,
+) -> Any:
     """Remote MCP endpoint — JSON-RPC 2.0 over HTTP.
 
     Accepts OAuth bearer tokens and Meridian API keys over the same endpoint.
@@ -7768,6 +7815,12 @@ async def _remote_mcp_inner(request: Request) -> Any:
     Accepts a single JSON-RPC 2.0 message or a batch (list).
     """
     from fastapi.responses import JSONResponse
+    from .mcp_profiles import get_tool_allowlist
+
+    try:
+        _allowed_tool_names = get_tool_allowlist(tool_profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     _prof = _mcp_profile_enabled()
     _prof_stages: "list[tuple[str, float]]" = []
@@ -7897,7 +7950,7 @@ async def _remote_mcp_inner(request: Request) -> Any:
         # an unhandled exception inside _handle_mcp_request produces a log row.
         _oa_method = _body.get("method", "") if isinstance(_body, dict) else "batch"
         if isinstance(_body, list):
-            _oa_results = [await _handle_mcp_request(i, _mdb, _mdd, tenant=_oa_tenant) for i in _body]
+            _oa_results = [await _handle_mcp_request(i, _mdb, _mdd, tenant=_oa_tenant, allowed_tool_names=_allowed_tool_names) for i in _body]
             # Log the first (most diagnostic) item from a batch.
             _oa_log_method = (_body[0].get("method", "") if _body and isinstance(_body[0], dict) else "batch")
             _oa_tools_ret = None
@@ -7914,7 +7967,7 @@ async def _remote_mcp_inner(request: Request) -> Any:
                 response_status=200,
             )
             return JSONResponse(_oa_results)
-        _oa_result = await _handle_mcp_request(_body, _mdb, _mdd, tenant=_oa_tenant)
+        _oa_result = await _handle_mcp_request(_body, _mdb, _mdd, tenant=_oa_tenant, allowed_tool_names=_allowed_tool_names)
         _oa_tools_ret2 = None
         if _oa_method == "tools/list":
             _oa_r = _oa_result.get("result") or {}
@@ -8067,7 +8120,7 @@ async def _remote_mcp_inner(request: Request) -> Any:
 
     _req_method = body.get("method", "") if isinstance(body, list) else (body.get("method", "") if isinstance(body, dict) else "batch")
     if isinstance(body, list):
-        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids) for item in body]
+        results = [await _handle_mcp_request(item, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids, allowed_tool_names=_allowed_tool_names) for item in body]
         # b12cc29f — log the first item of a batch (most diagnostic).
         _log_method = (body[0].get("method", "") if body and isinstance(body[0], dict) else "batch")
         _tools_ret = None
@@ -8085,7 +8138,7 @@ async def _remote_mcp_inner(request: Request) -> Any:
         )
         return JSONResponse(results)
 
-    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids)
+    result = await _handle_mcp_request(body, db, data_dir, tenant=tenant, token_type=_token_type, enforce_role=_enf_role, scoped_project_ids=_scoped_pids, allowed_tool_names=_allowed_tool_names)
 
     if _prof:
         _t_now = time.perf_counter()

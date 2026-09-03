@@ -634,6 +634,78 @@ async def _resolve_tenant_from_token(auth_db: Any, token: str | None) -> dict | 
 
 
 # ---------------------------------------------------------------------------
+# ff9d2963 — shared, single-source-of-truth token extraction for the tunnel's
+# two auth surfaces (WS query-param legacy fallback vs. plain-HTTP header-only).
+#
+# The 4 WebSocket endpoints below MUST keep accepting `?token=` as a fallback:
+# the local tunnel binary (tunnel_client.py's `_ws_url`/`_ws_code_url`/
+# `_ws_extract_url`/`_ws_office_url`) cannot always pass the token as a real
+# Authorization header, because the `websockets` client library renamed its
+# header kwarg across the version range this project supports
+# (`extra_headers` on 12.x/13.x, `additional_headers` on 14.x+) and
+# `pyproject.toml` pins only `websockets>=12.0` (open-ended) — a hardcoded
+# kwarg name would break for whichever major version the host machine has
+# installed. This is a genuine, load-bearing constraint, not an oversight, so
+# the fallback is kept but made explicit ("legacy-gated"): every connection
+# that authenticates via the query param is logged (never the raw token
+# itself) so the volume of legacy-path usage stays visible in ops ahead of
+# eventually closing the gap client-side (e.g. detecting the installed
+# `websockets.connect` signature at runtime and always sending a header).
+#
+# The 3 plain-HTTP endpoints (`/tunnel/active-repo`, `/tunnel/refresh`,
+# `/tunnel/manifest`) have no such constraint — httpx has no
+# equivalent header-kwarg-naming problem, and every internal caller
+# (`tunnel_client.py`'s `_fetch_tunnel_manifest`, the MCP handler's direct
+# in-process calls to `send_active_repo_control`/`refresh_tunnel_manifest`)
+# already sends a real `Authorization: Bearer` header. A durable bearer token
+# in a URL query string is a straightforward, avoidable leak (access logs,
+# browser history, `Referer` headers) with no offsetting benefit for these
+# three routes, so `_resolve_http_bearer_token` below never falls back to it.
+# ---------------------------------------------------------------------------
+
+def _extract_ws_auth_token(ws: "WebSocket") -> tuple[str, bool]:
+    """Resolve a WS tunnel connection's bearer token: header first, then the
+    legacy `?token=` query param. Returns ``(raw_token, used_query_fallback)``
+    so the caller can log the legacy path without ever logging the token."""
+    auth_header = ws.headers.get("authorization", "")
+    if auth_header:
+        return auth_header, False
+    token_param = ws.query_params.get("token", "")
+    return token_param, bool(token_param)
+
+
+def _log_ws_legacy_auth(label: str, tenant_id: str, used_query_fallback: bool) -> None:
+    """Redacted, opt-in log line for the legacy WS query-token auth path.
+
+    Never logs the token value — only that the fallback fired, for a
+    tenant-id truncated to 8 chars (matching this module's existing
+    "tenant %s connected" convention) — so ops can track/alert on legacy
+    usage without this line itself becoming a new leak surface."""
+    if used_query_fallback:
+        _log.info(
+            "tunnel-%s: tenant %s authenticated via legacy ?token= query "
+            "param (Authorization header preferred; see ff9d2963)",
+            label, tenant_id[:8],
+        )
+
+
+def _resolve_http_bearer_token(request: "Request") -> str:
+    """Extract a bearer token from the Authorization header ONLY.
+
+    ff9d2963: unlike the WS endpoints, the 3 plain-HTTP tunnel routes never
+    fall back to `?token=` — see the module note above for why the fallback
+    is unnecessary here and actively harmful (durable secret in the request
+    path/access logs). A request that only supplies `?token=` resolves to an
+    empty string here, which `_resolve_tenant_from_token` treats as invalid
+    (401), exactly as if no credential had been supplied at all.
+    """
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[len("Bearer "):].strip()
+    return auth_header
+
+
+# ---------------------------------------------------------------------------
 # /tunnel/{tenant_id}  — WebSocket: binary client holds this open
 # ---------------------------------------------------------------------------
 
@@ -653,10 +725,9 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
     # Accept the socket early so we can send a close frame with a reason.
     await ws.accept()
 
-    # Authenticate: header first, then query param
-    auth_header = ws.headers.get("authorization", "")
-    token_param = ws.query_params.get("token", "")
-    raw_token = auth_header or token_param
+    # Authenticate: header first, then legacy query param (see module note
+    # above `_extract_ws_auth_token`).
+    raw_token, used_query_fallback = _extract_ws_auth_token(ws)
 
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None or tenant.get("id") != tenant_id:
@@ -666,6 +737,8 @@ async def tunnel_ws(ws: WebSocket, tenant_id: str) -> None:
     if not _is_tunnel_allowed(tenant):
         await ws.close(code=4403, reason="tunnel requires Pro plan")
         return
+
+    _log_ws_legacy_auth("fs", tenant_id, used_query_fallback)
 
     # Evict any stale socket for this tenant (e.g. binary restarted)
     old_ws = _tunnel_sockets.pop(tenant_id, None)
@@ -780,9 +853,7 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
     auth_db = ws.app.state.db
     await ws.accept()
 
-    auth_header = ws.headers.get("authorization", "")
-    token_param = ws.query_params.get("token", "")
-    raw_token = auth_header or token_param
+    raw_token, used_query_fallback = _extract_ws_auth_token(ws)
 
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None or tenant.get("id") != tenant_id:
@@ -807,6 +878,7 @@ async def tunnel_code_ws(ws: WebSocket, tenant_id: str) -> None:
     # this only for the FS slot (tunnel_ws); this is the equivalent for code.
     owner_instance = record_tenant_owner_instance(tenant_id)
     _log.info("tunnel-code: tenant %s connected", tenant_id[:8])
+    _log_ws_legacy_auth("code", tenant_id, used_query_fallback)
 
     try:
         while True:
@@ -872,9 +944,7 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
     auth_db = ws.app.state.db
     await ws.accept()
 
-    auth_header = ws.headers.get("authorization", "")
-    token_param = ws.query_params.get("token", "")
-    raw_token = auth_header or token_param
+    raw_token, used_query_fallback = _extract_ws_auth_token(ws)
 
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None or tenant.get("id") != tenant_id:
@@ -899,6 +969,7 @@ async def tunnel_extract_ws(ws: WebSocket, tenant_id: str) -> None:
     # Fly). af5b5739 wired this only for the FS slot; this is the extract fix.
     owner_instance = record_tenant_owner_instance(tenant_id)
     _log.info("tunnel-extract: tenant %s connected", tenant_id[:8])
+    _log_ws_legacy_auth("extract", tenant_id, used_query_fallback)
 
     try:
         while True:
@@ -973,9 +1044,7 @@ async def _serve_tunnel_ws(
     auth_db = ws.app.state.db
     await ws.accept()
 
-    auth_header = ws.headers.get("authorization", "")
-    token_param = ws.query_params.get("token", "")
-    raw_token = auth_header or token_param
+    raw_token, used_query_fallback = _extract_ws_auth_token(ws)
 
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None or tenant.get("id") != tenant_id:
@@ -1005,6 +1074,7 @@ async def _serve_tunnel_ws(
     # word, dc, docs, zotero, and custom slots (p0-p3).
     owner_instance = record_tenant_owner_instance(tenant_id)
     _log.info("tunnel-%s: tenant %s connected", label, tenant_id[:8])
+    _log_ws_legacy_auth(label, tenant_id, used_query_fallback)
 
     try:
         while True:
@@ -1153,10 +1223,7 @@ async def set_tunnel_active_repo(request: Request) -> Response:
             media_type="application/json",
         )
 
-    auth_header = request.headers.get("authorization", "")
-    raw_token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else auth_header
-    if not raw_token:
-        raw_token = request.query_params.get("token", "")
+    raw_token = _resolve_http_bearer_token(request)
     auth_db = request.app.state.db
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None:
@@ -1248,10 +1315,7 @@ async def refresh_tunnel_tools_route(request: Request) -> Response:
     if not _hosted_mode():
         return _json_response({"error": "tunnel requires hosted mode"}, status_code=503)
 
-    auth_header = request.headers.get("authorization", "")
-    raw_token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else auth_header
-    if not raw_token:
-        raw_token = request.query_params.get("token", "")
+    raw_token = _resolve_http_bearer_token(request)
     auth_db = request.app.state.db
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None:
@@ -1279,10 +1343,7 @@ async def get_tunnel_manifest_route(request: Request) -> Response:
     if not _hosted_mode():
         return _json_response({"error": "tunnel requires hosted mode"}, status_code=503)
 
-    auth_header = request.headers.get("authorization", "")
-    raw_token = auth_header[len("Bearer "):].strip() if auth_header.lower().startswith("bearer ") else auth_header
-    if not raw_token:
-        raw_token = request.query_params.get("token", "")
+    raw_token = _resolve_http_bearer_token(request)
     auth_db = request.app.state.db
     tenant = await _resolve_tenant_from_token(auth_db, raw_token)
     if tenant is None:
@@ -2479,6 +2540,136 @@ def build_tunnel_diagnostics(tenant: "dict | None", hostname: "str | None" = Non
     }
 
 
+def build_launch_matrix(
+    tenant: "dict | None",
+    hostname: "str | None",
+    projects: "list[dict]",
+) -> dict:
+    """Read-only, repeatable launch matrix (ba31dedf).
+
+    Joins the tenant/slot diagnostic layer (:func:`build_tunnel_diagnostics` --
+    process state, health, config fingerprint) with Meridian PROJECT
+    registration, the one dimension that layer doesn't have. Does no DB I/O of
+    its own: *projects* is the caller-supplied list of in-scope project rows
+    (each a dict with at least ``"id"``/``"name"``/``"executor_config"``, the
+    shape ``db.get_project``/``db.list_projects`` already return), so this
+    stays a pure, trivially unit-testable join reusable from an HTTP route, an
+    MCP tool, or a test.
+
+    Emits one row per ``(project, slot)`` pair covering exactly the columns
+    the sprint item's acceptance criteria name: local stdio launcher status,
+    hosted/tunnel route, effective repo scope, project id, plugin
+    version/digest (reusing :func:`resolve_plugins`'s existing
+    ``stale_override`` reconciliation -- never re-implemented here),
+    active/invocable state, last health result, fallback, and failure class --
+    plus the config-digest/health-timestamp diagnostics criterion, both
+    already computed by :func:`build_tunnel_diagnostics` and surfaced here
+    under explicit names.
+
+    **Cross-project scope mismatch fails closed:** when two or more projects
+    in *projects* register the identical ``executor_config.repo_path``, every
+    row for those projects is marked ``repo_scope_status:
+    "cross_project_mismatch"`` and ``active_invocable`` is forced ``False``
+    regardless of the underlying slot's health -- this function cannot know
+    which of the ambiguous projects a given machine is actually serving, so it
+    never reports one as cleanly healthy. Same fail-closed treatment for a
+    registered repo path that is itself a bare home directory (see
+    :func:`meridian.repo_scope.looks_like_bare_home_directory`).
+    """
+    from .. import repo_scope as _repo_scope  # noqa: PLC0415
+
+    diagnostics = build_tunnel_diagnostics(tenant, hostname)
+    config_digest = diagnostics.get("connector_manifest", {}).get("manifest_hash")
+    health_timestamp = diagnostics.get("generated_at")
+    tenant_id = diagnostics.get("tenant_id")
+
+    # Plugin reconciliation (stale_override / newer_default_*) — resolved
+    # independently of build_tunnel_diagnostics's internal call so this
+    # function never depends on that function's private locals. Pure, no
+    # side effects, cheap to call twice.
+    plugins_by_slot: dict[str, dict] = {}
+    if tenant is not None:
+        parsed = _current_tunnel_config(tenant, hostname)
+        plugins_by_slot = {
+            p["slot"]: p for p in resolve_plugins(parsed) if isinstance(p, dict)
+        }
+
+    def _repo_path_of(project: dict) -> "str | None":
+        exec_cfg = project.get("executor_config") or {}
+        if isinstance(exec_cfg, str):
+            try:
+                exec_cfg = json.loads(exec_cfg) or {}
+            except Exception:  # noqa: BLE001 — malformed stored config, treat as unset
+                exec_cfg = {}
+        return (exec_cfg.get("repo_path") or "").strip() or None
+
+    # First pass: detect repo paths claimed by more than one project.
+    repo_path_owners: dict[str, list[str]] = {}
+    for project in projects:
+        rp = _repo_path_of(project)
+        if rp:
+            repo_path_owners.setdefault(rp, []).append(project.get("id"))
+
+    slots = dict(diagnostics.get("slots") or {})
+    rows: list[dict] = []
+    for project in projects:
+        project_id = project.get("id")
+        registered_repo_path = _repo_path_of(project)
+
+        if registered_repo_path and _repo_scope.looks_like_bare_home_directory(registered_repo_path):
+            scope_status = "rejected_home_directory"
+        elif registered_repo_path and len(repo_path_owners.get(registered_repo_path, [])) > 1:
+            scope_status = "cross_project_mismatch"
+        elif registered_repo_path:
+            scope_status = "ok"
+        else:
+            scope_status = "not_configured"
+
+        iter_slots = slots or {"_no_tenant": {}}
+        for slot, slot_diag in iter_slots.items():
+            plugin = plugins_by_slot.get(slot) or {}
+            label = slot_diag.get("state")
+            failure_class = None if label in (None, "healthy") else label
+            process_active = bool(slot_diag.get("process_active"))
+            rows.append({
+                "project_id": project_id,
+                "project_name": project.get("name"),
+                "slot": slot,
+                "local_launcher_status": label,
+                "hosted_route": (
+                    f"/tunnel-{slot}/{tenant_id}"
+                    if tenant_id and slot != "_no_tenant" else None
+                ),
+                "effective_repo_scope": registered_repo_path,
+                "repo_scope_status": scope_status,
+                "plugin_command": plugin.get("command") or (slot_diag.get("dashboard_configured") or {}).get("command"),
+                "plugin_stale_override": bool(plugin.get("stale_override")),
+                "plugin_newer_default_command": plugin.get("newer_default_command"),
+                "config_digest": config_digest,
+                "health_timestamp": health_timestamp,
+                # Fail closed: never "invocable" on an ambiguous/rejected scope,
+                # regardless of what the underlying slot health reports.
+                "active_invocable": (
+                    process_active and label == "healthy" and scope_status in ("ok", "not_configured")
+                ),
+                "last_health_result": {
+                    "state": label,
+                    "last_error": slot_diag.get("last_error"),
+                },
+                "fallback": slot_diag.get("remediation"),
+                "failure_class": failure_class,
+            })
+
+    return {
+        "run_id": diagnostics.get("run_id"),
+        "generated_at": diagnostics.get("generated_at"),
+        "tenant_id": tenant_id,
+        "config_digest": config_digest,
+        "health_timestamp": health_timestamp,
+        "rows": rows,
+    }
+
+
 @router.get("/tunnel/diagnostics/{tenant_id}")
 async def tunnel_diagnostics(tenant_id: str, request: Request) -> Response:
     """Layered, read-only tunnel/connector diagnostics for one tenant (f1e0df55).
@@ -2494,6 +2685,28 @@ async def tunnel_diagnostics(tenant_id: str, request: Request) -> Response:
     tenant = await _get_tenant_from_request(request)
     hostname = (request.query_params.get("hostname") or "").strip() or None
     return _json_response(build_tunnel_diagnostics(tenant, hostname))
+
+
+@router.get("/tunnel/launch-matrix/{tenant_id}")
+async def tunnel_launch_matrix(tenant_id: str, request: Request) -> Response:
+    """Read-only, repeatable launch matrix across every in-scope project (ba31dedf).
+
+    Same auth/hostname-resolution contract as ``/tunnel/diagnostics/{tenant_id}``
+    (``tenant_id`` in the path is documentary only); joins that diagnostic
+    snapshot with this request's project set — see :func:`build_launch_matrix`
+    for the full field-by-field contract. A DB error while listing projects
+    degrades to an empty project set (diagnostics-only response) rather than
+    failing the request — matches ``get_tunnel_filesystem_roots``'s existing
+    best-effort convention for this same tenant/project join.
+    """
+    tenant = await _get_tenant_from_request(request)
+    hostname = (request.query_params.get("hostname") or "").strip() or None
+    try:
+        db = await _db(request)
+        projects = await db_module.list_projects(db)
+    except Exception:  # noqa: BLE001 — unprovisioned/unreachable DB → diagnostics-only
+        projects = []
+    return _json_response(build_launch_matrix(tenant, hostname, projects))
 
 
 @router.post("/tunnel/plugins/custom")
@@ -3738,9 +3951,10 @@ async def keepalive_tunnel_sessions(app: Any) -> "list[str]":
         if conn is None:
             continue  # no MCP activity yet → nothing to keep alive
         try:
-            sid = await db_module.touch_latest_active_session(conn)
-            if sid:
-                refreshed.append(sid)
+            # <infra-fix> — now returns every genuinely-recent-activity session
+            # refreshed this tick (list), not a single "most recent" winner.
+            sids = await db_module.touch_latest_active_session(conn)
+            refreshed.extend(sids)
         except Exception:  # noqa: BLE001 — a failed bump must not kill the loop
             _log.debug("tunnel keepalive: touch failed for tenant %s", tenant_id[:8])
     return refreshed

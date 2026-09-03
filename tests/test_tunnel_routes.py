@@ -976,3 +976,258 @@ def test_manifest_route_requires_auth(monkeypatch):
     monkeypatch.setattr(tn, "_resolve_tenant_from_token", fake_resolve)
     resp = asyncio.run(tn.get_tunnel_manifest_route(_FakeManifestRequest()))
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# ff9d2963 — SECURITY-LAUNCH: WS/HTTP auth-path coverage for the 7 call sites
+# that used to accept `?token=` as a query-string bearer-token fallback.
+#
+# Confirmed pre-fix (discovery + this item's own audit): no test anywhere
+# exercised header-vs-query auth for tunnel_ws / tunnel_code_ws /
+# tunnel_extract_ws / _serve_tunnel_ws (the shared ppt/word/dc/docs/zotero/
+# outputs/debug handler), and the 3 plain-HTTP routes silently accepted
+# ?token= with no internal caller ever depending on it.
+#
+# Fix shape: the 4 WS endpoints keep the query-param fallback (a genuine
+# `websockets` client-library version constraint — see the module note above
+# `_extract_ws_auth_token` in meridian/routes/tunnel.py) but now log it as an
+# explicit "legacy" auth path; the 3 HTTP endpoints reject it outright (no
+# internal caller ever used it).
+# ---------------------------------------------------------------------------
+
+class _FakeAuthWS:
+    """Minimal WebSocket stand-in for exercising a tunnel WS handler's auth
+    extraction directly (tunnel_ws / tunnel_code_ws / tunnel_extract_ws /
+    _serve_tunnel_ws-backed routes) without a live network handshake.
+
+    `receive_json` raises WebSocketDisconnect immediately so a successfully
+    authenticated connection exits its message loop deterministically
+    instead of hanging on the real 120s ping timeout.
+    """
+
+    def __init__(self, headers=None, query_params=None):
+        self.headers = headers or {}
+        self.query_params = query_params or {}
+        self.closed_with = None
+        self.app = types.SimpleNamespace(state=types.SimpleNamespace(db=None))
+
+    async def accept(self):
+        pass
+
+    async def close(self, code=1000, reason=""):
+        self.closed_with = (code, reason)
+
+    async def receive_json(self):
+        raise tn.WebSocketDisconnect(code=1000)
+
+    async def send_json(self, obj):
+        pass
+
+
+def _patch_ws_auth(monkeypatch, tenant_id, plan="pro"):
+    """hosted mode + a fake `_resolve_tenant_from_token` that records exactly
+    which token string it was called with (`seen["token"]`) and only
+    resolves to a tenant for a non-empty token -- mirrors the real function's
+    ``if not token: return None`` short-circuit closely enough to prove
+    header-vs-query precedence without needing a real DB."""
+    monkeypatch.setattr(tn, "_hosted_mode", lambda: True)
+    seen = {"token": "unset"}
+
+    async def fake_resolve(auth_db, token):
+        seen["token"] = token
+        return {"id": tenant_id, "plan": plan} if token else None
+
+    monkeypatch.setattr(tn, "_resolve_tenant_from_token", fake_resolve)
+    return seen
+
+
+# (handler, kwargs beyond (ws, tenant_id)) for each of the 4 WS call sites.
+_WS_AUTH_SITES = [
+    ("tunnel_ws", {}),
+    ("tunnel_code_ws", {}),
+    ("tunnel_extract_ws", {}),
+    ("tunnel_ppt_ws", {}),  # representative _serve_tunnel_ws-backed route
+]
+
+
+@pytest.mark.parametrize("handler_name,extra", _WS_AUTH_SITES)
+def test_ws_auth_header_only_succeeds(monkeypatch, handler_name, extra):
+    tenant_id = _tid()
+    seen = _patch_ws_auth(monkeypatch, tenant_id)
+    ws = _FakeAuthWS(headers={"authorization": "Bearer header-token"})
+    handler = getattr(tn, handler_name)
+    asyncio.run(handler(ws, tenant_id, **extra))
+    assert seen["token"] == "Bearer header-token"
+    assert ws.closed_with is None, "a validly authenticated connection must not be closed"
+
+
+@pytest.mark.parametrize("handler_name,extra", _WS_AUTH_SITES)
+def test_ws_auth_query_only_succeeds_as_legacy_fallback(monkeypatch, handler_name, extra):
+    """The query-string fallback is intentionally still load-bearing for WS
+    (see the module note in routes/tunnel.py) — it must keep authenticating,
+    not silently break existing local tunnel binaries."""
+    tenant_id = _tid()
+    seen = _patch_ws_auth(monkeypatch, tenant_id)
+    ws = _FakeAuthWS(query_params={"token": "query-token"})
+    handler = getattr(tn, handler_name)
+    asyncio.run(handler(ws, tenant_id, **extra))
+    assert seen["token"] == "query-token"
+    assert ws.closed_with is None
+
+
+@pytest.mark.parametrize("handler_name,extra", _WS_AUTH_SITES)
+def test_ws_auth_header_wins_over_query_when_both_present(monkeypatch, handler_name, extra):
+    tenant_id = _tid()
+    seen = _patch_ws_auth(monkeypatch, tenant_id)
+    ws = _FakeAuthWS(
+        headers={"authorization": "Bearer header-token"},
+        query_params={"token": "query-token"},
+    )
+    handler = getattr(tn, handler_name)
+    asyncio.run(handler(ws, tenant_id, **extra))
+    assert seen["token"] == "Bearer header-token", "header must take precedence over query"
+
+
+@pytest.mark.parametrize("handler_name,extra", _WS_AUTH_SITES)
+def test_ws_auth_neither_header_nor_query_is_rejected(monkeypatch, handler_name, extra):
+    tenant_id = _tid()
+    _patch_ws_auth(monkeypatch, tenant_id)
+    ws = _FakeAuthWS()
+    handler = getattr(tn, handler_name)
+    asyncio.run(handler(ws, tenant_id, **extra))
+    assert ws.closed_with == (4401, "invalid or mismatched token")
+
+
+def test_extract_ws_auth_token_helper_directly_header_only():
+    ws = _FakeAuthWS(headers={"authorization": "Bearer h"})
+    token, used_query = tn._extract_ws_auth_token(ws)
+    assert (token, used_query) == ("Bearer h", False)
+
+
+def test_extract_ws_auth_token_helper_directly_query_only():
+    ws = _FakeAuthWS(query_params={"token": "q"})
+    token, used_query = tn._extract_ws_auth_token(ws)
+    assert (token, used_query) == ("q", True)
+
+
+def test_extract_ws_auth_token_helper_directly_both_prefers_header():
+    ws = _FakeAuthWS(headers={"authorization": "Bearer h"}, query_params={"token": "q"})
+    token, used_query = tn._extract_ws_auth_token(ws)
+    assert (token, used_query) == ("Bearer h", False)
+
+
+def test_extract_ws_auth_token_helper_directly_neither():
+    ws = _FakeAuthWS()
+    token, used_query = tn._extract_ws_auth_token(ws)
+    assert (token, used_query) == ("", False)
+
+
+def test_log_ws_legacy_auth_logs_only_on_query_fallback(caplog):
+    """Never logs the token value itself -- only that the legacy path fired."""
+    import logging
+    caplog.set_level(logging.INFO, logger="meridian.routes.tunnel")
+
+    caplog.clear()
+    tn._log_ws_legacy_auth("fs", "tenant-abc12345", used_query_fallback=False)
+    assert not caplog.records, "header-path auth must not log anything"
+
+    caplog.clear()
+    tn._log_ws_legacy_auth("fs", "tenant-abc12345", used_query_fallback=True)
+    assert len(caplog.records) == 1
+    msg = caplog.records[0].getMessage()
+    assert "legacy" in msg
+    assert "tenant-a" in msg  # truncated to 8 chars, matching this module's convention
+
+
+# ---------------------------------------------------------------------------
+# _resolve_http_bearer_token — the 3 plain-HTTP routes now REJECT a
+# query-string-only token outright (no internal caller ever needed it: this
+# item's audit confirmed tunnel_client.py's _fetch_tunnel_manifest and the
+# MCP handler's direct in-process calls always send a real Authorization
+# header). A request with only `?token=` must resolve exactly like a request
+# with no credential at all.
+# ---------------------------------------------------------------------------
+
+def test_resolve_http_bearer_token_reads_header():
+    req = types.SimpleNamespace(headers={"authorization": "Bearer abc"}, query_params={})
+    assert tn._resolve_http_bearer_token(req) == "abc"
+
+
+def test_resolve_http_bearer_token_ignores_query_param():
+    req = types.SimpleNamespace(headers={}, query_params={"token": "leaked-in-url"})
+    assert tn._resolve_http_bearer_token(req) == ""
+
+
+def test_resolve_http_bearer_token_header_without_bearer_prefix_passthrough():
+    # Matches the pre-existing behavior for a non-standard Authorization value.
+    req = types.SimpleNamespace(headers={"authorization": "raw-value"}, query_params={})
+    assert tn._resolve_http_bearer_token(req) == "raw-value"
+
+
+class _FakeQueryOnlyReq:
+    """A request carrying a bearer token ONLY in the query string -- the
+    exact shape that used to succeed against the 3 HTTP routes and must now
+    fail closed (401), matching a request with no credential at all."""
+
+    def __init__(self, token):
+        self.headers = {}
+        self.query_params = {"token": token}
+        self.app = types.SimpleNamespace(state=types.SimpleNamespace(db=None))
+
+    async def json(self):
+        return {"repo_path": "/some/repo"}
+
+
+def test_active_repo_route_rejects_query_only_token(monkeypatch):
+    tenant_id = _patch_manifest_auth(monkeypatch)
+    resp = asyncio.run(tn.set_tunnel_active_repo(_FakeQueryOnlyReq("sk_meridian_leaked")))
+    assert resp.status_code == 401, "query-only token must no longer authenticate this route"
+
+
+def test_refresh_route_rejects_query_only_token(monkeypatch):
+    _patch_manifest_auth(monkeypatch)
+    resp = asyncio.run(tn.refresh_tunnel_tools_route(_FakeQueryOnlyReq("sk_meridian_leaked")))
+    assert resp.status_code == 401
+
+
+def test_manifest_route_rejects_query_only_token(monkeypatch):
+    _patch_manifest_auth(monkeypatch)
+    resp = asyncio.run(tn.get_tunnel_manifest_route(_FakeQueryOnlyReq("sk_meridian_leaked")))
+    assert resp.status_code == 401
+
+
+class _FakeHeaderOnlyActiveRepoReq:
+    """Same shape as _FakeQueryOnlyReq but authenticated correctly (header),
+    to prove rejecting the query fallback didn't also break the header path."""
+
+    def __init__(self, repo_path, token):
+        self.headers = {"authorization": f"Bearer {token}"}
+        self.query_params = {}
+        self._repo_path = repo_path
+        self.app = types.SimpleNamespace(state=types.SimpleNamespace(db=None))
+
+    async def json(self):
+        return {"repo_path": self._repo_path}
+
+
+class _FakeExtractSocket:
+    """Minimal stand-in for the extract-slot WS: just records sends."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_json(self, obj):
+        self.sent.append(obj)
+
+
+def test_active_repo_route_still_accepts_header_token(monkeypatch):
+    """Regression guard: the header path for these 3 routes must be
+    completely unaffected by rejecting the query fallback."""
+    tenant_id = _patch_manifest_auth(monkeypatch)
+    tn._tenant_active_repo.pop(tenant_id, None)
+    tn._tunnel_extract_sockets[tenant_id] = _FakeExtractSocket()
+    resp = asyncio.run(tn.set_tunnel_active_repo(
+        _FakeHeaderOnlyActiveRepoReq("/worktrees/W", "sk_meridian_valid")
+    ))
+    assert resp.status_code == 200
+    assert tn._tenant_active_repo.get(tenant_id) == "/worktrees/W"

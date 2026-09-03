@@ -1161,6 +1161,7 @@ async def _handle_mcp_request(
     token_type: str = "readwrite",
     enforce_role: str | None = None,
     scoped_project_ids: "list[str] | None" = None,
+    allowed_tool_names: "frozenset[str] | None" = None,
 ) -> dict[str, Any]:
     """Dispatch one JSON-RPC 2.0 MCP request and return the response dict.
 
@@ -1284,6 +1285,11 @@ async def _handle_mcp_request(
                         "detail": str(exc)[:200],
                     }
         from ..tool_manifest import build_tool_manifest  # noqa: PLC0415
+        # A named public profile is an actual transport boundary, not merely
+        # advisory role metadata.  Filter after native/GitHub/tunnel assembly
+        # so no optional tenant or plugin tool can leak into the profile.
+        if allowed_tool_names is not None:
+            tools = [tool for tool in tools if tool.get("name") in allowed_tool_names]
         manifest = build_tool_manifest(tools)
         manifest_meta: dict = {
             "revision": manifest["revision"],
@@ -1338,6 +1344,12 @@ async def _handle_mcp_request(
         # rewritten.
         if isinstance(name, str) and name.startswith("meridian."):
             name = name.removeprefix("meridian.")
+        if allowed_tool_names is not None and name not in allowed_tool_names:
+            return _server._jsonrpc_err(
+                req_id,
+                -32601,
+                f"tool '{name}' is not available on this MCP profile",
+            )
         if token_type == "readonly" and name not in _server._mcp_readonly_tools:
             return _server._jsonrpc_err(req_id, -32603, f"tool '{name}' not allowed for read-only tokens")
         # 95499c3e / decision 6fe5210c — Option A project-scope enforcement for
@@ -5797,6 +5809,22 @@ async def _handle_tunnel_tools(
         repo_path = str(args.get("repo_path") or "").strip()
         if not repo_path:
             raise ValueError("repo_path is required")
+        # ba31dedf — explicit repo-scope requirement, matching the rigor the
+        # worktree_id branch above already gets. This handler runs on the
+        # SERVER; Path.home() here is the server's own home directory, not
+        # the remote tunnel client's, so filesystem-resolving validation
+        # (meridian.repo_scope.validate_repo_scope) can't be used -- instead
+        # this is a string-shape check for a BARE home directory (no
+        # subdirectory beneath it), which is exactly the "operate over my
+        # whole home tree" failure mode this criterion targets. Fails closed:
+        # a bare home-directory string is rejected outright, never silently
+        # accepted as a project scope.
+        from ..repo_scope import looks_like_bare_home_directory  # noqa: PLC0415
+        if looks_like_bare_home_directory(repo_path):
+            raise ValueError(
+                f"repo_path looks like a bare home directory ({repo_path!r}), "
+                "not a project checkout -- pass the specific project repo path"
+            )
         if tenant is None:
             raise ValueError("set_active_repo requires an authenticated tenant (tunnel mode)")
         tenant_id = tenant.get("id", "")

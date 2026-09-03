@@ -3519,6 +3519,12 @@ _READ_ONLY_TOOLS = {
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
 
+# MCP directory metadata: these tools contact a public third-party service
+# rather than only reading Meridian's own state.  Keep this separate from the
+# read-only set: a GitHub/paper/social search can be read-only for Meridian
+# while still operating in an external open world.
+_OPEN_WORLD_TOOLS = {"paper_search", "social_search", "github_search"}
+
 # ---------------------------------------------------------------------------
 # a749f87c — Deterministic tool pre-selection metadata.
 #
@@ -4271,7 +4277,7 @@ for _tool in _MCP_TOOLS_LIST:
         "title": _title,
         "readOnlyHint": _is_read_only,
         "destructiveHint": _is_destructive,
-        "openWorldHint": False,
+        "openWorldHint": _tool["name"] in _OPEN_WORLD_TOOLS,
         "idempotentHint": _is_read_only,
     }
     # a749f87c — stamp declared category + role_relevance onto every tool entry
