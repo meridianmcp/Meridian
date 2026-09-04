@@ -9870,6 +9870,37 @@ def _bibliography_entries_range(
     return (start, end)
 
 
+def _alphabetical_insert_pos(
+    body: ET.Element,
+    start: int,
+    end: int,
+    new_formatted_text: str,
+) -> int:
+    """Find the body-child index within ``[start, end)`` where a new
+    bibliography entry belongs to keep the block in APA alphabetical order.
+
+    APA reference lists are ordered by the leading author string (title
+    takes that place when there is no author) -- exactly the text every
+    entry already leads with, since ``format_apa_reference`` always emits
+    ``"{author_str} ({year}). {title}."``.  Comparing the full entry text
+    (rather than just the author substring) also naturally tie-breaks
+    same-author entries by year, since ``"(2020)"`` sorts before
+    ``"(2021)"`` once the author prefix matches.
+
+    Falls back to ``end`` (append) when the new entry sorts after every
+    existing one, or when the block is empty -- matching the append-only
+    behaviour that was previously unconditional.
+    """
+    w_t = _q(_W, "t")
+    new_key = new_formatted_text.casefold()
+    body_list = list(body)
+    for i in range(start, end):
+        existing_text = "".join(t.text or "" for t in body_list[i].iter(w_t))
+        if new_key < existing_text.casefold():
+            return i
+    return end
+
+
 # ---------------------------------------------------------------------------
 # Public bibliography API: insert / update / remove / sync
 # ---------------------------------------------------------------------------
@@ -9883,8 +9914,10 @@ def insert_bibliography_entry(
     """1258794a — Write a formatted APA bibliography entry into a .docx.
 
     Locates (or creates) a ``References`` heading at the end of the document,
-    then inserts a new entry paragraph at the end of the references block.
-    The entry is formatted as an APA 7th-edition reference from the supplied
+    then inserts the new entry paragraph at its correct alphabetical position
+    within the existing references block (APA order, by leading author/title
+    text; appended at the end when it sorts last or the block is empty). The
+    entry is formatted as an APA 7th-edition reference from the supplied
     CSL-JSON ``csl_item`` dict (as returned by Zotero's local API or by
     ``zotero_client.resolve_citation_ref`` + ``fetch_zotero_csl_item``).
 
@@ -9954,8 +9987,8 @@ def insert_bibliography_entry(
         entry_insert_pos = heading_idx + 1
     else:
         heading_idx, _heading_elem = heading_result
-        _start, end = _bibliography_entries_range(body, heading_idx)
-        entry_insert_pos = end
+        start, end = _bibliography_entries_range(body, heading_idx)
+        entry_insert_pos = _alphabetical_insert_pos(body, start, end, formatted_text)
 
     entry_p = _build_bibliography_paragraph(clean_key, formatted_text)
     body.insert(entry_insert_pos, entry_p)

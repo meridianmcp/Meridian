@@ -6,12 +6,14 @@ Covers:
   - APA author formatting: 1, 2, 3-19, 20+ authors; corporate authors;
     missing given name; 20+ author truncation.
   - insert_bibliography_entry: heading auto-creation, heading reuse,
-    entry appended after existing entries, Bibliography style present,
-    bookmark present, formatted text present.
+    entry placed at its correct alphabetical position among existing
+    entries, Bibliography style present, bookmark present, formatted
+    text present.
   - update_bibliography_entry: text replaced, bookmark preserved.
   - remove_bibliography_entry: paragraph removed.
-  - Alphabetization: entries inserted in multiple calls come out in the
-    order they were inserted (alphabetization is caller responsibility).
+  - Alphabetization: insert_bibliography_entry places each new entry at
+    its correct APA-alphabetical position (by author/title, then by year
+    for same-author ties) among existing entries, not merely appended.
   - scan_all_citation_keys: returns keys in appearance order, deduplicated.
   - sync_bibliography: insert/update/missing_data/stale_entries logic.
   - Error paths: unknown doc, missing file, bad key, duplicate insert,
@@ -625,19 +627,83 @@ class TestInsertBibliographyEntry:
         # Only one "References" heading should exist.
         assert xml.count("bibkey_jones2021") == 1
 
-    def test_insert_appends_after_existing_entries(self, tmp_path):
+    def test_insert_appends_when_new_entry_sorts_after_existing(self, tmp_path):
         docx = str(tmp_path / "doc.docx")
-        _write_docx(docx, _DOC_XML_WITH_REFS)
-        # Insert a second entry; it should appear after the existing smith2020.
+        _write_docx(docx, _DOC_XML_WITH_REFS)  # existing: smith2020
+        # "Zimmerman" sorts after "Smith" alphabetically -- still appended.
         docs_intel.insert_bibliography_entry(
             docx_path=docx,
-            citation_key="jones2021",
-            csl_item=_journal_article(family="Jones", given="B.", year=2021),
+            citation_key="zimmerman2021",
+            csl_item=_journal_article(family="Zimmerman", given="B.", year=2021),
         )
         xml = _read_doc_xml(docx)
         smith_pos = xml.index("bibkey_smith2020")
-        jones_pos = xml.index("bibkey_jones2021")
-        assert smith_pos < jones_pos
+        zimmerman_pos = xml.index("bibkey_zimmerman2021")
+        assert smith_pos < zimmerman_pos
+
+    def test_insert_lands_before_an_existing_entry_that_sorts_later(self, tmp_path):
+        """1258794a follow-up (PAPER-S7 hard-fixture stress test, 2026-09-04)
+        -- insert_bibliography_entry previously always appended, ignoring APA
+        alphabetical order, while a generic-tool control agent given the same
+        task correctly reasoned its way to alphabetical placement (see
+        docs/paper-s7-hard-fixtures-stress-test-v1.md in ooxml-graph-paper).
+        "Adams" must land BEFORE the existing "Smith" entry, not after it."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REFS)  # existing: smith2020
+        docs_intel.insert_bibliography_entry(
+            docx_path=docx,
+            citation_key="adams2019",
+            csl_item=_journal_article(family="Adams", given="J.", year=2019),
+        )
+        xml = _read_doc_xml(docx)
+        adams_pos = xml.index("bibkey_adams2019")
+        smith_pos = xml.index("bibkey_smith2020")
+        assert adams_pos < smith_pos
+
+    def test_insert_lands_alphabetically_between_two_existing_entries(self, tmp_path):
+        """Mirrors the exact scenario from the hard-fixture stress test
+        (docs/paper-s7-hard-fixtures-stress-test-v1.md in ooxml-graph-paper):
+        an "Adams" and a "Zimmerman" entry already present, "Marker" must
+        land alphabetically between them, not after both."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+        docs_intel.insert_bibliography_entry(
+            docx_path=docx,
+            citation_key="adams2019",
+            csl_item=_journal_article(family="Adams", given="J.", year=2019),
+        )
+        docs_intel.insert_bibliography_entry(
+            docx_path=docx,
+            citation_key="zimmerman2021",
+            csl_item=_journal_article(family="Zimmerman", given="Z.", year=2021),
+        )
+        docs_intel.insert_bibliography_entry(
+            docx_path=docx,
+            citation_key="marker2022",
+            csl_item=_journal_article(
+                family="Marker", given="P.", year=2022, title="Pilot marker entry",
+            ),
+        )
+        xml = _read_doc_xml(docx)
+        adams_pos = xml.index("bibkey_adams2019")
+        marker_pos = xml.index("bibkey_marker2022")
+        zimmerman_pos = xml.index("bibkey_zimmerman2021")
+        assert adams_pos < marker_pos < zimmerman_pos
+
+    def test_insert_same_author_different_years_orders_by_year(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REFS)  # existing: Smith, J. (2020)
+        docs_intel.insert_bibliography_entry(
+            docx_path=docx,
+            citation_key="smith2018",
+            csl_item=_journal_article(
+                family="Smith", given="J.", year=2018, title="Earlier paper",
+            ),
+        )
+        xml = _read_doc_xml(docx)
+        smith2018_pos = xml.index("bibkey_smith2018")
+        smith2020_pos = xml.index("bibkey_smith2020")
+        assert smith2018_pos < smith2020_pos
 
     def test_insert_duplicate_returns_error_file_unchanged(self, tmp_path):
         docx = str(tmp_path / "doc.docx")
