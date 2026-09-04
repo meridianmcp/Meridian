@@ -2732,6 +2732,21 @@ class OutputsFtsIndex:
         process restart -- the same class of unbounded growth this item
         fixes for the walk/write path, just at connect() time instead of
         during rebuild().
+
+        fa600e42 follow-up -- the actual read is chunked via
+        ``cursor.fetchmany(self._adaptive_batch)`` instead of one unchunked
+        ``fetchall()``, mirroring the identical lesson already applied to
+        :meth:`_migrate_legacy_storage_paths_locked` (see that method's own
+        docstring) but never ported here. Each chunk is inserted into
+        ``_row_cache``/``_manifest`` immediately rather than accumulated
+        into one big intermediate list first (this method has no
+        cross-row grouping to do, unlike the migration scan, so there is
+        no reason to hold the whole result set in Python at once at all).
+        Confirmed live: reconnecting to a real ~98,304-row/2.85GB index
+        took multiple minutes of mostly I/O-bound time before this fix,
+        with a single large ~2.3GB one-step memory jump once the unchunked
+        fetch completed -- a cost that only grows as the index does, on
+        every process restart.
         """
         con = self._con
         if con is None:
@@ -2746,47 +2761,67 @@ class OutputsFtsIndex:
         if exists is None:
             return
         try:
-            relation = con.execute(
+            cursor = con.execute(
                 "SELECT path, mtime, sha256, size, "
                 "generating_script, kind, is_archival, canonical_path, "
                 "csv_columns, json_keys FROM outputs_index"
             )
-            columns = [c[0] for c in relation.description]
-            fetched = relation.fetchall()
+            columns = [c[0] for c in cursor.description]
         except Exception:  # noqa: BLE001
             _log.debug(
                 "OutputsFtsIndex._rehydrate_cache_from_disk: read failed",
                 exc_info=True,
             )
             return
-        for raw in fetched:
-            rec = dict(zip(columns, raw))
-            path = rec.get("path")
-            if not path:
-                continue
-            row = OutputRow(
-                path=path,
-                content=None,  # edc84500 -- never resident; re-read on demand.
-                mtime=rec.get("mtime"),
-                sha256=rec.get("sha256"),
-                size=rec.get("size"),
-                generating_script=rec.get("generating_script"),
-                kind=rec.get("kind"),
-                is_archival=bool(rec.get("is_archival")),
-                canonical_path=rec.get("canonical_path"),
-                csv_columns=(
-                    json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
-                ),
-                json_keys=(
-                    json.loads(rec["json_keys"]) if rec.get("json_keys") else None
-                ),
-            )
-            self._row_cache[path] = row
-            self._manifest[path] = (rec.get("mtime"), rec.get("size"))
-        if fetched:
+        batch_limit = self._adaptive_batch
+        total_resumed = 0
+        while True:
+            try:
+                chunk = cursor.fetchmany(batch_limit)
+            except Exception:  # noqa: BLE001
+                # A failure mid-stream (e.g. the connection dying partway
+                # through a huge rehydration) must not lose chunks already
+                # merged into _row_cache/_manifest above -- degrade to
+                # "rehydrated as far as we got" rather than discarding
+                # everything, same partial-progress philosophy as every
+                # other best-effort read in this class.
+                _log.debug(
+                    "OutputsFtsIndex._rehydrate_cache_from_disk: chunked "
+                    "read failed partway through (%d rows already "
+                    "resumed)", total_resumed, exc_info=True,
+                )
+                break
+            if not chunk:
+                break
+            for raw in chunk:
+                rec = dict(zip(columns, raw))
+                path = rec.get("path")
+                if not path:
+                    continue
+                row = OutputRow(
+                    path=path,
+                    content=None,  # edc84500 -- never resident; re-read on demand.
+                    mtime=rec.get("mtime"),
+                    sha256=rec.get("sha256"),
+                    size=rec.get("size"),
+                    generating_script=rec.get("generating_script"),
+                    kind=rec.get("kind"),
+                    is_archival=bool(rec.get("is_archival")),
+                    canonical_path=rec.get("canonical_path"),
+                    csv_columns=(
+                        json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
+                    ),
+                    json_keys=(
+                        json.loads(rec["json_keys"]) if rec.get("json_keys") else None
+                    ),
+                )
+                self._row_cache[path] = row
+                self._manifest[path] = (rec.get("mtime"), rec.get("size"))
+                total_resumed += 1
+        if total_resumed:
             _log.debug(
                 "OutputsFtsIndex._rehydrate_cache_from_disk: resumed %d "
-                "cached rows from disk", len(fetched),
+                "cached rows from disk", total_resumed,
             )
 
     # Keys this instance owns inside the shared, generic ``outputs_index_meta``

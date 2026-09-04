@@ -1372,6 +1372,58 @@ class TestRowCacheContentEviction:
         finally:
             idx2.close()
 
+    @duckdb_required
+    def test_rehydrate_from_disk_is_chunked_across_multiple_batches(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up: _rehydrate_cache_from_disk() must fetch via
+        cursor.fetchmany() in bounded chunks (mirroring
+        _migrate_legacy_storage_paths_locked's own established pattern),
+        not one unchunked fetchall() -- a real live reconnect to a
+        ~98,304-row/2.85GB index spent multiple I/O-bound minutes and one
+        large ~2.3GB one-step memory jump on this before the fix. Forces a
+        tiny adaptive-batch size so a small, fast-to-build dataset still
+        spans several fetchmany() chunks, and asserts every row survives
+        the chunk boundaries with no loss or duplication."""
+        n = 47  # deliberately not a clean multiple of the forced batch size
+        for i in range(n):
+            (tmp_path / f"r{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        # An external db_path (outside outputs_dir) avoids the indexer's own
+        # ensure_gitignored() writing a .gitignore INTO outputs_dir, which
+        # would otherwise get walked and counted as an unexpected extra file.
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-chunked.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx1.rebuild(max_seconds=None)
+        assert len(idx1._row_cache) == n
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx2._adaptive_batch = 5  # forces >1 fetchmany() chunk for n=47
+            idx2._connect()  # first connect already calls _rehydrate_cache_from_disk once
+            idx2._row_cache.clear()
+            idx2._manifest.clear()
+            # Re-run directly (connection already open) so the chunk size
+            # override above is what governs this call -- verifies the
+            # OUTCOME (no loss/duplication across fetchmany() boundaries),
+            # which is the property that would actually regress if
+            # chunking were implemented incorrectly.
+            idx2._rehydrate_cache_from_disk()
+            assert len(idx2._row_cache) == n, (
+                "chunked rehydration lost or duplicated rows across "
+                "fetchmany() batch boundaries"
+            )
+            assert len(idx2._manifest) == n
+            for i in range(n):
+                key = next(
+                    p for p in idx2._row_cache if p.endswith(f"r{i:03d}.csv")
+                )
+                assert idx2._row_cache[key].content is None
+                assert idx2._row_cache[key].sha256 is not None
+        finally:
+            idx2.close()
+
 
 # ---------------------------------------------------------------------------
 # Module-level API: search_outputs, annotate_outputs, classify_outputs,
