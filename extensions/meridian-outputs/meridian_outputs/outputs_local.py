@@ -2698,6 +2698,15 @@ class OutputsFtsIndex:
                     "OutputsFtsIndex._connect: walk-state rehydration failed",
                     exc_info=True,
                 )
+            # fa600e42 follow-up -- same durability treatment as walk state
+            # immediately above, for the legacy-migration-scan throttle.
+            try:
+                self._rehydrate_legacy_migration_state_from_disk()
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._connect: legacy-migration-state "
+                    "rehydration failed", exc_info=True,
+                )
         return self._con
 
     def _rehydrate_cache_from_disk(self) -> None:
@@ -2786,6 +2795,20 @@ class OutputsFtsIndex:
         "walk_expected_count",
         "walk_last_error",
         "walk_pending_stale_json",
+    )
+
+    # fa600e42 follow-up -- same generic outputs_index_meta table, a
+    # separate key namespace for the legacy-migration-scan throttle (see
+    # _persist_legacy_migration_state_locked / _rehydrate_legacy_migration_
+    # state_from_disk below). Kept distinct from _WALK_STATE_META_KEYS
+    # rather than folded in: unlike walk state, these three fields need no
+    # per-field merge logic (see _rehydrate_legacy_migration_state_from_
+    # disk's docstring for why), so conflating the two would only make the
+    # already-intricate walk-state merge docstring harder to follow.
+    _LEGACY_MIGRATION_META_KEYS = (
+        "legacy_migration_ever_scanned",
+        "legacy_migration_found_last_time",
+        "legacy_migration_calls_since_scan",
     )
 
     def _persist_walk_state_locked(self, con: Any) -> None:
@@ -3054,6 +3077,139 @@ class OutputsFtsIndex:
             "state (epoch=%d, pass_complete=%s, pending=%d) from disk",
             self._walk_epoch, self._walk_pass_confirmed_complete,
             len(self._pending_stale),
+        )
+
+    def _persist_legacy_migration_state_locked(self, con: Any) -> None:
+        """Durably record the legacy-migration-scan throttle state into
+        ``outputs_index_meta`` so a process restart knows a full-table scan
+        already ran and doesn't have to redo it as if this were the very
+        first process ever to open this index.
+
+        Must be called with ``self._write_lock`` already held (mirrors
+        :meth:`_persist_walk_state_locked`'s naming and locking contract).
+        Best-effort: a persistence failure here must never break rebuild()'s
+        own contract, so callers wrap this in their own try/except.
+
+        fa600e42 follow-up -- without this, ``_legacy_migration_ever_
+        scanned`` (a plain in-memory flag, constructor default ``False``)
+        looks "never scanned" to EVERY freshly-constructed instance,
+        including one from a periodic-restart harness reconnecting to an
+        index a prior process already fully migration-scanned seconds
+        earlier. The scan itself is a full ``SELECT`` over the entire
+        ``outputs_index`` table (see
+        :meth:`_migrate_legacy_storage_paths_locked`'s own throttle
+        comment) -- confirmed live: with the throttle unable to survive a
+        restart, this forced a full O(total indexed rows) table scan on
+        literally every fresh process's first call, growing more expensive
+        every restart as the index grows, never reaching the intended
+        once-per-25-calls steady state -- the exact same "should be rare
+        but the 'have I done this' state is in-memory-only" shape as the
+        walk-resume bug this same follow-up already fixed.
+        """
+        self._ensure_schema(con)
+        values: dict[str, str | None] = {
+            "legacy_migration_ever_scanned": (
+                "1" if self._legacy_migration_ever_scanned else "0"
+            ),
+            "legacy_migration_found_last_time": (
+                "1" if self._legacy_migration_found_last_time else "0"
+            ),
+            "legacy_migration_calls_since_scan": str(
+                self._legacy_migration_calls_since_scan
+            ),
+        }
+        placeholders = ",".join("?" for _ in self._LEGACY_MIGRATION_META_KEYS)
+        con.execute("BEGIN TRANSACTION")
+        try:
+            con.execute(
+                f"DELETE FROM outputs_index_meta WHERE key IN ({placeholders})",
+                list(self._LEGACY_MIGRATION_META_KEYS),
+            )
+            for key, value in values.items():
+                con.execute(
+                    "INSERT INTO outputs_index_meta (key, value) VALUES (?, ?)",
+                    [key, value],
+                )
+        except BaseException:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._persist_legacy_migration_state_locked:"
+                    " rollback after a failed write also failed -- "
+                    "connection may be left in an unusable transaction "
+                    "state", exc_info=True,
+                )
+            raise
+        else:
+            con.execute("COMMIT")
+
+    def _rehydrate_legacy_migration_state_from_disk(self) -> None:
+        """Restore the legacy-migration-scan throttle state from a prior
+        process's persisted state (see
+        :meth:`_persist_legacy_migration_state_locked`).
+
+        Unlike walk state, this needs no per-field merge logic: it is
+        called from ``_connect()``, and :meth:`rebuild` makes an explicit
+        early ``self._connect()`` call right after
+        ``self._write_lock.acquire()`` (fa600e42 follow-up) specifically so
+        this always runs BEFORE anything else in this same process/call has
+        had a chance to read or mutate these three fields. "Adopt the
+        persisted value outright" is therefore correct and sufficient --
+        there is no "this call's own fresher in-flight answer" to protect,
+        unlike ``_scan_boundary``/``_walk_pass_confirmed_complete`` etc.
+
+        No-op (fields keep their constructor defaults -- i.e. behave
+        exactly like a brand-new index, always re-scanning once) when
+        ``outputs_index_meta`` doesn't hold these keys yet (a brand-new DB,
+        or one written before this feature shipped) or can't be read --
+        same degrade-gracefully contract as
+        :meth:`_rehydrate_walk_state_from_disk`.
+        """
+        con = self._con
+        if con is None:
+            return
+        try:
+            placeholders = ",".join(
+                "?" for _ in self._LEGACY_MIGRATION_META_KEYS
+            )
+            rows = con.execute(
+                "SELECT key, value FROM outputs_index_meta "
+                f"WHERE key IN ({placeholders})",
+                list(self._LEGACY_MIGRATION_META_KEYS),
+            ).fetchall()
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "OutputsFtsIndex._rehydrate_legacy_migration_state_from_"
+                "disk: read failed", exc_info=True,
+            )
+            return
+        if not rows:
+            return
+        values = {key: value for key, value in rows}
+        ever_scanned_raw = values.get("legacy_migration_ever_scanned")
+        if ever_scanned_raw is not None:
+            self._legacy_migration_ever_scanned = ever_scanned_raw == "1"
+        found_raw = values.get("legacy_migration_found_last_time")
+        if found_raw is not None:
+            self._legacy_migration_found_last_time = found_raw == "1"
+        calls_raw = values.get("legacy_migration_calls_since_scan")
+        if calls_raw is not None:
+            try:
+                self._legacy_migration_calls_since_scan = int(calls_raw)
+            except (TypeError, ValueError):
+                _log.debug(
+                    "OutputsFtsIndex._rehydrate_legacy_migration_state_"
+                    "from_disk: invalid legacy_migration_calls_since_scan "
+                    "%r", calls_raw,
+                )
+        _log.debug(
+            "OutputsFtsIndex._rehydrate_legacy_migration_state_from_disk: "
+            "restored legacy-migration state (ever_scanned=%s, "
+            "found_last_time=%s, calls_since_scan=%d) from disk",
+            self._legacy_migration_ever_scanned,
+            self._legacy_migration_found_last_time,
+            self._legacy_migration_calls_since_scan,
         )
 
     def _read_hash_algo_version(self, con: Any) -> int:
@@ -4324,6 +4480,25 @@ class OutputsFtsIndex:
             })
             return len(self._row_cache)
         try:
+            # fa600e42 follow-up -- force _connect() (and therefore
+            # rehydration, including _rehydrate_legacy_migration_state_from_
+            # disk() just below) to happen HERE, before the legacy-migration
+            # throttle decision reads self._legacy_migration_ever_scanned.
+            # Safe to move earlier than its previous implicit call sites
+            # (inside _migrate_legacy_storage_paths_locked(self._connect())
+            # below, or the `if changed or legacy_paths_migrated:` write
+            # block further down): self._write_lock is ALREADY held at this
+            # point (acquired just above), so this introduces no new
+            # lock-ordering exposure -- _connect() was always going to run
+            # somewhere inside this same locked section on this same call;
+            # this only moves WHERE, not WHETHER or under what lock state.
+            # _connect() is idempotent (no-ops on every later call once
+            # self._con is set), so this costs nothing on calls 2+ within
+            # one process. Without this, self._legacy_migration_ever_
+            # scanned/_found_last_time/_calls_since_scan are still at their
+            # constructor defaults when the throttle decision below reads
+            # them, making the persisted state just written pointless.
+            self._connect()
             # Repair caches written by pre-canonicalization versions before
             # the normal staleness pass. This runs under the write lease so a
             # repair cannot race another process's row update.
@@ -4721,6 +4896,17 @@ class OutputsFtsIndex:
                 _log.debug(
                     "OutputsFtsIndex.rebuild: failed to persist walk state",
                     exc_info=True,
+                )
+            # fa600e42 follow-up -- same durability treatment as walk state
+            # immediately above, for the legacy-migration-scan throttle.
+            try:
+                self._persist_legacy_migration_state_locked(
+                    self._connect()
+                )
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex.rebuild: failed to persist "
+                    "legacy-migration state", exc_info=True,
                 )
             self.last_rebuild_metrics["write_seconds"] = round(
                 time.monotonic() - write_started, 6,

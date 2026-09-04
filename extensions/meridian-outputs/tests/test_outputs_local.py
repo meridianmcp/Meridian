@@ -2518,6 +2518,19 @@ class TestParallelRebuildCorrectness:
 
         repaired = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
         try:
+            # fa600e42 follow-up -- the legacy-migration-scan throttle state
+            # now persists across process restarts (see
+            # TestLegacyMigrationScanSurvivesRestart), so `first`'s own
+            # clean scan already persisted "scanned, found nothing" before
+            # this out-of-band duplicate was inserted directly via duckdb
+            # above. A real fresh-DB-or-past-its-recheck-interval instance
+            # would still scan; force that same condition explicitly here
+            # rather than relying on `repaired` merely being a new object.
+            # connect() FIRST (so rehydration -- which would otherwise
+            # immediately reload and overwrite this override -- has already
+            # happened), THEN override.
+            repaired._connect()
+            repaired._legacy_migration_ever_scanned = False
             assert repaired.rebuild() == 1
             rows = repaired._con.execute(
                 "SELECT path FROM outputs_index"
@@ -2928,6 +2941,132 @@ class TestLegacyMigrationThrottle:
                 "the duplicate must be cleaned up within the recheck interval, "
                 "not permanently missed"
             )
+        finally:
+            idx.close()
+
+
+class TestLegacyMigrationScanSurvivesRestart:
+    """fa600e42 follow-up: the legacy-migration-scan throttle state must
+    persist across process restarts, the same shape of fix already applied
+    to the resumable file walk.
+
+    Confirmed live (2026-09-03): _legacy_migration_ever_scanned was a plain
+    in-memory flag with constructor default False and no persistence, so
+    EVERY freshly-constructed OutputsFtsIndex -- including one from a
+    periodic-restart harness reconnecting to an index a prior process had
+    already fully migration-scanned seconds earlier -- unconditionally ran
+    a full O(total indexed rows) table scan on its first rebuild() call.
+    This forced that scan onto literally every restart, growing more
+    expensive as the index grows, never reaching the intended
+    once-per-25-calls steady state.
+    """
+
+    @duckdb_required
+    def test_second_instance_does_not_rescan_after_clean_first_scan(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "f.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-persist.duckdb")
+
+        first = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            first.rebuild()
+            assert first._legacy_migration_ever_scanned is True
+            assert first._legacy_migration_found_last_time is False
+        finally:
+            first.close()
+
+        second = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            # The core regression: without the fix, a brand-new instance's
+            # _legacy_migration_ever_scanned starts at the constructor
+            # default (False), forcing run_legacy_migration True on this
+            # call regardless of what `first` already confirmed. With the
+            # fix, rehydration restores the persisted "already scanned,
+            # found nothing" state before the throttle decision runs, so
+            # this call does NOT re-trigger the full-table scan.
+            scan_called = False
+            real_migrate = second._migrate_legacy_storage_paths_locked
+
+            def _tracking_migrate(con):
+                nonlocal scan_called
+                scan_called = True
+                return real_migrate(con)
+
+            second._migrate_legacy_storage_paths_locked = _tracking_migrate
+            second.rebuild()
+            assert scan_called is False, (
+                "second instance re-ran the legacy-migration scan despite "
+                "the first instance already persisting a clean scan"
+            )
+            assert second._legacy_migration_ever_scanned is True
+        finally:
+            second.close()
+
+    @duckdb_required
+    def test_persisted_calls_since_scan_continues_counting_across_restart(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "f.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-counter.duckdb")
+        interval = OL.OutputsFtsIndex._LEGACY_MIGRATION_RECHECK_INTERVAL
+
+        first = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            first.rebuild()
+            # Advance most, but not all, of the way through the recheck
+            # interval in the FIRST process.
+            for _ in range(interval - 2):
+                first.rebuild()
+            assert first._legacy_migration_calls_since_scan == interval - 2
+        finally:
+            first.close()
+
+        second = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            # Restart resumes the counter from where it left off (interval
+            # - 2), not from zero -- confirmed via _connect() (which
+            # triggers rehydration) before rebuild() would otherwise
+            # advance it.
+            second._connect()
+            assert second._legacy_migration_calls_since_scan == interval - 2
+            # One call short of the threshold: no scan yet.
+            second.rebuild()
+            assert second._legacy_migration_calls_since_scan == interval - 1
+            # Force the pre-check value to the threshold directly (matching
+            # TestLegacyMigrationThrottle's own precise-count style) and
+            # confirm crossing it still re-triggers a scan and resets the
+            # counter -- i.e. persistence didn't just freeze the old
+            # in-memory throttle behavior, it correctly continues it.
+            second._legacy_migration_calls_since_scan = interval
+            second.rebuild()
+            assert second._legacy_migration_calls_since_scan == 0
+        finally:
+            second.close()
+
+    @duckdb_required
+    def test_brand_new_db_still_scans_on_first_call(
+        self, tmp_path: Path,
+    ) -> None:
+        """No persisted state yet (a genuinely fresh DB) must behave
+        exactly as before this fix -- degrade gracefully, not silently skip
+        the one-time first-scan concern this whole mechanism exists for."""
+        (tmp_path / "f.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-fresh.duckdb")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            scan_called = False
+            real_migrate = idx._migrate_legacy_storage_paths_locked
+
+            def _tracking_migrate(con):
+                nonlocal scan_called
+                scan_called = True
+                return real_migrate(con)
+
+            idx._migrate_legacy_storage_paths_locked = _tracking_migrate
+            idx.rebuild()
+            assert scan_called is True
         finally:
             idx.close()
 
