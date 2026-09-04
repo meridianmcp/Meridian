@@ -3071,6 +3071,75 @@ class TestLegacyMigrationScanSurvivesRestart:
             idx.close()
 
 
+class TestWriteSecondsSubMetrics:
+    """fa600e42 follow-up (write_seconds diagnostics): write_seconds is a
+    wall-clock umbrella over legacy-migration-scan, apply_precomputed, the
+    DB insert itself, and walk-state persist -- previously indistinguishable
+    from each other, which made a real live discrepancy (write_seconds
+    running 13-50x slower per row than an isolated pyarrow bulk-insert
+    benchmark) impossible to attribute without guessing. These sub-metrics
+    make each piece separately visible."""
+
+    @duckdb_required
+    def test_sub_metrics_present_and_sum_close_to_write_seconds(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            for key in (
+                "legacy_migration_seconds", "apply_precomputed_seconds",
+                "db_insert_seconds", "walk_state_persist_seconds",
+                "write_seconds",
+            ):
+                assert key in m, f"{key} missing from last_rebuild_metrics"
+                assert m[key] >= 0
+            # These four are all sub-windows of write_seconds's own timed
+            # span (not necessarily exhaustive -- Tantivy staging/commit and
+            # other small steps fill the remainder) -- they must never sum
+            # to MORE than the umbrella itself.
+            sub_total = (
+                m["legacy_migration_seconds"] + m["apply_precomputed_seconds"]
+                + m["db_insert_seconds"] + m["walk_state_persist_seconds"]
+            )
+            assert sub_total <= m["write_seconds"] + 1e-3
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_bulk_insert_path_recorded_as_pyarrow_when_available(
+        self, tmp_path: Path,
+    ) -> None:
+        pytest.importorskip("pyarrow")
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["bulk_insert_path"] == "pyarrow"
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_bulk_insert_path_recorded_as_fallback_when_pyarrow_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "pyarrow", None)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert (
+                idx.last_rebuild_metrics["bulk_insert_path"]
+                == "values_fallback"
+            )
+            assert idx._pyarrow_missing_warned is True
+        finally:
+            idx.close()
+
+
 # ---------------------------------------------------------------------------
 # rebuild() Phase 1 deadline enforcement (sprint item d9c76caa)
 # ---------------------------------------------------------------------------

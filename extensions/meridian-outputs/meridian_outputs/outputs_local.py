@@ -2439,6 +2439,12 @@ class OutputsFtsIndex:
         # that sets this per-pass, and the walk_complete branch below that
         # consults it.
         self._walk_pass_resumed_from_boundary: bool = False
+        # fa600e42 follow-up (write_seconds diagnostics) -- set True the
+        # first time Phase 2's bulk-insert pyarrow import fails at runtime
+        # this process, so the one-time WARNING log (see that call site)
+        # doesn't repeat on every subsequent call while the fallback path
+        # keeps silently costing ~150x per the e8a2f710 benchmark.
+        self._pyarrow_missing_warned: bool = False
         # 6ba77ada -- backlog of paths confirmed stale (by the staleness
         # check below) but not yet successfully analysed + written. Persists
         # across calls so a straggler is retried, not lost or re-detected
@@ -4529,6 +4535,11 @@ class OutputsFtsIndex:
                 or self._legacy_migration_calls_since_scan
                 >= self._LEGACY_MIGRATION_RECHECK_INTERVAL
             )
+            # fa600e42 follow-up (write_seconds diagnostics) -- timed even
+            # on the (common, throttled) skip branch, so this metric is
+            # always present and directly comparable call-to-call rather
+            # than only appearing on scan calls.
+            _legacy_migration_started = time.monotonic()
             if run_legacy_migration:
                 migration_failed = False
                 try:
@@ -4562,12 +4573,19 @@ class OutputsFtsIndex:
             else:
                 legacy_paths_migrated = False
                 self._legacy_migration_calls_since_scan += 1
+            self.last_rebuild_metrics["legacy_migration_seconds"] = round(
+                time.monotonic() - _legacy_migration_started, 6,
+            )
             self._ingest_meridian_notes(all_paths)
+            _apply_precomputed_started = time.monotonic()
             rows, changed, paths_to_delete, new_rows = (
                 self._apply_precomputed(
                     all_paths, path_set, removed_paths, stale, stale_sigs,
                     precomputed, classifications, deadline,
                 )
+            )
+            self.last_rebuild_metrics["apply_precomputed_seconds"] = round(
+                time.monotonic() - _apply_precomputed_started, 6,
             )
             if not walk_complete:
                 # 6ba77ada -- the walk itself hasn't finished a full pass yet
@@ -4625,6 +4643,19 @@ class OutputsFtsIndex:
                     # that self._max_batch's new effectively-unbounded
                     # default (time-primary walk convergence) can never
                     # silently turn this into one giant, unchunked write.
+                    #
+                    # fa600e42 follow-up (write_seconds diagnostics) --
+                    # isolates just the DELETE+INSERT DB work below from the
+                    # surrounding write_seconds umbrella (which also
+                    # includes legacy-migration-scan, apply_precomputed,
+                    # Tantivy delta-staging/commit, and walk-state persist --
+                    # each now separately timed too). Live evidence showed
+                    # write_seconds running 13-50x slower per row than the
+                    # isolated pyarrow bulk-insert benchmark this comment
+                    # block documents just above; this metric answers
+                    # whether that gap is really in the insert itself or in
+                    # the other work sharing its timed window.
+                    _db_insert_started = time.monotonic()
                     _WRITE_CHUNK = self._write_chunk
                     replacement_paths = {r.path for r in new_rows}
                     db_delete_paths = [
@@ -4644,6 +4675,33 @@ class OutputsFtsIndex:
                             import pyarrow as _pa  # noqa: PLC0415 -- optional, lazy
                         except ImportError:
                             _pa = None
+                            # fa600e42 follow-up (write_seconds diagnostics)
+                            # -- this fallback used to be entirely silent:
+                            # the ~150x-slower combined-VALUES path below
+                            # would just run, forever, with no signal
+                            # anywhere that the fast path never engaged.
+                            # Confirmed live: exactly this (pyarrow declared
+                            # in the extension's own pyproject.toml but
+                            # missing from the shared pixi.toml
+                            # [pypi-dependencies]) already caused a real
+                            # qualification run to spend the bulk of its
+                            # rebuild() time in Phase 2 for this reason
+                            # before being diagnosed by hand. One WARNING
+                            # per process, not per call.
+                            if not self._pyarrow_missing_warned:
+                                self._pyarrow_missing_warned = True
+                                _log.warning(
+                                    "OutputsFtsIndex.rebuild: pyarrow is "
+                                    "not importable -- falling back to the "
+                                    "combined-VALUES bulk-insert path, "
+                                    "measured ~150x slower per row than "
+                                    "the pyarrow fast path (see e8a2f710). "
+                                    "Install pyarrow>=14.0 to restore the "
+                                    "fast path.",
+                                )
+                        self.last_rebuild_metrics["bulk_insert_path"] = (
+                            "pyarrow" if _pa is not None else "values_fallback"
+                        )
                         if _pa is not None:
                             # task_ecb96ac9 follow-on (perf) -- the previous
                             # version built each of these 11 columns with its
@@ -4730,6 +4788,9 @@ class OutputsFtsIndex:
                                     f"INSERT OR REPLACE INTO outputs_index VALUES {row_placeholders}",
                                     flat_params,
                                 )
+                    self.last_rebuild_metrics["db_insert_seconds"] = round(
+                        time.monotonic() - _db_insert_started, 6,
+                    )
                     # 77443d83 -- stage this call's own delta for the next
                     # Tantivy commit. Accumulates (rather than overwrites)
                     # across deferred calls, so whenever _rebuild_fts() next
@@ -4889,6 +4950,7 @@ class OutputsFtsIndex:
             # call (e.g. a full pass over an already-converged tree).
             # Best-effort: a persistence failure here must never break
             # rebuild()'s own return contract.
+            _walk_state_persist_started = time.monotonic()
             try:
                 walk_state_con = self._connect()
                 self._persist_walk_state_locked(walk_state_con)
@@ -4908,6 +4970,9 @@ class OutputsFtsIndex:
                     "OutputsFtsIndex.rebuild: failed to persist "
                     "legacy-migration state", exc_info=True,
                 )
+            self.last_rebuild_metrics["walk_state_persist_seconds"] = round(
+                time.monotonic() - _walk_state_persist_started, 6,
+            )
             self.last_rebuild_metrics["write_seconds"] = round(
                 time.monotonic() - write_started, 6,
             )
