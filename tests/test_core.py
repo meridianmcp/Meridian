@@ -159,23 +159,51 @@ async def test_keepalive_keeps_busy_session_alive_but_expires_dead_ones(db):
 
 
 @pytest.mark.asyncio
-async def test_touch_latest_active_session_bumps_most_recent(db):
-    """4b698ea5 — touch_latest_active_session refreshes the ONE most-recently-active
-    live session and returns its id; picks the latest by last_seen; skips closed."""
+async def test_touch_latest_active_session_bumps_all_recently_active(db):
+    """<infra-fix> (was 4b698ea5) — touch_latest_active_session now refreshes
+    EVERY live session with genuine recent activity (a session_activity row, a
+    task_log row, or a fresh created_at), not just a single global "most
+    recent" winner. Two independently-busy sessions under the same tunnel both
+    get bridged; a stale one does not; a closed one is skipped regardless."""
     from datetime import datetime, timezone
 
     p = await db_module.create_project(db, "alpha")
-    older = await db_module.register_session(db, p["id"], "older")
-    newer = await db_module.register_session(db, p["id"], "newer")
+    busy1 = await db_module.register_session(db, p["id"], "busy1")
+    busy2 = await db_module.register_session(db, p["id"], "busy2")
+    stale = await db_module.register_session(db, p["id"], "stale")
     closed = await db_module.register_session(db, p["id"], "closed")
-    # older last_seen 9 min ago; newer 5 min ago; closed most recent but not live.
-    await db.execute("UPDATE sessions SET last_seen = datetime('now','-9 minutes') WHERE id = ?", (older["id"],))
-    await db.execute("UPDATE sessions SET last_seen = datetime('now','-5 minutes') WHERE id = ?", (newer["id"],))
-    await db.execute("UPDATE sessions SET last_seen = datetime('now'), status='closed' WHERE id = ?", (closed["id"],))
+
+    # busy1: a real tool call 2 minutes ago (session_activity).
+    await db_module.record_session_activity(db, busy1["id"], "log_task", "did something")
+    await db.execute(
+        "UPDATE session_activity SET recorded_at = datetime('now', '-2 minutes') "
+        "WHERE session_id = ?", (busy1["id"],),
+    )
+    # busy2: no session_activity row, but a task_log entry 3 minutes ago.
+    await db.execute(
+        "INSERT INTO task_log (id, session_id, project_id, description, created_at) "
+        "VALUES (?, ?, ?, 'work', datetime('now', '-3 minutes'))",
+        ("tl-" + busy2["id"], busy2["id"], p["id"]),
+    )
+    # stale: registered 30 minutes ago, one real tool call 25 minutes ago —
+    # genuinely idle since, but its last_seen may still be whatever the initial
+    # registration set (the exact bug: last_seen alone can't tell these apart).
+    await db.execute(
+        "UPDATE sessions SET created_at = datetime('now', '-30 minutes') WHERE id = ?",
+        (stale["id"],),
+    )
+    await db_module.record_session_activity(db, stale["id"], "log_task", "old work")
+    await db.execute(
+        "UPDATE session_activity SET recorded_at = datetime('now', '-25 minutes') "
+        "WHERE session_id = ?", (stale["id"],),
+    )
+    await db.execute("UPDATE sessions SET status = 'closed' WHERE id = ?", (closed["id"],))
     await db.commit()
 
     touched = await db_module.touch_latest_active_session(db, p["id"])
-    assert touched == newer["id"]  # the most-recently-active LIVE session
+    assert set(touched) == {busy1["id"], busy2["id"]}  # both, not just one winner
+    assert stale["id"] not in touched   # genuinely idle 25 min — not bridged
+    assert closed["id"] not in touched  # closed, skipped regardless
 
     rows = {r["id"]: r for r in await db_module.get_sessions(db, p["id"], active_only=False)}
 
@@ -183,18 +211,49 @@ async def test_touch_latest_active_session_bumps_most_recent(db):
         ls = datetime.fromisoformat(rows[sid]["last_seen"].replace(" ", "T")).replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - ls).total_seconds()
 
-    assert _age_of(newer["id"]) < 60       # bumped to now
-    assert _age_of(older["id"]) > 8 * 60   # untouched
+    assert _age_of(busy1["id"]) < 60
+    assert _age_of(busy2["id"]) < 60
 
 
 @pytest.mark.asyncio
-async def test_touch_latest_active_session_no_live_returns_none(db):
-    """4b698ea5 — no live session ⇒ returns None (nothing to keep alive)."""
+async def test_touch_latest_active_session_never_resurrects_dead_session_indefinitely(db):
+    """<infra-fix> — the exact self-reinforcing bug this fix closes: a session
+    with a SINGLE real tool call long ago, and an artificially-fresh last_seen
+    from a PRIOR keepalive tick, must not keep qualifying forever. Confirmed
+    live: 3 sessions orphaned by a crashed workflow (one real tool call each)
+    stayed classify_stale_claim "active"/"verified_alive" for hours because
+    the old code re-picked and re-touched whichever was the current max,
+    regardless of how long ago its one real action actually was."""
+    p = await db_module.create_project(db, "alpha")
+    dead = await db_module.register_session(db, p["id"], "dead")
+    await db_module.record_session_activity(db, dead["id"], "claim_sprint_item", "claimed once")
+    # The one real action was 2 hours ago...
+    await db.execute(
+        "UPDATE session_activity SET recorded_at = datetime('now', '-120 minutes') "
+        "WHERE session_id = ?", (dead["id"],),
+    )
+    # ...but a PRIOR keepalive tick (this is the bug) already left last_seen
+    # looking fresh. If the fix only looked at last_seen, this session would
+    # still qualify.
+    await db.execute(
+        "UPDATE sessions SET created_at = datetime('now', '-120 minutes'), "
+        "last_seen = datetime('now', '-1 minutes') WHERE id = ?", (dead["id"],),
+    )
+    await db.commit()
+
+    touched = await db_module.touch_latest_active_session(db, p["id"])
+    assert touched == []  # NOT resurrected by its own stale last_seen
+
+
+@pytest.mark.asyncio
+async def test_touch_latest_active_session_no_live_returns_empty(db):
+    """<infra-fix> (was 4b698ea5) — no live session ⇒ returns [] (nothing to
+    keep alive). Contract changed from a single id-or-None to a list."""
     p = await db_module.create_project(db, "alpha")
     s = await db_module.register_session(db, p["id"], "s1")
     await db.execute("UPDATE sessions SET status='closed' WHERE id = ?", (s["id"],))
     await db.commit()
-    assert await db_module.touch_latest_active_session(db, p["id"]) is None
+    assert await db_module.touch_latest_active_session(db, p["id"]) == []
 
 
 @pytest.mark.asyncio
