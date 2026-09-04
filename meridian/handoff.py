@@ -7336,6 +7336,13 @@ verpending="$(printf '%s' "$resp" | grep -oE '"verification_pending_count"[[:spa
 if [ -n "$verpending" ] && [ "$verpending" -gt 0 ] 2>/dev/null; then
   echo "Meridian: $verpending item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet)." >&2
 fi
+# a03c0eeb - the moment the guard is about to let a stop through is the
+# natural post-integration point (this session has no pending sprint items
+# left): fire a best-effort real disk cleanup pass for this project's git
+# worktrees so items that already merged/finished don't leave orphaned
+# worktree dirs behind. Self-hosted only server-side (see worktree_cleanup.py
+# module docstring); fire-and-forget here, never blocks or fails the stop.
+curl -sf --max-time 5 -X POST "$MERIDIAN_URL/projects/$PROJECT_ID/worktrees/sweep" >/dev/null 2>&1 || true
 exit 0
 """
 
@@ -7376,6 +7383,15 @@ if ($r.stopped_at_ceiling -eq $true) {
 if ($null -ne $r.verification_pending_count -and [int]$r.verification_pending_count -gt 0) {
     [Console]::Error.WriteLine("Meridian: $([int]$r.verification_pending_count) item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet).")
 }
+# a03c0eeb - the moment the guard is about to let a stop through is the
+# natural post-integration point (this session has no pending sprint items
+# left): fire a best-effort real disk cleanup pass for this project's git
+# worktrees so items that already merged/finished don't leave orphaned
+# worktree dirs behind. Self-hosted only server-side (see worktree_cleanup.py
+# module docstring); fire-and-forget here, never blocks or fails the stop.
+try {
+    Invoke-RestMethod -Method POST -Uri "$Url/projects/$ProjectId/worktrees/sweep" -TimeoutSec 5 | Out-Null
+} catch { }
 exit 0
 """
 
