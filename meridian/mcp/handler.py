@@ -4167,6 +4167,7 @@ async def _handle_notes_decisions(
         handle_get_workspace_proposals,
         handle_advance_proposal_status,
         handle_promote_proposal,
+        handle_add_proposal,
         handle_preview_proposal_promotion,
         handle_commit_proposal_promotion,
     )
@@ -4229,6 +4230,7 @@ async def _handle_notes_decisions(
         "get_workspace_proposals": handle_get_workspace_proposals,
         "advance_proposal_status": handle_advance_proposal_status,
         "promote_proposal": handle_promote_proposal,
+        "add_proposal": handle_add_proposal,
         "preview_proposal_promotion": handle_preview_proposal_promotion,
         "commit_proposal_promotion": handle_commit_proposal_promotion,
     }
