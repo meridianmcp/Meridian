@@ -2342,6 +2342,8 @@ class OutputsFtsIndex:
         write_chunk: int | None = None,
         session_id: str | None = None,
         initial_scan_boundary: str | None = None,
+        initial_row_cache: dict[str, "OutputRow"] | None = None,
+        initial_manifest: dict[str, tuple[float | None, int | None]] | None = None,
     ) -> None:
         # Persist one canonical spelling for the tree and its cache.  Without
         # this, a process that first indexes an absolute root and a later
@@ -2417,8 +2419,36 @@ class OutputsFtsIndex:
         # actually in the table -- so the caller gets REAL results (from a
         # partial but non-empty index) instead of empty hits with total_indexed=0.
         self._fts_pending = False
-        self._manifest: dict[str, tuple[float | None, int | None]] = {}
-        self._row_cache: dict[str, OutputRow] = {}
+        # fa600e42 follow-up, round 4 -- initial_row_cache/initial_manifest
+        # let a caller seed these BEFORE any rebuild() call, same pattern as
+        # initial_scan_boundary above (a plain constructor-time dict
+        # assignment -- no _connect() involved, so this introduces no
+        # lock-ordering change to rebuild()/`_connect()` at all).
+        #
+        # Why this exists: Phase 0/1's staleness check (`self._manifest.
+        # get(p) != sig or p not in self._row_cache`) runs BEFORE Phase 2's
+        # write-lock is acquired, and therefore before _connect() -- and
+        # therefore _rehydrate_cache_from_disk() -- has ever run on a fresh
+        # process's first call (by design; see rebuild()'s own comment on
+        # why _connect() is deferred to Phase 2). Confirmed live: this made
+        # EVERY already-indexed file look stale on every restart, forcing a
+        # full re-hash-and-rewrite of the whole index each time a periodic-
+        # restart harness reconnects -- and confirmed live tonight, that
+        # repeated full-index rewrite eventually caused a real MemoryError
+        # crash (index bloated from 6GB to 8.7GB from repeated DELETE+
+        # REINSERT cycles that never reclaim space). A caller that already
+        # knows it's reconnecting to an existing index (e.g. a harness that
+        # ran its own lightweight, out-of-band probe against the same
+        # db_path before constructing this instance) can pass the prior
+        # state in here to make Phase 0/1's very first staleness check
+        # correct immediately, instead of only becoming correct after
+        # Phase 2's lazy connect on THIS SAME call runs too late to help it.
+        self._manifest: dict[str, tuple[float | None, int | None]] = (
+            dict(initial_manifest) if initial_manifest else {}
+        )
+        self._row_cache: dict[str, OutputRow] = (
+            dict(initial_row_cache) if initial_row_cache else {}
+        )
         self.last_rebuild_partial = False
         # 1a799e52 -- set when Phase 2's DB write raises inside rebuild()'s
         # `except Exception: _log.debug(...)` block. Previously that failure

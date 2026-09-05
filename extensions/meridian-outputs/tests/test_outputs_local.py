@@ -3578,6 +3578,127 @@ class TestResumeAfterCrossProcess:
         idx2.close()
 
 
+class TestInitialRowCacheAndManifest:
+    """fa600e42 follow-up, round 4: initial_row_cache/initial_manifest let a
+    caller seed OutputsFtsIndex's staleness-detection state BEFORE any
+    rebuild() call -- closing the gap where Phase 0/1's staleness check
+    (self._manifest.get(p) != sig or p not in self._row_cache) runs before
+    Phase 2's lazy _connect() has ever rehydrated a fresh process's cache.
+
+    Confirmed live: without this, EVERY already-indexed file looked stale
+    on every restart, forcing a full re-hash-and-rewrite of the whole
+    index each time -- which eventually caused a real MemoryError crash
+    after the repeated cycle bloated the DB file from 6GB to 8.7GB.
+    """
+
+    @duckdb_required
+    def test_seeded_cache_prevents_false_staleness_on_first_call(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(10):
+            (outputs_dir / f"f{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx1.rebuild(max_seconds=30.0)
+        assert idx1.get_convergence_state().converged is True
+        row_cache = dict(idx1._row_cache)
+        manifest = dict(idx1._manifest)
+        idx1.close()
+
+        # Simulate a restart, seeded with the prior instance's cache (as a
+        # harness-level probe would source it) instead of the constructor
+        # defaults (empty dicts).
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path,
+            initial_row_cache=row_cache, initial_manifest=manifest,
+        )
+        assert len(idx2._row_cache) == 10
+        assert len(idx2._manifest) == 10
+        idx2.rebuild(max_seconds=30.0)
+        m = idx2.last_rebuild_metrics
+        # The core regression: without seeding, every one of the 10 files
+        # looks stale on this call (files_new==10, rows_changed==10) since
+        # Phase 0/1 run before _connect() has rehydrated anything. With
+        # seeding, the staleness check already knows all 10 are current.
+        assert m.get("files_new", 0) == 0, (
+            "seeded cache did not prevent false staleness on the first call"
+        )
+        assert m.get("rows_changed", 0) == 0
+        idx2.close()
+
+    @duckdb_required
+    def test_no_seed_reproduces_the_original_false_staleness_on_first_call(
+        self, tmp_path: Path,
+    ) -> None:
+        """Control case: confirms the regression test above is actually
+        exercising the bug, not passing vacuously. Same setup, but a
+        SECOND instance constructed WITHOUT seeding (today's default)
+        must still show the original false-staleness behavior."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(10):
+            (outputs_dir / f"f{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx1.rebuild(max_seconds=30.0)
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx2.rebuild(max_seconds=30.0)
+        m = idx2.last_rebuild_metrics
+        assert m.get("files_new", 0) == 10, (
+            "expected the original false-staleness behavior without seeding"
+        )
+        idx2.close()
+
+    @duckdb_required
+    def test_seeded_cache_produces_correct_final_row_count(
+        self, tmp_path: Path,
+    ) -> None:
+        """A seeded restart must still correctly pick up genuinely NEW
+        files discovered alongside the seeded (already-current) ones."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(5):
+            (outputs_dir / f"f{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx1.rebuild(max_seconds=30.0)
+        row_cache = dict(idx1._row_cache)
+        manifest = dict(idx1._manifest)
+        idx1.close()
+
+        # A genuinely new file appears between "process 1 exits" and
+        # "process 2 starts" -- exactly the ongoing-writer scenario the
+        # staleness check must still catch even when seeded.
+        (outputs_dir / "new_file.csv").write_text("col\nnew", encoding="utf-8")
+
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path,
+            initial_row_cache=row_cache, initial_manifest=manifest,
+        )
+        idx2.rebuild(max_seconds=30.0)
+        assert idx2.get_convergence_state().converged is True
+        assert len(idx2._row_cache) == 6
+        idx2.close()
+
+    @duckdb_required
+    def test_none_defaults_preserve_existing_empty_cache_behavior(
+        self, tmp_path: Path,
+    ) -> None:
+        """Omitting initial_row_cache/initial_manifest (every existing
+        caller) must behave exactly as before -- empty dicts, not None
+        leaking through into code that assumes a dict."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        assert idx._row_cache == {}
+        assert idx._manifest == {}
+
+
 class TestRebuildWalkDeadlineAwareness:
     """rebuild()-level regression coverage for 6ba77ada: a walk that alone
     exceeds max_seconds must not prevent rebuild() from returning promptly
