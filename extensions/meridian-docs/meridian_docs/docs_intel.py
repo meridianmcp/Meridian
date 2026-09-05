@@ -7309,15 +7309,27 @@ def _extract_keys_from_instruction(instruction: str) -> list[str]:
     return keys
 
 
-def _scan_citation_field(
+def _scan_all_citation_fields(
     para_elem: ET.Element,
-) -> tuple[int, int, str, str] | None:
-    """Scan a paragraph for the first CSL_CITATION complex field.
+) -> list[tuple[int, int, str, str]]:
+    """Scan a paragraph for EVERY CSL_CITATION complex field it contains.
 
-    Returns ``(begin_idx, end_idx, instruction, display_text)`` where
-    ``begin_idx`` / ``end_idx`` are indices into ``list(para_elem)`` for the
-    first (fldCharType=begin) and last (fldCharType=end) run of the field.
-    Returns ``None`` when no CSL_CITATION field is found.
+    Returns ``[(begin_idx, end_idx, instruction, display_text), ...]`` in
+    document order, where ``begin_idx`` / ``end_idx`` are indices into
+    ``list(para_elem)`` for each field's first (fldCharType=begin) and last
+    (fldCharType=end) run. Returns ``[]`` when no CSL_CITATION field is
+    found.
+
+    A real in-text sentence can cite more than one source in the same
+    paragraph as two independent complex fields (e.g. "(Smith 2020) and
+    (Jones 2021)"), as distinct from ONE field with multiple
+    ``citationItems`` (a single multi-source cite like "(Smith 2020;
+    Jones 2021)"). Every scan-then-act caller must consider ALL of them,
+    not just the first -- found live (2026-09-05) via a hand-authored
+    fixture: a paragraph with a pre-existing citation plus a newly
+    test-inserted one caused ``remove_citation`` to delete the wrong
+    (pre-existing) field while leaving the intended one in place, since it
+    previously always acted on whichever field happened to come first.
     """
     children = list(para_elem)
     w_r = _q(_W, "r")
@@ -7326,6 +7338,7 @@ def _scan_citation_field(
     w_fldCharType = _q(_W, "fldCharType")
     w_t = _q(_W, "t")
 
+    fields: list[tuple[int, int, str, str]] = []
     i = 0
     while i < len(children):
         el = children[i]
@@ -7347,12 +7360,13 @@ def _scan_citation_field(
                             elif ftype == "end":
                                 instr = "".join(instr_parts).strip()
                                 if "CSL_CITATION" in instr:
-                                    return (
+                                    fields.append((
                                         i,
                                         j,
                                         instr,
                                         "".join(display_parts),
-                                    )
+                                    ))
+                                    i = j
                                 break
                         it = el2.find(w_instrText)
                         if it is not None and not past_sep:
@@ -7362,7 +7376,22 @@ def _scan_citation_field(
                             display_parts.append(t_el.text or "")
                     j += 1
         i += 1
-    return None
+    return fields
+
+
+def _scan_citation_field(
+    para_elem: ET.Element,
+) -> tuple[int, int, str, str] | None:
+    """Scan a paragraph for the FIRST CSL_CITATION complex field only.
+
+    Kept for callers that only need to know "is there a citation here at
+    all" (e.g. detecting whether an anchor paragraph already has one).
+    Callers that then ACT on the result (edit/remove) must use
+    :func:`_scan_all_citation_fields` instead and handle more than one
+    match explicitly -- see that function's docstring for why.
+    """
+    fields = _scan_all_citation_fields(para_elem)
+    return fields[0] if fields else None
 
 
 # ---------------------------------------------------------------------------
@@ -7455,10 +7484,11 @@ def edit_citation(
     new_formatted_text: str | None = None,
     source: str = "zotero",
     index_db_path: str | None = None,
+    match_display_text: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Replace an existing CSL_CITATION field with updated keys/text.
 
-    Locates the first complex field in the paragraph whose ``instrText`` contains
+    Locates the complex field in the paragraph whose ``instrText`` contains
     ``CSL_CITATION``, removes the old field runs (begin through end), and inserts
     a new complex field with the updated keys / formatted text in their place.
 
@@ -7472,11 +7502,16 @@ def edit_citation(
         new_formatted_text: Replacement display text (``None`` = keep existing).
         source:             ``"zotero"`` or ``"csl"``.
         index_db_path:      If supplied, sidecar is invalidated after the write.
+        match_display_text: Same disambiguator as :func:`remove_citation` --
+                             required when the paragraph holds more than one
+                             CSL_CITATION field, ignored when it holds exactly
+                             one.
 
     Returns:
         ``{status, anchor_para_id, citation_keys, formatted_text, source,
            docx_path}``
-        or ``{"error": <message>}`` on failure.
+        or ``{"error": <message>}`` on failure (with ``"reason":
+        "ambiguous_citation_fields"`` when disambiguation is needed).
     """
     if new_citation_keys is None and new_formatted_text is None:
         return {"error": "supply at least one of new_citation_keys or new_formatted_text"}
@@ -7494,11 +7529,37 @@ def edit_citation(
 
     _body, para_elem, _cidx = result
 
-    scan = _scan_citation_field(para_elem)
-    if scan is None:
+    fields = _scan_all_citation_fields(para_elem)
+    if not fields:
         return {
             "error": f"no CSL_CITATION field found in paragraph {anchor_para_id!r}"
         }
+
+    if len(fields) == 1:
+        scan = fields[0]
+    else:
+        if not match_display_text or not match_display_text.strip():
+            return {
+                "error": (
+                    f"paragraph {anchor_para_id!r} has {len(fields)} CSL_CITATION "
+                    "fields; pass match_display_text (a substring of the target "
+                    "field's rendered text) to disambiguate which one to edit"
+                ),
+                "reason": "ambiguous_citation_fields",
+                "candidate_display_texts": [f[3] for f in fields],
+            }
+        matches = [f for f in fields if match_display_text in f[3]]
+        if len(matches) != 1:
+            return {
+                "error": (
+                    f"match_display_text {match_display_text!r} matched "
+                    f"{len(matches)} of {len(fields)} CSL_CITATION fields in "
+                    f"paragraph {anchor_para_id!r}; it must match exactly one"
+                ),
+                "reason": "ambiguous_citation_fields",
+                "candidate_display_texts": [f[3] for f in fields],
+            }
+        scan = matches[0]
 
     begin_idx, end_idx, old_instr, old_display = scan
 
@@ -7547,21 +7608,45 @@ def remove_citation(
     docx_path: str,
     anchor_para_id: str,
     index_db_path: str | None = None,
+    match_display_text: str | None = None,
 ) -> dict[str, Any]:
-    """9d749639 — Remove the first CSL_CITATION complex field from a paragraph.
+    """9d749639 — Remove a CSL_CITATION complex field from a paragraph.
 
     Locates the field by scanning for a complex field (fldChar begin...end)
     whose instrText contains ``CSL_CITATION``, removes all its constituent
     runs, and re-packs the ZIP.
 
+    A paragraph can hold more than one independent citation field (e.g. an
+    existing "(Original, 2019)" citation plus a separately inserted one) --
+    found live (2026-09-05) via a hand-authored fixture: this function
+    previously always removed whichever field came FIRST, silently deleting
+    the wrong (pre-existing) citation while leaving the intended one in
+    place. It now requires the caller to disambiguate whenever more than one
+    field is present, rather than guessing.
+
     Args:
-        docx_path:       Absolute path to the .docx file (mutated in place).
-        anchor_para_id:  ``w14:paraId`` or ``p{N}`` of the paragraph to edit.
-        index_db_path:   If supplied, sidecar is invalidated after the write.
+        docx_path:           Absolute path to the .docx file (mutated in
+                              place).
+        anchor_para_id:       ``w14:paraId`` or ``p{N}`` of the paragraph to
+                              edit.
+        index_db_path:        If supplied, sidecar is invalidated after the
+                              write.
+        match_display_text:   When the paragraph has more than one
+                              CSL_CITATION field, a substring of the target
+                              field's rendered display text (e.g. the
+                              formatted_text originally passed to
+                              :func:`insert_citation`) that identifies which
+                              one to remove. Ignored when the paragraph has
+                              exactly one field (unambiguous either way).
+                              Required whenever more than one field is
+                              present; matching more than one field is
+                              itself an error rather than removing the
+                              first match.
 
     Returns:
         ``{status, anchor_para_id, docx_path}``
-        or ``{"error": <message>}`` on failure.
+        or ``{"error": <message>}`` on failure (with ``"reason":
+        "ambiguous_citation_fields"`` when disambiguation is needed).
     """
     try:
         raw, root = _load_docx_xml_stdlib(docx_path)
@@ -7576,13 +7661,39 @@ def remove_citation(
 
     _body, para_elem, _cidx = result
 
-    scan = _scan_citation_field(para_elem)
-    if scan is None:
+    fields = _scan_all_citation_fields(para_elem)
+    if not fields:
         return {
             "error": f"no CSL_CITATION field found in paragraph {anchor_para_id!r}"
         }
 
-    begin_idx, end_idx, _instr, _display = scan
+    if len(fields) == 1:
+        target = fields[0]
+    else:
+        if not match_display_text or not match_display_text.strip():
+            return {
+                "error": (
+                    f"paragraph {anchor_para_id!r} has {len(fields)} CSL_CITATION "
+                    "fields; pass match_display_text (a substring of the target "
+                    "field's rendered text) to disambiguate which one to remove"
+                ),
+                "reason": "ambiguous_citation_fields",
+                "candidate_display_texts": [f[3] for f in fields],
+            }
+        matches = [f for f in fields if match_display_text in f[3]]
+        if len(matches) != 1:
+            return {
+                "error": (
+                    f"match_display_text {match_display_text!r} matched "
+                    f"{len(matches)} of {len(fields)} CSL_CITATION fields in "
+                    f"paragraph {anchor_para_id!r}; it must match exactly one"
+                ),
+                "reason": "ambiguous_citation_fields",
+                "candidate_display_texts": [f[3] for f in fields],
+            }
+        target = matches[0]
+
+    begin_idx, end_idx, _instr, _display = target
 
     children = list(para_elem)
     for idx in range(end_idx, begin_idx - 1, -1):
@@ -9676,8 +9787,14 @@ def scan_all_citation_keys(docx_path: str) -> list[str]:
     """Return a deduplicated list of all citation keys present in a .docx.
 
     Walks every paragraph in ``word/document.xml`` looking for CSL_CITATION
-    complex fields (same ``_scan_citation_field`` used by ``remove_citation``).
-    Returns keys in first-appearance order.  Returns [] on any error.
+    complex fields (``_scan_all_citation_fields``, same scan
+    ``remove_citation``/``edit_citation`` use). Returns keys in
+    first-appearance order. Returns [] on any error.
+
+    Checks EVERY field in a paragraph, not just the first -- a paragraph can
+    legitimately hold more than one independent citation field (e.g.
+    "(Smith 2020) and (Jones 2021)" as two separate complex fields); taking
+    only the first would silently under-report real citation keys.
     """
     try:
         _raw, root = _load_docx_xml_stdlib(docx_path)
@@ -9692,14 +9809,11 @@ def scan_all_citation_keys(docx_path: str) -> list[str]:
     ordered: list[str] = []
 
     for para in body.iter(_q(_W, "p")):
-        scan = _scan_citation_field(para)
-        if scan is None:
-            continue
-        _bi, _ei, instr, _disp = scan
-        for key in _extract_keys_from_instruction(instr):
-            if key not in seen:
-                seen.add(key)
-                ordered.append(key)
+        for _bi, _ei, instr, _disp in _scan_all_citation_fields(para):
+            for key in _extract_keys_from_instruction(instr):
+                if key not in seen:
+                    seen.add(key)
+                    ordered.append(key)
 
     return ordered
 
@@ -14346,6 +14460,330 @@ def relocate_table(
         "is_draft": bool(draft_output_path),
         # MDE-3 -- see move_section's identical field for rationale.
         "promoted_sha256": _current_file_sha256(dest),
+    }
+
+
+def insert_table(
+    docx_path: str,
+    anchor_para_id: str,
+    rows: int,
+    cols: int,
+    position: str = "after",
+    cell_texts: list[list[str]] | None = None,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+) -> dict[str, Any]:
+    """0a1e9c22 -- Insert a brand-new bare ``<w:tbl>`` at a position relative
+    to an anchor paragraph, atomically.
+
+    ``rows``/``cols`` are always caller-specified -- there is no implicit
+    default shape, the same discipline :func:`split_cell` already applies to
+    its own ``cols``/``rows`` parameters, since guessing a default row/column
+    count for a brand-new table is a real product decision with no single
+    right answer. What IS not a genuine design question, despite reading
+    like one at first: table STYLE. Every new table uses Word's own built-in
+    ``TableGrid`` style (the same style Word itself applies when a user
+    inserts a table through the ribbon with default settings) -- this is the
+    universally expected default, not an arbitrary choice requiring separate
+    design input, mirroring how APA turned out to be the unambiguous right
+    default for :func:`insert_bibliography_entry`'s alphabetical ordering.
+    Column widths split the page's standard 9000-twip (6.25in) content width
+    evenly across ``cols``.
+
+    Anchor/position semantics mirror :func:`relocate_table`'s destination
+    handling exactly: ``position="before"``/``"after"`` (default ``"after"``)
+    an ordinary paragraph is a literal body-child splice, but when
+    ``anchor_para_id`` resolves to a HEADING and ``position="after"``, the
+    table lands after that heading's ENTIRE section (its own body plus
+    subsections), not merely after the heading paragraph itself -- reusing
+    :func:`_locate_section_bounds` rather than reimplementing it.
+
+    Each new cell gets one empty paragraph (a fresh ``w14:paraId``) unless
+    ``cell_texts`` supplies literal text for it.
+
+    Unlike :func:`relocate_table`/:func:`remove_table`, there is no
+    bookmark-split guard here: a bookmark can only be split by REMOVING a
+    range that contains one of its endpoints but not the other -- inserting
+    brand-new content between an existing bookmarkStart and bookmarkEnd
+    only widens the bookmark's span, it can never sever it.
+
+    Args:
+        docx_path:       Absolute path to the .docx file (mutated in place).
+        anchor_para_id:  w14:paraId (or synthesized/legacy id, same schemes
+                         :func:`_find_para_by_id` accepts) of the paragraph
+                         to insert the table next to.
+        rows:            Number of rows (int >= 1). Required, never defaulted.
+        cols:            Number of grid columns (int >= 1). Required, never
+                         defaulted.
+        position:        "before" or "after" (default) the anchor.
+        cell_texts:      Optional ``rows`` x ``cols`` list of literal cell
+                         text; a cell not covered by it (or when omitted
+                         entirely) gets one empty paragraph.
+        index_db_path:   If supplied, sidecar is invalidated after the write.
+        allow_degraded_render: Explicit, audited opt-in to accept this write
+                         when no render backend is available in this
+                         environment. Requires degraded_render_reason.
+        degraded_render_reason: Required, non-empty when
+                         allow_degraded_render is True.
+
+    Returns:
+        ``{status, table_index, row_count, col_count, anchor_para_id,
+        position, docx_path, render_status, render_verified, render_backend,
+        render_detail}`` or ``{"error": ...}`` on failure -- the file is not
+        mutated on any error.
+    """
+    if position not in ("before", "after"):
+        return {"error": f"position must be 'before' or 'after', got {position!r}"}
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows < 1:
+        return {"error": f"rows must be a positive int, got {rows!r}"}
+    if not isinstance(cols, int) or isinstance(cols, bool) or cols < 1:
+        return {"error": f"cols must be a positive int, got {cols!r}"}
+    if allow_degraded_render and not (
+        degraded_render_reason and str(degraded_render_reason).strip()
+    ):
+        return {
+            "error": (
+                "degraded_render_reason is required and must be non-empty "
+                "when allow_degraded_render=True -- an audited degrade with "
+                "no stated reason is not auditable and is refused"
+            )
+        }
+    if cell_texts is not None:
+        if not isinstance(cell_texts, list) or len(cell_texts) != rows:
+            return {"error": f"cell_texts must be a list of {rows} row(s) when supplied"}
+        for row_texts in cell_texts:
+            if not isinstance(row_texts, list) or len(row_texts) != cols:
+                return {"error": f"each cell_texts row must have {cols} entr(y/ies)"}
+
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
+
+    anchor_result = _find_para_by_id(root, anchor_para_id)
+    if anchor_result is None:
+        return {"error": f"para_id {anchor_para_id!r} not found in {docx_path}"}
+    _abody, _aelem, anchor_idx = anchor_result
+
+    dest_section_bounds = (
+        _locate_section_bounds(body, anchor_para_id) if position == "after" else None
+    )
+    if dest_section_bounds is not None:
+        insert_at = dest_section_bounds[1]
+    else:
+        insert_at = anchor_idx if position == "before" else anchor_idx + 1
+
+    taken_ids = _existing_para_ids(root)
+    col_width = 9000 // cols
+
+    tbl = ET.Element(_W_TBL)
+    tblPr = ET.SubElement(tbl, _q(_W, "tblPr"))
+    ET.SubElement(tblPr, _q(_W, "tblStyle")).set(_q(_W, "val"), "TableGrid")
+    ET.SubElement(tblPr, _q(_W, "tblW")).set(_q(_W, "w"), "0")
+    tblPr.find(_q(_W, "tblW")).set(_q(_W, "type"), "auto")
+    tblGrid = ET.SubElement(tbl, _W_TBLGRID)
+    for _ in range(cols):
+        ET.SubElement(tblGrid, _W_GRIDCOL).set(_q(_W, "w"), str(col_width))
+
+    for row_idx in range(rows):
+        tr = ET.SubElement(tbl, _W_TR)
+        for col_idx in range(cols):
+            tc = ET.SubElement(tr, _W_TC)
+            tcPr = ET.SubElement(tc, _W_TCPR)
+            ET.SubElement(tcPr, _q(_W, "tcW")).set(_q(_W, "w"), str(col_width))
+            tcPr.find(_q(_W, "tcW")).set(_q(_W, "type"), "dxa")
+            p = ET.SubElement(tc, _q(_W, "p"))
+            p.set(_q(_W14, "paraId"), _new_para_id(taken_ids))
+            text = None
+            if cell_texts is not None:
+                text = cell_texts[row_idx][col_idx]
+            if text:
+                r = ET.SubElement(p, _q(_W, "r"))
+                t = ET.SubElement(r, _q(_W, "t"))
+                t.set(_q(_XML_NS, "space"), "preserve")
+                t.text = str(text)
+
+    expected_counts = dict(baseline_counts)
+    expected_counts["paragraph_count"] += rows * cols
+    expected_counts["table_count"] += 1
+
+    body.insert(insert_at, tbl)
+    expected_hash = _hash_elements([tbl])
+
+    write_result = _write_table_mutation(
+        docx_path=docx_path,
+        raw=raw,
+        root=root,
+        target_el=tbl,
+        table_index=insert_at,
+        expected_counts=expected_counts,
+        expected_hash=expected_hash,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+    if "error" in write_result:
+        write_result["anchor_para_id"] = anchor_para_id
+        return write_result
+
+    return {
+        "status": "inserted",
+        "table_index": insert_at,
+        "row_count": rows,
+        "col_count": cols,
+        "anchor_para_id": anchor_para_id,
+        "position": position,
+        "docx_path": write_result["docx_path"],
+        **write_result["render_info"],
+    }
+
+
+def remove_table(
+    docx_path: str,
+    table_index: int,
+    index_db_path: str | None = None,
+    allow_bookmark_split: bool = False,
+) -> dict[str, Any]:
+    """0a1e9c22 -- Remove an existing bare ``<w:tbl>`` from the document body,
+    atomically.
+
+    Mirrors :func:`relocate_table`'s addressing (0-based body-child
+    ``table_index``) and safety discipline (bookmark-split guard, mandatory
+    post-write structural-count verification, promotion lock) but for
+    deletion rather than relocation. Unlike an insert or a move, there is no
+    destination content to hash-verify against, so verification checks
+    structural counts only: ``table_count`` decreases by exactly the number
+    of tables the removed element itself contained (1, plus any tables
+    nested inside its cells), and ``paragraph_count`` decreases by exactly
+    that element's own paragraph count -- both computed from the table
+    BEFORE it is cut, the same reuse of :func:`_structural_counts` for a
+    specific element's own delta that :func:`copy_section` already relies
+    on.
+
+    Does NOT remove an adjacent caption paragraph, and does NOT call
+    :func:`renumber_sequences` -- same disclosed scope boundary as
+    :func:`relocate_table` (SEQ Table numbering is unaffected by this call).
+    A bare table has no render-shape risk of its own removal producing
+    malformed OOXML (deleting valid content can't manufacture invalid
+    content the way inserting new grid/cell XML could), so this does not
+    invoke the Word-COM render-verification gate -- same reasoning
+    :func:`relocate_table` already applies to a move.
+
+    Args:
+        docx_path:       Absolute path to the .docx file (mutated in place).
+        table_index:      0-based body-child position of the ``<w:tbl>`` to
+                          remove (same addressing as :func:`relocate_table`).
+        index_db_path:    If supplied, sidecar is invalidated after write.
+        allow_bookmark_split: Explicit override (default False) to proceed
+                          even when removing the table would split a
+                          bookmark's start/end pair across the removed range.
+
+    Returns:
+        ``{status, table_index, row_count, col_count, docx_path}`` or
+        ``{"error": ...}`` on failure -- the file is not mutated on any
+        error, including a post-write verification failure (best-effort
+        restored from backup).
+    """
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except FileNotFoundError as exc:
+        return {"error": str(exc)}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {"error": "document has no body element"}
+
+    target_el, err = _resolve_table_element(body, table_index)
+    if err is not None:
+        return err
+
+    body_list = list(body)
+    split_bookmarks = _bookmarks_split_by_range(body_list, table_index, table_index + 1)
+    if split_bookmarks and not allow_bookmark_split:
+        return {
+            "error": (
+                f"aborting remove_table: removing table at index {table_index} "
+                f"would split bookmark(s) {split_bookmarks!r} across the "
+                "removed range -- pass allow_bookmark_split=True to force the "
+                "removal anyway"
+            ),
+            "reason": "split_bookmarks",
+            "split_bookmarks": split_bookmarks,
+        }
+
+    from ._vendored_content_tree import _table_node  # noqa: PLC0415
+
+    table_meta = _table_node(target_el, table_index)
+
+    baseline_counts = _structural_counts([body])
+    baseline_counts["image_count"] = _docx_media_count(raw)
+    removed_counts = _structural_counts([target_el])
+    expected_counts = dict(baseline_counts)
+    expected_counts["paragraph_count"] -= removed_counts["paragraph_count"]
+    expected_counts["heading_count"] -= removed_counts["heading_count"]
+    expected_counts["table_count"] -= removed_counts["table_count"]
+
+    body.remove(target_el)
+
+    with _docx_promotion_lock(docx_path):
+        try:
+            transaction = _save_docx_xml_stdlib(raw, root, docx_path)
+        except OSError as exc:
+            return {"error": f"could not write {docx_path}: {exc}"}
+
+        verify_error = _verify_docx_write(docx_path, expected_counts=expected_counts)
+        if verify_error is not None:
+            safe_to_restore, restored, concurrent_write_detected = (
+                _safe_restore_after_verification_failure(
+                    docx_path, transaction.get("promoted_sha256") if transaction else None,
+                )
+            )
+            verify_error["file_restored"] = restored
+            verify_error["concurrent_write_detected"] = concurrent_write_detected
+            if not safe_to_restore:
+                if concurrent_write_detected:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- AND a different writer's promotion has landed on "
+                        "this file since ours, so this verification failure "
+                        "could not be safely auto-corrected: restoring from our "
+                        "own backup would destroy that writer's already-promoted "
+                        f"work. {docx_path} was left untouched, exactly as that "
+                        "other writer left it -- investigate manually."
+                    )
+                else:
+                    verify_error["error"] = (
+                        verify_error["error"]
+                        + " -- this write's own promotion fingerprint is "
+                        "unavailable, so it could not be safely confirmed that "
+                        "restoring from backup would not destroy a different "
+                        f"writer's work; {docx_path} was left untouched rather "
+                        "than risk it -- investigate manually."
+                    )
+            verify_error["table_index"] = table_index
+            verify_error["docx_path"] = docx_path
+            return verify_error
+
+    _invalidate_sidecar_mtime(index_db_path)
+
+    return {
+        "status": "removed",
+        "table_index": table_index,
+        "row_count": table_meta["row_count"],
+        "col_count": table_meta["col_count"],
+        "docx_path": docx_path,
     }
 
 

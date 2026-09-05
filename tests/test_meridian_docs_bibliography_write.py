@@ -559,6 +559,40 @@ class TestScanAllCitationKeys:
         keys = docs_intel.scan_all_citation_keys(str(tmp_path / "gone.docx"))
         assert keys == []
 
+    def test_two_fields_in_the_same_paragraph_both_counted(self, tmp_path):
+        """Found alongside remove_citation's 2026-09-05 fix: this walked
+        every paragraph but only checked the FIRST CSL_CITATION field in
+        it, silently under-reporting a paragraph that cites two sources as
+        two independent fields (e.g. "(Smith 2020) and (Jones 2021)" in one
+        sentence, as opposed to one multi-item field)."""
+        docx = str(tmp_path / "doc.docx")
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="GG000001">
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {"citationID":"a","properties":{"formattedCitation":"(Smith 2020)"},"citationItems":[{"id":"smith2020","uris":[],"itemData":{"id":"smith2020","type":"article"}}],"schema":"x"} </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>(Smith 2020)</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+      <w:r><w:t xml:space="preserve"> and </w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {"citationID":"b","properties":{"formattedCitation":"(Jones 2021)"},"citationItems":[{"id":"jones2021","uris":[],"itemData":{"id":"jones2021","type":"article"}}],"schema":"x"} </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>(Jones 2021)</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+        _write_docx(docx, xml)
+        keys = docs_intel.scan_all_citation_keys(docx)
+        assert "smith2020" in keys
+        assert "jones2021" in keys
+        assert len(keys) == 2
+
 
 # ---------------------------------------------------------------------------
 # insert_bibliography_entry
