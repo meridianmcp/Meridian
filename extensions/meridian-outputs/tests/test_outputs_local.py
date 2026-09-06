@@ -5665,6 +5665,60 @@ class TestDuckDBMemoryLimit:
         idx = OL.OutputsFtsIndex(str(tmp_path), duckdb_memory_limit_bytes=2048 * 1024 * 1024)
         assert idx._duckdb_memory_limit_bytes == 2048 * 1024 * 1024
 
+    def test_row_count_hint_widens_reserve_and_shrinks_limit(self, monkeypatch) -> None:
+        """fa600e42 follow-up (architecture review): _DUCKDB_MEMORY_RESERVE_
+        BYTES (768MB) is a flat constant calibrated on sub-million-file
+        runs -- it doesn't account for self._row_cache/_manifest's own
+        growth, which scales with corpus size (edc84500 only evicts the
+        heavy `content` field, never the row itself). A non-zero
+        row_count_hint must widen the reserve (and therefore shrink the
+        resulting limit) proportionally."""
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        tantivy_heap = 512 * 1024 * 1024
+        without_hint = OL._default_duckdb_memory_limit_bytes(tantivy_heap)
+        with_hint = OL._default_duckdb_memory_limit_bytes(
+            tantivy_heap, row_count_hint=1_000_000,
+        )
+        assert with_hint < without_hint
+        expected_reserve = (
+            OL._DUCKDB_MEMORY_RESERVE_BYTES
+            + 1_000_000 * OL._ESTIMATED_ROW_CACHE_BYTES_PER_ENTRY
+        )
+        usable = 20 * 1024**3 - tantivy_heap - expected_reserve
+        expected = max(
+            OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES,
+            min(int(usable * OL._DUCKDB_MEMORY_LIMIT_SHARE), OL._DUCKDB_MEMORY_LIMIT_CEILING_BYTES),
+        )
+        assert with_hint == expected
+
+    def test_zero_row_count_hint_matches_pre_fix_behaviour(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        tantivy_heap = 512 * 1024 * 1024
+        assert (
+            OL._default_duckdb_memory_limit_bytes(tantivy_heap, row_count_hint=0)
+            == OL._default_duckdb_memory_limit_bytes(tantivy_heap)
+        )
+
+    def test_constructor_derives_row_count_hint_from_initial_row_cache(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        """Integration check: a real OutputsFtsIndex construction with a
+        large initial_row_cache (the periodic-restart harness's own
+        mechanism) must actually reach the wider-reserve/smaller-limit
+        path, not just the module function in isolation."""
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        fake = self._fake_psutil(20 * 1024**3)
+        fake.cpu_count.return_value = 4  # also consulted by _physical_core_count()
+        monkeypatch.setitem(sys.modules, "psutil", fake)
+        fake_row_cache = {f"/a/{i}.csv": object() for i in range(500_000)}
+        idx_without = OL.OutputsFtsIndex(str(tmp_path))
+        idx_with = OL.OutputsFtsIndex(
+            str(tmp_path), initial_row_cache=fake_row_cache,  # type: ignore[arg-type]
+        )
+        assert idx_with._duckdb_memory_limit_bytes < idx_without._duckdb_memory_limit_bytes
+
     @duckdb_required
     def test_connect_applies_memory_limit_pragma(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
