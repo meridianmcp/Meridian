@@ -3427,9 +3427,28 @@ async def _handle_task_tools(
         # incomplete, so a contract built alongside it must not silently
         # report executable=true. Fully guarded — a failure degrades to no
         # field rather than breaking the mandatory handoff.
+        #
+        # 537a7cef — max_executor_contracts/max_contract_list_items were
+        # previously omitted here, so every mode (full/delta/goal/starter)
+        # got capability_contract.build_capability_contract's own generous
+        # 25/200 defaults, unbounded per-item routing-summary field, and
+        # unbounded requested/effective capability lists — on a large board
+        # this alone produced a ~440KB capability_contract, defeating the
+        # documented "compact summary object" contract for full/delta/goal
+        # alike (the item's own repro). Bound to the SAME
+        # _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS=15 the /goal text's own
+        # <tool_requirements>/<sprint_item_pointers>/
+        # <artifact_pointer_findings> clauses already use for starter/goal
+        # (see that constant's docstring: this JSON field is the documented
+        # escape hatch for whatever the text trims, so it should never be
+        # LARGER than what a compact render already omits) — never a silent
+        # drop: every item_*_truncated marker still reports the full
+        # candidate count when a board exceeds this.
         _capability_contract = await handoff_module_local.build_effective_capability_contract(
             db, args["project_id"], board_stale=_handoff_degraded,
             version=_effective_version,
+            max_executor_contracts=handoff_module_local._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+            max_contract_list_items=handoff_module_local._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
         )
         # 6cdc5df3 — machine-readable proposal-to-evidence linkage, emitted on
         # every generate_handoff mode alongside the capability contract above.

@@ -85,8 +85,16 @@ async def planner_handoff_endpoint(
         raise HTTPException(status_code=504, detail="planner handoff timed out")
     # 98aaccf4 — machine-readable effective capability contract; best-effort,
     # never breaks the planner handoff.
+    # 537a7cef — bound to the SAME _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS the
+    # /goal text's own starter/goal clauses use — see mcp/handler.py's
+    # generate_handoff dispatch (the sibling call site) for the full
+    # rationale: this REST endpoint was previously getting
+    # build_capability_contract's generous 25/200 defaults, unbounded on a
+    # large board.
     capability_contract = await handoff_module.build_effective_capability_contract(
         db, project_id,
+        max_executor_contracts=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+        max_contract_list_items=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
     )
     # 89a06e40 — machine-readable effective profile identity/generation;
     # best-effort, never breaks the planner handoff. See pinned decision
@@ -317,8 +325,16 @@ async def generate_handoff_endpoint(
         ) from exc
     # 98aaccf4 — machine-readable effective capability contract; best-effort,
     # never breaks the mandatory handoff.
+    # 537a7cef — bound to the SAME _DEFAULT_COMPACT_CONTRACT_MAX_ITEMS the
+    # /goal text's own starter/goal clauses use — see mcp/handler.py's
+    # generate_handoff dispatch (the sibling call site) for the full
+    # rationale: this REST endpoint was previously getting
+    # build_capability_contract's generous 25/200 defaults, unbounded on a
+    # large board, for every mode this endpoint serves.
     capability_contract = await handoff_module.build_effective_capability_contract(
         db, project_id, board_stale=_board_stale,
+        max_executor_contracts=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
+        max_contract_list_items=handoff_module._DEFAULT_COMPACT_CONTRACT_MAX_ITEMS,
     )
     # 89a06e40 — machine-readable effective profile identity/generation;
     # best-effort, never breaks the mandatory handoff. See pinned decision

@@ -251,8 +251,23 @@ async def get_proposal_links(
     return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
 
 
+# 537a7cef — get_proposal_evidence hydrates EVERY linked note/finding/
+# sprint_item/decision/artifact into its full stored row with no per-bucket
+# bound at all (only the outer proposal-COUNT is capped, by
+# handoff.build_proposal_evidence_for_handoff's own limit=10 default — that
+# bounds how many PROPOSALS get evidence-hydrated, not how much any ONE
+# proposal's evidence weighs). A proposal linked to hundreds of notes/
+# findings would pay one full-row SELECT per link with no bound, the same
+# class of unbounded-with-fan-in growth capability_contract's per-item
+# sections needed 248c0bb9/537a7cef's caps for. Default is well above any
+# proposal exercised by this codebase's own tests (single digits) or any
+# realistically-scoped real proposal.
+_DEFAULT_MAX_PROPOSAL_BUCKET_ITEMS = 50
+
+
 async def get_proposal_evidence(
     db: aiosqlite.Connection, project_id: str, proposal_id: str,
+    *, max_bucket_items: int = _DEFAULT_MAX_PROPOSAL_BUCKET_ITEMS,
 ) -> dict[str, Any]:
     """6cdc5df3 — answer "what's linked to proposal X", fully hydrated.
 
@@ -266,6 +281,25 @@ async def get_proposal_evidence(
     ``unresolved`` (never silently dropped) so a stale link is visible rather
     than invisible.
 
+    ``max_bucket_items`` (537a7cef) — caps how many entries EACH of the five
+    buckets (notes/findings/sprint_items/decisions/artifacts) hydrates,
+    applied over links in their existing deterministic ``id ASC`` order
+    (see :func:`get_proposal_links`). A link beyond its bucket's cap is
+    skipped BEFORE the per-entity SELECT (or the label lookup, for
+    artifacts) — bounding both response size and DB round-trips, not just
+    the former. Never a silent drop: the returned ``bucket_truncated`` dict
+    carries one ``{truncated, total_candidates, included}`` marker per
+    bucket (the SAME shape ``capability_contract._cap_contract_list`` uses),
+    and ``link_count`` always reports the TRUE total link count regardless
+    of any bucket's truncation. A link skipped for being over its bucket's
+    cap is counted in that bucket's ``total_candidates`` but — because it
+    was never hydrated — cannot also be checked for staleness, so it will
+    not appear in ``unresolved`` even if its target has been deleted; that
+    is visible via the count discrepancy in ``bucket_truncated``, not
+    itemized. A proposal at or under the cap in every bucket (every
+    existing test, and any realistically-scoped real proposal) is
+    byte-identical to the pre-cap output.
+
     Returns::
 
         {
@@ -273,12 +307,15 @@ async def get_proposal_evidence(
             "notes": [...], "findings": [...], "sprint_items": [...],
             "decisions": [...], "artifacts": [...],
             "link_count": <int>, "unresolved": [...],
+            "bucket_truncated": {"notes": {...}, "findings": {...}, ...},
         }
     """
     links = await get_proposal_links(db, project_id, proposal_id)
     buckets: dict[str, list[dict[str, Any]]] = {
         "notes": [], "findings": [], "sprint_items": [], "decisions": [], "artifacts": [],
     }
+    bucket_candidates: dict[str, int] = dict.fromkeys(buckets, 0)
+    cap = max(0, int(max_bucket_items or 0))
     unresolved: list[dict[str, Any]] = []
     for link in links:
         etype = link.get("entity_type")
@@ -286,6 +323,12 @@ async def get_proposal_evidence(
         bucket_name = _PROPOSAL_ENTITY_BUCKET.get(etype or "")
         if bucket_name is None:
             continue  # unknown/legacy entity_type — skip rather than crash
+        bucket_candidates[bucket_name] += 1
+        if len(buckets[bucket_name]) >= cap:
+            # Over this bucket's cap — skip the hydration query entirely
+            # (bounds DB round-trips, not just response size). Still
+            # reflected in bucket_candidates above, so never silent.
+            continue
         if etype == "artifact":
             buckets["artifacts"].append({
                 "link_id": link.get("id"),
@@ -305,12 +348,21 @@ async def get_proposal_evidence(
         hydrated["_proposal_link_id"] = link.get("id")
         hydrated["_proposal_link_label"] = link.get("label")
         buckets[bucket_name].append(hydrated)
+    bucket_truncated = {
+        name: {
+            "truncated": bucket_candidates[name] > len(buckets[name]),
+            "total_candidates": bucket_candidates[name],
+            "included": len(buckets[name]),
+        }
+        for name in buckets
+    }
     return {
         "proposal_id": proposal_id,
         "project_id": project_id,
         **buckets,
         "link_count": len(links),
         "unresolved": unresolved,
+        "bucket_truncated": bucket_truncated,
     }
 
 
