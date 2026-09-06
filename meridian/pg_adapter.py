@@ -4670,6 +4670,28 @@ async def _migrate_pg_object_sync_state(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_proposal_project_scope(conn: PostgresConnection) -> None:
+    """a8afd8f9 — workspace_proposals.scope_type + .project_id: project-scoped
+    proposals as a first-class alternative to workspace-global ones, without
+    forking a second table.
+
+    Mirrors db._migrate_proposal_project_scope. ADD COLUMN IF NOT EXISTS is
+    idempotent; scope_type defaults every existing row to 'workspace' so no
+    existing caller's behavior changes. project_id is nullable, no DB-level
+    FK (validated at the app layer, same convention as tenant_id on this
+    table). No automatic reclassification of existing rows (reserved for
+    4eedeef8, pending) — this migration only adds the columns.
+    """
+    await conn.executescript(
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
+        "scope_type TEXT NOT NULL DEFAULT 'workspace';"
+        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
+        "project_id TEXT;"
+        "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_project_scope "
+        "ON workspace_proposals(project_id, status)"
+    )
+
+
 async def _migrate_pg_executor_reports(conn: PostgresConnection) -> None:
     """9154aa9a — executor_reports: durable executor-report / corrective-
     handoff-lifecycle records (mirrors db.executor_reports._migrate_executor_reports_table
@@ -4881,4 +4903,5 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_proposal_gates,
     _migrate_pg_research_graph,
     _migrate_pg_object_sync_state,
+    _migrate_pg_proposal_project_scope,
 )

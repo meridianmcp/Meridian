@@ -31,7 +31,7 @@ Or add to your MCP client config:
 
 | Tool | Description |
 |------|-------------|
-| `search_outputs` | BM25 full-text search over CSV/JSON/NPY files, with a literal-filename-match boost and an optional `subtree` scope |
+| `search_outputs` | BM25 full-text search over CSV/JSON/text/PDF files (body content) plus filename-only search over everything else (NPY etc.), with a literal-filename-match boost and an optional `subtree` scope |
 | `register_output_paths` | Directly register a known list of output paths so they're searchable immediately, without waiting for the ambient walk |
 | `get_convergence_state` | Read-only snapshot of how far the index walk has progressed (never triggers indexing) |
 | `search_logs` | Disposable regex search over a log directory tree (ripgrep tier 0, pure-Python fallback, timestamp/JSON sniffing tier 1) |

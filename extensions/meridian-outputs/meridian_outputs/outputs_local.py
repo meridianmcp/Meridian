@@ -1254,10 +1254,47 @@ _ARCHIVAL_SUFFIX_RE = re.compile(r"_old(?:_\d+)?$", re.IGNORECASE)
 # bytes decoded and indexed by accident. Secret-shaped files never reach
 # this check at all -- is_secret_path (below) excludes them earlier, during
 # the walk itself.
+#
+# aa423c7e -- widened to add .R/.qmd/.Rmd/.sty (plain-text analysis/document
+# source formats with zero existing coverage) and .yml/.yaml. The .yml/.yaml
+# addition is safe by construction: is_secret_path (below) already excludes
+# the secret-shaped basenames that matter -- config.yml/.yaml, settings.yml/
+# .yaml, secrets.yml/.yaml, vault.yml/.yaml -- at the walk stage, BEFORE
+# _classify_suffix ever runs (see _iter_safe_output_files). This only newly
+# body-indexes non-matching basenames such as environment.yml.
 _TEXT_CONTENT_SUFFIXES: frozenset[str] = frozenset(
-    {".csv", ".json", ".txt", ".md", ".log"}
+    {
+        ".csv", ".json", ".txt", ".md", ".log",
+        # _classify_suffix lowercases the extension before this lookup (same
+        # as every existing entry above, e.g. "data.CSV" -> ".csv"), so these
+        # are stored lowercase even though the canonical on-disk spellings
+        # are typically ".R"/".Rmd" -- the set membership check is
+        # case-insensitive by construction, not by listing every case here.
+        ".r", ".qmd", ".rmd", ".sty", ".yml", ".yaml",
+    }
 )
 _METADATA_ONLY_SUFFIXES: frozenset[str] = frozenset({".npy"})
+
+# aa423c7e -- PDF is NOT a plaintext suffix (binary container format), so it
+# gets its own classification kind ("pdf_content") and its own bounded
+# extraction path (_extract_pdf_text) rather than being added to
+# _TEXT_CONTENT_SUFFIXES, which assumes UTF-8-decodable bytes (see
+# _read_text_capped / the fast-path decode in _analyse_file). Extraction is
+# lazy (pypdf imported on first use) and bounded on three independent axes
+# -- byte size, page count, and wall-clock time -- because a PDF can be
+# pathological on any of those axes independently of the other two (e.g. a
+# small file with thousands of pages, or a few huge/malformed pages that
+# stall a parser). Any cap exceeded, any parse failure, or the dependency
+# being unavailable all degrade to header-only (filename) indexing rather
+# than raising -- matching this module's existing degrade pattern
+# everywhere else (_xxh3_file's lazy-import fallback, npy_metadata's
+# try/except). Portable across platforms: time.monotonic() polled between
+# pages, never signal/alarm-based (this codebase runs on Windows, which has
+# no SIGALRM).
+_PDF_SUFFIXES: frozenset[str] = frozenset({".pdf"})
+_PDF_MAX_BYTES = 10 * 1024 * 1024
+_PDF_MAX_PAGES = 200
+_PDF_TIMEOUT_SECONDS = 5.0
 
 _SCRIPT_HINT_KEYS: tuple[str, ...] = (
     "generating_script", "generated_by", "source_script", "script",
@@ -1390,6 +1427,8 @@ def _classify_suffix(path: str) -> str:
         return "text_content"
     if suffix in _METADATA_ONLY_SUFFIXES:
         return "metadata_only"
+    if suffix in _PDF_SUFFIXES:
+        return "pdf_content"
     return "binary_metadata"
 
 
@@ -1511,6 +1550,92 @@ def _extract_json(text: str) -> tuple[list[str] | None, str | None]:
     return keys, script
 
 
+def _extract_pdf_text(
+    data: bytes,
+    *,
+    max_bytes: int = _PDF_MAX_BYTES,
+    max_pages: int = _PDF_MAX_PAGES,
+    timeout_seconds: float = _PDF_TIMEOUT_SECONDS,
+) -> str | None:
+    """Bounded best-effort text extraction from raw PDF bytes.
+
+    aa423c7e -- Returns ``None`` (never raises) whenever extraction cannot
+    safely proceed: the optional ``pypdf`` dependency is missing, ``data``
+    exceeds ``max_bytes``, the document exceeds ``max_pages``, the file is
+    malformed/unparseable, or a single page's extraction raises. ``None``
+    means "index this file as header/filename-only", the same degrade every
+    other optional-dependency path in this module already uses (see
+    _xxh3_file, npy_metadata).
+
+    Three independent bounds, because a PDF can be pathological on any one
+    of them without the others catching it:
+      - ``max_bytes`` -- caller-side size cap (checked here too, not just by
+        the caller, so this function is safe to call directly in tests).
+      - ``max_pages`` -- a small file can still declare an enormous page
+        count.
+      - ``timeout_seconds`` -- wall-clock budget polled via
+        time.monotonic() between pages (never signal/alarm-based -- this
+        codebase runs on Windows, which has no SIGALRM). On timeout, this
+        returns whatever text had already been extracted from prior pages
+        rather than discarding it -- a clean, bounded partial result, not a
+        hang and not an exception.
+    """
+    if len(data) > max_bytes:
+        return None
+    try:
+        import pypdf  # noqa: PLC0415 -- optional, lazy
+    except ImportError:
+        return None
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        num_pages = len(reader.pages)
+    except Exception:  # noqa: BLE001 -- malformed/encrypted/unparseable PDF
+        return None
+    if num_pages > max_pages:
+        return None
+    deadline = time.monotonic() + timeout_seconds
+    parts: list[str] = []
+    for page in reader.pages:
+        if time.monotonic() >= deadline:
+            break
+        try:
+            text = page.extract_text() or ""
+        except Exception:  # noqa: BLE001 -- one bad page must not abort the rest
+            continue
+        if text:
+            parts.append(text)
+    if not parts:
+        return None
+    return _sanitize_text_content("\n".join(parts))[:_MAX_CONTENT_CHARS]
+
+
+def _extract_pdf_text_from_path(path: str) -> str | None:
+    """Path-based wrapper for :func:`_extract_pdf_text`.
+
+    Reads at most ``_PDF_MAX_BYTES + 1`` bytes so an oversized PDF is never
+    fully loaded into memory just to discover it exceeds the cap -- a
+    tighter bound than the fast analysis path in :func:`_analyse_file` can
+    offer, since that path already holds the whole file in memory for
+    hashing before this is ever consulted.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(_PDF_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(data) > _PDF_MAX_BYTES:
+        return None
+    # Forward the live module-level bounds explicitly rather than relying on
+    # _extract_pdf_text's own default parameters: default-argument values
+    # are bound once at function-definition time, so a caller that wants
+    # runtime-tunable bounds (e.g. tests overriding OL._PDF_MAX_PAGES) must
+    # re-read the globals here, at call time, for the override to matter.
+    return _extract_pdf_text(
+        data, max_bytes=_PDF_MAX_BYTES, max_pages=_PDF_MAX_PAGES,
+        timeout_seconds=_PDF_TIMEOUT_SECONDS,
+    )
+
+
 @dataclass
 class FileFingerprint:
     """Cheap content-derived signature for one output file."""
@@ -1520,6 +1645,13 @@ class FileFingerprint:
     csv_columns: list[str] | None = None
     json_keys: list[str] | None = None
     generating_script: str | None = None
+    # aa423c7e -- extracted PDF body text (kind == "pdf_content" only), None
+    # when extraction degraded (missing dependency, cap exceeded, malformed
+    # file) or the kind isn't PDF. Stored here (unlike the plaintext kinds,
+    # which re-read the file on demand in _content_for_fts) because PDF
+    # extraction is comparatively expensive -- computing it once in
+    # file_fingerprint and reusing it avoids parsing the same PDF twice.
+    pdf_text: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1528,6 +1660,16 @@ class FileFingerprint:
 def file_fingerprint(path: str) -> FileFingerprint:
     """Compute a cheap FileFingerprint for one output file."""
     kind = _classify_suffix(path)
+    if kind == "pdf_content":
+        pdf_text = _extract_pdf_text_from_path(path)
+        # aa423c7e -- extend the same generating-script-hint inference every
+        # other text-shaped kind already gets (see the non-.csv branch
+        # below) to extracted PDF body text, so a PDF report carrying a
+        # "generated by X.py" provenance line is discoverable the same way
+        # a .txt/.md report already is.
+        script = _infer_generating_script_from_text(pdf_text) if pdf_text else None
+        return FileFingerprint(path=path, kind=kind,
+                               pdf_text=pdf_text, generating_script=script)
     if kind != "text_content":
         return FileFingerprint(path=path, kind=kind)
     try:
@@ -1560,6 +1702,9 @@ def _content_for_fts(
     if fingerprint.generating_script:
         terms.append(fingerprint.generating_script)
     header = " ".join(terms)
+    if fingerprint.kind == "pdf_content":
+        pdf_body = body if body is not None else fingerprint.pdf_text
+        return f"{header}\n{pdf_body}" if pdf_body else header
     if fingerprint.kind != "text_content":
         return header
     if body is None:
@@ -1841,7 +1986,25 @@ def _analyse_file(
             h.update(data)
             sha = h.hexdigest()
             kind = _classify_suffix(path)
-            if kind != "text_content":
+            if kind == "pdf_content":
+                # aa423c7e -- reuse the bytes already read for hashing above
+                # instead of reopening the file; _extract_pdf_text applies
+                # its own independent byte/page/time bounds regardless of
+                # how large ``data`` already is (see its docstring -- this
+                # fast path's hash-read is unbounded by design, pre-dating
+                # this change, so the PDF-specific bound has to be enforced
+                # here rather than relied upon from that read).
+                pdf_text = _extract_pdf_text(
+                    data, max_bytes=_PDF_MAX_BYTES, max_pages=_PDF_MAX_PAGES,
+                    timeout_seconds=_PDF_TIMEOUT_SECONDS,
+                )
+                pdf_script = (
+                    _infer_generating_script_from_text(pdf_text) if pdf_text else None
+                )
+                fp = FileFingerprint(path=path, kind=kind, pdf_text=pdf_text,
+                                     generating_script=pdf_script)
+                fts_content = _content_for_fts(path, fp, body=pdf_text)
+            elif kind != "text_content":
                 fp = FileFingerprint(path=path, kind=kind)
                 fts_content = _content_for_fts(path, fp)
             else:

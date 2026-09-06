@@ -95,9 +95,10 @@ EXPECTED_HANDLER_NAMES = [
     "handle_get_workspace_proposals",
     "handle_advance_proposal_status",
     "handle_promote_proposal",
+    "handle_add_proposal",
 ]
 
-# All 46 tool names that must be covered by the dispatch table.
+# All tool names that must be covered by the dispatch table.
 ALL_TOOL_NAMES = [
     "pin_decision",
     "update_decision",
@@ -145,11 +146,12 @@ ALL_TOOL_NAMES = [
     "get_workspace_proposals",
     "advance_proposal_status",
     "promote_proposal",
+    "add_proposal",
 ]
 
 
 def test_all_expected_handlers_are_importable():
-    """All 46 per-tool handlers must be importable from the new submodule."""
+    """All per-tool handlers must be importable from the new submodule."""
     for name in EXPECTED_HANDLER_NAMES:
         assert hasattr(nd_mod, name), f"Missing handler: {name}"
 
@@ -928,6 +930,46 @@ async def test_promote_proposal_handler_direct_missing_project(db):
     assert "error" in result
 
 
+@pytest.mark.asyncio
+async def test_add_proposal_dispatch_project_scoped(db, project):
+    result = await mh._handle_notes_decisions(
+        "add_proposal",
+        {"project_id": project["id"], "title": "Project idea", "body": "body"},
+        db, _DATA_DIR, None, None,
+    )
+    assert result.get("scope_type") == "project"
+    assert result.get("project_id") == project["id"]
+
+
+@pytest.mark.asyncio
+async def test_add_proposal_handler_direct_workspace_scope(db):
+    result = await nd_mod.handle_add_proposal(
+        {"title": "Workspace idea", "body": "body", "scope": "workspace"},
+        db, _DATA_DIR, None, "t-ap-ws",
+    )
+    assert result.get("scope_type") == "workspace"
+    assert result.get("project_id") in (None, "")
+
+
+@pytest.mark.asyncio
+async def test_add_proposal_requires_project_or_workspace_scope(db):
+    result = await nd_mod.handle_add_proposal(
+        {"title": "Ambiguous idea", "body": "body"},
+        db, _DATA_DIR, None, "t-ap-amb",
+    )
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_add_proposal_rejects_both_project_id_and_workspace_scope(db, project):
+    result = await nd_mod.handle_add_proposal(
+        {"project_id": project["id"], "title": "Conflicting idea", "body": "body",
+         "scope": "workspace"},
+        db, _DATA_DIR, None, "t-ap-conflict",
+    )
+    assert "error" in result
+
+
 # ---------------------------------------------------------------------------
 # Document-structure tools: error paths (no real file, just guard checks)
 # ---------------------------------------------------------------------------
@@ -1175,12 +1217,12 @@ async def test_link_table_caption_missing_doc(db, project):
 
 
 # ---------------------------------------------------------------------------
-# Dispatch-table completeness: none of the 46 known tool names returns _MISS
+# Dispatch-table completeness: none of the known tool names returns _MISS
 # ---------------------------------------------------------------------------
 
 def test_handler_names_match_all_tools():
     """Sanity: EXPECTED_HANDLER_NAMES and ALL_TOOL_NAMES must be same length."""
-    assert len(EXPECTED_HANDLER_NAMES) == len(ALL_TOOL_NAMES) == 46
+    assert len(EXPECTED_HANDLER_NAMES) == len(ALL_TOOL_NAMES) == 47
 
 
 # ---------------------------------------------------------------------------

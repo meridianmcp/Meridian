@@ -1333,11 +1333,12 @@ def edit_citation(
     new_formatted_text: str | None = None,
     source: str = "zotero",
     index_db_path: str | None = None,
+    match_display_text: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
     """9d749639 — Replace an existing CSL_CITATION field with updated keys/text.
 
-    Locates the first complex field in the paragraph whose instrText contains
+    Locates the complex field in the paragraph whose instrText contains
     CSL_CITATION, removes the old field runs (begin through end), and inserts a
     new complex field with the updated keys / formatted text in their place.
 
@@ -1351,6 +1352,11 @@ def edit_citation(
       new_formatted_text: Replacement display text (None = keep existing).
       source:             "zotero" or "csl".
       index_db_path:      If supplied, sidecar is invalidated after write.
+      match_display_text: Required when the paragraph holds more than one
+                          CSL_CITATION field -- a substring of the target
+                          field's rendered display text that identifies
+                          which one to edit. Ignored when the paragraph has
+                          exactly one field.
       session_id:         273df573 — identifies the calling Meridian session
                           to the tunnel-layer DOCX region-claim guard
                           (check_docs_write_conflict in meridian/routes/
@@ -1361,7 +1367,8 @@ def edit_citation(
 
     Returns:
       {status, anchor_para_id, citation_keys, formatted_text, source, docx_path}
-      or {error: <message>} on failure.
+      or {error: <message>} on failure (reason="ambiguous_citation_fields"
+      when disambiguation is needed).
     """
     return docs_intel.edit_citation(
         docx_path=docx_path,
@@ -1370,6 +1377,7 @@ def edit_citation(
         new_formatted_text=new_formatted_text,
         source=source,
         index_db_path=index_db_path,
+        match_display_text=match_display_text,
     )
 
 
@@ -1378,9 +1386,10 @@ def remove_citation(
     docx_path: str,
     anchor_para_id: str,
     index_db_path: str | None = None,
+    match_display_text: str | None = None,
     session_id: str | None = None,
 ) -> dict[str, Any]:
-    """9d749639 — Remove the first CSL_CITATION complex field from a paragraph.
+    """9d749639 — Remove a CSL_CITATION complex field from a paragraph.
 
     Locates the field by scanning for a complex field (fldChar begin...end)
     whose instrText contains CSL_CITATION, removes all its constituent runs,
@@ -1390,6 +1399,12 @@ def remove_citation(
       docx_path:       Absolute path to the .docx file (mutated in place).
       anchor_para_id:  w14:paraId or p{N} of the paragraph to edit.
       index_db_path:   If supplied, sidecar is invalidated after write.
+      match_display_text: Required when the paragraph holds more than one
+                       CSL_CITATION field -- a substring of the target
+                       field's rendered display text (e.g. the
+                       formatted_text originally passed to insert_citation)
+                       that identifies which one to remove. Ignored when the
+                       paragraph has exactly one field.
       session_id:      273df573 — identifies the calling Meridian session to
                        the tunnel-layer DOCX region-claim guard
                        (check_docs_write_conflict in meridian/routes/
@@ -1399,12 +1414,14 @@ def remove_citation(
 
     Returns:
       {status, anchor_para_id, docx_path}
-      or {error: <message>} on failure.
+      or {error: <message>} on failure (reason="ambiguous_citation_fields"
+      when disambiguation is needed).
     """
     return docs_intel.remove_citation(
         docx_path=docx_path,
         anchor_para_id=anchor_para_id,
         index_db_path=index_db_path,
+        match_display_text=match_display_text,
     )
 
 
@@ -2487,6 +2504,133 @@ def relocate_table(
         allow_bookmark_split=allow_bookmark_split,
         draft_output_path=draft_output_path,
         wave_run_id=wave_run_id,
+    )
+
+
+@mcp.tool()
+def insert_table(
+    docx_path: str,
+    anchor_para_id: str,
+    rows: int,
+    cols: int,
+    position: str = "after",
+    cell_texts: list[list[str]] | None = None,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """0a1e9c22 — Insert a brand-new bare <w:tbl> at a position relative to an
+    anchor paragraph, atomically.
+
+    rows/cols are always caller-specified — there is no implicit default
+    shape, the same discipline split_cell already applies to its own
+    cols/rows. Table STYLE, though, is not a real design question: every new
+    table uses Word's own built-in "TableGrid" style, the same style Word
+    itself applies via the ribbon's default table insert. Column widths
+    split the page's standard 9000-twip (6.25in) content width evenly across
+    cols.
+
+    position="before"/"after" (default) mirrors relocate_table's destination
+    handling exactly, including the heading-anchor special case: an "after"
+    anchor that resolves to a HEADING lands the table after that heading's
+    ENTIRE section, not merely after the heading paragraph.
+
+    Each new cell gets one empty paragraph (fresh w14:paraId) unless
+    cell_texts supplies literal text for it.
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      anchor_para_id:  w14:paraId (or p{N}) of the paragraph to insert the
+                       table next to.
+      rows:            Number of rows (int >= 1). Required, never defaulted.
+      cols:            Number of grid columns (int >= 1). Required, never
+                       defaulted.
+      position:        "before" or "after" (default) the anchor.
+      cell_texts:      Optional rows x cols list of literal cell text; a
+                       cell not covered by it (or when omitted entirely)
+                       gets one empty paragraph.
+      index_db_path:   If supplied, sidecar is invalidated after write.
+      allow_degraded_render: Explicit, audited opt-in to accept this write
+                       when no render backend is available. Requires
+                       degraded_render_reason.
+      degraded_render_reason: Required, non-empty when
+                       allow_degraded_render is True.
+      session_id:      273df573 — identifies the calling Meridian session to
+                       the tunnel-layer DOCX region-claim guard
+                       (check_docs_write_conflict in meridian/routes/
+                       tunnel.py). Not forwarded to docs_intel; has no effect
+                       when this tool is invoked outside Meridian's tunnel
+                       (e.g. standalone `uvx meridian-docs`).
+
+    Returns:
+      {status, table_index, row_count, col_count, anchor_para_id, position,
+      docx_path, render_status, render_verified, render_backend,
+      render_detail} or {error: <message>} (file NOT mutated on error).
+    """
+    return docs_intel.insert_table(
+        docx_path=docx_path,
+        anchor_para_id=anchor_para_id,
+        rows=rows,
+        cols=cols,
+        position=position,
+        cell_texts=cell_texts,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+
+@mcp.tool()
+def remove_table(
+    docx_path: str,
+    table_index: int,
+    index_db_path: str | None = None,
+    allow_bookmark_split: bool = False,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """0a1e9c22 — Remove an existing bare <w:tbl> from the document body,
+    atomically.
+
+    Mirrors relocate_table's addressing (0-based body-child table_index) and
+    safety discipline (bookmark-split guard, mandatory post-write
+    structural-count verification, promotion lock) but for deletion rather
+    than relocation. Verification checks structural counts only (table_count
+    and paragraph_count reduced by exactly the removed table's own content,
+    computed from the table BEFORE it is cut) — there is no destination
+    content to hash-verify the way a move has. Does not invoke the Word-COM
+    render-verification gate: deleting valid content can't manufacture
+    malformed OOXML, the same reasoning relocate_table already applies.
+
+    Does NOT remove an adjacent caption paragraph and does NOT call
+    renumber_sequences — same disclosed scope boundary as relocate_table
+    (SEQ Table numbering is unaffected by this call).
+
+    Args:
+      docx_path:       Absolute path to the .docx file (mutated in place).
+      table_index:      0-based body-child position of the <w:tbl> to remove
+                        (same addressing as relocate_table).
+      index_db_path:    If supplied, sidecar is invalidated after write.
+      allow_bookmark_split: Explicit override (default False) to proceed
+                        even when removing the table would split a
+                        bookmark's start/end pair across the removed range.
+      session_id:       273df573 — identifies the calling Meridian session
+                        to the tunnel-layer DOCX region-claim guard
+                        (check_docs_write_conflict in meridian/routes/
+                        tunnel.py). Not forwarded to docs_intel; has no
+                        effect when this tool is invoked outside Meridian's
+                        tunnel (e.g. standalone `uvx meridian-docs`).
+
+    Returns:
+      {status, table_index, row_count, col_count, docx_path} or
+      {error: <message>} on failure (file NOT mutated, including on a
+      post-write verification failure, best-effort restored from backup).
+    """
+    return docs_intel.remove_table(
+        docx_path=docx_path,
+        table_index=table_index,
+        index_db_path=index_db_path,
+        allow_bookmark_split=allow_bookmark_split,
     )
 
 

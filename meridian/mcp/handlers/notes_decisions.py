@@ -2430,7 +2430,12 @@ async def handle_get_workspace_proposals(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: get_workspace_proposals."""
+    """MCP tool: get_workspace_proposals.
+
+    a8afd8f9 — optional ``project_id``/``project_name`` (the dispatcher
+    already resolved project_name to project_id before this handler runs)
+    restricts the listing to that project's proposals only. Omitted (the
+    default) preserves the unchanged prior behavior."""
     return await db_module.get_workspace_proposals(
         db, status=args.get("status"), tag=args.get("tag"),
         tenant_id=_mcp_tenant_id,
@@ -2438,6 +2443,7 @@ async def handle_get_workspace_proposals(
         offset=int(args.get("offset", 0)),
         family_id=args.get("family_id"),
         sort_by=args.get("sort_by", "activity"),
+        project_id=args.get("project_id") or None,
     )
 
 
@@ -2470,7 +2476,12 @@ async def handle_promote_proposal(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """MCP tool: promote_proposal."""
+    """MCP tool: promote_proposal.
+
+    a8afd8f9 — optional ``allow_project_transfer`` + ``transfer_reason``
+    acknowledge promoting a project-scoped proposal into a DIFFERENT project
+    than the one it was created under; omitted, a scope mismatch is rejected
+    (see ``promote_workspace_proposal``'s docstring)."""
     _promo_project_id = args.get("project_id") or ""
     if not _promo_project_id:
         return {"error": "project_id (or project_name) is required for promote_proposal"}
@@ -2483,14 +2494,71 @@ async def handle_promote_proposal(
             touches_resources=args.get("touches_resources"),
             infer_touches_resources=args.get("infer_touches_resources", False),
             file_github_issue=args.get("file_github_issue", False),
+            allow_project_transfer=args.get("allow_project_transfer", False),
+            transfer_reason=args.get("transfer_reason"),
         )
     except (ValueError, ProposalSchemaError) as exc:
-        # ValueError covers not-found/wrong-state and 867317f6's lost
-        # double-promotion race; ProposalSchemaError covers a mid-migration
-        # schema on this backend. Both come back deterministically instead
-        # of an unhandled exception or a silently-duplicated sprint item.
+        # ValueError covers not-found/wrong-state, 867317f6's lost
+        # double-promotion race, and a8afd8f9's project-scope mismatch;
+        # ProposalSchemaError covers a mid-migration schema on this backend.
+        # Both come back deterministically instead of an unhandled exception
+        # or a silently-duplicated sprint item.
         return {"error": str(exc)}
     return result
+
+
+# ---------------------------------------------------------------------------
+# Section 14b: Project-scoped proposals as the default (a8afd8f9)
+# ---------------------------------------------------------------------------
+
+async def handle_add_proposal(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: add_proposal (a8afd8f9 — project-scoped proposals as the
+    default entry point; add_workspace_proposal remains the explicit
+    workspace-global opt-in, unchanged).
+
+    Requires the caller to be explicit about scope — never inferred from an
+    absent id: pass ``project_id`` (or ``project_name``, already resolved to
+    project_id by the dispatcher before this handler runs) for a
+    project-scoped proposal, XOR pass ``scope='workspace'`` to explicitly
+    opt into the original workspace-global behavior. Neither, or both, is a
+    hard {"error": ...} — never a guess."""
+    validate_input_size(args.get("title"), "proposal title", 500)
+    validate_input_size(args.get("body"), "proposal body", 100_000)
+    _project_id = args.get("project_id") or ""
+    _scope = (args.get("scope") or "").strip().lower()
+    if _scope and _scope not in ("project", "workspace"):
+        return {"error": f"Invalid scope '{_scope}' for add_proposal. Use 'project' or 'workspace'."}
+    if _scope == "workspace":
+        if _project_id:
+            return {
+                "error": "add_proposal got both project_id (or project_name) and "
+                "scope='workspace' — pass one or the other, not both."
+            }
+    elif not _project_id:
+        return {
+            "error": "add_proposal requires project_id (or project_name) to scope "
+            "the proposal to a project, or scope='workspace' to explicitly opt "
+            "into a workspace-global proposal instead (like add_workspace_proposal)."
+        }
+    try:
+        return await db_module.add_workspace_proposal(
+            db, args["title"], args["body"],
+            tags=args.get("tags"),
+            tenant_id=_mcp_tenant_id,
+            family_id=args.get("family_id"),
+            idempotency_key=args.get("idempotency_key"),
+            project_id=_project_id or None,
+        )
+    except (ValueError, ProposalSchemaError) as exc:
+        # ValueError: the given project_id doesn't resolve to a real project.
+        # ProposalSchemaError: a mid-migration schema on this backend.
+        return {"error": str(exc)}
 
 
 # ---------------------------------------------------------------------------

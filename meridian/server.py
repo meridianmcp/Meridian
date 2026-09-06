@@ -4114,24 +4114,35 @@ async def mcp_tools_doc() -> str:
         "---\n",
         "\n",
     ]
-    lines += ["## Workspace proposals\n"]
+    lines += ["## Proposals\n"]
+    lines += _render_tool("add_proposal",
+        "Capture an idea into a proposal — PROJECT-SCOPED BY DEFAULT (a8afd8f9). The preferred entry "
+        "point going forward. Pass `project_id`/`project_name` to scope it to a project, XOR "
+        "`scope='workspace'` to explicitly opt into a workspace-global proposal instead — an ambiguous "
+        "call (neither, or both) is rejected rather than guessed. NOT executor-claimable. status: "
+        "raw → investigating → promoted|rejected. Use `advance_proposal_status` to move through the "
+        "lifecycle; `promote_proposal` to convert one into a real sprint item.")
     lines += _render_tool("add_workspace_proposal",
         "Capture a workspace-level flash of insight into the 'drawer of inspiration' — cross-project ideas that "
-        "don't belong to any one project yet. NOT executor-claimable. status: raw → investigating → promoted|rejected. "
+        "don't belong to any one project yet. The explicit workspace-global opt-in (see `add_proposal` for the "
+        "project-scoped default). NOT executor-claimable. status: raw → investigating → promoted|rejected. "
         "Use `advance_proposal_status` to move through the lifecycle; `promote_proposal` to convert one into a real sprint item.")
     lines += _render_tool("get_workspace_proposals",
         "Read-only: List workspace proposals (human-authored flashes of insight), newest first. "
         "When status is omitted, defaults to 'live' proposals only (raw + investigating) — terminal "
         "proposals (promoted/rejected) are excluded. Pass status='all' for every status, or an "
         "explicit status (including promoted/rejected) to filter to just that one. Optional tag "
-        "substring filter.")
+        "substring filter. Pass `project_id`/`project_name` to restrict the listing to that project's "
+        "proposals only (a8afd8f9) — omitted, proposals of any scope are returned.")
     lines += _render_tool("advance_proposal_status",
         "Transition a workspace proposal through its lifecycle (raw → investigating|rejected; "
         "investigating → promoted|rejected|raw; rejected → raw). 'promoted' is a terminal status "
         "reachable only via `promote_proposal`.")
     lines += _render_tool("promote_proposal",
         "Promote a workspace proposal into a real sprint item, creating the link between them. "
-        "The proposal must be in 'raw' or 'investigating' state. Returns {proposal, sprint_item_id, sprint_item_title, project_id}.")
+        "The proposal must be in 'raw' or 'investigating' state. When the proposal is project-scoped "
+        "and this call's project differs, promotion is rejected unless `allow_project_transfer=True` "
+        "is passed with a `transfer_reason` (a8afd8f9). Returns {proposal, sprint_item_id, sprint_item_title, project_id}.")
     lines += ["## Notes\n"]
     lines += _render_tool("add_note",
         "Add a per-project wiki note. Use for setup instructions, gotchas, environment details, how-tos.")
