@@ -253,17 +253,20 @@ async def test_scoped_project_ids_blocks_project_id_project_name_bypass(db):
         scoped_project_ids=[in_scope["id"]],  # out_of_scope deliberately excluded
     )
 
-    # Must NOT succeed as a top-level JSON-RPC error (the protocol-level gate
-    # never fires here, by design — project_id alone is in scope) NOR as a
-    # silent success. It must come back as a tool-level {"error": ...} refusal
-    # from inside the handler itself.
-    assert "error" not in resp, (
-        "expected a normal JSON-RPC envelope with a tool-level error, not a "
-        f"protocol-level error: {resp}"
-    )
-    payload = json.loads(resp["result"]["content"][0]["text"])
-    assert "error" in payload, f"bypass succeeded silently: {payload}"
-    assert "access scope" in payload["error"]
+    # Must NOT succeed silently. Two valid ways to be refused now coexist:
+    # a9c041d7's systemic re-check inside _dispatch_mcp_tool runs FIRST (right
+    # after the project_name resolver, before any handler group dispatch) and
+    # raises the same ValueError the pre-dispatch gate uses, surfacing as a
+    # protocol-level JSON-RPC error -- so it fires before this tool's own
+    # handler-level check (84f77597 round 2) is ever reached. Accept either
+    # shape: the important invariant is that the bypass is refused, not which
+    # of the two (now redundant) layers caught it.
+    if "error" in resp:
+        assert "access scope" in resp["error"]["message"]
+    else:
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        assert "error" in payload, f"bypass succeeded silently: {payload}"
+        assert "access scope" in payload["error"]
 
     # The workspace note must be completely untouched — no partial mutation,
     # not moved into EITHER project.
@@ -293,9 +296,13 @@ async def test_scoped_project_ids_bypass_blocked_regardless_of_dispatch_order(db
         db=db, data_dir="/tmp",
         scoped_project_ids=[in_scope["id"]],
     )
-    assert "error" not in resp
-    payload = json.loads(resp["result"]["content"][0]["text"])
-    assert "error" in payload
+    # See the sibling test above: a9c041d7's systemic pre-dispatch re-check
+    # now fires first, so either error shape is an acceptable refusal.
+    if "error" in resp:
+        assert "access scope" in resp["error"]["message"]
+    else:
+        payload = json.loads(resp["result"]["content"][0]["text"])
+        assert "error" in payload
     assert {n["title"] for n in await db_module.get_workspace_notes(db)} == {"order-target"}
 
 
