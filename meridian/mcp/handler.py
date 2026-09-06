@@ -4664,7 +4664,7 @@ async def _handle_file_claims(
     tenant: dict[str, Any] | None,
     _mcp_tenant_id: Any,
 ) -> Any:
-    """Dispatch group: claim_file, get_file_claims, get_symbol_claims, get_symbol_hotspots, release_file, get_graph_diff, snapshot_graph_metrics, claim_docx_region, get_docx_region_claims, release_docx_region_claims."""
+    """Dispatch group: claim_file, get_file_claims, get_symbol_claims, get_symbol_hotspots, release_file, get_graph_diff, snapshot_graph_metrics, claim_docx_region, get_docx_region_claims, release_docx_region_claims, list_active_worktrees, list_worktrees_pending_cleanup."""
     if name == "claim_file":
         # 4bac57ff — symbol-level claim when both `symbol` and `content` are
         # supplied; otherwise the coarse whole-file lock. Falls back to a
@@ -4698,6 +4698,23 @@ async def _handle_file_claims(
     if name == "get_file_claims":
         return await db_module.get_file_claims(
             db, args["file_path"], args.get("project_id"), args.get("symbol")
+        )
+    if name == "list_active_worktrees":
+        # dffcde86 — project_id is required at the DB layer; the b6ab6e83
+        # project_name resolver above (in _dispatch_mcp_tool) has already
+        # folded a resolved project_name into args["project_id"] by the time
+        # this runs, so only a genuinely absent project_id/project_name
+        # reaches this guard.
+        _wt_pid = (args.get("project_id") or "").strip()
+        if not _wt_pid:
+            return {"error": "project_id is required (or pass project_name)"}
+        return await db_module.list_active_worktrees(db, _wt_pid)
+    if name == "list_worktrees_pending_cleanup":
+        # dffcde86 (a03c0eeb) — project_id is optional here: omitting it
+        # scopes across every project, matching the server-wide periodic
+        # sweep's own query (db_module.list_worktrees_pending_cleanup).
+        return await db_module.list_worktrees_pending_cleanup(
+            db, args.get("project_id") or None
         )
     if name == "store_finding":
         validate_input_size(args.get("content"), "finding content", 1_000_000)

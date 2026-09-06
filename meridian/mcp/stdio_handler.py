@@ -367,6 +367,12 @@ def build_mcp_server():
                     "required": ["session_id", "file_path"],
                 },
             ),
+            # dffcde86 — _shared_tool() pulls the exact same schema HTTP/MCP
+            # advertises from _MCP_TOOLS_LIST, so this transport can't drift
+            # out of sync with it (same pattern as load_handoff/start_session
+            # above).
+            _shared_tool("list_active_worktrees"),
+            _shared_tool("list_worktrees_pending_cleanup"),
             Tool(
                 name="idle_until_session_done",
                 description=(
@@ -2604,6 +2610,11 @@ def build_mcp_server():
                 "add_workspace_note", "get_workspace_notes",
                 "get_workspace_proposals",
                 "pin_workspace_decision", "get_workspace_decisions",
+                # dffcde86 — dispatches to the _handle_file_claims group's
+                # list_active_worktrees / list_worktrees_pending_cleanup
+                # branches in meridian/mcp/handler.py (mirrors that group's
+                # existing get_file_claims branch).
+                "list_active_worktrees", "list_worktrees_pending_cleanup",
             ):
                 # v2.4/v0.9 — share dispatch with HTTP MCP so both surfaces stay in sync.
                 result = await _dispatch_mcp_tool(

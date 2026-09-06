@@ -3225,6 +3225,39 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "min_sessions": {"type": "integer"},
          "days": {"type": "integer"}},
          "required": []}},
+    {"name": "list_active_worktrees", "description":
+        "dffcde86 — Read-only: list active (not-removed) git worktrees "
+        "registered for a project, newest first, each row including the "
+        "owning session's name. Reads the same active_worktrees registry "
+        "the merge guard (validate_worktree_merge) and the REST worktree "
+        "endpoints (GET /projects/{id}/worktrees) use — this is the MCP-side "
+        "view of it, for a session that wants to check what's checked out "
+        "before creating a new worktree or investigating a stale one, "
+        "without going through the REST API. Works identically on hosted "
+        "and self-hosted Meridian: it only reads DB rows, never the "
+        "filesystem.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
+    {"name": "list_worktrees_pending_cleanup", "description":
+        "dffcde86 (a03c0eeb) — Read-only: list active_worktrees rows still "
+        "marked active in the DB (removed_at IS NULL) whose owning sprint "
+        "item has reached a terminal status (done/skipped/failed/pushed) or "
+        "whose owning session is closed/archived — the real disk-cleanup "
+        "candidates the periodic sweep (worktree_cleanup.sweep_stale_worktrees) "
+        "reclaims. On hosted Meridian the POST /worktrees/sweep endpoint is "
+        "an explicit filesystem no-op (hosted has no access to the caller's "
+        "disk, so there is nothing there to remove from disk) — this tool is "
+        "the DB-only, hosted-safe way to see which registry rows are stale "
+        "either way; actually clearing a row still requires the self-hosted "
+        "sweep or an explicit DELETE /projects/{id}/worktrees/{worktree_id}. "
+        "Omit project_id to scope across every project, matching the "
+        "server-wide periodic sweep's own query.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."}},
+         "required": []}},
     {"name": "claim_docx_region", "description":
         "f7ee1ba7 — Model B scoped-region claiming for .docx files. Claim a "
         "specific paragraph/element by its durable `element_id` (the w14:paraId "
@@ -3537,6 +3570,7 @@ _READ_ONLY_TOOLS = {
     "list_plugins", "get_plugin_details", "refresh_tool_manifest",
     "get_tunnel_diagnostics",
     "get_symbol_claims", "get_symbol_hotspots", "get_graph_diff",
+    "list_active_worktrees", "list_worktrees_pending_cleanup",
     "get_citation_edges",
     "find_similar_equation", "find_symbol_usages",
     "find_similar_figure",
@@ -3756,6 +3790,8 @@ _TOOL_CATEGORY: dict[str, str] = {
     "claim_docx_region":        "file-locking",
     "get_docx_region_claims":   "file-locking",
     "release_docx_region_claims": "file-locking",
+    "list_active_worktrees":       "file-locking",
+    "list_worktrees_pending_cleanup": "file-locking",
     # parallel coordination
     "send_message":      "parallel-coord",
     "receive_messages":  "parallel-coord",
@@ -3821,6 +3857,12 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "claim_docx_region":         "executor",
     "get_docx_region_claims":    "executor",
     "release_docx_region_claims": "executor",
+    # dffcde86 — "both": unlike get_file_claims/get_symbol_claims (executor-only
+    # above), a planner session legitimately wants to see what worktrees are
+    # checked out / pending cleanup too (e.g. before fanning out a wave), not
+    # just an executor mid-edit.
+    "list_active_worktrees":     "both",
+    "list_worktrees_pending_cleanup": "both",
     "insert_equation":           "executor",
     "update_paragraph":          "executor",
     "index_equation":            "executor",
