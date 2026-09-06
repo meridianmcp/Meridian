@@ -1075,6 +1075,45 @@ class TestFileFingerprint:
         assert fp.kind == "text_content"
         assert fp.csv_columns is None
 
+    def test_extract_json_skips_parse_when_truncated(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): text at/above _MAX_CONTENT_CHARS is a
+        very likely truncated fragment (missing its closing brackets) --
+        json.loads() must not even be attempted, since it would guarantee a
+        full-buffer parse failure for a large JSON file the content cap cut
+        off mid-structure."""
+        truncated_text = "x" * OL._MAX_CONTENT_CHARS
+
+        def _boom(*_a: object, **_kw: object) -> None:
+            raise AssertionError("json.loads should not be called for truncated text")
+
+        monkeypatch.setattr(OL.json, "loads", _boom)
+        keys, _script = OL._extract_json(truncated_text)
+        assert keys is None
+
+    def test_extract_json_still_parses_when_not_truncated(self) -> None:
+        keys, _script = OL._extract_json('{"alpha": 1}')
+        assert keys == ["alpha"]
+
+    def test_non_json_text_suffix_skips_json_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): only a literal .json suffix should
+        ever reach _extract_json -- the other _TEXT_CONTENT_SUFFIXES
+        entries (.txt/.md/.log/.r/.qmd/.rmd/.sty/.yml/.yaml) are not JSON,
+        and attempting json.loads() on them is a guaranteed-useless parse."""
+        f = tmp_path / "notes.txt"
+        f.write_text("plain text notes, not json", encoding="utf-8")
+
+        def _boom(*_a: object, **_kw: object) -> None:
+            raise AssertionError("json.loads should not be attempted for a .txt file")
+
+        monkeypatch.setattr(OL.json, "loads", _boom)
+        fp = OL.file_fingerprint(str(f))
+        assert fp.kind == "text_content"
+        assert fp.json_keys is None
+
 
 # ---------------------------------------------------------------------------
 # PDF body-content indexing (sprint item aa423c7e)
@@ -1648,6 +1687,26 @@ class TestOutputsFtsIndex:
         idx.close()
 
     @duckdb_required
+    def test_apply_precomputed_returns_int_count_not_row_list(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up (perf): _apply_precomputed used to build a
+        full list[OutputRow] (every all_paths entry present in
+        _row_cache) purely to hand the caller a len() -- confirmed unused
+        for anything else, while an unused `path_set` parameter sat right
+        there instead. Returns a plain int count now."""
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            count = idx.rebuild()
+            assert count == 2
+            assert idx.last_rebuild_metrics["rows_returned"] == 2
+            assert isinstance(idx.last_rebuild_metrics["rows_returned"], int)
+        finally:
+            idx.close()
+
+    @duckdb_required
     def test_empty_query_returns_empty(self, tmp_path: Path) -> None:
         idx = OL.OutputsFtsIndex(str(tmp_path))
         idx.rebuild()
@@ -1902,6 +1961,24 @@ class TestRowCacheContentEviction:
                 assert idx2._row_cache[key].sha256 is not None
         finally:
             idx2.close()
+
+    def test_light_row_returns_independent_copy(self) -> None:
+        """fa600e42 follow-up (perf): _light_row switched from
+        dataclasses.replace() to copy.copy()+attribute-set (replace() calls
+        dataclasses.fields()/getattr() on all 11 fields to rebuild a kwargs
+        dict for a full __init__ call, once per stale/new row every
+        rebuild()) -- must still return a genuinely independent object, not
+        the same instance or a shallow alias that leaks mutations back."""
+        original = OL.OutputRow(
+            path="/a/b.csv", content="body text", mtime=1.0, sha256="abc",
+            size=10, generating_script=None,
+        )
+        light = OL._light_row(original)
+        assert light is not original
+        assert light.content is None
+        assert original.content == "body text"
+        light.is_archival = True
+        assert original.is_archival is False
 
 
 # ---------------------------------------------------------------------------
@@ -2938,6 +3015,23 @@ class TestAnalyseFile:
             f"expected an unbounded fh.read() call on the fast path, got: {read_calls!r}"
         )
 
+    def test_fast_path_non_json_text_suffix_skips_json_parse(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): mirrors file_fingerprint's matching
+        fix -- the fast path must also route only a literal .json suffix
+        through _extract_json, not every non-CSV text_content suffix."""
+        f = tmp_path / "readme.md"
+        f.write_text("# Notes\nplain markdown, not json", encoding="utf-8")
+
+        def _boom(*_a: object, **_kw: object) -> None:
+            raise AssertionError("json.loads should not be attempted for a .md file")
+
+        monkeypatch.setattr(OL.json, "loads", _boom)
+        analysis = OL._analyse_file(str(f), OL._sha256_file)
+        assert analysis.fingerprint.kind == "text_content"
+        assert analysis.fingerprint.json_keys is None
+
 
 @duckdb_required
 class TestParallelRebuildCorrectness:
@@ -3742,6 +3836,153 @@ class TestWriteSecondsSubMetrics:
                 == "values_fallback"
             )
             assert idx._pyarrow_missing_warned is True
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_db_insert_marshal_and_engine_sub_metrics_present(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up (perf): db_insert_seconds used to start its
+        timer before the Arrow table was even built, conflating pure-Python
+        marshalling (list building + json.dumps) with real DuckDB engine
+        time -- biasing any future insert-mechanism A/B. These two new
+        sub-metrics separate them; db_insert_seconds itself is unchanged."""
+        pytest.importorskip("pyarrow")
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            assert m["bulk_insert_path"] == "pyarrow"
+            assert "db_insert_marshal_seconds" in m
+            assert "db_insert_engine_seconds" in m
+            assert m["db_insert_marshal_seconds"] >= 0
+            assert m["db_insert_engine_seconds"] >= 0
+            assert (
+                m["db_insert_marshal_seconds"] + m["db_insert_engine_seconds"]
+                <= m["db_insert_seconds"] + 1e-3
+            )
+        finally:
+            idx.close()
+
+    @staticmethod
+    def _install_execute_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Wrap real duckdb.connect() so every SQL string executed through
+        it is captured, in order, while still running against a real
+        in-process DuckDB connection underneath."""
+        import duckdb
+
+        real_connect = duckdb.connect
+        captured: list[str] = []
+
+        class _ExecuteSpyCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                captured.append(sql)
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect", lambda *a, **kw: _ExecuteSpyCon(real_connect(*a, **kw)),
+        )
+        return captured
+
+    @duckdb_required
+    def test_db_write_wrapped_in_explicit_transaction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): DuckDB's own INSERT docs warn that
+        autocommitted statements in a loop each pay their own fsync --
+        the whole delete+insert sequence must run inside one explicit
+        BEGIN TRANSACTION/COMMIT, matching the pattern
+        _migrate_legacy_storage_paths_locked already uses elsewhere in
+        this same class."""
+        captured = self._install_execute_spy(monkeypatch)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+        finally:
+            idx.close()
+        assert "BEGIN TRANSACTION" in captured
+        assert "COMMIT" in captured
+        begin_idx = captured.index("BEGIN TRANSACTION")
+        commit_idx = captured.index("COMMIT")
+        insert_idx = next(
+            i for i, sql in enumerate(captured)
+            if "INSERT OR REPLACE INTO outputs_index" in sql
+        )
+        assert begin_idx < insert_idx < commit_idx
+
+    @duckdb_required
+    def test_bulk_insert_select_has_order_by_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): DuckDB issue #11275 -- INSERT OR
+        REPLACE against an already-populated PRIMARY KEY table measured
+        3.7x-7.8x slower when the incoming batch isn't sorted by the
+        conflict key. This connection runs with
+        preserve_insertion_order=false (a deliberate, unrelated
+        OOM-avoidance setting), which per DuckDB's own Order Preservation
+        docs means a no-ORDER-BY SELECT may be silently re-ordered before
+        the upsert ever sees it, discarding new_rows' own upstream sort."""
+        pytest.importorskip("pyarrow")
+        captured = self._install_execute_spy(monkeypatch)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+        finally:
+            idx.close()
+        insert_sql = next(
+            sql for sql in captured if "INSERT OR REPLACE INTO outputs_index" in sql
+        )
+        assert "ORDER BY path" in insert_sql
+
+    @duckdb_required
+    def test_db_write_failure_rolls_back_transaction(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """fa600e42 follow-up (perf): a failure partway through the
+        delete/insert sequence must roll back the new explicit transaction
+        (not leave the connection sitting mid-transaction for the next
+        rebuild() call) and still surface via the existing
+        last_db_write_error contract -- rebuild() itself must not raise."""
+        pytest.importorskip("pyarrow")
+        import duckdb
+
+        real_connect = duckdb.connect
+        captured: list[str] = []
+
+        class _FailingInsertCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                captured.append(sql)
+                if sql.startswith("INSERT OR REPLACE INTO outputs_index"):
+                    raise RuntimeError("boom")
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect",
+            lambda *a, **kw: _FailingInsertCon(real_connect(*a, **kw)),
+        )
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.last_db_write_error is not None
+            assert "boom" in idx.last_db_write_error
+            assert "ROLLBACK" in captured
         finally:
             idx.close()
 

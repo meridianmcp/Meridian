@@ -24,6 +24,7 @@ Security requirements (non-negotiable, tested):
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import csv as csv_mod
 import fnmatch
 import hashlib
@@ -1550,13 +1551,25 @@ def _extract_csv(text: str) -> tuple[list[str] | None, str | None]:
 def _extract_json(text: str) -> tuple[list[str] | None, str | None]:
     keys: list[str] | None = None
     script: str | None = None
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            keys = [str(k) for k in obj.keys()]
-        script = _infer_generating_script_from_obj(obj)
-    except Exception:  # noqa: BLE001
-        keys = None
+    # fa600e42 follow-up (perf) -- both callers cap `text` to
+    # _MAX_CONTENT_CHARS chars before it reaches here. When len(text) has
+    # hit that cap, the buffer is very likely a truncated fragment of a
+    # larger file (missing its closing brackets/braces, mid-structure) --
+    # json.loads() cannot detect this until it has tokenized through the
+    # ENTIRE buffer looking for the now-absent closer, paying a full parse
+    # for a guaranteed JSONDecodeError. Skipping straight to the text-based
+    # script-hint fallback avoids that wasted parse. The rare false positive
+    # (a genuinely complete JSON file whose text happens to be EXACTLY
+    # _MAX_CONTENT_CHARS chars) only costs a missed json_keys extraction,
+    # not a correctness bug -- script inference still runs either way.
+    if len(text) < _MAX_CONTENT_CHARS:
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict):
+                keys = [str(k) for k in obj.keys()]
+            script = _infer_generating_script_from_obj(obj)
+        except Exception:  # noqa: BLE001
+            keys = None
     if script is None:
         script = _infer_generating_script_from_text(text)
     return keys, script
@@ -1693,7 +1706,16 @@ def file_fingerprint(path: str) -> FileFingerprint:
         columns, script = _extract_csv(text)
         return FileFingerprint(path=path, kind=kind,
                                csv_columns=columns, generating_script=script)
-    keys, script = _extract_json(text)
+    if suffix == ".json":
+        keys, script = _extract_json(text)
+    else:
+        # fa600e42 follow-up (perf) -- the other _TEXT_CONTENT_SUFFIXES
+        # entries (.txt/.md/.log/.r/.qmd/.rmd/.sty/.yml/.yaml) are not
+        # JSON; attempting json.loads() on them is a guaranteed-useless
+        # parse for any file that doesn't happen to start with a
+        # JSON-like token. Script-hint inference from raw text still runs.
+        keys = None
+        script = _infer_generating_script_from_text(text)
     return FileFingerprint(path=path, kind=kind,
                            json_keys=keys, generating_script=script)
 
@@ -1851,8 +1873,16 @@ def _light_row(row: OutputRow) -> OutputRow:
     -- never read from ``_row_cache`` anywhere in this module, see
     ``search``/``resolve_output``/``get_content``, which all query DuckDB
     directly -- is dropped.
+
+    fa600e42 follow-up (perf) -- uses copy.copy()+attribute-set rather than
+    dataclasses.replace(): replace() calls dataclasses.fields() and getattr()
+    on every one of OutputRow's 11 fields to rebuild a kwargs dict for a full
+    __init__ call, even though only 1 field actually changes here. This runs
+    once per stale/new row (the whole batch, every rebuild() call).
     """
-    return replace(row, content=None)
+    light = copy.copy(row)
+    light.content = None
+    return light
 
 
 def build_output_rows(
@@ -2043,10 +2073,18 @@ def _analyse_file(
                     columns, script = _extract_csv(text)
                     fp = FileFingerprint(path=path, kind=kind,
                                          csv_columns=columns, generating_script=script)
-                else:
+                elif suffix == ".json":
                     keys, script = _extract_json(text)
                     fp = FileFingerprint(path=path, kind=kind,
                                          json_keys=keys, generating_script=script)
+                else:
+                    # fa600e42 follow-up (perf) -- see file_fingerprint's
+                    # matching branch: the other _TEXT_CONTENT_SUFFIXES
+                    # entries aren't JSON, so skip the guaranteed-useless
+                    # json.loads() attempt.
+                    script = _infer_generating_script_from_text(text)
+                    fp = FileFingerprint(path=path, kind=kind,
+                                         generating_script=script)
                 fts_content = _content_for_fts(path, fp, body=text)
             return _FileAnalysis(path=path, fingerprint=fp, mtime=mtime,
                                   size=size, sha256=sha, content=fts_content)
@@ -4872,7 +4910,7 @@ class OutputsFtsIndex:
                 time.monotonic() - _notes_ingest_started, 6,
             )
             _apply_precomputed_started = time.monotonic()
-            rows, changed, paths_to_delete, new_rows = (
+            rows_returned, changed, paths_to_delete, new_rows = (
                 self._apply_precomputed(
                     all_paths, path_set, removed_paths, stale, stale_sigs,
                     precomputed, classifications, deadline,
@@ -4955,133 +4993,202 @@ class OutputsFtsIndex:
                     db_delete_paths = [
                         p for p in paths_to_delete if p not in replacement_paths
                     ]
-                    if db_delete_paths:
-                        for i in range(0, len(db_delete_paths), _WRITE_CHUNK):
-                            chunk = db_delete_paths[i:i + _WRITE_CHUNK]
-                            placeholders = ",".join("?" for _ in chunk)
-                            con.execute(
-                                f"DELETE FROM outputs_index WHERE path IN ({placeholders})",
-                                chunk,
-                            )
-                    # Batch-insert only the new/changed rows.
-                    if new_rows:
-                        try:
-                            import pyarrow as _pa  # noqa: PLC0415 -- optional, lazy
-                        except ImportError:
-                            _pa = None
-                            # fa600e42 follow-up (write_seconds diagnostics)
-                            # -- this fallback used to be entirely silent:
-                            # the ~150x-slower combined-VALUES path below
-                            # would just run, forever, with no signal
-                            # anywhere that the fast path never engaged.
-                            # Confirmed live: exactly this (pyarrow declared
-                            # in the extension's own pyproject.toml but
-                            # missing from the shared pixi.toml
-                            # [pypi-dependencies]) already caused a real
-                            # qualification run to spend the bulk of its
-                            # rebuild() time in Phase 2 for this reason
-                            # before being diagnosed by hand. One WARNING
-                            # per process, not per call.
-                            if not self._pyarrow_missing_warned:
-                                self._pyarrow_missing_warned = True
-                                _log.warning(
-                                    "OutputsFtsIndex.rebuild: pyarrow is "
-                                    "not importable -- falling back to the "
-                                    "combined-VALUES bulk-insert path, "
-                                    "measured ~150x slower per row than "
-                                    "the pyarrow fast path (see e8a2f710). "
-                                    "Install pyarrow>=14.0 to restore the "
-                                    "fast path.",
+                    # fa600e42 follow-up (perf) -- DuckDB's own INSERT docs:
+                    # "In auto-commit mode every single statement will be
+                    # wrapped in a separate transaction, meaning fsync will
+                    # be called for every statement... If you absolutely
+                    # must use INSERT statements in a loop to load data,
+                    # wrap them in calls to BEGIN TRANSACTION and COMMIT."
+                    # The delete/insert chunk loops below used to run as
+                    # separate autocommitted statements (each its own
+                    # fsync) -- wrapping the whole delete+insert sequence in
+                    # one explicit transaction matches the BEGIN/COMMIT
+                    # pattern _migrate_legacy_storage_paths_locked already
+                    # uses elsewhere in this same class.
+                    con.execute("BEGIN TRANSACTION")
+                    try:
+                        if db_delete_paths:
+                            for i in range(0, len(db_delete_paths), _WRITE_CHUNK):
+                                chunk = db_delete_paths[i:i + _WRITE_CHUNK]
+                                placeholders = ",".join("?" for _ in chunk)
+                                con.execute(
+                                    f"DELETE FROM outputs_index WHERE path IN ({placeholders})",
+                                    chunk,
                                 )
-                        self.last_rebuild_metrics["bulk_insert_path"] = (
-                            "pyarrow" if _pa is not None else "values_fallback"
-                        )
-                        if _pa is not None:
-                            # task_ecb96ac9 follow-on (perf) -- the previous
-                            # version built each of these 11 columns with its
-                            # OWN separate `for r in new_rows` comprehension:
-                            # 11 full Python-level passes over the batch
-                            # instead of 1. Confirmed live at real scale
-                            # (SUT_Compressed, 82 calls / 303,104 files): even
-                            # with the pyarrow fast path active, write_seconds
-                            # was still 79.1% of total rebuild() time --
-                            # collapsing to a single pass removes 10 of those
-                            # 11 redundant iterations (and the equivalent
-                            # redundancy in json.dumps() calls, unchanged
-                            # either way) for any batch this large.
-                            _paths: list[str] = []
-                            _contents: list[str | None] = []
-                            _mtimes: list[float | None] = []
-                            _sha256s: list[str | None] = []
-                            _sizes: list[int | None] = []
-                            _generating_scripts: list[str | None] = []
-                            _kinds: list[str] = []
-                            _is_archivals: list[bool] = []
-                            _canonical_paths: list[str | None] = []
-                            _csv_columns_json: list[str | None] = []
-                            _json_keys_json: list[str | None] = []
-                            for r in new_rows:
-                                _paths.append(r.path)
-                                _contents.append(r.content)
-                                _mtimes.append(r.mtime)
-                                _sha256s.append(r.sha256)
-                                _sizes.append(r.size)
-                                _generating_scripts.append(r.generating_script)
-                                _kinds.append(r.kind)
-                                _is_archivals.append(r.is_archival)
-                                _canonical_paths.append(r.canonical_path)
-                                _csv_columns_json.append(
-                                    json.dumps(r.csv_columns) if r.csv_columns else None
-                                )
-                                _json_keys_json.append(
-                                    json.dumps(r.json_keys) if r.json_keys else None
-                                )
-                            _arrow_table = _pa.table({
-                                "path": _paths,
-                                "content": _contents,
-                                "mtime": _mtimes,
-                                "sha256": _sha256s,
-                                "size": _sizes,
-                                "generating_script": _generating_scripts,
-                                "kind": _kinds,
-                                "is_archival": _is_archivals,
-                                "canonical_path": _canonical_paths,
-                                "csv_columns": _csv_columns_json,
-                                "json_keys": _json_keys_json,
-                            })
-                            con.register("_outputs_index_bulk_insert", _arrow_table)
+                        # Batch-insert only the new/changed rows.
+                        if new_rows:
                             try:
-                                con.execute(
-                                    "INSERT OR REPLACE INTO outputs_index "
-                                    "(path, content, mtime, sha256, size, "
-                                    "generating_script, kind, is_archival, "
-                                    "canonical_path, csv_columns, json_keys) "
-                                    "SELECT path, content, mtime, sha256, size, "
-                                    "generating_script, kind, is_archival, "
-                                    "canonical_path, csv_columns, json_keys "
-                                    "FROM _outputs_index_bulk_insert"
+                                import pyarrow as _pa  # noqa: PLC0415 -- optional, lazy
+                            except ImportError:
+                                _pa = None
+                                # fa600e42 follow-up (write_seconds diagnostics)
+                                # -- this fallback used to be entirely silent:
+                                # the ~150x-slower combined-VALUES path below
+                                # would just run, forever, with no signal
+                                # anywhere that the fast path never engaged.
+                                # Confirmed live: exactly this (pyarrow declared
+                                # in the extension's own pyproject.toml but
+                                # missing from the shared pixi.toml
+                                # [pypi-dependencies]) already caused a real
+                                # qualification run to spend the bulk of its
+                                # rebuild() time in Phase 2 for this reason
+                                # before being diagnosed by hand. One WARNING
+                                # per process, not per call.
+                                if not self._pyarrow_missing_warned:
+                                    self._pyarrow_missing_warned = True
+                                    _log.warning(
+                                        "OutputsFtsIndex.rebuild: pyarrow is "
+                                        "not importable -- falling back to the "
+                                        "combined-VALUES bulk-insert path, "
+                                        "measured ~150x slower per row than "
+                                        "the pyarrow fast path (see e8a2f710). "
+                                        "Install pyarrow>=14.0 to restore the "
+                                        "fast path.",
+                                    )
+                            self.last_rebuild_metrics["bulk_insert_path"] = (
+                                "pyarrow" if _pa is not None else "values_fallback"
+                            )
+                            if _pa is not None:
+                                # task_ecb96ac9 follow-on (perf) -- the previous
+                                # version built each of these 11 columns with its
+                                # OWN separate `for r in new_rows` comprehension:
+                                # 11 full Python-level passes over the batch
+                                # instead of 1. Confirmed live at real scale
+                                # (SUT_Compressed, 82 calls / 303,104 files): even
+                                # with the pyarrow fast path active, write_seconds
+                                # was still 79.1% of total rebuild() time --
+                                # collapsing to a single pass removes 10 of those
+                                # 11 redundant iterations (and the equivalent
+                                # redundancy in json.dumps() calls, unchanged
+                                # either way) for any batch this large.
+                                _marshal_started = time.monotonic()
+                                _paths: list[str] = []
+                                _contents: list[str | None] = []
+                                _mtimes: list[float | None] = []
+                                _sha256s: list[str | None] = []
+                                _sizes: list[int | None] = []
+                                _generating_scripts: list[str | None] = []
+                                _kinds: list[str] = []
+                                _is_archivals: list[bool] = []
+                                _canonical_paths: list[str | None] = []
+                                _csv_columns_json: list[str | None] = []
+                                _json_keys_json: list[str | None] = []
+                                for r in new_rows:
+                                    _paths.append(r.path)
+                                    _contents.append(r.content)
+                                    _mtimes.append(r.mtime)
+                                    _sha256s.append(r.sha256)
+                                    _sizes.append(r.size)
+                                    _generating_scripts.append(r.generating_script)
+                                    _kinds.append(r.kind)
+                                    _is_archivals.append(r.is_archival)
+                                    _canonical_paths.append(r.canonical_path)
+                                    _csv_columns_json.append(
+                                        json.dumps(r.csv_columns) if r.csv_columns else None
+                                    )
+                                    _json_keys_json.append(
+                                        json.dumps(r.json_keys) if r.json_keys else None
+                                    )
+                                # fa600e42 follow-up (perf) -- an explicit
+                                # schema (matching outputs_index's own column
+                                # types below) skips pyarrow's per-column type
+                                # inference, which scans each Python list for
+                                # a None/str/bool/int/float mix to pick a
+                                # promotion type before building the column.
+                                _arrow_schema = _pa.schema([
+                                    ("path", _pa.string()),
+                                    ("content", _pa.string()),
+                                    ("mtime", _pa.float64()),
+                                    ("sha256", _pa.string()),
+                                    ("size", _pa.int64()),
+                                    ("generating_script", _pa.string()),
+                                    ("kind", _pa.string()),
+                                    ("is_archival", _pa.bool_()),
+                                    ("canonical_path", _pa.string()),
+                                    ("csv_columns", _pa.string()),
+                                    ("json_keys", _pa.string()),
+                                ])
+                                _arrow_table = _pa.table({
+                                    "path": _paths,
+                                    "content": _contents,
+                                    "mtime": _mtimes,
+                                    "sha256": _sha256s,
+                                    "size": _sizes,
+                                    "generating_script": _generating_scripts,
+                                    "kind": _kinds,
+                                    "is_archival": _is_archivals,
+                                    "canonical_path": _canonical_paths,
+                                    "csv_columns": _csv_columns_json,
+                                    "json_keys": _json_keys_json,
+                                }, schema=_arrow_schema)
+                                self.last_rebuild_metrics["db_insert_marshal_seconds"] = round(
+                                    time.monotonic() - _marshal_started, 6,
                                 )
-                            finally:
-                                con.unregister("_outputs_index_bulk_insert")
-                        else:
-                            for i in range(0, len(new_rows), _WRITE_CHUNK):
-                                chunk_rows = new_rows[i:i + _WRITE_CHUNK]
-                                row_placeholders = ",".join(
-                                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" for _ in chunk_rows
+                                _engine_started = time.monotonic()
+                                con.register("_outputs_index_bulk_insert", _arrow_table)
+                                try:
+                                    # fa600e42 follow-up (perf) -- DuckDB
+                                    # issue #11275: INSERT OR REPLACE against
+                                    # an already-populated PRIMARY KEY table
+                                    # measured 3.7x-7.8x slower when the
+                                    # incoming batch isn't delivered sorted
+                                    # by the conflict key. new_rows is
+                                    # already built from a sorted()
+                                    # traversal upstream, but this connection
+                                    # runs with preserve_insertion_order=false
+                                    # (see _connect() -- a deliberate, unrelated
+                                    # OOM-avoidance setting), which per DuckDB's
+                                    # own Order Preservation docs means any
+                                    # result with no ORDER BY may be silently
+                                    # re-ordered before the upsert ever sees
+                                    # it. ORDER BY forces sorted delivery
+                                    # regardless of that pragma.
+                                    con.execute(
+                                        "INSERT OR REPLACE INTO outputs_index "
+                                        "(path, content, mtime, sha256, size, "
+                                        "generating_script, kind, is_archival, "
+                                        "canonical_path, csv_columns, json_keys) "
+                                        "SELECT path, content, mtime, sha256, size, "
+                                        "generating_script, kind, is_archival, "
+                                        "canonical_path, csv_columns, json_keys "
+                                        "FROM _outputs_index_bulk_insert "
+                                        "ORDER BY path"
+                                    )
+                                finally:
+                                    con.unregister("_outputs_index_bulk_insert")
+                                self.last_rebuild_metrics["db_insert_engine_seconds"] = round(
+                                    time.monotonic() - _engine_started, 6,
                                 )
-                                flat_params: list[Any] = []
-                                for r in chunk_rows:
-                                    flat_params.extend([
-                                        r.path, r.content, r.mtime, r.sha256, r.size,
-                                        r.generating_script, r.kind, r.is_archival,
-                                        r.canonical_path,
-                                        json.dumps(r.csv_columns) if r.csv_columns else None,
-                                        json.dumps(r.json_keys) if r.json_keys else None,
-                                    ])
-                                con.execute(
-                                    f"INSERT OR REPLACE INTO outputs_index VALUES {row_placeholders}",
-                                    flat_params,
-                                )
+                            else:
+                                for i in range(0, len(new_rows), _WRITE_CHUNK):
+                                    chunk_rows = new_rows[i:i + _WRITE_CHUNK]
+                                    row_placeholders = ",".join(
+                                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" for _ in chunk_rows
+                                    )
+                                    flat_params: list[Any] = []
+                                    for r in chunk_rows:
+                                        flat_params.extend([
+                                            r.path, r.content, r.mtime, r.sha256, r.size,
+                                            r.generating_script, r.kind, r.is_archival,
+                                            r.canonical_path,
+                                            json.dumps(r.csv_columns) if r.csv_columns else None,
+                                            json.dumps(r.json_keys) if r.json_keys else None,
+                                        ])
+                                    con.execute(
+                                        f"INSERT OR REPLACE INTO outputs_index VALUES {row_placeholders}",
+                                        flat_params,
+                                    )
+                    except BaseException:
+                        try:
+                            con.execute("ROLLBACK")
+                        except Exception:  # noqa: BLE001
+                            _log.debug(
+                                "OutputsFtsIndex.rebuild: DB write rollback "
+                                "failed", exc_info=True,
+                            )
+                        raise
+                    else:
+                        con.execute("COMMIT")
                     self.last_rebuild_metrics["db_insert_seconds"] = round(
                         time.monotonic() - _db_insert_started, 6,
                     )
@@ -5272,7 +5379,7 @@ class OutputsFtsIndex:
             )
             self.last_rebuild_metrics.update({
                 "rebuild_seconds": round(time.monotonic() - rebuild_started, 6),
-                "rows_returned": len(rows),
+                "rows_returned": rows_returned,
                 "rows_changed": len(new_rows),
                 "rows_deleted": len(paths_to_delete),
                 "partial": bool(self.last_rebuild_partial),
@@ -5295,7 +5402,7 @@ class OutputsFtsIndex:
                 "index_db_bytes": self._index_db_file_size(),
                 "process_rss_bytes": self._current_process_rss_bytes(),
             })
-            return len(rows)
+            return rows_returned
         finally:
             self._write_lock.release()
 
@@ -5309,12 +5416,15 @@ class OutputsFtsIndex:
         precomputed: dict[str, "_FileAnalysis"],
         classifications: dict[str, ArchivalClassification],
         deadline: float | None,
-    ) -> tuple[list[OutputRow], bool, list[str], list[OutputRow]]:
+    ) -> tuple[int, bool, list[str], list[OutputRow]]:
         """Apply pre-computed per-file analysis to the in-memory cache.
 
         Called from inside :meth:`rebuild`'s ``with self._write_lock:`` block.
-        Returns ``(all_rows, changed, paths_to_delete, new_rows)`` where:
-        - ``all_rows`` -- the full current row list for all indexed paths
+        Returns ``(rows_returned, changed, paths_to_delete, new_rows)`` where:
+        - ``rows_returned`` -- count of ``path_set`` entries currently cached
+          (fa600e42 follow-up: the caller only ever needs the count, not the
+          list of rows itself -- previously this built and returned a full
+          ``list[OutputRow]`` just to be immediately reduced to ``len()``)
         - ``changed``  -- True if any DB write is needed
         - ``paths_to_delete`` -- paths to DELETE from the DB (removed + stale)
         - ``new_rows`` -- OutputRow objects to INSERT (stale paths with fresh data)
@@ -5323,8 +5433,8 @@ class OutputsFtsIndex:
         targeted delete + batched insert that replaces the old DELETE-all /
         reinsert-all pattern.
 
-        edc84500 -- ``new_rows`` (and therefore ``all_rows``'s inputs before
-        caching) always carry REAL content: either freshly extracted this
+        edc84500 -- ``new_rows`` (and therefore ``self._row_cache``'s inputs
+        before eviction) always carry REAL content: either freshly extracted this
         call, or re-read from DuckDB on demand (see the archival-metadata
         refresh loop below). ``self._row_cache`` itself only ever stores the
         light (content-evicted) copy -- see :func:`_light_row` -- so it never
@@ -5439,8 +5549,8 @@ class OutputsFtsIndex:
                     new_rows.append(full_row)
                     changed = True
 
-        all_rows = [self._row_cache[p] for p in all_paths if p in self._row_cache]
-        return all_rows, changed, paths_to_delete, new_rows
+        rows_returned = sum(1 for p in path_set if p in self._row_cache)
+        return rows_returned, changed, paths_to_delete, new_rows
 
     def invalidate(self, path: str) -> None:
         """Force ``path`` to be re-hashed on next rebuild."""
