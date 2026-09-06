@@ -8724,6 +8724,22 @@ def _trailing_text_after_omath(para_elem: ET.Element, omath_el: ET.Element) -> s
     )
 
 
+# Zero-width markup that can legally sit as a direct child of <w:p> anywhere
+# in document order but renders nothing and carries no prose -- a bookmark or
+# comment anchor placed right before a display equation (e.g. Word's own
+# "Insert Cross-reference"/"Insert Comment" commands) must not be mistaken
+# for the equation being mixed into running prose. See the `preceding` check
+# in audit_equation_style.
+_EQUATION_NON_CONTENT_MARKUP_TAGS = frozenset({
+    _q(_W, "pPr"),
+    _q(_W, "bookmarkStart"),
+    _q(_W, "bookmarkEnd"),
+    _q(_W, "commentRangeStart"),
+    _q(_W, "commentRangeEnd"),
+    _q(_W, "proofErr"),
+})
+
+
 _EQ_LEADING_INT_RE = re.compile(r"^\(\s*(\d+)")
 
 
@@ -8834,7 +8850,9 @@ def audit_equation_style(
             continue
         omath_el = direct_omaths[0]
 
-        # "Display equation" = nothing but pPr precedes the equation in the
+        # "Display equation" = nothing but pPr and zero-width markup
+        # (bookmarks, comment anchors, proofErr -- see
+        # _EQUATION_NON_CONTENT_MARKUP_TAGS) precedes the equation in the
         # paragraph. Content AFTER the equation -- e.g. a trailing
         # punctuation run written by append_text_run_after_math -- is
         # expected and does NOT disqualify it (that's exactly what the
@@ -8845,7 +8863,10 @@ def audit_equation_style(
         # that merely contains an equation.
         siblings = list(para_elem)
         top_idx = siblings.index(top_level_el)
-        preceding = [c for c in siblings[:top_idx] if c.tag != _q(_W, "pPr")]
+        preceding = [
+            c for c in siblings[:top_idx]
+            if c.tag not in _EQUATION_NON_CONTENT_MARKUP_TAGS
+        ]
         if preceding:
             continue  # inline equation mixed with prose -- no alignment/punctuation check
 

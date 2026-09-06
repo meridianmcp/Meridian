@@ -143,6 +143,39 @@ _INLINE_MIXED_DOC = _doc(f'''    <w:p w14:paraId="0000I001">
       <w:r><w:t xml:space="preserve"> was a physicist</w:t></w:r>
     </w:p>''')
 
+# Bookmark wrapping the equation (Word's own "Insert Cross-reference"/
+# "Insert Bookmark" commands produce exactly this shape) -> the bookmarkStart
+# before <m:oMath> must NOT be mistaken for prose disqualifying the equation
+# from being a "display equation". Deliberately unstyled + bad trailing text
+# so both findings would previously have been silently skipped entirely.
+_DISPLAY_WITH_BOOKMARK_DOC = _doc(f'''    <w:p w14:paraId="0000L001">
+      <w:bookmarkStart w:id="1" w:name="_Hlk1"/>
+      {_SIMPLE_OMATH}
+      <w:bookmarkEnd w:id="1"/>
+      <w:r><w:t xml:space="preserve"> (see note)</w:t></w:r>
+    </w:p>''')
+
+# Comment anchor + spell-check marker before the equation -> same "zero-width
+# markup, not prose" exclusion as bookmarks. Centered + clean trailing text
+# so a correct audit reports nothing.
+_DISPLAY_WITH_COMMENT_AND_PROOFERR_DOC = _doc(f'''    <w:p w14:paraId="0000M001">
+      <w:pPr><w:jc w:val="center"/></w:pPr>
+      <w:commentRangeStart w:id="5"/>
+      <w:proofErr w:type="spellStart"/>
+      {_SIMPLE_OMATH}
+      <w:commentRangeEnd w:id="5"/>
+      <w:r><w:t>.</w:t></w:r>
+    </w:p>''')
+
+# A REAL prose run before the bookmark must still disqualify the equation --
+# the fix must not make the "preceding content" check vacuous.
+_INLINE_MIXED_WITH_BOOKMARK_DOC = _doc(f'''    <w:p w14:paraId="0000N001">
+      <w:bookmarkStart w:id="2" w:name="_Hlk2"/>
+      <w:r><w:t xml:space="preserve">Einstein: </w:t></w:r>
+      {_SIMPLE_OMATH}
+      <w:bookmarkEnd w:id="2"/>
+    </w:p>''')
+
 # Two oMath as the ONLY content of one paragraph -> ambiguous, both skipped.
 _AMBIGUOUS_MULTI_EQ_DOC = _doc(f'''    <w:p w14:paraId="0000J001">
       {_SIMPLE_OMATH}
@@ -428,6 +461,41 @@ def test_audit_alignment_policy_left_matches_unset_jc(tmp_path):
 
 def test_audit_inline_equation_excluded_from_alignment_and_punctuation(tmp_path):
     path = _write_docx(tmp_path, _INLINE_MIXED_DOC)
+    result = docs_intel.audit_equation_style(path)
+    assert result["equation_count"] == 1
+    assert result["findings"] == []
+
+
+def test_audit_bookmark_before_equation_does_not_suppress_findings(tmp_path):
+    """Regression (found 2026-09-06 via a real organic corpus document): a
+    <w:bookmarkStart> directly before <m:oMath> was being counted as
+    "preceding content" mixing the equation into prose, silently skipping
+    BOTH the alignment and trailing-punctuation checks for an otherwise
+    ordinary display equation. A bookmark renders nothing and must not
+    disqualify the equation."""
+    path = _write_docx(tmp_path, _DISPLAY_WITH_BOOKMARK_DOC)
+    result = docs_intel.audit_equation_style(path)
+    assert result["equation_count"] == 1
+    assert result["findings_by_type"] == {
+        "misaligned_equation": 1,
+        "incorrect_trailing_punctuation": 1,
+    }
+    misaligned = next(f for f in result["findings"] if f["type"] == "misaligned_equation")
+    assert misaligned["para_id"] == "0000L001"
+
+
+def test_audit_comment_anchor_and_prooferr_before_equation_do_not_disqualify(tmp_path):
+    path = _write_docx(tmp_path, _DISPLAY_WITH_COMMENT_AND_PROOFERR_DOC)
+    result = docs_intel.audit_equation_style(path)
+    assert result["equation_count"] == 1
+    assert result["findings"] == []
+
+
+def test_audit_real_prose_before_bookmarked_equation_still_excludes_it(tmp_path):
+    """The bookmark fix must not make the preceding-content check vacuous --
+    genuine prose mixed with the equation is still excluded even when a
+    bookmark also wraps it."""
+    path = _write_docx(tmp_path, _INLINE_MIXED_WITH_BOOKMARK_DOC)
     result = docs_intel.audit_equation_style(path)
     assert result["equation_count"] == 1
     assert result["findings"] == []
