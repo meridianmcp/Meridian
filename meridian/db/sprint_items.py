@@ -2160,6 +2160,17 @@ async def complete_sprint_item(
     wave-run bookkeeping hook in this module: never lets wave-run
     bookkeeping block or fail a completion that has already committed. A
     project that never calls ``start_wave_run`` sees zero behavior change.
+
+    07229675 — WARN-ONLY ``blocker_kind`` completion re-check: if the item
+    still carries ``blocker_kind in ('superseded', 'systemic_invalidated_run')``
+    at completion time (:func:`_is_hard_blocked_sprint_item`), the returned
+    row gains a ``blocker_kind_completion_warning`` key explaining that this
+    item's premise may have been invalidated after it was claimed.
+    Deliberately advisory only — completion is never blocked by this check
+    in this pass (see the inline comment at the check site for the full
+    rationale and the deferred fail-closed follow-up). Runs in the same
+    branch as the ownership/verification/evidence gates above, so it is
+    correctly skipped for the idempotent ``already_committed`` replay path.
     """
     _t_start = time.monotonic()
     _phase_ms: dict[str, float] = {}
@@ -2192,7 +2203,43 @@ async def complete_sprint_item(
 
     _evidence_quality_warning: str | None = None
     _stored_evidence_warning: str | None = None
+    _blocker_kind_completion_warning: str | None = None
     if item is not None and item.get("project_id") == project_id:
+        # 07229675 — WARN-ONLY blocker_kind re-check at completion time.
+        # claim_sprint_item hard-gates blocker_kind in ('superseded',
+        # 'systemic_invalidated_run') at CLAIM time (f89d440f/cc3864bd), but
+        # nothing previously re-read blocker_kind here at COMPLETE time. An
+        # item can transition INTO one of those two states after a session
+        # has already claimed it — block_sprint_items_for_systemic_invalidation
+        # explicitly documents that an already in_progress item stays
+        # in_progress (never forced to a new status) when marked invalidated
+        # — so a session holding a live claim could complete the item anyway,
+        # unconditionally bypassing the hard gate's entire purpose. Reuses
+        # the existing :func:`_is_hard_blocked_sprint_item` predicate (same
+        # one ``get_parallelizable_groups``/handoff goal-building already use)
+        # so this can never disagree with claim_sprint_item's own gate about
+        # which blocker_kind values are hard-blocking ('manual' is a soft,
+        # listing-only exclusion — see f89d440f — and is deliberately NOT
+        # included here).
+        #
+        # Deliberately WARN-ONLY, not a hard block, in this pass — mirrors
+        # meridian/handoff_receipt.py's own precedent (1b7eb437): ship
+        # warn-only first on the single hottest completion path in the
+        # codebase, defer a fail-closed gate + override flag to a follow-up
+        # once the warning's real-world false-positive rate is known. Fails
+        # open (no warning) for a missing/unset blocker_kind, matching every
+        # other structural gate in this module.
+        if _is_hard_blocked_sprint_item(item):
+            _blocker_kind_completion_warning = (
+                f"item {item_id} is being completed while still marked "
+                f"blocker_kind={item.get('blocker_kind')!r} — its premise may "
+                "have been superseded or the wave run that owned it "
+                "systemically invalidated AFTER this claim was taken. This "
+                "is a WARN-ONLY signal: completion is NOT blocked. Verify "
+                "this item's work is still valid before relying on it; if "
+                "so, clear blocker_kind via update_sprint_item so future "
+                "claims/completions stop seeing this warning."
+            )
         # 8693b6a8 — claim-ownership gate. See the docstring above for the
         # full contract; short version: only block when we can actually
         # compare two non-empty identities and they disagree, and even then
@@ -2381,12 +2428,14 @@ async def complete_sprint_item(
         except Exception:  # noqa: BLE001 — advisory only, never block completion
             pass
         _mark_phase("post_commit_advisory")
-        if _evidence_quality_warning or _stored_evidence_warning:
+        if _evidence_quality_warning or _stored_evidence_warning or _blocker_kind_completion_warning:
             result = dict(result)
             if _evidence_quality_warning:
                 result["evidence_quality_warning"] = _evidence_quality_warning
             if _stored_evidence_warning:
                 result["stored_evidence_warning"] = _stored_evidence_warning
+            if _blocker_kind_completion_warning:
+                result["blocker_kind_completion_warning"] = _blocker_kind_completion_warning
         # ecc8b280 — machine-readable continuation_required/terminal_ready
         # state, scoped to this item's own version bucket, so a caller that
         # only calls complete_sprint_item (never get_sprint_progress) still

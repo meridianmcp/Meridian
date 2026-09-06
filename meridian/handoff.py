@@ -47,6 +47,7 @@ from . import executor_contract as executor_contract_module
 from . import hook_paths as hook_paths_module
 from . import pointers as pointers_module
 from . import profile_contract as profile_contract_module
+from . import proposal_gates as proposal_gates_module
 from . import slot_manifest_receipt as slot_manifest_receipt_module
 from . import test_run_receipt as test_run_receipt_module
 from . import tool_discovery as tool_discovery_module
@@ -8460,13 +8461,62 @@ async def build_continuation_manifest(
         can see how a dependency chain actually resolved, e.g. a failed or
         skipped parent, not just what remains claimable).
       - ``pending_count`` — how many of those are actually claimable
-        (status in ('pending', 'todo')).
+        (status in ('pending', 'todo') AND not hard-blocked — see
+        ``hard_blocked_pending_ids`` below, 07229675).
       - ``pending_item_ids`` — up to :data:`_CONTINUATION_MANIFEST_ID_CAP`
-        pending/todo item ids, in the snapshot's own deterministic order
-        (version, added_at, id — see ``board_snapshot.build_board_snapshot``).
-        Ids only, not full item dicts: titles/status/etc. for the same items
-        are already rendered in the delta body's own "Pending:" section:
-        duplicating them here would defeat the point of a compact delta.
+        genuinely claimable pending/todo item ids, in the snapshot's own
+        deterministic order (version, added_at, id — see
+        ``board_snapshot.build_board_snapshot``). Ids only, not full item
+        dicts: titles/status/etc. for the same items are already rendered in
+        the delta body's own "Pending:" section: duplicating them here would
+        defeat the point of a compact delta.
+      - ``hard_blocked_pending_ids`` (07229675) — up to
+        :data:`_CONTINUATION_MANIFEST_ID_CAP` ``{"id", "blocker_kind"}``
+        entries for items that are ``status in ('pending', 'todo')`` but
+        hard-gated by ``claim_sprint_item`` itself
+        (``blocker_kind in ('superseded', 'systemic_invalidated_run')`` —
+        see ``_is_hard_blocked_sprint_item``). Confirmed gap this closes:
+        before this field existed, such an item was indistinguishable from a
+        genuinely claimable one in this manifest — a resuming session reading
+        only ``pending_item_ids`` would predictably attempt (and fail) a
+        claim on a dead-end id. Excluded from ``pending_item_ids``/
+        ``pending_count`` (mirrors ``_build_quick_start_goal``'s existing
+        exclusion of the same predicate from the /goal text, "so all four
+        modes agree") but never silently dropped — every excluded id is
+        listed here instead, same "excluded but surfaced" pattern
+        ``_build_manual_todo_note``/``_build_backburner_todo_note`` already
+        use for their own exclusions.
+      - ``blocker_summary`` (07229675) — passed through verbatim from
+        ``snapshot["blocker_summary"]`` (already computed by
+        ``build_board_snapshot`` via ``blocker_policy.classify_and_evaluate``,
+        previously discarded here): the typed blocker-triage decision for the
+        same non-done item set (``policy``, ``blocked_item_ids``,
+        ``classifications``, ``skipped_dependents``, ``eligible_item_ids``,
+        ``run_stop``/``run_stop_reason``, ``continuation_rationale``). ``None``
+        when the underlying triage itself failed (best-effort upstream — see
+        ``build_board_snapshot``'s own docstring). Deliberately NOT folded
+        into ``revision_hash`` — matches ``build_board_snapshot``'s own
+        documented rationale (a notes-only quarantine-clearing edit should
+        recompute this fresh, not wait for a hash the edit itself wouldn't
+        move).
+      - ``hitl_gated_item_ids`` (07229675) — subset of the (already-capped)
+        ``pending_item_ids`` that currently have at least one blocking/
+        quarantining proposal gate (``meridian.proposal_gates`` — typed
+        legal/IP, product-scope, destructive-ops, production-deploy,
+        contradiction-acceptance, or other materially-ambiguous-decision
+        gates whose ``effective_state`` is not ``'allowed'``). Computed with
+        ONE ``list_gates`` call for the whole capped batch (not one call per
+        item) to keep this bounded. Best-effort: a failure here degrades to
+        an empty list rather than breaking the whole manifest build.
+
+    All four 07229675 fields above are purely additive — no existing field's
+    shape, presence, or the ``revision_hash``/``revision_counter`` byte-
+    stability contract changed. A project whose non-done board has no
+    hard-blocked items, no blocker-policy triage, and no active HITL gates
+    sees ``hard_blocked_pending_ids == []``, ``hitl_gated_item_ids == []``,
+    and whatever ``blocker_summary`` shape ``build_board_snapshot`` already
+    produced for an unblocked board — i.e. no observable behavior change for
+    the common case.
 
     Best-effort by convention (matches every other enrichment step in
     ``generate_handoff``): callers should wrap this in try/except and treat a
@@ -8514,10 +8564,54 @@ async def build_continuation_manifest(
         )
         revision_counter = _latest.get("revision_counter") if _latest else None
 
-    pending_ids = [
-        it.get("id") for it in snapshot["items"]
+    pending_items = [
+        it for it in snapshot["items"]
         if (it.get("status") or "") in ("pending", "todo")
     ]
+    # 07229675 — exclude hard-blocked items (blocker_kind in ('superseded',
+    # 'systemic_invalidated_run')) from the claimable pending list; a resuming
+    # session must never be handed a dead-end id that claim_sprint_item will
+    # deterministically refuse. Reuses the SAME predicate _build_quick_start_goal
+    # already applies to the /goal text, so this manifest can't disagree with
+    # what the goal itself would advertise as claimable.
+    claimable_pending_ids = [
+        it.get("id") for it in pending_items
+        if not _is_hard_blocked_sprint_item(it)
+    ]
+    hard_blocked_pending = [
+        {"id": it.get("id"), "blocker_kind": it.get("blocker_kind")}
+        for it in pending_items
+        if _is_hard_blocked_sprint_item(it)
+    ]
+
+    capped_pending_ids = claimable_pending_ids[:_CONTINUATION_MANIFEST_ID_CAP]
+
+    # 07229675 — live per-item HITL-gate presence check, bounded to the
+    # already-capped claimable batch. One list_gates call for the whole
+    # batch (not one per item) keeps this a single extra query regardless of
+    # how many pending items exist. Best-effort: never let a proposal_gates
+    # hiccup break the whole manifest build.
+    hitl_gated_item_ids: list[str] = []
+    if capped_pending_ids:
+        try:
+            _gates = await proposal_gates_module.list_gates(db, project_id)
+            _blocking_gates = [
+                g for g in _gates
+                if proposal_gates_module.effective_state(g) != "allowed"
+            ]
+            _capped_id_set = set(capped_pending_ids)
+            _gated: set[str] = set()
+            for gate in _blocking_gates:
+                for entry in gate.get("affected") or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    _sid = entry.get("sprint_item_id")
+                    if _sid in _capped_id_set:
+                        _gated.add(_sid)
+            # Preserve capped_pending_ids' own deterministic order.
+            hitl_gated_item_ids = [i for i in capped_pending_ids if i in _gated]
+        except Exception:  # noqa: BLE001 — best-effort enrichment, never fatal
+            hitl_gated_item_ids = []
 
     return {
         "schema_version": _CONTINUATION_MANIFEST_SCHEMA_VERSION,
@@ -8528,8 +8622,11 @@ async def build_continuation_manifest(
         "revision_hash": snapshot["revision_hash"],
         "revision_counter": revision_counter,
         "item_count": snapshot["item_count"],
-        "pending_count": len(pending_ids),
-        "pending_item_ids": pending_ids[:_CONTINUATION_MANIFEST_ID_CAP],
+        "pending_count": len(claimable_pending_ids),
+        "pending_item_ids": capped_pending_ids,
+        "hard_blocked_pending_ids": hard_blocked_pending[:_CONTINUATION_MANIFEST_ID_CAP],
+        "blocker_summary": snapshot.get("blocker_summary"),
+        "hitl_gated_item_ids": hitl_gated_item_ids,
     }
 
 
