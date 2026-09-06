@@ -4617,6 +4617,11 @@ class OutputsFtsIndex:
         # dict and processed in sorted order to guarantee determinism.
         precomputed: dict[str, _FileAnalysis] = {}
         analysis_started = time.monotonic()
+        # fa600e42 follow-up (perf diagnostics) -- initialized here (not
+        # inside `if stale:`) so last_rebuild_metrics always carries these
+        # keys, including the common "nothing stale this call" case.
+        files_hash_needed = 0
+        files_hash_skipped = 0
         if stale:
             # e1fd4182 (size-prefilter follow-up) -- build a size -> count
             # map across ALL known paths (stale files use their freshly-
@@ -4676,14 +4681,24 @@ class OutputsFtsIndex:
                 thread_name_prefix="meridian_outputs_analyse",
             )
             phase1_deadline_hit = False
+            # fa600e42 follow-up (perf diagnostics) -- the size-uniqueness
+            # prefilter's own validation (e1fd4182) was a 420-file tree with
+            # 95% unique sizes; whether that assumption holds on a given
+            # real corpus (e.g. many auto-generated plots from a repeated
+            # pipeline sharing near-identical byte counts) was previously
+            # unanswerable from last_rebuild_metrics alone.
             try:
-                futures = {
-                    pool.submit(
-                        _analyse_file, p, self._hasher, needs_hash=_needs_hash(p),
+                futures = {}
+                for p in stale:
+                    needs = _needs_hash(p)
+                    if needs:
+                        files_hash_needed += 1
+                    else:
+                        files_hash_skipped += 1
+                    futures[pool.submit(
+                        _analyse_file, p, self._hasher, needs_hash=needs,
                         stat_signature=stale_sigs.get(p),
-                    ): p
-                    for p in stale
-                }
+                    )] = p
                 for fut in concurrent.futures.as_completed(futures):
                     if phase1_deadline is not None and time.monotonic() > phase1_deadline:
                         phase1_deadline_hit = True
@@ -4708,6 +4723,8 @@ class OutputsFtsIndex:
         self.last_rebuild_metrics["analysis_seconds"] = round(
             time.monotonic() - analysis_started, 6,
         )
+        self.last_rebuild_metrics["files_hash_needed"] = files_hash_needed
+        self.last_rebuild_metrics["files_hash_skipped"] = files_hash_skipped
 
         # classify_canonical_archival needs all paths (not just stale ones) to
         # detect archival twins correctly.  It is read-only, so it runs here
@@ -5062,6 +5079,17 @@ class OutputsFtsIndex:
                                 # redundancy in json.dumps() calls, unchanged
                                 # either way) for any batch this large.
                                 _marshal_started = time.monotonic()
+                                # fa600e42 follow-up (perf diagnostics) --
+                                # covers BEGIN TRANSACTION, the
+                                # replacement_paths/db_delete_paths
+                                # comprehensions, the (usually empty) DELETE
+                                # chunk loop, and `import pyarrow` -- a cold
+                                # C-extension import can plausibly cost
+                                # hundreds of ms, and previously fell inside
+                                # db_insert_seconds with no attribution.
+                                self.last_rebuild_metrics["db_insert_setup_seconds"] = round(
+                                    _marshal_started - _db_insert_started, 6,
+                                )
                                 _paths: list[str] = []
                                 _contents: list[str | None] = []
                                 _mtimes: list[float | None] = []
@@ -5188,7 +5216,18 @@ class OutputsFtsIndex:
                             )
                         raise
                     else:
+                        # fa600e42 follow-up (perf diagnostics) -- research
+                        # confirmed COMMIT is where DuckDB unconditionally
+                        # fsyncs the WAL for durability, and previously ran
+                        # entirely outside every existing sub-timer (after
+                        # db_insert_engine_seconds already stopped). Timed
+                        # separately so a real fsync/checkpoint cost is
+                        # never silently invisible again.
+                        _commit_started = time.monotonic()
                         con.execute("COMMIT")
+                        self.last_rebuild_metrics["db_insert_commit_seconds"] = round(
+                            time.monotonic() - _commit_started, 6,
+                        )
                     self.last_rebuild_metrics["db_insert_seconds"] = round(
                         time.monotonic() - _db_insert_started, 6,
                     )

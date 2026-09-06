@@ -3866,6 +3866,74 @@ class TestWriteSecondsSubMetrics:
         finally:
             idx.close()
 
+    def test_db_insert_setup_and_commit_sub_metrics_present(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up (perf diagnostics): a real, disclosed
+        db_insert_seconds change (2.343s -> 2.735s) between two live runs
+        left a ~1s gap unattributable to marshal+engine alone -- COMMIT
+        (where DuckDB unconditionally fsyncs the WAL) ran entirely outside
+        every existing sub-timer, and BEGIN TRANSACTION/the delete-chunk
+        loop/`import pyarrow` had no timer either. These two new metrics
+        (setup = everything before marshal starts; commit = the COMMIT
+        call itself) make the full db_insert_seconds window self-accounting."""
+        pytest.importorskip("pyarrow")
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            assert m["bulk_insert_path"] == "pyarrow"
+            assert "db_insert_setup_seconds" in m
+            assert "db_insert_commit_seconds" in m
+            assert m["db_insert_setup_seconds"] >= 0
+            assert m["db_insert_commit_seconds"] >= 0
+            # Every sub-window together must never exceed the umbrella.
+            sub_total = (
+                m["db_insert_setup_seconds"] + m["db_insert_marshal_seconds"]
+                + m["db_insert_engine_seconds"] + m["db_insert_commit_seconds"]
+            )
+            assert sub_total <= m["db_insert_seconds"] + 1e-3
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_files_hash_needed_and_skipped_metrics(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up (perf diagnostics): the size-uniqueness
+        prefilter's own validation (e1fd4182) was a 420-file tree with 95%
+        unique sizes -- whether that assumption holds on any given real
+        corpus was previously unanswerable from last_rebuild_metrics alone.
+        Two files of the SAME size must both need a real hash (to tell them
+        apart); a lone uniquely-sized file must be skippable."""
+        (tmp_path / "a.bin").write_bytes(b"x" * 100)
+        (tmp_path / "b.bin").write_bytes(b"y" * 100)  # same size as a.bin
+        (tmp_path / "unique.bin").write_bytes(b"z" * 999)  # unique size
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            assert m["files_hash_needed"] == 2
+            assert m["files_hash_skipped"] == 1
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_files_hash_needed_and_skipped_present_when_nothing_stale(
+        self, tmp_path: Path,
+    ) -> None:
+        """The counters must exist (as 0) even on a call with nothing to
+        analyse, not only when `stale` is non-empty."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            assert m["files_hash_needed"] == 0
+            assert m["files_hash_skipped"] == 0
+        finally:
+            idx.close()
+
     @staticmethod
     def _install_execute_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         """Wrap real duckdb.connect() so every SQL string executed through
