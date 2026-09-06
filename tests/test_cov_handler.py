@@ -1723,56 +1723,6 @@ def test_generate_default_session_name_empty_board():
         _run(db.close())
 
 
-def test_generate_default_session_name_neutral_skips_pending_item_guess():
-    """<infra-fix> — neutral=True goes straight to the adjective+noun fallback
-    even when a pending item exists, instead of guessing from its title."""
-    import re
-    import meridian.db as db_module
-    db = _make_db()
-    try:
-        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "neutral"}, db, "/tmp"))
-        pid = proj["id"]
-        _run(mh._dispatch_mcp_tool("add_sprint_item",
-            {"project_id": pid, "title": "Wire Billing OAuth", "version": "v1"}, db, "/tmp"))
-        name = _run(db_module.generate_default_session_name(db, pid, neutral=True))
-        assert "wire-billing-oauth" not in name
-        assert re.match(r"^[a-z]+-[a-z]+-\d{4}-\d{6}$", name), name
-    finally:
-        _run(db.close())
-
-
-def test_start_session_continue_mode_uses_neutral_name():
-    """<infra-fix> — start_session(mode="continue") with no session_name must NOT
-    pick up an unrelated pending item's title. Confirmed real incidents: an
-    orchestrator resuming via mode="continue" got auto-named after a totally
-    unrelated item that merely happened to be first-pending on a large board,
-    and its own dispatched fix agents later misread that name as a hostile
-    concurrent session rather than their own dispatcher's resource lock."""
-    import meridian.db as db_module
-    db = _make_db()
-    try:
-        proj = _run(mh._dispatch_mcp_tool("create_project", {"name": "cont"}, db, "/tmp"))
-        pid = proj["id"]
-        _run(mh._dispatch_mcp_tool("add_sprint_item",
-            {"project_id": pid, "title": "Totally Unrelated Item", "version": "v1"}, db, "/tmp"))
-        res = _run(mh._dispatch_mcp_tool(
-            "start_session", {"project_id": pid, "mode": "continue"}, db, "/tmp"))
-        sid = res["session_id"]
-        sessions = _run(db_module.get_sessions(db, pid, active_only=False))
-        sess = next(s for s in sessions if s["id"] == sid)
-        assert "totally-unrelated-item" not in (sess["name"] or "")
-        # A normal (non-continue) unnamed start_session on the SAME board still
-        # gets the title-based guess — this fix is scoped to mode="continue" only.
-        res2 = _run(mh._dispatch_mcp_tool("start_session", {"project_id": pid}, db, "/tmp"))
-        sess2 = next(
-            s for s in _run(db_module.get_sessions(db, pid, active_only=False))
-            if s["id"] == res2["session_id"]
-        )
-        assert "totally-unrelated-item" in (sess2["name"] or "")
-    finally:
-        _run(db.close())
-
-
 def test_dispatch_complete_sprint_item_no_gate_when_not_flagged():
     """5823db0b — items without required_notes complete freely (no regression)."""
     db = _make_db()
@@ -2969,12 +2919,8 @@ def test_start_session_agent_instructions_hitl_mode_aware():
         ai1 = out1["agent_instructions"]
         assert "auto-answer SAFE" in ai1
         assert "not mandatory" in ai1.lower()
+        assert "does NOT apply" in ai1
         assert "skip blocked items" in ai1.lower()
-        # <infra-fix> — the "OVERRIDE ... does NOT apply" framing was repeatedly
-        # misread (by executor sessions and reviewers alike) as an adversarial
-        # prompt-injection attempt against the request_hitl rule, when it has
-        # always been this server's own code. Regression guard: it's gone.
-        assert "OVERRIDE" not in ai1
 
         # Mode 2: same override present.
         _run(db_module.update_project_settings(db, pid, hitl_auto_answer=2))
@@ -2983,7 +2929,7 @@ def test_start_session_agent_instructions_hitl_mode_aware():
         ai2 = out2["agent_instructions"]
         assert "AGGRESSIVE" in ai2
         assert "not mandatory" in ai2.lower()
-        assert "OVERRIDE" not in ai2
+        assert "does NOT apply" in ai2
     finally:
         _run(db.close())
 

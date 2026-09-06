@@ -1,0 +1,11 @@
+{
+    "schema_version": 2,
+    "commit": "259e5398f71dfd237a93da422df2b00bf75783ff",
+    "indexed_at": "2026-09-04T07:31:18Z",
+    "project": "meridian-main",
+    "nodes": 25457,
+    "edges": 173239,
+    "original_size": 53084160,
+    "compressed_size": 8172530,
+    "compression_level": 9
+}

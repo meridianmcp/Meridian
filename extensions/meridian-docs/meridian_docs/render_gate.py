@@ -1139,6 +1139,7 @@ class RenderReceipt:
     created_at: str
     created_at_epoch: float
     kind: str = "render"
+    preflight: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1200,6 +1201,8 @@ def render_with_receipt(
     receipts_path: str | None = None,
     visual_qa: dict[str, Any] | None = None,
     check_result: dict[str, Any] | None = None,
+    preflight: bool = False,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run :func:`check_render_capability` (or reuse an already-computed
     result) and build a DURABLE render receipt that survives the backend's
@@ -1228,7 +1231,7 @@ def render_with_receipt(
                        ``"not_applicable"`` (render did not succeed) status
                        -- a successful BACKEND CONVERSION is never, by
                        itself, recorded as a visual QA pass.
-      check_result:     Optional pre-computed :func:`check_render_capability`
+       check_result:     Optional pre-computed :func:`check_render_capability`
                        result (same three-state dict shape) to build the
                        receipt from INSTEAD of running a fresh render --
                        for a caller (e.g. a write-time gate) that already
@@ -1237,7 +1240,14 @@ def render_with_receipt(
                        second time. When given, ``backends``/``max_retries``
                        are not used to run anything; ``duration_seconds`` on
                        the resulting receipt is ``0.0`` (no render was timed
-                       by this call).
+                        by this call).
+       preflight:       When true, run :func:`docs_intel.preflight_document`
+                        before the backend. A deterministic package/equation
+                        failure returns a failed receipt without starting the
+                        expensive render. Ignored when ``check_result`` is
+                        supplied because that result already represents a
+                        completed render check.
+       style_policy:    Optional equation-style policy forwarded to preflight.
 
     Returns the receipt as a dict: ``receipt_id``, ``docx_path``,
     ``source_docx_sha256`` (the DOCX's own content hash, so a receipt can
@@ -1269,9 +1279,39 @@ def render_with_receipt(
         result = check_result
         duration = 0.0
         backend_order = result.get("backend_order") or backend_order
+        preflight_result = None
+    elif preflight:
+        preflight_result = docs_intel.preflight_document(
+            docx_path,
+            style_policy=style_policy,
+        )
+        if preflight_result.get("ready_for_render") is not True:
+            reason = preflight_result.get("error") or (
+                "equation/style findings: "
+                + repr((preflight_result.get("equation_audit") or {}).get("findings_by_type", {}))
+            )
+            result = {
+                "status": FAILED,
+                "reason": f"preflight blocked render: {reason}",
+                "backend_order": backend_order,
+                "detail": {
+                    "error_class": CORRUPTION_ERROR,
+                    "timed_out": False,
+                    "attempts": 1,
+                    "preflight": preflight_result,
+                },
+            }
+        else:
+            result = check_render_capability(
+                docx_path,
+                backends=backends,
+                max_retries=max_retries,
+            )
+        duration = time.monotonic() - started
     else:
         result = check_render_capability(docx_path, backends=backends, max_retries=max_retries)
         duration = time.monotonic() - started
+        preflight_result = None
 
     status = result["status"]
     detail = result.get("detail") or {}
@@ -1328,6 +1368,7 @@ def render_with_receipt(
         reason=result.get("reason"),
         created_at=_utcnow_iso(),
         created_at_epoch=now,
+        preflight=preflight_result,
     ).to_dict()
 
     if receipts_path:

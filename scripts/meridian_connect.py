@@ -49,56 +49,6 @@ def _settings_path() -> Path:
     return Path.home() / ".claude" / "settings.json"
 
 
-def _write_curl_header_config(token: str) -> str:
-    """Write a local curl `-K` config file holding the Authorization header.
-
-    ba31dedf — returns a path curl can read the header from at hook-fire
-    time, so the raw token is never a literal substring of the hook command
-    string this script writes into settings.json, and never appears in this
-    process's argv on every SessionStart/Stop firing (see call site comment).
-    Returns "" when there is no token (self-hosted/local, no auth needed) --
-    callers must treat an empty return as "omit the auth flag entirely",
-    never as a config file with an empty header.
-    """
-    if not token:
-        return ""
-    cfg_dir = Path.home() / ".meridian"
-    try:
-        cfg_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        return ""
-    cfg_path = cfg_dir / "hook_auth.conf"
-    try:
-        # curl -K config-file syntax: one `option = "value"` per line.
-        cfg_path.write_text(
-            f'header = "Authorization: Bearer {token}"\n', encoding="utf-8"
-        )
-        try:
-            os.chmod(cfg_path, 0o600)  # best-effort on POSIX; no-op on Windows
-        except OSError:
-            pass
-    except OSError:
-        return ""
-    return str(cfg_path)
-
-
-def _local_repo_hint() -> str:
-    """Directory to try starting the local server from (is_local health-check
-    fallback). NEVER guesses ``$HOME`` (ba31dedf) -- an unset
-    ``MERIDIAN_LOCAL_REPO``, or one that itself resolves to a bare home
-    directory, means "don't guess, skip the fallback" rather than silently
-    operating over the user's entire home tree.
-    """
-    hint = os.environ.get("MERIDIAN_LOCAL_REPO", "").strip()
-    if not hint:
-        return ""
-    resolved = str(Path(hint).expanduser().resolve())
-    home = str(Path.home().resolve())
-    if resolved.rstrip("\\/") == home.rstrip("\\/"):
-        return ""
-    return resolved
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Meridian session hooks installer",
@@ -191,50 +141,25 @@ def main() -> int:
             print("  Permanent token created.")
 
     # ---- Step 4: Build hook commands (cwd + hostname read at fire time) ------
-    # ba31dedf — the token must NEVER be a literal substring of the hook
-    # command string written into settings.json: these hooks fire on EVERY
-    # SessionStart/Stop, so a literal `-H 'Authorization: Bearer <token>'`
-    # here would (a) sit in settings.json in plaintext — a file people
-    # routinely paste into bug reports / dotfile-sync repos — and (b) put the
-    # raw token in this process's argv on every single invocation, visible to
-    # `ps`/Task Manager to any other user on a shared or process-monitored
-    # machine. curl's `-K <file>` reads headers from a local, restrictive-
-    # permission config file instead of argv/settings.json — the standard
-    # technique for keeping a secret out of both places. See
-    # _write_curl_header_config below.
-    auth_cfg_path = _write_curl_header_config(token)
-    auth_flag = f" -K \"{auth_cfg_path}\"" if auth_cfg_path else ""
+    auth_header = f" -H 'Authorization: Bearer {token}'" if token else ""
     start_cmd = (
-        f"curl -s -X POST{auth_flag} -H 'Content-Type: application/json'"
+        f"curl -s -X POST{auth_header} -H 'Content-Type: application/json'"
         f" -d \"{{\\\"cwd\\\":\\\"$PWD\\\",\\\"hostname\\\":\\\"$(hostname)\\\"}}\""
         f" '{meridian_url}/hooks/session-start'"
         f" | jq -r '.hookSpecificOutput.additionalContext // empty' 2>/dev/null"
     )
     stop_cmd = (
-        f"curl -s -X POST{auth_flag} -H 'Content-Type: application/json'"
+        f"curl -s -X POST{auth_header} -H 'Content-Type: application/json'"
         f" -d \"{{\\\"hostname\\\":\\\"$(hostname)\\\"}}\""
         f" '{meridian_url}/hooks/stop' >/dev/null 2>&1"
     )
 
     if is_local:
-        # ba31dedf — never fall back to $HOME: the prior unconditional
-        # `cd "$HOME" && nohup pixi run start` assumed the Meridian source
-        # checkout lives directly in the user's home directory, which is both
-        # fragile and the exact "home-directory execution fallback" class of
-        # bug the repo-scope guard (meridian/repo_scope.py) exists to reject
-        # elsewhere. This script is intentionally dependency-free (no
-        # `meridian` package import — see module docstring), so the fix here
-        # is self-contained: only attempt the fallback against an explicitly
-        # configured local repo path, and refuse a bare home directory even
-        # if one is configured. An unset/rejected hint means "don't guess" —
-        # the fallback is skipped entirely rather than defaulting to $HOME.
-        _local_repo = _local_repo_hint()
-        if _local_repo:
-            start_cmd = (
-                f"curl -sf --max-time 3 '{meridian_url}/health' >/dev/null 2>&1 ||"
-                f" {{ [ -f \"{_local_repo}/pixi.toml\" ] && (cd \"{_local_repo}\" && nohup pixi run start"
-                f" >/dev/null 2>&1 &) && sleep 3; }}; {start_cmd}"
-            )
+        start_cmd = (
+            f"curl -sf --max-time 3 '{meridian_url}/health' >/dev/null 2>&1 ||"
+            f" {{ [ -f \"$HOME/pixi.toml\" ] && (cd \"$HOME\" && nohup pixi run start"
+            f" >/dev/null 2>&1 &) && sleep 3; }}; {start_cmd}"
+        )
 
     # ---- Step 5: Claude Code -------------------------------------------------
     settings_path = _settings_path()

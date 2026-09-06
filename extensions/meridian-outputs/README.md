@@ -31,39 +31,13 @@ Or add to your MCP client config:
 
 | Tool | Description |
 |------|-------------|
-| `search_outputs` | BM25 full-text search over CSV/JSON/text/PDF files (body content) plus filename-only search over everything else (NPY etc.), with a literal-filename-match boost and an optional `subtree` scope |
+| `search_outputs` | BM25 full-text search over CSV/JSON/NPY files, with a literal-filename-match boost and an optional `subtree` scope |
 | `register_output_paths` | Directly register a known list of output paths so they're searchable immediately, without waiting for the ambient walk |
 | `get_convergence_state` | Read-only snapshot of how far the index walk has progressed (never triggers indexing) |
 | `search_logs` | Disposable regex search over a log directory tree (ripgrep tier 0, pure-Python fallback, timestamp/JSON sniffing tier 1) |
 | `classify_outputs` | Classify paths as canonical or archival (filename heuristics + two-stage SHA-256 byte-identity check) |
 | `npy_metadata` | Read a `.npy` header (shape/dtype/size) without loading the array |
 | `file_fingerprint` | Cheap content signature (CSV columns, JSON keys, generating-script hint) |
-
-### Local file inspection router (item a4cb12bf)
-
-`inspect_local_file` is one bounded local inspect/read workflow for a single
-XML, JSON, CSV, XLSX, or DOCX file — without a tunnel and without a second
-parser. It routes to whichever existing capability already understands the
-file's format (`meridian-file-inspection`'s `inspect_file`/
-`inspect_tabular_file`, or `meridian-docs`'s `document_outline`/
-`read_document_snapshot`), spawning each as its own short-lived local MCP
-stdio server rather than importing it directly (these are independently
-`uvx`-installable packages — see `meridian_outputs/file_inspector.py`'s
-module docstring for why a direct import isn't viable in production), and
-normalizes every answer into one canonical envelope.
-
-Every response carries `"local_only": true` (this tool never makes a
-network/tunnel call of its own) and an `operation` tier — `"metadata"`
-(identity/size/hash only), `"shape"` (default — structure without content
-previews/samples), or `"preview"` (the full bounded response). When the
-required sibling process can't even be reached, `state` is the new
-`"unavailable"` value (distinct from `"failed"`, which means a sibling ran
-and reported a real parse error) — never a raised exception, never a hang.
-`search_outputs`/`register_output_paths` are untouched by this addition.
-
-| Tool | Description |
-|------|-------------|
-| `inspect_local_file` | Route one file to the matching bounded inspector (XML/JSON/CSV/XLSX/DOCX) and return a single canonical envelope, with explicit `local_only`/`unavailable` state |
 
 ### Annotations & provenance
 
@@ -161,50 +135,6 @@ always surfaced together, never silently narrowed to one.
 | `get_source_artifacts` | Source → the artifacts it produced |
 | `list_registered_artifacts` | All registered artifacts, optionally filtered by kind/lifecycle_state |
 | `reconcile_legacy_artifact_outputs` | Migration/reconciliation report for legacy outputs (defaults to the `record_provenance` ledger); dry-run preview or real registration; ambiguous/unanchored entries are never silently registered |
-
-### Canonical run manifest (item 37ce5537)
-
-`meridian_outputs.run_manifest` composes this package's existing modules
-behind one run-scoped receipt — it introduces exactly ONE new ledger
-(`<outputs_dir>/.meridian-outputs-cache/run_manifest_ledger.json`, keyed by
-`run_id`) and duplicates none of the state the sibling ledgers above already
-own: hashes come from `fingerprint.script_content_hash`, artifact references
-are validated (never re-derived) against `artifact_registry`, and the
-convergence snapshot comes from `outputs_local.get_convergence_state`.
-
-A run manifest binds, in one place: project/repo identity (including a
-best-effort local `git_state` capture — this package cannot import
-`meridian.executor_contract` across the package boundary, see the module's
-own docstring), package/tool version, command identity, input/output file
-hashes, the indexing bounds actually in effect (max workers, batch caps,
-adaptive thresholds, DuckDB/Tantivy memory), every sibling ledger's on-disk
-location, referenced artifact ids, and an explicit `phase`
-(`in_progress`/`complete`/`failed`/`partial`).
-
-`start_run_manifest` persists an `in_progress` receipt immediately — an
-interrupted run's manifest is resumable, never lost. Its `manifest_hash` is
-a deterministic identity fingerprint (excludes wall-clock and
-lifecycle/outcome fields): identical identity inputs on unchanged
-repo/runtime state hash identically every time, and a same-`run_id` call
-with a genuinely different identity is refused rather than silently
-overwritten — a new run needs a new `run_id`. `finalize_run_manifest`
-re-hashes every declared output path and validates every declared artifact
-id RIGHT NOW (fail-closed): anything that doesn't check out downgrades an
-attempted `"complete"` to `"partial"` automatically, and `manifest_hash`
-never changes across finalize. `get_run_manifest_envelope` represents the
-finished (or still-partial) manifest as a `RUN`-kind `EvidenceRecord` — the
-`EvidenceKind.RUN` slot `research_evidence.py` already reserved but nothing
-populated until this item — so it round-trips through the exact same
-lossless JSON/XML envelope machinery as every other provenance answer in
-this package, with no second codec.
-
-| Tool | Description |
-|------|-------------|
-| `start_run_manifest` | Persist an in-progress canonical run manifest: project/repo/package/command identity, input hashes, indexing bounds in effect, sibling-ledger locations, convergence snapshot. Idempotent; refuses a same-`run_id`/different-identity collision |
-| `finalize_run_manifest` | Bind exact (re-hashed now) output paths and validated artifact-id references to a started run, and mark its final phase — fails closed to `partial` on anything unverified |
-| `get_run_manifest` | Look up the current run-manifest record for a `run_id`, whatever phase it's in |
-| `list_run_manifests` | List every run-manifest record started under an outputs directory |
-| `get_run_manifest_envelope` | Typed, lossless `RUN`-kind `ProvenanceEnvelope` for one run manifest |
 
 ## Security
 

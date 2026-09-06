@@ -14,14 +14,181 @@ that state as explicit keyword arguments to keep the import graph acyclic.
 from __future__ import annotations
 
 import asyncio
+from html import escape as _xml_escape
 from typing import Any, TYPE_CHECKING
 
 import meridian.server as _server
 from meridian import db as db_module
+from meridian import external_job_register as external_job_model
+from meridian.db import external_jobs as external_job_db
 from meridian._deps import validate_input_size
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+def _external_job_identifier(args: dict[str, Any]) -> dict[str, str | None]:
+    job_id = args.get("job_id")
+    job_key = args.get("job_key")
+    if bool(job_id) == bool(job_key):
+        raise ValueError("pass exactly one of job_id or job_key")
+    return {"job_id": job_id, "job_key": job_key}
+
+
+async def _external_job_snapshot(
+    db: Any, data_dir: str, project_id: str
+) -> dict[str, Any]:
+    jobs = await external_job_db.list_external_jobs(
+        db, project_id, include_terminal=True, limit=500
+    )
+    return external_job_model.write_local_status_snapshot(data_dir, project_id, jobs)
+
+
+async def _log_external_job_change(
+    db: Any, project_id: str, session_id: str, action: str, job: dict[str, Any]
+) -> dict[str, Any]:
+    terminal = job.get("status") in external_job_model.EXTERNAL_JOB_TERMINAL_STATUSES
+    status = "done" if terminal else "in_progress"
+    kind = "shipped" if terminal else "found"
+    return await db_module.log_task(
+        db, session_id, project_id,
+        external_job_model.build_log_description(action, job),
+        status=status,
+        kind=kind,
+    )
+
+
+async def handle_register_external_job(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: register_external_job."""
+    try:
+        job = await external_job_db.register_external_job(
+            db, args["project_id"], args["session_id"],
+            job_key=args["job_key"], provider=args["provider"],
+            external_id=args["external_id"], status=args.get("status", "running"),
+            phase=args.get("phase"), check_hint=args.get("check_hint"),
+            resume_hint=args.get("resume_hint"), resource_hint=args.get("resource_hint"),
+            next_check_at=args.get("next_check_at"), detail=args.get("detail"),
+            metadata=args.get("metadata"),
+        )
+        snapshot = await _external_job_snapshot(db, data_dir, args["project_id"])
+        log = await _log_external_job_change(
+            db, args["project_id"], args["session_id"], "registered", job
+        )
+        return {"job": job, "task_log": log, "local_snapshot": snapshot}
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+
+
+async def handle_update_external_job(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: update_external_job."""
+    try:
+        identifier = _external_job_identifier(args)
+        fields = {
+            name: args[name]
+            for name in (
+                "status", "phase", "check_hint", "resume_hint", "resource_hint",
+                "next_check_at", "detail", "metadata",
+            )
+            if name in args
+        }
+        job = await external_job_db.update_external_job(
+            db, args["project_id"], args["session_id"], **identifier, **fields
+        )
+        snapshot = await _external_job_snapshot(db, data_dir, args["project_id"])
+        log = await _log_external_job_change(
+            db, args["project_id"], args["session_id"], "updated", job
+        )
+        return {"job": job, "task_log": log, "local_snapshot": snapshot}
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+
+
+async def handle_get_external_job(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: get_external_job."""
+    try:
+        identifier = _external_job_identifier(args)
+        job = await external_job_db.get_external_job(
+            db, args["project_id"], **identifier,
+            include_history=args.get("include_history", True),
+        )
+        if job is None:
+            return {"error": "external job not found in this project"}
+        return {"job": job}
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+
+
+async def handle_list_external_jobs(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: list_external_jobs."""
+    try:
+        jobs = await external_job_db.list_external_jobs(
+            db, args["project_id"], include_terminal=args.get("include_terminal", False),
+            status=args.get("status"), limit=args.get("limit", 100),
+        )
+        local_path = external_job_model.external_job_snapshot_path(
+            data_dir, args["project_id"]
+        )
+        local = external_job_model.read_local_status_snapshot(data_dir, args["project_id"])
+        return {
+            "jobs": jobs,
+            "count": len(jobs),
+            "local_snapshot": {
+                "path": str(local_path),
+                "exists": local is not None,
+                "generated_at": (local or {}).get("generated_at"),
+                "job_count": len((local or {}).get("jobs") or []),
+            },
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+
+
+async def handle_complete_external_job(
+    args: dict[str, Any],
+    db: Any,
+    data_dir: str,
+    tenant: dict[str, Any] | None,
+    _mcp_tenant_id: Any,
+) -> Any:
+    """MCP tool: complete_external_job."""
+    try:
+        identifier = _external_job_identifier(args)
+        job = await external_job_db.complete_external_job(
+            db, args["project_id"], args["session_id"], **identifier,
+            status=args.get("status", "succeeded"), detail=args.get("detail"),
+            metadata=args.get("metadata"),
+        )
+        snapshot = await _external_job_snapshot(db, data_dir, args["project_id"])
+        log = await _log_external_job_change(
+            db, args["project_id"], args["session_id"], "completed", job
+        )
+        return {"job": job, "task_log": log, "local_snapshot": snapshot}
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"error": str(exc)}
 
 
 async def handle_checkpoint(
@@ -272,6 +439,12 @@ async def handle_checkpoint(
         "next_goal": next_goal,
         "start_fresh": start_fresh,
     }
+    try:
+        _ckpt_resp["external_jobs"] = await external_job_db.list_external_jobs(
+            db, project_id, include_terminal=False, limit=20
+        )
+    except Exception:  # noqa: BLE001 — a checkpoint must remain non-fatal
+        pass
     # 7479e427 — bounded proposal-run scope summary, so a caller sees the
     # SAME executable/degraded verdict generate_handoff's own <proposal_scope>
     # tag carries without a separate call. Omitted entirely when the
@@ -998,6 +1171,27 @@ async def handle_get_session_brief(
         f'<progress done="{_done_count}" total="{_total_count}" pct="{_pct}%"/>\n'
         if _total_count else ""
     )
+    try:
+        _brief_external_jobs = await external_job_db.list_external_jobs(
+            db, project_id, include_terminal=False, limit=5
+        )
+    except Exception:  # noqa: BLE001 — orientation remains useful if the table is unavailable
+        _brief_external_jobs = []
+    external_jobs_xml = ""
+    if _brief_external_jobs:
+        external_jobs_xml = (
+            f'<external_jobs count="{len(_brief_external_jobs)}">\n'
+            + "\n".join(
+                f'  <job key="{_xml_escape(str(job.get("job_key") or ""))}" '
+                f'provider="{_xml_escape(str(job.get("provider") or ""))}" '
+                f'status="{_xml_escape(str(job.get("status") or ""))}" '
+                f'phase="{_xml_escape(str(job.get("phase") or ""))}">'
+                f'check: {_xml_escape(str(job.get("check_hint") or ""))[:160]} '
+                f'resume: {_xml_escape(str(job.get("resume_hint") or ""))[:160]}</job>'
+                for job in _brief_external_jobs
+            )
+            + "\n</external_jobs>\n"
+        )
     # Sprint-4: planner role gets richer context — all decisions + all notes + active sessions.
     planner_extra_xml = ""
     if role == "planner":
@@ -1139,6 +1333,7 @@ async def handle_get_session_brief(
         f'{notes_xml}'
         f'{new_items_xml}'
         f'{_progress_xml}'
+        f'{external_jobs_xml}'
         f'<sprint>{sprint_str[:200]}</sprint>\n'
         f'<pending_items>\n{sprint_items_xml}\n</pending_items>\n'
         f'<last_tasks>\n{tasks_xml}\n</last_tasks>\n'

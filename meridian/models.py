@@ -381,18 +381,6 @@ class HandoffResult(BaseModel):
     # modes that don't compute it (planner/starter/compact/goal/l0_fallback)
     # or if generate_handoff's build itself failed before reaching the gate.
     continuation_status: dict[str, Any] | None = None
-    # c6015316 — machine-readable board-context-state signal (see
-    # meridian.handoff.build_board_context_state_for_handoff):
-    # {"state": "empty"|"context_only"|"has_pending_items",
-    # "pending_item_count", "in_progress_item_count", "pinned_decision_count",
-    # "note_count", "hint"?}. Distinguishes a genuinely-empty project from one
-    # with pinned decisions/notes but zero executable sprint items
-    # ("context_only") — previously these two cases were indistinguishable in
-    # every transport's response. Counts only, never decision/note bodies.
-    # dict, not a typed submodel, for the same forward-compat reason as
-    # capability_contract above. None only if the lookup itself failed
-    # (best-effort) — emitted on every mode, unlike continuation_status.
-    board_context_state: dict[str, Any] | None = None
 
 
 class TaskUpdate(BaseModel):
@@ -858,5 +846,113 @@ class HandoffFamilyContext(BaseModel):
         "adopted or rejected for this child -- the 'pending promotion decisions' ea49362c's own "
         "acceptance notes name. Never auto-populated by silently adopting anything.",
     )
+
+
+# ---------------------------------------------------------------------------
+# 4376e655 — Experiment / Run / RunAttempt state model. See
+# meridian.experiment_model (closed vocabularies, transition rules) and
+# meridian.db.experiment_model (persistence, derived run status) for the
+# full contract these wire-format shapes describe.
+# ---------------------------------------------------------------------------
+
+
+class ExperimentCreate(BaseModel):
+    """Body for creating a new experiment."""
+
+    project_id: str = Field(..., min_length=1)
+    name: str | None = None
+    config_template: dict[str, Any] | None = None
+    created_by: str | None = None
+
+
+class Experiment(BaseModel):
+    """An experiment row — a named research question many runs belong to."""
+
+    id: str
+    project_id: str
+    name: str | None = None
+    config_template: dict[str, Any] | None = None
+    created_by: str | None = None
+    created_at: str
+    updated_at: str | None = None
+
+
+class ResearchRunCreate(BaseModel):
+    """Body for creating a new run under an experiment.
+
+    ``idempotency_key`` (optional): a repeat call with the SAME key returns
+    the existing run rather than creating a duplicate — see
+    ``meridian.db.experiment_model.create_run``.
+    """
+
+    project_id: str = Field(..., min_length=1)
+    experiment_id: str = Field(..., min_length=1)
+    params: dict[str, Any] | None = None
+    source_revision: str | None = None
+    idempotency_key: str | None = None
+    created_by: str | None = None
+
+
+class RunAttempt(BaseModel):
+    """One concrete attempt to execute a run. ``status`` is one of
+    ``meridian.experiment_model.ATTEMPT_STATUSES``; ``failure_class`` is set
+    only when ``status`` is ``failed``/``crashed``."""
+
+    id: str
+    run_id: str
+    project_id: str
+    attempt_number: int
+    status: Literal["queued", "running", "succeeded", "failed", "cancelled", "crashed", "unknown"]
+    failure_class: Literal[
+        "user_error", "infra_error", "timeout", "oom", "preempted", "dependency_error", "unknown"
+    ] | None = None
+    error_message: str | None = None
+    checkpoint_ref: dict[str, Any] | None = None
+    artifact_refs: list[Any] | None = None
+    provenance_ref: dict[str, Any] | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    last_heartbeat_at: str | None = None
+    created_by: str | None = None
+    created_at: str
+    updated_at: str | None = None
+
+
+class ResearchRun(BaseModel):
+    """A run row. ``status`` and ``latest_attempt`` are ALWAYS derived live
+    from the run's attempts (see ``meridian.db.experiment_model.get_run``) —
+    never an independently-settable, cacheable field, so restart recovery
+    and handoff serialization can never replay a stale status."""
+
+    id: str
+    project_id: str
+    experiment_id: str
+    idempotency_key: str | None = None
+    params: dict[str, Any] | None = None
+    params_fingerprint: str | None = None
+    source_revision: str | None = None
+    attempt_count: int = 0
+    status: Literal["queued", "running", "succeeded", "failed", "cancelled", "crashed", "unknown"]
+    latest_attempt: RunAttempt | None = None
+    created_by: str | None = None
+    created_at: str
+    updated_at: str | None = None
+
+
+class AttemptTransitionRequest(BaseModel):
+    """Body for transitioning a run attempt's status. See
+    ``meridian.experiment_model.validate_attempt_transition`` for the legal
+    transition table; an illegal jump (e.g. ``succeeded`` -> ``running``) is
+    rejected with 400, not silently coerced."""
+
+    project_id: str = Field(..., min_length=1)
+    status: Literal["queued", "running", "succeeded", "failed", "cancelled", "crashed", "unknown"]
+    failure_class: Literal[
+        "user_error", "infra_error", "timeout", "oom", "preempted", "dependency_error", "unknown"
+    ] | None = None
+    error_message: str | None = None
+    checkpoint_ref: dict[str, Any] | None = None
+    artifact_refs: list[Any] | None = None
+    provenance_ref: dict[str, Any] | None = None
 
 

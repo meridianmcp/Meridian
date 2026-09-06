@@ -149,55 +149,6 @@ async def get_hooks_install_ps1() -> PlainTextResponse:
 
 
 # ---------------------------------------------------------------------------
-# Hook configuration diagnostics (34f76536)
-# ---------------------------------------------------------------------------
-
-@router.get("/hooks/diagnostics")
-async def get_hooks_diagnostics() -> dict[str, Any]:
-    """34f76536 — live hook-configuration diagnostics for the active repo.
-
-    Surfaces ``hook_paths.diagnose_configured_hooks`` as a real endpoint
-    instead of logic that only tests ever exercised. Classifies every hook
-    command configured in the active repo's
-    ``.claude/settings.json`` as ``ok`` / a genuine missing REQUIRED project
-    hook (``$CLAUDE_PROJECT_DIR``-scoped, must exist in this repo) / an
-    OPTIONAL global hook that is legitimately absent until the user runs
-    the ``hooks.ps1``/``hooks.sh`` installer on this machine / unresolvable.
-    A missing OPTIONAL hook is never treated as a problem here -- only
-    ``missing_required_count`` signals a genuine, actionable misconfiguration.
-
-    Never raises: an absent or unreadable settings.json yields
-    ``settings_found: false`` with an empty ``hooks`` list rather than a
-    404/500, since a diagnostics endpoint must never itself become a source
-    of failure for a session that polls it during orientation.
-    """
-    repo_root = hook_paths_module.resolve_active_repo_root(cwd=str(Path.cwd()))
-    settings_path = (repo_root / ".claude" / "settings.json") if repo_root else None
-    if settings_path is None or not settings_path.exists():
-        return {
-            "settings_found": False,
-            "settings_path": str(settings_path) if settings_path else None,
-            "repo_root": str(repo_root) if repo_root else None,
-            "hooks": [],
-            "missing_required_count": 0,
-        }
-    diagnostics = hook_paths_module.diagnose_configured_hooks(
-        settings_path, repo_root=repo_root
-    )
-    missing_required = [
-        d for d in diagnostics
-        if d["status"] == hook_paths_module.STATUS_MISSING_REQUIRED
-    ]
-    return {
-        "settings_found": True,
-        "settings_path": str(settings_path),
-        "repo_root": str(repo_root),
-        "hooks": diagnostics,
-        "missing_required_count": len(missing_required),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Connection management routes
 # ---------------------------------------------------------------------------
 

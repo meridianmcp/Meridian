@@ -632,13 +632,6 @@ class SlotResult:
     classification: "str | None" = None
     stderr_tail: "str | None" = None
     notes: "list[str]" = field(default_factory=list)
-    # ba31dedf — the "shutdown" leg of the cold/warm/shutdown smoke test.
-    # True only when StdioMcpClient.close() confirmed the spawned child
-    # actually exited (a real receipt, never fabricated); False when it was
-    # never spawned or termination could not be confirmed; None only for a
-    # SlotResult built before any spawn was attempted (skip_reason /
-    # no-runnable-command early returns in test_slot).
-    shutdown_confirmed: "bool | None" = None
 
     def to_dict(self) -> dict:
         return {
@@ -648,7 +641,6 @@ class SlotResult:
             "functional_ok": self.functional_ok, "repeat_consistent": self.repeat_consistent,
             "error": self.error, "classification": self.classification,
             "stderr_tail": self.stderr_tail, "notes": list(self.notes),
-            "shutdown_confirmed": self.shutdown_confirmed,
         }
 
 
@@ -883,24 +875,13 @@ class StdioMcpClient:
         await self._send(build_tools_call_request(name, arguments, req_id))
         return await self._recv(timeout=timeout, expected_id=req_id)
 
-    async def close(self) -> bool:
-        """Tear down the spawned child. Returns a REAL shutdown receipt --
-        ``True`` only when the process is CONFIRMED exited (a non-None
-        ``returncode``) after termination, ``False`` when it was never
-        spawned, or termination could not be confirmed (still running after
-        ``_terminate_proc_tree_async``'s own bounded kill+wait). Never
-        fabricated: this is exactly what ``_terminate_proc_tree_async``
-        already does internally, just observed and reported instead of
-        discarded (ba31dedf 'shutdown' leg of the cold/warm/shutdown smoke
-        test).
-        """
+    async def close(self) -> None:
         if self._proc is None:
-            return False
+            return
         with contextlib.suppress(Exception):
             if self._proc.stdin:
                 self._proc.stdin.close()
         await _terminate_proc_tree_async(self._proc)
-        shutdown_confirmed = self._proc.returncode is not None
         if self._stderr_task is not None:
             self._stderr_task.cancel()
             # asyncio.CancelledError is a BaseException (not Exception) since
@@ -914,7 +895,6 @@ class StdioMcpClient:
             # that should keep propagating.
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 await self._stderr_task
-        return shutdown_confirmed
 
 
 # ---------------------------------------------------------------------------
@@ -1116,11 +1096,10 @@ async def test_slot(
         stderr = client.captured_stderr
         text = f"{exc}\n{stderr}"
         classification = classify_captured_output(text)
-        shutdown_confirmed = await client.close()
+        await client.close()
         return SlotResult(
             spec.slot, spec.name, passed=False, cold=cold, error=str(exc),
             classification=classification, stderr_tail=stderr[-1500:] if stderr else None,
-            shutdown_confirmed=shutdown_confirmed,
         )
 
     spawn_ms = (time.monotonic() - t0) * 1000.0
@@ -1157,7 +1136,7 @@ async def test_slot(
             notes.append(f"functional call to {functional_tool!r} failed: {exc}")
 
     stderr = client.captured_stderr
-    shutdown_confirmed = await client.close()
+    await client.close()
     classification = classify_captured_output(stderr) if not functional_ok else None
     # Connectivity + a non-empty tool list is the floor; a real functional
     # call succeeding is the target. When no safe zero-arg tool exists at all,
@@ -1171,7 +1150,6 @@ async def test_slot(
         tools_count=len(tools), functional_tool=functional_tool, functional_ok=functional_ok,
         repeat_consistent=repeat_consistent, classification=classification,
         stderr_tail=stderr[-1500:] if stderr else None, notes=notes,
-        shutdown_confirmed=shutdown_confirmed,
     )
 
 

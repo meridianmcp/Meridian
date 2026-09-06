@@ -26,7 +26,8 @@ Stdlib only (zipfile + xml.etree.ElementTree, no lxml).
 
 a80af3a0 — OMML/equation support (local extraction + write-back).
 Two extraction patterns: standalone paragraph (<m:oMath> alone in <w:p>)
-and table-cell-with-numbering (2-col <w:tbl> row: equation | "(1)").
+and table-cell-with-numbering (2-col equation | number or 3-col spacer |
+equation | number <w:tbl> rows).
 Write-back: insert_equation_local / edit_equation_local / remove_equation_local.
 LaTeX -> OMML conversion via latex2mathml + stdlib ET mapper (no lxml).
 Local sidecar persistence: index_docx_equations / get_local_equations.
@@ -61,6 +62,11 @@ from . import ooxml_integrity, render_gate
 # OOXML namespaces.
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _W14 = "http://schemas.microsoft.com/office/word/2010/wordml"
+
+# Returned by preflight/audit callers so a long-lived MCP process can be
+# identified after a code reload.  A caller should never have to infer that a
+# result came from an older parser from its findings alone.
+DOCX_INTEL_CONTRACT_VERSION = "docx-intel-v2-preflight-caption-spacing"
 
 # XML namespace for xml:space attribute.
 _XML_NS = "http://www.w3.org/XML/1998/namespace"
@@ -6594,10 +6600,12 @@ def remove_caption(
 # ---------------------------------------------------------------------------
 
 _PLAINTEXT_FIGURE_RE = re.compile(
-    r"^\s*Figure\s+(\d+)\b\s*[.:]?\s*(.*)$", re.IGNORECASE | re.DOTALL
+    r"^\s*Figure\s+([A-Za-z]?\d+(?:\.\d+)*(?:-[A-Za-z]?\d+(?:\.\d+)*)?)\b\s*[.:]?\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
 )
 _PLAINTEXT_TABLE_RE = re.compile(
-    r"^\s*Table\s+(\d+)\b\s*[.:]?\s*(.*)$", re.IGNORECASE | re.DOTALL
+    r"^\s*Table\s+([A-Za-z]?\d+(?:\.\d+)*(?:-[A-Za-z]?\d+(?:\.\d+)*)?)\b\s*[.:]?\s*(.*)$",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -8198,51 +8206,15 @@ def _cell_has_omath(tc: ET.Element) -> bool:
     return tc.find(f".//{_qm('oMath')}") is not None
 
 
-def parse_docx_equations_local(
-    source: str | bytes | bytearray,
-) -> list[dict[str, Any]]:
-    """Parse every <m:oMath> in word/document.xml via stdlib ET (a80af3a0).
+def _parse_docx_equations_root(root: ET.Element) -> list[dict[str, Any]]:
+    """Parse equations from an already-loaded ``<w:document>`` tree.
 
-    Reads the real OOXML tree directly out of the .docx ZIP using zipfile +
-    xml.etree.ElementTree — no lxml, no third-party deps beyond stdlib.
-
-    Returns an ordered list of records::
-
-        {
-            "ordinal":    int,          # 0-based document order
-            "para_id":    str,          # w14:paraId or synthesized "p{index}"
-            "omml_raw":   str,          # serialized <m:oMath>...</m:oMath> XML
-            "pattern":    str,          # "standalone" | "table-numbered"
-            "number":     str | None,   # equation number "(1)" for table pattern
-            "flat_text":  str,          # flattened <m:t> content (dedup key)
-        }
-
-    Two patterns are detected:
-
-    1. **standalone**: an <m:oMath> occurring inside a <w:p> in the body
-       (including inside table cells that are not numbered-equation tables).
-       ``number`` is ``None``.
-
-    2. **table-numbered**: a <w:tbl> row where the first cell contains an
-       <m:oMath> and the second cell contains a parenthesised equation number
-       (e.g. "(1)", "(2a)").  The number is extracted and associated as the
-       equation's ``number`` field.  The ``para_id`` is synthesized from the
-       table's position in the body (``tbl{body_child_index}``) unless the cell
-       paragraph has a real w14:paraId.
-
-    A document with no equations returns [].
+    Keeping the traversal separate from ZIP loading is intentional: a single
+    preflight/audit call often needs both the parsed document and the equation
+    inventory.  Reopening and reparsing the same DOCX for each check made
+    chained QA needlessly slow and, more importantly, allowed two checks to
+    observe different runtime/parser behavior.
     """
-    if isinstance(source, (bytes, bytearray)):
-        zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
-    else:
-        zf = zipfile.ZipFile(source)
-    try:
-        with zf.open("word/document.xml") as handle:
-            xml_bytes = handle.read()
-    finally:
-        zf.close()
-
-    root = ET.fromstring(xml_bytes)
     body = root.find(_q(_W, "body"))
     if body is None:
         return []
@@ -8276,21 +8248,30 @@ def parse_docx_equations_local(
             p_global_idx += 1
 
         elif child.tag == w_tbl:
-            # Check every row for the equation-with-numbering pattern:
-            # first cell has oMath, second cell has a parenthesised number.
+            # Word uses both compact equation/number rows and the common
+            # spacer/equation/number layout.  Locate the OMML cell first and
+            # search only to its right for the parenthesised label.
             for tr in child.findall(f".//{w_tr}"):
                 cells = tr.findall(w_tc)
-                if len(cells) >= 2 and _cell_has_omath(cells[0]):
-                    number_text = _cell_text(cells[1]).strip()
-                    if _EQ_NUMBER_RE.match(number_text):
-                        # Table-numbered equation.
-                        # Use the first paragraph's para_id inside the cell, or synth.
-                        cell0_para = cells[0].find(w_p)
-                        if cell0_para is not None:
-                            para_id = cell0_para.get(w14_para_id) or f"tbl{body_child_idx}"
+                equation_cell_index = next(
+                    (index for index, cell in enumerate(cells) if _cell_has_omath(cell)),
+                    None,
+                )
+                if equation_cell_index is not None:
+                    numbered_cells = [
+                        cell
+                        for cell in cells[equation_cell_index + 1 :]
+                        if _EQ_NUMBER_RE.match(_cell_text(cell).strip())
+                    ]
+                    if numbered_cells:
+                        number_text = _cell_text(numbered_cells[-1]).strip()
+                        equation_cell = cells[equation_cell_index]
+                        equation_para = equation_cell.find(w_p)
+                        if equation_para is not None:
+                            para_id = equation_para.get(w14_para_id) or f"tbl{body_child_idx}"
                         else:
                             para_id = f"tbl{body_child_idx}"
-                        for omath_el in cells[0].iter(m_omath):
+                        for omath_el in equation_cell.iter(m_omath):
                             equations.append({
                                 "ordinal": ordinal,
                                 "para_id": para_id,
@@ -8302,15 +8283,13 @@ def parse_docx_equations_local(
                                 ),
                             })
                             ordinal += 1
-                        continue  # handled — don't fall through to standalone scan
+                        continue
 
-                # Not a numbered-equation table row — scan any oMath as standalone.
+                # Not a numbered-equation row: retain any OMML as standalone.
                 for omath_el in tr.iter(m_omath):
-                    # Derive para_id from containing <w:p> if possible.
-                    para_id = f"tbl{body_child_idx}"
                     equations.append({
                         "ordinal": ordinal,
-                        "para_id": para_id,
+                        "para_id": f"tbl{body_child_idx}",
                         "omml_raw": ET.tostring(omath_el, encoding="unicode"),
                         "pattern": "standalone",
                         "number": None,
@@ -8321,6 +8300,54 @@ def parse_docx_equations_local(
                     ordinal += 1
 
     return equations
+
+
+def parse_docx_equations_local(
+    source: str | bytes | bytearray,
+) -> list[dict[str, Any]]:
+    """Parse every <m:oMath> in word/document.xml via stdlib ET (a80af3a0).
+
+    Reads the real OOXML tree directly out of the .docx ZIP using zipfile +
+    xml.etree.ElementTree — no lxml, no third-party deps beyond stdlib.
+
+    Returns an ordered list of records::
+
+        {
+            "ordinal":    int,          # 0-based document order
+            "para_id":    str,          # w14:paraId or synthesized "p{index}"
+            "omml_raw":   str,          # serialized <m:oMath>...</m:oMath> XML
+            "pattern":    str,          # "standalone" | "table-numbered"
+            "number":     str | None,   # equation number "(1)" for table pattern
+            "flat_text":  str,          # flattened <m:t> content (dedup key)
+        }
+
+    Two patterns are detected:
+
+    1. **standalone**: an <m:oMath> occurring inside a <w:p> in the body
+       (including inside table cells that are not numbered-equation tables).
+       ``number`` is ``None``.
+
+    2. **table-numbered**: a <w:tbl> row where an OMML-containing cell is
+       followed by a cell containing a parenthesised equation number (e.g.
+       "(1)", "(2a)"). This covers both compact equation/number rows and
+       Word's common spacer/equation/number layout. The number is extracted and associated as the
+       equation's ``number`` field.  The ``para_id`` is synthesized from the
+       table's position in the body (``tbl{body_child_index}``) unless the cell
+       paragraph has a real w14:paraId.
+
+    A document with no equations returns [].
+    """
+    if isinstance(source, (bytes, bytearray)):
+        zf = zipfile.ZipFile(io.BytesIO(bytes(source)))
+    else:
+        zf = zipfile.ZipFile(source)
+    try:
+        with zf.open("word/document.xml") as handle:
+            xml_bytes = handle.read()
+    finally:
+        zf.close()
+
+    return _parse_docx_equations_root(ET.fromstring(xml_bytes))
 
 
 # ---------------------------------------------------------------------------
@@ -8439,6 +8466,214 @@ _VALID_HIGHLIGHT_COLORS = {
     "none", "red", "white", "yellow",
 }
 
+# Figure/table spacing is deliberately a named, opt-in profile rather than a
+# universal Word rule.  Current Missouri S&T guidance says spacing above and
+# below all figures/tables should be consistent, preferably 3--4 blank
+# single-spaced lines; it does not define a point/inch threshold.  Journal
+# submission guides commonly specify placement/caption semantics but leave
+# whitespace to the template or production system.  Keeping the sources and
+# the enforcement mode beside the profile prevents a future caller from
+# accidentally turning a preference into a hard error.
+#
+# ``min_gap_single_lines`` / ``max_gap_single_lines`` measure the structural
+# gap around the complete display unit (figure + caption, or caption + table)
+# in single-line equivalents.  They are an OOXML estimate, not rendered page
+# geometry.  The audit therefore never claims to verify bottom-of-page white
+# space, floating-object wrap, or line wrapping without a render backend.
+FIGURE_TABLE_SPACING_PROFILES: dict[str, dict[str, Any]] = {
+    "none": {
+        "description": "No figure/table whitespace policy selected.",
+        "enforcement": "disabled",
+        "min_gap_single_lines": None,
+        "max_gap_single_lines": None,
+        "gap_sides": [],
+        "caption_line_spacing": None,
+        "source_urls": [],
+    },
+    "mst_thesis": {
+        "description": (
+            "Missouri S&T current thesis specification: consistent spacing, "
+            "preferably 3--4 blank single-spaced lines above and below "
+            "figures/tables."
+        ),
+        "enforcement": "preferred",
+        "min_gap_single_lines": 3.0,
+        "max_gap_single_lines": 4.0,
+        "gap_sides": ["before", "after"],
+        "caption_line_spacing": None,
+        "source_urls": [
+            "https://grad.mst.edu/studentservices/thesisdissertationguide/preparingyourdocument/",
+            "https://grad.mst.edu/media/administrative/grad/documents/Final%20Draft%20-%2010.25.17%20(edited%204.2026).pdf",
+        ],
+    },
+    "mst_thesis_v11_legacy": {
+        "description": (
+            "Legacy Missouri S&T v11 template approximation: two double-spaced "
+            "carriage returns, retained only for historical compatibility."
+        ),
+        "enforcement": "preferred",
+        "min_gap_single_lines": 4.0,
+        "max_gap_single_lines": None,
+        "gap_sides": ["before", "after"],
+        "caption_line_spacing": None,
+        "source_urls": [],
+    },
+    "drexel_thesis": {
+        "description": (
+            "Drexel thesis manual: at least 3 single-spaced lines above/below "
+            "tables and figures (relative to their captions)."
+        ),
+        "enforcement": "minimum",
+        "min_gap_single_lines": 3.0,
+        "max_gap_single_lines": None,
+        "gap_sides": ["before", "after"],
+        "caption_line_spacing": None,
+        "source_urls": [
+            "https://drexel.edu/~/media/Files/graduatecollege/forms/Thesis%20Manual.ashx?la=en",
+        ],
+    },
+    "chicago_turabian": {
+        "description": (
+            "Chicago/Turabian figure convention: at least one blank line "
+            "between a caption and text below."
+        ),
+        "enforcement": "minimum",
+        "min_gap_single_lines": 1.0,
+        "max_gap_single_lines": None,
+        "gap_sides": ["after"],
+        "caption_line_spacing": None,
+        "source_urls": [
+            "https://cmosshoptalk.com/2019/02/12/how-do-i-format-a-figure-and-caption-in-turabian-chicago-style/",
+        ],
+    },
+    "asce_manuscript": {
+        "description": (
+            "ASCE manuscript profile: figure captions are double-spaced; "
+            "the guide does not prescribe a blank-line count."
+        ),
+        "enforcement": "caption_line_spacing",
+        "min_gap_single_lines": None,
+        "max_gap_single_lines": None,
+        "gap_sides": [],
+        "caption_line_spacing": "double",
+        "source_urls": [
+            "https://ascelibrary.org/author-center/preparing-manuscript",
+        ],
+    },
+    "jcshm_springer": {
+        "description": (
+            "JCSHM/Springer profile: no blank-line or point-spacing rule is "
+            "specified; retain structural caption and placement checks."
+        ),
+        "enforcement": "structural_only",
+        "min_gap_single_lines": None,
+        "max_gap_single_lines": None,
+        "gap_sides": [],
+        "caption_line_spacing": None,
+        "source_urls": [
+            "https://link.springer.com/journal/13349/submission-guidelines",
+        ],
+    },
+    "journal_generic": {
+        "description": (
+            "Generic journal submission profile: no whitespace threshold "
+            "assumed; use the target journal's guide or template."
+        ),
+        "enforcement": "structural_only",
+        "min_gap_single_lines": None,
+        "max_gap_single_lines": None,
+        "gap_sides": [],
+        "caption_line_spacing": None,
+        "source_urls": [],
+    },
+}
+
+_VALID_FIGURE_TABLE_SPACING_PROFILES = frozenset(FIGURE_TABLE_SPACING_PROFILES)
+_VALID_FIGURE_TABLE_ENFORCEMENTS = frozenset({
+    "disabled", "preferred", "minimum", "caption_line_spacing", "structural_only",
+})
+_VALID_FIGURE_TABLE_GAP_SIDES = frozenset({"before", "after"})
+
+
+def _resolve_figure_table_profile(
+    value: str | dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Validate and normalize a built-in or caller-supplied spacing profile."""
+    if isinstance(value, str):
+        if value not in _VALID_FIGURE_TABLE_SPACING_PROFILES:
+            raise ValueError(
+                "style policy 'figure_table_spacing_profile' must be one of "
+                f"{sorted(_VALID_FIGURE_TABLE_SPACING_PROFILES)}"
+            )
+        return value, copy.deepcopy(FIGURE_TABLE_SPACING_PROFILES[value])
+
+    if not isinstance(value, dict):
+        raise ValueError(
+            "style policy 'figure_table_spacing_profile' must be a built-in "
+            "profile name or a profile object"
+        )
+
+    allowed = {
+        "name", "description", "enforcement", "min_gap_single_lines",
+        "max_gap_single_lines", "gap_sides", "caption_line_spacing", "source_urls",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"unknown figure/table spacing profile key(s): {unknown}")
+
+    name = value.get("name", "custom")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("custom figure/table spacing profile 'name' must be non-empty")
+    enforcement = value.get("enforcement", "minimum")
+    if enforcement not in _VALID_FIGURE_TABLE_ENFORCEMENTS:
+        raise ValueError(
+            "custom figure/table spacing profile 'enforcement' must be one of "
+            f"{sorted(_VALID_FIGURE_TABLE_ENFORCEMENTS)}"
+        )
+
+    def _number_or_none(key: str) -> float | None:
+        raw = value.get(key)
+        if raw is None:
+            return None
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0:
+            raise ValueError(
+                f"custom figure/table spacing profile '{key}' must be a non-negative number or null"
+            )
+        return float(raw)
+
+    minimum = _number_or_none("min_gap_single_lines")
+    maximum = _number_or_none("max_gap_single_lines")
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise ValueError(
+            "custom figure/table spacing profile minimum cannot exceed maximum"
+        )
+
+    sides = value.get("gap_sides", [])
+    if not isinstance(sides, list) or any(side not in _VALID_FIGURE_TABLE_GAP_SIDES for side in sides):
+        raise ValueError(
+            "custom figure/table spacing profile 'gap_sides' must be a list containing only 'before'/'after'"
+        )
+    caption_line_spacing = value.get("caption_line_spacing")
+    if caption_line_spacing not in {None, "single", "double"}:
+        raise ValueError(
+            "custom figure/table spacing profile 'caption_line_spacing' must be null, 'single', or 'double'"
+        )
+    source_urls = value.get("source_urls", [])
+    if not isinstance(source_urls, list) or any(not isinstance(url, str) for url in source_urls):
+        raise ValueError(
+            "custom figure/table spacing profile 'source_urls' must be a list of strings"
+        )
+
+    return name, {
+        "description": value.get("description", "Caller-supplied figure/table spacing profile."),
+        "enforcement": enforcement,
+        "min_gap_single_lines": minimum,
+        "max_gap_single_lines": maximum,
+        "gap_sides": list(sides),
+        "caption_line_spacing": caption_line_spacing,
+        "source_urls": list(source_urls),
+    }
+
 
 def _style_policy_defaults() -> dict[str, Any]:
     """Built-in defaults -- reproduce today's pre-4efc63fd behavior except
@@ -8458,6 +8693,11 @@ def _style_policy_defaults() -> dict[str, Any]:
         "equation_alignment": "center",
         "equation_punctuation_required": True,
         "equation_punctuation_chars": ".,;:",
+        # Disabled unless a target venue is explicitly selected.  This keeps
+        # generic journal linting from manufacturing whitespace errors while
+        # making the MST/Drexel/Chicago/ASCE/JCSHM profiles available to every
+        # caller through one stable policy key.
+        "figure_table_spacing_profile": "none",
         "note_style": _INTERNAL_NOTE_STYLE_DEFAULT,
         "note_highlight_color": _INTERNAL_NOTE_HIGHLIGHT_COLOR,
     }
@@ -8489,6 +8729,11 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
       equation_punctuation_chars (str): the accepted trailing-punctuation
                                     characters (checked by
                                     :func:`audit_equation_style`).
+      figure_table_spacing_profile (str|dict): named figure/table spacing
+                                    profile, or a validated custom profile
+                                    object, used by
+                                    :func:`audit_figure_table_spacing`.
+                                    ``"none"`` is the safe default.
       note_style (str):            OOXML paragraph style name
                                     :func:`insert_highlighted_note` (inline
                                     mode) writes for new notes.
@@ -8528,6 +8773,8 @@ def resolve_style_policy(overrides: dict[str, Any] | None = None) -> dict[str, A
     punct_chars = policy["equation_punctuation_chars"]
     if not isinstance(punct_chars, str) or not punct_chars:
         raise ValueError("style policy 'equation_punctuation_chars' must be a non-empty string")
+
+    _resolve_figure_table_profile(policy["figure_table_spacing_profile"])
 
     note_style = policy["note_style"]
     if not isinstance(note_style, str) or not note_style.strip():
@@ -8594,6 +8841,8 @@ def _leading_equation_number(number_text: str | None) -> int | None:
 def audit_equation_style(
     docx_path: str,
     style_policy: dict[str, Any] | None = None,
+    *,
+    _loaded: tuple[ET.Element, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """4efc63fd -- audit every equation in a .docx and report STRUCTURED
     findings (never free-text) covering alignment, trailing punctuation, and
@@ -8647,14 +8896,16 @@ def audit_equation_style(
     except ValueError as exc:
         return {"error": str(exc)}
 
-    try:
-        _raw, root = _load_docx_xml_stdlib(docx_path)
-    except FileNotFoundError as exc:
-        return {"error": str(exc)}
-    except ValueError as exc:
-        return {"error": str(exc)}
-
-    equations = parse_docx_equations_local(docx_path)
+    if _loaded is None:
+        try:
+            _raw, root = _load_docx_xml_stdlib(docx_path)
+        except FileNotFoundError as exc:
+            return {"error": str(exc)}
+        except ValueError as exc:
+            return {"error": str(exc)}
+        equations = _parse_docx_equations_root(root)
+    else:
+        root, equations = _loaded
     findings: list[dict[str, Any]] = []
 
     m_omath_tag = _qm("oMath")
@@ -8763,12 +9014,704 @@ def audit_equation_style(
         findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
 
     return {
+        "contract_version": DOCX_INTEL_CONTRACT_VERSION,
         "docx_path": docx_path,
         "equation_count": len(equations),
         "findings": findings,
         "finding_count": len(findings),
         "findings_by_type": findings_by_type,
         "policy": policy,
+    }
+
+
+def _caption_kind_from_paragraph(paragraph: ET.Element) -> str | None:
+    """Return ``"Figure"``/``"Table"`` for a native SEQ caption paragraph."""
+    for field in paragraph.iter(_q(_W, "fldSimple")):
+        instruction = field.get(_q(_W, "instr")) or ""
+        if _SEQ_FIGURE_RE.search(instruction):
+            return "Figure"
+        if _SEQ_TABLE_RE.search(instruction):
+            return "Table"
+    for instruction in paragraph.iter(_q(_W, "instrText")):
+        text = "".join(instruction.itertext())
+        if _SEQ_FIGURE_RE.search(text):
+            return "Figure"
+        if _SEQ_TABLE_RE.search(text):
+            return "Table"
+    # Legacy Word documents often carry hard-coded chapter/appendix labels
+    # (Figure 2.1, Table A.10) instead of SEQ fields.  Restrict this fallback
+    # to the same standalone-caption pattern used by retrofit_plaintext_
+    # captions; arbitrary prose mentioning a figure is not treated as a
+    # caption because this function is only used for a direct caption sibling.
+    visible = _paragraph_plain_text(paragraph)
+    if _PLAINTEXT_FIGURE_RE.match(visible):
+        return "Figure"
+    if _PLAINTEXT_TABLE_RE.match(visible):
+        return "Table"
+    return None
+
+
+def _paragraph_plain_text(paragraph: ET.Element) -> str:
+    """Return visible Word text, excluding OMML text and field instructions."""
+    return "".join(t.text or "" for t in paragraph.iter(_q(_W, "t")))
+
+
+def _paragraph_has_image(paragraph: ET.Element) -> bool:
+    return (
+        paragraph.find(f".//{_q(_W, 'drawing')}") is not None
+        or paragraph.find(f".//{_q(_W, 'pict')}") is not None
+    )
+
+
+def _paragraph_has_page_break(paragraph: ET.Element) -> bool:
+    for br in paragraph.iter(_q(_W, "br")):
+        if (br.get(_q(_W, "type")) or "").casefold() == "page":
+            return True
+    pPr = paragraph.find(_q(_W, "pPr"))
+    if pPr is None:
+        return False
+    page_break_before = pPr.find(_q(_W, "pageBreakBefore"))
+    return page_break_before is not None and (
+        page_break_before.get(_q(_W, "val"), "1").casefold()
+        not in {"0", "false", "off", "none"}
+    )
+
+
+def _paragraph_style_id(paragraph: ET.Element) -> str | None:
+    pPr = paragraph.find(_q(_W, "pPr"))
+    if pPr is None:
+        return None
+    pStyle = pPr.find(_q(_W, "pStyle"))
+    return pStyle.get(_q(_W, "val")) if pStyle is not None else None
+
+
+def _styles_spacing_from_raw(raw: bytes) -> dict[str, dict[str, Any]]:
+    """Resolve paragraph line/before/after spacing through the OOXML style chain."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            styles_xml = archive.read("word/styles.xml")
+        styles_root = ET.fromstring(styles_xml)
+    except (KeyError, zipfile.BadZipFile, ET.ParseError):
+        styles_root = None
+
+    defaults = {
+        "before_twips": 0,
+        "after_twips": 0,
+        "line_twips": 240,
+        "line_rule": None,
+        "line_defined": False,
+        "line_source": "default",
+    }
+    if styles_root is not None:
+        ppr_default = styles_root.find(
+            f"./{_q(_W, 'docDefaults')}/{_q(_W, 'pPrDefault')}/{_q(_W, 'pPr')}"
+        )
+        default_spacing = ppr_default.find(_q(_W, "spacing")) if ppr_default is not None else None
+        if default_spacing is not None:
+            for attr, key in (("before", "before_twips"), ("after", "after_twips"), ("line", "line_twips")):
+                value = default_spacing.get(_q(_W, attr))
+                if value is not None:
+                    try:
+                        defaults[key] = max(0, int(value))
+                    except (TypeError, ValueError):
+                        pass
+                    if attr == "line":
+                        defaults["line_defined"] = True
+                        defaults["line_source"] = "docDefaults"
+            defaults["line_rule"] = default_spacing.get(_q(_W, "lineRule"))
+
+    style_elements: dict[str, ET.Element] = {}
+    paragraph_default_style_id: str | None = None
+    if styles_root is not None:
+        for style in styles_root.findall(_q(_W, "style")):
+            if style.get(_q(_W, "type"), "paragraph") == "paragraph":
+                style_id = style.get(_q(_W, "styleId"))
+                if style_id:
+                    style_elements[style_id] = style
+                    if style.get(_q(_W, "default"), "").casefold() in {"1", "true", "on"}:
+                        paragraph_default_style_id = style_id
+        # Word normally marks the built-in Normal style as the default, but
+        # a few generated packages omit w:default.  Use Normal as the safe
+        # OOXML fallback before falling back to docDefaults.
+        if paragraph_default_style_id is None and "Normal" in style_elements:
+            paragraph_default_style_id = "Normal"
+
+    resolved: dict[str, dict[str, Any]] = {}
+    resolving: set[str] = set()
+
+    def _resolve(style_id: str) -> dict[str, Any]:
+        if style_id in resolved:
+            return dict(resolved[style_id])
+        # A malformed cyclic basedOn chain should not break the linter or
+        # manufacture a recursive parse; fall back to document defaults.
+        if style_id in resolving:
+            return dict(defaults)
+        resolving.add(style_id)
+        style = style_elements.get(style_id)
+        metrics = dict(defaults)
+        if style is not None:
+            based_on = style.find(_q(_W, "basedOn"))
+            if based_on is not None and based_on.get(_q(_W, "val")):
+                metrics = _resolve(based_on.get(_q(_W, "val")))
+            pPr = style.find(_q(_W, "pPr"))
+            spacing = pPr.find(_q(_W, "spacing")) if pPr is not None else None
+            if spacing is not None:
+                for attr, key in (("before", "before_twips"), ("after", "after_twips"), ("line", "line_twips")):
+                    value = spacing.get(_q(_W, attr))
+                    if value is not None:
+                        try:
+                            metrics[key] = max(0, int(value))
+                        except (TypeError, ValueError):
+                            pass
+                        if attr == "line":
+                            metrics["line_defined"] = True
+                            metrics["line_source"] = "style"
+                if spacing.get(_q(_W, "lineRule")) is not None:
+                    metrics["line_rule"] = spacing.get(_q(_W, "lineRule"))
+        resolving.remove(style_id)
+        resolved[style_id] = dict(metrics)
+        return metrics
+
+    for style_id in style_elements:
+        _resolve(style_id)
+    # Keep document defaults available for paragraphs that do not carry a
+    # paragraph style.  The private key is never exposed as a style id.
+    resolved["__defaults__"] = dict(defaults)
+    if paragraph_default_style_id is not None:
+        resolved["__paragraph_default__"] = dict(
+            resolved.get(paragraph_default_style_id, defaults)
+        )
+    return resolved
+
+
+def _paragraph_spacing_metrics(
+    paragraph: ET.Element,
+    style_spacing: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Read effective OOXML paragraph spacing using Word's 240-twip unit.
+
+    Direct paragraph properties override the paragraph style, which inherits
+    through ``basedOn`` and ``docDefaults``.  This is still structural XML
+    measurement; it does not claim to know rendered line wrapping or page
+    pagination.
+    """
+    style_id = _paragraph_style_id(paragraph)
+    spacing_map = style_spacing or {}
+    fallback = spacing_map.get("__paragraph_default__", spacing_map.get("__defaults__", {
+        "before_twips": 0,
+        "after_twips": 0,
+        "line_twips": 240,
+        "line_rule": None,
+        "line_defined": False,
+        "line_source": "default",
+    }))
+    effective = dict(spacing_map.get(style_id, fallback))
+    pPr = paragraph.find(_q(_W, "pPr"))
+    spacing = pPr.find(_q(_W, "spacing")) if pPr is not None else None
+
+    explicit_attrs: set[str] = set()
+
+    def _twips(attribute: str, fallback: int) -> int:
+        if spacing is None:
+            return fallback
+        raw = spacing.get(_q(_W, attribute))
+        if raw is None:
+            return fallback
+        explicit_attrs.add(attribute)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return fallback
+
+    line = _twips("line", int(effective.get("line_twips", 240) or 240))
+    return {
+        "before_twips": _twips("before", int(effective.get("before_twips", 0) or 0)),
+        "after_twips": _twips("after", int(effective.get("after_twips", 0) or 0)),
+        "line_twips": line or 240,
+        "explicit_line": "line" in explicit_attrs or bool(effective.get("line_defined")),
+        "line_source": "direct" if "line" in explicit_attrs else effective.get("line_source", "default"),
+        "line_rule": (
+            spacing.get(_q(_W, "lineRule"))
+            if spacing is not None and spacing.get(_q(_W, "lineRule")) is not None
+            else effective.get("line_rule")
+        ),
+    }
+
+
+def _layout_items_for_spacing(
+    root: ET.Element,
+    style_spacing: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build direct-body layout items with stable paragraph/table anchors."""
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return []
+
+    synth_map = None
+    try:
+        from ._vendored_content_tree import _build_synth_id_map  # noqa: PLC0415
+        synth_map = _build_synth_id_map(body)
+    except Exception:  # noqa: BLE001 -- malformed/minimal fixtures use legacy ids
+        synth_map = {}
+
+    items: list[dict[str, Any]] = []
+    global_p_index = 0
+    for body_index, child in enumerate(list(body)):
+        if child.tag == _q(_W, "p"):
+            paragraph_id = (
+                child.get(_q(_W14, "paraId"))
+                or synth_map.get(id(child))
+                or f"p{global_p_index}"
+            )
+            caption_kind = _caption_kind_from_paragraph(child)
+            has_image = _paragraph_has_image(child)
+            has_math = any(
+                element.tag.rsplit("}", 1)[-1] in {"oMath", "oMathPara"}
+                for element in child.iter()
+            )
+            items.append({
+                "kind": "paragraph",
+                "body_index": body_index,
+                "element": child,
+                "para_id": paragraph_id,
+                "caption_kind": caption_kind,
+                "blank": not _paragraph_plain_text(child).strip()
+                and not has_image
+                and not has_math,
+                "page_break": _paragraph_has_page_break(child),
+                "spacing": _paragraph_spacing_metrics(child, style_spacing),
+            })
+            global_p_index += 1
+        elif child.tag == _q(_W, "tbl"):
+            items.append({
+                "kind": "table",
+                "body_index": body_index,
+                "element": child,
+                "table_id": _table_anchor_id(body_index),
+                "caption_kind": None,
+                "blank": False,
+                "page_break": False,
+                "spacing": None,
+            })
+            # Legacy p{N} ids count table-cell paragraphs as well.
+            global_p_index += len(list(child.iter(_q(_W, "p"))))
+    return items
+
+
+def _layout_item_spacing(item: dict[str, Any], side: str) -> int:
+    spacing = item.get("spacing")
+    if not spacing:
+        return 0
+    return spacing["before_twips"] if side == "before" else spacing["after_twips"]
+
+
+def _measure_layout_gap(
+    items: list[dict[str, Any]], target_index: int, direction: str,
+) -> dict[str, Any]:
+    """Estimate a structural gap on one side of a display unit.
+
+    Only contiguous empty direct-body paragraphs and explicit paragraph
+    before/after spacing are measured.  A page break, a document edge, a
+    floating anchor, and automatic pagination are returned as unmeasured so a
+    caller cannot mistake XML arithmetic for visual page QA.
+    """
+    step = -1 if direction == "before" else 1
+    neighbor = target_index + step
+    if neighbor < 0 or neighbor >= len(items):
+        return {"status": "document_edge", "single_line_equivalents": None}
+
+    blanks: list[dict[str, Any]] = []
+    cursor = neighbor
+    while 0 <= cursor < len(items):
+        item = items[cursor]
+        if item["kind"] != "paragraph" or not item["blank"]:
+            break
+        blanks.append(item)
+        cursor += step
+
+    if cursor < 0 or cursor >= len(items):
+        return {"status": "document_edge", "single_line_equivalents": None}
+    other = items[cursor]
+    target = items[target_index]
+    ordered_blanks = list(reversed(blanks)) if direction == "before" else blanks
+    sequence = ([other] + ordered_blanks + [target]) if direction == "before" else (
+        [target] + ordered_blanks + [other]
+    )
+    if any(item.get("page_break") for item in sequence):
+        return {"status": "page_break", "single_line_equivalents": None}
+
+    line_twips = sum(
+        item["spacing"]["line_twips"] for item in ordered_blanks
+        if item.get("spacing")
+    )
+    boundary_twips = 0
+    for left, right in zip(sequence, sequence[1:]):
+        boundary_twips += max(
+            _layout_item_spacing(left, "after"),
+            _layout_item_spacing(right, "before"),
+        )
+    total_twips = line_twips + boundary_twips
+    return {
+        "status": "measured",
+        "single_line_equivalents": round(total_twips / 240.0, 3),
+        "blank_paragraph_count": len(ordered_blanks),
+        "measured_twips": total_twips,
+    }
+
+
+def _find_caption_near_layout_item(
+    items: list[dict[str, Any]], object_index: int, kind: str, direction: str,
+) -> int | None:
+    step = -1 if direction == "before" else 1
+    cursor = object_index + step
+    while 0 <= cursor < len(items):
+        item = items[cursor]
+        if item["kind"] == "paragraph" and item["blank"]:
+            cursor += step
+            continue
+        if item["kind"] == "paragraph" and item.get("caption_kind") == kind:
+            return cursor
+        return None
+    return None
+
+
+def audit_figure_table_spacing(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+    *,
+    _loaded: tuple[bytes, ET.Element] | None = None,
+) -> dict[str, Any]:
+    """Audit figure/table whitespace using an explicit venue profile.
+
+    This is a read-only, structural companion to :func:`audit_equation_style`.
+    It does not try to infer page-bottom whitespace from OOXML: Word's actual
+    page layout depends on pagination, style inheritance, wrapping, floating
+    anchors, and the selected renderer.  When a profile such as
+    ``"mst_thesis"`` is selected, it measures contiguous blank paragraphs and
+    explicit paragraph before/after spacing around a paired figure/caption or
+    caption/table unit in single-line equivalents.  It reports preferences as
+    warnings, never as submission-certifying errors.
+
+    ``style_policy["figure_table_spacing_profile"]`` accepts the named
+    profiles in :data:`FIGURE_TABLE_SPACING_PROFILES` or a validated custom
+    profile object with the same fields. The safe default is ``"none"``;
+    select a target venue explicitly at the lint boundary.
+    Profiles whose author guidance specifies no whitespace threshold (for
+    example ``"jcshm_springer"`` and ``"journal_generic"``) intentionally
+    produce no whitespace findings.
+    """
+    try:
+        policy = resolve_style_policy(style_policy)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    try:
+        profile_name, profile = _resolve_figure_table_profile(
+            policy["figure_table_spacing_profile"]
+        )
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if _loaded is None:
+        try:
+            raw, root = _load_docx_xml_stdlib(docx_path)
+        except FileNotFoundError as exc:
+            return {"error": str(exc)}
+        except ValueError as exc:
+            return {"error": str(exc)}
+    else:
+        raw, root = _loaded
+
+    base = {
+        "contract_version": DOCX_INTEL_CONTRACT_VERSION,
+        "docx_path": docx_path,
+        "profile": profile_name,
+        "policy": policy,
+        "profile_definition": profile,
+        "measurement": {
+            "basis": "direct-body OOXML blank paragraphs and explicit paragraph spacing",
+            "single_line_twips": 240,
+            "page_geometry_checked": False,
+            "render_required_for": [
+                "page-bottom whitespace",
+                "floating-object placement/wrap",
+                "automatic pagination",
+                "caption line wrapping",
+                "renderer-specific style/theme effects",
+            ],
+        },
+    }
+    if profile["enforcement"] == "disabled":
+        return {
+            **base,
+            "status": "ok",
+            "enabled": False,
+            "skipped_reason": "no venue spacing profile selected",
+            "object_count": 0,
+            "paired_display_count": 0,
+            "findings": [],
+            "finding_count": 0,
+            "findings_by_type": {},
+        }
+
+    style_spacing = _styles_spacing_from_raw(raw)
+    items = _layout_items_for_spacing(root, style_spacing)
+    findings: list[dict[str, Any]] = []
+    pairs: list[dict[str, Any]] = []
+    used_captions: set[int] = set()
+    for object_index, item in enumerate(items):
+        if item["kind"] == "paragraph" and _paragraph_has_image(item["element"]):
+            caption_index = _find_caption_near_layout_item(
+                items, object_index, "Figure", "after"
+            )
+            if caption_index is None or caption_index in used_captions:
+                continue
+            pair = {
+                "kind": "Figure",
+                "object_index": item["body_index"],
+                "object_para_id": item["para_id"],
+                "caption_index": items[caption_index]["body_index"],
+                "caption_para_id": items[caption_index]["para_id"],
+                "before_target": object_index,
+                "after_target": caption_index,
+            }
+        elif item["kind"] == "table":
+            caption_index = _find_caption_near_layout_item(
+                items, object_index, "Table", "before"
+            )
+            caption_after = caption_index is None
+            if caption_after:
+                caption_index = _find_caption_near_layout_item(
+                    items, object_index, "Table", "after"
+                )
+            if caption_index is None or caption_index in used_captions:
+                continue
+            pair = {
+                "kind": "Table",
+                "object_index": item["body_index"],
+                "object_id": item["table_id"],
+                "caption_index": items[caption_index]["body_index"],
+                "caption_para_id": items[caption_index]["para_id"],
+                "before_target": caption_index if not caption_after else object_index,
+                "after_target": object_index if not caption_after else caption_index,
+            }
+        else:
+            continue
+
+        used_captions.add(caption_index)
+        pairs.append(pair)
+
+        for side in profile["gap_sides"]:
+            measured = _measure_layout_gap(
+                items, pair["before_target"] if side == "before" else pair["after_target"], side
+            )
+            actual = measured.get("single_line_equivalents")
+            if actual is None:
+                continue
+            minimum = profile.get("min_gap_single_lines")
+            maximum = profile.get("max_gap_single_lines")
+            common = {
+                "para_id": pair["caption_para_id"],
+                "kind": pair["kind"],
+                "object_index": pair["object_index"],
+                "object_para_id": pair.get("object_para_id"),
+                "object_id": pair.get("object_id"),
+                "caption_para_id": pair["caption_para_id"],
+                "side": side,
+                "actual_single_line_equivalents": actual,
+                "blank_paragraph_count": measured.get("blank_paragraph_count", 0),
+                "measured_twips": measured.get("measured_twips", 0),
+                "expected_min_single_line_equivalents": minimum,
+                "preferred_max_single_line_equivalents": maximum,
+                "measurement_status": measured["status"],
+                "severity": "warning",
+            }
+            if minimum is not None and actual < minimum:
+                findings.append({"type": "figure_table_spacing_too_small", **common})
+            elif maximum is not None and actual > maximum:
+                findings.append({"type": "figure_table_spacing_above_preferred", **common})
+
+    expected_caption_spacing = profile.get("caption_line_spacing")
+    if expected_caption_spacing in {"single", "double"}:
+        expected_twips = 240 if expected_caption_spacing == "single" else 480
+        for pair in pairs:
+            if pair["kind"] != "Figure":
+                continue
+            caption = next(
+                item for item in items
+                if item["body_index"] == pair["caption_index"]
+            )
+            metrics = caption["spacing"]
+            if not metrics["explicit_line"]:
+                continue
+            actual_twips = metrics["line_twips"]
+            if actual_twips != expected_twips:
+                findings.append({
+                    "type": "caption_line_spacing_mismatch",
+                    "para_id": pair["caption_para_id"],
+                    "kind": pair["kind"],
+                    "caption_para_id": pair["caption_para_id"],
+                    "actual_line_twips": actual_twips,
+                    "expected_line_twips": expected_twips,
+                    "actual_line_spacing": round(actual_twips / 240.0, 3),
+                    "expected_line_spacing": expected_caption_spacing,
+                    "severity": "warning",
+                    "measurement_status": "explicit_direct_paragraph_property",
+                })
+
+    findings_by_type: dict[str, int] = {}
+    for finding in findings:
+        findings_by_type[finding["type"]] = findings_by_type.get(finding["type"], 0) + 1
+    return {
+        **base,
+        "status": "ok",
+        "enabled": True,
+        # Count only display objects whose caption can actually be paired and
+        # whose spacing is therefore being audited.  Raw body-table count is
+        # not a useful object count here because equation layouts are tables
+        # in OOXML and must never be reported as manuscript tables.
+        "object_count": len(pairs),
+        "paired_display_count": len(pairs),
+        "findings": findings,
+        "finding_count": len(findings),
+        "findings_by_type": findings_by_type,
+    }
+
+
+def preflight_document(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+    *,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Run the cheap, deterministic checks that must precede a render.
+
+    This is intentionally a single-read pipeline.  It loads the DOCX ZIP and
+    XML once, validates the package, parses the equation inventory once, and
+    feeds that same XML tree/inventory into :func:`audit_equation_style`.
+    Callers can therefore decide ``ready_for_render`` before starting a slow
+    Word/LibreOffice render.  The result includes the implementation contract
+    version so a long-lived MCP process cannot be mistaken for the current
+    parser after a code update.
+
+    ``status`` is ``"ok"`` only when the package is valid and the configured
+    equation/style/layout audits have no findings. ``"needs_review"`` means
+    the file is readable but a deterministic equation/style/layout issue was
+    found. ``"stale"`` means ``expected_source_fingerprint`` did not match;
+    no style conclusion is made against possibly-wrong content. ``"failed"``
+    means the package could not be read or parsed. This function never
+    mutates the DOCX.
+    """
+    started = time.monotonic()
+    base = {
+        "contract_version": DOCX_INTEL_CONTRACT_VERSION,
+        "docx_path": docx_path,
+    }
+    try:
+        raw, root = _load_docx_xml_stdlib(docx_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {**base, "status": "failed", "ready_for_render": False, "error": str(exc)}
+
+    source_fingerprint = hashlib.sha256(raw).hexdigest()
+    if expected_source_fingerprint is not None and source_fingerprint != expected_source_fingerprint:
+        return {
+            **base,
+            "status": "stale",
+            "ready_for_render": False,
+            "source_fingerprint": source_fingerprint,
+            "expected_source_fingerprint": expected_source_fingerprint,
+            "elapsed_seconds": time.monotonic() - started,
+        }
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            bad_member = archive.testzip()
+            package_parts = len(archive.namelist())
+    except zipfile.BadZipFile as exc:
+        return {
+            **base,
+            "status": "failed",
+            "ready_for_render": False,
+            "source_fingerprint": source_fingerprint,
+            "error": f"invalid DOCX ZIP: {exc}",
+            "elapsed_seconds": time.monotonic() - started,
+        }
+    if bad_member is not None:
+        return {
+            **base,
+            "status": "failed",
+            "ready_for_render": False,
+            "source_fingerprint": source_fingerprint,
+            "error": f"DOCX ZIP member failed CRC check: {bad_member}",
+            "elapsed_seconds": time.monotonic() - started,
+        }
+
+    body = root.find(_q(_W, "body"))
+    if body is None:
+        return {
+            **base,
+            "status": "failed",
+            "ready_for_render": False,
+            "source_fingerprint": source_fingerprint,
+            "package": {"valid": True, "parts": package_parts},
+            "error": "word/document.xml has no document body",
+            "elapsed_seconds": time.monotonic() - started,
+        }
+
+    equations = _parse_docx_equations_root(root)
+    equation_audit = audit_equation_style(
+        docx_path,
+        style_policy,
+        _loaded=(root, equations),
+    )
+    if "error" in equation_audit:
+        return {
+            **base,
+            "status": "failed",
+            "ready_for_render": False,
+            "source_fingerprint": source_fingerprint,
+            "equation_audit": equation_audit,
+            "elapsed_seconds": time.monotonic() - started,
+        }
+
+    figure_table_audit = audit_figure_table_spacing(
+        docx_path,
+        style_policy,
+        _loaded=(raw, root),
+    )
+    if "error" in figure_table_audit:
+        return {
+            **base,
+            "status": "failed",
+            "ready_for_render": False,
+            "source_fingerprint": source_fingerprint,
+            "equation_audit": equation_audit,
+            "figure_table_audit": figure_table_audit,
+            "elapsed_seconds": time.monotonic() - started,
+        }
+
+    paragraph_count = len(list(root.iter(_q(_W, "p"))))
+    table_count = len(list(root.iter(_q(_W, "tbl"))))
+    equation_findings = equation_audit.get("finding_count", 0)
+    layout_findings = figure_table_audit.get("finding_count", 0)
+    ready = equation_findings == 0 and layout_findings == 0
+    return {
+        **base,
+        "status": "ok" if ready else "needs_review",
+        "ready_for_render": ready,
+        "source_fingerprint": source_fingerprint,
+        "package": {"valid": True, "parts": package_parts},
+        "structure": {
+            "body_present": body is not None,
+            "paragraph_count": paragraph_count,
+            "table_count": table_count,
+            "equation_count": len(equations),
+            "numbered_equation_count": sum(
+                1 for equation in equations if equation["pattern"] == "table-numbered"
+            ),
+        },
+        "equation_audit": equation_audit,
+        "figure_table_audit": figure_table_audit,
+        "elapsed_seconds": time.monotonic() - started,
     }
 
 
@@ -17795,7 +18738,8 @@ def build_document_review(
     * ``caption``     -- :func:`_legacy_plaintext_caption_findings` (a
                         plain-text "Figure N"/"Table N" paragraph with no SEQ
                         field -- what :func:`retrofit_plaintext_captions`
-                        would convert, reported without mutating).
+                        would convert, reported without mutating) plus the
+                        opt-in :func:`audit_figure_table_spacing` profile.
     * ``provenance``  -- :func:`scan_stale_notes` findings (placeholder/TODO
                         text that may now be outdated).
     * ``render_integrity`` -- :func:`render_gate.check_render_capability`,
@@ -17871,6 +18815,22 @@ def build_document_review(
                 "detail": f,
             })
 
+    spacing_audit = audit_figure_table_spacing(
+        docx_path,
+        style_policy,
+    )
+    # The audit is independently read-only; its explicit result is surfaced
+    # through the caption findings so the selected profile is not implicit.
+    if isinstance(spacing_audit, dict) and not spacing_audit.get("error"):
+        for f in spacing_audit.get("findings", []):
+            findings.append({
+                "category": "caption",
+                "severity": _review_finding_severity("caption", f["type"]),
+                "type": f["type"],
+                "para_id": f.get("para_id"),
+                "detail": f,
+            })
+
     for f in _legacy_plaintext_caption_findings(records):
         findings.append({
             "category": "caption",
@@ -17935,6 +18895,7 @@ def build_document_review(
         "findings_by_category": findings_by_category,
         "findings_by_severity": findings_by_severity,
         "categories": list(REVIEW_CATEGORIES),
+        "figure_table_spacing_audit": spacing_audit,
     }
 
 

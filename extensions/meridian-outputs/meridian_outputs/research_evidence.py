@@ -25,19 +25,11 @@ A canonical, typed data model -- :class:`ProvenanceEnvelope`, made of
     canonical dict (see :func:`envelope_to_dict`) -- they can never drift
     apart in what they're able to express.
   * **Explicit about confidence and resolution state**: every record and
-    every link carries a :class:`ResolverState` with one of eight explicit
+    every link carries a :class:`ResolverState` with one of six explicit
     statuses (:data:`ResolverStatus.VERIFIED` / :data:`STALE` / :data:`HELD`
-    / :data:`AMBIGUOUS` / :data:`UNAVAILABLE` / :data:`DEGRADED` /
-    :data:`PENDING_RETRY` / :data:`FAILED`) plus a ``confidence`` float in
-    ``[0.0, 1.0]`` -- never a bare boolean "is this trustworthy."
-    ``PENDING_RETRY``/``FAILED`` were added by PROV-CANONICAL (7d9b8251) to
-    close a gap the original six-state set left open: a genuinely still-
-    executing/in-flight operation (``PENDING_RETRY``) was previously
-    indistinguishable from a permanently, terminally failed one (``FAILED``)
-    -- both collapsed onto ``UNAVAILABLE``/``DEGRADED`` respectively by
-    callers with no better option (see
-    ``run_manifest.run_manifest_to_evidence_record``, fixed in the same
-    item to use these two new states instead of overloading the old ones).
+    / :data:`AMBIGUOUS` / :data:`UNAVAILABLE` / :data:`DEGRADED`) plus a
+    ``confidence`` float in ``[0.0, 1.0]`` -- never a bare boolean "is this
+    trustworthy."
   * **Honest about partial records**: ``partial``/``partial_reason`` fields
     exist at the record, link, and envelope level. A partial record is
     *never* rendered by :meth:`ProvenanceEnvelope.to_markdown` without an
@@ -89,7 +81,6 @@ __all__ = [
     "EvidenceTimestamps",
     "ResolverState",
     "EvidenceIdentity",
-    "EvidenceScope",
     "EvidenceRecord",
     "EvidenceLink",
     "ProvenanceEnvelope",
@@ -136,27 +127,12 @@ class EvidenceKind(str, Enum):
 
 
 class ResolverStatus(str, Enum):
-    """The eight explicit resolver states this envelope model recognizes.
+    """The six explicit resolver states the acceptance criteria requires.
 
     ``VERIFIED`` is the only status :meth:`ResolverState.is_authoritative`
     treats as safe to present without a caveat -- every other status is a
     real, named degree of NOT being confirmed-good, distinct from a bare
     "unknown"/absent status field.
-
-    PROV-CANONICAL (7d9b8251) added ``PENDING_RETRY`` and ``FAILED`` to the
-    original six-state set (VERIFIED/STALE/HELD/AMBIGUOUS/UNAVAILABLE/
-    DEGRADED). Before this, a caller bridging some OTHER system's status
-    into this envelope (e.g. ``run_manifest``'s own ``phase``) had no way to
-    say "this is still genuinely in flight, safe to poll/retry" without
-    reusing ``UNAVAILABLE`` -- which also had to mean "this is a dead,
-    orphaned, never-finalized receipt" -- and no way to say "this
-    terminally failed" without reusing ``DEGRADED``, which also covers much
-    milder "still usable but imperfect" cases. Adding these as new members
-    of a plain ``str`` ``Enum`` is purely additive: every existing
-    comparison/serialization of the prior six values is unaffected, and
-    ``evidence_status_summary``'s ``status_counts`` dict (built via
-    ``{s.value: 0 for s in ResolverStatus}``) picks the new members up
-    automatically.
     """
 
     VERIFIED = "verified"
@@ -165,12 +141,6 @@ class ResolverStatus(str, Enum):
     AMBIGUOUS = "ambiguous"
     UNAVAILABLE = "unavailable"
     DEGRADED = "degraded"
-    #: Genuinely still in-flight / safe to poll or retry -- distinct from a
-    #: stale/dead/orphaned operation, which stays UNAVAILABLE.
-    PENDING_RETRY = "pending_retry"
-    #: Terminally, confirmedly failed -- distinct from DEGRADED (still
-    #: usable, just imperfect).
-    FAILED = "failed"
 
 
 def _utcnow_iso() -> str:
@@ -351,30 +321,6 @@ class EvidenceIdentity:
                 ) from exc
 
 
-@dataclass(frozen=True)
-class EvidenceScope:
-    """PROV-CANONICAL (7d9b8251) -- stable project/tenant/subproject scope
-    for one :class:`EvidenceRecord`, closing the gap where this module had
-    NO scope fields at all while sibling systems disagreed on which ones
-    they carried (``action_audit_log``: tenant_id+project_id;
-    ``research_graph``: project_id only; ``run_manifest``'s own ``scope``
-    dict: project_id+version+sprint_item_id, no tenant_id). This is a
-    superset of all three so a record can carry whichever subset its
-    producer actually knows, rather than smuggling scope into the untyped
-    ``attributes`` catch-all.
-
-    Every field is optional -- a record legitimately may not know its
-    tenant (self-hosted, no multi-tenancy) or its subproject (most
-    projects have none). ``None`` means "not applicable/not known", never
-    "explicitly empty"."""
-
-    project_id: "str | None" = None
-    tenant_id: "str | None" = None
-    subproject_id: "str | None" = None
-    version: "str | None" = None
-    sprint_item_id: "str | None" = None
-
-
 @dataclass
 class EvidenceRecord:
     """One node in the provenance graph: a single claim/source/citation/
@@ -402,29 +348,6 @@ class EvidenceRecord:
     # fact, not an absence a reader can't distinguish from "never collected").
     redacted: bool = False
     redaction_reason: "str | None" = None
-    # PROV-CANONICAL (7d9b8251) -- stable scope, schema version, idempotency
-    # key, and first-class derivation links. See EvidenceScope's own
-    # docstring for why scope is a typed field rather than smuggled into
-    # ``attributes``. ``schema_version`` is THE one canonical name/meaning
-    # for "payload schema version" this item settles on -- distinct from
-    # ``ProvenanceEnvelope.version`` (a string, envelope-FORMAT version, not
-    # payload schema version) and matching the int convention
-    # ``docx_integrity_gate.GATE_SCHEMA_VERSION`` and
-    # ``run_manifest``'s own (module-private) ``_SCHEMA_VERSION`` already
-    # use. ``operation_key`` is an optional caller-supplied idempotency key
-    # (mirrors ``run_manifest``'s ``run_id``+``manifest_hash`` identity and
-    # ``batch_management``'s deterministic ``action_audit_log.id`` --
-    # neither of which exposed a SHARED, named concept for this before).
-    # ``parent_ids`` is a first-class "this record was derived from these
-    # other record ids" list -- distinct from (and independent of)
-    # EvidenceLink's free-text ``relation`` edges and research_graph's typed
-    # ``edge_kind`` closed vocabulary; this is the lightweight, always-
-    # available derivation pointer every record can carry without needing a
-    # separate link object.
-    scope: "EvidenceScope | None" = None
-    schema_version: int = 1
-    operation_key: "str | None" = None
-    parent_ids: "list[str]" = field(default_factory=list)
     # MDE-5 -- unknown top-level keys from a newer/different producer's
     # schema, preserved verbatim across a JSON/XML round trip instead of
     # being silently dropped by envelope_from_dict. Never populated by code
@@ -445,18 +368,6 @@ class EvidenceRecord:
                 f"EvidenceRecord {self.identity.id!r} is marked redacted=True but has "
                 "no redaction_reason -- a redacted record must say why"
             )
-        if not isinstance(self.schema_version, int) or isinstance(self.schema_version, bool) or self.schema_version < 1:
-            raise EnvelopeValidationError(
-                f"EvidenceRecord {self.identity.id!r}: schema_version must be a "
-                f"positive int, got {self.schema_version!r}"
-            )
-        if self.scope is not None and not isinstance(self.scope, EvidenceScope):
-            try:
-                self.scope = EvidenceScope(**self.scope)  # type: ignore[arg-type]
-            except TypeError as exc:
-                raise EnvelopeValidationError(
-                    f"EvidenceRecord {self.identity.id!r}: invalid scope {self.scope!r}"
-                ) from exc
 
     @property
     def is_authoritative(self) -> bool:
@@ -759,8 +670,6 @@ def _identity_from_dict(d: "dict[str, Any]") -> EvidenceIdentity:
 _RECORD_KNOWN_KEYS = frozenset({
     "identity", "timestamps", "resolver", "hashes", "partial", "partial_reason",
     "attributes", "redacted", "redaction_reason",
-    # PROV-CANONICAL (7d9b8251)
-    "scope", "schema_version", "operation_key", "parent_ids",
 })
 _LINK_KNOWN_KEYS = frozenset({
     "id", "relation", "source_id", "target_id", "resolver", "partial",
@@ -770,18 +679,6 @@ _ENVELOPE_KNOWN_KEYS = frozenset({
     "envelope_id", "generated_at", "records", "links", "version",
     "partial", "partial_reason",
 })
-
-
-def _scope_from_dict(d: "dict[str, Any] | None") -> "EvidenceScope | None":
-    if not d:
-        return None
-    return EvidenceScope(
-        project_id=d.get("project_id"),
-        tenant_id=d.get("tenant_id"),
-        subproject_id=d.get("subproject_id"),
-        version=d.get("version"),
-        sprint_item_id=d.get("sprint_item_id"),
-    )
 
 
 def _record_from_dict(d: "dict[str, Any]") -> EvidenceRecord:
@@ -795,10 +692,6 @@ def _record_from_dict(d: "dict[str, Any]") -> EvidenceRecord:
         attributes=dict(d.get("attributes") or {}),
         redacted=bool(d.get("redacted", False)),
         redaction_reason=d.get("redaction_reason"),
-        scope=_scope_from_dict(d.get("scope")),
-        schema_version=int(d.get("schema_version", 1) or 1),
-        operation_key=d.get("operation_key"),
-        parent_ids=list(d.get("parent_ids") or []),
         extra_fields={k: v for k, v in d.items() if k not in _RECORD_KNOWN_KEYS},
     )
 

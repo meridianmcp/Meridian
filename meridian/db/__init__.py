@@ -941,6 +941,7 @@ def _encode_content(content: Any) -> str:
 
 
 from .migrations import *  # noqa: F401,F403
+from .migrations import _migrate_external_job_register  # noqa: F401
 
 async def init_db(db_path: str) -> aiosqlite.Connection:
     """Open the database, apply schema, and return the connection.
@@ -1145,7 +1146,8 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
     await _migrate_wave_gate_results_version_unique(db)
     await _migrate_wave_gate_configs_version_unique(db)
     await _migrate_research_graph(db)
-    await _migrate_proposal_project_scope(db)
+    await _migrate_experiment_model(db)
+    await _migrate_external_job_register(db)
     return db
 
 
@@ -2974,8 +2976,6 @@ async def register_session(
 async def generate_default_session_name(
     db: aiosqlite.Connection,
     project_id: str,
-    *,
-    neutral: bool = False,
 ) -> str:
     """599d0097 — derive a meaningful session name when start_session gets none.
 
@@ -2987,37 +2987,23 @@ async def generate_default_session_name(
     the anonymous ``session-<ts>``. The timestamp keeps the name unique (the
     board rejects duplicate active names); year is dropped for brevity but
     seconds are kept so two sessions in the same minute don't collide.
-
-    <infra-fix> — ``neutral=True`` skips the first-pending-item guess entirely
-    and goes straight to the adjective+noun+timestamp fallback below. Pass this
-    for a session that is not itself about to claim/work a specific item — e.g.
-    an orchestrator resuming via ``start_session(mode="continue")`` to dispatch
-    OTHER sessions rather than do sprint work directly. The title-based guess is
-    reasonable for a fresh single executor about to grab the next item, but is
-    actively misleading for a coordinator: two confirmed incidents saw a fix
-    agent read an orchestrator's own auto-generated name (based on some
-    unrelated pending item's title, purely because it happened to be first on
-    the board at that instant) as evidence of a hostile concurrent session,
-    when it was the dispatching orchestrator's own already-acquired resource
-    lock under a different display name.
     """
     from datetime import datetime, timezone  # local: db/__init__ has no top import
     ts = datetime.now(timezone.utc).strftime("%m%d-%H%M%S")
-    if not neutral:
-        try:
-            items = await get_sprint_items(db, project_id, include_human=False)
-        except Exception:  # noqa: BLE001 — naming must never block start_session
-            items = []
-        first = next(
-            (it for it in items
-             if (it.get("status") or "pending") in {"pending", "todo"}),
-            None,
-        )
-        title = (first or {}).get("title") or ""
-        words = re.findall(r"[a-z0-9]+", title.lower())
-        if words:
-            slug = "-".join(words[:5])[:48].strip("-") or "session"
-            return f"{slug}-{ts}"
+    try:
+        items = await get_sprint_items(db, project_id, include_human=False)
+    except Exception:  # noqa: BLE001 — naming must never block start_session
+        items = []
+    first = next(
+        (it for it in items
+         if (it.get("status") or "pending") in {"pending", "todo"}),
+        None,
+    )
+    title = (first or {}).get("title") or ""
+    words = re.findall(r"[a-z0-9]+", title.lower())
+    if words:
+        slug = "-".join(words[:5])[:48].strip("-") or "session"
+        return f"{slug}-{ts}"
     # 2bce89ed — memorable adjective+noun for an empty board, chosen
     # deterministically from the timestamp (readable + unique via the ts suffix).
     _adj = ("brisk", "calm", "clever", "bold", "quiet", "swift", "warm", "keen",
@@ -3533,33 +3519,11 @@ async def keepalive_sessions(
     return cursor.rowcount
 
 
-# <infra-fix> — a session only qualifies for the tunnel keepalive's passive
-# last_seen bump if it has shown GENUINE (non-keepalive-driven) activity within
-# this window: a real MCP tool call (session_activity), a log_task entry
-# (task_log), or its own recent registration (created_at, for a session that
-# hasn't made its first tool call yet). Without this bound, the original
-# "touch whichever session is currently most-recently-active" selection is
-# self-reinforcing: once picked, a session's freshly-bumped last_seen makes it
-# win the identical query again next tick, so a session that stopped doing
-# real work minutes (or hours) ago can be kept looking classify_stale_claim
-# "verified_alive" indefinitely — blocking a legitimate reset of a genuinely
-# dead claim, with no way to tell from last_seen alone. Confirmed live: three
-# sessions orphaned by a crashed workflow (each with exactly ONE real tool call
-# ever, per session_activity) were still classified "active"/"verified_alive"
-# hours later, purely because the tunnel keepalive kept re-selecting and
-# re-touching whichever of them happened to be the current max. Bounding
-# eligibility to real signals within this window preserves the original
-# intent (bridge brief gaps of non-Meridian-tool work) while letting a truly
-# idle session go stale like any other.
-_TUNNEL_KEEPALIVE_BRIDGE_WINDOW_MINUTES = 10
-
-
 async def touch_latest_active_session(
     db: aiosqlite.Connection, project_id: str | None = None
-) -> list[str]:
-    """4b698ea5 — bump ``last_seen`` for every live session with GENUINE recent
-    activity, and return the list of session ids refreshed (``[]`` when none
-    qualify).
+) -> str | None:
+    """4b698ea5 — bump ``last_seen`` on the most-recently-active live session and
+    return its id (or None when there is no live session to touch).
 
     This is the DB side of the *passive* tunnel-liveness signal: the server's
     keepalive loop calls it once per tick for every tenant that holds a live
@@ -3567,80 +3531,38 @@ async def touch_latest_active_session(
     files, thinking, running tests) — and therefore touching no Meridian tool —
     still keeps a fresh ``last_seen`` and isn't mistaken for dead.
 
-    <infra-fix> — a candidate session only qualifies when its genuine last
-    activity (the more recent of a ``session_activity`` row, a ``task_log``
-    row, or its own ``created_at``) falls within
-    ``_TUNNEL_KEEPALIVE_BRIDGE_WINDOW_MINUTES``. The ORIGINAL version picked
-    the single globally most-recently-active ('active'/'idle') session and
-    re-touched it unconditionally every tick — self-reinforcing (see the
-    constant's docstring above) and wrong once more than one session is live
-    under the same tunnel, which is the common case for a parallelized
-    executor. This version can refresh zero, one, or several sessions per
-    tick, each judged on its own real evidence rather than relative ranking.
+    The signal is genuinely passive because the liveness *proof* is the open
+    tunnel socket (the tenant's local ``meridian --tunnel`` binary is running),
+    NOT ``last_seen`` itself — so it is not circular the way a loop that renews
+    based on ``last_seen`` would be.
 
-    ``project_id`` narrows the scope when a tenant DB holds more than one
-    project; ``None`` (the common single-project tenant DB) considers all of
-    them.
+    Association: a tunnel is per-TENANT and a tenant's project DB typically has a
+    single active executor. We resolve the ambiguity by touching the ONE
+    most-recently-active ('active'/'idle') session — the one a planner would most
+    plausibly read as "the live executor". ``project_id`` narrows the scope when a
+    tenant DB holds more than one project; None (the common single-project tenant
+    DB) considers all of them.
     """
-    from datetime import datetime, timezone  # local: db/__init__ has no top import
-
-    where = "s.status IN ('active', 'idle')"
-    params: list[Any] = []
+    where = "status IN ('active', 'idle')"
+    params: tuple[Any, ...] = ()
     if project_id is not None:
-        where += " AND s.project_id = ?"
-        params.append(project_id)
+        where += " AND project_id = ?"
+        params = (project_id,)
     async with db.execute(
-        f"""
-        SELECT s.id AS id, s.created_at AS created_at,
-               sa.last_activity AS last_activity,
-               tl.last_task AS last_task
-        FROM sessions s
-        LEFT JOIN (
-            SELECT session_id, MAX(recorded_at) AS last_activity
-            FROM session_activity GROUP BY session_id
-        ) sa ON sa.session_id = s.id
-        LEFT JOIN (
-            SELECT session_id, MAX(created_at) AS last_task
-            FROM task_log GROUP BY session_id
-        ) tl ON tl.session_id = s.id
-        WHERE {where}
-        """,
-        tuple(params),
+        f"SELECT id FROM sessions WHERE {where} "
+        f"ORDER BY last_seen DESC LIMIT 1",
+        params,
     ) as cur:
-        rows = await cur.fetchall()
-
-    now = datetime.now(timezone.utc)
-    eligible: list[str] = []
-    for r in rows:
-        row = _row_to_dict(r) or {}
-        sid = row.get("id")
-        if not sid:
-            continue
-        candidate_ts = [
-            t for t in (row.get("last_activity"), row.get("last_task"), row.get("created_at"))
-            if t
-        ]
-        if not candidate_ts:
-            continue
-        try:
-            latest = max(
-                datetime.fromisoformat(str(t).replace(" ", "T")).replace(tzinfo=timezone.utc)
-                for t in candidate_ts
-            )
-        except (ValueError, AttributeError):
-            continue
-        age_min = (now - latest).total_seconds() / 60
-        if age_min <= _TUNNEL_KEEPALIVE_BRIDGE_WINDOW_MINUTES:
-            eligible.append(sid)
-
-    if eligible:
-        placeholders = ", ".join("?" for _ in eligible)
-        await db.execute(
-            f"UPDATE sessions SET last_seen = datetime('now') WHERE id IN ({placeholders})",
-            tuple(eligible),
-        )
-        await db.commit()
-    return eligible
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    sid = row["id"] if isinstance(row, dict) else row[0]
+    await db.execute(
+        "UPDATE sessions SET last_seen = datetime('now') WHERE id = ?",
+        (sid,),
+    )
+    await db.commit()
+    return sid
 
 
 # ---------------------------------------------------------------------------
@@ -12827,4 +12749,24 @@ from .research_graph import (  # noqa: F401
     get_claim_evidence,
     get_lineage_subgraph,
     get_artifact_document_lineage,
+)
+
+# 4376e655 — the provider-neutral Experiment/Run/RunAttempt state model.
+# Imported LAST (after research_graph) — depends on nothing above at import
+# time. See meridian.experiment_model for the closed ATTEMPT_STATUSES/
+# FAILURE_CLASSES vocabularies and transition rules, and
+# meridian.db.experiment_model's own module docstring for the full schema/
+# derived-status contract.
+from .experiment_model import (  # noqa: F401
+    _migrate_experiment_model,
+    create_experiment,
+    get_experiment,
+    create_run,
+    get_run,
+    create_attempt,
+    get_attempt,
+    list_run_attempts,
+    transition_attempt,
+    heartbeat_attempt,
+    reconcile_stale_attempts,
 )

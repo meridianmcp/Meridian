@@ -157,6 +157,15 @@ def _numbered_row(para_id: str, number_text: str) -> str:
     </w:tr>'''
 
 
+def _spacer_numbered_row(para_id: str, number_text: str) -> str:
+    """Word's three-column equation layout: spacer, equation, number."""
+    return f'''    <w:tr>
+      <w:tc><w:p/></w:tc>
+      <w:tc><w:p w14:paraId="{para_id}">{_SIMPLE_OMATH}</w:p></w:tc>
+      <w:tc><w:p><w:r><w:t>{number_text}</w:t></w:r></w:p></w:tc>
+    </w:tr>'''
+
+
 _DUPLICATE_NUMBERS_DOC = _doc(
     "    <w:tbl>\n"
     + _numbered_row("EQD001", "(1)") + "\n"
@@ -168,6 +177,13 @@ _GAP_NUMBERS_DOC = _doc(
     "    <w:tbl>\n"
     + _numbered_row("EQG001", "(1)") + "\n"
     + _numbered_row("EQG002", "(3)") + "\n"
+    "    </w:tbl>"
+)
+
+_THREE_COLUMN_GAP_NUMBERS_DOC = _doc(
+    "    <w:tbl>\n"
+    + _spacer_numbered_row("EQ3C001", "(1)") + "\n"
+    + _spacer_numbered_row("EQ3C002", "(3)") + "\n"
     "    </w:tbl>"
 )
 
@@ -199,6 +215,7 @@ def test_resolve_style_policy_defaults():
         "equation_alignment": "center",
         "equation_punctuation_required": True,
         "equation_punctuation_chars": ".,;:",
+        "figure_table_spacing_profile": "none",
         "note_style": "MeridianInternalNote",
         "note_highlight_color": "yellow",
     }
@@ -413,6 +430,60 @@ def test_audit_equation_number_gap(tmp_path):
     assert result["findings_by_type"] == {"equation_number_gap": 1}
     finding = result["findings"][0]
     assert finding["missing_number"] == 2
+
+
+def test_audit_three_column_equation_number_gap(tmp_path):
+    """The parser must recognize the common spacer/equation/number layout."""
+    path = _write_docx(tmp_path, _THREE_COLUMN_GAP_NUMBERS_DOC)
+    result = docs_intel.audit_equation_style(path)
+    assert result["equation_count"] == 2
+    assert result["findings_by_type"] == {"equation_number_gap": 1}
+    assert result["findings"][0]["missing_number"] == 2
+
+
+def test_preflight_clean_document_is_ready_for_render(tmp_path):
+    path = _write_docx(tmp_path, _DISPLAY_CLEAN_DOC)
+    result = docs_intel.preflight_document(path)
+    assert result["status"] == "ok"
+    assert result["ready_for_render"] is True
+    assert result["contract_version"] == "docx-intel-v2-preflight-caption-spacing"
+    assert result["package"]["valid"] is True
+    assert result["structure"]["equation_count"] == 1
+    assert result["equation_audit"]["findings"] == []
+
+
+def test_preflight_blocks_render_when_equation_style_needs_review(tmp_path):
+    path = _write_docx(tmp_path, _DISPLAY_CENTERED_NO_PUNCT_DOC)
+    result = docs_intel.preflight_document(path)
+    assert result["status"] == "needs_review"
+    assert result["ready_for_render"] is False
+    assert result["equation_audit"]["findings_by_type"] == {
+        "missing_trailing_punctuation": 1
+    }
+
+
+def test_preflight_rejects_stale_expected_fingerprint_before_style_conclusion(tmp_path):
+    path = _write_docx(tmp_path, _DISPLAY_CLEAN_DOC)
+    result = docs_intel.preflight_document(path, expected_source_fingerprint="stale")
+    assert result["status"] == "stale"
+    assert result["ready_for_render"] is False
+    assert "equation_audit" not in result
+
+
+def test_preflight_loads_docx_once_and_reuses_equation_tree(tmp_path, monkeypatch):
+    path = _write_docx(tmp_path, _DISPLAY_CLEAN_DOC)
+    original_loader = docs_intel._load_docx_xml_stdlib
+    calls = 0
+
+    def counting_loader(value):
+        nonlocal calls
+        calls += 1
+        return original_loader(value)
+
+    monkeypatch.setattr(docs_intel, "_load_docx_xml_stdlib", counting_loader)
+    result = docs_intel.preflight_document(path)
+    assert result["status"] == "ok"
+    assert calls == 1
 
 
 def test_audit_alphabetic_suffix_does_not_create_false_gap_or_duplicate(tmp_path):

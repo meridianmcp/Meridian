@@ -331,6 +331,37 @@ class TestRenderWithReceipt:
         assert receipt["backend_order"] == ["fake-ok"]
         assert receipt["duration_seconds"] == 0.0
 
+    def test_preflight_blocks_render_before_backend_starts(self, tmp_path, monkeypatch) -> None:
+        docx_path = _write_dummy_docx(tmp_path)
+        calls: list[str] = []
+
+        def _must_not_render(path: str) -> dict[str, Any]:
+            calls.append(path)
+            raise AssertionError("render backend must not start after preflight failure")
+
+        backend = _fake_backend("fake-ok", render=_must_not_render)
+        preflight = {
+            "status": "needs_review",
+            "ready_for_render": False,
+            "contract_version": "docx-intel-v2-preflight-caption-spacing",
+            "equation_audit": {"findings_by_type": {"missing_trailing_punctuation": 1}},
+        }
+        monkeypatch.setattr(
+            render_gate.docs_intel,
+            "preflight_document",
+            lambda *args, **kwargs: preflight,
+        )
+
+        receipt = render_gate.render_with_receipt(
+            docx_path, backends=[backend], preflight=True,
+        )
+
+        assert calls == []
+        assert receipt["status"] == render_gate.FAILED
+        assert receipt["preflight"] == preflight
+        assert "preflight blocked render" in receipt["reason"]
+        assert receipt["error_class"] == render_gate.CORRUPTION_ERROR
+
     def test_multiple_receipts_accumulate_newest_first(self, tmp_path) -> None:
         docx_path = _write_dummy_docx(tmp_path)
         receipts_path = str(tmp_path / "receipts.json")
@@ -601,7 +632,10 @@ class TestServerToolWiring:
 
         assert callable(server.render_with_receipt)
         sig = inspect.signature(server.render_with_receipt)
-        assert list(sig.parameters) == ["docx_path", "receipts_path", "max_retries", "visual_qa"]
+        assert list(sig.parameters) == [
+            "docx_path", "receipts_path", "max_retries", "visual_qa",
+            "preflight", "style_policy",
+        ]
 
         sentinel = {"status": "rendered", "receipt_id": "sentinel"}
         seen: dict[str, Any] = {}
@@ -617,6 +651,7 @@ class TestServerToolWiring:
         assert result is sentinel
         assert seen["path"] == "doc.docx"
         assert seen["receipts_path"] == "r.json"
+        assert seen["preflight"] is True
 
     def test_list_render_receipts_is_registered_and_delegates(self, monkeypatch) -> None:
         import inspect

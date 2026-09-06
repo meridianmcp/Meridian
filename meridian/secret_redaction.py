@@ -29,7 +29,7 @@ import fnmatch
 import os
 import re
 from dataclasses import dataclass
-from typing import Iterable, NamedTuple
+from typing import NamedTuple
 
 
 # ---------------------------------------------------------------------------
@@ -60,16 +60,6 @@ SECRET_PATTERNS: list[_Pattern] = [
     _p("aws-access-key-id", r"AKIA[0-9A-Z]{16}"),
     # Stripe LIVE secret key (not test keys)
     _p("stripe-live-key", r"sk_live_[A-Za-z0-9]{24,}"),
-    # Meridian's own bearer token (ba31dedf). Underscore-delimited, unlike the
-    # hyphenated openai-anthropic-key pattern below, so it needs its own entry --
-    # a bare `"BEARER_TOKEN": "sk_meridian_..."` JSON/TOML/env pair otherwise slips
-    # past every existing pattern here (confirmed: none of stripe-live-key,
-    # openai-anthropic-key, or dotenv-credential's `KEY=value`-shaped match fire on
-    # it, since the value is quoted/colon-joined, not a bare `=` assignment, and the
-    # prefix uses `_` not `-`). See docs/meridian-storage-and-file-inspector-contract
-    # investigation notes / ba31dedf launch-matrix sprint item for the audit that
-    # found this gap across three independent config-generation code paths.
-    _p("meridian-token", r"sk_meridian_[A-Za-z0-9_-]{16,}"),
     # GitHub tokens: personal access, OAuth, server-to-server, refresh, user
     _p("github-token", r"gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,}"),
     # Slack tokens
@@ -184,52 +174,6 @@ def redact(text: str) -> str:
         cursor = m.end
     parts.append(text[cursor:])
     return "".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# scan_file() / scan_paths(): non-disclosing scan over files on disk
-# (ff9d2963 — SECURITY-LAUNCH acceptance: "tracked-file scan emits
-# paths/categories only"). Kept separate from scan()/redact() (pure
-# string -> string/list, no I/O) so those stay usable in contexts (DB
-# write-path guard, request bodies) that never touch the filesystem.
-# ---------------------------------------------------------------------------
-
-def scan_file(path: str) -> list[SecretMatch]:
-    """Scan one file on disk for secrets. Never raises: a missing file,
-    permission error, or file that isn't valid UTF-8 (a binary asset —
-    image, video, compiled artifact) returns ``[]`` rather than propagating
-    an exception, so a caller can point this at a large, mixed tracked-file
-    tree without special-casing non-text files itself. Decoding uses
-    ``errors="ignore"`` for the same reason -- a false-positive match inside
-    a mangled binary decode is unlikely (the patterns require fairly long,
-    specific-alphabet runs) and is one of `scan`'s regular false-positive
-    considerations, not a new risk this introduces.
-    """
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read()
-    except OSError:
-        return []
-    return scan(text)
-
-
-def scan_paths(paths: "Iterable[str]") -> list[dict]:
-    """Scan multiple files; return ONLY ``{"path": ..., "category": ...}``
-    rows -- never the matched text, the surrounding line, or file content.
-
-    This is the "non-disclosing scanner" ff9d2963's acceptance criteria ask
-    for: a caller (a test, a CI step, a manual audit) can safely print,
-    assert on, or log this return value without risking a live secret value
-    leaking into test output, CI logs, or a bug report, unlike calling
-    `scan()`/`scan_file()` and printing the raw `SecretMatch` list (whose
-    `.snippet` field, while truncated, is still a real fragment of the
-    matched text).
-    """
-    rows: list[dict] = []
-    for path in paths:
-        for m in scan_file(path):
-            rows.append({"path": path, "category": m.name})
-    return rows
 
 
 # ---------------------------------------------------------------------------

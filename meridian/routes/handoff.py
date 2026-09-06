@@ -117,12 +117,6 @@ async def planner_handoff_endpoint(
         latest_executor_report = _reports[0] if _reports else None
     except Exception:  # noqa: BLE001
         latest_executor_report = None
-    # c6015316 — machine-readable board-context-state signal; best-effort,
-    # never breaks the planner handoff. See
-    # build_board_context_state_for_handoff's own docstring.
-    board_context_state = await handoff_module.build_board_context_state_for_handoff(
-        db, project_id,
-    )
     return {
         # a5e8aa74 — route through the same shared helper the MCP handler/stdio
         # transports use so all transports share one raw-text contract (this
@@ -135,7 +129,6 @@ async def planner_handoff_endpoint(
         "proposal_evidence": proposal_evidence,
         "docx_integrity": docx_integrity,
         "latest_executor_report": latest_executor_report,
-        "board_context_state": board_context_state,
     }
 
 
@@ -339,13 +332,6 @@ async def generate_handoff_endpoint(
     docx_integrity = await handoff_module.build_docx_integrity_gate_for_handoff(
         db, project_id, proposal_evidence=proposal_evidence,
     )
-    # c6015316 — machine-readable board-context-state signal; best-effort,
-    # never breaks the mandatory handoff. See
-    # build_board_context_state_for_handoff's own docstring. Scoped to the
-    # same effective version generate_handoff itself resolved for this call.
-    board_context_state = await handoff_module.build_board_context_state_for_handoff(
-        db, project_id, version=_version if isinstance(_version, str) else None,
-    )
     return {
         # a5e8aa74 — same shared helper as the planner endpoint above and both
         # MCP transports; see format_handoff_mcp_content's docstring.
@@ -371,9 +357,6 @@ async def generate_handoff_endpoint(
         # d2fc7465 — same structured selected-scope signal the MCP transport
         # returns; see handler.py's own "selected_scope" field comment.
         "selected_scope": _selected_scope_outcome or None,
-        # c6015316 — see build_board_context_state_for_handoff's own
-        # docstring. None only if the best-effort lookup itself failed.
-        "board_context_state": board_context_state,
     }
 
 

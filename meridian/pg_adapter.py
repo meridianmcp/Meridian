@@ -3328,6 +3328,80 @@ async def _migrate_pg_research_graph(conn: PostgresConnection) -> None:
     )
 
 
+async def _migrate_pg_experiment_model(conn: PostgresConnection) -> None:
+    """4376e655 — experiments / research_runs / research_run_attempts: the
+    provider-neutral Experiment/Run/RunAttempt state model. Mirrors
+    db.experiment_model._migrate_experiment_model exactly — see that
+    module's docstring (and meridian.experiment_model's) for the full
+    schema, derived-run-status, and restart-recovery contract. Not present
+    in the base CREATE_TABLES_CORE literal — this guarded migration is the
+    only creation path on Postgres, matching _migrate_pg_research_graph
+    immediately above.
+
+    The plain (non-COALESCE) unique index on research_runs' idempotency_key
+    is deliberate, not an oversight: unlike research_nodes' COALESCE-
+    normalized revision index (which treats every NULL as the SAME value on
+    purpose), a NULL idempotency_key here means "no dedup requested" — both
+    SQLite and Postgres already treat each NULL as distinct in a UNIQUE
+    index, so multiple key-less runs never collide while two runs sharing a
+    real key correctly do.
+    """
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS experiments ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    name TEXT,"
+        "    config_template TEXT,"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    updated_at TEXT"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_experiments_project ON experiments(project_id);"
+        "CREATE TABLE IF NOT EXISTS research_runs ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL,"
+        "    experiment_id TEXT NOT NULL,"
+        "    idempotency_key TEXT,"
+        "    params TEXT,"
+        "    params_fingerprint TEXT,"
+        "    source_revision TEXT,"
+        "    attempt_count INTEGER NOT NULL DEFAULT 0,"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    updated_at TEXT"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_research_runs_idempotency "
+        "ON research_runs(project_id, experiment_id, idempotency_key);"
+        "CREATE INDEX IF NOT EXISTS idx_research_runs_experiment ON research_runs(experiment_id);"
+        "CREATE INDEX IF NOT EXISTS idx_research_runs_project ON research_runs(project_id);"
+        "CREATE TABLE IF NOT EXISTS research_run_attempts ("
+        "    id TEXT PRIMARY KEY,"
+        "    run_id TEXT NOT NULL,"
+        "    project_id TEXT NOT NULL,"
+        "    attempt_number INTEGER NOT NULL,"
+        "    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ("
+        "        'queued', 'running', 'succeeded', 'failed', 'cancelled', 'crashed', 'unknown')),"
+        "    failure_class TEXT CHECK (failure_class IS NULL OR failure_class IN ("
+        "        'user_error', 'infra_error', 'timeout', 'oom', 'preempted',"
+        "        'dependency_error', 'unknown')),"
+        "    error_message TEXT,"
+        "    checkpoint_ref TEXT,"
+        "    artifact_refs TEXT,"
+        "    provenance_ref TEXT,"
+        "    started_at TEXT,"
+        "    ended_at TEXT,"
+        "    last_heartbeat_at TEXT,"
+        "    created_by TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    updated_at TEXT"
+        ");"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_run_attempts_number "
+        "ON research_run_attempts(run_id, attempt_number);"
+        "CREATE INDEX IF NOT EXISTS idx_run_attempts_run ON research_run_attempts(run_id);"
+        "CREATE INDEX IF NOT EXISTS idx_run_attempts_project ON research_run_attempts(project_id);"
+    )
+
+
 async def _migrate_pg_ai_log_events(conn: PostgresConnection) -> None:
     """9e83be4a (Round 1 proposal e143949d) — ai_log_events: canonical,
     versioned, append-only ExecutionEvent storage (mirrors
@@ -4670,28 +4744,6 @@ async def _migrate_pg_object_sync_state(conn: PostgresConnection) -> None:
     )
 
 
-async def _migrate_pg_proposal_project_scope(conn: PostgresConnection) -> None:
-    """a8afd8f9 — workspace_proposals.scope_type + .project_id: project-scoped
-    proposals as a first-class alternative to workspace-global ones, without
-    forking a second table.
-
-    Mirrors db._migrate_proposal_project_scope. ADD COLUMN IF NOT EXISTS is
-    idempotent; scope_type defaults every existing row to 'workspace' so no
-    existing caller's behavior changes. project_id is nullable, no DB-level
-    FK (validated at the app layer, same convention as tenant_id on this
-    table). No automatic reclassification of existing rows (reserved for
-    4eedeef8, pending) — this migration only adds the columns.
-    """
-    await conn.executescript(
-        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
-        "scope_type TEXT NOT NULL DEFAULT 'workspace';"
-        "ALTER TABLE workspace_proposals ADD COLUMN IF NOT EXISTS "
-        "project_id TEXT;"
-        "CREATE INDEX IF NOT EXISTS idx_workspace_proposals_project_scope "
-        "ON workspace_proposals(project_id, status)"
-    )
-
-
 async def _migrate_pg_executor_reports(conn: PostgresConnection) -> None:
     """9154aa9a — executor_reports: durable executor-report / corrective-
     handoff-lifecycle records (mirrors db.executor_reports._migrate_executor_reports_table
@@ -4779,6 +4831,51 @@ async def _migrate_pg_wave_run_summaries(conn: PostgresConnection) -> None:
         "ON wave_run_summaries(wave_run_id);"
         "CREATE INDEX IF NOT EXISTS idx_wave_run_summaries_supersedes "
         "ON wave_run_summaries(supersedes);"
+    )
+
+
+async def _migrate_pg_external_job_register(conn: PostgresConnection) -> None:
+    """88277b63 — Postgres mirror of the durable external-job register."""
+    await conn.executescript(
+        "CREATE TABLE IF NOT EXISTS external_jobs ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    job_key TEXT NOT NULL,"
+        "    provider TEXT NOT NULL,"
+        "    external_id TEXT NOT NULL,"
+        "    status TEXT NOT NULL DEFAULT 'running',"
+        "    phase TEXT,"
+        "    check_hint TEXT,"
+        "    resume_hint TEXT,"
+        "    resource_hint TEXT,"
+        "    next_check_at TEXT,"
+        "    detail TEXT,"
+        "    metadata_json TEXT NOT NULL DEFAULT '{}',"
+        "    created_by_session_id TEXT NOT NULL REFERENCES sessions(id),"
+        "    updated_by_session_id TEXT NOT NULL REFERENCES sessions(id),"
+        f"    started_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    last_observed_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    completed_at TEXT,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS}),"
+        f"    updated_at TEXT NOT NULL DEFAULT ({_TS}),"
+        "    UNIQUE (project_id, job_key)"
+        ");"
+        "CREATE TABLE IF NOT EXISTS external_job_events ("
+        "    id TEXT PRIMARY KEY,"
+        "    project_id TEXT NOT NULL REFERENCES projects(id),"
+        "    external_job_id TEXT NOT NULL REFERENCES external_jobs(id),"
+        "    session_id TEXT NOT NULL REFERENCES sessions(id),"
+        "    event_kind TEXT NOT NULL,"
+        "    status TEXT NOT NULL,"
+        "    phase TEXT,"
+        "    detail TEXT,"
+        "    snapshot_json TEXT NOT NULL,"
+        f"    created_at TEXT NOT NULL DEFAULT ({_TS})"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_external_jobs_project_status "
+        "ON external_jobs(project_id, status, last_observed_at DESC);"
+        "CREATE INDEX IF NOT EXISTS idx_external_job_events_job "
+        "ON external_job_events(external_job_id, created_at ASC);"
     )
 
 
@@ -4903,5 +5000,6 @@ _PG_MIGRATIONS_LATE = (
     _migrate_pg_proposal_gates,
     _migrate_pg_research_graph,
     _migrate_pg_object_sync_state,
-    _migrate_pg_proposal_project_scope,
+    _migrate_pg_experiment_model,
+    _migrate_pg_external_job_register,
 )

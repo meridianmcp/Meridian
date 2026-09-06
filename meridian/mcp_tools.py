@@ -34,6 +34,11 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "reopen_proposal_gate": 'reopen_proposal_gate(project_id="abc-123", gate_id="gate-uuid", actor="adam", reason="new evidence surfaced")',
     "get_proposal_gates": 'get_proposal_gates(project_id="abc-123", sprint_item_id="item-uuid")',
     "checkpoint": 'checkpoint(session_id="session-uuid", project_id="abc-123")',
+    "register_external_job": 'register_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", provider="runpod", external_id="pod-123", phase="build", check_hint="query pod status", resume_hint="rerun the next safe step")',
+    "update_external_job": 'update_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", status="running", phase="upload", check_hint="check transfer process")',
+    "get_external_job": 'get_external_job(project_id="abc-123", job_key="gps-slam-build")',
+    "list_external_jobs": 'list_external_jobs(project_id="abc-123")',
+    "complete_external_job": 'complete_external_job(project_id="abc-123", session_id="session-uuid", job_key="gps-slam-build", status="succeeded", detail="verified output")',
     "request_hitl": 'request_hitl(project_id="abc-123", question="Should we add rate limiting here?", urgency="normal")',
     "get_hitl_request": 'get_hitl_request(request_id="hitl-uuid")',
     "add_note": 'add_note(project_id="abc-123", title="Deploy note", body="Reminder: update env vars before deploy", tags="ops,deploy")',
@@ -72,7 +77,6 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
     "get_workspace_notes": 'get_workspace_notes(tag="setup")',
     "add_workspace_proposal": 'add_workspace_proposal(title="IDEA: expose auth as plugin", body="Could ship auth as a separate optional plugin so self-hosters can swap it out", tags="arch")',
-    "add_proposal": 'add_proposal(project_id="proj-uuid", title="Cache the parser output", body="Re-parsing on every call is slow; memoize by content hash", tags="perf")',
     "get_workspace_proposals": 'get_workspace_proposals(status="investigating")',
     "advance_proposal_status": 'advance_proposal_status(proposal_id="prop-uuid", status="investigating")',
     "promote_proposal": 'promote_proposal(proposal_id="prop-uuid", project_id="proj-uuid", sprint_item_title="Expose auth as plugin")',
@@ -794,6 +798,68 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "session_id": {"type": "string"},
          "project_id": {"type": "string"}, "project_name": {"type": "string", "description": "Project name — an alternative to project_id; resolved to the id internally. project_id wins if both are given."},
          "version": {"type": "string", "description": "(455cfc36) Optional explicit sprint-version bucket (e.g. 'v0.2.6') to scope this checkpoint to — wins over the calling session's own stored sprint_version, exactly like generate_handoff's own version kwarg. Omit to fall back to the session's resolved scope (unchanged default behavior)."}},
+         "required": ["session_id"]}},
+    {"name": "register_external_job", "description":
+        "Create or reaffirm a project-scoped record for long-running external work "
+        "such as RunPod, SSH, Slurm, or CI. Meridian records the opaque external "
+        "identity and resumable state, appends a task-log event, and writes an "
+        "atomic host-local JSON snapshot. Do not include credentials or machine-"
+        "local absolute paths in shared hints or metadata.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"},
+         "project_name": {"type": "string"},
+         "session_id": {"type": "string"},
+         "job_key": {"type": "string", "description": "Stable project-local logical key; reuse it for later observations."},
+         "provider": {"type": "string", "description": "Provider/launcher label, e.g. runpod, ssh, slurm, ci."},
+         "external_id": {"type": "string", "description": "Opaque external job/pod/build identifier."},
+         "status": {"type": "string", "enum": ["queued", "running", "blocked", "unknown", "succeeded", "failed", "canceled"]},
+         "phase": {"type": "string"},
+         "check_hint": {"type": "string", "description": "Exact safe next observation to make; no credentials or absolute paths."},
+         "resume_hint": {"type": "string", "description": "Exact safe continuation instruction; no credentials or absolute paths."},
+         "resource_hint": {"type": "string"},
+         "next_check_at": {"type": "string"},
+         "detail": {"type": "string"},
+         "metadata": {"type": "object"}},
+         "required": ["session_id", "job_key", "provider", "external_id"]}},
+    {"name": "update_external_job", "description":
+        "Record a new observation for an existing external job. Use job_id or "
+        "job_key, and pass only fields that changed; every write appends durable "
+        "history and refreshes the local crash-surviving snapshot. Terminal jobs "
+        "cannot be reopened or silently replaced.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "session_id": {"type": "string"}, "job_id": {"type": "string"}, "job_key": {"type": "string"},
+         "status": {"type": "string", "enum": ["queued", "running", "blocked", "unknown", "succeeded", "failed", "canceled"]},
+         "phase": {"type": "string"}, "check_hint": {"type": "string"},
+         "resume_hint": {"type": "string"}, "resource_hint": {"type": "string"},
+         "next_check_at": {"type": "string"}, "detail": {"type": "string"},
+         "metadata": {"type": "object"}},
+         "required": ["session_id"]}},
+    {"name": "get_external_job", "description":
+        "Read one project-scoped external job and its durable observation history. "
+        "Use this from a fresh session before taking any action on a live job.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "job_id": {"type": "string"}, "job_key": {"type": "string"},
+         "include_history": {"type": "boolean"}}, "required": []}},
+    {"name": "list_external_jobs", "description":
+        "Read the project's live external-job register. By default terminal jobs "
+        "are omitted so a new session sees only work that may require observation "
+        "or resumption. The response also reports the host-local snapshot state.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "include_terminal": {"type": "boolean"},
+         "status": {"type": "string", "enum": ["queued", "running", "blocked", "unknown", "succeeded", "failed", "canceled"]},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500}}, "required": []}},
+    {"name": "complete_external_job", "description":
+        "Finalize an external job with an explicit terminal outcome. This never "
+        "infers success from output files and never reopens a terminal record. "
+        "It appends a final task-log event and refreshes the local snapshot.",
+     "inputSchema": {"type": "object", "properties": {
+         "project_id": {"type": "string"}, "project_name": {"type": "string"},
+         "session_id": {"type": "string"}, "job_id": {"type": "string"}, "job_key": {"type": "string"},
+         "status": {"type": "string", "enum": ["succeeded", "failed", "canceled"]},
+         "detail": {"type": "string"}, "metadata": {"type": "object"}},
          "required": ["session_id"]}},
     {"name": "request_hitl", "description":
         "Surface a question to the human-in-the-loop queue. ALWAYS use this to ask "
@@ -2000,48 +2066,19 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "body": {"type": "string", "description": "Full description of the insight or idea."},
          "tags": {"type": "string", "description": "Optional comma-separated tags."}},
          "required": ["title", "body"]}},
-    {"name": "add_proposal", "description":
-        "Capture an idea into a proposal — PROJECT-SCOPED BY DEFAULT (a8afd8f9). This is the "
-        "preferred entry point going forward; add_workspace_proposal remains available as the "
-        "explicit workspace-global opt-in for cross-project ideas. Pass project_id (or "
-        "project_name) to scope the proposal to that project, XOR pass scope='workspace' to "
-        "explicitly opt into a workspace-global proposal instead — an ambiguous call (neither, "
-        "or both) is rejected with an error rather than guessed. Like add_workspace_proposal, "
-        "these are NOT executor-claimable; a human reviews and promotes them via promote_proposal. "
-        "Proposals start at status='raw' and progress through an enforced lifecycle: "
-        "raw → investigating → promoted|rejected. A project-scoped proposal's project_id is "
-        "enforced at promote_proposal time: promoting it into a DIFFERENT project is rejected "
-        "unless allow_project_transfer=True (+ transfer_reason) is passed there.",
-     "inputSchema": {"type": "object", "properties": {
-         "title": {"type": "string", "description": "Short idea title."},
-         "body": {"type": "string", "description": "Full description of the insight or idea."},
-         "project_id": {"type": "string", "description": "Project to scope this proposal to. Required unless scope='workspace' is passed instead."},
-         "project_name": {"type": "string", "description": "Project name — alternative to project_id; resolved to the id internally."},
-         "scope": {"type": "string", "enum": ["project", "workspace"],
-                   "description": "Pass 'workspace' to explicitly opt into a workspace-global proposal instead of "
-                   "project-scoping it. Defaults to project-scoped when project_id/project_name is given; omitting "
-                   "both project_id/project_name AND scope is an error (never inferred)."},
-         "tags": {"type": "string", "description": "Optional comma-separated tags."},
-         "family_id": {"type": "string", "description": "Optional family/grouping id shared by related proposals."},
-         "idempotency_key": {"type": "string", "description": "Optional caller-supplied key; a retried call with the same key returns the original proposal instead of creating a duplicate."}},
-         "required": ["title", "body"]}},
     {"name": "get_workspace_proposals", "description":
         "Read-only: List a bounded page of workspace proposals (human-authored flashes of insight), newest first. "
         "When status is omitted, defaults to 'live' proposals only (raw + investigating) — "
         "terminal proposals (promoted/rejected) are excluded so the default view reflects "
         "what's actually still open. Pass status='all' to fetch every status, or an explicit "
         "status (including promoted/rejected) to filter to just that one. Optional tag "
-        "substring filter. Pass project_id (or project_name) to restrict the listing to that "
-        "project's proposals only (a8afd8f9) — omitted, every proposal matching the other "
-        "filters is returned regardless of scope. Pagination defaults to 20 rows (maximum 100); "
-        "pass offset to fetch the next page.",
+        "substring filter. Pagination defaults to 20 rows (maximum 100); pass offset to "
+        "fetch the next page.",
      "inputSchema": {"type": "object", "properties": {
          "status": {"type": "string", "enum": ["raw", "investigating", "promoted", "rejected", "all"],
                     "description": "Filter to proposals in this status. Defaults to raw+investigating "
                     "('live') when omitted; use 'all' for every status."},
          "tag": {"type": "string", "description": "Substring filter on tags."},
-         "project_id": {"type": "string", "description": "Restrict to proposals scoped to this project only. Omitted returns proposals of any scope."},
-         "project_name": {"type": "string", "description": "Project name — alternative to project_id; resolved to the id internally."},
          "limit": {"type": "integer", "minimum": 1, "maximum": 100,
                    "description": "Maximum proposals to return (default 20, clamped to 1..100)."},
          "offset": {"type": "integer", "minimum": 0,
@@ -2063,21 +2100,13 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "The proposal must be in 'raw' or 'investigating' state. Creates a sprint item under "
         "the given project and sets the proposal's status to 'promoted' with "
         "promoted_to_sprint_item_id pointing to the new item. "
-        "a8afd8f9 — when the proposal is project-scoped (created via add_proposal with a "
-        "project_id) and this project_id differs from that, the promotion is rejected UNLESS "
-        "allow_project_transfer=True is passed together with a non-empty transfer_reason "
-        "(recorded on the resulting 'promoted' proposal_events row). A proposal with no "
-        "project_id (created via add_workspace_proposal, or predating this column) has nothing "
-        "to compare against, so this check never fires for it. "
         "Returns {proposal, sprint_item_id, sprint_item_title, project_id}.",
      "inputSchema": {"type": "object", "properties": {
          "proposal_id": {"type": "string"},
          "project_id": {"type": "string", "description": "Project to create the sprint item under."},
          "project_name": {"type": "string", "description": "Project name — alternative to project_id; resolved to the id internally."},
          "sprint_item_title": {"type": "string", "description": "Override title for the sprint item; defaults to the proposal title."},
-         "sprint_item_version": {"type": "string", "description": "Sprint version for the new item; defaults to 'current'."},
-         "allow_project_transfer": {"type": "boolean", "description": "Acknowledge promoting a project-scoped proposal into a DIFFERENT project than the one it was created under. Requires transfer_reason. Default false."},
-         "transfer_reason": {"type": "string", "description": "Non-empty reason for a cross-project transfer; required when allow_project_transfer=true. Recorded on the promoted event."}},
+         "sprint_item_version": {"type": "string", "description": "Sprint version for the new item; defaults to 'current'."}},
          "required": ["proposal_id"]}},
     {"name": "preview_proposal_promotion", "description":
         "Read-only (ce4883f3): preview what commit_proposal_promotion would do for a proposal at "
@@ -3523,6 +3552,7 @@ _READ_ONLY_TOOLS = {
     "get_pinned_decisions", "get_proposal_gates", "get_tasks", "search_tasks", "search_all", "search_synthesis",
     "paper_search", "social_search", "github_search",
     "get_session_brief", "get_context_block", "get_hitl_request",
+    "get_external_job", "list_external_jobs",
     "list_hitl_requests", "list_sessions", "get_sprint_notes",
     "get_session_log", "get_session_activity", "get_connection_log", "get_server_logs",
     "search_server_logs", "get_server_log_checkpoint",
@@ -3611,6 +3641,11 @@ _TOOL_CATEGORY: dict[str, str] = {
     "export_ai_log_artifacts": "notes",
     "purge_ai_log":            "notes",
     "checkpoint":              "session",
+    "register_external_job":    "session",
+    "update_external_job":      "session",
+    "get_external_job":         "session",
+    "list_external_jobs":       "session",
+    "complete_external_job":    "session",
     "get_session_brief":       "session",
     "get_context_block":       "session",
     "get_session_log":         "session",
@@ -3709,7 +3744,6 @@ _TOOL_CATEGORY: dict[str, str] = {
     "update_workspace_sprint_item":    "workspace",
     "complete_workspace_sprint_item":  "workspace",
     "add_workspace_proposal":          "workspace",
-    "add_proposal":                    "workspace",
     "get_workspace_proposals":         "workspace",
     "advance_proposal_status":         "workspace",
     "promote_proposal":                "workspace",
@@ -3835,6 +3869,11 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "generate_handoff":          "executor",
     "record_handoff_correction": "executor",
     "checkpoint":                "executor",
+    "register_external_job":      "executor",
+    "update_external_job":        "executor",
+    "complete_external_job":      "executor",
+    "get_external_job":           "both",
+    "list_external_jobs":         "both",
     "add_sprint_note":           "executor",
     "heartbeat":                 "executor",
     "run_verification":          "executor",
@@ -3855,7 +3894,6 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "validate_assumption":       "planner",
     "archive_decision":          "planner",
     "add_workspace_proposal":    "planner",
-    "add_proposal":              "planner",
     "get_workspace_proposals":   "planner",
     "advance_proposal_status":   "planner",
     "promote_proposal":          "planner",
@@ -4031,7 +4069,6 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "get_planning_brief":         "main-workflow",
     "get_sprint_items":           "main-workflow",
     "add_workspace_proposal":     "main-workflow",
-    "add_proposal":               "main-workflow",
     "promote_proposal":           "main-workflow",
     "add_sprint_item":            "main-workflow",
     "claim_sprint_item":          "main-workflow",
@@ -4042,6 +4079,11 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     # ---- COMMON SUPPORT: frequent hygiene ----
     # explicitly listed by Adam as common-support
     "checkpoint":                 "common-support",
+    "register_external_job":       "common-support",
+    "update_external_job":         "common-support",
+    "get_external_job":            "common-support",
+    "list_external_jobs":          "common-support",
+    "complete_external_job":       "common-support",
     "add_insight":                "common-support",
     "get_insights":               "common-support",
     "validate_assumption":        "common-support",
@@ -4255,7 +4297,6 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "add_workspace_note": "Add Workspace Note",
     "get_workspace_proposals": "Get Workspace Proposals",
     "add_workspace_proposal": "Add Workspace Proposal",
-    "add_proposal": "Add Proposal",
     "advance_proposal_status": "Advance Proposal Status",
     "promote_proposal": "Promote Proposal to Sprint Item",
     "get_workspace_settings": "Get Workspace Settings",

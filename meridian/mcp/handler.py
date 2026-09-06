@@ -3473,17 +3473,6 @@ async def _handle_task_tools(
         _profile_binding = await handoff_module_local.build_effective_profile_binding(
             db, args["project_id"], session_id=session_id,
         )
-        # c6015316 — machine-readable board-context-state signal, emitted on
-        # every generate_handoff mode alongside the fields above. Distinguishes
-        # a genuinely-empty project from one with pinned decisions/notes but
-        # zero executable sprint items ("context_only") — see
-        # build_board_context_state_for_handoff's own docstring for the exact
-        # contract. Fully guarded — a failure degrades to no field rather than
-        # breaking the mandatory handoff. Never touches `content`/quick_start_goal
-        # itself (goal-mode text stays byte-for-byte identical).
-        _board_context_state = await handoff_module_local.build_board_context_state_for_handoff(
-            db, args["project_id"], version=_effective_version,
-        )
         return {
             "file_path": path,
             "content": _plain_content,
@@ -3592,11 +3581,6 @@ async def _handle_task_tools(
             "continuation_status": _continuation_status,
             "checkpoint": _checkpoint,
             "strict_continuation": _strict_continuation,
-            # c6015316 — {"state": "empty"|"context_only"|"has_pending_items",
-            # pending_item_count, in_progress_item_count, pinned_decision_count,
-            # note_count, hint?} — see build_board_context_state_for_handoff's
-            # own docstring. None only if the best-effort lookup itself failed.
-            "board_context_state": _board_context_state,
         }
     if name == "load_handoff":
         # 5efe254b — trusted retrieval of the latest stored handoff for a project
@@ -4167,7 +4151,6 @@ async def _handle_notes_decisions(
         handle_get_workspace_proposals,
         handle_advance_proposal_status,
         handle_promote_proposal,
-        handle_add_proposal,
         handle_preview_proposal_promotion,
         handle_commit_proposal_promotion,
     )
@@ -4230,7 +4213,6 @@ async def _handle_notes_decisions(
         "get_workspace_proposals": handle_get_workspace_proposals,
         "advance_proposal_status": handle_advance_proposal_status,
         "promote_proposal": handle_promote_proposal,
-        "add_proposal": handle_add_proposal,
         "preview_proposal_promotion": handle_preview_proposal_promotion,
         "commit_proposal_promotion": handle_commit_proposal_promotion,
     }
@@ -4455,7 +4437,8 @@ async def _handle_session_tools(
     """Dispatch group: checkpoint, get_context_block, list_sessions, get_session_log,
     get_session_activity, get_agent_instructions, set_agent_instructions,
     set_executor_config, idle_until_session_done, search_all, search_synthesis,
-    paper_search, social_search, github_search, get_session_brief.
+    paper_search, social_search, github_search, get_session_brief, and the
+    external-job continuity register.
 
     81abd31f — the original if/elif chain has been replaced with a per-tool
     dispatch table (dict mapping tool name -> handler function).  Each tool's
@@ -4466,6 +4449,11 @@ async def _handle_session_tools(
     """
     from .handlers.session_tools import (  # noqa: PLC0415
         handle_checkpoint,
+        handle_register_external_job,
+        handle_update_external_job,
+        handle_get_external_job,
+        handle_list_external_jobs,
+        handle_complete_external_job,
         handle_get_context_block,
         handle_list_sessions,
         handle_get_session_log,
@@ -4488,6 +4476,8 @@ async def _handle_session_tools(
 
     # Tools that need no extra context beyond the standard five parameters.
     _standard_dispatch: dict[str, Any] = {
+        "get_external_job": handle_get_external_job,
+        "list_external_jobs": handle_list_external_jobs,
         "get_context_block": handle_get_context_block,
         "list_sessions": handle_list_sessions,
         "get_session_log": handle_get_session_log,
@@ -4510,6 +4500,19 @@ async def _handle_session_tools(
 
     if name in _standard_dispatch:
         return await _standard_dispatch[name](args, db, data_dir, tenant, _mcp_tenant_id)
+
+    if name == "register_external_job":
+        return await handle_register_external_job(
+            args, db, data_dir, tenant, _mcp_tenant_id
+        )
+    if name == "update_external_job":
+        return await handle_update_external_job(
+            args, db, data_dir, tenant, _mcp_tenant_id
+        )
+    if name == "complete_external_job":
+        return await handle_complete_external_job(
+            args, db, data_dir, tenant, _mcp_tenant_id
+        )
 
     # checkpoint needs handler-level _fetch_recent_commits and
     # _resolve_caller_identity passed explicitly to keep the import graph acyclic.
@@ -5827,22 +5830,6 @@ async def _handle_tunnel_tools(
         repo_path = str(args.get("repo_path") or "").strip()
         if not repo_path:
             raise ValueError("repo_path is required")
-        # ba31dedf — explicit repo-scope requirement, matching the rigor the
-        # worktree_id branch above already gets. This handler runs on the
-        # SERVER; Path.home() here is the server's own home directory, not
-        # the remote tunnel client's, so filesystem-resolving validation
-        # (meridian.repo_scope.validate_repo_scope) can't be used -- instead
-        # this is a string-shape check for a BARE home directory (no
-        # subdirectory beneath it), which is exactly the "operate over my
-        # whole home tree" failure mode this criterion targets. Fails closed:
-        # a bare home-directory string is rejected outright, never silently
-        # accepted as a project scope.
-        from ..repo_scope import looks_like_bare_home_directory  # noqa: PLC0415
-        if looks_like_bare_home_directory(repo_path):
-            raise ValueError(
-                f"repo_path looks like a bare home directory ({repo_path!r}), "
-                "not a project checkout -- pass the specific project repo path"
-            )
         if tenant is None:
             raise ValueError("set_active_repo requires an authenticated tenant (tunnel mode)")
         tenant_id = tenant.get("id", "")

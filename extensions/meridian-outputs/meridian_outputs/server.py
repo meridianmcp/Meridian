@@ -32,15 +32,6 @@ semantic validation (``validate_output_semantics``) remains a separate,
 not-yet-built capability with its own sprint item; nothing below should be
 read as a promise that it exists.
 
-Item a4cb12bf added ``inspect_local_file``, a single bounded local
-inspect/read router for ONE file (XML/JSON/CSV/XLSX/DOCX) that dispatches to
-the ``meridian-file-inspection`` and ``meridian-docs`` sibling packages over
-real (subprocess-spawned) MCP client sessions rather than importing them
-directly -- see :mod:`meridian_outputs.file_inspector` for the full routing
-table, the two-tier launch strategy, and the ``local_only``/``unavailable``
-convention it introduces. This tool never touches ``search_outputs``/
-``register_output_paths``, which remain exactly as they were.
-
 This is the wave-1 stopgap for local outputs indexing.  The hosted-aware
 smart-routing layer (item 1365e01a) is deliberately out of scope here.
 
@@ -63,13 +54,11 @@ from . import (
     annotate,
     artifact_registry,
     classify,
-    file_inspector,
     fingerprint,
     outputs_local,
     provenance,
     provenance_status,
     research_evidence,
-    run_manifest,
     search,
 )
 
@@ -293,102 +282,6 @@ def get_convergence_state(
       one that confirmed a genuinely empty directory.
     """
     return outputs_local.get_convergence_state(outputs_dir, subtree=subtree)
-
-
-@mcp.tool()
-def inspect_local_file(
-    path: str,
-    operation: str = "shape",
-    format: str = "auto",
-    allowed_root: str | None = None,
-    allow_symlinks: bool = False,
-    selector: str | None = None,
-    max_bytes: int = file_inspector.DEFAULT_MAX_BYTES,
-    timeout_seconds: float = file_inspector.DEFAULT_TIMEOUT_SECONDS,
-    preview_chars: int | None = None,
-    max_sample_rows: int | None = None,
-) -> dict[str, Any]:
-    """One bounded local inspect/read workflow for a single file -- XML,
-    JSON, CSV, XLSX, or DOCX -- without a tunnel and without a duplicate
-    parser (item a4cb12bf).
-
-    Routes ``path`` to whichever existing capability already understands
-    its format -- ``extensions/meridian-file-inspection``'s ``inspect_file``
-    (raw XML, generic JSON) or ``inspect_tabular_file`` (CSV, XLSX,
-    row-shaped JSON), or ``extensions/meridian-docs``'s ``document_outline``/
-    ``read_document_snapshot`` (DOCX/DOTX/DOCM/DOTM) -- each spawned as its
-    own short-lived local MCP stdio server (never a direct cross-package
-    import; see ``file_inspector`` module docstring for why) and normalizes
-    every answer into ONE canonical envelope. ``search_outputs``/
-    ``register_output_paths`` are unaffected by this tool -- output-tree
-    indexing/search stays exactly as it was.
-
-    This tool never makes a network or tunnel call of its own -- every
-    response carries ``"local_only": true``. When the required sibling
-    process cannot even be reached (missing package directory, no
-    compatible Python/``uvx`` on PATH, a crash before it can answer, or the
-    whole attempt exceeding its wall-clock budget), ``state`` is
-    ``"unavailable"`` (distinct from ``"failed"``, which means a sibling DID
-    run and reported a real parse/policy error) and ``errors`` carries a
-    stable ``"unavailable"`` code -- never a raised exception, never a hang.
-
-    Args:
-      path:              Path to the single file to inspect.
-      operation:         ``"metadata"`` (identity/size/hash/state only, no
-                          content), ``"shape"`` (default -- structure
-                          without content previews/samples), or
-                          ``"preview"`` (the full underlying bounded
-                          response, content included). For DOCX, metadata/
-                          shape genuinely request a smaller bounded page of
-                          headings (cheaper, not just post-filtered);
-                          preview reads paragraph content via
-                          ``read_document_snapshot``.
-      format:            ``"auto"`` (default, sniffed -- never from
-                          extension alone except to disambiguate DOCX from
-                          XLSX, which share the same ZIP magic bytes),
-                          ``"xml"``, ``"json"``, ``"csv"``, ``"xlsx"``, or
-                          ``"docx"``.
-      allowed_root:       Optional directory the resolved ``path`` must
-                          fall under -- a path escaping it is refused as
-                          ``denied``/``outside_allowed_root``.
-      allow_symlinks:     Set True to permit inspecting a symlink target
-                          (default False).
-      selector:           Optional bounded dotted/bracket JSON selector,
-                          forwarded to ``inspect_file`` when the path
-                          routes there; ignored otherwise.
-      max_bytes:          Maximum source file size in bytes (default
-                          10 MiB) -- checked before any sibling is spawned.
-      timeout_seconds:    Wall-clock budget forwarded to the sibling's own
-                          parse-time bound (default 5.0s) -- the subprocess
-                          spawn/handshake itself gets its own separate,
-                          fixed overhead allowance on top of this.
-      preview_chars:      Optional override forwarded to the underlying
-                          tool's own ``preview_chars``.
-      max_sample_rows:    Optional override forwarded to
-                          ``inspect_tabular_file``'s ``max_sample_rows``
-                          (tabular routes only).
-
-    Returns:
-      ``{schema_version, source_ref, format, mime, size_bytes,
-      source_sha256, parser_id, parser_version, result_hash, state, shape,
-      bounds, warnings, errors, provenance_ref, local_only, operation,
-      route}``. ``source_ref`` is a REDACTED portable reference, never the
-      raw machine-local absolute path. ``state`` is one of ``"complete"``/
-      ``"partial"``/``"failed"``/``"unavailable"``. ``route`` is one of
-      ``"generic"``/``"tabular"``/``"docs"`` -- which sibling answered.
-    """
-    return file_inspector.inspect_local_file(
-        path,
-        operation=operation,
-        format=format,
-        allowed_root=allowed_root,
-        allow_symlinks=allow_symlinks,
-        selector=selector,
-        max_bytes=max_bytes,
-        timeout_seconds=timeout_seconds,
-        preview_chars=preview_chars,
-        max_sample_rows=max_sample_rows,
-    )
 
 
 @mcp.tool()
@@ -1247,180 +1140,6 @@ def script_content_hash(script_path: str) -> str | None:
       moved, permissions) -- never raises.
     """
     return fingerprint.script_content_hash(script_path)
-
-
-@mcp.tool()
-def start_run_manifest(
-    outputs_dir: str,
-    run_id: str,
-    command_name: str,
-    command_args: dict[str, Any] | None = None,
-    project_id: str | None = None,
-    version: str | None = None,
-    sprint_item_id: str | None = None,
-    repo_dir: str | None = None,
-    input_paths: list[str] | None = None,
-    expected_counts: dict[str, int] | None = None,
-    allow_partial: bool = False,
-    external_manifest_hash: str | None = None,
-) -> dict[str, Any]:
-    """Persist an in-progress canonical run manifest for ``run_id`` (item
-    37ce5537) -- one durable receipt binding project/repo identity,
-    tool/package version, command identity, input hashes, the indexing
-    bounds actually in effect, every sibling ledger's on-disk location, and
-    a convergence-state snapshot, all in ONE place.
-
-    Composes this package's existing modules rather than duplicating them:
-    hashes via ``fingerprint.script_content_hash``, git state via a local
-    best-effort ``run_manifest.capture_git_state`` (this package cannot
-    import ``meridian.executor_contract`` across the package boundary --
-    see ``run_manifest``'s module docstring), and a convergence snapshot via
-    ``outputs_local.get_convergence_state``. No per-path provenance data or
-    artifact record is copied into this ledger -- only references.
-
-    Idempotent: calling this again with identical identity inputs (same
-    ``run_id`` plus everything else that feeds the identity hash) returns
-    the ALREADY-PERSISTED record unchanged, including a prior
-    ``finalize_run_manifest`` outcome if one already ran, rather than
-    clobbering it with a fresh ``in_progress`` skeleton -- this is what
-    makes an interrupted run's receipt resumable.
-
-    Args:
-      outputs_dir:            Absolute path to the outputs directory.
-      run_id:                  Unique id for this run. Required.
-      command_name:            The tool/script/command that is running.
-                              Required.
-      command_args:            Opaque caller-supplied args for that command.
-      project_id/version/
-      sprint_item_id:          Optional project/lineage identity.
-      repo_dir:                Optional local repo path to best-effort
-                              capture ``git_state`` (HEAD + dirty files) for.
-      input_paths:             Input file paths to hash now.
-      expected_counts:         Optional ``{label: non-negative int}`` dict.
-      allow_partial:           Whether a partial verdict is an acceptable
-                              outcome for this run.
-      external_manifest_hash:  Optional cross-reference to an externally
-                              (e.g. ``meridian.executor_contract``) built
-                              execution-manifest hash -- stored, never
-                              re-derived.
-
-    Returns:
-      The persisted manifest record (``phase="in_progress"`` on a fresh
-      start).
-
-    Raises:
-      ValueError (run_manifest.RunManifestError): missing required
-      arguments, an invalid ``expected_counts`` value, or a manifest already
-      exists for this ``run_id`` with a DIFFERENT identity hash -- fails
-      closed rather than silently overwriting a different run's identity.
-    """
-    return run_manifest.start_run_manifest(
-        outputs_dir, run_id=run_id, command_name=command_name,
-        command_args=command_args, project_id=project_id, version=version,
-        sprint_item_id=sprint_item_id, repo_dir=repo_dir,
-        input_paths=input_paths, expected_counts=expected_counts,
-        allow_partial=allow_partial, external_manifest_hash=external_manifest_hash,
-    )
-
-
-@mcp.tool()
-def finalize_run_manifest(
-    outputs_dir: str,
-    run_id: str,
-    output_paths: list[str] | None = None,
-    artifact_ids: list[str] | None = None,
-    status: str = "complete",
-    reason: str | None = None,
-) -> dict[str, Any]:
-    """Bind exact output hashes and artifact-id references to an
-    already-started run manifest, and mark its final phase (item 37ce5537).
-
-    Fail-closed exact output binding: every path in ``output_paths`` is
-    RE-HASHED right now -- never trusts a caller-declared hash. A missing/
-    unreadable output, or an ``artifact_id`` that doesn't resolve via
-    ``resolve_artifact``'s own registry, automatically downgrades an
-    attempted ``status="complete"`` to ``"partial"`` -- a finalize call is
-    never silently reported as a clean, fully-verified run when something
-    it claimed doesn't actually check out.
-
-    Args:
-      outputs_dir:    Absolute path to the outputs directory.
-      run_id:          The run started via ``start_run_manifest``.
-      output_paths:    Exact output file paths this run produced.
-      artifact_ids:    Public artifact ids (from ``register_artifact``) this
-                      run is claiming credit for.
-      status:          "complete" (default), "failed", or "partial".
-      reason:          Optional human-readable explanation.
-
-    Returns:
-      The updated manifest record. Its ``manifest_hash`` is unchanged from
-      ``start_run_manifest`` -- finalize only ever touches outcome fields.
-
-    Raises:
-      ValueError (run_manifest.RunManifestError): ``outputs_dir``/``run_id``
-      missing, an invalid ``status``, or no manifest was ever started for
-      this ``run_id``.
-    """
-    return run_manifest.finalize_run_manifest(
-        outputs_dir, run_id, output_paths=output_paths,
-        artifact_ids=artifact_ids, status=status, reason=reason,
-    )
-
-
-@mcp.tool()
-def get_run_manifest(outputs_dir: str, run_id: str) -> dict[str, Any] | None:
-    """Look up the current run-manifest record for ``run_id`` (item
-    37ce5537), whatever phase it's currently in.
-
-    Args:
-      outputs_dir:  Absolute path to the outputs directory.
-      run_id:        The run to look up.
-
-    Returns:
-      The manifest record dict, or ``None`` if nothing was ever started for
-      this ``run_id``.
-    """
-    return run_manifest.get_run_manifest(outputs_dir, run_id)
-
-
-@mcp.tool()
-def list_run_manifests(outputs_dir: str) -> list[dict[str, Any]]:
-    """List every run-manifest record ever started under ``outputs_dir``
-    (item 37ce5537), sorted by ``run_id``.
-
-    Args:
-      outputs_dir:  Absolute path to the outputs directory.
-
-    Returns:
-      A list of manifest record dicts; ``[]`` if none have been started yet.
-    """
-    return run_manifest.list_run_manifests(outputs_dir)
-
-
-@mcp.tool()
-def get_run_manifest_envelope(outputs_dir: str, run_id: str) -> dict[str, Any]:
-    """Typed, lossless research-evidence envelope for one run manifest (item
-    37ce5537) -- a single ``RUN``-kind ``EvidenceRecord`` (the
-    previously-unused ``EvidenceKind.RUN`` slot ``research_evidence.py``
-    already reserved) wrapping the manifest's full structured fields under
-    ``attributes``.
-
-    Args:
-      outputs_dir:  Absolute path to the outputs directory.
-      run_id:        The run to build an envelope for.
-
-    Returns:
-      The canonical envelope dict (same shape
-      ``get_provenance_status_envelope`` returns) -- pass to
-      ``serialize_provenance_envelope``/``parse_provenance_envelope`` for a
-      round-trippable JSON/XML form.
-
-    Raises:
-      ValueError (run_manifest.RunManifestError): no manifest exists for
-      ``run_id`` under ``outputs_dir``.
-    """
-    envelope = run_manifest.build_run_manifest_envelope(outputs_dir, run_id)
-    return research_evidence.envelope_to_dict(envelope)
 
 
 def main() -> None:

@@ -547,21 +547,11 @@ async def add_workspace_proposal(
     source: str | None = "workspace",
     family_id: str | None = None,
     idempotency_key: str | None = None,
-    project_id: str | None = None,
 ) -> dict[str, Any]:
     """Insert a workspace_proposals row with status='raw'.
 
     Workspace-scoped by ``tenant_id`` (like ``add_workspace_note``). These are
     human-authored flashes of insight — NOT auto-claimable by executors.
-
-    a8afd8f9 — ``project_id`` (optional) scopes this proposal to a specific
-    project: ``scope_type`` is stored as ``'project'`` when given, else the
-    unchanged default ``'workspace'``. When given, the target project must
-    already exist (:class:`ValueError` otherwise, checked BEFORE any write —
-    mirrors the existing project-existence check in
-    ``promote_workspace_proposal``). Every existing caller that omits
-    ``project_id`` gets byte-for-byte the same row shape as before this
-    parameter existed.
 
     6fb48898 — a kebab-cased ``slug`` and a short memorable ``nickname`` are
     auto-generated from the title, unique per tenant scope, mirroring the
@@ -593,10 +583,6 @@ async def add_workspace_proposal(
         if existing is not None:
             return existing
 
-    if project_id and await get_project(db, project_id) is None:
-        raise ValueError(f"Project '{project_id}' not found")
-    scope_type = "project" if project_id else "workspace"
-
     pid = _new_id()
     # 6fb48898 — derive human-readable secondary keys from the title.
     _slug = await _unique_proposal_slug(
@@ -609,10 +595,10 @@ async def add_workspace_proposal(
         await db.execute(
             "INSERT INTO workspace_proposals "
             "(id, title, body, tags, tenant_id, family_id, slug, nickname, "
-            "idempotency_key, scope_type, project_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "idempotency_key) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (pid, title, body, tags, tenant_id, family_id, _slug, _nickname,
-             idempotency_key, scope_type, project_id),
+             idempotency_key),
         )
     except Exception as exc:  # noqa: BLE001 — classified below
         if idempotency_key and _is_proposal_unique_violation(exc):
@@ -767,19 +753,12 @@ async def get_workspace_proposals(
     offset: int = 0,
     family_id: str | None = None,
     sort_by: str = "activity",
-    project_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return a bounded page of workspace proposals, newest first.
 
     Optional filters: ``status`` (raw/investigating/paused/promoted/rejected,
     closed, or superseded) and
     ``tag`` (substring match). Scoped to ``tenant_id`` when provided.
-
-    a8afd8f9 — ``project_id`` (optional), when given, restricts the result to
-    proposals scoped to exactly that project (``project_id = ?``); other
-    projects' rows AND workspace-global rows are excluded. Omitted (the
-    default) preserves the unchanged prior behavior — every proposal
-    matching the other filters regardless of scope.
 
     When ``status`` is omitted, defaults to "live" proposals only (raw +
     investigating) — terminal proposals (promoted/rejected) are excluded so
@@ -809,9 +788,6 @@ async def get_workspace_proposals(
     if family_id:
         clauses.append("family_id = ?")
         params.append(family_id)
-    if project_id:
-        clauses.append("project_id = ?")
-        params.append(project_id)
     scope, scope_params = _ws_tenant_clause(tenant_id)
     if scope:
         clauses.append(scope)
@@ -967,8 +943,6 @@ async def promote_workspace_proposal(
     touches_resources: list[str] | None = None,
     infer_touches_resources: bool = False,
     file_github_issue: bool = False,
-    allow_project_transfer: bool = False,
-    transfer_reason: str | None = None,
 ) -> dict[str, Any]:
     """Promote a proposal to a real sprint item and link the two.
 
@@ -983,24 +957,9 @@ async def promote_workspace_proposal(
     UPDATE is guarded by ``WHERE status IN ('raw','investigating')``, so a
     lost race never creates a second, orphaned sprint item for one proposal).
 
-    a8afd8f9 — project-scope mismatch guard: when the proposal carries a
-    non-null ``project_id`` (it was created project-scoped) that differs
-    from the ``project_id`` this call is promoting into, promotion is
-    rejected with ``ValueError`` UNLESS ``allow_project_transfer=True`` is
-    passed together with a non-empty ``transfer_reason`` — the override is
-    recorded in the "promoted" event's payload (a durable ``proposal_events``
-    row) rather than silently allowed. A proposal with no ``project_id``
-    (every row created before this column existed, or explicitly workspace-
-    scoped) has nothing to compare against, so this check never fires for it
-    — promotion behaves exactly as it did before this guard existed.
-
     Atomic: the sprint-item insert, the promote UPDATE, and the "promoted"
     event are compensated together on failure — see ``ProposalSchemaError``.
     """
-    if allow_project_transfer and not (transfer_reason or "").strip():
-        raise ValueError(
-            "allow_project_transfer=True requires a non-empty transfer_reason"
-        )
     scope, scope_params = _ws_tenant_clause(tenant_id)
     scope_sql = f" AND {scope}" if scope else ""
     async with db.execute(
@@ -1017,23 +976,6 @@ async def promote_workspace_proposal(
             f"Cannot promote a proposal in status '{current}'. "
             "Only 'raw' or 'investigating' proposals can be promoted."
         )
-    # a8afd8f9 — project-scope mismatch guard (see docstring). Checked before
-    # any write, alongside the other pre-flight validations above.
-    proposal_project_id = proposal.get("project_id")
-    project_transfer: dict[str, Any] | None = None
-    if proposal_project_id and proposal_project_id != project_id:
-        if not allow_project_transfer:
-            raise ValueError(
-                f"Cannot promote proposal '{proposal_id}': it is scoped to "
-                f"project '{proposal_project_id}', not '{project_id}'. Pass "
-                "allow_project_transfer=True with a transfer_reason to "
-                "promote it into a different project anyway."
-            )
-        project_transfer = {
-            "from_project_id": proposal_project_id,
-            "to_project_id": project_id,
-            "reason": (transfer_reason or "").strip(),
-        }
     # Verify the target project exists.
     project = await get_project(db, project_id)
     if project is None:
@@ -1115,21 +1057,12 @@ async def promote_workspace_proposal(
         )
 
     try:
-        _promoted_payload: dict[str, Any] = {
-            "sprint_item_id": si_id, "touches_resources": resource_candidates,
-        }
-        if project_transfer is not None:
-            # a8afd8f9 — durable audit trail for a cross-project promotion
-            # override, recorded on the SAME "promoted" event rather than as
-            # a separate write (keeps the existing atomic-compensation
-            # machinery below unchanged).
-            _promoted_payload["project_transfer"] = project_transfer
         await _append_proposal_event(
             db,
             proposal_id,
             "promoted",
             f"Promoted to sprint item {si_id}",
-            payload=_promoted_payload,
+            payload={"sprint_item_id": si_id, "touches_resources": resource_candidates},
             tenant_id=(tenant_id if tenant_id is not None else proposal.get("tenant_id")),
         )
     except Exception as exc:  # noqa: BLE001 — classified below

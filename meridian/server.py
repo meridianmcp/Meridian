@@ -4114,35 +4114,24 @@ async def mcp_tools_doc() -> str:
         "---\n",
         "\n",
     ]
-    lines += ["## Proposals\n"]
-    lines += _render_tool("add_proposal",
-        "Capture an idea into a proposal — PROJECT-SCOPED BY DEFAULT (a8afd8f9). The preferred entry "
-        "point going forward. Pass `project_id`/`project_name` to scope it to a project, XOR "
-        "`scope='workspace'` to explicitly opt into a workspace-global proposal instead — an ambiguous "
-        "call (neither, or both) is rejected rather than guessed. NOT executor-claimable. status: "
-        "raw → investigating → promoted|rejected. Use `advance_proposal_status` to move through the "
-        "lifecycle; `promote_proposal` to convert one into a real sprint item.")
+    lines += ["## Workspace proposals\n"]
     lines += _render_tool("add_workspace_proposal",
         "Capture a workspace-level flash of insight into the 'drawer of inspiration' — cross-project ideas that "
-        "don't belong to any one project yet. The explicit workspace-global opt-in (see `add_proposal` for the "
-        "project-scoped default). NOT executor-claimable. status: raw → investigating → promoted|rejected. "
+        "don't belong to any one project yet. NOT executor-claimable. status: raw → investigating → promoted|rejected. "
         "Use `advance_proposal_status` to move through the lifecycle; `promote_proposal` to convert one into a real sprint item.")
     lines += _render_tool("get_workspace_proposals",
         "Read-only: List workspace proposals (human-authored flashes of insight), newest first. "
         "When status is omitted, defaults to 'live' proposals only (raw + investigating) — terminal "
         "proposals (promoted/rejected) are excluded. Pass status='all' for every status, or an "
         "explicit status (including promoted/rejected) to filter to just that one. Optional tag "
-        "substring filter. Pass `project_id`/`project_name` to restrict the listing to that project's "
-        "proposals only (a8afd8f9) — omitted, proposals of any scope are returned.")
+        "substring filter.")
     lines += _render_tool("advance_proposal_status",
         "Transition a workspace proposal through its lifecycle (raw → investigating|rejected; "
         "investigating → promoted|rejected|raw; rejected → raw). 'promoted' is a terminal status "
         "reachable only via `promote_proposal`.")
     lines += _render_tool("promote_proposal",
         "Promote a workspace proposal into a real sprint item, creating the link between them. "
-        "The proposal must be in 'raw' or 'investigating' state. When the proposal is project-scoped "
-        "and this call's project differs, promotion is rejected unless `allow_project_transfer=True` "
-        "is passed with a `transfer_reason` (a8afd8f9). Returns {proposal, sprint_item_id, sprint_item_title, project_id}.")
+        "The proposal must be in 'raw' or 'investigating' state. Returns {proposal, sprint_item_id, sprint_item_title, project_id}.")
     lines += ["## Notes\n"]
     lines += _render_tool("add_note",
         "Add a per-project wiki note. Use for setup instructions, gotchas, environment details, how-tos.")
@@ -5252,20 +5241,10 @@ def _execution_mode_directive(mode: str | None) -> str:
 # 72e12ed8 — HITL auto-answer directive surfaced in the start_session orientation
 # so executors know whether request_hitl resolves inline or blocks for a human.
 # 67f118c3 — this directive is prepended to agent_instructions, so for modes 1/2
-# it must ALSO soften the unconditional "request_hitl is mandatory for any human
-# question" rule baked into DEFAULT_AGENT_INSTRUCTIONS: with auto-answer on, that
-# rule's own premise (filing always means waiting on a human) no longer holds, so
-# stating it as an absolute would make sessions file unwanted mid-sprint HITLs for
-# questions that would just resolve inline anyway. Mode 0 keeps the mandatory
-# wording verbatim, since there auto-answer is off and the premise holds.
-#
-# <infra-fix> — reworded modes 1/2 to drop the "OVERRIDE ... does NOT apply"
-# framing. That phrasing repeatedly got misread, by both human reviewers and
-# executor sessions across many runs, as an adversarial prompt-injection attempt
-# targeting the request_hitl rule — when it has always been this server's own
-# first-party code describing a real, project-configured setting. Same guidance,
-# stated as a fact about how auto-answer changes the cost of filing rather than
-# as an "override" of a rule stated elsewhere.
+# it must ALSO override the unconditional "request_hitl is mandatory for any human
+# question" rule baked into DEFAULT_AGENT_INSTRUCTIONS. Without the override, the
+# injected body contradicts the /goal's mode>=1 "Do NOT file HITLs" clause and
+# sessions still file unwanted mid-sprint HITLs. Mode 0 keeps the mandatory wording.
 _HITL_MODE_DIRECTIVES = {
     0: ("HITL: auto-answer OFF — request_hitl queues for a human and "
         "urgency='blocking' pauses you until answered. Still ALWAYS use request_hitl "
@@ -5273,17 +5252,17 @@ _HITL_MODE_DIRECTIVES = {
     1: ("HITL: auto-answer SAFE — request_hitl resolves immediately for "
         "non-destructive questions and returns the answer inline (it does not "
         "block). Use it freely; require_human=true still routes to a human. "
-        "Because auto-answer is on, filing a request_hitl here is not mandatory "
-        "the way it is when auto-answer is off — it resolves inline rather than "
-        "blocking, so prefer to skip blocked items and continue when a human "
-        "genuinely isn't needed; file request_hitl whenever you are unsure."),
+        "OVERRIDE: auto-answer is ON, so filing a request_hitl is NOT mandatory — "
+        "the 'request_hitl is the ONLY human-decision channel / MUST go through "
+        "request_hitl' rule below does NOT apply mid-sprint. Prefer to skip blocked "
+        "items and continue; only file a HITL when you genuinely need a human."),
     2: ("HITL: auto-answer AGGRESSIVE — request_hitl resolves immediately and "
         "returns the answer inline for nearly all questions. Use it freely; "
         "require_human=true still forces a human reply. "
-        "Because auto-answer is on, filing a request_hitl here is not mandatory "
-        "the way it is when auto-answer is off — it resolves inline rather than "
-        "blocking, so prefer to skip blocked items and continue when a human "
-        "genuinely isn't needed; file request_hitl whenever you are unsure."),
+        "OVERRIDE: auto-answer is ON, so filing a request_hitl is NOT mandatory — "
+        "the 'request_hitl is the ONLY human-decision channel / MUST go through "
+        "request_hitl' rule below does NOT apply mid-sprint. Prefer to skip blocked "
+        "items and continue; only file a HITL when you genuinely need a human."),
 }
 
 

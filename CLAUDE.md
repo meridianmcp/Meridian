@@ -2,7 +2,7 @@
 
 ---
 <!-- MERIDIAN STATE — auto-generated, do not edit below -->
-## Current Sprint State  _(auto-updated 2026-08-24 05:54 UTC)_
+## Current Sprint State  _(auto-updated 2026-09-04 09:13 UTC)_
 
 **Key Files:**
 - `meridian/server.py` — FastAPI app + MCP handlers

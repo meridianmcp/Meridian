@@ -63,20 +63,6 @@ dependencies = [
     # install always gets the memory-adaptive path, same policy as xxhash/
     # pyarrow above.
     "psutil>=5.9",
-    # aa423c7e -- PDF body-content indexing (_classify_suffix's "pdf_content"
-    # kind, backed by _extract_pdf_text in outputs_local.py). pypdf is the
-    # lightest-weight extraction option available (pure-Python-ish, no C
-    # extension surface, smallest attack surface) given no PDF library was
-    # previously vendored anywhere in this repo. outputs_local.py lazily
-    # imports it and degrades to header/filename-only indexing if it's ever
-    # missing at runtime, but it's declared as a real, non-optional
-    # dependency here so a normal install always gets real PDF text
-    # extraction -- same policy as xxhash/pyarrow/psutil above. MUST also be
-    # mirrored into the repo root pixi.toml's [pypi-dependencies] (see the
-    # 52cbe5d8/task_ecb96ac9 comments there) -- this extension's tests import
-    # the module straight off sys.path rather than via a pip install of this
-    # package, so nothing here alone reaches the shared pixi test env.
-    "pypdf>=4.0",
 ]
 
 [project.optional-dependencies]

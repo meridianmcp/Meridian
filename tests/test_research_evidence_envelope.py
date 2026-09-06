@@ -110,12 +110,7 @@ class TestEnums:
         assert {k.value for k in RE.EvidenceKind} == required
 
     def test_all_required_resolver_statuses_present(self):
-        # PROV-CANONICAL (7d9b8251) added pending_retry/failed to the
-        # original six-value set -- see ResolverStatus's own docstring.
-        required = {
-            "verified", "stale", "held", "ambiguous", "unavailable", "degraded",
-            "pending_retry", "failed",
-        }
+        required = {"verified", "stale", "held", "ambiguous", "unavailable", "degraded"}
         assert {s.value for s in RE.ResolverStatus} == required
 
 

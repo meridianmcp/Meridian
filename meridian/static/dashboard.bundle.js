@@ -2962,34 +2962,34 @@
     const _guest = _activeRole === "viewer" || _activeRole === "member";
     const _canInvite = _activeRole === "owner" || _activeRole === "admin";
     try {
-      let buildHookCurlHeaders2 = function(needsAuth) {
+      let buildHookCurlHeaders2 = function(token) {
         const headers = [];
-        if (needsAuth) headers.push(`-H "Authorization: Bearer $MERIDIAN_HOOKS_TOKEN"`);
+        if (token) headers.push(`-H 'Authorization: Bearer ${token}'`);
         headers.push(`-H 'Content-Type: application/json'`);
         return headers.join(" ");
-      }, buildHookCurlCommand2 = function(path, needsAuth) {
-        const cmd = `curl -s -X POST ${buildHookCurlHeaders2(needsAuth)} -d '{"project_id":"${projectId}"}' ${hooksBaseUrl}/hooks/${path}`;
+      }, buildHookCurlCommand2 = function(path, token) {
+        const cmd = `curl -s -X POST ${buildHookCurlHeaders2(token)} -d '{"project_id":"${projectId}"}' ${hooksBaseUrl}/hooks/${path}`;
         if (path === "session-start") return `${cmd} | jq -r '.hookSpecificOutput.additionalContext // empty'`;
         return cmd;
-      }, buildHookPowerShellCommand2 = function(path, needsAuth) {
-        const headerClause = needsAuth ? ` -Headers @{ Authorization = "Bearer $env:MERIDIAN_HOOKS_TOKEN" }` : "";
+      }, buildHookPowerShellCommand2 = function(path, token) {
+        const headerClause = token ? ` -Headers @{ Authorization = 'Bearer ${token}' }` : "";
         const bodyJson = `{"project_id":"${projectId}"}`;
         if (path === "session-start") {
           return `powershell -NoProfile -NonInteractive -Command "try { $r = Invoke-WebRequest -Method POST -Uri '${hooksBaseUrl}/hooks/session-start'${headerClause} -ContentType 'application/json' -Body '${bodyJson}' -UseBasicParsing; $r.Content } catch { '{}' }"`;
         }
         return `powershell -NoProfile -NonInteractive -Command "try { Invoke-WebRequest -Method POST -Uri '${hooksBaseUrl}/hooks/stop'${headerClause} -ContentType 'application/json' -Body '${bodyJson}' -UseBasicParsing | Out-Null } catch { }"`;
-      }, buildClaudeHookSnippet2 = function(platform, needsAuth) {
-        const start = platform === "windows" ? buildHookPowerShellCommand2("session-start", needsAuth) : buildHookCurlCommand2("session-start", needsAuth);
-        const stop = platform === "windows" ? buildHookPowerShellCommand2("stop", needsAuth) : buildHookCurlCommand2("stop", needsAuth);
+      }, buildClaudeHookSnippet2 = function(platform, token) {
+        const start = platform === "windows" ? buildHookPowerShellCommand2("session-start", token) : buildHookCurlCommand2("session-start", token);
+        const stop = platform === "windows" ? buildHookPowerShellCommand2("stop", token) : buildHookCurlCommand2("stop", token);
         return JSON.stringify({
           hooks: {
             SessionStart: [{ matcher: "", hooks: [{ type: "command", command: start }] }],
             Stop: [{ matcher: "", hooks: [{ type: "command", command: stop }] }]
           }
         }, null, 2);
-      }, buildCodexHookSnippet2 = function(platform, needsAuth) {
-        const start = platform === "windows" ? buildHookPowerShellCommand2("session-start", needsAuth) : buildHookCurlCommand2("session-start", needsAuth);
-        const stop = platform === "windows" ? buildHookPowerShellCommand2("stop", needsAuth) : buildHookCurlCommand2("stop", needsAuth);
+      }, buildCodexHookSnippet2 = function(platform, token) {
+        const start = platform === "windows" ? buildHookPowerShellCommand2("session-start", token) : buildHookCurlCommand2("session-start", token);
+        const stop = platform === "windows" ? buildHookPowerShellCommand2("stop", token) : buildHookCurlCommand2("stop", token);
         return `[mcp_servers.meridian]
 type = "http"
 url = "${hooksBaseUrl}/mcp"
@@ -5765,18 +5765,19 @@ project_id = "${displayPid}"`;
       }
       var currentToken = null;
       setTimeout(() => {
+        const hostedPlaceholderToken = mcpData ? "sk_meridian_" + "x".repeat(32) : "";
         let hooksToken = null;
         const renderHooks = () => {
-          const needsAuth = !!mcpData;
+          const activeToken = hooksToken || hostedPlaceholderToken;
           const installUnix = `curl -fsSL ${hooksBaseUrl}/install.sh | sh`;
           const installWindows = `irm ${hooksBaseUrl}/install.ps1 | iex`;
           const snippets = {
             [`hooks-install-unix-${projectId}`]: installUnix,
             [`hooks-install-windows-${projectId}`]: installWindows,
-            [`hooks-win-claude-${projectId}`]: buildClaudeHookSnippet2("windows", needsAuth),
-            [`hooks-win-codex-${projectId}`]: buildCodexHookSnippet2("windows", needsAuth),
-            [`hooks-unix-claude-${projectId}`]: buildClaudeHookSnippet2("unix", needsAuth),
-            [`hooks-unix-codex-${projectId}`]: buildCodexHookSnippet2("unix", needsAuth)
+            [`hooks-win-claude-${projectId}`]: buildClaudeHookSnippet2("windows", activeToken),
+            [`hooks-win-codex-${projectId}`]: buildCodexHookSnippet2("windows", activeToken),
+            [`hooks-unix-claude-${projectId}`]: buildClaudeHookSnippet2("unix", activeToken),
+            [`hooks-unix-codex-${projectId}`]: buildCodexHookSnippet2("unix", activeToken)
           };
           Object.entries(snippets).forEach(([id, text]) => {
             const el2 = document.getElementById(id);
@@ -5785,9 +5786,9 @@ project_id = "${displayPid}"`;
           const statusEl = document.getElementById(`hooks-token-status-${projectId}`);
           if (statusEl) {
             if (hooksToken) {
-              statusEl.textContent = 'Real API key generated. The snippets below read it from a MERIDIAN_HOOKS_TOKEN environment variable rather than embedding it \u2014 set that once (Unix: add "export MERIDIAN_HOOKS_TOKEN=..." to your shell profile; Windows: setx MERIDIAN_HOOKS_TOKEN "..." then reopen your terminal) using the key shown above, then use "Generate new key" only to rotate.';
+              statusEl.textContent = "Real API key generated - hosted snippets are prefilled for this user and project.";
             } else if (mcpData) {
-              statusEl.textContent = "Generate an API key, then set it as the MERIDIAN_HOOKS_TOKEN environment variable the snippets below reference (never paste the raw key into settings.json).";
+              statusEl.textContent = "Generate an API key to replace the placeholder token in the hosted snippets below.";
             } else {
               statusEl.textContent = "Local mode - no Bearer token needed.";
             }
@@ -8223,7 +8224,7 @@ ${n2.tags || ""}`.toLowerCase();
   } catch (e3) {
   }
 
-  // ../../../node_modules/preact/dist/preact.module.js
+  // node_modules/preact/dist/preact.module.js
   var n;
   var l;
   var u;
@@ -8482,7 +8483,7 @@ ${n2.tags || ""}`.toLowerCase();
     return n2.__v.__b - l3.__v.__b;
   }, H.__r = 0, f = Math.random().toString(8), c = "__d" + f, a = "__a" + f, s = /(PointerCapture)$|Capture$/i, h = 0, p = V(false), v = V(true), y = 0;
 
-  // ../../../node_modules/preact/hooks/dist/hooks.module.js
+  // node_modules/preact/hooks/dist/hooks.module.js
   var t2;
   var r2;
   var u2;
@@ -8623,7 +8624,7 @@ ${n2.tags || ""}`.toLowerCase();
     return "function" == typeof t3 ? t3(n2) : t3;
   }
 
-  // ../../../node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
+  // node_modules/preact/jsx-runtime/dist/jsxRuntime.module.js
   var f3 = 0;
   function u3(e3, t3, n2, o3, i3, u4) {
     t3 || (t3 = {});
@@ -9476,7 +9477,7 @@ ${n2.tags || ""}`.toLowerCase();
     }
   }
 
-  // ../../../node_modules/zustand/esm/vanilla.mjs
+  // node_modules/zustand/esm/vanilla.mjs
   var createStoreImpl = (createState) => {
     let state2;
     const listeners = /* @__PURE__ */ new Set();

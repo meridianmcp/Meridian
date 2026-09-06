@@ -45,6 +45,7 @@ from mcp.server.fastmcp import FastMCP
 from . import docs_intel
 from . import local_ingest
 from . import render_gate
+from . import rights_clearance
 
 mcp = FastMCP("meridian-docs")
 
@@ -315,6 +316,7 @@ def get_document_review(
     docx_path: str,
     expected_source_fingerprint: str | None = None,
     include_render_check: bool = False,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """b67ec6b5 -- non-mutating DOCX review: findings grouped by category
     (structure/equation/caption/section_page/ownership/provenance/
@@ -324,7 +326,8 @@ def get_document_review(
     alone.
 
     Composes existing read-only primitives (audit_equation_style,
-    scan_stale_notes, a read-only legacy-plaintext-caption detector, and
+    audit_figure_table_spacing, scan_stale_notes, a read-only
+    legacy-plaintext-caption detector, and
     optionally check_render_capability) rather than re-deriving detection or
     anchor-resolution logic. Pass expected_source_fingerprint (a value
     previously returned as source_fingerprint) to detect the document having
@@ -339,6 +342,7 @@ def get_document_review(
     return docs_intel.build_document_review(
         docx_path,
         expected_source_fingerprint=expected_source_fingerprint,
+        style_policy=style_policy,
         include_render_check=include_render_check,
     )
 
@@ -379,6 +383,87 @@ def audit_document(
 
 
 @mcp.tool()
+def audit_rights_clearance(
+    docx_paths: str | list[str],
+    rights_manifest: dict[str, Any],
+    profile: dict[str, Any] | None = None,
+    zotero_records: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Read-only, fail-closed rights audit for every figure/table caption.
+
+    ``rights_manifest`` is the explicit per-artifact rights ledger.  Each
+    figure/table must identify its source reference, DOI/URL, transformation,
+    asset hash, and permission/license evidence.  The scanner resolves the
+    caption's own bracket citations against the in-document reference list;
+    it deliberately does not use nearby prose as a substitute for an
+    association.  ``zotero_records`` may supply CSL/Zotero metadata for
+    identity and link normalization, but Zotero metadata never counts as
+    permission evidence.
+
+    The result's ``submission_allowed`` is true only when every discovered
+    artifact is explicitly cleared for all profile scopes.  Missing,
+    ambiguous, conflicting, or scope-mismatched evidence blocks the result.
+    No document is written and no render check is performed.
+    """
+    return rights_clearance.audit_docx_rights(
+        docx_paths,
+        rights_manifest,
+        profile=profile,
+        zotero_records=zotero_records,
+    )
+
+
+@mcp.tool()
+def build_rights_manifest_template(
+    docx_paths: str | list[str],
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a review-only per-figure/per-table rights ledger from DOCX files.
+
+    The template records only observed facts: caption/paragraph identity,
+    embedded asset hashes, caption-local citations, and reference-list DOI/URL
+    candidates.  It intentionally leaves source classification, license,
+    permission evidence, and publication scopes blank for review.
+    """
+    return rights_clearance.build_rights_manifest_template(docx_paths, profile=profile)
+
+
+@mcp.tool()
+def evaluate_rights_manifest(
+    rights_manifest: dict[str, Any],
+    profile: dict[str, Any] | None = None,
+    zotero_records: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Evaluate a rights ledger without opening a DOCX.
+
+    This is useful while a manuscript or supplementary-information package is
+    being assembled.  It is intentionally separate from citation formatting:
+    source identity is necessary, but not sufficient, for reuse clearance.
+    """
+    return rights_clearance.evaluate_manifest(
+        rights_manifest,
+        profile=profile,
+        zotero_records=zotero_records,
+    )
+
+
+@mcp.tool()
+def inspect_rights_sources(
+    urls: list[str],
+    timeout_seconds: float = 15.0,
+) -> dict[str, Any]:
+    """Collect publisher/DOI-page rights signals for later human review.
+
+    The fetched HTML, metadata, license links, and content hash are evidence
+    candidates only.  This tool never upgrades a figure/table to allowed just
+    because a page contains the words ``open access`` or ``CC BY``; the
+    article's panel-specific credit line and intended publication scope still
+    have to be recorded in the rights manifest.
+    """
+    return rights_clearance.inspect_source_urls(urls, timeout_seconds=timeout_seconds)
+
+
+@mcp.tool()
 def check_render_capability(docx_path: str) -> dict[str, Any]:
     """93cd9798 -- lightweight render-capability detection for visual QA.
 
@@ -415,6 +500,8 @@ def render_with_receipt(
     receipts_path: str | None = None,
     max_retries: int = 1,
     visual_qa: dict[str, Any] | None = None,
+    preflight: bool = True,
+    style_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """1e6150ef -- run a render attempt and build a DURABLE receipt that
     survives the render backend's own temp directory being cleaned up.
@@ -441,6 +528,10 @@ def render_with_receipt(
       visual_qa:        Optional explicit visual-QA verdict dict, e.g.
                        ``{"status": "verified", "reviewer": "...", "notes":
                        "..."}``.
+      preflight:       Run deterministic DOCX/equation checks before starting
+                       the expensive backend render. The MCP wrapper defaults
+                       this to ``True``; low-level library callers can opt out.
+      style_policy:    Optional equation-style policy forwarded to preflight.
 
     Returns the full receipt dict -- see ``render_gate.render_with_receipt``
     for every field. Per this module's existing contract, a timed-out
@@ -449,7 +540,7 @@ def render_with_receipt(
     """
     return render_gate.render_with_receipt(
         docx_path, receipts_path=receipts_path, max_retries=max_retries,
-        visual_qa=visual_qa,
+        visual_qa=visual_qa, preflight=preflight, style_policy=style_policy,
     )
 
 
@@ -1659,6 +1750,28 @@ def remove_equation(
 
 
 @mcp.tool()
+def preflight_document(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+    expected_source_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """docx-intel-v2-preflight — run deterministic checks before rendering.
+
+    Loads and validates the DOCX once, parses all OMML equations once, and
+    runs the configured equation-style and venue-aware figure/table spacing
+    audits. Use ``ready_for_render`` as the gate before starting a slow Word
+    or LibreOffice render. The response includes ``contract_version`` so
+    callers can detect a long-lived MCP process that has not reloaded newer
+    parser code. This tool is read-only and never mutates the document.
+    """
+    return docs_intel.preflight_document(
+        docx_path=docx_path,
+        style_policy=style_policy,
+        expected_source_fingerprint=expected_source_fingerprint,
+    )
+
+
+@mcp.tool()
 def audit_equation_style(
     docx_path: str,
     style_policy: dict[str, Any] | None = None,
@@ -1691,6 +1804,30 @@ def audit_equation_style(
       policy} or {error: <message>}.
     """
     return docs_intel.audit_equation_style(
+        docx_path=docx_path,
+        style_policy=style_policy,
+    )
+
+
+@mcp.tool()
+def audit_figure_table_spacing(
+    docx_path: str,
+    style_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Audit figure/table spacing against an explicit venue profile.
+
+    The audit is read-only and structural: it measures contiguous blank
+    paragraphs and explicit paragraph spacing in OOXML, not rendered page
+    geometry. Use ``style_policy[\"figure_table_spacing_profile\"]`` to select
+    ``mst_thesis``, ``mst_thesis_v11_legacy``, ``drexel_thesis``,
+    ``chicago_turabian``, ``asce_manuscript``, ``jcshm_springer``,
+    ``journal_generic``, or ``none``. Under the MST profile, the same spacing
+    preference is applied to figures and tables; only caption placement differs
+    (figure captions below, table titles above).
+    Page-bottom whitespace, floating-object wrap, and line wrapping still
+    require a renderer/manual review.
+    """
+    return docs_intel.audit_figure_table_spacing(
         docx_path=docx_path,
         style_policy=style_policy,
     )

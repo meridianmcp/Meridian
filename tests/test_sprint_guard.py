@@ -3,7 +3,6 @@ generate_handoff hook-writer."""
 from __future__ import annotations
 
 import asyncio
-import re
 from pathlib import Path
 
 import pytest
@@ -426,63 +425,6 @@ def test_write_sprint_guard_hooks_never_writes_reserved_slug_files(tmp_path):
     sh = (tmp_path / ".claude" / "hooks" / "sprint_guard.sh").read_text(encoding="utf-8")
     assert "MERIDIAN_BYPASS_MARKER_9f3a" not in sh  # bypass row never leaked in
     assert "pending_count" in sh                    # still the real sprint_guard body
-
-
-# ---------------------------------------------------------------------------
-# 34f76536 -- template/checked-in-file parity (the a03c0eeb drift this fixes)
-# ---------------------------------------------------------------------------
-
-
-def test_sprint_guard_templates_have_feature_parity():
-    """a03c0eeb landed the worktree-sweep addition directly in the checked-in
-    sprint_guard.ps1 (commit 9a6cc6b8) without ever touching handoff.py's
-    generator templates, so POSIX silently never got the feature and any
-    future generate_handoff() call would have regressed the Windows hook
-    back to pre-a03c0eeb content. Assert both platform templates carry the
-    same feature markers so a future single-platform addition to ONE
-    template without the other fails the suite immediately."""
-    sh = handoff_module._SPRINT_GUARD_SH
-    ps1 = handoff_module._SPRINT_GUARD_PS1
-    markers = (
-        "c0d2356d", "b4ce3274", "e2e1b682", "a03c0eeb",
-        "stop_hook_active", "pending_count", "verification_pending_count",
-        "worktrees/sweep",
-    )
-    for marker in markers:
-        assert marker in sh, f"{marker!r} in _SPRINT_GUARD_PS1 but missing from _SPRINT_GUARD_SH"
-        assert marker in ps1, f"{marker!r} in _SPRINT_GUARD_SH but missing from _SPRINT_GUARD_PS1"
-
-
-def test_checked_in_sprint_guard_hooks_match_generator_output(tmp_path, monkeypatch):
-    """The committed .claude/hooks/sprint_guard.{sh,ps1} must always be
-    byte-for-byte what _write_sprint_guard_hooks generates today for this
-    project's real baked id -- catches template/checked-in-file drift (the
-    exact a03c0eeb asymmetry this item fixes) the moment either side changes
-    without the other being regenerated to match."""
-    monkeypatch.delenv("MERIDIAN_URL", raising=False)  # checked-in files bake the default URL
-    real_hooks_dir = Path(handoff_module.__file__).parent.parent / ".claude" / "hooks"
-    checked_in_sh = real_hooks_dir / "sprint_guard.sh"
-    checked_in_ps1 = real_hooks_dir / "sprint_guard.ps1"
-    if not checked_in_sh.exists() or not checked_in_ps1.exists():
-        pytest.skip("no checked-in .claude/hooks/sprint_guard.{sh,ps1} in this checkout")
-
-    # Recover the baked project_id from the checked-in file rather than
-    # hardcoding it, so this test tracks whichever project this repo is
-    # currently wired to.
-    checked_in_sh_text = checked_in_sh.read_text(encoding="utf-8")
-    m = re.search(r'PROJECT_ID="([^"]+)"', checked_in_sh_text)
-    assert m, "could not recover PROJECT_ID from checked-in sprint_guard.sh"
-    project_id = m.group(1)
-
-    async def _run():
-        db = await db_module.init_db(":memory:")
-        await handoff_module._write_sprint_guard_hooks(db, project_id, root=tmp_path)
-
-    asyncio.run(_run())
-    generated_sh = (tmp_path / ".claude" / "hooks" / "sprint_guard.sh").read_text(encoding="utf-8")
-    generated_ps1 = (tmp_path / ".claude" / "hooks" / "sprint_guard.ps1").read_text(encoding="utf-8")
-    assert generated_sh == checked_in_sh_text
-    assert generated_ps1 == checked_in_ps1.read_text(encoding="utf-8")
 
 
 async def test_mcp_custom_hook_tools_add_get_delete(db):

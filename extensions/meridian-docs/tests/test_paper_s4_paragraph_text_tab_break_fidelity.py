@@ -20,18 +20,7 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-# <ci-fix> — `docparse` belongs to the separate, external ooxml-graph-paper
-# project (see module docstring); it is never installed alongside this repo's
-# own CI/pixi environment, only in a local dev checkout that also happens to
-# have that sibling project available. Guard the import so the cross-project
-# comparison runs opportunistically when present, without hard-crashing test
-# COLLECTION (not just this file) everywhere it isn't -- which is what an
-# unguarded import does, since a collection error in one file aborts the
-# whole pytest run.
-try:
-    from docparse.docs_intel import _paragraph_text as docparse_paragraph_text
-except ImportError:
-    docparse_paragraph_text = None
+from docparse.docs_intel import _paragraph_text as docparse_paragraph_text
 from meridian_docs._vendored_content_tree import _paragraph_text as vendored_paragraph_text
 
 _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
@@ -56,18 +45,11 @@ def _build_paragraph(*run_specs: list[tuple[str, str]]) -> ET.Element:
     return p
 
 
-# <ci-fix> — always include the real, in-repo vendored implementation; only
-# include the external docparse one when it's actually importable, so the
-# regression protection this repo cares about runs unconditionally while the
-# cross-project comparison is best-effort.
-_IMPLS = [vendored_paragraph_text]
-_IDS = ["meridian_docs._vendored_content_tree"]
-if docparse_paragraph_text is not None:
-    _IMPLS.insert(0, docparse_paragraph_text)
-    _IDS.insert(0, "docparse.docs_intel")
-
-
-@pytest.mark.parametrize("paragraph_text", _IMPLS, ids=_IDS)
+@pytest.mark.parametrize(
+    "paragraph_text",
+    [docparse_paragraph_text, vendored_paragraph_text],
+    ids=["docparse.docs_intel", "meridian_docs._vendored_content_tree"],
+)
 class TestParagraphTextTabBreakFidelity:
     def test_converts_tab_to_literal_tab_character(self, paragraph_text):
         p = _build_paragraph([("t", "(a)"), ("tab", ""), ("t", "there is text")])

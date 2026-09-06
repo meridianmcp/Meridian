@@ -7336,13 +7336,6 @@ verpending="$(printf '%s' "$resp" | grep -oE '"verification_pending_count"[[:spa
 if [ -n "$verpending" ] && [ "$verpending" -gt 0 ] 2>/dev/null; then
   echo "Meridian: $verpending item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet)." >&2
 fi
-# a03c0eeb - the moment the guard is about to let a stop through is the
-# natural post-integration point (this session has no pending sprint items
-# left): fire a best-effort real disk cleanup pass for this project's git
-# worktrees so items that already merged/finished don't leave orphaned
-# worktree dirs behind. Self-hosted only server-side (see worktree_cleanup.py
-# module docstring); fire-and-forget here, never blocks or fails the stop.
-curl -sf --max-time 5 -X POST "$MERIDIAN_URL/projects/$PROJECT_ID/worktrees/sweep" >/dev/null 2>&1 || true
 exit 0
 """
 
@@ -7383,15 +7376,6 @@ if ($r.stopped_at_ceiling -eq $true) {
 if ($null -ne $r.verification_pending_count -and [int]$r.verification_pending_count -gt 0) {
     [Console]::Error.WriteLine("Meridian: $([int]$r.verification_pending_count) item(s) require an independent fresh-session PASS/FAIL verification before their completion can stick (require_verification=true, no independent PASS on file yet).")
 }
-# a03c0eeb - the moment the guard is about to let a stop through is the
-# natural post-integration point (this session has no pending sprint items
-# left): fire a best-effort real disk cleanup pass for this project's git
-# worktrees so items that already merged/finished don't leave orphaned
-# worktree dirs behind. Self-hosted only server-side (see worktree_cleanup.py
-# module docstring); fire-and-forget here, never blocks or fails the stop.
-try {
-    Invoke-RestMethod -Method POST -Uri "$Url/projects/$ProjectId/worktrees/sweep" -TimeoutSec 5 | Out-Null
-} catch { }
 exit 0
 """
 
@@ -8944,128 +8928,6 @@ async def build_blocker_policy_for_handoff(
             db, project_id, version=version, items=pending_items,
         )
     except Exception:  # noqa: BLE001 — blocker policy is best-effort enrichment
-        return None
-
-
-async def build_board_context_state_for_handoff(
-    db: Any, project_id: str, *, version: "str | None" = None,
-) -> "dict[str, Any] | None":
-    """c6015316 — machine-readable signal distinguishing a genuinely-empty
-    project from one that has pinned decisions/notes but zero executable
-    sprint items ("context-only"), mirroring
-    :func:`build_effective_capability_contract`'s fully-guarded wrapper
-    style so this is emitted alongside every ``generate_handoff`` mode the
-    same way ``capability_contract``/``proposal_evidence``/``docx_integrity``
-    already are.
-
-    **The gap this closes:** ``mode="goal"`` (see
-    ``_generate_goal_only_handoff``) returns ONLY the bare ``/goal`` block —
-    by design it never fetches ``get_pinned_decisions``/``get_project_notes``
-    at all (those calls happen further down in ``generate_handoff``, on a
-    code path ``mode="goal"`` returns before reaching). When the pending-item
-    list is empty, ``_build_quick_start_goal`` renders the literal
-    ``<executor_directive>Verify remaining work is complete.</executor_directive>``
-    regardless of whether the project has substantial pinned decisions/notes
-    or genuinely nothing at all — the two cases were structurally
-    indistinguishable to any caller. This helper is the additive,
-    machine-readable fix: it does NOT touch ``quick_start_goal`` or any other
-    mode's rendered ``content`` (goal-mode byte-for-byte output is a fixed
-    test contract — see ``tests/test_682005f4_goal_only_handoff.py`` and
-    ``tests/test_cov_handoff.py``), it is a new sibling field each transport
-    splices into its own response dict, exactly like the fields listed above.
-
-    **Project-scoped only — no workspace/cross-project injection.** Uses
-    ``get_pinned_decisions``/``get_project_notes``/``get_sprint_items``, all
-    three filtered ``WHERE project_id = ?`` — never
-    ``get_workspace_decisions``/``get_workspace_notes``. This mirrors
-    ``generate_handoff``'s own ``mode == "full"`` gate on workspace-wide
-    records (see the comment above that gate: "a decision or note pinned for
-    a completely different project ... has no business in a bounded
-    continuation handoff") — the same reasoning applies here even more
-    strongly, since this field is emitted on EVERY mode including goal/
-    delta/starter/compact, not just the explicit archival ``full`` dump.
-
-    **Counts only, never bodies/prose.** ``get_project_notes`` is called with
-    the default ``bodies=False`` (id/slug/title/kind/priority/timestamps
-    only — see that function's own "pull model" docstring) and only
-    ``len()`` of each list is kept — no decision/note title or body text is
-    read into the returned dict. This makes it structurally impossible for
-    this field to leak decision/note prose into a goal-mode consumer, and
-    keeps the field's own byte size trivially bounded regardless of how many
-    decisions/notes a project accumulates.
-
-    ``version`` (optional) scopes the sprint-item counts to the same
-    effective-version bucket the caller's own ``generate_handoff`` call
-    used — pass the same ``_effective_version`` each transport already
-    resolves for its ``build_effective_capability_contract`` call so the two
-    agree. ``None`` (default) counts every version, matching
-    ``generate_handoff``'s own unscoped default.
-
-    Returns a dict with:
-      - ``state``: one of ``"empty"`` (zero pending/in_progress items AND
-        zero pinned decisions AND zero notes), ``"context_only"`` (zero
-        pending/in_progress items but at least one pinned decision or note
-        exists — there IS context here even though there is no executable
-        sprint work; this is the state this item introduces), or
-        ``"has_pending_items"`` (at least one pending or in_progress sprint
-        item exists, regardless of decisions/notes).
-      - ``pending_item_count``: count of ``todo``/``pending`` items (not yet
-        claimed).
-      - ``in_progress_item_count``: count of ``in_progress`` items (already
-        claimed by some session) — counted separately from
-        ``pending_item_count`` but folded into ``state`` the same way,
-        since an actively-claimed item means this project is not
-        context-only either.
-      - ``pinned_decision_count`` / ``note_count``: cheap project-scoped
-        counts (see above).
-      - ``hint``: a short pointer string, present only when
-        ``state == "context_only"``, naming ``mode="planner"``/
-        ``GET .../handoff/planner`` as where the actual decision/note
-        content can be read — never embedded in the goal text itself.
-
-    Returns ``None`` on any failure (missing project, DB error) — a
-    ``generate_handoff`` call must never break over this best-effort field,
-    same convention as every other ``build_*_for_handoff`` wrapper above.
-    """
-    try:
-        items = await db_module.get_sprint_items(
-            db, project_id, include_human=False, include_deferred=False,
-            version=version,
-        )
-        pending_item_count = sum(
-            1 for it in items if it.get("status") in ("todo", "pending")
-        )
-        in_progress_item_count = sum(
-            1 for it in items if it.get("status") == "in_progress"
-        )
-        pinned_decisions = await db_module.get_pinned_decisions(db, project_id)
-        # bodies=False — id/slug/title/kind/priority/timestamps only; only
-        # len() is used below, so no note body/title text is ever read here.
-        project_notes = await db_module.get_project_notes(db, project_id, bodies=False)
-        pinned_decision_count = len(pinned_decisions)
-        note_count = len(project_notes)
-        if pending_item_count > 0 or in_progress_item_count > 0:
-            state = "has_pending_items"
-        elif pinned_decision_count > 0 or note_count > 0:
-            state = "context_only"
-        else:
-            state = "empty"
-        result: dict[str, Any] = {
-            "state": state,
-            "pending_item_count": pending_item_count,
-            "in_progress_item_count": in_progress_item_count,
-            "pinned_decision_count": pinned_decision_count,
-            "note_count": note_count,
-        }
-        if state == "context_only":
-            result["hint"] = (
-                "No executable sprint items, but this project has pinned "
-                "decisions and/or notes. Call generate_handoff(mode='planner') "
-                "or GET /projects/{project_id}/handoff/planner for bounded "
-                "decision/note context — do not treat this as nothing to do."
-            )
-        return result
-    except Exception:  # noqa: BLE001 — board context state is best-effort
         return None
 
 
