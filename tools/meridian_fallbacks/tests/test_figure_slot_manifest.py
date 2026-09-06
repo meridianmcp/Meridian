@@ -202,6 +202,41 @@ class TestManifestContradictoryUnknownSlot:
 
 
 # ---------------------------------------------------------------------------
+# 5b. MANIFEST_CONTRADICTORY -- the defensive count-mismatch fallback,
+#     reached via a duplicate id WITHIN expected_slot_ids itself (not a
+#     duplicate classification). d44e7692 (5cc3d745 follow-up): this used to
+#     be undertested and its docstring wrongly called it "mathematically
+#     unreachable" -- it is reachable, and this is the fixture that reaches
+#     it. See reconcile_slot_manifest's own docstring for the full trace.
+# ---------------------------------------------------------------------------
+
+class TestManifestContradictoryDuplicateExpectedId:
+    def test_duplicate_id_in_expected_slot_ids_hits_count_mismatch_fallback(self):
+        result = reconcile_slot_manifest(
+            ["fig-1", "fig-1", "fig-2"],
+            promoted=[_entry("fig-1")],
+            held=[_entry("fig-2", reason="pending review")],
+        )
+        assert result["verdict"] == MANIFEST_CONTRADICTORY
+        # Every distinct expected id was classified exactly once, so none of
+        # the OTHER three contradiction checks fire -- confirms this is
+        # reached via the defensive raw-count fallback, not
+        # duplicate_assignments/unknown_slot_ids/unclassified_slot_ids.
+        assert result["duplicate_assignments"] == {}
+        assert result["unknown_slot_ids"] == []
+        assert result["unclassified_slot_ids"] == []
+        assert result["structural_errors"] == []
+        assert result["counts"] == {
+            "expected_total": 3,
+            "classified_total": 2,
+            "counts_match": False,
+        }
+        assert any(
+            "does not match the expected slot" in r for r in result["reasons"]
+        )
+
+
+# ---------------------------------------------------------------------------
 # 6. JSON round-tripping.
 # ---------------------------------------------------------------------------
 

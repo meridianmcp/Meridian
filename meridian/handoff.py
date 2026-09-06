@@ -47,6 +47,7 @@ from . import executor_contract as executor_contract_module
 from . import hook_paths as hook_paths_module
 from . import pointers as pointers_module
 from . import profile_contract as profile_contract_module
+from . import slot_manifest_receipt as slot_manifest_receipt_module
 from . import test_run_receipt as test_run_receipt_module
 from . import tool_discovery as tool_discovery_module
 from . import tool_requirements as tool_requirements_module
@@ -9295,6 +9296,105 @@ async def build_promotion_readiness_for_handoff(
 
 
 # ---------------------------------------------------------------------------
+# d44e7692 (5cc3d745 follow-up) — figure-slot-manifest reconciliation
+# readiness for generate_handoff. Sibling to build_promotion_readiness_for_
+# handoff directly above, but a RECEIPT LOOKUP (meridian.slot_manifest_
+# receipt.find_recent_slot_manifest_receipt, backed by action_audit_log) —
+# not a live filesystem/hash check — so this needs no output_dir.
+#
+# KNOWN LIMITATIONS (documented honestly, matching promotion_readiness's own
+# posture above rather than silently claiming full coverage):
+#   * There is, as of this function's introduction, no production call site
+#     that actually writes a receipt after a real reconcile_slot_manifest()
+#     run — tools.meridian_fallbacks.figure_slot_manifest.
+#     reconcile_slot_manifest / transactional_merge.promote() have zero
+#     callers anywhere in meridian/ or any MCP tool today. Until a producer
+#     is wired, every checked item will correctly report has_receipt=False —
+#     an honest "nothing recorded yet" signal, not a false positive.
+#   * Unlike promotion_readiness (gated on a declared
+#     planned_output.promotion.base_sha256 field), there is no equivalent
+#     declared field this check can filter on — extending
+#     meridian.artifact_declaration's hard-validated field allowlists for a
+#     post-hoc RESULT/receipt (as opposed to every existing field there,
+#     which is a pre-execution declaration/plan) was deliberately avoided.
+#     So this checks every pending item passed to it, up to
+#     max_checked_items, rather than pre-filtering to "items that declared
+#     slot-manifest work".
+#   * Only reachable from mode in {"full", "delta"} (see generate_handoff's
+#     own slot_manifest_readiness docstring) — the starter/compact/goal
+#     paths return before pending_sprint_items reaches its final form and
+#     are NOT wired to this function in this pass, mirroring
+#     promotion_readiness's own scope exactly.
+#   * Not (yet) threaded through mcp/handler.py, mcp/stdio_handler.py, or
+#     routes/handoff.py — same gap promotion_readiness itself already has
+#     (verified by reading all three call sites); a direct/programmatic
+#     caller of generate_handoff sees this signal, a transport-mediated
+#     MCP/HTTP caller does not, yet.
+# ---------------------------------------------------------------------------
+
+async def build_slot_manifest_readiness_for_handoff(
+    db: Any,
+    project_id: str,
+    pending_items: "list[dict[str, Any]] | None",
+    *,
+    max_checked_items: int = 20,
+) -> dict[str, Any]:
+    """d44e7692 — best-effort figure-slot-manifest reconciliation readiness
+    for a handoff.
+
+    For every pending item (up to ``max_checked_items``), looks up the most
+    recent slot-manifest reconciliation receipt recorded for that item via
+    :func:`meridian.slot_manifest_receipt.find_recent_slot_manifest_receipt`,
+    scoped to receipts recorded no earlier than the item's own ``claimed_at``
+    (a receipt from a stale, earlier pass at the item does not count as
+    evidence for the CURRENT claim — same freshness contract
+    ``code_intel_receipt`` uses). Returns ``{"checked": [...],
+    "unresolved_count": int}`` where each ``checked`` entry is
+    ``{"item_id", "has_receipt": bool, "verdict": str | None}`` — ``verdict``
+    is the receipt's recorded ``MANIFEST_COMPLETE``/``MANIFEST_INCOMPLETE``/
+    ``MANIFEST_CONTRADICTORY`` string when a receipt was found, else
+    ``None``. ``unresolved_count`` counts entries with ``has_receipt`` False
+    OR a non-``MANIFEST_COMPLETE`` verdict — a recorded-but-incomplete/
+    contradictory reconciliation is exactly as "not ready" as no receipt at
+    all.
+
+    Bounded to ``max_checked_items`` (mirrors ``build_promotion_readiness_
+    for_handoff``'s own discipline) so a large board never turns this
+    best-effort enrichment into dozens of DB lookups. Never raises — an
+    individual item's lookup failure is skipped, not fatal to the whole
+    result; the caller (``generate_handoff``) wraps this in its own
+    try/except regardless, matching every other best-effort field here.
+    """
+    # Deferred import, mirroring artifact_declaration.py's own precedent for
+    # reaching into tools/meridian_fallbacks (see its compute_base_sha256) —
+    # meridian/ depends on this CLI-fallback package only for its public
+    # constant here, never the reverse.
+    from tools.meridian_fallbacks.figure_slot_manifest import (  # noqa: PLC0415
+        MANIFEST_COMPLETE,
+    )
+
+    checked: list[dict[str, Any]] = []
+    unresolved = 0
+    for item in (pending_items or [])[:max_checked_items]:
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        item_id = item["id"]
+        try:
+            receipt = await slot_manifest_receipt_module.find_recent_slot_manifest_receipt(
+                db, project_id=project_id, item_id=item_id,
+                since=item.get("claimed_at"),
+            )
+        except Exception:  # noqa: BLE001 — one item's lookup failure skips just that item
+            continue
+        verdict = slot_manifest_receipt_module.receipt_verdict(receipt)
+        entry = {"item_id": item_id, "has_receipt": receipt is not None, "verdict": verdict}
+        checked.append(entry)
+        if receipt is None or verdict != MANIFEST_COMPLETE:
+            unresolved += 1
+    return {"checked": checked, "unresolved_count": unresolved}
+
+
+# ---------------------------------------------------------------------------
 # 8a883f60 — explicit, machine-readable outcome for every best-effort step
 # generate_handoff runs: code-pointer enrichment, resolved-pointer annotation,
 # freshness re-query, wave-gate exclusion, graph-search availability.
@@ -11119,6 +11219,7 @@ async def generate_handoff(
     selected_item_ids: list[str] | None = None,
     selected_scope_outcome: "dict[str, Any] | None" = None,
     promotion_readiness: dict[str, Any] | None = None,
+    slot_manifest_readiness: dict[str, Any] | None = None,
     strict_test_evidence: bool = False,
     test_run_evidence: dict[str, Any] | None = None,
     test_run_repo_root: "str | None" = None,
@@ -11485,6 +11586,29 @@ async def generate_handoff(
     leave the passed dict untouched (documented gap, not silent — see the
     module's own KNOWN LIMITATIONS note near ``build_promotion_readiness_for_handoff``).
 
+    ``slot_manifest_readiness`` (d44e7692, 5cc3d745 follow-up) — optional
+    output dict, SAME purely-additive out-param shape as
+    ``promotion_readiness`` directly above, but a durable-RECEIPT lookup
+    rather than a live filesystem/hash check: when given (any dict,
+    typically ``{}``), it is populated in place with ``{"checked": [...],
+    "unresolved_count": int}`` via :func:`build_slot_manifest_readiness_
+    for_handoff` — one entry per pending item, each
+    ``{"item_id", "has_receipt": bool, "verdict": str | None}`` describing
+    whether a :func:`meridian.slot_manifest_receipt.
+    find_recent_slot_manifest_receipt` lookup found a figure-slot-manifest
+    reconciliation receipt recorded for that item since it was claimed, and
+    what verdict (``MANIFEST_COMPLETE``/``MANIFEST_INCOMPLETE``/
+    ``MANIFEST_CONTRADICTORY``) it recorded. A caller that passes ``None``
+    (the default — every pre-existing call site) sees ZERO functional
+    change to the returned ``(path, content, amended)`` or to ``content``
+    itself. Best-effort and fully guarded: any failure degrades to an empty
+    ``checked`` list, never breaks the mandatory handoff. Only populated for
+    ``mode in {"full", "delta"}``, same scope as ``promotion_readiness`` —
+    see the module's own KNOWN LIMITATIONS note near
+    ``build_slot_manifest_readiness_for_handoff`` for the documented gaps
+    (no production receipt-writer wired yet; not threaded through the MCP/
+    HTTP transports).
+
     ``research_evidence_envelope`` (0ea8fd3c) — optional, ``None`` by
     default. A caller-supplied typed research-evidence provenance envelope
     (see ``extensions/meridian-outputs/meridian_outputs/research_evidence
@@ -11817,6 +11941,23 @@ async def generate_handoff(
         except Exception:  # noqa: BLE001 — promotion readiness is best-effort
             promotion_readiness.clear()
             promotion_readiness.update({"checked": [], "unresolved_count": 0, "error": "promotion_readiness_failed"})
+    # d44e7692 (5cc3d745 follow-up) — best-effort figure-slot-manifest
+    # reconciliation-receipt readiness, purely additive (see
+    # slot_manifest_readiness's own docstring above). Same placement/guard
+    # shape as promotion_readiness directly above — full/delta only, first
+    # point pending_sprint_items is the final, force-include-resolved list.
+    if slot_manifest_readiness is not None:
+        try:
+            _slot_manifest = await build_slot_manifest_readiness_for_handoff(
+                db, project_id, pending_sprint_items,
+            )
+            slot_manifest_readiness.clear()
+            slot_manifest_readiness.update(_slot_manifest)
+        except Exception:  # noqa: BLE001 — slot-manifest readiness is best-effort
+            slot_manifest_readiness.clear()
+            slot_manifest_readiness.update(
+                {"checked": [], "unresolved_count": 0, "error": "slot_manifest_readiness_failed"}
+            )
     # Flag items that may already be done based on recent task descriptions or commits
     pending_sprint_items = _annotate_possibly_done(pending_sprint_items, tasks, commit_messages)
     # Auto-set touches_files from recent git history for items without it.

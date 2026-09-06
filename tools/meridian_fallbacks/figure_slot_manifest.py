@@ -265,12 +265,22 @@ def reconcile_slot_manifest(
          classification in any bucket (``unclassified_slot_ids``).
       3. :data:`MANIFEST_CONTRADICTORY` (defensive fallback) -- the raw
          count of bucket entries does not equal ``len(expected_slot_ids)``
-         even though none of the specific checks above explains why. Given a
-         clean manifest this is mathematically unreachable (each valid,
-         uniquely-owned, known slot accounts for exactly one entry), so
-         hitting it means an inconsistency this function's own logic did not
-         anticipate -- failing closed rather than reporting COMPLETE on an
-         unexplained mismatch.
+         even though none of the specific checks above explains why. This is
+         REACHABLE, not merely theoretical: it fires whenever
+         ``expected_slot_ids`` itself contains a duplicate id (e.g.
+         ``["fig-1", "fig-1", "fig-2"]``) and every DISTINCT id is otherwise
+         classified exactly once. That manifest has no unclassified slot
+         (every distinct expected id got exactly one classification), no
+         duplicate assignment (no ``slot_id`` appears more than once across
+         the accepted classifications), and no unknown slot -- so none of
+         the specific checks above fires -- yet ``expected`` (built via
+         ``list(expected_slot_ids)``, which never dedupes its input) is
+         longer than the number of distinct ids actually classified, so the
+         raw entry count no longer equals ``len(expected)``. Hitting this
+         fallback therefore means either that specific "duplicate in the
+         expected list" shape, or some other inconsistency this function's
+         own logic did not anticipate -- either way, failing closed rather
+         than reporting COMPLETE on an unexplained mismatch is correct.
       4. :data:`MANIFEST_COMPLETE` -- every expected slot is classified
          exactly once, every entry is well-formed, and no unknown slot
          appears in any bucket.
