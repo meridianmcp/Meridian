@@ -5231,6 +5231,22 @@ async def _handle_planning_tools(
                 row["version"] = it.get("version")
             return row
 
+        # e6f58c25 — carry the evidence-staleness flag (set by
+        # db_module.list_hitl_requests) through this brief's own re-projection.
+        # Without this, the flag/note computed above is silently dropped here —
+        # the one place a DB-only fix would not actually reach this tool's output.
+        def _brief_hitl_row(h: dict[str, Any]) -> dict[str, Any]:
+            row = {
+                "id": h.get("id"),
+                "question": (h.get("question") or "")[:120],
+                "urgency": h.get("urgency"),
+            }
+            if "evidence_may_be_stale" in h:
+                row["evidence_may_be_stale"] = h.get("evidence_may_be_stale")
+            if h.get("evidence_staleness_note"):
+                row["evidence_staleness_note"] = h.get("evidence_staleness_note")
+            return row
+
         return {
             "project_id": project_id,
             "project_name": project.get("name"),
@@ -5264,12 +5280,7 @@ async def _handle_planning_tools(
             "new_handoff_available": new_handoff_available,
             "handoff_signal": handoff_signal,
             "pending_hitls": [
-                {
-                    "id": h.get("id"),
-                    "question": (h.get("question") or "")[:120],
-                    "urgency": h.get("urgency"),
-                }
-                for h in (hitls if isinstance(hitls, list) else [])[:5]
+                _brief_hitl_row(h) for h in (hitls if isinstance(hitls, list) else [])[:5]
             ],
         }
     if name == "refresh_context":

@@ -9868,6 +9868,187 @@ async def test_get_hitl_request_returns_none_for_unknown(db):
     assert result is None
 
 
+# ---------------------------------------------------------------------------
+# e6f58c25 — HITL evidence-staleness detection/flagging
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("question,context", [
+    ("Re-verify: head e6d45334 still failing?", None),
+    ("Is the CI run still green?", None),
+    ("Build is green since 2026-09-03 23:13Z, ok to proceed?", None),
+    ("Any red streak on dev since the last deploy?", None),
+    (None, "Deployed to prod at 2026-08-30, committed 62a3a6c"),
+    ("Should we trust the workflow run from yesterday?", None),
+])
+def test_detect_checkable_hitl_evidence_positive_cases(question, context):
+    """Mirrors the real 04be5832 phrasing ('head <sha>') plus other CI/
+    timestamp-shaped claims that make a HITL's premise time-sensitive."""
+    result = db_module._detect_checkable_hitl_evidence(question, context)
+    assert result is not None, f"expected evidence detected for {question!r}/{context!r}"
+
+
+@pytest.mark.parametrize("question,context", [
+    ("Should we rename this field?", None),
+    ("Do we prefer snake_case or camelCase for the new API?", None),
+    ("", None),
+    (None, None),
+    ("What color should the button be?", "no strong opinion either way"),
+])
+def test_detect_checkable_hitl_evidence_negative_cases(question, context):
+    """Purely subjective HITLs must not be flagged as carrying checkable evidence."""
+    assert db_module._detect_checkable_hitl_evidence(question, context) is None
+
+
+def test_parse_hitl_created_at_handles_both_backend_formats():
+    """SQLite's created_at omits microseconds; Postgres's clock_timestamp()-based
+    default includes them — age computation must not silently degrade to
+    'unknown age' on either backend's format."""
+    sqlite_style = db_module._parse_hitl_created_at("2026-09-01 12:00:00")
+    pg_style = db_module._parse_hitl_created_at("2026-09-01 12:00:00.123456")
+    assert sqlite_style is not None and sqlite_style.hour == 12
+    assert pg_style is not None and pg_style.microsecond == 123456
+    assert db_module._parse_hitl_created_at(None) is None
+    assert db_module._parse_hitl_created_at("not-a-timestamp") is None
+
+
+async def _backdate_hitl(db, hitl_id, hours):
+    from datetime import datetime, timedelta
+
+    old_ts = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    await db.execute(
+        "UPDATE hitl_requests SET created_at = ? WHERE id = ?", (old_ts, hitl_id)
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_list_hitl_requests_flags_stale_evidence(db):
+    """A pending HITL citing checkable evidence, backdated past the staleness
+    threshold, is flagged with evidence_may_be_stale + an explanatory note."""
+    p = await db_module.create_project(db, "hitl-stale-evidence")
+    h = await db_module.request_hitl(
+        db, p["id"], "Re-verified: head e6d45334 still failing on CI?"
+    )
+    await _backdate_hitl(db, h["id"], 48)
+
+    rows = await db_module.list_hitl_requests(db, p["id"], status="pending")
+    assert len(rows) == 1
+    assert rows[0]["evidence_may_be_stale"] is True
+    assert "evidence_staleness_note" in rows[0]
+    # Existing fields/values are untouched by the new annotation.
+    assert rows[0]["status"] == "pending"
+    assert rows[0]["answer"] is None
+    assert rows[0]["question"] == "Re-verified: head e6d45334 still failing on CI?"
+
+
+@pytest.mark.asyncio
+async def test_list_hitl_requests_fresh_evidence_not_flagged_stale(db):
+    """A freshly-filed pending HITL with the same evidence text is not stale."""
+    p = await db_module.create_project(db, "hitl-fresh-evidence")
+    await db_module.request_hitl(
+        db, p["id"], "Re-verified: head e6d45334 still failing on CI?"
+    )
+    rows = await db_module.list_hitl_requests(db, p["id"], status="pending")
+    assert len(rows) == 1
+    # Contract allows either an explicit False or the key being absent.
+    assert rows[0].get("evidence_may_be_stale", False) is False
+    assert "evidence_staleness_note" not in rows[0]
+
+
+@pytest.mark.asyncio
+async def test_hitl_evidence_staleness_scoped_to_pending_only(db):
+    """An answered HITL with the same stale evidence text is never annotated —
+    staleness detection is pending-only by design (a human already acted)."""
+    p = await db_module.create_project(db, "hitl-answered-evidence")
+    h = await db_module.request_hitl(
+        db, p["id"], "Re-verified: head e6d45334 still failing on CI?"
+    )
+    await _backdate_hitl(db, h["id"], 48)
+    await db_module.answer_hitl_request(
+        db, h["id"], "Re-verified, CI is green now.", answered_by="adam"
+    )
+
+    answered = await db_module.list_hitl_requests(db, p["id"], status="answered")
+    assert len(answered) == 1
+    assert "evidence_may_be_stale" not in answered[0]
+    assert "evidence_staleness_note" not in answered[0]
+
+    fetched = await db_module.get_hitl_request(db, h["id"])
+    assert fetched["status"] == "answered"
+    assert "evidence_may_be_stale" not in fetched
+    assert "evidence_staleness_note" not in fetched
+
+
+@pytest.mark.asyncio
+async def test_get_hitl_request_flags_stale_evidence(db):
+    """get_hitl_request (single-row path) applies the same annotation."""
+    p = await db_module.create_project(db, "hitl-single-stale")
+    h = await db_module.request_hitl(
+        db, p["id"], "CI run green since 2026-09-03 23:13Z, still true?"
+    )
+    await _backdate_hitl(db, h["id"], 30)
+
+    fetched = await db_module.get_hitl_request(db, h["id"])
+    assert fetched["evidence_may_be_stale"] is True
+    assert "evidence_staleness_note" in fetched
+
+
+@pytest.mark.asyncio
+async def test_get_planning_brief_carries_evidence_staleness_flag(db):
+    """e6f58c25 — get_planning_brief's pending_hitls re-projection must not
+    silently drop the evidence-staleness flag/note computed by
+    list_hitl_requests (the one behavior a DB-only fix would miss)."""
+    import meridian.server as srv
+
+    p = await db_module.create_project(db, "hitl-brief-stale")
+    h = await db_module.request_hitl(
+        db, p["id"], "Deploy to Fly.io green since 2026-09-04 00:48Z, still holds?"
+    )
+    await _backdate_hitl(db, h["id"], 72)
+
+    res = await srv._dispatch_mcp_tool(
+        "get_planning_brief", {"project_id": p["id"]}, db, "/tmp"
+    )
+    matches = [row for row in res["pending_hitls"] if row["id"] == h["id"]]
+    assert len(matches) == 1
+    assert matches[0]["evidence_may_be_stale"] is True
+    assert "evidence_staleness_note" in matches[0]
+    # Existing shape (id/question truncation/urgency) is unchanged.
+    assert matches[0]["question"] == h["question"][:120]
+    assert "urgency" in matches[0]
+
+
+@pytest.mark.asyncio
+async def test_hitl_evidence_staleness_never_makes_network_calls(db, monkeypatch):
+    """Guard: evidence detection is a pure text heuristic — list_hitl_requests,
+    get_hitl_request, and get_planning_brief must never touch the network even
+    when stale checkable evidence is present, per the item's bounded/
+    best-effort requirement."""
+    import meridian.server as srv
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("httpx.AsyncClient must not be constructed from a HITL read path")
+
+    monkeypatch.setattr("httpx.AsyncClient", _boom)
+
+    p = await db_module.create_project(db, "hitl-no-network")
+    h = await db_module.request_hitl(
+        db, p["id"], "head e6d45334 CI run still red, re-check?"
+    )
+    await _backdate_hitl(db, h["id"], 48)
+
+    rows = await db_module.list_hitl_requests(db, p["id"], status="pending")
+    assert rows[0]["evidence_may_be_stale"] is True
+
+    fetched = await db_module.get_hitl_request(db, h["id"])
+    assert fetched["evidence_may_be_stale"] is True
+
+    res = await srv._dispatch_mcp_tool(
+        "get_planning_brief", {"project_id": p["id"]}, db, "/tmp"
+    )
+    assert res["pending_hitls"][0]["evidence_may_be_stale"] is True
+
+
 def test_hitl_rest_lifecycle(client):
     """POST/GET/PATCH /hitl routes create, fetch, answer, and dismiss."""
     proj = client.post("/projects", json={"name": "hitl-rest"}).json()

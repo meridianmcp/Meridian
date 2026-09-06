@@ -9010,6 +9010,119 @@ async def delete_pinned_decision(
 _VALID_HITL_URGENCY = {"normal", "high", "blocking"}
 _VALID_HITL_STATUS = {"pending", "answered", "dismissed"}
 
+# e6f58c25 — a PENDING HITL whose question/context embeds evidence that can
+# go stale (a commit SHA, a CI/workflow-run claim, an explicit timestamp) is
+# flagged once it has been open this long, mirroring PENDING_GOAL_STALE_HOURS'
+# style: age-only, advisory, never a network check.
+HITL_EVIDENCE_STALE_HOURS: int = 24
+
+# CI/workflow-run/timestamp phrasing that makes a HITL's premise time-sensitive,
+# beyond the commit-SHA case github_ci.extract_commit_sha already covers. This
+# is deliberately a SEPARATE, local pattern rather than widening github_ci's own
+# shared regex, so the production-gating complete_sprint_item CI check (which
+# reuses that regex) is never touched by this read-path-only feature. Includes
+# "head <sha>" because github_ci's keyword anchor list (commit(ted)?|sha|main|@)
+# does not match "head" — the real motivating HITL (04be5832) phrased it that way.
+_HITL_EVIDENCE_KEYWORDS_RE = re.compile(
+    r"\b(?:ci|ci run|workflow run|github action|check-?run|pipeline|"
+    r"build(?:s)?(?:\s+(?:is|was|are|were))?\s+green|green since|red streak|"
+    r"test(?:s)?\s+(?:pass|passing|green)|deploy(?:ed|ment)?\s+to|"
+    r"head\s+[0-9a-f]{7,40})\b",
+    re.IGNORECASE,
+)
+# An explicit ISO-ish date (2026-09-03) or a bare HH:MM[:SS]Z time — evidence
+# that names a specific moment, which staleness detection can reason about.
+_HITL_EVIDENCE_TIMESTAMP_RE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}\b|\b\d{2}:\d{2}(?::\d{2})?Z\b"
+)
+
+
+def _detect_checkable_hitl_evidence(
+    question: str | None, context: str | None
+) -> dict[str, Any] | None:
+    """Heuristically detect externally-checkable evidence embedded in a HITL's
+    text — a commit SHA, a CI/workflow-run claim, or an explicit timestamp —
+    whose truth can drift after the request was filed.
+
+    Returns ``None`` when nothing checkable is present (e.g. a purely
+    subjective "should we rename this field?"), otherwise a dict with
+    ``sha`` (str | None), ``ci_mentioned`` (bool), ``timestamp_mentioned``
+    (bool). This is a TEXT heuristic only — it never makes a network call
+    and never confirms anything actually changed, only that the request
+    cites something time-sensitive worth a human re-checking.
+    """
+    combined = " ".join(t for t in (question, context) if t)
+    if not combined:
+        return None
+    from .. import github_ci  # noqa: PLC0415 — local import, mirrors handler.py's pattern
+
+    sha = github_ci.extract_commit_sha(combined)
+    ci_mentioned = bool(_HITL_EVIDENCE_KEYWORDS_RE.search(combined))
+    timestamp_mentioned = bool(_HITL_EVIDENCE_TIMESTAMP_RE.search(combined))
+    if not (sha or ci_mentioned or timestamp_mentioned):
+        return None
+    return {"sha": sha, "ci_mentioned": ci_mentioned, "timestamp_mentioned": timestamp_mentioned}
+
+
+def _parse_hitl_created_at(value: str | None) -> _dt.datetime | None:
+    """Parse ``hitl_requests.created_at`` from either backend.
+
+    SQLite's ``datetime('now')`` omits microseconds
+    (``YYYY-MM-DD HH:MM:SS``); Postgres's ``clock_timestamp()``-based
+    default includes them (``YYYY-MM-DD HH:MM:SS.ffffff``). Returns ``None``
+    (unknown age — never guess) for anything that matches neither.
+    """
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return _dt.datetime.strptime(value, fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _annotate_hitl_evidence_staleness(row: dict[str, Any]) -> None:
+    """Mutate ``row`` in place: attach ``evidence_may_be_stale`` (bool) — and,
+    only when it is ``True``, ``evidence_staleness_note`` — for a PENDING HITL
+    whose text embeds checkable evidence (see ``_detect_checkable_hitl_evidence``).
+
+    Scope is pending-only by design (e6f58c25): an answered/dismissed HITL's
+    evidence staleness is moot since a human already acted on it. Rows with no
+    checkable evidence, or with unparseable/missing ``created_at``, are left
+    untouched (no new keys) — this never changes an existing key's name, value,
+    or type. This is age-only: it flags that the premise MAY have drifted since
+    filing, it does NOT confirm anything actually changed (no CI/git call is
+    ever made here — see github_ci.py's own must-never-block-on-network stance).
+    """
+    if row.get("status") != "pending":
+        return
+    evidence = _detect_checkable_hitl_evidence(row.get("question"), row.get("context"))
+    if evidence is None:
+        return
+    created = _parse_hitl_created_at(row.get("created_at"))
+    if created is None:
+        return
+    age_hours = (_dt.datetime.utcnow() - created).total_seconds() / 3600.0
+    stale = age_hours >= HITL_EVIDENCE_STALE_HOURS
+    row["evidence_may_be_stale"] = stale
+    if not stale:
+        return
+    what = []
+    if evidence["sha"]:
+        what.append(f"commit {evidence['sha']}")
+    if evidence["ci_mentioned"]:
+        what.append("a CI/workflow-run claim")
+    if evidence["timestamp_mentioned"]:
+        what.append("an explicit timestamp")
+    cited = ", ".join(what) if what else "time-sensitive evidence"
+    row["evidence_staleness_note"] = (
+        f"This request cites {cited} and has been open {age_hours:.1f}h "
+        f"(>= {HITL_EVIDENCE_STALE_HOURS}h) — this is an age check only, not "
+        "confirmation that anything actually changed. Re-verify before trusting "
+        "it at face value."
+    )
+
 
 async def request_hitl(
     db: aiosqlite.Connection,
@@ -9215,7 +9328,10 @@ async def get_hitl_request(
         "SELECT * FROM hitl_requests WHERE id = ?", (request_id,)
     ) as cur:
         row = await cur.fetchone()
-    return _row_to_dict(row)
+    result = _row_to_dict(row)
+    if result is not None:
+        _annotate_hitl_evidence_staleness(result)
+    return result
 
 
 async def list_hitl_requests(
@@ -9254,7 +9370,10 @@ async def list_hitl_requests(
         )
         async with db.execute(sql, args) as cur:
             rows = await cur.fetchall()
-        return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+        results = [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+        for _r in results:
+            _annotate_hitl_evidence_staleness(_r)  # type: ignore[arg-type]
+        return results
     if status is not None and status not in _VALID_HITL_STATUS:
         raise ValueError(
             f"status must be one of {sorted(_VALID_HITL_STATUS)} or None"
@@ -9277,7 +9396,10 @@ async def list_hitl_requests(
     )
     async with db.execute(sql, args2) as cur:
         rows = await cur.fetchall()
-    return [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+    results = [_row_to_dict(r) for r in rows if r is not None]  # type: ignore[misc]
+    for _r in results:
+        _annotate_hitl_evidence_staleness(_r)  # type: ignore[arg-type]
+    return results
 
 
 async def answer_hitl_request(
