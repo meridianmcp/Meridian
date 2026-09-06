@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "meridian-file-inspection"
+description = "Standalone local MCP server for a tunnel-independent, bounded single-file XML/JSON/CSV/XLSX inspector. Runs fully locally against one file, no hosted call, no tunnel/Serena dependency."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Adam Camerer" }]
+keywords = ["mcp", "inspector", "xml", "json", "csv", "xlsx", "duckdb", "xxe", "security"]
+version = "0.1.0"
+dependencies = [
+    # 2ffd763d -- previously >=1.0 with no upper bound elsewhere in this repo's
+    # extensions resolved mcp==2.0.0, which removed `mcp.server.fastmcp` (see
+    # extensions/meridian-outputs/pyproject.toml's identical pin + rationale).
+    # Pinned below the v2 major for the same reason.
+    "mcp>=1.27,<2",
+    # 2ffd763d -- lxml is used ONLY for its secure, explicitly-configured
+    # XMLParser (resolve_entities=False, no_network=True, load_dtd=False,
+    # dtd_validation=False, huge_tree=False) -- never for XSLT/XInclude, which
+    # this package never invokes. Deliberately NOT `defusedxml`: lxml is
+    # already a direct dependency of the core `meridian` pixi env AND of
+    # extensions/meridian-docs, so reusing it here adds zero new dependency
+    # surface to the project as a whole (defusedxml is only ever a transitive,
+    # not-guaranteed-installed dependency of fpdf2 -- verified against
+    # pixi.lock before choosing this path; see xml_safe.py's module docstring
+    # for the full hardening rationale).
+    "lxml>=5.0",
+    # 28ef2710 (LOCAL-FILE-INSPECTION-TABULAR, Wave 1) -- bounded CSV/JSON/
+    # XLSX tabular shape inspection via DuckDB (see tabular.py's module
+    # docstring for the full rationale). duckdb>=1.0 is ALREADY a direct
+    # dependency of the root `meridian` pixi environment (resolved to 1.5.4
+    # in the root pixi.lock, used by meridian/outputs_indexer.py) -- this
+    # adds ZERO new dependency surface to the project as a whole, exactly
+    # the same reasoning already applied to `lxml` above. It IS new to this
+    # standalone package's own pyproject.toml, though (this package
+    # previously declared only mcp+lxml), so a `uvx --from` install of just
+    # this package now also pulls duckdb. No Polars/fastexcel/Calamine are
+    # added anywhere -- DuckDB's native .xlsx path (the "excel" core
+    # extension, loaded on demand -- see tabular.py's
+    # _ensure_excel_extension) was verified sufficient for schema/sample/
+    # row-count inspection during this item's investigation; Calamine/
+    # fastexcel remain unused pending a real xls/xlsb/ods benchmark corpus
+    # per the design doc's Wave 1 scope.
+    "duckdb>=1.0",
+]
+
+[project.scripts]
+# Entry point is "meridian-file-inspection-mcp" (NOT "meridian-file-inspection")
+# to avoid the same uvx name-collision bug documented in
+# extensions/meridian-outputs/pyproject.toml.
+meridian-file-inspection-mcp = "meridian_file_inspection.server:main"
+
+[project.urls]
+Homepage = "https://usemeridian.us"
+Source = "https://github.com/meridianmcp/meridian"
+
+[tool.hatch.build.targets.wheel]
+packages = ["meridian_file_inspection"]

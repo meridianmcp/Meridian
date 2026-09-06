@@ -72,6 +72,7 @@ _TOOL_EXAMPLES: dict[str, str] = {
     "add_workspace_note": 'add_workspace_note(title="Onboarding", body="All repos use pixi", tags="setup")',
     "get_workspace_notes": 'get_workspace_notes(tag="setup")',
     "add_workspace_proposal": 'add_workspace_proposal(title="IDEA: expose auth as plugin", body="Could ship auth as a separate optional plugin so self-hosters can swap it out", tags="arch")',
+    "add_proposal": 'add_proposal(project_id="proj-uuid", title="Cache the parser output", body="Re-parsing on every call is slow; memoize by content hash", tags="perf")',
     "get_workspace_proposals": 'get_workspace_proposals(status="investigating")',
     "advance_proposal_status": 'advance_proposal_status(proposal_id="prop-uuid", status="investigating")',
     "promote_proposal": 'promote_proposal(proposal_id="prop-uuid", project_id="proj-uuid", sprint_item_title="Expose auth as plugin")',
@@ -1999,19 +2000,48 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
          "body": {"type": "string", "description": "Full description of the insight or idea."},
          "tags": {"type": "string", "description": "Optional comma-separated tags."}},
          "required": ["title", "body"]}},
+    {"name": "add_proposal", "description":
+        "Capture an idea into a proposal — PROJECT-SCOPED BY DEFAULT (a8afd8f9). This is the "
+        "preferred entry point going forward; add_workspace_proposal remains available as the "
+        "explicit workspace-global opt-in for cross-project ideas. Pass project_id (or "
+        "project_name) to scope the proposal to that project, XOR pass scope='workspace' to "
+        "explicitly opt into a workspace-global proposal instead — an ambiguous call (neither, "
+        "or both) is rejected with an error rather than guessed. Like add_workspace_proposal, "
+        "these are NOT executor-claimable; a human reviews and promotes them via promote_proposal. "
+        "Proposals start at status='raw' and progress through an enforced lifecycle: "
+        "raw → investigating → promoted|rejected. A project-scoped proposal's project_id is "
+        "enforced at promote_proposal time: promoting it into a DIFFERENT project is rejected "
+        "unless allow_project_transfer=True (+ transfer_reason) is passed there.",
+     "inputSchema": {"type": "object", "properties": {
+         "title": {"type": "string", "description": "Short idea title."},
+         "body": {"type": "string", "description": "Full description of the insight or idea."},
+         "project_id": {"type": "string", "description": "Project to scope this proposal to. Required unless scope='workspace' is passed instead."},
+         "project_name": {"type": "string", "description": "Project name — alternative to project_id; resolved to the id internally."},
+         "scope": {"type": "string", "enum": ["project", "workspace"],
+                   "description": "Pass 'workspace' to explicitly opt into a workspace-global proposal instead of "
+                   "project-scoping it. Defaults to project-scoped when project_id/project_name is given; omitting "
+                   "both project_id/project_name AND scope is an error (never inferred)."},
+         "tags": {"type": "string", "description": "Optional comma-separated tags."},
+         "family_id": {"type": "string", "description": "Optional family/grouping id shared by related proposals."},
+         "idempotency_key": {"type": "string", "description": "Optional caller-supplied key; a retried call with the same key returns the original proposal instead of creating a duplicate."}},
+         "required": ["title", "body"]}},
     {"name": "get_workspace_proposals", "description":
         "Read-only: List a bounded page of workspace proposals (human-authored flashes of insight), newest first. "
         "When status is omitted, defaults to 'live' proposals only (raw + investigating) — "
         "terminal proposals (promoted/rejected) are excluded so the default view reflects "
         "what's actually still open. Pass status='all' to fetch every status, or an explicit "
         "status (including promoted/rejected) to filter to just that one. Optional tag "
-        "substring filter. Pagination defaults to 20 rows (maximum 100); pass offset to "
-        "fetch the next page.",
+        "substring filter. Pass project_id (or project_name) to restrict the listing to that "
+        "project's proposals only (a8afd8f9) — omitted, every proposal matching the other "
+        "filters is returned regardless of scope. Pagination defaults to 20 rows (maximum 100); "
+        "pass offset to fetch the next page.",
      "inputSchema": {"type": "object", "properties": {
          "status": {"type": "string", "enum": ["raw", "investigating", "promoted", "rejected", "all"],
                     "description": "Filter to proposals in this status. Defaults to raw+investigating "
                     "('live') when omitted; use 'all' for every status."},
          "tag": {"type": "string", "description": "Substring filter on tags."},
+         "project_id": {"type": "string", "description": "Restrict to proposals scoped to this project only. Omitted returns proposals of any scope."},
+         "project_name": {"type": "string", "description": "Project name — alternative to project_id; resolved to the id internally."},
          "limit": {"type": "integer", "minimum": 1, "maximum": 100,
                    "description": "Maximum proposals to return (default 20, clamped to 1..100)."},
          "offset": {"type": "integer", "minimum": 0,
@@ -2033,13 +2063,21 @@ _MCP_TOOLS_LIST: list[dict[str, Any]] = [
         "The proposal must be in 'raw' or 'investigating' state. Creates a sprint item under "
         "the given project and sets the proposal's status to 'promoted' with "
         "promoted_to_sprint_item_id pointing to the new item. "
+        "a8afd8f9 — when the proposal is project-scoped (created via add_proposal with a "
+        "project_id) and this project_id differs from that, the promotion is rejected UNLESS "
+        "allow_project_transfer=True is passed together with a non-empty transfer_reason "
+        "(recorded on the resulting 'promoted' proposal_events row). A proposal with no "
+        "project_id (created via add_workspace_proposal, or predating this column) has nothing "
+        "to compare against, so this check never fires for it. "
         "Returns {proposal, sprint_item_id, sprint_item_title, project_id}.",
      "inputSchema": {"type": "object", "properties": {
          "proposal_id": {"type": "string"},
          "project_id": {"type": "string", "description": "Project to create the sprint item under."},
          "project_name": {"type": "string", "description": "Project name — alternative to project_id; resolved to the id internally."},
          "sprint_item_title": {"type": "string", "description": "Override title for the sprint item; defaults to the proposal title."},
-         "sprint_item_version": {"type": "string", "description": "Sprint version for the new item; defaults to 'current'."}},
+         "sprint_item_version": {"type": "string", "description": "Sprint version for the new item; defaults to 'current'."},
+         "allow_project_transfer": {"type": "boolean", "description": "Acknowledge promoting a project-scoped proposal into a DIFFERENT project than the one it was created under. Requires transfer_reason. Default false."},
+         "transfer_reason": {"type": "string", "description": "Non-empty reason for a cross-project transfer; required when allow_project_transfer=true. Recorded on the promoted event."}},
          "required": ["proposal_id"]}},
     {"name": "preview_proposal_promotion", "description":
         "Read-only (ce4883f3): preview what commit_proposal_promotion would do for a proposal at "
@@ -3519,6 +3557,12 @@ _READ_ONLY_TOOLS = {
 }
 _DESTRUCTIVE_TOOLS = {"delete_note", "archive_decision", "dismiss_hitl", "delete_sprint_item_pointer", "delete_custom_hook", "purge_ai_log"}
 
+# MCP directory metadata: these tools contact a public third-party service
+# rather than only reading Meridian's own state.  Keep this separate from the
+# read-only set: a GitHub/paper/social search can be read-only for Meridian
+# while still operating in an external open world.
+_OPEN_WORLD_TOOLS = {"paper_search", "social_search", "github_search"}
+
 # ---------------------------------------------------------------------------
 # a749f87c — Deterministic tool pre-selection metadata.
 #
@@ -3665,6 +3709,7 @@ _TOOL_CATEGORY: dict[str, str] = {
     "update_workspace_sprint_item":    "workspace",
     "complete_workspace_sprint_item":  "workspace",
     "add_workspace_proposal":          "workspace",
+    "add_proposal":                    "workspace",
     "get_workspace_proposals":         "workspace",
     "advance_proposal_status":         "workspace",
     "promote_proposal":                "workspace",
@@ -3810,6 +3855,7 @@ _TOOL_ROLE_RELEVANCE: dict[str, str] = {
     "validate_assumption":       "planner",
     "archive_decision":          "planner",
     "add_workspace_proposal":    "planner",
+    "add_proposal":              "planner",
     "get_workspace_proposals":   "planner",
     "advance_proposal_status":   "planner",
     "promote_proposal":          "planner",
@@ -3985,6 +4031,7 @@ _TOOL_WORKFLOW_TIER: dict[str, str] = {
     "get_planning_brief":         "main-workflow",
     "get_sprint_items":           "main-workflow",
     "add_workspace_proposal":     "main-workflow",
+    "add_proposal":               "main-workflow",
     "promote_proposal":           "main-workflow",
     "add_sprint_item":            "main-workflow",
     "claim_sprint_item":          "main-workflow",
@@ -4208,6 +4255,7 @@ _TITLE_OVERRIDES: dict[str, str] = {
     "add_workspace_note": "Add Workspace Note",
     "get_workspace_proposals": "Get Workspace Proposals",
     "add_workspace_proposal": "Add Workspace Proposal",
+    "add_proposal": "Add Proposal",
     "advance_proposal_status": "Advance Proposal Status",
     "promote_proposal": "Promote Proposal to Sprint Item",
     "get_workspace_settings": "Get Workspace Settings",
@@ -4271,7 +4319,7 @@ for _tool in _MCP_TOOLS_LIST:
         "title": _title,
         "readOnlyHint": _is_read_only,
         "destructiveHint": _is_destructive,
-        "openWorldHint": False,
+        "openWorldHint": _tool["name"] in _OPEN_WORLD_TOOLS,
         "idempotentHint": _is_read_only,
     }
     # a749f87c — stamp declared category + role_relevance onto every tool entry

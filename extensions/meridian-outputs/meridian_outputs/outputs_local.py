@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import posixpath
+import random
 import re
 import shutil
 import socket
@@ -1209,8 +1210,54 @@ class IndexFileLock:
 _MAX_CONTENT_CHARS = 200_000
 _ARCHIVAL_SUFFIX_RE = re.compile(r"_old(?:_\d+)?$", re.IGNORECASE)
 
-_TEXT_CONTENT_SUFFIXES: frozenset[str] = frozenset({".csv", ".json"})
+# fa600e42 -- bounded plaintext allowlist. Only genuinely text-shaped
+# formats get their BODY content read and indexed (see _classify_suffix /
+# _content_for_fts below): a deliberate allowlist, not a denylist, so a new
+# or unexpected suffix defaults to metadata-only rather than having its raw
+# bytes decoded and indexed by accident. Secret-shaped files never reach
+# this check at all -- is_secret_path (below) excludes them earlier, during
+# the walk itself.
+#
+# aa423c7e -- widened to add .R/.qmd/.Rmd/.sty (plain-text analysis/document
+# source formats with zero existing coverage) and .yml/.yaml. The .yml/.yaml
+# addition is safe by construction: is_secret_path (below) already excludes
+# the secret-shaped basenames that matter -- config.yml/.yaml, settings.yml/
+# .yaml, secrets.yml/.yaml, vault.yml/.yaml -- at the walk stage, BEFORE
+# _classify_suffix ever runs (see _iter_safe_output_files). This only newly
+# body-indexes non-matching basenames such as environment.yml.
+_TEXT_CONTENT_SUFFIXES: frozenset[str] = frozenset(
+    {
+        ".csv", ".json", ".txt", ".md", ".log",
+        # _classify_suffix lowercases the extension before this lookup (same
+        # as every existing entry above, e.g. "data.CSV" -> ".csv"), so these
+        # are stored lowercase even though the canonical on-disk spellings
+        # are typically ".R"/".Rmd" -- the set membership check is
+        # case-insensitive by construction, not by listing every case here.
+        ".r", ".qmd", ".rmd", ".sty", ".yml", ".yaml",
+    }
+)
 _METADATA_ONLY_SUFFIXES: frozenset[str] = frozenset({".npy"})
+
+# aa423c7e -- PDF is NOT a plaintext suffix (binary container format), so it
+# gets its own classification kind ("pdf_content") and its own bounded
+# extraction path (_extract_pdf_text) rather than being added to
+# _TEXT_CONTENT_SUFFIXES, which assumes UTF-8-decodable bytes (see
+# _read_text_capped / the fast-path decode in _analyse_file). Extraction is
+# lazy (pypdf imported on first use) and bounded on three independent axes
+# -- byte size, page count, and wall-clock time -- because a PDF can be
+# pathological on any of those axes independently of the other two (e.g. a
+# small file with thousands of pages, or a few huge/malformed pages that
+# stall a parser). Any cap exceeded, any parse failure, or the dependency
+# being unavailable all degrade to header-only (filename) indexing rather
+# than raising -- matching this module's existing degrade pattern
+# everywhere else (_xxh3_file's lazy-import fallback, npy_metadata's
+# try/except). Portable across platforms: time.monotonic() polled between
+# pages, never signal/alarm-based (this codebase runs on Windows, which has
+# no SIGALRM).
+_PDF_SUFFIXES: frozenset[str] = frozenset({".pdf"})
+_PDF_MAX_BYTES = 10 * 1024 * 1024
+_PDF_MAX_PAGES = 200
+_PDF_TIMEOUT_SECONDS = 5.0
 
 _SCRIPT_HINT_KEYS: tuple[str, ...] = (
     "generating_script", "generated_by", "source_script", "script",
@@ -1327,17 +1374,45 @@ def _canonical_storage_path(path: Any) -> str:
 
 
 def _classify_suffix(path: str) -> str:
+    # fa600e42 -- MERIDIAN_NOTES.md is a reserved, human-authored annotation
+    # file, separately ingested by _ingest_meridian_notes into the
+    # annotations table (a directory-level note, not a per-file output).
+    # Widening _TEXT_CONTENT_SUFFIXES to include .md must not ALSO pull
+    # this one reserved filename into the regular body-indexing pipeline --
+    # that would surface its identical text twice (once as an ordinary
+    # output row, once as a directory annotation) and misrepresent a human
+    # note as generated output content. This preserves MERIDIAN_NOTES.md's
+    # exact pre-fa600e42 classification; every other .md file is unaffected.
+    if os.path.basename(path) == MERIDIAN_NOTES_FILENAME:
+        return "binary_metadata"
     suffix = os.path.splitext(path)[1].lower()
     if suffix in _TEXT_CONTENT_SUFFIXES:
         return "text_content"
     if suffix in _METADATA_ONLY_SUFFIXES:
         return "metadata_only"
+    if suffix in _PDF_SUFFIXES:
+        return "pdf_content"
     return "binary_metadata"
+
+
+def _sanitize_text_content(text: str) -> str:
+    """Strip embedded NUL bytes from decoded file text before it is indexed
+    (fa600e42).
+
+    A text-content file can legally decode as valid UTF-8 while still
+    containing an embedded NUL byte (e.g. a corrupted or binary-ish .log
+    line) -- but DuckDB TEXT columns and the FTS index both reject/choke on
+    an embedded NUL. Stripping (not replacing with a placeholder) keeps the
+    surrounding text searchable. This only ever touches the FTS-facing body
+    copy; the file's real on-disk bytes are still what gets fingerprinted/
+    hashed elsewhere, so this has no effect on identity or staleness checks.
+    """
+    return text.replace("\x00", "") if "\x00" in text else text
 
 
 def _read_text_capped(path: str) -> str:
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        return fh.read(_MAX_CONTENT_CHARS)
+        return _sanitize_text_content(fh.read(_MAX_CONTENT_CHARS))
 
 
 def _sha256_file(path: str) -> str | None:
@@ -1438,6 +1513,92 @@ def _extract_json(text: str) -> tuple[list[str] | None, str | None]:
     return keys, script
 
 
+def _extract_pdf_text(
+    data: bytes,
+    *,
+    max_bytes: int = _PDF_MAX_BYTES,
+    max_pages: int = _PDF_MAX_PAGES,
+    timeout_seconds: float = _PDF_TIMEOUT_SECONDS,
+) -> str | None:
+    """Bounded best-effort text extraction from raw PDF bytes.
+
+    aa423c7e -- Returns ``None`` (never raises) whenever extraction cannot
+    safely proceed: the optional ``pypdf`` dependency is missing, ``data``
+    exceeds ``max_bytes``, the document exceeds ``max_pages``, the file is
+    malformed/unparseable, or a single page's extraction raises. ``None``
+    means "index this file as header/filename-only", the same degrade every
+    other optional-dependency path in this module already uses (see
+    _xxh3_file, npy_metadata).
+
+    Three independent bounds, because a PDF can be pathological on any one
+    of them without the others catching it:
+      - ``max_bytes`` -- caller-side size cap (checked here too, not just by
+        the caller, so this function is safe to call directly in tests).
+      - ``max_pages`` -- a small file can still declare an enormous page
+        count.
+      - ``timeout_seconds`` -- wall-clock budget polled via
+        time.monotonic() between pages (never signal/alarm-based -- this
+        codebase runs on Windows, which has no SIGALRM). On timeout, this
+        returns whatever text had already been extracted from prior pages
+        rather than discarding it -- a clean, bounded partial result, not a
+        hang and not an exception.
+    """
+    if len(data) > max_bytes:
+        return None
+    try:
+        import pypdf  # noqa: PLC0415 -- optional, lazy
+    except ImportError:
+        return None
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        num_pages = len(reader.pages)
+    except Exception:  # noqa: BLE001 -- malformed/encrypted/unparseable PDF
+        return None
+    if num_pages > max_pages:
+        return None
+    deadline = time.monotonic() + timeout_seconds
+    parts: list[str] = []
+    for page in reader.pages:
+        if time.monotonic() >= deadline:
+            break
+        try:
+            text = page.extract_text() or ""
+        except Exception:  # noqa: BLE001 -- one bad page must not abort the rest
+            continue
+        if text:
+            parts.append(text)
+    if not parts:
+        return None
+    return _sanitize_text_content("\n".join(parts))[:_MAX_CONTENT_CHARS]
+
+
+def _extract_pdf_text_from_path(path: str) -> str | None:
+    """Path-based wrapper for :func:`_extract_pdf_text`.
+
+    Reads at most ``_PDF_MAX_BYTES + 1`` bytes so an oversized PDF is never
+    fully loaded into memory just to discover it exceeds the cap -- a
+    tighter bound than the fast analysis path in :func:`_analyse_file` can
+    offer, since that path already holds the whole file in memory for
+    hashing before this is ever consulted.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(_PDF_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(data) > _PDF_MAX_BYTES:
+        return None
+    # Forward the live module-level bounds explicitly rather than relying on
+    # _extract_pdf_text's own default parameters: default-argument values
+    # are bound once at function-definition time, so a caller that wants
+    # runtime-tunable bounds (e.g. tests overriding OL._PDF_MAX_PAGES) must
+    # re-read the globals here, at call time, for the override to matter.
+    return _extract_pdf_text(
+        data, max_bytes=_PDF_MAX_BYTES, max_pages=_PDF_MAX_PAGES,
+        timeout_seconds=_PDF_TIMEOUT_SECONDS,
+    )
+
+
 @dataclass
 class FileFingerprint:
     """Cheap content-derived signature for one output file."""
@@ -1447,6 +1608,13 @@ class FileFingerprint:
     csv_columns: list[str] | None = None
     json_keys: list[str] | None = None
     generating_script: str | None = None
+    # aa423c7e -- extracted PDF body text (kind == "pdf_content" only), None
+    # when extraction degraded (missing dependency, cap exceeded, malformed
+    # file) or the kind isn't PDF. Stored here (unlike the plaintext kinds,
+    # which re-read the file on demand in _content_for_fts) because PDF
+    # extraction is comparatively expensive -- computing it once in
+    # file_fingerprint and reusing it avoids parsing the same PDF twice.
+    pdf_text: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1455,6 +1623,16 @@ class FileFingerprint:
 def file_fingerprint(path: str) -> FileFingerprint:
     """Compute a cheap FileFingerprint for one output file."""
     kind = _classify_suffix(path)
+    if kind == "pdf_content":
+        pdf_text = _extract_pdf_text_from_path(path)
+        # aa423c7e -- extend the same generating-script-hint inference every
+        # other text-shaped kind already gets (see the non-.csv branch
+        # below) to extracted PDF body text, so a PDF report carrying a
+        # "generated by X.py" provenance line is discoverable the same way
+        # a .txt/.md report already is.
+        script = _infer_generating_script_from_text(pdf_text) if pdf_text else None
+        return FileFingerprint(path=path, kind=kind,
+                               pdf_text=pdf_text, generating_script=script)
     if kind != "text_content":
         return FileFingerprint(path=path, kind=kind)
     try:
@@ -1487,6 +1665,9 @@ def _content_for_fts(
     if fingerprint.generating_script:
         terms.append(fingerprint.generating_script)
     header = " ".join(terms)
+    if fingerprint.kind == "pdf_content":
+        pdf_body = body if body is not None else fingerprint.pdf_text
+        return f"{header}\n{pdf_body}" if pdf_body else header
     if fingerprint.kind != "text_content":
         return header
     if body is None:
@@ -1768,7 +1949,25 @@ def _analyse_file(
             h.update(data)
             sha = h.hexdigest()
             kind = _classify_suffix(path)
-            if kind != "text_content":
+            if kind == "pdf_content":
+                # aa423c7e -- reuse the bytes already read for hashing above
+                # instead of reopening the file; _extract_pdf_text applies
+                # its own independent byte/page/time bounds regardless of
+                # how large ``data`` already is (see its docstring -- this
+                # fast path's hash-read is unbounded by design, pre-dating
+                # this change, so the PDF-specific bound has to be enforced
+                # here rather than relied upon from that read).
+                pdf_text = _extract_pdf_text(
+                    data, max_bytes=_PDF_MAX_BYTES, max_pages=_PDF_MAX_PAGES,
+                    timeout_seconds=_PDF_TIMEOUT_SECONDS,
+                )
+                pdf_script = (
+                    _infer_generating_script_from_text(pdf_text) if pdf_text else None
+                )
+                fp = FileFingerprint(path=path, kind=kind, pdf_text=pdf_text,
+                                     generating_script=pdf_script)
+                fts_content = _content_for_fts(path, fp, body=pdf_text)
+            elif kind != "text_content":
                 fp = FileFingerprint(path=path, kind=kind)
                 fts_content = _content_for_fts(path, fp)
             else:
@@ -1777,9 +1976,11 @@ def _analyse_file(
                 # worst case for UTF-8) then slice the DECODED text --
                 # avoids decoding a huge file unnecessarily, never cuts a
                 # multi-byte char differently than the original read did.
-                text = data[: _MAX_CONTENT_CHARS * 4].decode(
-                    "utf-8", errors="replace"
-                )[:_MAX_CONTENT_CHARS]
+                text = _sanitize_text_content(
+                    data[: _MAX_CONTENT_CHARS * 4].decode(
+                        "utf-8", errors="replace"
+                    )[:_MAX_CONTENT_CHARS]
+                )
                 suffix = os.path.splitext(path)[1].lower()
                 if suffix == ".csv":
                     columns, script = _extract_csv(text)
@@ -2027,6 +2228,104 @@ def _resolve_tantivy_heap_bytes(explicit: int | None) -> int:
     return _default_tantivy_heap_bytes()
 
 
+# task_ecb96ac9 follow-on -- DuckDB has no default memory ceiling of its own
+# (it will try to use up to ~80% of total system RAM). Confirmed live: a real
+# whole-root run (632k+ files) crashed with an unrecoverable
+# "Out of Memory Error: Allocation failure" where even the ROLLBACK of the
+# failed operation also hit an allocation failure, permanently invalidating
+# the connection ("database has been invalidated") -- every subsequent
+# rebuild() call failed identically on the same dead connection. The system
+# was already down to single-digit GB free (other concurrent processes on a
+# shared machine) before this connection even opened, so DuckDB's unbounded
+# default let it keep growing until the OS itself had nothing left to give,
+# a much harder failure mode than DuckDB hitting its own configured limit
+# (an expected, internally-handled condition its query executor is built to
+# recover from, unlike a bare malloc() returning nothing). Setting an
+# explicit `memory_limit` gives DuckDB a ceiling to self-manage against
+# *before* system-wide exhaustion, at the cost of DuckDB reporting an
+# out-of-memory error somewhat sooner than it otherwise might.
+_DEFAULT_DUCKDB_MEMORY_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
+_DUCKDB_MEMORY_LIMIT_ENV_VAR = "MERIDIAN_OUTPUTS_DUCKDB_MEMORY_LIMIT_MB"
+#: Kept free (beyond the Tantivy writer's own heap) for this process's
+#: Python heap and general OS headroom before DuckDB's share is computed.
+#: 768MB, not the original 1GB -- this process's own observed peak Python
+#: heap across four real qualification-run attempts never exceeded ~700MB.
+_DUCKDB_MEMORY_RESERVE_BYTES = 768 * 1024 * 1024
+#: DuckDB gets at most this fraction of whatever's left after reserves.
+#: Recalibrated from an original 0.6 after FOUR real crashes at the
+#: original share confirmed it was too conservative for this workload, not
+#: too generous: DuckDB's own working set (buffer pool, WAL) genuinely
+#: grows with on-disk table size, and by ~60-70k indexed rows it had
+#: already consumed nearly all of a ~1.9GB budget from ordinary operation
+#: alone -- leaving no margin for a new batch's transient needs, let alone
+#: a rollback if one was needed. A larger MAJORITY share still leaves the
+#: reserve above untouched for the OS/other processes; it stops being
+#: quite so tight that normal growth alone exhausts it before the corpus
+#: is anywhere near fully indexed.
+_DUCKDB_MEMORY_LIMIT_SHARE = 0.8
+#: 1.5GB, not the original 512MB -- the original floor was never actually
+#: the binding constraint in any of the four crashes (the resolved value
+#: was always well above it), but 512MB is now a KNOWN-insufficient value
+#: for this workload at real scale, confirmed live at ~1.9GB. Raising the
+#: floor stops _resolve_duckdb_memory_limit_bytes from ever configuring a
+#: value that's already known not to work, even under low-availability
+#: conditions or a badly-chosen explicit override.
+_DUCKDB_MEMORY_LIMIT_FLOOR_BYTES = 1536 * 1024 * 1024
+_DUCKDB_MEMORY_LIMIT_CEILING_BYTES = 16 * 1024 * 1024 * 1024
+
+
+def _default_duckdb_memory_limit_bytes(tantivy_heap_bytes: int) -> int:
+    """Resolve the default DuckDB `memory_limit` (bytes) from the
+    environment (MB) or, absent that, from currently AVAILABLE system
+    memory -- checked fresh at connect time, not total capacity, since a
+    shared machine's free memory at any given moment is the real constraint
+    (see module comment above). Mirrors _default_tantivy_heap_bytes's
+    env-var-in-MB convention and _initial_adaptive_batch's psutil
+    lazy-import/fail-soft convention."""
+    raw = os.environ.get(_DUCKDB_MEMORY_LIMIT_ENV_VAR)
+    if raw is not None and raw.strip():
+        try:
+            env_bytes = int(raw.strip()) * 1024 * 1024
+        except ValueError:
+            _log.warning(
+                "%s=%r is not a valid integer (MB) -- falling back to "
+                "availability-based default", _DUCKDB_MEMORY_LIMIT_ENV_VAR, raw,
+            )
+        else:
+            # An in-range value passes straight through; an out-of-range one
+            # (0, negative, or absurdly large) gets clamped rather than
+            # silently defeating the floor/ceiling the rest of this
+            # mechanism exists to enforce -- a fat-fingered env var (e.g.
+            # "=0") must not be able to reproduce the exact starvation this
+            # whole safety net was built to prevent.
+            return max(
+                _DUCKDB_MEMORY_LIMIT_FLOOR_BYTES,
+                min(env_bytes, _DUCKDB_MEMORY_LIMIT_CEILING_BYTES),
+            )
+    try:
+        import psutil  # noqa: PLC0415
+        available = int(psutil.virtual_memory().available)
+    except (ImportError, OSError, AttributeError):
+        return _DEFAULT_DUCKDB_MEMORY_LIMIT_BYTES
+    usable = available - tantivy_heap_bytes - _DUCKDB_MEMORY_RESERVE_BYTES
+    limit = int(usable * _DUCKDB_MEMORY_LIMIT_SHARE)
+    return max(_DUCKDB_MEMORY_LIMIT_FLOOR_BYTES, min(limit, _DUCKDB_MEMORY_LIMIT_CEILING_BYTES))
+
+
+def _resolve_duckdb_memory_limit_bytes(explicit: int | None, tantivy_heap_bytes: int) -> int:
+    """Precedence: explicit constructor arg (bytes) > env var (MB) >
+    availability-based default. Mirrors _resolve_tantivy_heap_bytes."""
+    if explicit is not None:
+        if explicit >= _DUCKDB_MEMORY_LIMIT_FLOOR_BYTES:
+            return explicit
+        _log.warning(
+            "OutputsFtsIndex: duckdb_memory_limit_bytes=%r must be >= %dMB -- "
+            "falling back to availability-based default", explicit,
+            _DUCKDB_MEMORY_LIMIT_FLOOR_BYTES // (1024 * 1024),
+        )
+    return _default_duckdb_memory_limit_bytes(tantivy_heap_bytes)
+
+
 # ---------------------------------------------------------------------------
 # 9a18a2b2 -- Tantivy single-writer lock conflict handling
 # ---------------------------------------------------------------------------
@@ -2080,6 +2379,16 @@ class OutputsFtsIndex:
     _ADAPTIVE_LOW_AVAILABLE_BYTES = 2 * 1024**3
     _ADAPTIVE_MAX_FTS_SECONDS = 8.0
     _ADAPTIVE_MAX_WRITE_SECONDS = 24.0
+    # Bound on how many winner paths go into one `IN (...)` content lookup
+    # during legacy-path migration (task_ecb96ac9) -- keeps the parameter
+    # list small even if a corpus has an unusually large number of
+    # duplicate-path groups, independent of _ADAPTIVE_* batch sizing above.
+    _MIGRATION_CONTENT_CHUNK = 200
+    # How many rebuild() calls the legacy-path migration scan may be skipped
+    # for after a clean (nothing-to-fix) pass, bounding how stale a
+    # concurrent-writer-introduced duplicate can get before it's caught
+    # again (see rebuild()'s call site for the full throttling rationale).
+    _LEGACY_MIGRATION_RECHECK_INTERVAL = 25
     """Persistent DuckDB FTS index over a local outputs directory.
 
     Same logic as the main-repo OutputsFtsIndex, but:
@@ -2154,6 +2463,7 @@ class OutputsFtsIndex:
         max_workers: int | None = None,
         exclude_patterns: tuple[str, ...] | None = None,
         tantivy_heap_bytes: int | None = None,
+        duckdb_memory_limit_bytes: int | None = None,
         max_batch: int | None = None,
         write_chunk: int | None = None,
         session_id: str | None = None,
@@ -2181,6 +2491,19 @@ class OutputsFtsIndex:
         # MERIDIAN_OUTPUTS_TANTIVY_HEAP_MB env var > 512MB default (up from
         # tantivy's own undersized default, measured ~3x faster commits).
         self._tantivy_heap_bytes = _resolve_tantivy_heap_bytes(tantivy_heap_bytes)
+        # task_ecb96ac9 follow-on -- see _default_duckdb_memory_limit_bytes's
+        # module comment: DuckDB has no default ceiling of its own, which let
+        # a real whole-root run take the OS's last available memory and
+        # invalidate its own connection past recovery. Resolved once here
+        # (not adaptively re-resolved per call, unlike _adaptive_batch --
+        # memory_limit is a per-connection PRAGMA, not something DuckDB lets
+        # you cheaply re-tune mid-session). Relies on this instance never
+        # surviving a close()+reconnect cycle with stale memory conditions --
+        # true today: _get_cached_index() always .close()s an evicted
+        # instance and constructs a fresh one, which re-resolves this value.
+        self._duckdb_memory_limit_bytes = _resolve_duckdb_memory_limit_bytes(
+            duckdb_memory_limit_bytes, self._tantivy_heap_bytes,
+        )
         # 3535b9ad -- walk batch cap: explicit param > MERIDIAN_OUTPUTS_MAX_BATCH
         # env var > class default (1bce8c41: an effectively-unbounded default,
         # time-primary -- see _ResumableFileWalk._MAX_BATCH). This value feeds
@@ -2293,6 +2616,15 @@ class OutputsFtsIndex:
         # never converge, so this must be surfaced rather than silently
         # swallowed at DEBUG level.
         self._last_walk_error: str | None = None
+        # fa600e42 -- True once Phase 0 has established a fresh, this-
+        # instance in-memory answer for _last_walk_error (via the "brand
+        # new pass is starting" reset in rebuild()), so
+        # _rehydrate_walk_state_from_disk's "fill only if still None" merge
+        # rule (see its own docstring) knows NOT to treat that reset as
+        # "nothing known yet, go trust whatever is on disk" -- see the
+        # reset site in rebuild() for the full explanation of why this
+        # exists.
+        self._walk_error_confirmed_fresh: bool = False
         # Best current estimate of the total file count under outputs_dir --
         # set from the authoritative len(all_paths) each time a walk pass
         # completes. None until the very first pass has ever completed.
@@ -2338,11 +2670,58 @@ class OutputsFtsIndex:
         # process died" from an arbitrarily older one; nothing in the
         # convergence-state contract branches on its value.
         self._walk_epoch = 0
+        # task_ecb96ac9 follow-on (perf) -- see _LEGACY_MIGRATION_RECHECK_
+        # INTERVAL and rebuild()'s call site. _ever_scanned starting False
+        # forces the full migration scan on this instance's first rebuild()
+        # call; _found_last_time starting True is only consulted after that
+        # first real scan overwrites it, so its initial value is inert.
+        self._legacy_migration_ever_scanned = False
+        self._legacy_migration_calls_since_scan = 0
+        self._legacy_migration_found_last_time = True
 
     def _connect(self) -> Any:
         if self._con is None:
             import duckdb  # noqa: PLC0415
             self._con = duckdb.connect(self._db_path)
+            # task_ecb96ac9 follow-on -- give DuckDB an explicit ceiling to
+            # self-manage against (see _default_duckdb_memory_limit_bytes's
+            # module comment for why: no ceiling let a real run exhaust
+            # system memory catastrophically). Best-effort: a PRAGMA failure
+            # here must never block opening the connection at all -- an
+            # unconfigured DuckDB (its own unbounded default) is strictly
+            # better than no usable connection.
+            try:
+                limit_mb = max(1, self._duckdb_memory_limit_bytes // (1024 * 1024))
+                self._con.execute(f"PRAGMA memory_limit='{limit_mb}MB'")
+            except Exception:  # noqa: BLE001
+                _log.warning(
+                    "OutputsFtsIndex._connect: could not set memory_limit=%dMB",
+                    self._duckdb_memory_limit_bytes // (1024 * 1024), exc_info=True,
+                )
+            # task_ecb96ac9 follow-on, round 2 -- a configured memory_limit
+            # alone was not sufficient: confirmed live, DuckDB hit its OWN
+            # limit cleanly (a normal, expected "Out of Memory Error: failed
+            # to pin block" with its own tuning suggestions attached) but the
+            # ROLLBACK of that failed operation ALSO ran out of memory within
+            # the same already-nearly-full budget, producing the identical
+            # unrecoverable "database has been invalidated" failure a bare
+            # ceiling was supposed to prevent. `preserve_insertion_order`
+            # defaults to true in DuckDB, which buffers extra bookkeeping to
+            # guarantee row order is preserved through inserts/updates --
+            # real memory cost this class never relies on (no query here
+            # depends on outputs_index's physical row order; lookups are by
+            # `path`, a unique key). Disabling it is DuckDB's own first
+            # suggestion in that exact error message and reduces the PEAK
+            # memory a large write actually needs, rather than just moving
+            # where the ceiling sits -- addressing the pressure, not only
+            # the limit.
+            try:
+                self._con.execute("PRAGMA preserve_insertion_order=false")
+            except Exception:  # noqa: BLE001
+                _log.warning(
+                    "OutputsFtsIndex._connect: could not disable "
+                    "preserve_insertion_order", exc_info=True,
+                )
             # 77443d83 -- a fresh instance always assumed _fts_built started
             # False. With Tantivy this is now cheap either way (_rebuild_fts
             # only ever commits its pending delta, never a full re-index), but
@@ -2644,6 +3023,14 @@ class OutputsFtsIndex:
           -- fill only if this call hasn't already produced a value
           (still ``None``); a value Phase 0/1 already set this call is by
           definition more current than anything persisted from before.
+          ``_last_walk_error`` additionally checks
+          ``_walk_error_confirmed_fresh`` (fa600e42): Phase 0's own
+          "brand new pass is starting" reset deliberately sets this field
+          to ``None`` to optimistically clear a resolved historical error
+          -- without the flag, that reset would be indistinguishable from
+          "nothing observed yet" and this rule would immediately reload
+          the stale pre-reset value right back in, undoing the reset
+          within the very same call.
         * ``_walk_epoch`` -- take the max of the two: a purely monotonic,
           purely diagnostic counter (nothing in the convergence contract
           branches on it), so "genuinely newer" is simply "numerically
@@ -2727,7 +3114,15 @@ class OutputsFtsIndex:
         # this call hasn't already produced a value (see docstring).
         if self._scan_boundary is None:
             self._scan_boundary = values.get("walk_scan_boundary")
-        if self._last_walk_error is None:
+        # fa600e42 -- _walk_error_confirmed_fresh guards against this merge
+        # blindly reloading a stale persisted error that Phase 0's own
+        # "brand new pass is starting" reset (in rebuild()) has ALREADY
+        # deliberately cleared THIS instance -- see that reset site's
+        # comment for the full explanation. Without this guard, the reset
+        # (which makes the field None) would be indistinguishable from
+        # "never observed anything yet," and this rule would immediately
+        # undo it by reloading whatever was on disk before the reset.
+        if self._last_walk_error is None and not self._walk_error_confirmed_fresh:
             self._last_walk_error = values.get("walk_last_error")
         if self._expected_count is None:
             expected_raw = values.get("walk_expected_count")
@@ -3021,15 +3416,49 @@ class OutputsFtsIndex:
         The migration is deliberately limited to path identity.  It does not
         re-walk or re-hash files, and it preserves the established display
         spelling by using :func:`_canonical_storage_path` for the winner.
+
+        Memory (task_ecb96ac9): the scan deliberately excludes ``content``
+        (the full extracted-text FTS body) from the bulk read.  At whole-root
+        scale (632k files / 433 GiB, the SUT_Compressed qualification
+        corpus) fetching it for every row reproduced the same allocator-
+        failure pattern as the historical row-cache content-retention bug
+        (see the 96k-file incident this class's adaptive batching already
+        exists to avoid). Dedup only needs path identity plus a
+        ``content IS NOT NULL`` presence flag; the repair itself only ever
+        DELETEs losing rows and UPDATEs the winner's ``path`` column, so
+        content never round-trips through Python for the DB repair. The
+        bulk scan is chunked through :meth:`_adaptive_batch_limit`, the same
+        memory/commit-pressure-aware limit the normal write path uses, so
+        peak memory tracks available RAM instead of corpus size. Content is
+        fetched afterward, in small bounded batches
+        (``_MIGRATION_CONTENT_CHUNK``), only for the winning rows that need
+        it staged into the Tantivy FTS upsert delta.
+
+        Deliberately reads ``self._adaptive_batch`` directly rather than
+        calling :meth:`_adaptive_batch_limit`: that method also *adjusts*
+        ``self._adaptive_batch`` from ``self.last_rebuild_metrics``, and this
+        method runs (from :meth:`rebuild`) after ``analysis_seconds``/
+        ``classification_seconds`` are recorded but before ``fts_seconds``/
+        ``write_seconds`` exist yet -- the missing keys default to ``0``,
+        which always satisfies the "fast, healthy" branch and would double
+        the shared write-path batch size on every single call, regardless of
+        real memory or commit pressure. A plain read has no such side effect.
         """
         self._ensure_schema(con)
-        relation = con.execute(
-            "SELECT path, content, mtime, sha256, size, generating_script, "
-            "kind, is_archival, canonical_path, csv_columns, json_keys "
-            "FROM outputs_index"
+        cursor = con.execute(
+            "SELECT path, mtime, sha256, size, generating_script, kind, "
+            "is_archival, canonical_path, csv_columns, json_keys, "
+            "(content IS NOT NULL) AS has_content FROM outputs_index"
         )
-        columns = [c[0] for c in relation.description]
-        raw_rows = [dict(zip(columns, row)) for row in relation.fetchall()]
+        columns = [c[0] for c in cursor.description]
+        raw_rows: list[dict[str, Any]] = []
+        batch_limit = self._adaptive_batch
+        while True:
+            chunk = cursor.fetchmany(batch_limit)
+            if not chunk:
+                break
+            raw_rows.extend(dict(zip(columns, row)) for row in chunk)
+
         groups: dict[str, list[dict[str, Any]]] = {}
         for row in raw_rows:
             raw_path = row.get("path")
@@ -3039,7 +3468,11 @@ class OutputsFtsIndex:
             row["_canonical_storage_path"] = canonical
             groups.setdefault(_normalize_output_path(canonical), []).append(row)
 
-        affected: list[tuple[list[dict[str, Any]], dict[str, Any]]] = []
+        # Each tuple is (group, winner-with-corrected-path, winner's
+        # original/pre-repair path) -- the original path is kept alongside
+        # the winner dict so the transaction below can UPDATE by it without
+        # re-deriving it from the (already-mutated) winner dict.
+        affected: list[tuple[list[dict[str, Any]], dict[str, Any], str]] = []
         for group in groups.values():
             canonical = min(
                 row["_canonical_storage_path"] for row in group
@@ -3048,45 +3481,38 @@ class OutputsFtsIndex:
                 group,
                 key=lambda row: (
                     row.get("path") == canonical,
-                    row.get("content") is not None,
+                    bool(row.get("has_content")),
                     row.get("sha256") is not None,
                     row.get("mtime") or 0,
                     row.get("size") or 0,
                     str(row.get("path") or ""),
                 ),
             )
-            if len(group) > 1 or winner.get("path") != canonical:
+            winner_original_path = winner.get("path")
+            if len(group) > 1 or winner_original_path != canonical:
                 winner = dict(winner)
                 winner["path"] = canonical
-                affected.append((group, winner))
+                affected.append((group, winner, winner_original_path))
 
         if not affected:
             return False
 
-        old_paths = [
-            row["path"]
-            for group, _winner in affected
-            for row in group
-            if row.get("path")
-        ]
-        winners = [winner for _group, winner in affected]
         con.execute("BEGIN TRANSACTION")
         try:
-            for path in old_paths:
-                con.execute("DELETE FROM outputs_index WHERE path = ?", [path])
-            for row in winners:
-                con.execute(
-                    "INSERT INTO outputs_index (path, content, mtime, sha256, "
-                    "size, generating_script, kind, is_archival, canonical_path, "
-                    "csv_columns, json_keys) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    [
-                        row["path"], row.get("content"), row.get("mtime"),
-                        row.get("sha256"), row.get("size"),
-                        row.get("generating_script"), row.get("kind"),
-                        row.get("is_archival"), row.get("canonical_path"),
-                        row.get("csv_columns"), row.get("json_keys"),
-                    ],
-                )
+            for group, winner, winner_original_path in affected:
+                for row in group:
+                    other_path = row.get("path")
+                    if other_path and other_path != winner_original_path:
+                        con.execute(
+                            "DELETE FROM outputs_index WHERE path = ?",
+                            [other_path],
+                        )
+                canonical_path = winner["path"]
+                if winner_original_path != canonical_path:
+                    con.execute(
+                        "UPDATE outputs_index SET path = ? WHERE path = ?",
+                        [canonical_path, winner_original_path],
+                    )
         except BaseException:
             try:
                 con.execute("ROLLBACK")
@@ -3099,32 +3525,42 @@ class OutputsFtsIndex:
         else:
             con.execute("COMMIT")
 
+        winners = [winner for _group, winner, _orig in affected]
+
         # Reconcile this process's metadata cache as well as the durable table.
         # _connect() may have rehydrated the old duplicate spellings before
         # rebuild() acquired the write lease.
-        affected_old = set(old_paths)
+        affected_old = {
+            row.get("path")
+            for group, _winner, winner_original_path in affected
+            for row in group
+            if row.get("path") and row.get("path") != winner_original_path
+        }
+        affected_old.update(
+            winner_original_path for _group, _winner, winner_original_path in affected
+        )
         for path in affected_old:
             self._row_cache.pop(path, None)
             self._manifest.pop(path, None)
             self._pending_stale.pop(path, None)
-        for row in winners:
+        for winner in winners:
             parsed = OutputRow(
-                path=row["path"],
+                path=winner["path"],
                 content=None,
-                mtime=row.get("mtime"),
-                sha256=row.get("sha256"),
-                size=row.get("size"),
-                generating_script=row.get("generating_script"),
-                kind=row.get("kind") or "",
-                is_archival=bool(row.get("is_archival")),
-                canonical_path=row.get("canonical_path"),
+                mtime=winner.get("mtime"),
+                sha256=winner.get("sha256"),
+                size=winner.get("size"),
+                generating_script=winner.get("generating_script"),
+                kind=winner.get("kind") or "",
+                is_archival=bool(winner.get("is_archival")),
+                canonical_path=winner.get("canonical_path"),
                 csv_columns=(
-                    json.loads(row["csv_columns"])
-                    if row.get("csv_columns") else None
+                    json.loads(winner["csv_columns"])
+                    if winner.get("csv_columns") else None
                 ),
                 json_keys=(
-                    json.loads(row["json_keys"])
-                    if row.get("json_keys") else None
+                    json.loads(winner["json_keys"])
+                    if winner.get("json_keys") else None
                 ),
             )
             self._row_cache[parsed.path] = parsed
@@ -3132,25 +3568,39 @@ class OutputsFtsIndex:
 
         # Remove every legacy spelling from Tantivy, then insert the canonical
         # winner. _rebuild_fts() commits this delta in one small transaction.
+        # Content is looked up here, in bounded batches, only for the winning
+        # paths -- the one place this migration still needs real body text.
         self._pending_tantivy_deletes.update(affected_old)
-        for row in winners:
+        winner_paths = [winner["path"] for winner in winners]
+        content_by_path: dict[str, Any] = {}
+        chunk_size = self._MIGRATION_CONTENT_CHUNK
+        for start in range(0, len(winner_paths), chunk_size):
+            chunk_paths = winner_paths[start:start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk_paths)
+            content_rows = con.execute(
+                f"SELECT path, content FROM outputs_index "
+                f"WHERE path IN ({placeholders})",
+                chunk_paths,
+            ).fetchall()
+            content_by_path.update(content_rows)
+        for winner in winners:
             parsed = OutputRow(
-                path=row["path"],
-                content=row.get("content"),
-                mtime=row.get("mtime"),
-                sha256=row.get("sha256"),
-                size=row.get("size"),
-                generating_script=row.get("generating_script"),
-                kind=row.get("kind") or "",
-                is_archival=bool(row.get("is_archival")),
-                canonical_path=row.get("canonical_path"),
+                path=winner["path"],
+                content=content_by_path.get(winner["path"]),
+                mtime=winner.get("mtime"),
+                sha256=winner.get("sha256"),
+                size=winner.get("size"),
+                generating_script=winner.get("generating_script"),
+                kind=winner.get("kind") or "",
+                is_archival=bool(winner.get("is_archival")),
+                canonical_path=winner.get("canonical_path"),
                 csv_columns=(
-                    json.loads(row["csv_columns"])
-                    if row.get("csv_columns") else None
+                    json.loads(winner["csv_columns"])
+                    if winner.get("csv_columns") else None
                 ),
                 json_keys=(
-                    json.loads(row["json_keys"])
-                    if row.get("json_keys") else None
+                    json.loads(winner["json_keys"])
+                    if winner.get("json_keys") else None
                 ),
             )
             self._pending_tantivy_upserts[parsed.path] = parsed
@@ -3263,7 +3713,7 @@ class OutputsFtsIndex:
             directory = os.path.dirname(p)
             try:
                 with open(p, "r", encoding="utf-8", errors="replace") as fh:
-                    text = fh.read(_MAX_CONTENT_CHARS)
+                    text = _sanitize_text_content(fh.read(_MAX_CONTENT_CHARS))
             except OSError:
                 _log.debug("_ingest_meridian_notes: could not read %r", p,
                             exc_info=True)
@@ -3331,8 +3781,41 @@ class OutputsFtsIndex:
             dir_path, exc,
         )
 
+    def _index_db_file_size(self) -> int | None:
+        """On-disk size of the DuckDB index file, or None if unreadable
+        (not yet created, or a transient stat failure). Deliberately does
+        NOT also walk the Tantivy directory (unlike get_cache_quota_status,
+        built for quota enforcement and willing to pay a full os.walk of
+        the whole .meridian-outputs-cache/ dir) -- a single os.path.getsize
+        call is the cheap, always-safe-to-call-every-rebuild() telemetry
+        this method exists for; a full cache-tree size belongs to that
+        other, explicitly opt-in tool.
+        """
+        try:
+            return os.path.getsize(self._db_path)
+        except OSError:
+            return None
+
+    def _current_process_rss_bytes(self) -> int | None:
+        """Current process resident set size, or None if psutil is
+        unavailable/fails -- same fail-soft, lazy-import convention as
+        _initial_adaptive_batch's own psutil usage elsewhere in this class.
+        """
+        try:
+            import psutil  # noqa: PLC0415 -- optional, already used elsewhere here
+            return int(psutil.Process(os.getpid()).memory_info().rss)
+        except (ImportError, OSError, AttributeError):
+            return None
+        except Exception:  # noqa: BLE001 -- best-effort telemetry only
+            _log.debug(
+                "OutputsFtsIndex._current_process_rss_bytes: psutil call "
+                "failed", exc_info=True,
+            )
+            return None
+
     def rebuild(
         self, *, max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
+        staleness_mode: str = "fast", staleness_sample_rate: float = 0.1,
     ) -> int:
         """Incrementally rebuild the table + FTS index.  Returns row count.
 
@@ -3445,6 +3928,40 @@ class OutputsFtsIndex:
                 # BEFORE any paths are drained, so even a crash during this
                 # very first drain() records the correct epoch on restart.
                 self._walk_epoch += 1
+                # fa600e42 -- clear a stale error from a PRIOR, already-
+                # completed pass optimistically: it no longer describes this
+                # fresh pass's state (distinguishing "active" from
+                # "historical" walk failure). If the same directory is
+                # still unreadable, _record_walk_error (this walk's
+                # on_error callback) re-sets it the moment this new pass
+                # hits it again -- so a genuinely persistent problem never
+                # goes silent, but a problem that has since been fixed
+                # actually clears instead of reporting non-convergence
+                # forever. Sibling per-call resets: last_db_write_error /
+                # last_lock_error at the top of rebuild() above -- this one
+                # resets per-PASS instead of per-call because the walk
+                # itself (unlike Phase 2's write) can legitimately span
+                # multiple rebuild() calls.
+                #
+                # _walk_error_confirmed_fresh is set alongside this reset
+                # for a subtle but critical reason (code-review fix,
+                # fa600e42): on a genuinely fresh instance, self._connect()
+                # -- and therefore _rehydrate_walk_state_from_disk -- has
+                # NOT run yet at this point in rebuild() (see that method's
+                # own docstring: in the real production call order, the
+                # first _connect() doesn't happen until mid-Phase-2 of this
+                # SAME call, well after this reset). Rehydration's merge
+                # rule for this field is "fill only if still None" -- so
+                # without this flag, the very reset meant to clear a
+                # resolved error would instead look EXACTLY like "nothing
+                # known yet," and rehydration would immediately reload the
+                # stale pre-restart error right back in and re-persist it,
+                # completely undoing this fix on every fresh-process
+                # restart. The flag tells rehydration "Phase 0 already
+                # established a current answer this instance -- do not
+                # override it with whatever was on disk before."
+                self._last_walk_error = None
+                self._walk_error_confirmed_fresh = True
                 self._walk_state = _ResumableFileWalk(
                     self.outputs_dir, exclude_patterns=self._exclude_patterns,
                     max_batch=walk_batch, on_error=self._record_walk_error,
@@ -3561,6 +4078,66 @@ class OutputsFtsIndex:
             if self._manifest.get(p) != sig or p not in self._row_cache:
                 self._pending_stale[p] = sig
 
+        # 89612890 -- opt-in content-based staleness, layered ON TOP of the
+        # fast mtime/size check above (which stays the documented default
+        # and is NEVER disabled by this). Fast staleness cannot detect a
+        # same-size+same-mtime content rewrite (a backdated mtime, or a
+        # coarse-resolution filesystem) -- by construction, `sig` compares
+        # equal to what's stored and the file never enters `_pending_stale`.
+        # "strict" content-verifies every file the fast check just cleared;
+        # "sampled" verifies a random subset (staleness_sample_rate) to
+        # bound the cost on a large tree while still catching some of this
+        # class of miss. Synchronous, not dispatched to Phase 1's
+        # ThreadPoolExecutor -- this is Phase 0, before the analysis_limit
+        # backlog-bounding below even runs, and is expected to cost real
+        # I/O proportional to how much of `newly_seen` this call clears;
+        # that cost is exactly what opting into a non-"fast" mode means.
+        if staleness_mode != "fast":
+            for p in newly_seen:
+                # Code review: this loop does real synchronous file I/O
+                # (open + full read + hash) per path, dispatched to NO
+                # thread pool, with NO deadline check -- reproducing,
+                # for content hashing, the exact "no deadline awareness ->
+                # runs to completion regardless of budget" bug class
+                # Phase 1's own ThreadPoolExecutor dispatch was fixed for
+                # (see phase1_deadline_hit below). Bounded by the SAME
+                # phase1_deadline the walk itself respects (5845cc6d's own
+                # reasoning: a sub-deadline here too, so this can never
+                # consume the whole budget and starve Phase 1/2 of a
+                # chance to run at all) -- checked once per path, same
+                # granularity as _ResumableFileWalk.drain()'s own check.
+                if (
+                    phase1_deadline is not None
+                    and time.monotonic() > phase1_deadline
+                ):
+                    break
+                if p in self._pending_stale:
+                    continue  # already confirmed stale by the fast check
+                if (
+                    staleness_mode == "sampled"
+                    and random.random() >= staleness_sample_rate
+                ):
+                    continue
+                fresh_hash = self._hasher(p)
+                if fresh_hash is None:
+                    continue  # unreadable now -- leave to the stat-based path
+                cached_row = self._row_cache.get(p)
+                stored_hash = cached_row.sha256 if cached_row is not None else None
+                if stored_hash is None or stored_hash != fresh_hash:
+                    # Either a genuine content mismatch, or no baseline hash
+                    # exists yet for this path (e.g. it was only ever
+                    # indexed under "fast" mode before, or has a unique
+                    # size the default size-prefilter never bothered to
+                    # hash). Both cases route through the SAME normal
+                    # Phase 1/2 analysis+write path below (not an ad-hoc
+                    # in-memory patch) so `_needs_hash`'s own staleness_mode
+                    # check above actually computes and DURABLY persists a
+                    # real hash this call -- establishing (or correcting)
+                    # the baseline a FUTURE call can trust, rather than
+                    # silently updating _row_cache in memory only and
+                    # leaving the on-disk row's content untouched.
+                    self._pending_stale[p] = self._manifest.get(p, (None, None))
+
         # b85394bd -- BOUNDED ANALYSIS INTAKE: `self._pending_stale` may hold
         # far more than one call should take on at once (discovery capacity
         # is now effectively unbounded per call -- see `walk_batch` above --
@@ -3584,6 +4161,15 @@ class OutputsFtsIndex:
         self.last_rebuild_metrics["analysis_backlog_deferred"] = (
             len(stale_all) - len(stale)
         )
+        # 89612890 -- captured HERE (before Phase 2's write mutates
+        # _row_cache) since "was this path already indexed before this
+        # call" can only be answered before that mutation happens: a path
+        # already in _row_cache is a genuine RE-analysis (content/stat
+        # changed since it was last indexed); one that isn't is a brand-new
+        # discovery. `rows_changed` (set at the tail of this method) counts
+        # both together -- this distinguishes them.
+        files_reanalyzed_this_call = sum(1 for p in stale if p in self._row_cache)
+        files_new_this_call = len(stale) - files_reanalyzed_this_call
 
         # Parallel per-file analysis for stale paths (fingerprint + hash + stat).
         # Workers run before the write lock is taken so heavy I/O (e.g. hashing
@@ -3619,6 +4205,16 @@ class OutputsFtsIndex:
                 # cheapest to skip. Confirmed via
                 # TestHashAlgoVersionUpgrade::test_legacy_db_triggers_full_rehash_on_upgrade.
                 if self._pending_hash_upgrade:
+                    return True
+                # 89612890 -- strict/sampled staleness needs a REAL,
+                # durably-persisted content hash for every file it might
+                # need to compare against a future call, not just the
+                # size-collision subset the fast/default path bothers to
+                # hash. Without this, a unique-size file would never get a
+                # baseline hash at all (see the size-prefilter's own
+                # rationale above), and content-based staleness could never
+                # be established for it, regardless of staleness_mode.
+                if staleness_mode != "fast":
                     return True
                 sz = stale_sigs.get(p, (None, None))[1]
                 return sz is None or size_counts.get(sz, 0) > 1
@@ -3781,20 +4377,66 @@ class OutputsFtsIndex:
             # Repair caches written by pre-canonicalization versions before
             # the normal staleness pass. This runs under the write lease so a
             # repair cannot race another process's row update.
-            try:
-                legacy_paths_migrated = (
-                    self._migrate_legacy_storage_paths_locked(self._connect())
+            #
+            # Throttled (task_ecb96ac9 follow-on, perf): the scan itself is
+            # memory-safe (excludes content), but it's still O(rows already
+            # indexed) EVERY call -- confirmed live on the SUT_Compressed
+            # qualification run: by ~98k indexed rows this was re-scanning
+            # nearly 100k rows of metadata every single call to find
+            # duplicates that essentially never exist once a process's own
+            # writes are already canonical. Legacy duplicates only arise from
+            # genuinely pre-canonicalization on-disk data (a one-time,
+            # first-scan concern) or a concurrent SECOND process racing a
+            # write for the same path (an ongoing but comparatively rare
+            # concern) -- neither needs re-verifying on literally every call.
+            # Run it on the first call, skip up to
+            # _LEGACY_MIGRATION_RECHECK_INTERVAL calls after a clean scan,
+            # and re-run immediately (not throttled) the call right after any
+            # scan that actually found+fixed something, since that signals
+            # either a still-completing first pass or an active concurrent
+            # writer -- either way, worth staying vigilant rather than
+            # reverting straight back to the full throttle. This bounds the
+            # staleness window for the concurrent-writer case rather than
+            # eliminating the check permanently.
+            run_legacy_migration = (
+                not self._legacy_migration_ever_scanned
+                or self._legacy_migration_found_last_time
+                or self._legacy_migration_calls_since_scan
+                >= self._LEGACY_MIGRATION_RECHECK_INTERVAL
+            )
+            if run_legacy_migration:
+                migration_failed = False
+                try:
+                    legacy_paths_migrated = (
+                        self._migrate_legacy_storage_paths_locked(self._connect())
+                    )
+                except Exception as _path_migration_exc:  # noqa: BLE001
+                    legacy_paths_migrated = False
+                    migration_failed = True
+                    self.last_db_write_error = (
+                        f"{type(_path_migration_exc).__name__}: "
+                        f"{_path_migration_exc}"
+                    )
+                    _log.warning(
+                        "OutputsFtsIndex.rebuild: legacy path migration failed",
+                        exc_info=True,
+                    )
+                self._legacy_migration_ever_scanned = True
+                # A failed attempt must NOT be treated as a verified-clean
+                # scan -- that would buy it the full recheck-interval
+                # cooldown for a DB state we never actually confirmed,
+                # exactly backwards from Phase 2's own "resubmit next call"
+                # retry philosophy for write failures elsewhere in this
+                # method. Forcing found_last_time=True makes the NEXT call
+                # retry immediately instead, same as a scan that genuinely
+                # found (and needs to keep watching for) real duplicates.
+                self._legacy_migration_found_last_time = (
+                    True if migration_failed else legacy_paths_migrated
                 )
-            except Exception as _path_migration_exc:  # noqa: BLE001
+                self._legacy_migration_calls_since_scan = 0
+            else:
                 legacy_paths_migrated = False
-                self.last_db_write_error = (
-                    f"{type(_path_migration_exc).__name__}: "
-                    f"{_path_migration_exc}"
-                )
-                _log.warning(
-                    "OutputsFtsIndex.rebuild: legacy path migration failed",
-                    exc_info=True,
-                )
+                self._legacy_migration_calls_since_scan += 1
             self._ingest_meridian_notes(all_paths)
             rows, changed, paths_to_delete, new_rows = (
                 self._apply_precomputed(
@@ -4104,6 +4746,23 @@ class OutputsFtsIndex:
                 "partial": bool(self.last_rebuild_partial),
                 "fts_pending": bool(self._fts_pending),
             })
+            # 89612890 -- bounded-scale-run telemetry: files examined/re-
+            # analyzed, queue depth, checkpoint/recovery state, index size,
+            # and process RSS, all in the SAME per-call metrics dict a scale
+            # run already reads (last_rebuild_metrics / search_outputs's
+            # "discovery" key) instead of requiring a separate
+            # get_convergence_state() call to piece the picture together.
+            self.last_rebuild_metrics.update({
+                "files_examined": len(newly_seen),
+                "files_reanalyzed": files_reanalyzed_this_call,
+                "files_new": files_new_this_call,
+                "queue_depth": len(self._pending_stale),
+                "checkpoint_walk_epoch": self._walk_epoch,
+                "checkpoint_walk_pass_complete": bool(self._walk_pass_confirmed_complete),
+                "checkpoint_scan_boundary": self._scan_boundary,
+                "index_db_bytes": self._index_db_file_size(),
+                "process_rss_bytes": self._current_process_rss_bytes(),
+            })
             return len(rows)
         finally:
             self._write_lock.release()
@@ -4399,6 +5058,71 @@ class OutputsFtsIndex:
     # ------------------------------------------------------------------
     # Explicit convergence state (item 6af1518d, requirement 1 & 2)
     # ------------------------------------------------------------------
+
+    def get_directory_progress(self) -> dict[str, Any]:
+        """Per-top-level-directory walk/backlog progress (item 89612890).
+
+        A directory-granular VIEW built entirely from existing state (one
+        :meth:`get_convergence_state` call per immediate child directory of
+        ``outputs_dir``) -- no change to the underlying walk's own
+        traversal algorithm or persisted schema.
+
+        Scope decision, stated plainly: this does NOT make a restarted walk
+        skip re-``os.scandir``-ing directories it has already fully passed
+        -- doing that safely runs into the same rehydration-timing hazard
+        fa600e42's own walk-error fix had to solve (see
+        ``_walk_error_confirmed_fresh`` and its docstring on
+        :meth:`_rehydrate_walk_state_from_disk`): on a genuinely fresh
+        process, in the documented real production call order, the first
+        :meth:`_connect` (and therefore rehydration) does not run until
+        mid-Phase-2 of :meth:`rebuild`, well AFTER Phase 0 would need to
+        know a skip-set to seed a resumed walk correctly. Reading persisted
+        state early enough to seed that skip-set would mean either
+        reordering ``_connect()`` ahead of Phase 0 (reintroducing the exact
+        "clobbered same-call discoveries" bug sprint item 6b5ecdc5 fixed by
+        deferring that same ordering) or duplicating rehydration's own DB
+        read outside its documented merge logic -- both the kind of
+        "major... redesign" this program's own qualification explicitly
+        defers. What this method DOES give a caller: real, directory-
+        granular insight into what remains converged vs. still pending,
+        without altering how the walk itself resumes.
+
+        Cost, stated plainly (code review): each directory's
+        :meth:`get_convergence_state` call does a full linear scan over
+        ``self._pending_stale`` when scoped to a subtree -- this method
+        calls it once per top-level directory, making the total cost
+        O(directories x pending-backlog-size), uncapped. Fine for
+        occasional, human-triggered inspection; not a substitute for a
+        cheap per-call telemetry field a caller would poll frequently on a
+        large tree with a sizeable backlog.
+        """
+        try:
+            top_level = sorted(
+                e.name for e in os.scandir(self.outputs_dir)
+                if e.is_dir(follow_symlinks=False) and not e.name.startswith(".")
+            )
+        except OSError:
+            return {
+                "outputs_dir": self.outputs_dir, "directories": [],
+                "error": "could not list outputs_dir",
+            }
+
+        directories = []
+        for name in top_level:
+            sub_state = self.get_convergence_state(
+                subtree=os.path.join(self.outputs_dir, name),
+            )
+            directories.append({
+                "name": name,
+                "converged": sub_state.converged,
+                "pending_stale_count": sub_state.pending_count,
+            })
+        return {
+            "outputs_dir": self.outputs_dir,
+            "walk_pass_complete": bool(self._walk_pass_confirmed_complete),
+            "scan_boundary": self._scan_boundary,
+            "directories": directories,
+        }
 
     def get_convergence_state(self, subtree: str | None = None) -> "ConvergenceState":
         """Return an explicit, structured convergence-state snapshot.
@@ -5412,8 +6136,18 @@ def search_outputs(
     include_archival: bool = True,
     max_seconds: float | None = DEFAULT_REBUILD_BUDGET_SECONDS,
     subtree: str | None = None,
+    staleness_mode: str = "fast",
+    staleness_sample_rate: float = 0.1,
 ) -> dict[str, Any]:
     """BM25 search over a local outputs tree.
+
+    ``staleness_mode`` (item 89612890, optional, default ``"fast"``): the
+    documented default is stat-based (mtime+size) staleness, which cannot
+    detect a same-size+same-mtime content rewrite. ``"strict"`` content-
+    hash-verifies every file the fast check just cleared this call;
+    ``"sampled"`` verifies a random ``staleness_sample_rate`` fraction of
+    them. Both cost real, opt-in-only extra I/O proportional to how much of
+    the tree this call re-examines -- see :meth:`OutputsFtsIndex.rebuild`.
 
     ``subtree`` (item 6af1518d requirement 4, optional): scope indexing AND
     searching to a sub-path of ``outputs_dir`` without requiring a full
@@ -5500,7 +6234,11 @@ def search_outputs(
         result["subtree"] = subtree
     else:
         index = _get_cached_index(outputs_dir)
-    result["total_indexed"] = index.rebuild(max_seconds=max_seconds)
+    result["total_indexed"] = index.rebuild(
+        max_seconds=max_seconds,
+        staleness_mode=staleness_mode,
+        staleness_sample_rate=staleness_sample_rate,
+    )
     # b1789c0d -- expose cumulative row count from the DB (which may be
     # larger than total_indexed on a partial rebuild that resumes prior work)
     # so callers can distinguish "cold tree, indexing in progress" from

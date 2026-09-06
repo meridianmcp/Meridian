@@ -866,3 +866,336 @@ def test_split_cell_and_transpose_are_zip_valid_after_write(tmp_path, monkeypatc
     docs_intel.transpose_table(path, table_index=1)
     with zipfile.ZipFile(path) as zf:
         assert zf.testzip() is None
+
+
+# ---------------------------------------------------------------------------
+# insert_table / remove_table (0a1e9c22)
+# ---------------------------------------------------------------------------
+
+_NO_TABLE_WITH_HEADING_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="{_W}" xmlns:w14="{_W14}">
+  <w:body>
+    <w:p w14:paraId="H0000001"><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Section One</w:t></w:r></w:p>
+    <w:p w14:paraId="P0000001"><w:r><w:t>Section one body.</w:t></w:r></w:p>
+    <w:p w14:paraId="H0000002"><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Subsection</w:t></w:r></w:p>
+    <w:p w14:paraId="P0000002"><w:r><w:t>Subsection body.</w:t></w:r></w:p>
+    <w:p w14:paraId="H0000003"><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Section Two</w:t></w:r></w:p>
+    <w:p w14:paraId="P0000003"><w:r><w:t>Section two body.</w:t></w:r></w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+_BOOKMARK_ACROSS_TWO_PARAGRAPHS_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="{_W}" xmlns:w14="{_W14}">
+  <w:body>
+    <w:p w14:paraId="P0000001">
+      <w:bookmarkStart w:id="1" w:name="spans"/>
+      <w:r><w:t>First half.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="P0000002">
+      <w:r><w:t>Second half.</w:t></w:r>
+      <w:bookmarkEnd w:id="1"/>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def test_insert_table_after_anchor_lands_where_expected(tmp_path, monkeypatch):
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    result = docs_intel.insert_table(path, anchor_para_id="p0", rows=2, cols=3, position="after")
+
+    assert result["status"] == "inserted"
+    assert result["row_count"] == 2
+    assert result["col_count"] == 3
+    assert result["render_verified"] is True
+    tbl = _table(path, result["table_index"])
+    assert _grid_col_count(tbl) == 3
+    assert _cell_texts(tbl) == [["", "", ""], ["", "", ""]]
+
+
+def test_insert_table_before_anchor_lands_before_it(tmp_path, monkeypatch):
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    result = docs_intel.insert_table(path, anchor_para_id="p0", rows=1, cols=1, position="before")
+
+    root = _load(path)
+    body_list = list(root.find(docs_intel._q(_W, "body")))
+    assert body_list[result["table_index"]].tag == docs_intel._q(_W, "tbl")
+    assert result["table_index"] == 0
+
+
+def test_insert_table_uses_table_grid_style(tmp_path, monkeypatch):
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    docs_intel.insert_table(path, anchor_para_id="p0", rows=1, cols=1, position="after")
+
+    tbl = _table(path, 1)
+    style = tbl.find(docs_intel._q(_W, "tblPr")).find(docs_intel._q(_W, "tblStyle"))
+    assert style.get(docs_intel._q(_W, "val")) == "TableGrid"
+
+
+def test_insert_table_with_cell_texts_fills_them_in(tmp_path, monkeypatch):
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    docs_intel.insert_table(
+        path, anchor_para_id="p0", rows=2, cols=2,
+        cell_texts=[["a", "b"], ["c", "d"]],
+    )
+
+    tbl = _table(path, 1)
+    assert _cell_texts(tbl) == [["a", "b"], ["c", "d"]]
+
+
+def test_insert_table_new_cells_have_fresh_unique_para_ids(tmp_path, monkeypatch):
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    docs_intel.insert_table(path, anchor_para_id="p0", rows=2, cols=2)
+
+    tbl = _table(path, 1)
+    ids = [
+        p.get(docs_intel._q(_W14, "paraId"))
+        for tr in tbl.findall(docs_intel._q(_W, "tr"))
+        for tc in tr.findall(docs_intel._q(_W, "tc"))
+        for p in tc.findall(docs_intel._q(_W, "p"))
+    ]
+    assert all(ids)
+    assert len(set(ids)) == len(ids)
+
+
+def test_insert_table_after_heading_lands_after_whole_section(tmp_path, monkeypatch):
+    """Mirrors relocate_table's own heading-anchor behavior: an "after"
+    anchor resolving to a heading lands after that heading's ENTIRE
+    section (body + subsections), not merely after the heading paragraph."""
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_WITH_HEADING_XML)
+
+    result = docs_intel.insert_table(
+        path, anchor_para_id="H0000001", rows=1, cols=1, position="after",
+    )
+
+    root = _load(path)
+    body_list = list(root.find(docs_intel._q(_W, "body")))
+    w14_paraId = docs_intel._q(_W14, "paraId")
+    table_pos = result["table_index"]
+    # Section One's subsection (H0000002 + its body) must come BEFORE the
+    # table -- i.e. the table landed after ALL of Section One, not right
+    # after its own heading paragraph.
+    subsection_idx = next(
+        i for i, el in enumerate(body_list) if el.get(w14_paraId) == "H0000002"
+    )
+    assert subsection_idx < table_pos
+    # Section Two must come AFTER the table.
+    section_two_idx = next(
+        i for i, el in enumerate(body_list) if el.get(w14_paraId) == "H0000003"
+    )
+    assert section_two_idx > table_pos
+
+
+def test_insert_table_rejects_bad_position(tmp_path):
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    result = docs_intel.insert_table(path, anchor_para_id="p0", rows=1, cols=1, position="sideways")
+
+    assert "error" in result
+
+
+def test_insert_table_rejects_non_positive_rows_or_cols(tmp_path):
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    assert "error" in docs_intel.insert_table(path, anchor_para_id="p0", rows=0, cols=1)
+    assert "error" in docs_intel.insert_table(path, anchor_para_id="p0", rows=1, cols=-1)
+    assert "error" in docs_intel.insert_table(path, anchor_para_id="p0", rows=True, cols=1)
+
+
+def test_insert_table_rejects_mismatched_cell_texts_shape(tmp_path):
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+    before = open(path, "rb").read()
+
+    result = docs_intel.insert_table(
+        path, anchor_para_id="p0", rows=2, cols=2, cell_texts=[["only one row"]],
+    )
+
+    assert "error" in result
+    assert open(path, "rb").read() == before
+
+
+def test_insert_table_rejects_unknown_anchor(tmp_path):
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+    before = open(path, "rb").read()
+
+    result = docs_intel.insert_table(path, anchor_para_id="bogus", rows=1, cols=1)
+
+    assert "error" in result
+    assert open(path, "rb").read() == before
+
+
+def test_insert_table_between_a_bookmarks_start_and_end_is_not_a_split(tmp_path, monkeypatch):
+    """Unlike remove_table/relocate_table, inserting brand-new content
+    between an existing bookmarkStart and bookmarkEnd only widens the
+    bookmark's span -- it can never sever it, so this must succeed with no
+    bookmark-split guard at all."""
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _BOOKMARK_ACROSS_TWO_PARAGRAPHS_XML)
+
+    result = docs_intel.insert_table(path, anchor_para_id="P0000001", rows=1, cols=1, position="after")
+
+    assert result["status"] == "inserted"
+
+
+def test_insert_table_render_failed_restores_and_errors(tmp_path, monkeypatch):
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+    before = open(path, "rb").read()
+    monkeypatch.setattr(
+        docs_intel.render_gate, "check_render_capability",
+        lambda p, **kwargs: {"status": "failed", "backend": "test-stub", "detail": {"reason": "boom"}},
+    )
+
+    result = docs_intel.insert_table(path, anchor_para_id="p0", rows=1, cols=1)
+
+    assert "error" in result
+    assert open(path, "rb").read() == before
+
+
+def test_insert_table_allow_degraded_render_requires_non_empty_reason(tmp_path):
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    result = docs_intel.insert_table(
+        path, anchor_para_id="p0", rows=1, cols=1, allow_degraded_render=True,
+    )
+
+    assert "error" in result
+
+
+def test_insert_table_server_wrapper_delegates(tmp_path, monkeypatch):
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    result = server.insert_table(path, anchor_para_id="p0", rows=1, cols=1)
+
+    assert result["status"] == "inserted"
+
+
+def test_remove_table_removes_it_and_preserves_surrounding_content(tmp_path, monkeypatch):
+    path = _write_docx(tmp_path, _SIMPLE_2X2_XML)
+
+    result = docs_intel.remove_table(path, table_index=1)
+
+    assert result["status"] == "removed"
+    assert result["row_count"] == 2
+    assert result["col_count"] == 2
+    root = _load(path)
+    body_list = list(root.find(docs_intel._q(_W, "body")))
+    assert not any(el.tag == docs_intel._q(_W, "tbl") for el in body_list)
+    w14_paraId = docs_intel._q(_W14, "paraId")
+    body_ids = [el.get(w14_paraId) for el in body_list]
+    assert "P0000001" in body_ids and "P0000002" in body_ids
+
+
+def test_remove_table_rejects_bad_table_index(tmp_path):
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    result = docs_intel.remove_table(path, table_index=0)
+
+    assert "error" in result
+    assert "not a <w:tbl>" in result["error"]
+
+
+def test_remove_table_rejects_out_of_range_index(tmp_path):
+    path = _write_docx(tmp_path, _SIMPLE_2X2_XML)
+    before = open(path, "rb").read()
+
+    result = docs_intel.remove_table(path, table_index=99)
+
+    assert "error" in result
+    assert open(path, "rb").read() == before
+
+
+def test_remove_table_does_not_invoke_the_render_gate(tmp_path, monkeypatch):
+    """Deleting valid content can't manufacture malformed OOXML -- same
+    reasoning relocate_table already applies to a move."""
+    path = _write_docx(tmp_path, _SIMPLE_2X2_XML)
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("remove_table must not call the render gate")
+
+    monkeypatch.setattr(docs_intel.render_gate, "check_render_capability", _boom)
+
+    result = docs_intel.remove_table(path, table_index=1)
+
+    assert result["status"] == "removed"
+
+
+def test_remove_table_rejects_split_bookmark_by_default(tmp_path):
+    """A bookmark starting BEFORE the table and ending INSIDE one of its own
+    cells would have its end carried away by the removal while its start
+    stays behind -- genuinely split, must be refused."""
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="{_W}" xmlns:w14="{_W14}">
+  <w:body>
+    <w:p w14:paraId="P0000001">
+      <w:bookmarkStart w:id="1" w:name="spans"/>
+      <w:r><w:t>Before.</w:t></w:r>
+    </w:p>
+    <w:tbl>
+      <w:tblGrid><w:gridCol w:w="1000"/></w:tblGrid>
+      <w:tr><w:tc><w:p><w:r><w:t>Cell.</w:t></w:r></w:p><w:bookmarkEnd w:id="1"/></w:tc></w:tr>
+    </w:tbl>
+    <w:p w14:paraId="P0000002">
+      <w:r><w:t>After.</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+    path = _write_docx(tmp_path, xml)
+    before = open(path, "rb").read()
+
+    result = docs_intel.remove_table(path, table_index=1)
+
+    assert "error" in result
+    assert result["reason"] == "split_bookmarks"
+    assert open(path, "rb").read() == before
+
+
+def test_remove_table_server_wrapper_delegates(tmp_path):
+    path = _write_docx(tmp_path, _SIMPLE_2X2_XML)
+
+    result = server.remove_table(path, table_index=1)
+
+    assert result["status"] == "removed"
+
+
+def test_insert_then_remove_table_round_trip_restores_original_document(tmp_path, monkeypatch):
+    _rendered_ok(monkeypatch)
+    path = _write_docx(tmp_path, _NO_TABLE_XML)
+
+    def _paragraph_texts_and_tags(p):
+        root = _load(p)
+        body_list = list(root.find(docs_intel._q(_W, "body")))
+        from meridian_docs._vendored_content_tree import _paragraph_text
+        return [
+            (el.tag, _paragraph_text(el) if el.tag == docs_intel._q(_W, "p") else None)
+            for el in body_list
+        ]
+
+    original = _paragraph_texts_and_tags(path)
+
+    insert_result = docs_intel.insert_table(
+        path, anchor_para_id="p0", rows=2, cols=2, cell_texts=[["a", "b"], ["c", "d"]],
+    )
+    assert insert_result["status"] == "inserted"
+
+    remove_result = docs_intel.remove_table(path, table_index=insert_result["table_index"])
+    assert remove_result["status"] == "removed"
+
+    final = _paragraph_texts_and_tags(path)
+    assert final == original, "the round trip must restore the exact original body structure and text"

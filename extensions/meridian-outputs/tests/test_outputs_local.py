@@ -16,7 +16,9 @@ Covers:
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import socket
@@ -47,6 +49,111 @@ def _make_dir(tmp_path: Path, files: dict[str, str]) -> str:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
     return str(tmp_path)
+
+
+def _make_minimal_pdf_bytes(text: str, *, num_pages: int = 1) -> bytes:
+    """Hand-build a minimal, well-formed PDF with a correct xref table.
+
+    aa423c7e -- No PDF-writing library (reportlab/fpdf2/PyMuPDF) is available
+    in this environment (fpdf2 is only ever a transitive lockfile entry, per
+    the sprint item's discovery notes -- never a direct, importable
+    dependency), so real .pdf test fixtures for the new pdf_content
+    extraction path are built directly here. Every page repeats the same
+    single-line text content stream; byte offsets for the xref table are
+    computed programmatically (never hardcoded) so this stays correct for
+    any ``num_pages``. Verified to parse and extract cleanly under the
+    ``pypdf`` version pinned in pyproject.toml/pixi.toml before being relied
+    on by the tests below.
+    """
+    page_obj_nums = list(range(3, 3 + num_pages))
+    content_obj_nums = list(range(3 + num_pages, 3 + 2 * num_pages))
+    font_obj_num = 3 + 2 * num_pages
+
+    objects: list[bytes] = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        (
+            f"<< /Type /Pages /Kids [{' '.join(f'{n} 0 R' for n in page_obj_nums)}] "
+            f"/Count {num_pages} >>"
+        ).encode("ascii"),
+    ]
+    for page_num, content_num in zip(page_obj_nums, content_obj_nums):
+        objects.append(
+            (
+                f"<< /Type /Page /Parent 2 0 R "
+                f"/Resources << /Font << /F1 {font_obj_num} 0 R >> >> "
+                f"/MediaBox [0 0 300 300] /Contents {content_num} 0 R >>"
+            ).encode("ascii")
+        )
+    stream_body = f"BT /F1 12 Tf 20 250 Td ({text}) Tj ET".encode("ascii")
+    for _ in content_obj_nums:
+        objects.append(
+            f"<< /Length {len(stream_body)} >>\nstream\n".encode("ascii")
+            + stream_body + b"\nendstream"
+        )
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+
+    buf = io.BytesIO()
+    buf.write(b"%PDF-1.4\n")
+    offsets: list[int] = [0]
+    for i, obj_body in enumerate(objects, start=1):
+        offsets.append(buf.tell())
+        buf.write(f"{i} 0 obj\n".encode("ascii"))
+        buf.write(obj_body)
+        buf.write(b"\nendobj\n")
+
+    xref_offset = buf.tell()
+    n = len(objects) + 1
+    buf.write(f"xref\n0 {n}\n".encode("ascii"))
+    buf.write(b"0000000000 65535 f \n")
+    for off in offsets[1:]:
+        buf.write(f"{off:010d} 00000 n \n".encode("ascii"))
+    buf.write(
+        f"trailer\n<< /Size {n} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF"
+        .encode("ascii")
+    )
+    return buf.getvalue()
+
+
+try:
+    import pypdf  # noqa: F401
+    _PYPDF_AVAILABLE = True
+except ImportError:
+    _PYPDF_AVAILABLE = False
+
+pypdf_required = pytest.mark.skipif(
+    not _PYPDF_AVAILABLE, reason="pypdf not installed"
+)
+
+
+@contextlib.contextmanager
+def inject_db_write_failure(exc: Exception | None = None):
+    """Shared helper (89612890) consolidating the previously hand-rolled,
+    independently-duplicated ``_boom``/``patch.object(_ensure_schema, ...)``
+    pattern already used across several tests in this file (e.g. around
+    ``test_rebuild_surfaces_db_write_error_instead_of_silent_debug_log``,
+    ``test_db_write_failure_does_not_permanently_drop_file_from_index``).
+    Injects a DB-write-path failure by patching
+    ``OutputsFtsIndex._ensure_schema`` (the first call inside Phase 2's
+    write_lock-held section) to raise ``exc``.
+
+    Windows limitation, documented rather than silently worked around
+    (89612890): a REAL OS-level disk-full or permission-denied condition is
+    not reliably triggerable on Windows without admin rights (no quota-
+    based disk-full trigger available to an ordinary process, no reliable
+    owner-process-blocking chmod equivalent). Every failure this helper --
+    and every existing test using the pattern it consolidates -- injects is
+    therefore a Python-level exception at the call boundary, not a genuine
+    OS-level write failure. That is an accepted, indeterminate-on-Windows
+    limitation of this test suite, not a problem this helper solves.
+    """
+    if exc is None:
+        exc = RuntimeError("simulated disk-full / connection failure")
+
+    def _boom(self, con):  # noqa: ANN001 -- matches _ensure_schema's real signature
+        raise exc
+
+    with patch.object(OL.OutputsFtsIndex, "_ensure_schema", _boom):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -760,13 +867,171 @@ class TestClassifySuffix:
         ("data.csv", "text_content"),
         ("data.CSV", "text_content"),
         ("result.json", "text_content"),
+        # fa600e42 -- bounded plaintext allowlist additions.
+        ("readme.txt", "text_content"),
+        ("NOTES.TXT", "text_content"),
+        ("summary.md", "text_content"),
+        ("run.log", "text_content"),
         ("weights.npy", "metadata_only"),
         ("figure.png", "binary_metadata"),
         ("model.pt", "binary_metadata"),
         ("noext", "binary_metadata"),
+        # aa423c7e -- bounded plaintext allowlist widening: analysis/document
+        # source formats with zero prior coverage.
+        ("analysis.R", "text_content"),
+        ("ANALYSIS.R", "text_content"),
+        ("notebook.qmd", "text_content"),
+        ("report.Rmd", "text_content"),
+        ("REPORT.RMD", "text_content"),
+        ("preamble.sty", "text_content"),
+        # aa423c7e -- .yml/.yaml: safe by construction because is_secret_path
+        # excludes the risky basenames (config.yml, secrets.yaml, ...) at the
+        # walk stage, upstream of this suffix-only classifier -- see
+        # TestYamlSecretExclusionStillApplies below for that boundary.
+        ("environment.yml", "text_content"),
+        ("params.yaml", "text_content"),
+        ("config.yaml", "text_content"),  # suffix-only: secrecy is a separate layer
+        # aa423c7e -- PDF gets its own "pdf_content" kind, not text_content
+        # (binary container format, not UTF-8-decodable plaintext).
+        ("document.pdf", "pdf_content"),
+        ("DOCUMENT.PDF", "pdf_content"),
     ])
     def test_classification(self, path: str, expected: str) -> None:
         assert OL._classify_suffix(path) == expected
+
+
+# ---------------------------------------------------------------------------
+# _sanitize_text_content / NUL-byte handling (sprint item fa600e42)
+# ---------------------------------------------------------------------------
+
+class TestSanitizeTextContent:
+    def test_no_nul_bytes_returns_unchanged(self) -> None:
+        text = "plain text\nwith two lines\n"
+        assert OL._sanitize_text_content(text) == text
+
+    def test_strips_embedded_nul_bytes(self) -> None:
+        text = "before\x00after"
+        assert OL._sanitize_text_content(text) == "beforeafter"
+
+    def test_strips_multiple_nul_bytes(self) -> None:
+        text = "\x00a\x00b\x00c\x00"
+        assert OL._sanitize_text_content(text) == "abc"
+
+
+# ---------------------------------------------------------------------------
+# Bounded plaintext body indexing: .txt/.md/.log (sprint item fa600e42)
+# ---------------------------------------------------------------------------
+
+class TestPlaintextBodyIndexing:
+    @pytest.mark.parametrize("filename", ["notes.txt", "README.md", "run.log"])
+    def test_body_content_is_read_and_classified_as_text(
+        self, tmp_path: Path, filename: str,
+    ) -> None:
+        f = tmp_path / filename
+        f.write_text("generated by train.py\nloss: 0.05\n", encoding="utf-8")
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.kind == "text_content"
+
+        content = OL._content_for_fts(str(f), fp)
+        assert "loss: 0.05" in content
+        assert filename in content
+
+    def test_generating_script_hint_recognised_in_plain_text(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "run.log"
+        f.write_text("started run\ngenerated by train.py\ndone\n", encoding="utf-8")
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.generating_script == "train.py"
+
+    def test_embedded_nul_byte_stripped_from_indexed_body(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "corrupted.log"
+        with open(f, "wb") as fh:
+            fh.write(b"alpha \x00 beta\n")
+
+        fp = OL.file_fingerprint(str(f))
+        content = OL._content_for_fts(str(f), fp)
+
+        assert "\x00" not in content
+        assert "alpha" in content
+        assert "beta" in content
+
+    def test_secret_shaped_file_excluded_before_reaching_allowlist(
+        self,
+    ) -> None:
+        # is_secret_path (checked during the walk, upstream of _classify_suffix)
+        # must still exclude a secret-shaped file regardless of the bounded
+        # plaintext allowlist expanding to cover .txt/.md/.log generally.
+        assert OL.is_secret_path("/outputs/run_1/.env") is True
+
+    # aa423c7e -- widened-allowlist additions: .R/.qmd/.Rmd/.sty/.yml/.yaml
+    # follow the identical body-indexing contract as .txt/.md/.log above.
+    @pytest.mark.parametrize("filename", [
+        "analysis.R", "notebook.qmd", "report.Rmd", "preamble.sty",
+        "environment.yml", "params.yaml",
+    ])
+    def test_new_suffixes_body_content_is_read_and_classified_as_text(
+        self, tmp_path: Path, filename: str,
+    ) -> None:
+        f = tmp_path / filename
+        f.write_text("generated by train.py\nloss: 0.05\n", encoding="utf-8")
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.kind == "text_content"
+
+        content = OL._content_for_fts(str(f), fp)
+        assert "loss: 0.05" in content
+        assert filename in content
+
+    def test_new_suffix_generating_script_hint_recognised(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "analysis.R"
+        f.write_text("started run\ngenerated by train.py\ndone\n", encoding="utf-8")
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.generating_script == "train.py"
+
+
+class TestYamlSecretExclusionStillApplies:
+    """aa423c7e -- widening _TEXT_CONTENT_SUFFIXES to include .yml/.yaml must
+    not newly body-index secret-shaped basenames: is_secret_path already
+    excludes them upstream (during the directory walk, before _classify_suffix
+    is ever consulted), and that exclusion is basename-pattern-based, not
+    suffix-based, so it is unaffected by this suffix-set widening."""
+
+    @pytest.mark.parametrize("basename", [
+        "config.yml", "config.yaml", "settings.yml", "settings.yaml",
+        "secrets.yml", "secrets.yaml", "vault.yml", "vault.yaml",
+    ])
+    def test_secret_shaped_yaml_basenames_still_excluded(
+        self, basename: str,
+    ) -> None:
+        assert OL.is_secret_path(f"/outputs/run_1/{basename}") is True
+
+    def test_non_secret_yaml_basename_is_not_excluded(self) -> None:
+        # environment.yml is the explicit non-secret counter-example already
+        # asserted at the is_secret_path level in test_outputs_local.py:177
+        # (TestIsSecretPath) -- this confirms it flows end to end through
+        # file_fingerprint/_content_for_fts as real body-indexed content too.
+        assert OL.is_secret_path("/outputs/run_1/environment.yml") is False
+
+    def test_non_secret_yaml_actually_gets_body_indexed_end_to_end(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "environment.yml"
+        f.write_text("name: myenv\ndependencies:\n  - numpy\n", encoding="utf-8")
+        assert OL.is_secret_path(str(f)) is False
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.kind == "text_content"
+        content = OL._content_for_fts(str(f), fp)
+        assert "dependencies" in content
+        assert "numpy" in content
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +1073,187 @@ class TestFileFingerprint:
         fp = OL.file_fingerprint("/nonexistent/file.csv")
         assert fp.kind == "text_content"
         assert fp.csv_columns is None
+
+
+# ---------------------------------------------------------------------------
+# PDF body-content indexing (sprint item aa423c7e)
+# ---------------------------------------------------------------------------
+
+class TestPdfBodyIndexing:
+    @pypdf_required
+    def test_pdf_body_extracted_via_file_fingerprint(self, tmp_path: Path) -> None:
+        f = tmp_path / "report.pdf"
+        f.write_bytes(_make_minimal_pdf_bytes("UNIQUE_PDF_TOKEN_9f2c hello world"))
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.kind == "pdf_content"
+        assert fp.pdf_text is not None
+        assert "UNIQUE_PDF_TOKEN_9f2c" in fp.pdf_text
+
+        content = OL._content_for_fts(str(f), fp)
+        assert "UNIQUE_PDF_TOKEN_9f2c" in content
+        assert "report.pdf" in content
+
+    @pypdf_required
+    def test_pdf_body_extracted_via_analyse_file_fast_path(
+        self, tmp_path: Path,
+    ) -> None:
+        # _analyse_file's single-read fast path (default _sha256_file hasher)
+        # must independently wire up the same pdf_content extraction as
+        # file_fingerprint -- it does not call file_fingerprint() for this
+        # kind, it reuses the bytes already read for hashing.
+        f = tmp_path / "report.pdf"
+        f.write_bytes(_make_minimal_pdf_bytes("UNIQUE_FASTPATH_TOKEN_3ab1"))
+
+        analysis = OL._analyse_file(str(f), OL._sha256_file)
+        assert analysis.fingerprint.kind == "pdf_content"
+        assert analysis.sha256 == OL._sha256_file(str(f))
+        assert analysis.content is not None
+        assert "UNIQUE_FASTPATH_TOKEN_3ab1" in analysis.content
+
+    @pypdf_required
+    def test_pdf_generating_script_hint_recognised_in_body_text(
+        self, tmp_path: Path,
+    ) -> None:
+        # aa423c7e -- PDF body text gets the same generating-script-hint
+        # inference every other text-shaped kind already has.
+        f = tmp_path / "report.pdf"
+        f.write_bytes(_make_minimal_pdf_bytes("generated by train.py"))
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.generating_script == "train.py"
+
+        analysis = OL._analyse_file(str(f), OL._sha256_file)
+        assert analysis.fingerprint.generating_script == "train.py"
+
+    def test_extract_pdf_text_exceeding_max_bytes_returns_none(
+        self, tmp_path: Path,
+    ) -> None:
+        if not _PYPDF_AVAILABLE:
+            pytest.skip("pypdf not installed")
+        data = _make_minimal_pdf_bytes("too big for the cap")
+        # Force the cap below the real (small) fixture's size.
+        assert OL._extract_pdf_text(data, max_bytes=1) is None
+
+    def test_pdf_exceeding_max_bytes_degrades_to_metadata_only_end_to_end(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if not _PYPDF_AVAILABLE:
+            pytest.skip("pypdf not installed")
+        f = tmp_path / "big.pdf"
+        f.write_bytes(_make_minimal_pdf_bytes("content that will be capped away"))
+        monkeypatch.setattr(OL, "_PDF_MAX_BYTES", 1)
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.kind == "pdf_content"
+        assert fp.pdf_text is None  # degraded, no exception
+
+        content = OL._content_for_fts(str(f), fp)
+        assert content == "big.pdf"  # header-only, no truncated/garbage body
+
+    def test_extract_pdf_text_exceeding_max_pages_returns_none(self) -> None:
+        if not _PYPDF_AVAILABLE:
+            pytest.skip("pypdf not installed")
+        data = _make_minimal_pdf_bytes("multi page content", num_pages=3)
+        assert OL._extract_pdf_text(data, max_pages=1) is None
+
+    def test_pdf_exceeding_max_pages_degrades_to_metadata_only_end_to_end(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if not _PYPDF_AVAILABLE:
+            pytest.skip("pypdf not installed")
+        f = tmp_path / "many_pages.pdf"
+        f.write_bytes(_make_minimal_pdf_bytes("page content", num_pages=3))
+        monkeypatch.setattr(OL, "_PDF_MAX_PAGES", 1)
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.kind == "pdf_content"
+        assert fp.pdf_text is None
+        content = OL._content_for_fts(str(f), fp)
+        assert content == "many_pages.pdf"
+
+    def test_malformed_pdf_degrades_gracefully_no_exception(self) -> None:
+        if not _PYPDF_AVAILABLE:
+            pytest.skip("pypdf not installed")
+        garbage = b"this is not a PDF at all, just plain bytes \x00\x01\x02" * 20
+        assert OL._extract_pdf_text(garbage) is None
+
+    def test_malformed_pdf_degrades_end_to_end(self, tmp_path: Path) -> None:
+        if not _PYPDF_AVAILABLE:
+            pytest.skip("pypdf not installed")
+        f = tmp_path / "corrupt.pdf"
+        f.write_bytes(b"%PDF-1.4\nnot actually a valid pdf body" * 5)
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.kind == "pdf_content"
+        assert fp.pdf_text is None
+        content = OL._content_for_fts(str(f), fp)
+        assert content == "corrupt.pdf"
+
+    def test_pdf_with_no_extractable_text_degrades_to_header_only(
+        self, tmp_path: Path,
+    ) -> None:
+        # A structurally valid single-page PDF with an EMPTY content stream
+        # (no text at all) -- extraction succeeds but yields nothing to index.
+        if not _PYPDF_AVAILABLE:
+            pytest.skip("pypdf not installed")
+        f = tmp_path / "blank.pdf"
+        f.write_bytes(_make_minimal_pdf_bytes(""))
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.kind == "pdf_content"
+        content = OL._content_for_fts(str(f), fp)
+        assert content == "blank.pdf"
+
+    def test_extraction_time_budget_exceeded_aborts_cleanly_with_partial_text(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # aa423c7e -- portable (no signal/alarm) time-budget enforcement:
+        # time.monotonic() is polled once for the deadline, then once before
+        # each page. Simulate "budget already exhausted before page 2" via a
+        # scripted monotonic() sequence -- deterministic, no real sleeping,
+        # no flakiness -- and confirm the loop breaks instead of processing
+        # every page, keeping whatever it already extracted (a clean abort,
+        # not a raise and not a hang).
+        if not _PYPDF_AVAILABLE:
+            pytest.skip("pypdf not installed")
+        data = _make_minimal_pdf_bytes("page text", num_pages=5)
+
+        clock = iter([0.0, 0.0] + [100.0] * 20)
+        monkeypatch.setattr(OL.time, "monotonic", lambda: next(clock))
+
+        result = OL._extract_pdf_text(data, timeout_seconds=5.0)
+        assert result is not None
+        # Only the first page's text made it in before the budget check
+        # tripped on page 2 -- proves it stopped early, not that it read
+        # everything then silently truncated at the end.
+        assert result.count("page text") == 1
+
+    def test_pypdf_dependency_missing_degrades_gracefully(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Mirrors TestXxh3Hasher.test_degrades_to_sha256_when_xxhash_unavailable:
+        # sys.modules[name] = None is the standard mechanism for forcing
+        # ImportError on the next `import name` regardless of real
+        # availability in this environment.
+        monkeypatch.setitem(sys.modules, "pypdf", None)
+        data = _make_minimal_pdf_bytes("irrelevant") if _PYPDF_AVAILABLE else b"%PDF-1.4\n"
+        assert OL._extract_pdf_text(data) is None
+
+    def test_pypdf_dependency_missing_degrades_end_to_end(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "pypdf", None)
+        f = tmp_path / "doc.pdf"
+        f.write_bytes(
+            _make_minimal_pdf_bytes("irrelevant") if _PYPDF_AVAILABLE else b"%PDF-1.4\n"
+        )
+
+        fp = OL.file_fingerprint(str(f))
+        assert fp.kind == "pdf_content"  # classification is suffix-based, unaffected
+        assert fp.pdf_text is None
+        content = OL._content_for_fts(str(f), fp)
+        assert content == "doc.pdf"
 
 
 # ---------------------------------------------------------------------------
@@ -965,6 +1411,52 @@ class TestOutputsFtsIndex:
         idx.close()
 
     @duckdb_required
+    @pypdf_required
+    def test_indexes_pdf_file_body_and_makes_it_searchable(
+        self, tmp_path: Path,
+    ) -> None:
+        # aa423c7e -- end-to-end: a PDF's extracted body text must actually be
+        # retrievable via search_outputs/OutputsFtsIndex.search, not just
+        # present in the fingerprint (see TestPdfBodyIndexing above for the
+        # narrower fingerprint/content-string-level coverage).
+        (tmp_path / "report.pdf").write_bytes(
+            _make_minimal_pdf_bytes("UNIQUE_PDF_SEARCH_TOKEN_c72e")
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            count = idx.rebuild()
+            assert count == 1
+            hits = idx.search("UNIQUE_PDF_SEARCH_TOKEN_c72e")
+            assert len(hits) == 1
+            assert "report.pdf" in hits[0]["path"]
+        finally:
+            idx.close()
+
+    @duckdb_required
+    @pypdf_required
+    def test_pdf_exceeding_caps_still_indexed_filename_only_searchable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A PDF that degrades to header-only (cap exceeded) is still a real
+        # indexed row -- filename-searchable, just without body content --
+        # exactly like any other binary_metadata file, never dropped/errored.
+        monkeypatch.setattr(OL, "_PDF_MAX_PAGES", 0)
+        (tmp_path / "oversized_report.pdf").write_bytes(
+            _make_minimal_pdf_bytes("UNIQUE_CAPPED_TOKEN_11aa")
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            count = idx.rebuild()
+            assert count == 1
+            # Body text was never extracted, so it must NOT be searchable.
+            assert idx.search("UNIQUE_CAPPED_TOKEN_11aa") == []
+            # But the file is still indexed and filename-searchable.
+            hits = idx.search("oversized_report")
+            assert len(hits) == 1
+        finally:
+            idx.close()
+
+    @duckdb_required
     def test_annotation_crud(self, tmp_path: Path) -> None:
         idx = OL.OutputsFtsIndex(str(tmp_path))
         idx.rebuild()
@@ -987,6 +1479,64 @@ class TestOutputsFtsIndex:
         annotations = idx.get_annotations_for_path(str(tmp_path))
         assert any("PCA=on" in (a.get("note") or "") for a in annotations)
         idx.close()
+
+    def test_meridian_notes_excluded_from_widened_text_allowlist(self) -> None:
+        """Code-review fix (fa600e42): widening _TEXT_CONTENT_SUFFIXES to
+        include .md must not ALSO pull this one reserved filename into the
+        regular body-indexing pipeline -- MERIDIAN_NOTES.md keeps its
+        pre-fa600e42 classification (annotation only, no separate content
+        row), every OTHER .md file is unaffected."""
+        assert OL._classify_suffix("MERIDIAN_NOTES.md") == "binary_metadata"
+        assert OL._classify_suffix("/some/dir/MERIDIAN_NOTES.md") == "binary_metadata"
+        assert OL._classify_suffix("summary.md") == "text_content"
+
+    @duckdb_required
+    def test_meridian_notes_not_double_indexed_as_content_row(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "MERIDIAN_NOTES.md").write_text(
+            "UNIQUE_NOTE_TOKEN_7f3a run with PCA=on", encoding="utf-8",
+        )
+        (tmp_path / "results.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            hits = idx.search("UNIQUE_NOTE_TOKEN_7f3a")
+            # The note's text must surface via annotations, never as its own
+            # independent text_content search hit.
+            assert not any(
+                os.path.basename(h["path"]) == OL.MERIDIAN_NOTES_FILENAME
+                for h in hits
+            )
+            annotations = idx.get_annotations_for_path(str(tmp_path))
+            assert any(
+                "UNIQUE_NOTE_TOKEN_7f3a" in (a.get("note") or "")
+                for a in annotations
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_meridian_notes_embedded_nul_byte_sanitized(
+        self, tmp_path: Path,
+    ) -> None:
+        """Code-review fix (fa600e42): _ingest_meridian_notes reads
+        MERIDIAN_NOTES.md through the same utf-8/errors=replace pattern as
+        _read_text_capped, but was not sanitizing embedded NUL bytes before
+        this fix -- unlike the other two text-read call sites."""
+        with open(tmp_path / "MERIDIAN_NOTES.md", "wb") as fh:
+            fh.write(b"alpha \x00 beta\n")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            ingested = idx._ingest_meridian_notes([str(tmp_path / "MERIDIAN_NOTES.md")])
+            assert ingested == 1
+            annotations = idx.get_annotations_for_path(str(tmp_path))
+            assert len(annotations) == 1
+            assert "\x00" not in annotations[0]["note"]
+            assert "alpha" in annotations[0]["note"]
+            assert "beta" in annotations[0]["note"]
+        finally:
+            idx.close()
 
     @duckdb_required
     def test_incremental_rebuild(self, tmp_path: Path) -> None:
@@ -2363,6 +2913,166 @@ class TestParallelRebuildCorrectness:
         finally:
             repaired.close()
 
+    @duckdb_required
+    def test_legacy_migration_scan_excludes_content_column(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression test for task_ecb96ac9: the SUT_Compressed whole-root
+        qualification run (632k files / 433 GiB) hit an allocator failure
+        inside the legacy-path migration because its dedup scan selected the
+        full extracted-text `content` column for every row before doing any
+        grouping. The scan must only ever select a `content IS NOT NULL`
+        presence flag, never the bare `content` column.
+        """
+        class _ExecuteSpy:
+            """Proxies a DuckDB connection, recording SQL text.
+
+            DuckDB's connection object is a C extension type with read-only
+            attributes, so `.execute` cannot be monkeypatched directly on it
+            -- this wraps it instead and is passed in place of the real
+            connection to the (test-only) direct call below.
+            """
+
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+                self.captured: list[str] = []
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                self.captured.append(sql)
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        spy = _ExecuteSpy(idx._connect())
+        try:
+            idx._migrate_legacy_storage_paths_locked(spy)
+        finally:
+            idx.close()
+
+        scan_sql = next(
+            sql for sql in spy.captured
+            if sql.strip().upper().startswith("SELECT")
+            and "OUTPUTS_INDEX" in sql.upper()
+        )
+        select_clause = scan_sql.split("FROM", 1)[0]
+        columns = [
+            c.strip().lower()
+            for c in select_clause.split("SELECT", 1)[1].split(",")
+        ]
+        assert not any(c == "content" for c in columns), (
+            f"bare `content` column must not be selected in the dedup scan: {columns!r}"
+        )
+        assert any("content is not null" in c for c in columns), (
+            f"expected a `content IS NOT NULL` presence flag in the scan: {columns!r}"
+        )
+
+    @duckdb_required
+    def test_legacy_migration_dedup_chunked_preserves_winner_content(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Dedup must still pick the canonical-spelling row and stage its
+        real content for Tantivy even when both the row-scan batch limit and
+        the winner-content lookup chunk are forced down to 1 -- i.e. the new
+        chunked reads (task_ecb96ac9) must not drop or scramble rows across
+        chunk boundaries, for multiple independent duplicate-path groups.
+
+        Note: the winner here is decided by the pre-existing, unchanged
+        `path == canonical` tie-break (highest priority in the selection
+        key) rather than by content/mtime/sha256 richness -- the "rich"/
+        "stale" naming reflects the deliberately-chosen setup (canonical
+        spelling paired with the richer values), not an independent
+        richness-based assertion.
+        """
+        import duckdb
+
+        db_path = str(tmp_path / "chunked.duckdb")
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx._ensure_schema(idx._connect())
+        idx.close()
+
+        con = duckdb.connect(db_path)
+        try:
+            for name, rich_content, stale_content in [
+                ("a.csv", "rich-A-content", "stale-A-content"),
+                ("b.csv", "rich-B-content", "stale-B-content"),
+            ]:
+                absolute_path = os.path.abspath(str(tmp_path / name))
+                legacy_path = os.path.relpath(absolute_path, start=os.getcwd())
+                con.execute(
+                    "INSERT INTO outputs_index (path, content, mtime, sha256, "
+                    "size, generating_script, kind, is_archival, "
+                    "canonical_path, csv_columns, json_keys) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, 'data', false, ?, NULL, NULL)",
+                    [absolute_path, rich_content, 200.0, "richsha", 10, absolute_path],
+                )
+                con.execute(
+                    "INSERT INTO outputs_index (path, content, mtime, sha256, "
+                    "size, generating_script, kind, is_archival, "
+                    "canonical_path, csv_columns, json_keys) "
+                    "VALUES (?, ?, ?, NULL, ?, NULL, 'data', false, ?, NULL, NULL)",
+                    [legacy_path, stale_content, 50.0, 5, absolute_path],
+                )
+        finally:
+            con.close()
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            monkeypatch.setattr(idx, "_adaptive_batch_limit", lambda: 1)
+            monkeypatch.setattr(type(idx), "_MIGRATION_CONTENT_CHUNK", 1)
+            con = idx._connect()
+            assert idx._migrate_legacy_storage_paths_locked(con) is True
+
+            rows = con.execute(
+                "SELECT path, content FROM outputs_index ORDER BY path"
+            ).fetchall()
+            assert len(rows) == 2
+            surviving = {path: content for path, content in rows}
+            expected_a = os.path.abspath(str(tmp_path / "a.csv"))
+            expected_b = os.path.abspath(str(tmp_path / "b.csv"))
+            assert surviving[expected_a] == "rich-A-content"
+            assert surviving[expected_b] == "rich-B-content"
+
+            assert idx._pending_tantivy_upserts[expected_a].content == "rich-A-content"
+            assert idx._pending_tantivy_upserts[expected_b].content == "rich-B-content"
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_legacy_migration_does_not_perturb_adaptive_batch(
+        self, tmp_path: Path,
+    ) -> None:
+        """Regression for a bug caught reviewing task_ecb96ac9's own fix:
+        the migration must read `self._adaptive_batch` directly, not call
+        `_adaptive_batch_limit()`. That method both reads AND *adjusts*
+        `self._adaptive_batch` from `self.last_rebuild_metrics`; the
+        migration runs (from `rebuild()`) after `analysis_seconds`/
+        `classification_seconds` are recorded but before `fts_seconds`/
+        `write_seconds` exist yet, so the missing keys default to 0 and
+        always satisfy the "fast, healthy" branch -- doubling the shared
+        write-path batch size on every single rebuild(), regardless of real
+        memory or commit pressure, which is the opposite of what the
+        adaptive mechanism exists to do.
+        """
+        f = tmp_path / "data.csv"
+        f.write_text("x\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            after_first = idx._adaptive_batch
+            idx.rebuild()
+            after_second = idx._adaptive_batch
+            idx.rebuild()
+            after_third = idx._adaptive_batch
+            assert after_first == after_second == after_third, (
+                "adaptive_batch drifted across rebuild() calls with no real "
+                f"fts/write pressure signal: {after_first}, {after_second}, "
+                f"{after_third}"
+            )
+        finally:
+            idx.close()
+
     def test_worker_failure_falls_back_gracefully(self, tmp_path: Path) -> None:
         """If a worker raises, the file is re-analysed synchronously and indexed."""
         f = tmp_path / "ok.csv"
@@ -2384,6 +3094,228 @@ class TestParallelRebuildCorrectness:
         # The file should still get indexed via the fallback path.
         assert count >= 0  # may be 0 if fallback also failed; main check is no raise
         idx.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase-2 bulk-insert path (task_ecb96ac9 follow-on, perf)
+# ---------------------------------------------------------------------------
+
+class TestBulkInsertPath:
+    """e8a2f710 added a pyarrow zero-copy bulk-insert fast path (measured
+    ~150x faster than the parameter-bound fallback for a comparable batch),
+    but pyarrow was never added to this repo's shared pixi.toml (the same
+    gap 52cbe5d8 already fixed once for tantivy/xxhash) -- confirmed live,
+    it was silently absent in every worktree, so this branch had ZERO test
+    coverage: every rebuild() in the whole suite always took the fallback
+    path. Both branches must produce identical, correct results."""
+
+    @duckdb_required
+    def test_pyarrow_and_fallback_paths_produce_identical_rows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("term,value\nalpha,1", encoding="utf-8")
+        (tmp_path / "b.json").write_text('{"beta": 2}', encoding="utf-8")
+        (tmp_path / "c.txt").write_text("gamma content", encoding="utf-8")
+
+        def _index_rows(db_path: str) -> list[tuple]:
+            idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+            try:
+                count = idx.rebuild()
+                rows = idx._con.execute(
+                    "SELECT path, content, sha256, size, kind, csv_columns, "
+                    "json_keys FROM outputs_index ORDER BY path"
+                ).fetchall()
+                return count, rows
+            finally:
+                idx.close()
+
+        pyarrow_db = str(tmp_path.parent / f"{tmp_path.name}-pyarrow.duckdb")
+        count_pyarrow, rows_pyarrow = _index_rows(pyarrow_db)
+        assert count_pyarrow == 3
+
+        monkeypatch.setitem(sys.modules, "pyarrow", None)
+        fallback_db = str(tmp_path.parent / f"{tmp_path.name}-fallback.duckdb")
+        count_fallback, rows_fallback = _index_rows(fallback_db)
+        assert count_fallback == 3
+
+        assert rows_pyarrow == rows_fallback, (
+            "the pyarrow bulk-insert path and the parameter-bound fallback "
+            "must persist identical rows for the same input files"
+        )
+
+    def test_missing_pyarrow_falls_back_without_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression for the exact gap that made this branch untested for
+        so long: pyarrow being ABSENT must never raise, just silently take
+        the documented fallback path."""
+        monkeypatch.setitem(sys.modules, "pyarrow", None)
+        (tmp_path / "a.txt").write_text("content", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            assert idx.rebuild() == 1
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
+# Legacy-path migration throttling (task_ecb96ac9 follow-on, perf)
+# ---------------------------------------------------------------------------
+
+class TestLegacyMigrationThrottle:
+    """The legacy-path migration scan was running unconditionally on every
+    rebuild() call -- an O(rows already indexed) cost that compounds badly
+    at real scale (confirmed live: ~100k-row rescans on every single call of
+    the SUT_Compressed qualification run, finding nothing to fix on nearly
+    all of them). Throttled to: the first call always scans, a scan that
+    finds+fixes something forces an immediate recheck next call (stays
+    vigilant for an active concurrent writer or a still-completing first
+    pass), and otherwise at most one scan per
+    _LEGACY_MIGRATION_RECHECK_INTERVAL calls -- bounding staleness rather
+    than eliminating the check."""
+
+    @staticmethod
+    def _spy_migration(idx: "OL.OutputsFtsIndex", results: list) -> list:
+        """Replaces the instance's migration method with a spy that records
+        each call and returns the next value from `results` (repeating the
+        last value once exhausted) instead of touching a real DuckDB
+        connection -- isolates the throttle's call-counting logic from the
+        migration function's own behavior."""
+        calls: list[int] = []
+
+        def spy(con: Any) -> bool:
+            calls.append(len(calls) + 1)
+            idx_in_results = min(len(calls) - 1, len(results) - 1)
+            return results[idx_in_results]
+
+        idx._migrate_legacy_storage_paths_locked = spy
+        return calls
+
+    def test_first_call_always_scans(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        calls = self._spy_migration(idx, [False])
+        try:
+            idx.rebuild()
+        finally:
+            idx.close()
+        assert len(calls) == 1
+
+    def test_clean_scan_throttles_subsequent_calls(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        calls = self._spy_migration(idx, [False])
+        try:
+            for _ in range(5):
+                idx.rebuild()
+        finally:
+            idx.close()
+        assert len(calls) == 1, "a clean first scan must throttle every call after it"
+
+    def test_periodic_recheck_after_interval(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        calls = self._spy_migration(idx, [False])
+        interval = OL.OutputsFtsIndex._LEGACY_MIGRATION_RECHECK_INTERVAL
+        try:
+            for _ in range(interval + 1):
+                idx.rebuild()
+            assert len(calls) == 1, "the interval must not have elapsed yet"
+            idx.rebuild()
+            assert len(calls) == 2, "one more call must cross the recheck interval"
+        finally:
+            idx.close()
+
+    def test_found_migration_forces_immediate_recheck(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        calls = self._spy_migration(idx, [True, False])
+        try:
+            idx.rebuild()
+            assert len(calls) == 1
+            idx.rebuild()
+            assert len(calls) == 2, (
+                "a scan that found+fixed something must force an immediate "
+                "recheck next call, not throttle"
+            )
+            idx.rebuild()
+            assert len(calls) == 2, "the clean 2nd scan must throttle the 3rd call"
+        finally:
+            idx.close()
+
+    def test_failed_scan_forces_immediate_retry_not_full_cooldown(
+        self, tmp_path: Path,
+    ) -> None:
+        """A scan that RAISES must not be treated as a verified-clean pass --
+        that would buy a DB state we never actually confirmed the full
+        recheck-interval cooldown. It must force a retry on the very next
+        call instead, same as a scan that found real duplicates."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        call_count = [0]
+
+        def flaky(con: Any) -> bool:
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise RuntimeError("simulated transient DB error")
+            return False
+
+        idx._migrate_legacy_storage_paths_locked = flaky
+        try:
+            idx.rebuild()  # call 1: scan raises
+            assert call_count[0] == 1
+            idx.rebuild()  # call 2: must retry immediately, not throttle
+            assert call_count[0] == 2, (
+                "a failed scan must force an immediate recheck next call, "
+                "not the full recheck-interval cooldown"
+            )
+            idx.rebuild()  # call 3: the now-clean scan on call 2 throttles this one
+            assert call_count[0] == 2
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_duplicate_introduced_mid_throttle_is_eventually_caught(
+        self, tmp_path: Path,
+    ) -> None:
+        """Real end-to-end correctness check (no spy): a legacy-spelling
+        duplicate row inserted directly into the DB -- standing in for a
+        concurrent second process's write, without actually opening a second
+        concurrent connection to the same file -- while this instance is
+        throttled must still get cleaned up within the recheck interval, not
+        silently missed forever."""
+        f = tmp_path / "data.csv"
+        f.write_text("x\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-throttle.duckdb")
+        absolute_path = os.path.abspath(os.path.normpath(str(f)))
+        legacy_path = os.path.relpath(absolute_path, start=os.getcwd())
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            assert idx.rebuild() == 1  # first call: real scan, establishes throttle
+            rows = idx._con.execute("SELECT path FROM outputs_index").fetchall()
+            assert rows == [(absolute_path,)]
+
+            # Stand in for a concurrent second process's write via this
+            # instance's own already-open connection -- avoids the separate
+            # question of whether DuckDB allows two concurrent connections to
+            # one file, which isn't what this test is checking.
+            idx._con.execute(
+                "INSERT INTO outputs_index (path, content, mtime, sha256, size, "
+                "generating_script, kind, is_archival, canonical_path, "
+                "csv_columns, json_keys) "
+                "SELECT ?, content, mtime, sha256, size, generating_script, kind, "
+                "is_archival, canonical_path, csv_columns, json_keys "
+                "FROM outputs_index WHERE path = ?",
+                [legacy_path, absolute_path],
+            )
+
+            interval = OL.OutputsFtsIndex._LEGACY_MIGRATION_RECHECK_INTERVAL
+            for _ in range(interval + 1):
+                idx.rebuild()
+
+            rows = idx._con.execute("SELECT path FROM outputs_index").fetchall()
+            assert rows == [(absolute_path,)], (
+                "the duplicate must be cleaned up within the recheck interval, "
+                "not permanently missed"
+            )
+        finally:
+            idx.close()
 
 
 # ---------------------------------------------------------------------------
@@ -3503,6 +4435,208 @@ class TestTantivyHeapSize:
         monkeypatch.delenv(OL._TANTIVY_HEAP_ENV_VAR, raising=False)
         idx = OL.OutputsFtsIndex(str(tmp_path))
         assert idx._tantivy_heap_bytes == 512 * 1024 * 1024
+
+
+class TestDuckDBMemoryLimit:
+    """task_ecb96ac9 follow-on: a real whole-root run (632k+ files) crashed
+    with an unrecoverable DuckDB "Out of Memory Error: Allocation failure"
+    where even the rollback of the failed operation also hit an allocation
+    failure, permanently invalidating the connection. DuckDB had no
+    configured memory_limit, so it kept growing until the OS itself had
+    nothing left to give -- a much harder failure than DuckDB hitting its
+    own configured ceiling. See _default_duckdb_memory_limit_bytes's module
+    docstring for the full reasoning."""
+
+    def test_missing_psutil_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", None)
+        assert (
+            OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024)
+            == OL._DEFAULT_DUCKDB_MEMORY_LIMIT_BYTES
+        )
+
+    @staticmethod
+    def _fake_psutil(available_bytes: int) -> MagicMock:
+        fake = MagicMock()
+        fake.virtual_memory.return_value = MagicMock(available=available_bytes)
+        return fake
+
+    def test_healthy_memory_computes_conservative_share(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        tantivy_heap = 512 * 1024 * 1024
+        usable = 20 * 1024**3 - tantivy_heap - OL._DUCKDB_MEMORY_RESERVE_BYTES
+        expected = int(usable * OL._DUCKDB_MEMORY_LIMIT_SHARE)
+        assert OL._default_duckdb_memory_limit_bytes(tantivy_heap) == expected
+
+    def test_low_memory_uses_floor(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(100 * 1024 * 1024))
+        assert (
+            OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024)
+            == OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES
+        )
+
+    def test_high_memory_uses_ceiling(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(200 * 1024**3))
+        assert (
+            OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024)
+            == OL._DUCKDB_MEMORY_LIMIT_CEILING_BYTES
+        )
+
+    def test_env_var_overrides_availability_based_default(self, monkeypatch) -> None:
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "4096")
+        assert OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024) == 4096 * 1024 * 1024
+
+    def test_out_of_range_env_var_is_clamped_not_passed_through(self, monkeypatch) -> None:
+        """A VALID integer env var that's out of range (0, negative, or
+        absurdly large) must still be clamped -- it must not bypass the
+        floor/ceiling the way an in-range value legitimately does."""
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "0")
+        assert (
+            OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024)
+            == OL._DUCKDB_MEMORY_LIMIT_FLOOR_BYTES
+        )
+        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "999999999")
+        assert (
+            OL._default_duckdb_memory_limit_bytes(512 * 1024 * 1024)
+            == OL._DUCKDB_MEMORY_LIMIT_CEILING_BYTES
+        )
+
+    def test_invalid_env_var_falls_back_to_availability_based_default(self, monkeypatch) -> None:
+        monkeypatch.setitem(sys.modules, "psutil", self._fake_psutil(20 * 1024**3))
+        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "not-a-number")
+        tantivy_heap = 512 * 1024 * 1024
+        usable = 20 * 1024**3 - tantivy_heap - OL._DUCKDB_MEMORY_RESERVE_BYTES
+        expected = int(usable * OL._DUCKDB_MEMORY_LIMIT_SHARE)
+        assert OL._default_duckdb_memory_limit_bytes(tantivy_heap) == expected
+
+    def test_explicit_constructor_arg_takes_precedence_over_env_var(self, monkeypatch) -> None:
+        monkeypatch.setenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, "8192")
+        assert (
+            OL._resolve_duckdb_memory_limit_bytes(2048 * 1024 * 1024, 512 * 1024 * 1024)
+            == 2048 * 1024 * 1024
+        )
+
+    def test_explicit_arg_below_floor_falls_back_to_default(self, monkeypatch) -> None:
+        monkeypatch.delenv(OL._DUCKDB_MEMORY_LIMIT_ENV_VAR, raising=False)
+        monkeypatch.setitem(sys.modules, "psutil", None)
+        assert (
+            OL._resolve_duckdb_memory_limit_bytes(1024, 512 * 1024 * 1024)
+            == OL._DEFAULT_DUCKDB_MEMORY_LIMIT_BYTES
+        )
+
+    def test_index_resolves_memory_limit_from_constructor(self, tmp_path: Path) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path), duckdb_memory_limit_bytes=2048 * 1024 * 1024)
+        assert idx._duckdb_memory_limit_bytes == 2048 * 1024 * 1024
+
+    @duckdb_required
+    def test_connect_applies_memory_limit_pragma(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The resolved limit must actually reach a real PRAGMA call on
+        connect, not just be stored on the instance and never used."""
+        import duckdb
+
+        real_connect = duckdb.connect
+        captured: list[str] = []
+
+        class _ExecuteSpyCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                captured.append(sql)
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect", lambda *a, **kw: _ExecuteSpyCon(real_connect(*a, **kw)),
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path), duckdb_memory_limit_bytes=2048 * 1024 * 1024)
+        try:
+            idx._connect()
+        finally:
+            idx.close()
+        pragma_calls = [sql for sql in captured if "memory_limit" in sql.lower()]
+        assert pragma_calls, f"expected a memory_limit PRAGMA, got: {captured!r}"
+        assert "2048MB" in pragma_calls[0]
+
+    @duckdb_required
+    def test_connect_survives_pragma_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A PRAGMA failure (any reason) must never block opening the
+        connection -- an unconfigured DuckDB is strictly better than no
+        usable connection at all."""
+        import duckdb
+
+        real_connect = duckdb.connect
+
+        class _FailingPragmaCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                if "memory_limit" in sql.lower():
+                    raise RuntimeError("simulated PRAGMA failure")
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect", lambda *a, **kw: _FailingPragmaCon(real_connect(*a, **kw)),
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            con = idx._connect()
+            assert con is not None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_connect_disables_preserve_insertion_order(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """task_ecb96ac9 round 2: a configured memory_limit alone was not
+        sufficient -- confirmed live, DuckDB hit its own limit cleanly but
+        the ROLLBACK of that failed operation also ran out of memory within
+        the same budget, reproducing the identical unrecoverable failure.
+        `preserve_insertion_order=false` is DuckDB's own first suggestion in
+        that exact error message; must actually be applied on connect."""
+        import duckdb
+
+        real_connect = duckdb.connect
+        captured: list[str] = []
+
+        class _ExecuteSpyCon:
+            def __init__(self, real_con: Any) -> None:
+                self._real_con = real_con
+
+            def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+                captured.append(sql)
+                return self._real_con.execute(sql, *args, **kwargs)
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._real_con, name)
+
+        monkeypatch.setattr(
+            duckdb, "connect", lambda *a, **kw: _ExecuteSpyCon(real_connect(*a, **kw)),
+        )
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx._connect()
+        finally:
+            idx.close()
+        matches = [sql for sql in captured if "preserve_insertion_order" in sql.lower()]
+        assert matches, f"expected a preserve_insertion_order PRAGMA, got: {captured!r}"
+        assert "false" in matches[0].lower()
 
     def test_connect_tantivy_passes_resolved_heap_size_to_writer(
         self, tmp_path: Path,
@@ -5083,6 +6217,170 @@ class TestWalkErrorSurfacedInConvergence:
         assert any("ok.csv" in p for p in found)
 
 
+class TestWalkErrorClearsOnRecovery:
+    """fa600e42: distinguishes ACTIVE walk failure (this pass) from
+    HISTORICAL walk failure (a prior, already-superseded pass). Before this
+    fix, _last_walk_error was set once by _record_walk_error and never
+    reset anywhere -- one transient error made get_convergence_state()
+    report non-convergence forever, even after arbitrarily many subsequent
+    clean passes."""
+
+    def test_error_clears_once_the_next_pass_completes_without_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        good = tmp_path / "good"
+        good.mkdir()
+        (good / "a.csv").write_text("col\n1", encoding="utf-8")
+        bad = tmp_path / "bad_dir"
+        bad.mkdir()
+        (bad / "b.csv").write_text("col\n2", encoding="utf-8")
+
+        real_scandir = os.scandir
+        bad_norm = os.path.normpath(str(bad))
+        fail = {"active": True}
+
+        def flaky_scandir(path):
+            if fail["active"] and os.path.normpath(str(path)) == bad_norm:
+                raise PermissionError("simulated permission denied")
+            return real_scandir(path)
+
+        monkeypatch.setattr(OL.os, "scandir", flaky_scandir)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            first_state = idx.get_convergence_state()
+            assert first_state.last_error is not None
+            assert first_state.walk_complete is True  # tiny tree, one call
+
+            # The problem is now fixed (e.g. permissions repaired) -- the
+            # NEXT full pass must be given a genuine chance to prove that,
+            # not have the old error follow it around forever.
+            fail["active"] = False
+            idx.rebuild()
+            second_state = idx.get_convergence_state()
+            assert second_state.last_error is None
+            assert any("b.csv" in p for p in idx._row_cache)  # really recovered
+        finally:
+            idx.close()
+
+    def test_persistent_error_stays_surfaced_across_passes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        good = tmp_path / "good"
+        good.mkdir()
+        (good / "a.csv").write_text("col\n1", encoding="utf-8")
+        bad = tmp_path / "bad_dir"
+        bad.mkdir()
+        (bad / "b.csv").write_text("col\n2", encoding="utf-8")
+
+        real_scandir = os.scandir
+        bad_norm = os.path.normpath(str(bad))
+
+        def flaky_scandir(path):
+            if os.path.normpath(str(path)) == bad_norm:
+                raise PermissionError("still broken")
+            return real_scandir(path)
+
+        monkeypatch.setattr(OL.os, "scandir", flaky_scandir)
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.get_convergence_state().last_error is not None
+
+            # A second full pass hits the SAME still-broken directory -- the
+            # error must never go silent just because a new pass began.
+            idx.rebuild()
+            second_error = idx.get_convergence_state().last_error
+            assert second_error is not None
+            assert "bad_dir" in second_error
+        finally:
+            idx.close()
+
+    def test_error_clears_across_a_real_process_restart(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Code-review fix (fa600e42): the FIRST version of this fix reset
+        _last_walk_error in Phase 0, but on a genuinely fresh process
+        instance rebuild()'s own _connect() (mid-Phase-2) doesn't run until
+        AFTER Phase 0 -- and _rehydrate_walk_state_from_disk's "fill only
+        if still None" merge rule then immediately reloaded the stale
+        pre-restart error right back in, silently undoing the reset within
+        the SAME call. This test reproduces the REAL production call
+        order (rebuild() called directly on a brand-new instance, with NO
+        preceding get_convergence_state()/_connect() call) across a
+        SIMULATED PROCESS RESTART (cache eviction + close, this codebase's
+        own established restart-simulation convention -- see
+        TestCachedIndexPersistence.test_index_survives_cache_eviction)."""
+        good = tmp_path / "good"
+        good.mkdir()
+        (good / "a.csv").write_text("col\n1", encoding="utf-8")
+        bad = tmp_path / "bad_dir"
+        bad.mkdir()
+        (bad / "b.csv").write_text("col\n2", encoding="utf-8")
+
+        real_scandir = os.scandir
+        bad_norm = os.path.normpath(str(bad))
+        fail = {"active": True}
+
+        def flaky_scandir(path):
+            if fail["active"] and os.path.normpath(str(path)) == bad_norm:
+                raise PermissionError("simulated permission denied")
+            return real_scandir(path)
+
+        monkeypatch.setattr(OL.os, "scandir", flaky_scandir)
+
+        # "Process A": hits the error, persists it, then "exits" (evict the
+        # cached instance -- the ONLY way this field reaches disk at all).
+        idx_a = OL._get_cached_index(str(tmp_path))
+        idx_a.rebuild()
+        assert idx_a.get_convergence_state().last_error is not None
+        key = OL._cache_key(str(tmp_path))
+        with OL._index_cache_lock:
+            OL._index_cache.pop(key, None)
+        idx_a.close()
+
+        # The problem is now fixed.
+        fail["active"] = False
+
+        # "Process B": a BRAND NEW instance, and -- matching the real
+        # production call order -- rebuild() is the FIRST call made on it,
+        # with no preceding get_convergence_state()/_connect().
+        idx_b = OL._get_cached_index(str(tmp_path))
+        try:
+            assert idx_b._con is None  # sanity: genuinely fresh, unconnected
+            idx_b.rebuild()
+            state = idx_b.get_convergence_state()
+            assert state.last_error is None
+            assert any("b.csv" in p for p in idx_b._row_cache)
+        finally:
+            idx_b.close()
+
+    def test_confirmed_fresh_flag_prevents_rehydration_override(
+        self, tmp_path: Path,
+    ) -> None:
+        """Narrower unit-level check directly on the flag/rehydration
+        interaction, independent of the walk/scandir machinery above."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            con = idx._connect()  # persist a real error to disk first
+            idx._last_walk_error = "a stale, since-resolved error"
+            with idx._write_lock:
+                idx._persist_walk_state_locked(con)
+
+            # Simulate Phase 0's reset on a hypothetical next pass, on a
+            # FRESH instance that hasn't connected yet.
+            idx2 = OL.OutputsFtsIndex(str(tmp_path))
+            idx2._last_walk_error = None
+            idx2._walk_error_confirmed_fresh = True
+            idx2._connect()  # triggers _rehydrate_walk_state_from_disk
+            assert idx2._last_walk_error is None
+            idx2.close()
+        finally:
+            idx.close()
+
+
 class TestSubtreeConvergenceHeuristic:
     """6af1518d requirement 2: a subtree-scoped convergence answer must be
     correctly derived from the walk's own deterministic sorted-DFS order,
@@ -5804,3 +7102,328 @@ class TestResearchGraphOutputIdentity:
     def test_return_shape_has_exactly_the_documented_keys(self) -> None:
         out = OL.research_graph_output_identity(path="/tmp/x.png")
         assert set(out.keys()) == {"node_type", "identity_key", "revision", "external_ref"}
+
+
+# ---------------------------------------------------------------------------
+# Fast-vs-strict/sampled staleness (sprint item 89612890)
+# ---------------------------------------------------------------------------
+
+class TestStalenessModes:
+    @duckdb_required
+    def test_fast_mode_misses_same_size_same_mtime_content_change(
+        self, tmp_path: Path,
+    ) -> None:
+        """The documented default cannot catch this class of change --
+        confirms the premise the strict/sampled modes exist to close."""
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            st = os.stat(f)
+            # Overwrite with DIFFERENT content, same length, then force the
+            # mtime back to its exact original value -- a real, deliberately
+            # constructed same-size+same-mtime content change, not reliant
+            # on filesystem timestamp coarseness.
+            f.write_text("col\nbbbb\n", encoding="utf-8")
+            os.utime(f, (st.st_atime, st.st_mtime))
+            assert os.stat(f).st_size == st.st_size
+
+            idx.rebuild(staleness_mode="fast")
+            content = idx.get_content(str(f))
+            assert content is not None and "bbbb" not in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_strict_mode_detects_same_size_same_mtime_content_change(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            # First pass under strict mode establishes a real content-hash
+            # baseline (this file has a unique size, so a normal "fast"
+            # rebuild would never hash it at all -- see _needs_hash).
+            idx.rebuild(staleness_mode="strict")
+
+            st = os.stat(f)
+            f.write_text("col\nbbbb\n", encoding="utf-8")
+            os.utime(f, (st.st_atime, st.st_mtime))
+            assert os.stat(f).st_size == st.st_size
+
+            idx.rebuild(staleness_mode="strict")
+            content = idx.get_content(str(f))
+            assert content is not None and "bbbb" in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_sampled_mode_with_rate_one_behaves_like_strict(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild(staleness_mode="sampled", staleness_sample_rate=1.0)
+            st = os.stat(f)
+            f.write_text("col\nbbbb\n", encoding="utf-8")
+            os.utime(f, (st.st_atime, st.st_mtime))
+
+            idx.rebuild(staleness_mode="sampled", staleness_sample_rate=1.0)
+            content = idx.get_content(str(f))
+            assert content is not None and "bbbb" in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_sampled_mode_with_rate_zero_behaves_like_fast(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild(staleness_mode="sampled", staleness_sample_rate=0.0)
+            st = os.stat(f)
+            f.write_text("col\nbbbb\n", encoding="utf-8")
+            os.utime(f, (st.st_atime, st.st_mtime))
+
+            idx.rebuild(staleness_mode="sampled", staleness_sample_rate=0.0)
+            content = idx.get_content(str(f))
+            assert content is not None and "bbbb" not in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_strict_mode_is_opt_in_default_stays_fast(self, tmp_path: Path) -> None:
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()  # no staleness_mode given
+            st = os.stat(f)
+            f.write_text("col\nbbbb\n", encoding="utf-8")
+            os.utime(f, (st.st_atime, st.st_mtime))
+
+            idx.rebuild()  # still no staleness_mode given -- must stay "fast"
+            content = idx.get_content(str(f))
+            assert content is not None and "bbbb" not in content
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_strict_mode_content_check_respects_deadline(
+        self, tmp_path: Path,
+    ) -> None:
+        """Code-review fix: the content-check loop must never run past its
+        own share of the budget, matching every other I/O-heavy stage in
+        rebuild() (the walk, Phase 1's ThreadPoolExecutor dispatch). An
+        already-expired deadline (max_seconds=0) must make the loop skip
+        content-checking entirely rather than hashing every file
+        regardless of budget."""
+        n = 200
+        for i in range(n):
+            (tmp_path / f"f{i:04d}.csv").write_text(f"col\nvalue{i}\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild(staleness_mode="strict")  # establish baselines, warm pass
+            hash_calls = {"count": 0}
+            real_hasher = idx._hasher
+
+            def _counting_hasher(p: str) -> str | None:
+                hash_calls["count"] += 1
+                return real_hasher(p)
+
+            idx._hasher = _counting_hasher
+            # An already-past deadline (max_seconds=0) must make the
+            # phase1_deadline check stop the loop almost immediately, not
+            # process the whole tree regardless of budget. A handful of
+            # calls (clock-granularity slop on very fast iterations) is
+            # tolerated; hashing anywhere near the full 200-file tree is
+            # exactly the unbounded-cost bug this fix closes.
+            idx.rebuild(staleness_mode="strict", max_seconds=0.0)
+            assert hash_calls["count"] < n // 4, (
+                f"content-check loop hashed {hash_calls['count']}/{n} files "
+                "despite an already-expired deadline -- it must respect "
+                "phase1_deadline like every other I/O-heavy stage in "
+                "rebuild(), not run unbounded regardless of budget"
+            )
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_strict_mode_reachable_via_module_level_search_outputs(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "data.csv"
+        f.write_text("col\naaaa\n", encoding="utf-8")
+        OL.search_outputs(str(tmp_path), "col", staleness_mode="strict")
+        st = os.stat(f)
+        f.write_text("col\nbbbb\n", encoding="utf-8")
+        os.utime(f, (st.st_atime, st.st_mtime))
+
+        OL.search_outputs(str(tmp_path), "col", staleness_mode="strict")
+        idx = OL._get_cached_index(str(tmp_path))
+        content = idx.get_content(str(f))
+        assert content is not None and "bbbb" in content
+
+
+# ---------------------------------------------------------------------------
+# Directory-level progress diagnostic (sprint item 89612890)
+# ---------------------------------------------------------------------------
+
+class TestDirectoryProgress:
+    @duckdb_required
+    def test_reports_one_entry_per_top_level_directory(self, tmp_path: Path) -> None:
+        (tmp_path / "run_a").mkdir()
+        (tmp_path / "run_a" / "x.csv").write_text("col\n1\n", encoding="utf-8")
+        (tmp_path / "run_b").mkdir()
+        (tmp_path / "run_b" / "y.csv").write_text("col\n2\n", encoding="utf-8")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            progress = idx.get_directory_progress()
+            names = {d["name"] for d in progress["directories"]}
+            assert names == {"run_a", "run_b"}
+            assert all(d["converged"] for d in progress["directories"])
+            assert all(d["pending_stale_count"] == 0 for d in progress["directories"])
+        finally:
+            idx.close()
+
+    def test_missing_outputs_dir_degrades_to_error_not_raise(
+        self, tmp_path: Path,
+    ) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path / "does_not_exist"))
+        try:
+            progress = idx.get_directory_progress()
+            assert progress["directories"] == []
+            assert "error" in progress
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_hidden_directories_excluded(self, tmp_path: Path) -> None:
+        (tmp_path / ".git").mkdir()
+        (tmp_path / "run_a").mkdir()
+        (tmp_path / "run_a" / "x.csv").write_text("col\n1\n", encoding="utf-8")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            progress = idx.get_directory_progress()
+            names = {d["name"] for d in progress["directories"]}
+            assert names == {"run_a"}
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
+# Write-failure injection (sprint item 89612890) -- shared helper
+# ---------------------------------------------------------------------------
+
+class TestInjectDbWriteFailureHelper:
+    @duckdb_required
+    def test_shared_helper_surfaces_db_write_error(self, tmp_path: Path) -> None:
+        (tmp_path / "a.csv").write_text("col\n1\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            with inject_db_write_failure():
+                idx.rebuild()
+            assert idx.last_db_write_error is not None
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_shared_helper_accepts_a_custom_exception(self, tmp_path: Path) -> None:
+        (tmp_path / "a.csv").write_text("col\n1\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            with inject_db_write_failure(PermissionError("access denied")):
+                idx.rebuild()
+            assert "access denied" in (idx.last_db_write_error or "")
+        finally:
+            idx.close()
+
+
+# ---------------------------------------------------------------------------
+# Bounded scale-run telemetry (sprint item 89612890)
+# ---------------------------------------------------------------------------
+
+class TestScaleTelemetry:
+    @duckdb_required
+    def test_last_rebuild_metrics_carries_the_new_telemetry_fields(
+        self, tmp_path: Path,
+    ) -> None:
+        # index_db_bytes needs a REAL on-disk DB file -- the bare
+        # OutputsFtsIndex(outputs_dir) constructor used elsewhere in this
+        # file defaults to an in-memory DB (fine for FTS/search-only
+        # tests); production code reaches a real on-disk file via
+        # _get_cached_index, so that's what this specific assertion needs.
+        (tmp_path / "a.csv").write_text("col\n1\n", encoding="utf-8")
+        idx = OL._get_cached_index(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            for key in (
+                "files_examined", "files_reanalyzed", "files_new",
+                "queue_depth", "checkpoint_walk_epoch",
+                "checkpoint_walk_pass_complete", "checkpoint_scan_boundary",
+                "index_db_bytes",
+            ):
+                assert key in m, f"missing scale-telemetry field {key!r}"
+            # _get_cached_index auto-creates a .gitignore at outputs_dir's
+            # root to protect its own .meridian-outputs-cache/ subdirectory
+            # -- a real, pre-existing side effect (files, unlike
+            # directories, are not hidden-name-filtered by the walk), so
+            # both it and a.csv are genuinely new this call.
+            assert m["files_new"] == 2
+            assert m["files_reanalyzed"] == 0
+            assert isinstance(m["index_db_bytes"], int)
+            assert m["index_db_bytes"] > 0
+            # process_rss_bytes is present but best-effort (None if psutil
+            # unavailable) -- only assert the key exists, not a specific type.
+            assert "process_rss_bytes" in m
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_files_reanalyzed_distinguishes_from_files_new(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "a.csv"
+        f.write_text("col\n1\n", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["files_new"] == 1
+            assert idx.last_rebuild_metrics["files_reanalyzed"] == 0
+
+            f.write_text("col\n2\n", encoding="utf-8")  # genuine mtime+size change
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["files_new"] == 0
+            assert idx.last_rebuild_metrics["files_reanalyzed"] == 1
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_rss_helper_degrades_gracefully_without_psutil(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            import builtins
+            real_import = builtins.__import__
+
+            def _no_psutil(name, *args, **kwargs):
+                if name == "psutil":
+                    raise ImportError("simulated: psutil not installed")
+                return real_import(name, *args, **kwargs)
+
+            monkeypatch.setattr(builtins, "__import__", _no_psutil)
+            assert idx._current_process_rss_bytes() is None
+        finally:
+            idx.close()

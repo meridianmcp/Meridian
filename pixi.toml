@@ -104,6 +104,45 @@ meridian-codeindex = { path = "extensions/meridian-codeindex", editable = true }
 # under investigation for 52cbe5d8 until this was caught and fixed.
 tantivy = ">=0.22"
 xxhash = ">=3.4"
+# task_ecb96ac9 follow-on (perf) -- same gap as tantivy/xxhash above (52cbe5d8):
+# declared in extensions/meridian-outputs/pyproject.toml (e8a2f710) as the
+# backing dependency for OutputsFtsIndex.rebuild()'s Phase-2 bulk-insert fast
+# path, but never added HERE, so it was silently absent in every worktree's
+# shared pixi env. Confirmed live: a real qualification run against the
+# SUT_Compressed corpus spent 94% of total rebuild() time in the write phase
+# (70.5s of 74.8s for a single 1954-row batch) because it was silently falling
+# back to the slow parameter-bound insert path this whole time -- the code's
+# own comment at that call site measured the pyarrow path at ~150x faster for
+# a comparable batch size.
+pyarrow = ">=14.0"
+# task_ecb96ac9 follow-on (perf/correctness) -- same class of gap as tantivy/
+# xxhash/pyarrow above, but subtler: psutil WAS already declared somewhere in
+# this file, but only under [feature.semantic.pypi-dependencies] (added
+# alongside model2vec for the semantic code-search environment, an unrelated
+# opt-in feature) -- never in the default environment `pixi run` actually
+# uses. extensions/meridian-outputs/pyproject.toml declares psutil as a real,
+# non-optional dependency backing OutputsFtsIndex's adaptive Phase-1 batch
+# sizing (_initial_adaptive_batch/_adaptive_batch_limit) AND the DuckDB
+# memory_limit calculation added earlier tonight (_default_duckdb_memory_
+# limit_bytes) -- both lazily import psutil and degrade to fixed fallback
+# constants when it's missing, exactly what was silently happening in every
+# one of tonight's five real qualification-run attempts: the adaptive
+# memory-based tuning was NEVER actually engaging, always falling back to
+# hardcoded defaults regardless of real system memory or any of tonight's
+# constant recalibration. Declared here (not just in the semantic feature)
+# so the default environment gets the real adaptive path.
+psutil = ">=5.9"
+# aa423c7e -- same class of gap as tantivy/xxhash/pyarrow/psutil above:
+# extensions/meridian-outputs/pyproject.toml declares pypdf as a real,
+# non-optional dependency backing outputs_local.py's PDF body-content
+# extraction (_extract_pdf_text, feeding the new "pdf_content" classify_
+# suffix kind), but that extension's tests import the module straight off
+# sys.path (no pip install of the package), so nothing previously pulled
+# pypdf into THIS pixi env either. Declared here so a fresh clone/worktree
+# actually exercises real PDF extraction in tests instead of silently
+# falling back to the (also-correct, but untested-by-default) missing-
+# dependency degrade path.
+pypdf = ">=4.0"
 mcp = ">=1.0"
 anthropic = ">=0.40"
 python-dotenv = ">=1.0"

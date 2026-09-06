@@ -40,6 +40,8 @@ from meridian.secret_redaction import (
     is_sensitive_path,
     redact,
     scan,
+    scan_file,
+    scan_paths,
 )
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -341,6 +343,74 @@ class TestScanDotenvCredential:
 # scan() -- edge cases
 # ---------------------------------------------------------------------------
 
+class TestScanMeridianToken:
+    """ba31dedf — Meridian's own bearer token shape. Confirmed gap: none of
+    stripe-live-key, openai-anthropic-key, or dotenv-credential fired on a
+    bare `"BEARER_TOKEN": "sk_meridian_..."` JSON/TOML/env pair (the exact
+    shape AGENTS.md's hosted-tier config, tunnel_client's generated configs,
+    and meridian_connect.py's installer all produce) before this pattern was
+    added."""
+
+    # Fixture value only -- never a real credential. Deliberately shaped like
+    # the real thing (prefix + length) so it exercises the actual regex.
+    _FAKE = "sk_meridian_" + "abcdefghijklmnopqrstuvwxyz123456"  # noqa: S105
+
+    def test_detects_bare_meridian_token(self):
+        matches = scan(self._FAKE)
+        assert any(m.name == "meridian-token" for m in matches), matches
+
+    def test_detects_meridian_token_in_bearer_header_prose(self):
+        text = f"Authorization: Bearer {self._FAKE}"
+        matches = scan(text)
+        assert any(m.name == "meridian-token" for m in matches), matches
+
+    def test_detects_meridian_token_in_json_env_pair(self):
+        """The exact confirmed-gap shape: a bare JSON `"BEARER_TOKEN": "..."`
+        pair, quoted/colon-joined rather than a bare KEY=value assignment --
+        this is what slipped past every pre-existing pattern."""
+        text = f'{{"env": {{"BEARER_TOKEN": "{self._FAKE}"}}}}'
+        matches = scan(text)
+        assert any(m.name == "meridian-token" for m in matches), matches
+
+    def test_detects_meridian_token_in_generated_mcp_json_snippet(self):
+        """A realistic generated-config sample matching tunnel_client's own
+        `_tunnel_mcp_entries` shape."""
+        text = (
+            '{\n'
+            '  "mcpServers": {\n'
+            '    "meridian": {\n'
+            '      "type": "http",\n'
+            '      "url": "https://usemeridian.us/mcp",\n'
+            f'      "headers": {{"Authorization": "Bearer {self._FAKE}"}}\n'
+            '    }\n'
+            '  }\n'
+            '}\n'
+        )
+        matches = scan(text)
+        assert any(m.name == "meridian-token" for m in matches), matches
+
+    def test_does_not_match_short_meridian_prefix(self):
+        text = "sk_meridian_short"
+        matches = [m for m in scan(text) if m.name == "meridian-token"]
+        assert not matches
+
+    def test_does_not_confuse_stripe_key_for_meridian_token(self):
+        text = "sk_live_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcd"
+        matches = [m for m in scan(text) if m.name == "meridian-token"]
+        assert not matches
+
+    def test_redact_masks_meridian_token(self):
+        result = redact(self._FAKE)
+        assert self._FAKE not in result
+        assert "[REDACTED:meridian-token]" in result
+
+    def test_check_for_secrets_rejects_meridian_token(self):
+        # Bare value (no KEY= wrapper) to test this pattern in isolation, per
+        # the module docstring's convention for the other pattern classes.
+        with pytest.raises(ValueError, match="meridian-token"):
+            check_for_secrets(f"Use {self._FAKE} to authenticate", context="x")
+
+
 class TestScanEdgeCases:
     def test_empty_string_returns_empty(self):
         assert scan("") == []
@@ -524,6 +594,117 @@ class TestIsSensitivePath:
         assert is_sensitive_path("ID_RSA")
         assert is_sensitive_path("Server.KEY")
         assert is_sensitive_path("TERRAFORM.TFVARS")
+
+
+# ---------------------------------------------------------------------------
+# scan_file() / scan_paths() -- non-disclosing scan over files on disk
+# (ff9d2963 -- SECURITY-LAUNCH acceptance: "tracked-file scan emits
+# paths/categories only").
+# ---------------------------------------------------------------------------
+
+class TestScanFile:
+    def test_detects_secret_in_a_real_file(self, tmp_path):
+        fake = "sk_meridian_" + "c" * 32  # fixture only, never a real credential
+        f = tmp_path / "leaky.txt"
+        f.write_text(f"BEARER_TOKEN={fake}\n", encoding="utf-8")
+        matches = scan_file(str(f))
+        assert any(m.name in ("meridian-token", "dotenv-credential") for m in matches), matches
+
+    def test_returns_empty_list_for_missing_file(self, tmp_path):
+        assert scan_file(str(tmp_path / "does-not-exist.txt")) == []
+
+    def test_returns_empty_list_for_benign_file(self, tmp_path):
+        f = tmp_path / "clean.py"
+        f.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        assert scan_file(str(f)) == []
+
+    def test_does_not_raise_on_binary_content(self, tmp_path):
+        f = tmp_path / "binary.bin"
+        f.write_bytes(bytes(range(256)) * 4)
+        # Must not raise -- errors="ignore" decoding, whatever (if anything)
+        # comes out is scanned like any other text.
+        result = scan_file(str(f))
+        assert isinstance(result, list)
+
+
+class TestScanPaths:
+    def test_non_disclosing_shape_is_path_and_category_only(self, tmp_path):
+        fake = "sk_meridian_" + "d" * 32  # fixture only, never a real credential
+        f = tmp_path / "config.json"
+        f.write_text(f'{{"headers": {{"Authorization": "Bearer {fake}"}}}}', encoding="utf-8")
+
+        rows = scan_paths([str(f)])
+
+        assert rows == [{"path": str(f), "category": "meridian-token"}]
+        # Belt-and-suspenders: the raw secret value must not appear anywhere
+        # in the returned structure, only in the source file we just wrote.
+        assert fake not in json.dumps(rows)
+
+    def test_multiple_files_multiple_categories(self, tmp_path):
+        clean = tmp_path / "clean.py"
+        clean.write_text("x = 1\n", encoding="utf-8")
+        leaky = tmp_path / "leaky.py"
+        leaky.write_text("AKIAIOSFODNN7EXAMPLE\n", encoding="utf-8")
+
+        rows = scan_paths([str(clean), str(leaky)])
+
+        assert rows == [{"path": str(leaky), "category": "aws-access-key-id"}]
+
+    def test_empty_for_no_secrets_anywhere(self, tmp_path):
+        f = tmp_path / "readme.md"
+        f.write_text("# Just docs, nothing secret here.\n", encoding="utf-8")
+        assert scan_paths([str(f)]) == []
+
+    def test_missing_files_are_silently_skipped(self, tmp_path):
+        assert scan_paths([str(tmp_path / "missing.txt")]) == []
+
+
+# ---------------------------------------------------------------------------
+# ff9d2963 -- targeted non-disclosing scan of the exact files this
+# security-launch item touched (the WS/HTTP query-token fix, the hook-snippet
+# generator fix, the client-side redaction fix). This is intentionally
+# narrower than a whole-repo scan: the wider tracked-file tree legitimately
+# contains many `sk_meridian_...`-SHAPED fixture values in test files (this
+# suite's own fixtures included) that would need a real allowlist mechanism
+# to distinguish from a genuine leak -- out of scope for this item. Scanning
+# exactly the files this item fixed still gives a real, non-flaky regression
+# guard: if a future edit to any of them re-introduces a literal secret, this
+# test catches it and reports ONLY the path + category (never the value).
+# ---------------------------------------------------------------------------
+
+def test_security_launch_touched_files_contain_no_live_secret():
+    """Confirmed while writing this test: the `dotenv-credential` pattern
+    (designed for actual `KEY=value`-shaped .env file lines / DB payload
+    text -- see TestScanDotenvCredential above) fires heavily and
+    correctly-per-its-own-design on ordinary application source code, since
+    any assignment to a variable merely NAMED `token`/`key`/`auth`/etc (e.g.
+    `token = auth_header[...]`, `key = ...`) matches its intentionally broad,
+    case-insensitive shape. That is expected behavior for its documented use
+    case, not a bug -- but it makes the pattern unsuitable for scanning
+    general source code, where it would drown out genuine findings in noise.
+    This scan therefore checks every OTHER pattern (the ones that match an
+    actual secret VALUE's shape -- sk_meridian_..., sk_live_..., AKIA...,
+    ghp_..., xox_..., sk-..., a JWT, or a PEM block -- rather than an
+    assignment's shape), which is what actually matters for "did a live
+    credential end up in this file."
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    touched = [
+        repo_root / "meridian" / "routes" / "tunnel.py",
+        repo_root / "meridian" / "tunnel_client.py",
+        repo_root / "meridian" / "static" / "dashboard-settings.ts",
+        repo_root / "meridian" / "secret_redaction.py",
+        repo_root / "scripts" / "meridian_connect.py",
+    ]
+    for p in touched:
+        assert p.exists(), f"expected file missing: {p}"
+
+    rows = scan_paths([str(p) for p in touched])
+    rows = [r for r in rows if r["category"] != "dotenv-credential"]
+    assert rows == [], (
+        "non-disclosing scan found secret-shaped content (path/category only, "
+        f"no value): {rows}"
+    )
 
 
 # ---------------------------------------------------------------------------

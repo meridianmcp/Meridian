@@ -6,12 +6,14 @@ Covers:
   - APA author formatting: 1, 2, 3-19, 20+ authors; corporate authors;
     missing given name; 20+ author truncation.
   - insert_bibliography_entry: heading auto-creation, heading reuse,
-    entry appended after existing entries, Bibliography style present,
-    bookmark present, formatted text present.
+    entry placed at its correct alphabetical position among existing
+    entries, Bibliography style present, bookmark present, formatted
+    text present.
   - update_bibliography_entry: text replaced, bookmark preserved.
   - remove_bibliography_entry: paragraph removed.
-  - Alphabetization: entries inserted in multiple calls come out in the
-    order they were inserted (alphabetization is caller responsibility).
+  - Alphabetization: insert_bibliography_entry places each new entry at
+    its correct APA-alphabetical position (by author/title, then by year
+    for same-author ties) among existing entries, not merely appended.
   - scan_all_citation_keys: returns keys in appearance order, deduplicated.
   - sync_bibliography: insert/update/missing_data/stale_entries logic.
   - Error paths: unknown doc, missing file, bad key, duplicate insert,
@@ -557,6 +559,40 @@ class TestScanAllCitationKeys:
         keys = docs_intel.scan_all_citation_keys(str(tmp_path / "gone.docx"))
         assert keys == []
 
+    def test_two_fields_in_the_same_paragraph_both_counted(self, tmp_path):
+        """Found alongside remove_citation's 2026-09-05 fix: this walked
+        every paragraph but only checked the FIRST CSL_CITATION field in
+        it, silently under-reporting a paragraph that cites two sources as
+        two independent fields (e.g. "(Smith 2020) and (Jones 2021)" in one
+        sentence, as opposed to one multi-item field)."""
+        docx = str(tmp_path / "doc.docx")
+        xml = """<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml">
+  <w:body>
+    <w:p w14:paraId="GG000001">
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {"citationID":"a","properties":{"formattedCitation":"(Smith 2020)"},"citationItems":[{"id":"smith2020","uris":[],"itemData":{"id":"smith2020","type":"article"}}],"schema":"x"} </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>(Smith 2020)</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+      <w:r><w:t xml:space="preserve"> and </w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText xml:space="preserve"> ADDIN ZOTERO_ITEM CSL_CITATION {"citationID":"b","properties":{"formattedCitation":"(Jones 2021)"},"citationItems":[{"id":"jones2021","uris":[],"itemData":{"id":"jones2021","type":"article"}}],"schema":"x"} </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>(Jones 2021)</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+    </w:p>
+  </w:body>
+</w:document>
+"""
+        _write_docx(docx, xml)
+        keys = docs_intel.scan_all_citation_keys(docx)
+        assert "smith2020" in keys
+        assert "jones2021" in keys
+        assert len(keys) == 2
+
 
 # ---------------------------------------------------------------------------
 # insert_bibliography_entry
@@ -625,19 +661,83 @@ class TestInsertBibliographyEntry:
         # Only one "References" heading should exist.
         assert xml.count("bibkey_jones2021") == 1
 
-    def test_insert_appends_after_existing_entries(self, tmp_path):
+    def test_insert_appends_when_new_entry_sorts_after_existing(self, tmp_path):
         docx = str(tmp_path / "doc.docx")
-        _write_docx(docx, _DOC_XML_WITH_REFS)
-        # Insert a second entry; it should appear after the existing smith2020.
+        _write_docx(docx, _DOC_XML_WITH_REFS)  # existing: smith2020
+        # "Zimmerman" sorts after "Smith" alphabetically -- still appended.
         docs_intel.insert_bibliography_entry(
             docx_path=docx,
-            citation_key="jones2021",
-            csl_item=_journal_article(family="Jones", given="B.", year=2021),
+            citation_key="zimmerman2021",
+            csl_item=_journal_article(family="Zimmerman", given="B.", year=2021),
         )
         xml = _read_doc_xml(docx)
         smith_pos = xml.index("bibkey_smith2020")
-        jones_pos = xml.index("bibkey_jones2021")
-        assert smith_pos < jones_pos
+        zimmerman_pos = xml.index("bibkey_zimmerman2021")
+        assert smith_pos < zimmerman_pos
+
+    def test_insert_lands_before_an_existing_entry_that_sorts_later(self, tmp_path):
+        """1258794a follow-up (PAPER-S7 hard-fixture stress test, 2026-09-04)
+        -- insert_bibliography_entry previously always appended, ignoring APA
+        alphabetical order, while a generic-tool control agent given the same
+        task correctly reasoned its way to alphabetical placement (see
+        docs/paper-s7-hard-fixtures-stress-test-v1.md in ooxml-graph-paper).
+        "Adams" must land BEFORE the existing "Smith" entry, not after it."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REFS)  # existing: smith2020
+        docs_intel.insert_bibliography_entry(
+            docx_path=docx,
+            citation_key="adams2019",
+            csl_item=_journal_article(family="Adams", given="J.", year=2019),
+        )
+        xml = _read_doc_xml(docx)
+        adams_pos = xml.index("bibkey_adams2019")
+        smith_pos = xml.index("bibkey_smith2020")
+        assert adams_pos < smith_pos
+
+    def test_insert_lands_alphabetically_between_two_existing_entries(self, tmp_path):
+        """Mirrors the exact scenario from the hard-fixture stress test
+        (docs/paper-s7-hard-fixtures-stress-test-v1.md in ooxml-graph-paper):
+        an "Adams" and a "Zimmerman" entry already present, "Marker" must
+        land alphabetically between them, not after both."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx)
+        docs_intel.insert_bibliography_entry(
+            docx_path=docx,
+            citation_key="adams2019",
+            csl_item=_journal_article(family="Adams", given="J.", year=2019),
+        )
+        docs_intel.insert_bibliography_entry(
+            docx_path=docx,
+            citation_key="zimmerman2021",
+            csl_item=_journal_article(family="Zimmerman", given="Z.", year=2021),
+        )
+        docs_intel.insert_bibliography_entry(
+            docx_path=docx,
+            citation_key="marker2022",
+            csl_item=_journal_article(
+                family="Marker", given="P.", year=2022, title="Pilot marker entry",
+            ),
+        )
+        xml = _read_doc_xml(docx)
+        adams_pos = xml.index("bibkey_adams2019")
+        marker_pos = xml.index("bibkey_marker2022")
+        zimmerman_pos = xml.index("bibkey_zimmerman2021")
+        assert adams_pos < marker_pos < zimmerman_pos
+
+    def test_insert_same_author_different_years_orders_by_year(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REFS)  # existing: Smith, J. (2020)
+        docs_intel.insert_bibliography_entry(
+            docx_path=docx,
+            citation_key="smith2018",
+            csl_item=_journal_article(
+                family="Smith", given="J.", year=2018, title="Earlier paper",
+            ),
+        )
+        xml = _read_doc_xml(docx)
+        smith2018_pos = xml.index("bibkey_smith2018")
+        smith2020_pos = xml.index("bibkey_smith2020")
+        assert smith2018_pos < smith2020_pos
 
     def test_insert_duplicate_returns_error_file_unchanged(self, tmp_path):
         docx = str(tmp_path / "doc.docx")
@@ -904,6 +1004,85 @@ class TestRemoveBibliographyEntry:
         )
         assert "error" in res
         assert open(docx, "rb").read() == original
+
+    def test_remove_last_entry_with_flag_also_removes_heading(self, tmp_path):
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REFS)
+
+        res = docs_intel.remove_bibliography_entry(
+            docx_path=docx,
+            citation_key="smith2020",
+            remove_heading_if_empty=True,
+        )
+        assert "error" not in res, res.get("error")
+        assert res["heading_removed"] is True
+        xml_after = _read_doc_xml(docx)
+        assert "bibkey_smith2020" not in xml_after
+        assert "References" not in xml_after
+        assert "Body text." in xml_after
+
+    def test_remove_default_behaviour_leaves_heading_in_place(self, tmp_path):
+        """The flag defaults to False -- unchanged behaviour for every
+        existing caller that never asked for heading cleanup."""
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, _DOC_XML_WITH_REFS)
+
+        res = docs_intel.remove_bibliography_entry(
+            docx_path=docx,
+            citation_key="smith2020",
+        )
+        assert "error" not in res, res.get("error")
+        assert res["heading_removed"] is False
+        xml_after = _read_doc_xml(docx)
+        assert "References" in xml_after
+
+    def test_remove_one_of_several_entries_keeps_heading_even_with_flag(self, tmp_path):
+        """remove_heading_if_empty must never remove the heading while a
+        SIBLING entry still remains under it."""
+        docx = str(tmp_path / "doc.docx")
+        two_entry_xml = _DOC_XML_WITH_REFS.replace(
+            "  </w:body>",
+            '    <w:p w14:paraId="BB0004">\n'
+            '      <w:pPr><w:pStyle w:val="Bibliography"/></w:pPr>\n'
+            '      <w:bookmarkStart w:id="0" w:name="bibkey_jones2021"/>\n'
+            '      <w:r><w:t xml:space="preserve">Jones, B. (2021). New paper.</w:t></w:r>\n'
+            '      <w:bookmarkEnd w:id="0"/>\n'
+            "    </w:p>\n"
+            "  </w:body>",
+        )
+        _write_docx(docx, two_entry_xml)
+
+        res = docs_intel.remove_bibliography_entry(
+            docx_path=docx,
+            citation_key="smith2020",
+            remove_heading_if_empty=True,
+        )
+        assert "error" not in res, res.get("error")
+        assert res["heading_removed"] is False
+        xml_after = _read_doc_xml(docx)
+        assert "References" in xml_after
+        assert "bibkey_jones2021" in xml_after
+        assert "bibkey_smith2020" not in xml_after
+
+    def test_remove_with_flag_but_no_heading_present_is_a_no_op_for_heading(self, tmp_path):
+        """A document whose entry has no References heading at all (e.g. an
+        entry inserted by some other path) must not error just because
+        remove_heading_if_empty was requested."""
+        no_heading_xml = _DOC_XML_WITH_REFS.replace(
+            '      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>\n'
+            "      <w:r><w:t>References</w:t></w:r>\n",
+            "      <w:r><w:t>Not a heading.</w:t></w:r>\n",
+        )
+        docx = str(tmp_path / "doc.docx")
+        _write_docx(docx, no_heading_xml)
+
+        res = docs_intel.remove_bibliography_entry(
+            docx_path=docx,
+            citation_key="smith2020",
+            remove_heading_if_empty=True,
+        )
+        assert "error" not in res, res.get("error")
+        assert res["heading_removed"] is False
 
 
 # ---------------------------------------------------------------------------

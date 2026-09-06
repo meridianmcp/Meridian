@@ -381,6 +381,18 @@ class HandoffResult(BaseModel):
     # modes that don't compute it (planner/starter/compact/goal/l0_fallback)
     # or if generate_handoff's build itself failed before reaching the gate.
     continuation_status: dict[str, Any] | None = None
+    # c6015316 — machine-readable board-context-state signal (see
+    # meridian.handoff.build_board_context_state_for_handoff):
+    # {"state": "empty"|"context_only"|"has_pending_items",
+    # "pending_item_count", "in_progress_item_count", "pinned_decision_count",
+    # "note_count", "hint"?}. Distinguishes a genuinely-empty project from one
+    # with pinned decisions/notes but zero executable sprint items
+    # ("context_only") — previously these two cases were indistinguishable in
+    # every transport's response. Counts only, never decision/note bodies.
+    # dict, not a typed submodel, for the same forward-compat reason as
+    # capability_contract above. None only if the lookup itself failed
+    # (best-effort) — emitted on every mode, unlike continuation_status.
+    board_context_state: dict[str, Any] | None = None
 
 
 class TaskUpdate(BaseModel):

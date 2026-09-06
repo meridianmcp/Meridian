@@ -99,6 +99,38 @@ def test_patch_file_tool_registered_as_writeable():
     assert patch["annotations"]["readOnlyHint"] is False
 
 
+def test_github_tool_annotations_describe_external_and_mutating_behavior():
+    """Directory metadata must not understate GitHub side effects."""
+    tenant = {"github_pat": db_module.encrypt_field("ghp_x")}
+    by_name = {tool["name"]: tool for tool in server_module._github_tools_for_tenant(tenant)}
+
+    for name, tool in by_name.items():
+        assert tool["annotations"]["openWorldHint"] is True, name
+        assert tool["annotations"]["title"], name
+        assert isinstance(tool["annotations"]["readOnlyHint"], bool), name
+        assert isinstance(tool["annotations"]["destructiveHint"], bool), name
+
+    for name in ("patch_file", "trigger_workflow", "create_issue"):
+        assert by_name[name]["annotations"]["readOnlyHint"] is False
+        assert by_name[name]["annotations"]["destructiveHint"] is True
+
+    for name in server_module._GITHUB_READ_ONLY:
+        assert by_name[name]["annotations"]["readOnlyHint"] is True, name
+        assert by_name[name]["annotations"]["destructiveHint"] is False, name
+
+
+def test_builtin_external_search_annotations_are_open_world():
+    """Public search providers are external even though the tools are read-only."""
+    from meridian import mcp_tools
+
+    by_name = {tool["name"]: tool for tool in mcp_tools._MCP_TOOLS_LIST}
+    for name in ("paper_search", "social_search", "github_search"):
+        annotations = by_name[name]["annotations"]
+        assert annotations["readOnlyHint"] is True
+        assert annotations["destructiveHint"] is False
+        assert annotations["openWorldHint"] is True
+
+
 @pytest.mark.asyncio
 async def test_github_patch_file_replaces_and_commits(db, monkeypatch):
     import base64
@@ -673,18 +705,29 @@ def test_mcp_tools_list_no_github_tools_when_disconnected(tmp_path, monkeypatch)
 # ---------------------------------------------------------------------------
 
 _REPO_SCOPED_GITHUB_TOOLS = (
+    "read_file",
+    "patch_file",
+    "list_files",
+    "search_code",
+    "get_commits",
+    "search_commits",
+    "get_commit",
     "git_diff",
     "list_branches",
     "get_workflow_runs",
+    "get_workflow_run_logs",
     "trigger_workflow",
     "list_issues",
     "create_issue",
+    "get_issue",
 )
 
 
 def test_github_tool_descriptions_disclose_connected_repo_scope():
-    """git_diff/list_branches/get_workflow_runs/trigger_workflow/list_issues/
-    create_issue must explicitly say they operate on the project's connected
+    """All connected-repository GitHub tools must explicitly say they operate
+    on the project's connected GitHub repository, including git_diff,
+    list_branches, get_workflow_runs, trigger_workflow, list_issues, and
+    create_issue.
     GitHub repository (Anthropic MCP Directory disclosure requirement,
     f1c6dd63). Checked against the actual generated tool list returned by
     _github_tools_for_tenant, not just the source literal in isolation.
@@ -698,7 +741,7 @@ def test_github_tool_descriptions_disclose_connected_repo_scope():
         assert "connected GitHub repository" in description, (
             f"{name} description does not disclose connected-repo scope: {description!r}"
         )
-        # None of these six tools accept an owner/repo override today, so the
+        # None of these tools accept an owner/repo override today, so the
         # description must claim scoping to the connected repo outright --
         # not a hedged "defaults to" that would imply a broader reach than
         # the tool actually has. If an owner/repo param is ever added, this

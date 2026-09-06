@@ -885,6 +885,7 @@ No auth required.
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/hooks/diagnostics` | 34f76536 — live hook-configuration diagnostics for the active repo |
 | `POST` | `/hooks/session-start` | Claude Code / Codex SessionStart hook |
 | `POST` | `/hooks/stop` | Claude Code / Codex Stop hook |
 
@@ -895,6 +896,7 @@ No auth required.
 |--------|------|-------------|
 | `GET` | `/mcp` |  |
 | `POST` | `/mcp` |  |
+| `POST` | `/mcp/openai` | Curated MCP endpoint for the OpenAI plugin directory submission |
 | `GET` | `/mcp/quickstart` | One-page MCP quick reference — the 5 tools you use 90% of the time |
 | `GET` | `/mcp/sse` | MCP SSE transport GET — opens event stream for dnakov/claude-mcp |
 | `OPTIONS` | `/mcp/sse` | CORS preflight for chrome-extension:// origin |
@@ -1185,6 +1187,7 @@ No auth required.
 | `DELETE` | `/tunnel/filesystem-roots` | live-fs-roots — remove a served filesystem root and apply it live |
 | `GET` | `/tunnel/filesystem-roots` | Return the directories the tunnel's filesystem connector may read |
 | `POST` | `/tunnel/filesystem-roots` | live-fs-roots — add a served filesystem root and push it live |
+| `GET` | `/tunnel/launch-matrix/{tenant_id}` | Read-only, repeatable launch matrix across every in-scope project (ba31dedf) |
 | `GET` | `/tunnel/manifest` | Read-only tools/list manifest snapshot for this tenant (49d8244d) |
 | `POST` | `/tunnel/openai/diagnostics/{tenant_id}` | Compose OpenAI Secure MCP Tunnel adapter diagnostics for *tenant_id*, |
 | `GET` | `/tunnel/plugins` | Return the current tenant's resolved tunnel plugins + raw override config |

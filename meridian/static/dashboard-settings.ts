@@ -915,11 +915,29 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
   const hooksBaseUrl = ((mcpData && mcpData.base_url) || window.location.origin || window.state.serverConfig?.server_url || 'http://localhost:7878').replace(/\/$/, '');
 
-  function buildHookCurlHeaders(token: any) {
+  // ff9d2963 — these builders take `needsAuth` (a boolean), never the raw
+  // token. A hook command fires on EVERY SessionStart/Stop and (a) lands
+  // verbatim in ~/.claude/settings.json — a file people routinely paste into
+  // bug reports and dotfile-sync repos — and (b) becomes a literal argv
+  // substring of this process on every single firing, visible to `ps`/Task
+  // Manager to any other user on a shared machine. That is the exact
+  // anti-pattern ba31dedf already fixed server-side for
+  // scripts/meridian_connect.py's generated hooks (curl `-K <file>` reading
+  // the header from a local, restrictive-permission config file instead of
+  // argv/settings.json) — this file just never got the same fix. Browser JS
+  // has no filesystem access to write that local config file for the user,
+  // so the equivalent here is an env-var reference: the generated command
+  // reads `$MERIDIAN_HOOKS_TOKEN` / `$env:MERIDIAN_HOOKS_TOKEN` at hook-fire
+  // time instead of embedding the live secret. The actual token value is
+  // still shown to the user, but only via the existing one-time
+  // `_showKeyReveal` reveal-and-copy UI (same pattern install_mcp.html
+  // already uses correctly for the hosted-tier token) — never concatenated
+  // into this generated text.
+  function buildHookCurlHeaders(needsAuth: any) {
 
     const headers = [];
 
-    if (token) headers.push(`-H 'Authorization: Bearer ${token}'`);
+    if (needsAuth) headers.push(`-H "Authorization: Bearer $MERIDIAN_HOOKS_TOKEN"`);
 
     headers.push(`-H 'Content-Type: application/json'`);
 
@@ -929,9 +947,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
-  function buildHookCurlCommand(path: any, token: any) {
+  function buildHookCurlCommand(path: any, needsAuth: any) {
 
-    const cmd = `curl -s -X POST ${buildHookCurlHeaders(token)} -d '{"project_id":"${projectId}"}' ${hooksBaseUrl}/hooks/${path}`;
+    const cmd = `curl -s -X POST ${buildHookCurlHeaders(needsAuth)} -d '{"project_id":"${projectId}"}' ${hooksBaseUrl}/hooks/${path}`;
 
     if (path === 'session-start') return `${cmd} | jq -r '.hookSpecificOutput.additionalContext // empty'`;
 
@@ -941,9 +959,9 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
-  function buildHookPowerShellCommand(path: any, token: any) {
+  function buildHookPowerShellCommand(path: any, needsAuth: any) {
 
-    const headerClause = token ? ` -Headers @{ Authorization = 'Bearer ${token}' }` : '';
+    const headerClause = needsAuth ? ` -Headers @{ Authorization = "Bearer $env:MERIDIAN_HOOKS_TOKEN" }` : '';
 
     const bodyJson = `{"project_id":"${projectId}"}`;
 
@@ -959,19 +977,19 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
-  function buildClaudeHookSnippet(platform: any, token: any) {
+  function buildClaudeHookSnippet(platform: any, needsAuth: any) {
 
     const start = platform === 'windows'
 
-      ? buildHookPowerShellCommand('session-start', token)
+      ? buildHookPowerShellCommand('session-start', needsAuth)
 
-      : buildHookCurlCommand('session-start', token);
+      : buildHookCurlCommand('session-start', needsAuth);
 
     const stop = platform === 'windows'
 
-      ? buildHookPowerShellCommand('stop', token)
+      ? buildHookPowerShellCommand('stop', needsAuth)
 
-      : buildHookCurlCommand('stop', token);
+      : buildHookCurlCommand('stop', needsAuth);
 
     return JSON.stringify({
 
@@ -989,19 +1007,19 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
 
 
-  function buildCodexHookSnippet(platform: any, token: any) {
+  function buildCodexHookSnippet(platform: any, needsAuth: any) {
 
     const start = platform === 'windows'
 
-      ? buildHookPowerShellCommand('session-start', token)
+      ? buildHookPowerShellCommand('session-start', needsAuth)
 
-      : buildHookCurlCommand('session-start', token);
+      : buildHookCurlCommand('session-start', needsAuth);
 
     const stop = platform === 'windows'
 
-      ? buildHookPowerShellCommand('stop', token)
+      ? buildHookPowerShellCommand('stop', needsAuth)
 
-      : buildHookCurlCommand('stop', token);
+      : buildHookCurlCommand('stop', needsAuth);
 
     return `[mcp_servers.meridian]\ntype = "http"\nurl = "${hooksBaseUrl}/mcp"\n\n[hooks]\nsession_start = ${JSON.stringify(start)}\nstop = ${JSON.stringify(stop)}`;
 
@@ -4455,15 +4473,21 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
   setTimeout(() => {
 
-    const hostedPlaceholderToken = mcpData ? ('sk_meridian_' + 'x'.repeat(32)) : '';
-
     let hooksToken: any = null;
 
 
 
     const renderHooks = () => {
 
-      const activeToken = hooksToken || hostedPlaceholderToken;
+      // ff9d2963 — the generated snippets below NEVER interpolate the live
+      // token (see the builder functions' own comments): they reference
+      // $MERIDIAN_HOOKS_TOKEN / $env:MERIDIAN_HOOKS_TOKEN whenever hosted
+      // auth is required at all, whether or not a real key has been
+      // generated yet. The separate hosted-.mcp.json box elsewhere on this
+      // page still embeds a token in an `env` block — that is the sanctioned
+      // MCP-client injection pattern (a real env var passed to the child
+      // process, not a hook-argv substring), so it is out of scope here.
+      const needsAuth = !!mcpData;
 
       const installUnix = `curl -fsSL ${hooksBaseUrl}/install.sh | sh`;
 
@@ -4475,13 +4499,13 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
         [`hooks-install-windows-${projectId}`]: installWindows,
 
-        [`hooks-win-claude-${projectId}`]: buildClaudeHookSnippet('windows', activeToken),
+        [`hooks-win-claude-${projectId}`]: buildClaudeHookSnippet('windows', needsAuth),
 
-        [`hooks-win-codex-${projectId}`]: buildCodexHookSnippet('windows', activeToken),
+        [`hooks-win-codex-${projectId}`]: buildCodexHookSnippet('windows', needsAuth),
 
-        [`hooks-unix-claude-${projectId}`]: buildClaudeHookSnippet('unix', activeToken),
+        [`hooks-unix-claude-${projectId}`]: buildClaudeHookSnippet('unix', needsAuth),
 
-        [`hooks-unix-codex-${projectId}`]: buildCodexHookSnippet('unix', activeToken),
+        [`hooks-unix-codex-${projectId}`]: buildCodexHookSnippet('unix', needsAuth),
 
       };
 
@@ -4499,11 +4523,11 @@ export async function loadSettingsTab(projectId: any, { force = false } = {}) {
 
         if (hooksToken) {
 
-          statusEl.textContent = 'Real API key generated - hosted snippets are prefilled for this user and project.';
+          statusEl.textContent = 'Real API key generated. The snippets below read it from a MERIDIAN_HOOKS_TOKEN environment variable rather than embedding it — set that once (Unix: add "export MERIDIAN_HOOKS_TOKEN=..." to your shell profile; Windows: setx MERIDIAN_HOOKS_TOKEN "..." then reopen your terminal) using the key shown above, then use "Generate new key" only to rotate.';
 
         } else if (mcpData) {
 
-          statusEl.textContent = 'Generate an API key to replace the placeholder token in the hosted snippets below.';
+          statusEl.textContent = 'Generate an API key, then set it as the MERIDIAN_HOOKS_TOKEN environment variable the snippets below reference (never paste the raw key into settings.json).';
 
         } else {
 

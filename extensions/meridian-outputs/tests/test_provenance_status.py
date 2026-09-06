@@ -69,6 +69,72 @@ def _simulate_restart(outputs_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# annotate._read_ledger caching (code-review fix, fa600e42) -- added to
+# mitigate a real O(N*M) regression an adversarial review caught:
+# get_provenance_status's new relocation-detection tier calls
+# annotate.list_provenance (a full ledger read+parse) on every lookup that
+# doesn't hit an exact record, including from real batch/loop callers.
+# ---------------------------------------------------------------------------
+
+class TestLedgerReadCache:
+    def test_repeated_reads_of_unchanged_ledger_return_consistent_data(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "a.csv"
+        f.write_text("x,y\n1,1\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(f), generating_script="train.py")
+
+        first = AN.list_provenance(str(tmp_path))
+        second = AN.list_provenance(str(tmp_path))
+        assert first == second
+        assert len(first) == 1
+
+    def test_write_after_read_is_visible_on_next_read(
+        self, tmp_path: Path,
+    ) -> None:
+        """The cache must never serve a stale ledger after a real write --
+        it is keyed on the ledger file's own (mtime, size), not a fixed
+        TTL, so a subsequent write is always observed on the next read."""
+        f1 = tmp_path / "a.csv"
+        f1.write_text("x,y\n1,1\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(f1))
+        assert len(AN.list_provenance(str(tmp_path))) == 1
+
+        f2 = tmp_path / "b.csv"
+        f2.write_text("x,y\n2,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(f2))
+        assert len(AN.list_provenance(str(tmp_path))) == 2
+
+    def test_get_provenance_sees_own_immediately_preceding_write(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "a.csv"
+        f.write_text("x,y\n1,1\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(f), generating_script="v1.py")
+        assert AN.get_provenance(str(tmp_path), str(f))["generating_script"] == "v1.py"
+
+        AN.record_provenance(str(tmp_path), str(f), generating_script="v2.py")
+        assert AN.get_provenance(str(tmp_path), str(f))["generating_script"] == "v2.py"
+
+    def test_different_outputs_dirs_never_share_a_cache_entry(
+        self, tmp_path: Path,
+    ) -> None:
+        dir_a = tmp_path / "a"
+        dir_a.mkdir()
+        dir_b = tmp_path / "b"
+        dir_b.mkdir()
+        fa = dir_a / "out.csv"
+        fa.write_text("x\n1\n", encoding="utf-8")
+        AN.record_provenance(str(dir_a), str(fa), generating_script="a.py")
+        fb = dir_b / "out.csv"
+        fb.write_text("x\n1\n", encoding="utf-8")
+        AN.record_provenance(str(dir_b), str(fb), generating_script="b.py")
+
+        assert AN.get_provenance(str(dir_a), str(fa))["generating_script"] == "a.py"
+        assert AN.get_provenance(str(dir_b), str(fb))["generating_script"] == "b.py"
+
+
+# ---------------------------------------------------------------------------
 # Argument validation
 # ---------------------------------------------------------------------------
 
@@ -258,6 +324,176 @@ class TestStaleness:
         assert status["staleness"]["current_content_hash"] == (
             status["staleness"]["recorded_content_hash"]
         )
+
+
+# ---------------------------------------------------------------------------
+# Relocation via content-hash match (sprint item fa600e42)
+# ---------------------------------------------------------------------------
+
+class TestRelocated:
+    @duckdb_required
+    def test_single_hash_match_at_different_path_is_relocated(
+        self, tmp_path: Path,
+    ) -> None:
+        old = tmp_path / "run_1" / "metrics.csv"
+        old.parent.mkdir()
+        old.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old), generating_script="train.py")
+
+        new = tmp_path / "run_1_moved" / "metrics.csv"
+        new.parent.mkdir()
+        new.write_text("epoch,accuracy\n1,0.9\n", encoding="utf-8")  # identical content
+        old.unlink()
+
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        assert status["provenance_type"] == PS.RELOCATED
+        assert status["record"]["path"] == str(old)
+        assert status["directory_note"] is None
+        assert status["staleness"]["exists_on_disk"] is True
+        assert status["staleness"]["stale"] is False
+        assert repr(str(old)) in status["staleness"]["reason"]
+        assert status["inconclusive"] is False
+
+    @duckdb_required
+    def test_exact_record_for_this_path_wins_over_relocation_match(
+        self, tmp_path: Path,
+    ) -> None:
+        # Two files can legitimately share identical content -- an exact
+        # record for THIS path must still take priority over treating it as
+        # "relocated from" some other twin.
+        twin_a = tmp_path / "a.csv"
+        twin_a.write_text("x,y\n1,1\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(twin_a))
+        twin_b = tmp_path / "b.csv"
+        twin_b.write_text("x,y\n1,1\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(twin_b))
+
+        status = PS.get_provenance_status(str(tmp_path), str(twin_b))
+        assert status["provenance_type"] == PS.EXACT
+        assert status["record"]["path"] == str(twin_b)
+
+    def test_no_relocation_match_when_candidate_file_missing(
+        self, tmp_path: Path,
+    ) -> None:
+        old = tmp_path / "gone.csv"
+        old.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old))
+        old.unlink()
+
+        # A path that never existed on disk has no content to hash, so it
+        # can never be confirmed "relocated" -- falls through to unknown.
+        phantom = tmp_path / "phantom.csv"
+        status = PS.get_provenance_status(str(tmp_path), str(phantom))
+        assert status["provenance_type"] == PS.UNKNOWN
+
+    @duckdb_required
+    def test_resolver_state_maps_relocated_to_verified_authoritative(
+        self, tmp_path: Path,
+    ) -> None:
+        old = tmp_path / "before.csv"
+        old.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(old))
+        new = tmp_path / "after.csv"
+        new.write_text("a,b\n1,2\n", encoding="utf-8")
+        old.unlink()
+
+        status = PS.get_provenance_status(str(tmp_path), str(new))
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.VERIFIED
+        assert rec.partial is False
+        assert rec.is_authoritative is True
+        assert rec.attributes["provenance_type"] == PS.RELOCATED
+
+
+# ---------------------------------------------------------------------------
+# Ambiguous: content hash matches more than one prior record (fa600e42)
+# ---------------------------------------------------------------------------
+
+class TestAmbiguous:
+    @duckdb_required
+    def test_two_hash_matches_is_ambiguous(self, tmp_path: Path) -> None:
+        content = "epoch,accuracy\n1,0.9\n"
+        first = tmp_path / "run_a" / "metrics.csv"
+        first.parent.mkdir()
+        first.write_text(content, encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(first))
+
+        second = tmp_path / "run_b" / "metrics.csv"
+        second.parent.mkdir()
+        second.write_text(content, encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(second))
+
+        candidate = tmp_path / "run_c" / "metrics.csv"
+        candidate.parent.mkdir()
+        candidate.write_text(content, encoding="utf-8")  # matches BOTH
+
+        status = PS.get_provenance_status(str(tmp_path), str(candidate))
+        assert status["provenance_type"] == PS.AMBIGUOUS
+        assert status["record"] is None
+        assert status["directory_note"] is None
+        assert status["staleness"] is None
+        assert status["inconclusive"] is False
+        candidate_paths = {c["path"] for c in status["candidates"]}
+        assert candidate_paths == {str(first), str(second)}
+
+    @duckdb_required
+    def test_resolver_state_maps_ambiguous_to_partial_ambiguous(
+        self, tmp_path: Path,
+    ) -> None:
+        content = "a,b\n1,2\n"
+        first = tmp_path / "x.csv"
+        first.write_text(content, encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(first))
+        second = tmp_path / "y.csv"
+        second.write_text(content, encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(second))
+        candidate = tmp_path / "z.csv"
+        candidate.write_text(content, encoding="utf-8")
+
+        status = PS.get_provenance_status(str(tmp_path), str(candidate))
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.resolver.status is RE.ResolverStatus.AMBIGUOUS
+        assert rec.partial is True
+        assert rec.partial_reason
+        assert "2" in rec.partial_reason
+        assert rec.is_authoritative is False
+
+    @duckdb_required
+    def test_candidates_preserved_losslessly_in_evidence_record(
+        self, tmp_path: Path,
+    ) -> None:
+        """Code-review fix (fa600e42): evidence_record_from_provenance_status
+        promises every field get_provenance_status returns is preserved
+        losslessly in attributes -- AMBIGUOUS's candidates list was being
+        silently dropped, contradicting that guarantee."""
+        content = "a,b\n1,2\n"
+        first = tmp_path / "x.csv"
+        first.write_text(content, encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(first))
+        second = tmp_path / "y.csv"
+        second.write_text(content, encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(second))
+        candidate = tmp_path / "z.csv"
+        candidate.write_text(content, encoding="utf-8")
+
+        status = PS.get_provenance_status(str(tmp_path), str(candidate))
+        rec = PS.evidence_record_from_provenance_status(status)
+
+        assert rec.attributes["candidates"] == status["candidates"]
+        candidate_paths = {c["path"] for c in rec.attributes["candidates"]}
+        assert candidate_paths == {str(first), str(second)}
+
+    @duckdb_required
+    def test_candidates_absent_for_non_ambiguous_types(
+        self, tmp_path: Path,
+    ) -> None:
+        f = tmp_path / "results.csv"
+        f.write_text("a,b\n1,2\n", encoding="utf-8")
+        AN.record_provenance(str(tmp_path), str(f))
+
+        status = PS.get_provenance_status(str(tmp_path), str(f))
+        rec = PS.evidence_record_from_provenance_status(status)
+        assert rec.attributes["candidates"] is None
 
 
 # ---------------------------------------------------------------------------
