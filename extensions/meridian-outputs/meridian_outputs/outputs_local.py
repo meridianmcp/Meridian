@@ -2348,7 +2348,7 @@ def _default_walk_cooldown_seconds() -> float:
 
 
 def _resolve_walk_cooldown_seconds(explicit: float | None) -> float:
-    """Precedence: explicit constructor arg > env var > 60s default."""
+    """Precedence: explicit constructor arg > env var > 0s (disabled) default."""
     if explicit is not None:
         if explicit >= 0:
             return explicit
@@ -2359,6 +2359,114 @@ def _resolve_walk_cooldown_seconds(explicit: float | None) -> float:
         )
         return _WALK_COOLDOWN_SECONDS_DEFAULT
     return _default_walk_cooldown_seconds()
+
+
+# ---------------------------------------------------------------------------
+# fa600e42 follow-up (adaptive cooldown) -- scale the walk-restart cooldown
+# to the observed cost of a full pass, instead of a flat window
+# ---------------------------------------------------------------------------
+# Confirmed live: a fixed walk_cooldown_seconds window (see above) correctly
+# suppresses redundant re-walks on a corpus small enough that one full pass
+# completes well inside the window (e.g. a pass finishing in well under a
+# minute against a 60s cooldown) -- but on a large/slow corpus where a
+# single full pass itself takes SEVERAL MINUTES, the fixed window has almost
+# always already expired by the time rebuild() next checks it, so most
+# restarts after the first go through anyway. A 385,064-file stress run
+# with a 60s cooldown still spent ~20% of total wall-clock time on ~7
+# separate full-tree re-enumerations for exactly this reason -- the flat
+# window can't tell "this corpus is just slow" from "the caller's floor is
+# too short"; it always behaves as the latter once a pass runs long.
+#
+# The fix: once a full pass's own wall-clock duration has been observed
+# (this process's own timing, never persisted -- see
+# self._walk_last_full_pass_duration_seconds), scale the EFFECTIVE cooldown
+# up to a multiple of that duration, bounded by a ceiling so one anomalously
+# slow pass (e.g. a transient network-filesystem stall) can't push the
+# worst-case re-discovery delay arbitrarily high. The explicit
+# walk_cooldown_seconds floor always still applies via max() -- this can
+# only ever widen the effective window relative to the flat setting, never
+# narrow it below what the caller explicitly configured.
+_WALK_COOLDOWN_SAFETY_FACTOR_DEFAULT = 0.5
+_WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR = "MERIDIAN_OUTPUTS_WALK_COOLDOWN_SAFETY_FACTOR"
+_WALK_COOLDOWN_MAX_SECONDS_DEFAULT = 1800.0
+_WALK_COOLDOWN_MAX_SECONDS_ENV_VAR = "MERIDIAN_OUTPUTS_WALK_COOLDOWN_MAX_SECONDS"
+
+
+def _default_walk_cooldown_safety_factor() -> float:
+    """Resolve the default walk-cooldown safety factor from the environment.
+
+    A factor of 0.0 disables duration-based scaling outright -- the
+    effective cooldown then always collapses back to the flat
+    walk_cooldown_seconds floor, exactly the pre-scaling behaviour.
+    """
+    raw = os.environ.get(_WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR)
+    if raw is None or not raw.strip():
+        return _WALK_COOLDOWN_SAFETY_FACTOR_DEFAULT
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        _log.warning(
+            "%s=%r is not a valid float -- falling back to default (%s)",
+            _WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, raw, _WALK_COOLDOWN_SAFETY_FACTOR_DEFAULT,
+        )
+        return _WALK_COOLDOWN_SAFETY_FACTOR_DEFAULT
+    if value < 0:
+        _log.warning(
+            "%s=%r must be >= 0 -- falling back to default (%s)",
+            _WALK_COOLDOWN_SAFETY_FACTOR_ENV_VAR, raw, _WALK_COOLDOWN_SAFETY_FACTOR_DEFAULT,
+        )
+        return _WALK_COOLDOWN_SAFETY_FACTOR_DEFAULT
+    return value
+
+
+def _resolve_walk_cooldown_safety_factor(explicit: float | None) -> float:
+    """Precedence: explicit constructor arg > env var > 0.5 default."""
+    if explicit is not None:
+        if explicit >= 0:
+            return explicit
+        _log.warning(
+            "OutputsFtsIndex: walk_cooldown_safety_factor=%r must be >= 0 "
+            "-- falling back to default (%s)",
+            explicit, _WALK_COOLDOWN_SAFETY_FACTOR_DEFAULT,
+        )
+        return _WALK_COOLDOWN_SAFETY_FACTOR_DEFAULT
+    return _default_walk_cooldown_safety_factor()
+
+
+def _default_walk_cooldown_max_seconds() -> float:
+    """Resolve the default walk-cooldown ceiling from the environment."""
+    raw = os.environ.get(_WALK_COOLDOWN_MAX_SECONDS_ENV_VAR)
+    if raw is None or not raw.strip():
+        return _WALK_COOLDOWN_MAX_SECONDS_DEFAULT
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        _log.warning(
+            "%s=%r is not a valid float -- falling back to default (%s)",
+            _WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, raw, _WALK_COOLDOWN_MAX_SECONDS_DEFAULT,
+        )
+        return _WALK_COOLDOWN_MAX_SECONDS_DEFAULT
+    if value < 0:
+        _log.warning(
+            "%s=%r must be >= 0 -- falling back to default (%s)",
+            _WALK_COOLDOWN_MAX_SECONDS_ENV_VAR, raw, _WALK_COOLDOWN_MAX_SECONDS_DEFAULT,
+        )
+        return _WALK_COOLDOWN_MAX_SECONDS_DEFAULT
+    return value
+
+
+def _resolve_walk_cooldown_max_seconds(explicit: float | None) -> float:
+    """Precedence: explicit constructor arg > env var > 1800s default."""
+    if explicit is not None:
+        if explicit >= 0:
+            return explicit
+        _log.warning(
+            "OutputsFtsIndex: walk_cooldown_max_seconds=%r must be >= 0 "
+            "-- falling back to default (%s)",
+            explicit, _WALK_COOLDOWN_MAX_SECONDS_DEFAULT,
+        )
+        return _WALK_COOLDOWN_MAX_SECONDS_DEFAULT
+    return _default_walk_cooldown_max_seconds()
 
 
 # ---------------------------------------------------------------------------
@@ -2688,6 +2796,8 @@ class OutputsFtsIndex:
         max_batch: int | None = None,
         write_chunk: int | None = None,
         walk_cooldown_seconds: float | None = None,
+        walk_cooldown_safety_factor: float | None = None,
+        walk_cooldown_max_seconds: float | None = None,
         session_id: str | None = None,
         initial_scan_boundary: str | None = None,
         initial_row_cache: dict[str, "OutputRow"] | None = None,
@@ -2753,6 +2863,17 @@ class OutputsFtsIndex:
         # redundant-re-walk incident this closes.
         self._walk_cooldown_seconds = _resolve_walk_cooldown_seconds(
             walk_cooldown_seconds,
+        )
+        # fa600e42 follow-up (adaptive cooldown) -- see
+        # _WALK_COOLDOWN_SAFETY_FACTOR_DEFAULT's module comment: scales the
+        # effective cooldown above to the observed duration of the last full
+        # pass, so a slow/large corpus gets real protection instead of the
+        # flat floor expiring before rebuild() next checks it.
+        self._walk_cooldown_safety_factor = _resolve_walk_cooldown_safety_factor(
+            walk_cooldown_safety_factor,
+        )
+        self._walk_cooldown_max_seconds = _resolve_walk_cooldown_max_seconds(
+            walk_cooldown_max_seconds,
         )
         self._adaptive_batch = self._initial_adaptive_batch()
         # 1bce8c41 -- DB write-chunk size: explicit param > MERIDIAN_OUTPUTS_
@@ -2850,6 +2971,25 @@ class OutputsFtsIndex:
         # the walk-restart cooldown in rebuild()'s Phase 0 -- see
         # _WALK_COOLDOWN_SECONDS_DEFAULT's module comment.
         self._walk_last_full_pass_completed_at: float | None = None
+        # fa600e42 follow-up (adaptive cooldown) -- time.monotonic() (unlike
+        # the wall-clock field above, this is a pure DURATION measurement
+        # local to this process's own timing, so it needs no cross-restart
+        # comparability and monotonic is strictly safer against NTP/DST/
+        # sleep-wake skew). Set when a brand-new pass starts, consumed and
+        # reset to None the moment that pass is confirmed complete.
+        self._walk_last_full_pass_started_at: float | None = None
+        # fa600e42 follow-up (adaptive cooldown) -- observed wall duration of
+        # the most recently COMPLETED full pass this process itself timed
+        # start-to-finish. None until one such pass has finished. Never
+        # persisted (same durability tier as _walk_last_full_pass_completed_at
+        # above -- both are absent from _WALK_STATE_META_KEYS), and never
+        # updated from a pass that resumed from a scan boundary (see the
+        # walk_complete branch in rebuild()'s Phase 0): that pass's own
+        # elapsed time only covers the portion of the tree THIS process
+        # re-walked, not the full logical pass a prior process partly
+        # completed, so folding it in would under-count and silently shrink
+        # the scaled cooldown below.
+        self._walk_last_full_pass_duration_seconds: float | None = None
         # fa600e42 follow-up (write_seconds diagnostics) -- set True the
         # first time Phase 2's bulk-insert pyarrow import fails at runtime
         # this process, so the one-time WARNING log (see that call site)
@@ -4565,6 +4705,11 @@ class OutputsFtsIndex:
         # self._walk_accumulated during a cooldown-skipped call) has a
         # defined value even when os.path.isdir() is False below.
         in_walk_cooldown = False
+        # fa600e42 follow-up (adaptive cooldown) -- defined here (not inside
+        # the os.path.isdir() branch below) so it always has a value for the
+        # diagnostics dict later, even when outputs_dir doesn't exist this
+        # call. See _WALK_COOLDOWN_SAFETY_FACTOR_DEFAULT's module comment.
+        effective_walk_cooldown_seconds = self._walk_cooldown_seconds
         if os.path.isdir(self.outputs_dir):
             # fa600e42 follow-up (architecture review) -- see
             # _WALK_COOLDOWN_SECONDS_DEFAULT's module comment: a confirmed
@@ -4577,12 +4722,37 @@ class OutputsFtsIndex:
             # (the tree IS fully converged as of the last completed pass),
             # and eventual re-discovery of genuinely new/changed files is
             # never blocked, only deferred past this cooldown window.
+            #
+            # fa600e42 follow-up (adaptive cooldown) -- the flat
+            # self._walk_cooldown_seconds floor above is widened here once a
+            # full pass's own observed duration is known, so a slow/large
+            # corpus (where a single pass can itself take minutes) gets a
+            # cooldown proportional to what it actually needs instead of one
+            # that always expires before rebuild() next checks it. See
+            # _WALK_COOLDOWN_SAFETY_FACTOR_DEFAULT's module comment.
+            if (
+                self._walk_cooldown_seconds > 0
+                and self._walk_last_full_pass_duration_seconds is not None
+            ):
+                scaled = (
+                    self._walk_last_full_pass_duration_seconds
+                    * self._walk_cooldown_safety_factor
+                )
+                # Outer max() guarantees the explicit floor is the absolute
+                # minimum in every case, even if a misconfigured ceiling is
+                # smaller than the floor -- the ceiling only ever narrows how
+                # far scaling can push the value UP, never drags it below
+                # what the caller explicitly asked for.
+                effective_walk_cooldown_seconds = max(
+                    self._walk_cooldown_seconds,
+                    min(scaled, self._walk_cooldown_max_seconds),
+                )
             in_walk_cooldown = (
                 self._walk_state is None
                 and self._walk_last_full_pass_completed_at is not None
                 and (
                     time.time() - self._walk_last_full_pass_completed_at
-                    < self._walk_cooldown_seconds
+                    < effective_walk_cooldown_seconds
                 )
             )
             if self._walk_state is None and not in_walk_cooldown:
@@ -4643,6 +4813,9 @@ class OutputsFtsIndex:
                     max_batch=walk_batch, on_error=self._record_walk_error,
                     resume_after=self._scan_boundary,
                 )
+                # fa600e42 follow-up (adaptive cooldown) -- start timing this
+                # pass; consumed and reset once it's confirmed complete below.
+                self._walk_last_full_pass_started_at = time.monotonic()
                 self._walk_accumulated = []
                 # fa600e42 follow-up, code-review fix -- whether THIS pass
                 # started from a boundary (skipping ground a DIFFERENT,
@@ -4681,10 +4854,30 @@ class OutputsFtsIndex:
                 walk_complete = self._walk_state.exhausted
                 if walk_complete:
                     self._walk_last_full_pass_completed_at = time.time()
+                    # fa600e42 follow-up (adaptive cooldown) -- only trust
+                    # this measurement as a FULL pass's duration when it
+                    # started fresh in this process (not resumed from a
+                    # boundary): a boundary-resumed pass's own elapsed time
+                    # only covers the portion of the tree THIS process
+                    # re-walked, not the full logical pass a prior process
+                    # partly completed, so folding it in would under-count
+                    # and silently shrink the scaled cooldown above.
+                    if (
+                        self._walk_last_full_pass_started_at is not None
+                        and not self._walk_pass_resumed_from_boundary
+                    ):
+                        self._walk_last_full_pass_duration_seconds = (
+                            time.monotonic() - self._walk_last_full_pass_started_at
+                        )
+                    self._walk_last_full_pass_started_at = None
         else:
             self._walk_state = None
             self._walk_accumulated = []
             self._pending_stale = {}
+            # fa600e42 follow-up (adaptive cooldown) -- outputs_dir vanishing
+            # mid-pass must never leak an outage window into a future pass's
+            # measured duration.
+            self._walk_last_full_pass_started_at = None
             walk_complete = True
 
         # Durable proxy for "_walk_state is not None" -- see the field's
@@ -4783,6 +4976,16 @@ class OutputsFtsIndex:
             "analysis_batch_limit": analysis_limit,
             "analysis_batch_source": (
                 "override" if self._max_batch_overridden else "adaptive"
+            ),
+            # fa600e42 follow-up (adaptive cooldown) -- observational surface
+            # for the scaling in Phase 0 above: the cooldown window actually
+            # applied THIS call, and the last full pass's own measured
+            # duration it was derived from (None until one pass has
+            # completed in this process).
+            "walk_cooldown_effective_seconds": round(effective_walk_cooldown_seconds, 3),
+            "walk_last_full_pass_duration_seconds": (
+                round(self._walk_last_full_pass_duration_seconds, 3)
+                if self._walk_last_full_pass_duration_seconds is not None else None
             ),
         })
 
