@@ -20502,3 +20502,230 @@ async def test_supersede_pinned_decision_inherits_slug_generation(db):
     )
     assert new.get("slug"), "superseding decision should have slug"
     assert new.get("nickname"), "superseding decision should have nickname"
+
+
+# ---------------------------------------------------------------------------
+# paper_search — semantic_scholar_search, author_search, pubmed_search
+# (2e51a41a)
+# ---------------------------------------------------------------------------
+
+from unittest.mock import AsyncMock, MagicMock, patch as _patch  # noqa: E402
+
+
+def _make_async_cm(mock_http):
+    """Return an async context-manager mock that yields *mock_http* on __aenter__."""
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=mock_http)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return cm
+
+
+def _mock_response(json_data=None, text_data="", status_code=200):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json = MagicMock(return_value=json_data or {})
+    resp.text = text_data
+    resp.status_code = status_code
+    return resp
+
+
+@pytest.mark.asyncio
+async def test_semantic_scholar_search_returns_results():
+    from meridian.paper_search import semantic_scholar_search
+
+    payload = {
+        "data": [
+            {
+                "paperId": "s2id1",
+                "title": "Witches Broom Disease of Cacao",
+                "authors": [{"name": "J. Doe"}, {"name": "M. Smith"}],
+                "abstract": "Moniliophthora perniciosa causes significant yield loss.",
+                "year": 2021,
+                "citationCount": 42,
+                "tldr": {"text": "Fungal pathogen review."},
+                "openAccessPdf": {"url": "https://example.com/paper.pdf"},
+                "externalIds": {"DOI": "10.1234/cacao"},
+            }
+        ]
+    }
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await semantic_scholar_search("cacao disease", limit=5)
+
+    assert result["query"] == "cacao disease"
+    assert result["count"] == 1
+    r = result["results"][0]
+    assert r["s2_id"] == "s2id1"
+    assert r["title"] == "Witches Broom Disease of Cacao"
+    assert r["authors"] == ["J. Doe", "M. Smith"]
+    assert r["citation_count"] == 42
+    assert r["doi"] == "10.1234/cacao"
+    assert r["pdf_url"] == "https://example.com/paper.pdf"
+    assert r["tldr"] == "Fungal pathogen review."
+
+
+@pytest.mark.asyncio
+async def test_semantic_scholar_search_degrades_on_error():
+    from meridian.paper_search import semantic_scholar_search
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=Exception("connection refused"))
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await semantic_scholar_search("cacao")
+
+    assert "error" in result
+    assert result.get("query") == "cacao"
+    assert "results" not in result
+
+
+@pytest.mark.asyncio
+async def test_semantic_scholar_search_empty_query_returns_error():
+    from meridian.paper_search import semantic_scholar_search
+
+    result = await semantic_scholar_search("")
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_author_search_returns_results():
+    from meridian.paper_search import author_search
+
+    payload = {
+        "data": [
+            {
+                "authorId": "auth42",
+                "name": "Karina Gramacho",
+                "affiliations": ["CEPEC"],
+                "paperCount": 30,
+                "citationCount": 200,
+                "papers": [
+                    {"title": "Cacao Resistance", "year": 2009, "externalIds": {"DOI": "10.5/cr"}},
+                    {"title": "Biocontrol Review", "year": 2015, "externalIds": None},
+                ],
+            }
+        ]
+    }
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await author_search("Karina Gramacho", limit=3)
+
+    assert result["query"] == "Karina Gramacho"
+    assert result["count"] == 1
+    a = result["results"][0]
+    assert a["author_id"] == "auth42"
+    assert a["name"] == "Karina Gramacho"
+    assert a["affiliations"] == ["CEPEC"]
+    assert a["paper_count"] == 30
+    assert a["citation_count"] == 200
+    assert len(a["papers"]) == 2
+    assert a["papers"][0]["doi"] == "10.5/cr"
+    assert a["papers"][1]["doi"] == ""  # externalIds None degrades to ""
+
+
+@pytest.mark.asyncio
+async def test_author_search_empty_name_returns_error():
+    from meridian.paper_search import author_search
+
+    result = await author_search("")
+    assert "error" in result
+
+
+@pytest.mark.asyncio
+async def test_author_search_degrades_on_http_error():
+    from meridian.paper_search import author_search
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=Exception("timeout"))
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await author_search("Pirovani")
+
+    assert "error" in result
+    assert result.get("query") == "Pirovani"
+
+
+@pytest.mark.asyncio
+async def test_pubmed_search_returns_results():
+    from meridian.paper_search import pubmed_search
+
+    esearch_payload = {"esearchresult": {"idlist": ["38123456"]}}
+    efetch_xml = """\
+<PubmedArticleSet>
+  <PubmedArticle>
+    <MedlineCitation>
+      <PMID>38123456</PMID>
+      <Article>
+        <ArticleTitle>AOX and Nitric Oxide in Cacao Defense</ArticleTitle>
+        <Abstract>
+          <AbstractText>Alternative oxidase mediates reactive oxygen species.</AbstractText>
+        </Abstract>
+        <AuthorList>
+          <Author><LastName>Pirovani</LastName><ForeName>C P</ForeName></Author>
+        </AuthorList>
+        <Journal><JournalIssue><PubDate><Year>2019</Year></PubDate></JournalIssue></Journal>
+      </Article>
+    </MedlineCitation>
+    <PubmedData>
+      <ArticleIdList>
+        <ArticleId IdType="doi">10.1016/j.plantsci.2019.01.001</ArticleId>
+      </ArticleIdList>
+    </PubmedData>
+  </PubmedArticle>
+</PubmedArticleSet>"""
+
+    esearch_resp = _mock_response(json_data=esearch_payload)
+    efetch_resp = _mock_response(text_data=efetch_xml)
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=[esearch_resp, efetch_resp])
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await pubmed_search("cacao alternative oxidase")
+
+    assert result["query"] == "cacao alternative oxidase"
+    assert result["count"] == 1
+    r = result["results"][0]
+    assert r["pmid"] == "38123456"
+    assert r["title"] == "AOX and Nitric Oxide in Cacao Defense"
+    assert "Alternative oxidase" in r["summary"]
+    assert r["authors"] == ["C P Pirovani"]
+    assert r["published"] == "2019"
+    assert r["url"] == "https://pubmed.ncbi.nlm.nih.gov/38123456/"
+    assert r["pdf_url"] == ""
+    assert r["doi"] == "10.1016/j.plantsci.2019.01.001"
+
+
+@pytest.mark.asyncio
+async def test_pubmed_search_empty_idlist_returns_zero():
+    from meridian.paper_search import pubmed_search
+
+    esearch_payload = {"esearchresult": {"idlist": []}}
+    esearch_resp = _mock_response(json_data=esearch_payload)
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(return_value=esearch_resp)
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await pubmed_search("xyzzy_nonexistent_topic")
+
+    assert result["count"] == 0
+    assert result["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_pubmed_search_degrades_on_error():
+    from meridian.paper_search import pubmed_search
+
+    mock_http = AsyncMock()
+    mock_http.get = AsyncMock(side_effect=Exception("network error"))
+
+    with _patch("httpx.AsyncClient", return_value=_make_async_cm(mock_http)):
+        result = await pubmed_search("disease")
+
+    assert "error" in result
+    assert result.get("query") == "disease"

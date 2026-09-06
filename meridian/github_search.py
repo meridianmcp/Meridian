@@ -17,18 +17,74 @@ paper_search's two-source shape:
   finds competitor/prior-art repositories by topic/description/stars.
 
 Both are keyless (no PAT required for public-repo search) — matching the exact
-keyless constraint paper_search.py/social_search.py are built around. GitHub rate-
-limits unauthenticated search requests fairly aggressively; no explicit backoff/
-retry is implemented here, matching the existing keyless-family convention of
-degrading to ``{error}`` on any exception rather than retrying.
+keyless constraint paper_search.py/social_search.py are built around.
+
+2e51a41a — adds an in-memory result cache (TTL 5 min, keyed by query+limit) and
+exponential backoff on HTTP 429/503 responses (max 3 attempts, delays 0.5s and 1.5s
+between attempts). A cached result is returned immediately on a cache hit; only
+successful responses are cached (errors are never cached). Retry is limited to
+429/503; any other exception degrades immediately without retrying, consistent with
+the keyless-family convention of degrading to ``{error}`` rather than hanging.
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 
 _GITHUB_CODE_API = "https://api.github.com/search/code"
 _GITHUB_REPO_API = "https://api.github.com/search/repositories"
 _ACCEPT_HEADER = "application/vnd.github+json"
+
+# 2e51a41a — in-memory result cache shared by both search functions.
+# Key: ("code"|"repo", query, limit); value: (result_dict, monotonic_timestamp).
+_CACHE: dict[tuple, tuple] = {}
+_CACHE_TTL = 300.0  # 5 minutes in seconds
+_RETRY_DELAYS = (0.5, 1.5)  # waits [s] before attempt 2 and attempt 3; no wait before 1
+
+
+def _cache_get(key: tuple) -> Any | None:
+    """Return cached result if still within TTL, evicting stale entries. Returns None on miss."""
+    entry = _CACHE.get(key)
+    if entry is None:
+        return None
+    result, ts = entry
+    if time.monotonic() - ts > _CACHE_TTL:
+        del _CACHE[key]
+        return None
+    return result
+
+
+def _cache_set(key: tuple, result: Any) -> None:
+    """Store result in cache with current monotonic timestamp."""
+    _CACHE[key] = (result, time.monotonic())
+
+
+async def _fetch_with_backoff(
+    http: Any, url: str, params: dict[str, str], headers: dict[str, str]
+) -> Any:
+    """HTTP GET with exponential backoff on 429/503; max 3 attempts.
+
+    No delay before the first attempt. Waits ``_RETRY_DELAYS[0]`` s before the
+    second attempt and ``_RETRY_DELAYS[1]`` s before the third. Any non-429/503
+    exception propagates immediately so the caller's outer ``except Exception``
+    can degrade the response without retrying.
+    """
+    import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        if attempt > 0:
+            await asyncio.sleep(_RETRY_DELAYS[attempt - 1])
+        try:
+            resp = await http.get(url, params=params, headers=headers)
+            resp.raise_for_status()
+            return resp
+        except _httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (429, 503):
+                last_exc = exc
+                continue
+            raise  # non-429/503 HTTP error — don't retry, propagate immediately
+    raise last_exc  # type: ignore[misc]
 
 
 def parse_github_code_items(payload: Any, limit: int = 10) -> list[dict[str, Any]]:
@@ -153,31 +209,36 @@ async def github_code_search(
     alternate sort the Code Search API supports).
     Never raises — an empty query returns ``{error}`` and any network/parse
     failure degrades to ``{error, query}`` so a research call can't crash the
-    MCP handler.
+    MCP handler.  Results are cached in memory for ``_CACHE_TTL`` seconds.
     """
     q = (query or "").strip()
     if not q:
         return {"error": "query is required"}
     n = max(1, min(int(limit or 10), 50))
-    params = {"q": q, "per_page": str(n)}
+    cache_key = ("code", q, n)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    params: dict[str, str] = {"q": q, "per_page": str(n)}
     if str(sort_by).lower() in ("date", "recent", "newest"):
         params["sort"] = "indexed"
         params["order"] = "desc"
     import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
     try:
         async with _httpx.AsyncClient(timeout=15.0) as http:
-            resp = await http.get(
-                _GITHUB_CODE_API, params=params,
+            resp = await _fetch_with_backoff(
+                http, _GITHUB_CODE_API, params=params,
                 headers={
                     "User-Agent": "Meridian/github_search (research routing)",
                     "Accept": _ACCEPT_HEADER,
                 },
             )
-            resp.raise_for_status()
             results = parse_github_code_items(resp.json(), n)
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
         return {"error": f"github code search failed: {exc}", "query": q}
-    return {"query": q, "count": len(results), "results": results}
+    out = {"query": q, "count": len(results), "results": results}
+    _cache_set(cache_key, out)
+    return out
 
 
 async def github_repo_search(
@@ -192,28 +253,33 @@ async def github_repo_search(
     Never raises — an empty query returns ``{error}`` and any network/parse
     failure degrades to ``{error, query}`` so a research call can't crash the
     MCP handler. Mirrors ``github_code_search`` exactly (keyless, best-effort,
-    non-raising).
+    non-raising, with cache and backoff).
     """
     q = (query or "").strip()
     if not q:
         return {"error": "query is required"}
     n = max(1, min(int(limit or 10), 50))
-    params = {"q": q, "per_page": str(n)}
+    cache_key = ("repo", q, n)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    params: dict[str, str] = {"q": q, "per_page": str(n)}
     if str(sort_by).lower() in ("date", "recent", "newest"):
         params["sort"] = "updated"
         params["order"] = "desc"
     import httpx as _httpx  # noqa: PLC0415 — match the handler's inline-httpx pattern
     try:
         async with _httpx.AsyncClient(timeout=15.0) as http:
-            resp = await http.get(
-                _GITHUB_REPO_API, params=params,
+            resp = await _fetch_with_backoff(
+                http, _GITHUB_REPO_API, params=params,
                 headers={
                     "User-Agent": "Meridian/github_search (research routing)",
                     "Accept": _ACCEPT_HEADER,
                 },
             )
-            resp.raise_for_status()
             results = parse_github_repo_items(resp.json(), n)
     except Exception as exc:  # noqa: BLE001 — degrade, never crash the tool call
         return {"error": f"github repo search failed: {exc}", "query": q}
-    return {"query": q, "count": len(results), "results": results}
+    out = {"query": q, "count": len(results), "results": results}
+    _cache_set(cache_key, out)
+    return out
