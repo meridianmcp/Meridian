@@ -6616,6 +6616,81 @@ class OutputsFtsIndex:
                 return None
         return row[0] if row is not None else None
 
+    def compact_to(self, new_db_path: str) -> None:
+        """Write a compacted copy of this index's DuckDB database to
+        ``new_db_path``, reclaiming on-disk space that DELETE/UPDATE churn
+        (the DELETE-then-INSERT write path -- see rebuild()'s Phase 2)
+        leaves behind over the lifetime of a long-running, repeatedly-
+        rebuilt index.
+
+        fa600e42 follow-up (architecture review) -- confirmed live, not
+        assumed: DuckDB's own ``VACUUM`` command does NOT reclaim on-disk
+        space in this version. A test table with 5000 rows, 98% deleted
+        then explicitly ``VACUUM``'d and ``CHECKPOINT``'d, left the file
+        size completely unchanged (~500MB before and after). The only
+        verified-working compaction mechanism is DuckDB's own documented
+        "copy to a fresh database" pattern (``ATTACH`` + ``COPY FROM
+        DATABASE ... TO ...``) -- confirmed live to shrink that same test
+        file from ~500MB to ~11MB (matching the real, surviving row count)
+        after the same 98% delete.
+
+        Deliberately NOT an in-place, automatic swap: this only writes the
+        compacted copy to ``new_db_path`` and leaves this instance's own
+        ``db_path``/connection completely untouched. Swapping a live
+        database file out from under whatever else might have it open (a
+        concurrent search() caller in this process, or a sibling OS
+        process -- see this module's own confirmed cross-process file-
+        exclusivity findings) needs careful, dedicated crash-safety
+        handling (quiesce writers, verify the compacted copy, then
+        rename/repoint) that this method does not attempt. The caller
+        owns that sequencing.
+
+        Never called automatically on any hot path. This project's own
+        checkpoint_threshold fix (earlier this session) exists specifically
+        because a stop-the-world maintenance operation landing on an
+        unlucky commit was a real, measured regression; copy-based
+        compaction is a much larger version of that same cost class and
+        must stay an explicit, out-of-band, caller-scheduled operation --
+        e.g. a periodic maintenance window, not a rebuild() side effect.
+
+        Raises ``ValueError`` for ``:memory:`` mode (nothing to compact --
+        there is no persistent file) or if ``new_db_path`` resolves to this
+        index's own ``db_path``. Raises ``RuntimeError`` if this
+        connection's own catalog name can't be resolved (should not
+        happen in practice; DuckDB always names it from the db_path).
+        """
+        if self._db_path == ":memory:":
+            raise ValueError("compact_to: nothing to compact in ':memory:' mode")
+        target_norm = os.path.normcase(os.path.abspath(new_db_path))
+        source_norm = os.path.normcase(os.path.abspath(self._db_path))
+        if target_norm == source_norm:
+            raise ValueError(
+                "compact_to: new_db_path must differ from this index's own db_path"
+            )
+        with self._write_lock:
+            con = self._connect()
+            con.execute("CHECKPOINT")
+            databases = con.execute("PRAGMA database_list").fetchall()
+            source_catalog = None
+            for _oid, name, db_file_path in databases:
+                if db_file_path and os.path.normcase(os.path.abspath(db_file_path)) == source_norm:
+                    source_catalog = name
+                    break
+            if source_catalog is None:
+                raise RuntimeError(
+                    f"compact_to: could not resolve catalog name for {self._db_path!r} "
+                    f"(database_list={databases!r})"
+                )
+            new_dir = os.path.dirname(os.path.abspath(new_db_path))
+            if new_dir:
+                os.makedirs(new_dir, exist_ok=True)
+            target_catalog = "_meridian_outputs_compact_target"
+            con.execute(f'ATTACH \'{new_db_path}\' AS "{target_catalog}"')
+            try:
+                con.execute(f'COPY FROM DATABASE "{source_catalog}" TO "{target_catalog}"')
+            finally:
+                con.execute(f'DETACH "{target_catalog}"')
+
     def close(self) -> None:
         with self._write_lock:
             if self._owns_con and self._con is not None:
