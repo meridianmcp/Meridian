@@ -2445,16 +2445,46 @@ _DUCKDB_MEMORY_LIMIT_SHARE = 0.8
 #: conditions or a badly-chosen explicit override.
 _DUCKDB_MEMORY_LIMIT_FLOOR_BYTES = 1536 * 1024 * 1024
 _DUCKDB_MEMORY_LIMIT_CEILING_BYTES = 16 * 1024 * 1024 * 1024
+#: fa600e42 follow-up (architecture review) -- _DUCKDB_MEMORY_RESERVE_BYTES
+#: (768MB) is a FLAT constant calibrated on runs whose corpus topped out in
+#: the hundreds of thousands of files -- it does not scale with how many
+#: rows self._row_cache/self._manifest actually hold, even though those
+#: two structures are the dominant driver of this process's own Python-heap
+#: footprint (edc84500 only evicts the heavy `content` field per row, never
+#: the row itself, so growth is O(total corpus), unbounded). A per-entry
+#: cost estimate of ~700 bytes/row for the combined _row_cache+_manifest
+#: shape was independently measured (tracemalloc, this repo's own OutputRow
+#: shape) during this session's architecture review -- used here, rounded
+#: up for margin, ONLY when a caller already knows the corpus size in
+#: advance (the periodic-restart harness's initial_row_cache/
+#: initial_manifest constructor params -- see their own docstring: this is
+#: exactly the documented mechanism for a large-corpus process restart).
+#: A cold/first-ever construction has no such hint and cannot know corpus
+#: size before the walk even runs -- the flat reserve alone is still the
+#: correct, and only available, choice for that case.
+_ESTIMATED_ROW_CACHE_BYTES_PER_ENTRY = 1024
 
 
-def _default_duckdb_memory_limit_bytes(tantivy_heap_bytes: int) -> int:
+def _default_duckdb_memory_limit_bytes(
+    tantivy_heap_bytes: int, row_count_hint: int = 0,
+) -> int:
     """Resolve the default DuckDB `memory_limit` (bytes) from the
     environment (MB) or, absent that, from currently AVAILABLE system
     memory -- checked fresh at connect time, not total capacity, since a
     shared machine's free memory at any given moment is the real constraint
     (see module comment above). Mirrors _default_tantivy_heap_bytes's
     env-var-in-MB convention and _initial_adaptive_batch's psutil
-    lazy-import/fail-soft convention."""
+    lazy-import/fail-soft convention.
+
+    ``row_count_hint`` (fa600e42 follow-up, architecture review) -- when
+    non-zero (a caller-supplied initial_row_cache/initial_manifest at
+    construction, i.e. a restart against an already-large corpus), widens
+    the reserve by _ESTIMATED_ROW_CACHE_BYTES_PER_ENTRY per row, on top of
+    the flat _DUCKDB_MEMORY_RESERVE_BYTES -- see that constant's own module
+    comment for why a flat reserve alone under-provisions at large row
+    counts. Zero (a cold construction, corpus size not yet known) reduces
+    to the exact pre-fix flat-reserve behaviour.
+    """
     raw = os.environ.get(_DUCKDB_MEMORY_LIMIT_ENV_VAR)
     if raw is not None and raw.strip():
         try:
@@ -2480,12 +2510,18 @@ def _default_duckdb_memory_limit_bytes(tantivy_heap_bytes: int) -> int:
         available = int(psutil.virtual_memory().available)
     except (ImportError, OSError, AttributeError):
         return _DEFAULT_DUCKDB_MEMORY_LIMIT_BYTES
-    usable = available - tantivy_heap_bytes - _DUCKDB_MEMORY_RESERVE_BYTES
+    reserve = (
+        _DUCKDB_MEMORY_RESERVE_BYTES
+        + max(0, row_count_hint) * _ESTIMATED_ROW_CACHE_BYTES_PER_ENTRY
+    )
+    usable = available - tantivy_heap_bytes - reserve
     limit = int(usable * _DUCKDB_MEMORY_LIMIT_SHARE)
     return max(_DUCKDB_MEMORY_LIMIT_FLOOR_BYTES, min(limit, _DUCKDB_MEMORY_LIMIT_CEILING_BYTES))
 
 
-def _resolve_duckdb_memory_limit_bytes(explicit: int | None, tantivy_heap_bytes: int) -> int:
+def _resolve_duckdb_memory_limit_bytes(
+    explicit: int | None, tantivy_heap_bytes: int, row_count_hint: int = 0,
+) -> int:
     """Precedence: explicit constructor arg (bytes) > env var (MB) >
     availability-based default. Mirrors _resolve_tantivy_heap_bytes."""
     if explicit is not None:
@@ -2496,7 +2532,7 @@ def _resolve_duckdb_memory_limit_bytes(explicit: int | None, tantivy_heap_bytes:
             "falling back to availability-based default", explicit,
             _DUCKDB_MEMORY_LIMIT_FLOOR_BYTES // (1024 * 1024),
         )
-    return _default_duckdb_memory_limit_bytes(tantivy_heap_bytes)
+    return _default_duckdb_memory_limit_bytes(tantivy_heap_bytes, row_count_hint)
 
 
 # ---------------------------------------------------------------------------
@@ -2678,8 +2714,15 @@ class OutputsFtsIndex:
         # surviving a close()+reconnect cycle with stale memory conditions --
         # true today: _get_cached_index() always .close()s an evicted
         # instance and constructs a fresh one, which re-resolves this value.
+        # fa600e42 follow-up (architecture review) -- when a caller already
+        # knows the corpus size (initial_row_cache, the periodic-restart
+        # harness's own mechanism for a large-corpus resume), widen the
+        # reserve proportionally instead of assuming the flat constant
+        # (calibrated on sub-million-file runs) still covers it -- see
+        # _ESTIMATED_ROW_CACHE_BYTES_PER_ENTRY's module comment.
         self._duckdb_memory_limit_bytes = _resolve_duckdb_memory_limit_bytes(
             duckdb_memory_limit_bytes, self._tantivy_heap_bytes,
+            row_count_hint=len(initial_row_cache) if initial_row_cache else 0,
         )
         # 3535b9ad -- walk batch cap: explicit param > MERIDIAN_OUTPUTS_MAX_BATCH
         # env var > class default (1bce8c41: an effectively-unbounded default,
