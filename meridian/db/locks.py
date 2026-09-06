@@ -2038,14 +2038,24 @@ async def check_docx_region_write_conflict(
     1. Whole-file lock: if another session holds a whole-file write lock on
        ``file_path``, BLOCK (regardless of element_id). The file owner controls
        every element.
-    2. Scoped-claim enforcement: if ANY session holds a scoped claim on
-       ``file_path`` AND ``session_id`` is NOT the holder AND ``element_id``
-       is NOT in the caller's own scoped claims for this file → BLOCK.
-       - If the write is for an element another session has claimed → BLOCK
-         (element owned by someone else).
+    2. Scoped-claim enforcement: if ANY session holds a LIVE scoped claim on
+       ``file_path`` (see ``_live_docx_region_claims_for_file`` — same
+       ``_CLAIM_LIVE_HOURS`` staleness cutoff ``claim_docx_region`` itself uses)
+       AND ``session_id`` is NOT the holder AND ``element_id`` is NOT in the
+       caller's own live scoped claims for this file → BLOCK.
+       - If the write is for an element another (live) session has claimed →
+         BLOCK (element owned by someone else).
        - If the write is for an element the caller DOES own → ALLOW (owner
          writes their own region).
-       - If no scoped claims exist at all → ALLOW (unscoped/unclaimed).
+       - If no LIVE scoped claims exist at all → ALLOW (unscoped/unclaimed, or
+         every claimant has gone stale/crashed past ``_CLAIM_LIVE_HOURS``).
+       40937a21 — this must stay liveness-filtered, matching the acquire path
+       (``claim_docx_region``'s own conflict check already uses the same live
+       read): a crashed session's ``released_at IS NULL`` row must not wedge
+       this gate shut past its own nominal TTL merely because nobody called
+       ``release_docx_region_claims``. Do NOT swap this back to the raw
+       ``get_docx_region_claims`` read — that one is deliberately unfiltered
+       for its own callers (see its docstring) and is a different contract.
     3. Fail-open: a DB error, missing db, or unidentifiable element degrades
        to None (no block). The gate surfaces conflicts; claim_docx_region is
        the real primitive.
@@ -2084,7 +2094,26 @@ async def check_docx_region_write_conflict(
         # Rule 2: scoped-claim enforcement.
         # Any scoped claim on this file means the file is in "region-partitioned"
         # mode — edits without owning the target element are rejected.
-        all_claims = await get_docx_region_claims(db, normalized)
+        #
+        # 40937a21 — use the LIVENESS-FILTERED read (_live_docx_region_claims_for_file),
+        # not the raw get_docx_region_claims(). get_docx_region_claims is intentionally
+        # unfiltered (its own docstring: "Expired claims ... are NOT pruned here —
+        # read-only so it never writes") because it also backs the public
+        # get_docx_region_claims MCP read tool and a dashboard's raw claim history.
+        # But reusing that same unfiltered read for this ENFORCEMENT gate meant a
+        # stale/crashed session's element claim (released_at still NULL, but the
+        # owning session's heartbeat is well past _CLAIM_LIVE_HOURS) was treated as
+        # live here even though claim_docx_region's own acquire-path conflict check
+        # (which already goes through _live_docx_region_claims_for_file) would let a
+        # new session reclaim that exact element — i.e. the write gate could stay
+        # wedged shut past its own nominal TTL while the acquire path had already
+        # moved on. Passing exclude_session_id="" excludes nobody (no real session id
+        # is ever the empty string), so the caller's own live claims still appear
+        # (required for the caller_owns check just below) while claims held by
+        # sessions that are gone/closed or whose last_seen is stale are correctly
+        # dropped — making this gate consistent with claim_docx_region's own notion
+        # of "who currently holds this element."
+        all_claims = await _live_docx_region_claims_for_file(db, normalized, "")
         if not all_claims:
             return None  # No scoped claims — unguarded, allow.
 
