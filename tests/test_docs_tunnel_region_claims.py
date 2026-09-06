@@ -105,6 +105,30 @@ def test_docs_write_target_uses_canonical_path_arg_for_merge():
     ) == ("canon.docx", None)
 
 
+def test_docs_write_target_uses_canonical_path_arg_for_reviewable_edit_transaction():
+    """0d62f067 round 2 -- apply_reviewable_edit_transaction is registered the
+    same "whole-canonical-path, no narrower anchor" way merge_docx_draft is.
+    Before this fix, apply_reviewable_edit_transaction was absent from
+    _DOCS_WRITE_TOOLS entirely, so this call returned None unconditionally --
+    the exact "ZERO enforcement through the tunnel path for this specific
+    tool" gap the independent verifier found."""
+    assert tun._docs_write_target(
+        "apply_reviewable_edit_transaction",
+        {
+            "canonical_path": "canon.docx",
+            "steps": [{"kind": "move_section", "params": {}}],
+            "draft_dir": "drafts",
+            "wave_run_id": "wave-1",
+        },
+    ) == ("canon.docx", None)
+    # Connector-prefixed name accepted too (prefix stripped before lookup),
+    # same as every other entry in the map.
+    assert tun._docs_write_target(
+        "docs__apply_reviewable_edit_transaction",
+        {"canonical_path": "canon.docx", "steps": [], "draft_dir": "d", "wave_run_id": "w"},
+    ) == ("canon.docx", None)
+
+
 def test_docs_write_target_none_for_reads_and_unknowns():
     for tool in (
         "document_outline", "parse_document", "get_structure",
@@ -246,7 +270,9 @@ async def test_read_only_docs_tool_never_gated(db):
 # above) -- so extending that ONE function in locks.py with a whole-document
 # lease check automatically protects EVERY tool in tunnel.py's
 # _DOCS_WRITE_TOOLS map (insert_image, insert_figure_block, move_section,
-# relocate_table, ... 27 mutating tools), with ZERO changes to this file.
+# relocate_table, ... 27 mutating tools as of 273df573, 28 as of the
+# 0d62f067 round-2 fix that added apply_reviewable_edit_transaction),
+# with ZERO changes to this file.
 # These tests prove that inherited protection actually holds for the tunnel
 # relay path specifically, not just for the underlying locks.py unit tests.
 # ---------------------------------------------------------------------------
@@ -268,6 +294,15 @@ async def test_whole_document_lease_blocks_every_docs_write_tool_over_the_tunnel
         ("relocate_table", {"docx_path": doc, "table_index": 0}),
         ("highlight_document", {"docx_path": doc, "target_text": "x"}),
         ("move_section", {"docx_path": doc, "section_id": "SEC1"}),
+        (
+            "apply_reviewable_edit_transaction",
+            {
+                "canonical_path": doc,
+                "steps": [{"kind": "move_section", "params": {}}],
+                "draft_dir": "drafts",
+                "wave_run_id": "wave-1",
+            },
+        ),
     ):
         verdict = await tun.check_docs_write_conflict(
             db, "tenant-1", tool_name, arguments, session_id=other,
@@ -506,8 +541,13 @@ def test_all_docs_write_tools_declare_session_id_in_their_mcp_schema():
     server.py before this commit), every iteration of this loop fails --
     none of the 27 wrappers declared session_id, so it never appeared in
     inputSchema for any of them.
+
+    28 as of the 0d62f067 round-2 fix, which added
+    apply_reviewable_edit_transaction to _DOCS_WRITE_TOOLS -- its wrapper
+    already declared session_id (a2449ffa), so only the registration was
+    missing, not the schema field this test checks.
     """
-    assert len(tun._DOCS_WRITE_TOOLS) == 27
+    assert len(tun._DOCS_WRITE_TOOLS) == 28
     for tool_name in sorted(tun._DOCS_WRITE_TOOLS):
         schema = _docs_mcp_tool_schema(tool_name)
         props = schema.get("properties", {})
@@ -615,3 +655,154 @@ async def test_e2e_missing_session_id_reproduces_the_original_bug(db, monkeypatc
             {"docx_path": doc, "caption_para_id": elem, "new_label_text": "x"},
             db=db, session_id=None,
         )
+
+
+# ---------------------------------------------------------------------------
+# 0d62f067 round 2 — apply_reviewable_edit_transaction registration fix.
+#
+# An independent verifier confirmed apply_reviewable_edit_transaction
+# (a2449ffa) was registered in NEITHER _DOCS_WRITE_TOOLS NOR
+# _PRIMARY_DOCX_RELEASE_TOOLS: _docs_write_target() returned None for it
+# unconditionally, so check_docs_write_conflict never even looked up a
+# claim -- a second, non-compliant session calling this tool over the
+# tunnel was NEVER blocked, regardless of whether another live session held
+# a whole-file lock or a scoped claim on the same canonical_path. These
+# tests mirror test_call_tunnel_tool_whole_file_lock_blocks_docs_write and
+# test_call_tunnel_tool_raises_on_docs_write_conflict above (the directly
+# analogous existing coverage for an already-registered tool) but target
+# apply_reviewable_edit_transaction specifically, through the SAME
+# call_tunnel_tool relay path production traffic actually uses.
+# ---------------------------------------------------------------------------
+
+async def test_call_tunnel_tool_whole_file_lock_blocks_reviewable_edit_transaction(db, monkeypatch):
+    """Regression for the exact gap the verifier found: a whole-file write
+    lock held by another session now blocks a relayed
+    apply_reviewable_edit_transaction call. Before the 0d62f067 round-2 fix
+    (i.e. with apply_reviewable_edit_transaction absent from
+    _DOCS_WRITE_TOOLS), this call was relayed unconditionally -- the fake
+    jsonrpc below would have been invoked instead of raising AssertionError,
+    and this test would have failed to catch the RuntimeError it now
+    asserts on."""
+    file_owner = await _mk_session(db, "docs-e2e-transaction-flock")
+    doc = "e2e-locked-transaction.docx"
+    await db_module.claim_file(db, doc, file_owner, mode="write")
+
+    tenant = "tenant-docs-transaction-81"
+    monkeypatch.setitem(
+        tun._tunnel_tool_routes, tenant, {"docs__apply_reviewable_edit_transaction": "docs"},
+    )
+    monkeypatch.setitem(tun._tunnel_docs_sockets, tenant, object())
+
+    async def _fake_jsonrpc(*a, **k):
+        raise AssertionError(
+            "must not relay apply_reviewable_edit_transaction when the "
+            "canonical_path is whole-file-locked by another session"
+        )
+
+    monkeypatch.setattr(tun, "_tunnel_jsonrpc", _fake_jsonrpc)
+
+    with pytest.raises(RuntimeError, match="whole-file write lock"):
+        await tun.call_tunnel_tool(
+            tenant, "docs__apply_reviewable_edit_transaction",
+            {
+                "canonical_path": doc,
+                "steps": [{"kind": "move_section", "params": {"section_id": "SEC1"}}],
+                "draft_dir": "drafts",
+                "wave_run_id": "wave-e2e-1",
+            },
+            db=db, session_id="intruder",
+        )
+
+
+async def test_call_tunnel_tool_raises_on_reviewable_edit_transaction_scoped_claim_conflict(
+    db, monkeypatch, tmp_path,
+):
+    """Same regression, via a SCOPED docx-region claim instead of a whole-
+    file lock, mirroring test_call_tunnel_tool_raises_on_docs_write_conflict
+    above -- and additionally proving canonical_path is provably untouched
+    when the call is correctly rejected before ever reaching the tunnel.
+
+    apply_reviewable_edit_transaction has no anchor argument (registered
+    element_id=None/whole-document, per _docs_write_target -- same tier as
+    merge_docx_draft), so a caller with no live claims of their own hitting
+    a file that ANY other session has scoped-claimed any element of gets
+    check_docx_region_write_conflict's "scoped_mode" verdict (Rule 2's
+    element_id=None branch), not "element_locked" -- the caller is told to
+    acquire a scoped claim of its own rather than being told which specific
+    element it collided with, since a whole-document write's ultimate
+    footprint isn't known to a per-element claim check."""
+    owner = await _mk_session(db, "docs-e2e-transaction-owner")
+    doc_path = tmp_path / "canonical.docx"
+    original_bytes = b"ORIGINAL-CANONICAL-DOCX-BYTES"
+    doc_path.write_bytes(original_bytes)
+    doc = str(doc_path)
+
+    await db_module.claim_docx_region(db, owner, doc, "PARA1")
+
+    tenant = "tenant-docs-transaction-82"
+    monkeypatch.setitem(
+        tun._tunnel_tool_routes, tenant, {"docs__apply_reviewable_edit_transaction": "docs"},
+    )
+    monkeypatch.setitem(tun._tunnel_docs_sockets, tenant, object())
+
+    called = {"relayed": False}
+
+    async def _fake_jsonrpc(*a, **k):
+        called["relayed"] = True
+        doc_path.write_bytes(b"MUTATED-BY-RELAY")
+        return {"result": {"content": []}}
+
+    monkeypatch.setattr(tun, "_tunnel_jsonrpc", _fake_jsonrpc)
+
+    with pytest.raises(RuntimeError, match="scoped-edit mode"):
+        await tun.call_tunnel_tool(
+            tenant, "docs__apply_reviewable_edit_transaction",
+            {
+                "canonical_path": doc,
+                "steps": [{"kind": "move_section", "params": {"section_id": "SEC1"}}],
+                "draft_dir": "drafts",
+                "wave_run_id": "wave-e2e-2",
+            },
+            db=db, session_id="intruder",
+        )
+
+    assert called["relayed"] is False
+    assert doc_path.read_bytes() == original_bytes
+
+
+async def test_call_tunnel_tool_relays_reviewable_edit_transaction_when_clear(db, monkeypatch):
+    """Sanity companion: an UNCLAIMED, unlocked canonical_path still relays
+    normally -- the fix must not turn this tool into an unconditional
+    block."""
+    tenant = "tenant-docs-transaction-83"
+    monkeypatch.setitem(
+        tun._tunnel_tool_routes, tenant, {"docs__apply_reviewable_edit_transaction": "docs"},
+    )
+    monkeypatch.setitem(tun._tunnel_docs_sockets, tenant, object())
+
+    async def _fake_jsonrpc(*a, **k):
+        return {"result": {"content": [{"type": "text", "text": "ok"}]}}
+
+    monkeypatch.setattr(tun, "_tunnel_jsonrpc", _fake_jsonrpc)
+
+    result = await tun.call_tunnel_tool(
+        tenant, "docs__apply_reviewable_edit_transaction",
+        {
+            "canonical_path": "brand-new-canonical.docx",
+            "steps": [{"kind": "move_section", "params": {"section_id": "SEC1"}}],
+            "draft_dir": "drafts",
+            "wave_run_id": "wave-e2e-3",
+        },
+        db=db, session_id="s1",
+    )
+    assert result == {"content": [{"type": "text", "text": "ok"}]}
+
+
+async def test_apply_reviewable_edit_transaction_declares_session_id_in_its_mcp_schema():
+    """The tool wrapper already declared session_id (a2449ffa) -- this fix
+    is the registration, not the schema field -- but assert the schema
+    contract explicitly here too, since it's what makes the guard above
+    reachable for a real client in the first place (see
+    test_all_docs_write_tools_declare_session_id_in_their_mcp_schema)."""
+    schema = _docs_mcp_tool_schema("apply_reviewable_edit_transaction")
+    assert "session_id" in schema.get("properties", {})

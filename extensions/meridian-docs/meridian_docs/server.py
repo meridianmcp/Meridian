@@ -3288,20 +3288,51 @@ def apply_reviewable_edit_transaction(
                                      but the final pre-merge draft is kept
                                      on disk so it can be inspected or
                                      retried via merge_docx_draft.
-      session_id:                   273df573 -- identifies the calling
-                                     Meridian session to the tunnel-layer
-                                     DOCX region-claim guard
+      session_id:                   273df573, wired for this tool by the
+                                     0d62f067 round-2 fix -- identifies the
+                                     calling Meridian session to the
+                                     tunnel-layer DOCX region-claim guard
                                      (check_docs_write_conflict in
-                                     meridian/routes/tunnel.py; the guarded
-                                     path is canonical_path). Not forwarded
-                                     to docs_intel; has no effect when this
+                                     meridian/routes/tunnel.py, backed by
+                                     that module's _DOCS_WRITE_TOOLS map;
+                                     the guarded path is canonical_path,
+                                     with no narrower anchor -- this tool is
+                                     registered the same "whole-document
+                                     fallback" way merge_docx_draft is,
+                                     since a single transaction can touch an
+                                     arbitrary mix of elements across its
+                                     steps list). Not forwarded to
+                                     docs_intel; has no effect when this
                                      tool is invoked outside Meridian's
                                      tunnel (e.g. standalone
                                      `uvx meridian-docs`).
 
-                                     NOT provided by this tool call itself:
-                                     cross-process single-writer locking.
-                                     meridian.db.locks.
+                                     Known limits of that guard, honestly
+                                     stated rather than overclaimed: (1) it
+                                     is FAIL-OPEN, same as every other
+                                     _DOCS_WRITE_TOOLS entry -- a missing db,
+                                     an unidentifiable target, or a claim-
+                                     lookup error lets the call through
+                                     unblocked rather than refusing it; (2)
+                                     this tool is NOT one of the four
+                                     _PRIMARY_DOCX_RELEASE_TOOLS
+                                     (move_section/copy_section/
+                                     relocate_table/merge_docx_draft), so it
+                                     gets neither those tools' FAIL-CLOSED
+                                     required-claim-lookup gate
+                                     (_required_claim_lookup_gate) nor their
+                                     docx_merge PREPARED->RELEASED release-
+                                     transaction audit trail -- a deliberate,
+                                     separately-scoped follow-up (see the
+                                     comment above _PRIMARY_DOCX_RELEASE_TOOLS
+                                     in tunnel.py), not something this fix
+                                     silently grants.
+
+                                     NOT provided by this tool call itself
+                                     AT ALL, guard or no guard: cross-process
+                                     single-writer LOCKING (mutual exclusion,
+                                     as opposed to the claim-conflict check
+                                     above). meridian.db.locks.
                                      acquire_docx_document_lease/
                                      release_docx_document_lease is an
                                      async, aiosqlite-backed primitive in
