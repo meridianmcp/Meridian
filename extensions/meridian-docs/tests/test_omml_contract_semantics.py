@@ -1,6 +1,13 @@
-"""Renderer-independent semantic OMML contract tests for proposal e1d0552e."""
+"""Renderer-independent semantic OMML contract tests for proposal e1d0552e.
+
+Also covers (e03b41ef, BE4ED581-W2): classify_edit_packet's fail-closed
+boundary between prose-edit packets and OMML-touching operations -- see
+``TestClassifyEditPacketBoundary`` below.
+"""
 from __future__ import annotations
 
+import io
+import zipfile
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -76,3 +83,223 @@ def test_display_builder_assigns_fresh_identity_and_style():
     assert first.get(para_attr) and second.get(para_attr) != first.get(para_attr)
     assert first.get(text_attr) and second.get(text_attr) != first.get(text_attr)
     assert first.find(f"./{_q(_W, 'pPr')}/{_q(_W, 'jc')}").get(_q(_W, "val")) == "center"
+
+
+# ---------------------------------------------------------------------------
+# e03b41ef (BE4ED581-W2): classify_edit_packet's fail-closed boundary
+# between prose-edit packets (4c992e91) and OMML-touching operations.
+# ---------------------------------------------------------------------------
+
+_CLASSIFIER_DOC_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+    xmlns:w="{_W}"
+    xmlns:w14="{_W14}">
+  <w:body>
+    <w:p w14:paraId="P0000001">
+      <w:r><w:t>Plain paragraph one.</w:t></w:r>
+    </w:p>
+    <w:p w14:paraId="EQ0000001">
+      {_omml('<m:r><m:t>E</m:t></m:r><m:r><m:t>=</m:t></m:r><m:r><m:t>mc2</m:t></m:r>')}
+    </w:p>
+    <w:p w14:paraId="EQDUP0001">
+      <w:r><w:t>E=mc2</w:t></w:r>
+      {_omml('<m:r><m:t>E</m:t></m:r><m:r><m:t>=</m:t></m:r><m:r><m:t>mc2</m:t></m:r>')}
+    </w:p>
+    <w:p w14:paraId="EQCLEAN0001">
+      <w:pPr><w:jc w:val="center"/></w:pPr>
+      {_omml('<m:r><m:t>a</m:t></m:r><m:r><m:t>+</m:t></m:r><m:r><m:t>b</m:t></m:r>')}
+      <w:r><w:t>.</w:t></w:r>
+    </w:p>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+
+def _make_classifier_docx_bytes(xml: str = _CLASSIFIER_DOC_XML) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("word/document.xml", xml)
+    return buf.getvalue()
+
+
+def _write_classifier_docx(tmp_path, xml: str = _CLASSIFIER_DOC_XML, name: str = "classifier.docx") -> str:
+    path = str(tmp_path / name)
+    with open(path, "wb") as fh:
+        fh.write(_make_classifier_docx_bytes(xml))
+    return path
+
+
+_VALID_OMML_PAYLOAD = _omml('<m:r><m:t>a</m:t></m:r><m:r><m:t>+</m:t></m:r><m:r><m:t>b</m:t></m:r>')
+_MALFORMED_OMML_PAYLOAD = _omml('<m:f><m:num /><m:den><m:e /></m:den></m:f>')
+
+
+class TestClassifyEditPacketBoundary:
+    """e03b41ef (BE4ED581-W2): classify_edit_packet composes the EXISTING
+    prose gate (_prose_packet_structural_error) and the EXISTING OMML
+    hardening primitives (_validate_omml_structure, audit_equation_integrity,
+    audit_equation_style) into one fail-closed classification -- never a
+    reimplementation of any of them, and never a guess on an ambiguous or
+    mixed-signal packet."""
+
+    # -- non-dict / ambiguous input -------------------------------------
+
+    def test_non_dict_packet_is_rejected(self):
+        result = docs_intel.classify_edit_packet("not a dict")  # type: ignore[arg-type]
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert result["reason"] == docs_intel.CLASSIFIER_REASON_NOT_A_DICT
+
+    def test_ambiguous_packet_with_no_recognized_kind_is_rejected(self):
+        result = docs_intel.classify_edit_packet({"some": "unrelated shape"})
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert result["reason"] == docs_intel.CLASSIFIER_REASON_AMBIGUOUS_PACKET_KIND
+
+    # -- prose side: delegates to the EXISTING gate ----------------------
+
+    def test_built_prose_packet_classifies_as_prose(self, tmp_path):
+        doc = _write_classifier_docx(tmp_path)
+        packet = docs_intel.build_prose_edit_packet(
+            doc, {"para_id": "P0000001"}, "New prose text.",
+        )
+        assert packet["status"] == "built"
+        result = docs_intel.classify_edit_packet(packet)
+        assert result == {"boundary": docs_intel.CLASSIFIER_BOUNDARY_PROSE, "reason": None}
+
+    def test_prose_packet_refused_at_build_classifies_as_rejected(self, tmp_path):
+        """A prose packet build_prose_edit_packet itself refused (here, an
+        equation-anchor refusal -- see TestProsePacketNeverTouchesOmml in
+        test_4c992e91_prose_edit_packet.py for the build/apply-time version
+        of this same invariant) must classify as rejected -- it must NEVER
+        be silently reclassified onto the OMML side just because its
+        underlying anchor happens to be math."""
+        doc = _write_classifier_docx(tmp_path)
+        packet = docs_intel.build_prose_edit_packet(
+            doc, {"para_id": "EQ0000001"}, "some replacement prose",
+        )
+        assert packet["status"] == "refused"
+        assert packet["effective_element_type"] == "equation"
+        result = docs_intel.classify_edit_packet(packet)
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert result["reason"] == docs_intel.CLASSIFIER_REASON_PROSE_INVALID
+
+    def test_prose_packet_carrying_omml_payload_is_mixed_signal_rejected(self, tmp_path):
+        doc = _write_classifier_docx(tmp_path)
+        packet = docs_intel.build_prose_edit_packet(
+            doc, {"para_id": "P0000001"}, "New prose text.",
+        )
+        assert packet["status"] == "built"
+        packet["omml_payload"] = _VALID_OMML_PAYLOAD
+        result = docs_intel.classify_edit_packet(packet)
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert result["reason"] == docs_intel.CLASSIFIER_REASON_MIXED_SIGNALS
+
+    # -- OMML side: validates via the EXISTING hardening primitives ------
+
+    def test_valid_omml_payload_with_no_document_classifies_as_omml(self):
+        result = docs_intel.classify_edit_packet({"omml_payload": _VALID_OMML_PAYLOAD})
+        assert result == {"boundary": docs_intel.CLASSIFIER_BOUNDARY_OMML, "reason": None}
+
+    def test_raw_omml_alias_field_is_also_recognized(self):
+        result = docs_intel.classify_edit_packet({"raw_omml": _VALID_OMML_PAYLOAD})
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_OMML
+
+    def test_missing_omml_payload_value_is_rejected(self):
+        result = docs_intel.classify_edit_packet({"omml_payload": ""})
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert result["reason"] == docs_intel.CLASSIFIER_REASON_OMML_PAYLOAD_MISSING
+
+    def test_non_string_omml_payload_value_is_rejected(self):
+        result = docs_intel.classify_edit_packet({"omml_payload": 12345})
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert result["reason"] == docs_intel.CLASSIFIER_REASON_OMML_PAYLOAD_MISSING
+
+    def test_structurally_malformed_omml_payload_is_rejected(self):
+        """Reuses the SAME malformed-fraction shape
+        test_validator_rejects_malformed_fraction_and_flattened_fallback
+        exercises directly against _validate_omml_structure -- the
+        classifier must not reimplement or relax that validator's own
+        judgment, only compose it."""
+        result = docs_intel.classify_edit_packet({"omml_payload": _MALFORMED_OMML_PAYLOAD})
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert result["reason"] == docs_intel.CLASSIFIER_REASON_OMML_STRUCTURE_INVALID
+        assert "m:num" in result["detail"]
+
+    def test_omml_targeting_anchor_with_existing_integrity_finding_is_rejected(self, tmp_path):
+        """EQDUP0001 already carries a plaintext_math_duplicate finding
+        (its own <w:t> text duplicates its <m:oMath> flattened text) -- a
+        new OMML operation aimed at that same anchor must fail closed
+        rather than silently proceed against a known-suspect anchor."""
+        doc = _write_classifier_docx(tmp_path)
+        integrity = docs_intel.audit_equation_integrity(doc)
+        assert integrity["finding_count"] >= 1
+        assert any(f["anchor"] == "EQDUP0001" for f in integrity["findings"])
+
+        packet = {"omml_payload": _VALID_OMML_PAYLOAD, "target_para_id": "EQDUP0001"}
+        result = docs_intel.classify_edit_packet(packet, document_path=doc)
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert result["reason"] == docs_intel.CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING
+        assert result["findings"]
+
+    def test_omml_targeting_clean_anchor_via_anchor_query_classifies_as_omml(self, tmp_path):
+        """A genuinely clean anchor (no integrity findings, no style
+        findings -- EQCLEAN0001 is centered with compliant trailing
+        punctuation) is accepted even when the target is named via
+        anchor_query, the same vocabulary prose packets already use -- no
+        new anchor field is invented for the OMML side."""
+        doc = _write_classifier_docx(tmp_path)
+        packet = {
+            "omml_payload": _VALID_OMML_PAYLOAD,
+            "anchor_query": {"para_id": "EQCLEAN0001"},
+        }
+        result = docs_intel.classify_edit_packet(packet, document_path=doc)
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_OMML
+        assert result["style_findings"] == []
+
+    def test_omml_style_findings_are_informational_not_blocking(self, tmp_path):
+        """A pre-existing style finding (missing trailing punctuation) on
+        the target anchor is surfaced but never causes a reject -- fixing
+        that exact finding may be the whole point of the caller's edit."""
+        doc = _write_classifier_docx(tmp_path)
+        style_audit = docs_intel.audit_equation_style(doc)
+        assert any(
+            f["para_id"] == "EQ0000001" and f["type"] == "missing_trailing_punctuation"
+            for f in style_audit["findings"]
+        )
+        packet = {"omml_payload": _VALID_OMML_PAYLOAD, "target_para_id": "EQ0000001"}
+        result = docs_intel.classify_edit_packet(packet, document_path=doc)
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_OMML
+        assert any(f["type"] == "missing_trailing_punctuation" for f in result["style_findings"])
+
+    # -- fail-closed mixed batch ------------------------------------------
+
+    def test_batch_never_lets_prose_success_mask_omml_rejection(self, tmp_path):
+        doc = _write_classifier_docx(tmp_path)
+        prose_packet = docs_intel.build_prose_edit_packet(
+            doc, {"para_id": "P0000001"}, "New prose text.",
+        )
+        assert prose_packet["status"] == "built"
+        omml_packet = {"omml_payload": _VALID_OMML_PAYLOAD, "target_para_id": "EQDUP0001"}
+
+        results = docs_intel.classify_edit_packet_batch(
+            [prose_packet, omml_packet], document_path=doc,
+        )
+        assert len(results) == 2
+        assert results[0]["index"] == 0
+        assert results[0]["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_PROSE
+        assert results[1]["index"] == 1
+        assert results[1]["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert results[1]["reason"] == docs_intel.CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING
+
+    def test_batch_mixed_signal_packet_is_rejected_independently(self, tmp_path):
+        doc = _write_classifier_docx(tmp_path)
+        prose_packet = docs_intel.build_prose_edit_packet(
+            doc, {"para_id": "P0000001"}, "New prose text.",
+        )
+        assert prose_packet["status"] == "built"
+        mixed_packet = dict(prose_packet)
+        mixed_packet["omml_payload"] = _VALID_OMML_PAYLOAD
+
+        results = docs_intel.classify_edit_packet_batch([prose_packet, mixed_packet])
+        assert results[0]["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_PROSE
+        assert results[1]["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert results[1]["reason"] == docs_intel.CLASSIFIER_REASON_MIXED_SIGNALS

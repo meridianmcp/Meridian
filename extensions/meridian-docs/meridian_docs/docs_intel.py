@@ -20858,6 +20858,308 @@ def apply_reviewable_edit_transaction(
 
 
 # ---------------------------------------------------------------------------
+# e03b41ef (BE4ED581-W2) -- a hard, fail-closed boundary between PROSE-EDIT
+# packets (4c992e91, directly above) and any packet-shaped operation that
+# touches OMML/equation content.
+#
+# This is INTEGRATION, not reimplementation: every check below composes an
+# already-shipped primitive rather than re-deriving its logic --
+#   * the prose side re-runs the EXACT SAME _prose_packet_structural_error
+#     gate apply_prose_edit_packets itself uses (never a second, possibly-
+#     drifting notion of "is this prose packet well-formed");
+#   * the OMML side validates a candidate raw-OMML payload with the SAME
+#     _validate_omml_structure every equation writer in this module already
+#     calls before touching a document, and cross-checks the operation's
+#     target anchor against audit_equation_integrity's own findings for the
+#     CURRENT on-disk document (never a second structural-integrity walk).
+#
+# Deliberate scope decision (flagged during discovery, confirmed here): this
+# function CLASSIFIES a packet-shaped dict -- it never builds, applies, or
+# persists anything, and it does not introduce a typed, symmetric
+# "OMML edit packet" contract (a build_omml_edit_packet/apply_omml_edit_packets
+# pair mirroring the prose contract). That remains real, unclaimed follow-up
+# work in its own right (see the sprint item's own notes) -- inventing half
+# of that contract here, under a different item's scope, would be exactly
+# the kind of ad hoc reimplementation this module's own conventions warn
+# against. What this function DOES guarantee: given ANY packet-shaped dict,
+# it either (a) confidently recognizes it as belonging to the existing prose
+# contract and re-validates it against that contract's own gate, (b)
+# confidently recognizes it as an OMML-touching operation and validates its
+# payload/target against the existing OMML hardening primitives, or (c)
+# refuses to guess and rejects it. There is no fourth outcome where an
+# ambiguous or mixed-signal packet is silently treated as safe.
+#
+# Recognition rule (deliberately narrow, so nothing is ever misclassified by
+# accident): a packet declaring packet_kind == PROSE_PACKET_KIND is prose;
+# a packet carrying a non-empty string under one of _OMML_PAYLOAD_KEYS is an
+# OMML-touching operation; a packet that is BOTH (mixed signals) or NEITHER
+# (unrecognized) is rejected outright -- this function never falls back to
+# "probably prose" or "probably OMML" on a packet it cannot place with
+# confidence.
+#
+# audit_equation_style's punctuation/alignment findings are intentionally
+# surfaced as INFORMATIONAL "style_findings" on an accepted "omml"
+# classification rather than folded into the reject/accept decision: unlike
+# a structural-integrity finding (evidence the anchor's CURRENT state is
+# already corrupt -- a reason to refuse touching it blind), a pre-existing
+# style finding (misaligned, missing trailing punctuation) on the anchor
+# being edited may be exactly what the caller's operation is trying to fix.
+# Rejecting on style findings would make it impossible to ever classify a
+# legitimate style-correction operation as "omml" -- so they are reported,
+# never used to reject.
+# ---------------------------------------------------------------------------
+
+CLASSIFIER_BOUNDARY_PROSE = "prose"
+CLASSIFIER_BOUNDARY_OMML = "omml"
+CLASSIFIER_BOUNDARY_REJECTED = "rejected"
+CLASSIFIER_BOUNDARIES: tuple[str, ...] = (
+    CLASSIFIER_BOUNDARY_PROSE,
+    CLASSIFIER_BOUNDARY_OMML,
+    CLASSIFIER_BOUNDARY_REJECTED,
+)
+
+CLASSIFIER_REASON_NOT_A_DICT = "packet_not_a_dict"
+CLASSIFIER_REASON_PROSE_INVALID = "prose_packet_invalid"
+CLASSIFIER_REASON_MIXED_SIGNALS = "mixed_prose_and_omml_signals"
+CLASSIFIER_REASON_OMML_PAYLOAD_MISSING = "omml_payload_missing"
+CLASSIFIER_REASON_OMML_STRUCTURE_INVALID = "omml_structure_invalid"
+CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING = "omml_target_has_integrity_finding"
+CLASSIFIER_REASON_AMBIGUOUS_PACKET_KIND = "ambiguous_or_unrecognized_packet_kind"
+
+# Recognized field names for a candidate OMML-touching operation's raw
+# "<m:oMath>...</m:oMath>" payload. Kept short and explicit rather than
+# pattern-matched -- a caller must name one of these fields exactly, never
+# guessed at from arbitrary dict shapes.
+_OMML_PAYLOAD_KEYS: tuple[str, ...] = ("omml_payload", "raw_omml")
+
+
+def _classifier_omml_payload_key(packet: "dict[str, Any]") -> "str | None":
+    """The first recognized OMML-payload field NAME present in ``packet``,
+    or ``None`` if the packet carries none of them.
+
+    Checks key PRESENCE (``key in packet``), not the value's truthiness --
+    a packet that explicitly sets ``omml_payload`` to ``""``/``None``/a
+    non-string is still declaring itself an OMML-directed operation, just
+    an invalid one; it must be rejected with
+    :data:`CLASSIFIER_REASON_OMML_PAYLOAD_MISSING` downstream, never fall
+    through to being treated as an unrecognized/ambiguous packet.
+    """
+    for key in _OMML_PAYLOAD_KEYS:
+        if key in packet:
+            return key
+    return None
+
+
+def _classifier_target_para_id(packet: "dict[str, Any]") -> "str | None":
+    """Best-effort target anchor id for an OMML-touching packet, using the
+    SAME field names prose packets already use (``target_para_id`` directly,
+    or ``anchor_query["para_id"]``) -- no new anchor vocabulary is
+    introduced for the OMML side."""
+    target_para_id = packet.get("target_para_id")
+    if isinstance(target_para_id, str) and target_para_id:
+        return target_para_id
+    anchor_query = packet.get("anchor_query")
+    if isinstance(anchor_query, dict):
+        candidate = anchor_query.get("para_id")
+        if isinstance(candidate, str) and candidate:
+            return candidate
+    return None
+
+
+def classify_edit_packet(
+    packet: "dict[str, Any]",
+    *,
+    document_path: "str | None" = None,
+) -> "dict[str, Any]":
+    """Classify one packet-shaped dict onto exactly one side of the
+    prose/OMML boundary, or reject it. Never mutates anything; never builds
+    or applies a packet of either kind.
+
+    Returns ``{"boundary": ..., "reason": ..., ...}`` where ``boundary`` is
+    one of :data:`CLASSIFIER_BOUNDARIES`:
+
+      * ``"prose"`` -- ``packet`` declares ``packet_kind == PROSE_PACKET_KIND``,
+        carries none of :data:`_OMML_PAYLOAD_KEYS`, and passes the SAME
+        :func:`_prose_packet_structural_error` gate
+        :func:`apply_prose_edit_packets` itself re-checks at apply time.
+        ``reason`` is ``None``.
+
+      * ``"omml"`` -- ``packet`` carries a non-empty string under one of
+        :data:`_OMML_PAYLOAD_KEYS`, does NOT also declare
+        ``packet_kind == PROSE_PACKET_KIND``, the payload parses as a
+        structurally valid ``<m:oMath>`` per :func:`_validate_omml_structure`,
+        and -- when both ``document_path`` and a resolvable target anchor
+        (``target_para_id`` or ``anchor_query["para_id"]``) are given --
+        that anchor carries no existing finding in a fresh
+        :func:`audit_equation_integrity` run against ``document_path``.
+        ``reason`` is ``None``. When ``document_path`` and a target anchor
+        are both available, an additional informational ``style_findings``
+        list is attached (see module note above: never used to reject).
+        This classification is scoped to VALIDATION ONLY -- no typed,
+        build/apply OMML packet contract exists yet; a caller must still
+        route an ``"omml"``-classified operation through
+        :func:`insert_equation_local` / :func:`edit_equation_local` (or a
+        future typed contract), never through the prose writer.
+
+      * ``"rejected"`` -- everything else. ``reason`` is one of:
+
+        - :data:`CLASSIFIER_REASON_NOT_A_DICT` -- ``packet`` is not a dict.
+        - :data:`CLASSIFIER_REASON_MIXED_SIGNALS` -- ``packet`` declares
+          ``packet_kind == PROSE_PACKET_KIND`` AND also carries an OMML
+          payload field -- a single packet may never claim both sides of
+          the boundary at once.
+        - :data:`CLASSIFIER_REASON_PROSE_INVALID` -- declares
+          ``packet_kind == PROSE_PACKET_KIND`` but fails
+          :func:`_prose_packet_structural_error` (includes a prose packet
+          that was itself REFUSED at build time -- e.g. an equation-anchor
+          refusal from :func:`build_prose_edit_packet` -- since a refused
+          packet's own ``status`` is never ``"built"``).
+        - :data:`CLASSIFIER_REASON_OMML_PAYLOAD_MISSING` -- carries a
+          recognized OMML-payload key whose value is not a non-empty
+          string.
+        - :data:`CLASSIFIER_REASON_OMML_STRUCTURE_INVALID` -- the OMML
+          payload fails :func:`_validate_omml_structure` (malformed
+          fraction, ``m:oMathPara`` wrapper, flattened-fallback text with
+          no structural element, ...); ``detail`` carries that validator's
+          own message.
+        - :data:`CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING` --
+          the operation's target anchor already carries one or more
+          unresolved :func:`audit_equation_integrity` findings; refusing to
+          route a new OMML operation at an anchor whose current state is
+          already known to be structurally suspect (``findings`` carries
+          the matched finding dicts).
+        - :data:`CLASSIFIER_REASON_AMBIGUOUS_PACKET_KIND` -- ``packet`` is
+          neither a recognizable prose packet nor carries an OMML payload
+          field; this function never guesses, so an unrecognized shape is
+          always rejected rather than defaulted to either side.
+    """
+    if not isinstance(packet, dict):
+        return {
+            "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+            "reason": CLASSIFIER_REASON_NOT_A_DICT,
+            "detail": f"packet must be a dict, got {type(packet).__name__}",
+        }
+
+    omml_payload_key = _classifier_omml_payload_key(packet)
+    is_prose_kind = packet.get("packet_kind") == PROSE_PACKET_KIND
+
+    if is_prose_kind and omml_payload_key is not None:
+        return {
+            "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+            "reason": CLASSIFIER_REASON_MIXED_SIGNALS,
+            "detail": (
+                f"packet declares packet_kind={PROSE_PACKET_KIND!r} but also "
+                f"carries a raw OMML payload under {omml_payload_key!r} -- a "
+                "single packet may never claim to be both prose and OMML; "
+                "refusing rather than guessing which side is authoritative"
+            ),
+        }
+
+    if is_prose_kind:
+        structural_error = _prose_packet_structural_error(packet)
+        if structural_error:
+            return {
+                "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+                "reason": CLASSIFIER_REASON_PROSE_INVALID,
+                "detail": structural_error,
+            }
+        return {"boundary": CLASSIFIER_BOUNDARY_PROSE, "reason": None}
+
+    if omml_payload_key is None:
+        return {
+            "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+            "reason": CLASSIFIER_REASON_AMBIGUOUS_PACKET_KIND,
+            "detail": (
+                f"packet_kind={packet.get('packet_kind')!r} is not "
+                f"{PROSE_PACKET_KIND!r} and the packet carries none of "
+                f"{_OMML_PAYLOAD_KEYS!r} -- cannot confidently place this "
+                "packet on either side of the prose/OMML boundary, so it "
+                "is rejected rather than guessed at"
+            ),
+        }
+
+    omml_payload = packet.get(omml_payload_key)
+    if not isinstance(omml_payload, str) or not omml_payload.strip():
+        return {
+            "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+            "reason": CLASSIFIER_REASON_OMML_PAYLOAD_MISSING,
+            "detail": f"packet[{omml_payload_key!r}] must be a non-empty OMML XML string",
+        }
+
+    try:
+        _validate_omml_structure(omml_payload)
+    except ValueError as exc:
+        return {
+            "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+            "reason": CLASSIFIER_REASON_OMML_STRUCTURE_INVALID,
+            "detail": str(exc),
+        }
+
+    target_para_id = _classifier_target_para_id(packet)
+    style_findings: "list[dict[str, Any]]" = []
+
+    if document_path and target_para_id:
+        integrity = audit_equation_integrity(document_path)
+        if "error" not in integrity:
+            matching = [
+                finding
+                for finding in integrity.get("findings", [])
+                if finding.get("anchor") == target_para_id
+                or target_para_id in (finding.get("anchors") or [])
+            ]
+            if matching:
+                return {
+                    "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+                    "reason": CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING,
+                    "detail": (
+                        f"target anchor {target_para_id!r} already carries "
+                        f"{len(matching)} unresolved equation-integrity "
+                        "finding(s) -- refusing to route a new OMML "
+                        "operation at an anchor whose current state is "
+                        "already known to be structurally suspect"
+                    ),
+                    "findings": matching,
+                }
+
+        style_audit = audit_equation_style(document_path)
+        if "error" not in style_audit:
+            style_findings = [
+                finding
+                for finding in style_audit.get("findings", [])
+                if finding.get("para_id") == target_para_id
+            ]
+
+    result: "dict[str, Any]" = {"boundary": CLASSIFIER_BOUNDARY_OMML, "reason": None}
+    if document_path and target_para_id:
+        result["style_findings"] = style_findings
+    return result
+
+
+def classify_edit_packet_batch(
+    packets: "list[dict[str, Any]]",
+    *,
+    document_path: "str | None" = None,
+) -> "list[dict[str, Any]]":
+    """Classify every packet in ``packets`` independently via
+    :func:`classify_edit_packet`, returning one result per packet (index
+    preserved via an added ``"index"`` key on each result).
+
+    Deliberately a thin per-item map, not a batch-transaction primitive: a
+    caller must not read "some packets classified as prose" as license to
+    silently drop or auto-degrade an OMML-classified or rejected packet
+    elsewhere in the same batch -- each entry's own ``boundary``/``reason``
+    is the complete, independent verdict for that one packet. In
+    particular, a batch mixing a valid prose packet with an OMML-touching
+    operation always reports BOTH verdicts; the prose packet's success
+    never suppresses or masks the OMML packet's own result.
+    """
+    return [
+        {"index": index, **classify_edit_packet(packet, document_path=document_path)}
+        for index, packet in enumerate(packets)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # 3d0769ab (MDE-B1 P0) -- raw-OOXML equation integrity auditor + golden
 # fixtures.
 #
