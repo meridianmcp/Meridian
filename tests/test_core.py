@@ -3405,19 +3405,39 @@ async def test_dispatch_project_scoped_tool_with_only_project_name(db):
 
 @pytest.mark.asyncio
 async def test_dispatch_project_id_wins_over_project_name(db):
-    """When both are given, project_id takes precedence (the resolver only
-    overrides when project_name is set OR project_id is a non-UUID name)."""
+    """a9c041d7 — CORRECTED: this test's original name/docstring claimed
+    project_id takes precedence over project_name when both are supplied.
+    That was never true of the resolver (``_lookup = _pname_raw or
+    _pid_raw`` picks project_name whenever it is present) and the original
+    assertion (``isinstance(items, list)``) was too weak to notice: it passed
+    regardless of which project's data actually came back. Verified here by
+    seeding each project with a distinguishing sprint item and asserting on
+    identity — project_name's project id (the decoy) is what actually gets
+    dispatched against, not the supplied project_id. This resolver precedence
+    is a separate, pre-existing behavior from the scoped_project_ids bypass
+    fixed by a9c041d7 (see the dedicated scoped_project_ids tests below) —
+    changing WHICH of project_id/project_name wins during resolution is out
+    of that fix's scope, so this test now documents the real behavior instead
+    of asserting a false one."""
     from meridian import server as srv
 
     real = await db_module.create_project(db, "wins-real")
-    await db_module.create_project(db, "wins-decoy")
+    decoy = await db_module.create_project(db, "wins-decoy")
+    await db_module.add_sprint_item(db, real["id"], "v1", "real-project-item")
+    await db_module.add_sprint_item(db, decoy["id"], "v1", "decoy-project-item")
+
     items = await srv._dispatch_mcp_tool(
         "get_sprint_items",
         {"project_id": real["id"], "project_name": "wins-decoy"},
         db, "/tmp",
     )
-    # Resolves against the UUID project_id, not the decoy name → no crash, list.
     assert isinstance(items, list)
+    titles = {it["title"] for it in items}
+    # The resolver overrides the supplied project_id with project_name's
+    # project — dispatch actually runs against the DECOY project.
+    assert titles == {"decoy-project-item"}
+    assert "real-project-item" not in titles
+    assert all(it["project_id"] == decoy["id"] for it in items)
 
 
 @pytest.mark.asyncio
@@ -3446,6 +3466,107 @@ async def test_dispatch_project_scoped_tool_with_neither_fails_cleanly(db):
     )
     assert isinstance(result, dict) and result.get("error")
     assert "project_id" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# a9c041d7 — SECURITY: scoped_project_ids gate must re-check AFTER the
+# project_name resolver runs, not just against the caller's raw project_id.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_scoped_project_ids_blocks_project_name_override_of_in_scope_id(db):
+    """The exact exploit: a scoped caller supplies an IN-scope project_id
+    alongside an OUT-of-scope project_name. The pre-dispatch gate in
+    _handle_mcp_request only inspects the raw project_id and lets this
+    through; without the a9c041d7 post-resolution re-check, the resolver in
+    _dispatch_mcp_tool would then silently swap in the out-of-scope project
+    (project_name wins — see test_dispatch_project_id_wins_over_project_name)
+    and dispatch would proceed against data the caller has no access to. Must
+    be denied with the same -32603 "access scope" shape as the pre-check gate."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    in_scope = await db_module.create_project(db, "scope-in-a9c041d7")
+    out_of_scope = await db_module.create_project(db, "scope-out-a9c041d7")
+    await db_module.add_sprint_item(db, out_of_scope["id"], "v1", "secret-item")
+
+    resp = await _handle_mcp_request(
+        {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "get_sprint_items",
+                "arguments": {
+                    "project_id": in_scope["id"],
+                    "project_name": "scope-out-a9c041d7",
+                },
+            },
+        },
+        db=db, data_dir="/tmp",
+        scoped_project_ids=[in_scope["id"]],
+    )
+    assert "error" in resp, (
+        "combined in-scope project_id + out-of-scope project_name must be "
+        f"denied, not dispatched — got: {resp}"
+    )
+    assert resp["error"]["code"] == -32603
+    assert "access scope" in resp["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_scoped_project_ids_none_unaffected_by_new_check(db):
+    """No scoping in effect (self-host / owner / workspace-wide member) —
+    the a9c041d7 post-resolution check must not fire at all. Combined
+    in-scope-shaped id + a different project_name still resolves and
+    dispatches against whatever project_name resolves to, matching the
+    documented pre-existing resolver precedence."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    id_only_project = await db_module.create_project(db, "noscope-id-a9c041d7")
+    name_project = await db_module.create_project(db, "noscope-name-a9c041d7")
+    await db_module.add_sprint_item(db, name_project["id"], "v1", "name-project-item")
+
+    resp = await _handle_mcp_request(
+        {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "get_sprint_items",
+                "arguments": {
+                    "project_id": id_only_project["id"],
+                    "project_name": "noscope-name-a9c041d7",
+                },
+            },
+        },
+        db=db, data_dir="/tmp",
+        scoped_project_ids=None,
+    )
+    assert "error" not in resp, resp
+    payload = json.loads(resp["result"]["content"][0]["text"])
+    assert isinstance(payload, list)
+    assert any(it["title"] == "name-project-item" for it in payload)
+
+
+@pytest.mark.asyncio
+async def test_scoped_project_ids_allows_project_name_only_when_in_scope(db):
+    """project_name-only (no project_id) resolving to an IN-scope project must
+    still succeed — the a9c041d7 check must not produce a false-positive
+    denial on the ordinary, legitimate project_name-only path."""
+    from meridian.mcp.handler import _handle_mcp_request
+
+    p = await db_module.create_project(db, "scope-name-only-a9c041d7")
+
+    resp = await _handle_mcp_request(
+        {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {
+                "name": "get_sprint_items",
+                "arguments": {"project_name": "scope-name-only-a9c041d7"},
+            },
+        },
+        db=db, data_dir="/tmp",
+        scoped_project_ids=[p["id"]],
+    )
+    assert "error" not in resp, resp
+    payload = json.loads(resp["result"]["content"][0]["text"])
+    assert payload == []
 
 
 # ---------------------------------------------------------------------------

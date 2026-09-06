@@ -1493,23 +1493,27 @@ async def _handle_mcp_request(
             if _is_github:
                 result = await _dispatch_github_tool(name, args, tenant, db)
             else:
-                # 84f77597 round-2 (security fix) — move_workspace_note_to_project
-                # re-validates its OWN resolved destination project_id against
-                # the caller's scope from inside the handler itself (see that
-                # handler's docstring), because _dispatch_mcp_tool's
-                # project_name -> project_id resolver runs AFTER the generic
-                # scoped_project_ids gate above and is not itself re-checked.
-                # Thread the exact list this gate already computed straight
-                # through as a private args key so the handler can reuse it
-                # without recomputing it a different way. Scoped to this one
-                # tool's args only — no other tool's dispatch is affected, and
-                # the resolver itself is untouched. The systemic version of
-                # this pattern for every project_id-bearing tool is tracked
-                # separately (sprint item a9c041d7-9dea-4e13-83e0-599ac198b56c).
+                # a9c041d7 (systemic fix) — _dispatch_mcp_tool itself re-checks
+                # scoped_project_ids against the FINAL resolved project_id right
+                # after its project_name resolver runs, for every tool. See that
+                # function's docstring for the full rationale.
+                #
+                # 84f77597 round-2 predates a9c041d7 and closed the same class of
+                # bug narrowly for move_workspace_note_to_project by threading the
+                # scope list through as a private args key the handler re-checks
+                # itself. Left in place as harmless, already-tested defense in
+                # depth — a9c041d7's check below now runs first and would already
+                # raise before this handler is ever reached, so this path is
+                # effectively redundant, not a second real gate — but removing
+                # already-shipped, tested code for a purely cosmetic cleanup isn't
+                # worth the extra churn/risk.
                 _dispatch_args = args
                 if name == "move_workspace_note_to_project" and scoped_project_ids is not None:
                     _dispatch_args = {**args, "_scoped_project_ids": scoped_project_ids}
-                result = await _dispatch_mcp_tool(name, _dispatch_args, db, data_dir, tenant=tenant)
+                result = await _dispatch_mcp_tool(
+                    name, _dispatch_args, db, data_dir, tenant=tenant,
+                    scoped_project_ids=scoped_project_ids,
+                )
                 # 4b698ea5 — implicit last_seen bump on the HOSTED path, mirroring
                 # the stdio handler. Previously ONLY stdio tool calls refreshed a
                 # session's last_seen; a hosted/tunnel executor's session went
@@ -6716,8 +6720,26 @@ async def _dispatch_mcp_tool(
     db: Any,
     data_dir: str,
     tenant: dict[str, Any] | None = None,
+    scoped_project_ids: "list[str] | None" = None,
 ) -> Any:
-    """Route a tools/call to the appropriate db_module function."""
+    """Route a tools/call to the appropriate db_module function.
+
+    ``scoped_project_ids`` (a9c041d7) — defense-in-depth re-check of the
+    project-scope gate, run AFTER the project_name/non-UUID resolver below has
+    settled on a final ``project_id``. The pre-dispatch gate in
+    ``_handle_mcp_request`` only inspects the caller-supplied ``project_id``
+    (falling back to resolving ``project_name`` itself when ``project_id`` is
+    absent); it never re-runs once this resolver's own name lookup overrides
+    ``args["project_id"]``. That left a bypass: a scoped caller supplying an
+    in-scope ``project_id`` alongside an out-of-scope ``project_name`` sailed
+    through the pre-check gate (which saw the in-scope id and stopped there),
+    then had this resolver silently swap in the out-of-scope project — since
+    ``project_name`` wins over a UUID ``project_id`` whenever both are present
+    (see ``_lookup`` below). Re-checking here, against the actually-resolved
+    id, closes that gap regardless of which of the three resolution paths
+    (plain UUID passthrough, non-UUID project_id-as-name, or project_name
+    override) produced it.
+    """
     # Tenant scope for the workspace layer (notes/decisions/settings). None for
     # self-host / unauthenticated; the db functions then skip isolation.
     _mcp_tenant_id = tenant.get("id") if tenant else None
@@ -6744,6 +6766,18 @@ async def _dispatch_mcp_tool(
             args = {**args, "project_id": _resolved_proj["id"]}
         elif _pname_raw and not _pid_raw:
             raise ValueError(f"no project found matching name '{_lookup}'")
+    # a9c041d7 — re-check tenant scope against the FINAL resolved project_id,
+    # after the resolver above may have overridden it via project_name (or a
+    # non-UUID project_id-as-name lookup). The pre-dispatch gate in
+    # _handle_mcp_request only ever sees the caller's raw args, so a combined
+    # {project_id: <in-scope>, project_name: <out-of-scope>} payload could pass
+    # that gate and then have this resolver silently swap in the out-of-scope
+    # project. Same error shape/message as the pre-check gate so callers can't
+    # distinguish which layer caught it.
+    if scoped_project_ids is not None:
+        _final_pid = (args.get("project_id") or "").strip()
+        if _final_pid and _final_pid not in scoped_project_ids:
+            raise ValueError("project is outside your access scope")
     _groups = (
         _handle_project_tools,
         _handle_task_tools,
