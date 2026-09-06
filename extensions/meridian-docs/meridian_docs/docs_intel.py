@@ -20372,6 +20372,492 @@ def apply_prose_edit_packets(
 
 
 # ---------------------------------------------------------------------------
+# 0d62f067 (BE4ED581-W2) -- batch reviewable section moves / prose edits into
+# ONE fail-closed, all-or-nothing writer transaction.
+#
+# Every primitive this section composes already supports isolated drafting
+# on its own (fe989980's draft_output_path/wave_run_id on move_section /
+# copy_section / relocate_table / relocate_figure; 4c992e91's
+# apply_prose_edit_packets) -- but nothing chains several of them into ONE
+# reviewable unit with genuine all-or-nothing rollback. The closest existing
+# precedent, apply_and_merge_batch_transform (982f8564, directly above), is
+# a single apply step + a single merge; test_merge_draft_into_canonical_
+# sequential_non_overlapping_drafts_combine (test_fe989980_merge_draft.py)
+# chains two OPERATIONS but merges into canonical after EACH ONE -- that is
+# multi-session wave coordination, not a single all-or-nothing batch. This
+# section is the genuinely different composition: chain
+# docx_path=draft_(n-1) -> draft_output_path=draft_n across every step
+# WITHOUT ever touching canonical_path mid-batch, then call
+# merge_draft_into_canonical exactly ONCE, only after every step has
+# already succeeded.
+#
+# canonical_path is the docx_path for step 0 ONLY, and is opened read-only
+# there (like every other draft-mode call in this module) -- every
+# subsequent step's docx_path is the previous step's own isolated draft.
+# canonical_path is therefore never a write target anywhere in this
+# function except inside the final merge_draft_into_canonical call, which
+# already carries its own atomic stage/verify/backup/restore discipline.
+#
+# Deliberate scope reduction for this pass (see the sprint item's own
+# priority list): this composes prose-edit packets + the four EXISTING
+# structural mutators only. Two adjacent asks from the same item are
+# explicitly DEFERRED, not silently dropped:
+#
+#   * Caption normalization -- edit_caption (9d749639, elsewhere in this
+#     module) has NO draft_output_path/wave_run_id support at all: it
+#     writes docx_path in place, with no promotion lock and no post-write
+#     verification, unlike every mutator this transaction chains. Routing
+#     a caption-label edit through apply_prose_edit_packets/
+#     apply_batch_transform's plain-text writer would destroy the
+#     paragraph's SEQ field (_set_paragraph_text discards every child but
+#     w:pPr). Folding caption edits into this transaction needs
+#     edit_caption extended with the SAME opt-in draft pattern FIRST -- a
+#     separate, sequenced follow-up.
+#   * Single-writer locking -- meridian/db/locks.py's
+#     acquire_docx_document_lease/release_docx_document_lease (from item
+#     ab940e79) is exactly the primitive the item's notes ask for, but it
+#     is an ASYNC, aiosqlite-backed function in the Meridian CORE package.
+#     This extension (extensions/meridian-docs) is deliberately stdlib-only
+#     and DB-free -- see merge_draft_into_canonical's own module comment
+#     above, and pyproject.toml's dependencies = ["mcp", "latex2mathml",
+#     "lxml"], no aiosqlite/meridian-core -- so calling it here would cross
+#     a boundary this package intentionally does not cross, from a
+#     synchronous call site, for a dependency this package does not
+#     declare. Wiring it is a separate, cross-package change: the CALLER
+#     (a Meridian MCP session, which does have DB access) is responsible
+#     for acquiring/releasing that lease around a call to this function
+#     until that follow-up lands -- see the docstring below.
+# ---------------------------------------------------------------------------
+
+TRANSACTION_STEP_KIND_PROSE_EDITS = "prose_edit_packets"
+TRANSACTION_STEP_KIND_MOVE_SECTION = "move_section"
+TRANSACTION_STEP_KIND_COPY_SECTION = "copy_section"
+TRANSACTION_STEP_KIND_RELOCATE_TABLE = "relocate_table"
+TRANSACTION_STEP_KIND_RELOCATE_FIGURE = "relocate_figure"
+
+#: Every step "kind" apply_reviewable_edit_transaction accepts. Caption
+#: normalization is NOT included -- see the module comment above.
+TRANSACTION_SUPPORTED_STEP_KINDS: tuple[str, ...] = (
+    TRANSACTION_STEP_KIND_PROSE_EDITS,
+    TRANSACTION_STEP_KIND_MOVE_SECTION,
+    TRANSACTION_STEP_KIND_COPY_SECTION,
+    TRANSACTION_STEP_KIND_RELOCATE_TABLE,
+    TRANSACTION_STEP_KIND_RELOCATE_FIGURE,
+)
+
+# Required params.* keys per step kind, beyond the fields this function
+# injects itself (docx_path/draft_output_path/wave_run_id/index_db_path).
+# prose_edit_packets is validated separately (params.packets must be a
+# non-empty list) since it has no single-string required key.
+_TRANSACTION_STEP_REQUIRED_PARAMS: "dict[str, tuple[str, ...]]" = {
+    TRANSACTION_STEP_KIND_MOVE_SECTION: ("section_id", "destination_anchor_para_id"),
+    TRANSACTION_STEP_KIND_COPY_SECTION: ("section_id", "destination_anchor_para_id"),
+    TRANSACTION_STEP_KIND_RELOCATE_TABLE: ("table_index", "destination_anchor_para_id"),
+    TRANSACTION_STEP_KIND_RELOCATE_FIGURE: ("figure_index", "destination_anchor_para_id"),
+}
+
+_TRANSACTION_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _transaction_draft_filename(wave_run_id: str, index: int, kind: str) -> str:
+    """Deterministic, filesystem-safe intermediate draft filename for step
+    ``index`` of a transaction. Not used for the caller-supplied
+    ``draft_dir`` itself -- only for the basename inside it."""
+    safe_wave = _TRANSACTION_UNSAFE_FILENAME_CHARS.sub("_", str(wave_run_id)).strip("_") or "wave"
+    safe_kind = _TRANSACTION_UNSAFE_FILENAME_CHARS.sub("_", str(kind))
+    return f"{safe_wave}.step{index:02d}.{safe_kind}.docx"
+
+
+def _validate_transaction_step(index: int, step: Any) -> "str | None":
+    """Structural validation ONLY (kind recognised, params well-shaped,
+    required keys present) -- semantic resolution (does section_id actually
+    exist, etc.) is deliberately left to the underlying primitive when the
+    step actually runs, exactly like every other anchor-resolving call in
+    this module. Returns an error string, or ``None`` when well-formed."""
+    if not isinstance(step, dict):
+        return f"step {index} must be a dict, got {type(step).__name__}"
+    kind = step.get("kind")
+    if kind not in TRANSACTION_SUPPORTED_STEP_KINDS:
+        return (
+            f"step {index} has unsupported kind {kind!r} -- must be one of "
+            f"{TRANSACTION_SUPPORTED_STEP_KINDS}"
+        )
+    params = step.get("params")
+    if not isinstance(params, dict):
+        return f"step {index} ({kind}) params must be a dict"
+    if kind == TRANSACTION_STEP_KIND_PROSE_EDITS:
+        packets = params.get("packets")
+        if not isinstance(packets, list) or not packets:
+            return f"step {index} (prose_edit_packets) params.packets must be a non-empty list"
+        return None
+    required = _TRANSACTION_STEP_REQUIRED_PARAMS[kind]
+    missing = [name for name in required if params.get(name, None) is None]
+    if missing:
+        return f"step {index} ({kind}) params missing required key(s): {missing}"
+    return None
+
+
+def _transaction_step_failed(kind: str, result: Any) -> bool:
+    """Uniform success/failure read across the two distinct result shapes
+    this transaction composes: prose_edit_packets uses ``{"applied": bool}``
+    (982f8564/4c992e91's convention); the four structural mutators use a
+    plain success dict with NO "error" key, or ``{"error": ...}`` on
+    failure (fe989980's pre-existing convention, unchanged here)."""
+    if not isinstance(result, dict):
+        return True
+    if kind == TRANSACTION_STEP_KIND_PROSE_EDITS:
+        return not result.get("applied")
+    return "error" in result
+
+
+def _run_transaction_step(
+    kind: str,
+    params: "dict[str, Any]",
+    src: str,
+    dest: str,
+    wave_run_id: str,
+) -> "dict[str, Any]":
+    """Dispatch one already-validated transaction step. ``src`` is read-only
+    (the previous step's draft, or canonical_path for step 0); ``dest`` is
+    THIS step's own isolated draft -- never src, never canonical_path."""
+    if kind == TRANSACTION_STEP_KIND_PROSE_EDITS:
+        return apply_prose_edit_packets(
+            src,
+            params["packets"],
+            dest,
+            expected_source_fingerprint=params.get("expected_source_fingerprint"),
+        )
+    if kind == TRANSACTION_STEP_KIND_MOVE_SECTION:
+        return move_section(
+            docx_path=src,
+            section_id=params["section_id"],
+            destination_anchor_para_id=params["destination_anchor_para_id"],
+            destination_position=params.get("destination_position", "after"),
+            allow_bookmark_split=bool(params.get("allow_bookmark_split", False)),
+            draft_output_path=dest,
+            wave_run_id=wave_run_id,
+        )
+    if kind == TRANSACTION_STEP_KIND_COPY_SECTION:
+        return copy_section(
+            docx_path=src,
+            section_id=params["section_id"],
+            destination_anchor_para_id=params["destination_anchor_para_id"],
+            destination_position=params.get("destination_position", "after"),
+            trim_original_to=params.get("trim_original_to"),
+            allow_relationship_reuse=bool(params.get("allow_relationship_reuse", False)),
+            draft_output_path=dest,
+            wave_run_id=wave_run_id,
+        )
+    if kind == TRANSACTION_STEP_KIND_RELOCATE_TABLE:
+        return relocate_table(
+            docx_path=src,
+            table_index=params["table_index"],
+            destination_anchor_para_id=params["destination_anchor_para_id"],
+            destination_position=params.get("destination_position", "after"),
+            allow_bookmark_split=bool(params.get("allow_bookmark_split", False)),
+            draft_output_path=dest,
+            wave_run_id=wave_run_id,
+        )
+    if kind == TRANSACTION_STEP_KIND_RELOCATE_FIGURE:
+        return relocate_figure(
+            docx_path=src,
+            figure_index=params["figure_index"],
+            destination_anchor_para_id=params["destination_anchor_para_id"],
+            destination_position=params.get("destination_position", "after"),
+            allow_bookmark_split=bool(params.get("allow_bookmark_split", False)),
+            draft_output_path=dest,
+            wave_run_id=wave_run_id,
+            artifact_provenance=params.get("artifact_provenance"),
+        )
+    raise AssertionError(f"unreachable -- unsupported step kind {kind!r}")  # pragma: no cover
+
+
+def _cleanup_transaction_drafts(paths: "list[str]") -> "dict[str, list[str]]":
+    """Best-effort delete every path in ``paths`` (deduplicated, order
+    preserved). Never raises -- a draft that is already gone, or that could
+    not be removed (e.g. permissions), is reported back rather than
+    crashing the transaction result the caller still needs to see."""
+    deleted: "list[str]" = []
+    failed: "list[str]" = []
+    seen: "set[str]" = set()
+    for path in paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            deleted.append(path)
+        except OSError:
+            failed.append(path)
+    return {"deleted": deleted, "failed": failed}
+
+
+def apply_reviewable_edit_transaction(
+    canonical_path: str,
+    steps: "list[dict[str, Any]]",
+    draft_dir: str,
+    wave_run_id: str,
+    *,
+    expected_source_fingerprint: "str | None" = None,
+    index_db_path: "str | None" = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: "str | None" = None,
+    cleanup_drafts: bool = True,
+) -> dict[str, Any]:
+    """0d62f067 (BE4ED581-W2) -- apply a reviewable BATCH of staged prose
+    replacements and/or section/table/figure relocations as ONE
+    all-or-nothing writer transaction, then promote exactly once.
+
+    ``canonical_path`` is opened READ-ONLY for step 0 and is NEVER a write
+    target anywhere in this function except inside the final
+    :func:`merge_draft_into_canonical` call (which has its own atomic
+    stage -> verify -> backup/restore-on-failure discipline). Every step
+    after the first reads the PREVIOUS step's own isolated draft, chaining
+    ``docx_path=draft_(n-1) -> draft_output_path=draft_n`` through
+    ``draft_dir`` so no step ever mutates canonical_path or an earlier
+    step's input mid-batch.
+
+    ALL-OR-NOTHING: the first step that fails aborts the WHOLE batch --
+    every draft this call itself created so far (all preceding successful
+    steps' outputs) is deleted, canonical_path is guaranteed untouched (it
+    was only ever read), and the result names exactly which step failed and
+    why. Nothing is promoted unless every single step succeeds.
+
+    Args:
+      canonical_path:                The real document. Read-only throughout
+                                     every step; only ever written by the
+                                     final promotion, and only via the same
+                                     verified, backup-guarded
+                                     merge_draft_into_canonical every other
+                                     promotion path in this module uses.
+      steps:                         Non-empty list of ``{"kind": ..., "params":
+                                     {...}}``. ``kind`` must be one of
+                                     :data:`TRANSACTION_SUPPORTED_STEP_KINDS`
+                                     ("prose_edit_packets", "move_section",
+                                     "copy_section", "relocate_table",
+                                     "relocate_figure" -- NOT caption edits,
+                                     see the module comment above this
+                                     function). ``params`` mirrors that
+                                     primitive's own keyword arguments MINUS
+                                     ``docx_path``/``draft_output_path``/
+                                     ``wave_run_id``/``index_db_path``, which
+                                     this function injects itself for every
+                                     step. ``prose_edit_packets``' params is
+                                     ``{"packets": [...], "expected_source_
+                                     fingerprint": <optional>}`` (packets from
+                                     :func:`build_prose_edit_packet`).
+      draft_dir:                     Directory to stage every intermediate
+                                     draft in (created if missing). Must
+                                     differ from canonical_path's own
+                                     directory reasoning is unnecessary here
+                                     -- what matters is that each step's own
+                                     dest differs from its own src, which
+                                     this function guarantees by construction
+                                     (a fresh, uniquely-named file per step).
+      wave_run_id:                  Required, non-empty. Threaded into every
+                                     chained step's own wave_run_id (opaque
+                                     to this stdlib-only, DB-free extension)
+                                     and used to name intermediate drafts.
+      expected_source_fingerprint:  Optional whole-document staleness guard
+                                     on canonical_path, checked BEFORE step 0
+                                     even runs (a mismatch short-circuits
+                                     with reason="document_changed_before_
+                                     apply" -- no step runs, nothing is
+                                     staged).
+      index_db_path:                Forwarded ONLY to the final
+                                     merge_draft_into_canonical call (each
+                                     intermediate step already skips sidecar
+                                     invalidation while draft_output_path is
+                                     set -- see move_section's own docstring
+                                     -- so passing it earlier would be a
+                                     no-op).
+      allow_degraded_render /
+      degraded_render_reason:       Forwarded verbatim to the final
+                                     merge_draft_into_canonical call -- see
+                                     its own docstring for the shared,
+                                     audited-opt-in contract.
+      cleanup_drafts:               Default True. On a full success (every
+                                     step AND the final merge succeeded),
+                                     every intermediate AND final draft this
+                                     call created is deleted (their job is
+                                     done -- the content is now canonical).
+                                     On a step failure, every draft created
+                                     so far is ALWAYS deleted regardless of
+                                     this flag (a rejected batch must never
+                                     leave orphaned staged files). On a
+                                     MERGE failure specifically (every step
+                                     succeeded, but the final promotion did
+                                     not), intermediate drafts are deleted
+                                     but the FINAL pre-merge draft is kept
+                                     on disk (its path is returned) so a
+                                     caller can inspect it or retry the
+                                     promotion via merge_docx_draft once
+                                     whatever blocked it (e.g. a render
+                                     backend) is fixed -- unless
+                                     cleanup_drafts=False is passed, kept
+                                     drafts are never silently deleted by a
+                                     later call.
+
+    Returns on full success: ``merge_draft_into_canonical``'s own result
+    dict PLUS ``{"transaction": True, "wave_run_id", "steps_applied": [...
+    one entry per step, {"index", "kind", "draft_path"}...], "cleanup":
+    {"deleted": [...], "failed": [...]}}``.
+
+    Returns on a step failure: ``{"transaction": False, "reason":
+    "step_failed", "failed_step_index", "failed_step_kind", "step_result",
+    "steps_applied": [...steps BEFORE the failing one...], "cleanup": {...}}``
+    -- canonical_path untouched, every draft this call created removed.
+
+    Returns on a merge failure (every step succeeded): ``merge_draft_into_
+    canonical``'s own error dict PLUS ``{"transaction": False, "reason":
+    "merge_failed", "steps_applied": [...], "final_draft_path", "cleanup":
+    {...}}``.
+
+    Returns ``{"transaction": False, "reason": "invalid_request", "error":
+    ...}`` for a malformed request (empty/missing steps, an unsupported step
+    kind, missing wave_run_id, an unwritable draft_dir, ...) or
+    ``{"transaction": False, "reason": "document_changed_before_apply",
+    ...}`` for a canonical_path staleness mismatch -- in both cases NOTHING
+    is touched, not even a directory is created for the latter.
+
+    NOT provided by this function (deliberately deferred -- see the module
+    comment above): caption normalization as a step kind, and cross-process
+    single-writer locking. A caller that needs the latter today should
+    acquire meridian.db.locks.acquire_docx_document_lease(session_id,
+    canonical_path) over its own separate Meridian MCP/DB connection BEFORE
+    calling this function, and release it after -- this stdlib-only, DB-free
+    extension has no access to that state itself.
+    """
+    if not canonical_path or not str(canonical_path).strip():
+        return {"transaction": False, "reason": "invalid_request", "error": "canonical_path is required"}
+    if not wave_run_id or not str(wave_run_id).strip():
+        return {"transaction": False, "reason": "invalid_request", "error": "wave_run_id is required"}
+    if not isinstance(steps, list) or not steps:
+        return {"transaction": False, "reason": "invalid_request", "error": "steps must be a non-empty list"}
+    if not draft_dir or not str(draft_dir).strip():
+        return {"transaction": False, "reason": "invalid_request", "error": "draft_dir is required"}
+
+    for index, step in enumerate(steps):
+        step_error = _validate_transaction_step(index, step)
+        if step_error:
+            return {"transaction": False, "reason": "invalid_request", "error": step_error}
+
+    if expected_source_fingerprint:
+        try:
+            actual_fingerprint = _source_fingerprint(canonical_path)
+        except OSError as exc:
+            return {"transaction": False, "reason": "invalid_request", "error": str(exc)}
+        if actual_fingerprint != expected_source_fingerprint:
+            return {
+                "transaction": False,
+                "reason": "document_changed_before_apply",
+                "error": (
+                    "canonical_path has changed since expected_source_fingerprint "
+                    "was captured -- refusing to stage a transaction against "
+                    "content this call was not invoked against"
+                ),
+                "expected_source_fingerprint": expected_source_fingerprint,
+                "source_fingerprint": actual_fingerprint,
+            }
+
+    try:
+        os.makedirs(draft_dir, exist_ok=True)
+    except OSError as exc:
+        return {
+            "transaction": False,
+            "reason": "invalid_request",
+            "error": f"could not create draft_dir {draft_dir!r}: {exc}",
+        }
+
+    created_drafts: "list[str]" = []
+    steps_applied: "list[dict[str, Any]]" = []
+    src = canonical_path
+
+    for index, step in enumerate(steps):
+        kind = step["kind"]
+        params = step["params"]
+        dest = os.path.join(draft_dir, _transaction_draft_filename(wave_run_id, index, kind))
+        if os.path.normcase(os.path.abspath(dest)) == os.path.normcase(os.path.abspath(canonical_path)):
+            # Astronomically unlikely given the wave_run_id/index/kind-scoped
+            # name, but never silently write over canonical_path.
+            cleanup = _cleanup_transaction_drafts(created_drafts)
+            return {
+                "transaction": False,
+                "reason": "step_failed",
+                "failed_step_index": index,
+                "failed_step_kind": kind,
+                "step_result": {"error": f"computed draft path {dest!r} collides with canonical_path"},
+                "steps_applied": steps_applied,
+                "cleanup": cleanup,
+            }
+
+        result = _run_transaction_step(kind, params, src, dest, wave_run_id)
+        if _transaction_step_failed(kind, result):
+            # 0d62f067 -- roll back EVERY draft this call created so far,
+            # including a partially-written `dest` from THIS failing step
+            # (e.g. a post-write verification failure inside move_section
+            # itself can leave a malformed file at dest even though the
+            # step is being reported as failed) -- never leave an orphaned
+            # staged file behind after a rejected batch.
+            cleanup = _cleanup_transaction_drafts(created_drafts + [dest])
+            return {
+                "transaction": False,
+                "reason": "step_failed",
+                "failed_step_index": index,
+                "failed_step_kind": kind,
+                "step_result": result,
+                "steps_applied": steps_applied,
+                "cleanup": cleanup,
+            }
+
+        created_drafts.append(dest)
+        steps_applied.append({"index": index, "kind": kind, "draft_path": dest})
+        src = dest
+
+    final_draft_path = src
+    merge_result = merge_draft_into_canonical(
+        canonical_path,
+        final_draft_path,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+    )
+
+    if not merge_result.get("merged"):
+        # Every step succeeded, but the single promotion did not. Drop the
+        # now-superseded INTERMEDIATE drafts (steps 0..n-2 are unreachable
+        # once chained forward into the final draft) but keep the final
+        # pre-merge draft on disk -- it is a real, structurally valid
+        # document a caller can still promote via merge_docx_draft once
+        # whatever blocked this merge (a transient render backend issue,
+        # for instance) is resolved, rather than forcing the whole chain
+        # to be redone from canonical_path.
+        intermediate_drafts = created_drafts[:-1]
+        cleanup = _cleanup_transaction_drafts(intermediate_drafts)
+        return {
+            **merge_result,
+            "transaction": False,
+            "reason": "merge_failed",
+            "steps_applied": steps_applied,
+            "final_draft_path": final_draft_path,
+            "cleanup": cleanup,
+        }
+
+    cleanup = {"deleted": [], "failed": []}
+    if cleanup_drafts:
+        cleanup = _cleanup_transaction_drafts(created_drafts)
+
+    return {
+        **merge_result,
+        "transaction": True,
+        "wave_run_id": wave_run_id,
+        "steps_applied": steps_applied,
+        "cleanup": cleanup,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 3d0769ab (MDE-B1 P0) -- raw-OOXML equation integrity auditor + golden
 # fixtures.
 #

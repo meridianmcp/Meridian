@@ -3212,6 +3212,135 @@ def apply_prose_edit_packets(
 
 
 @mcp.tool()
+def apply_reviewable_edit_transaction(
+    canonical_path: str,
+    steps: list[dict[str, Any]],
+    draft_dir: str,
+    wave_run_id: str,
+    expected_source_fingerprint: str | None = None,
+    index_db_path: str | None = None,
+    allow_degraded_render: bool = False,
+    degraded_render_reason: str | None = None,
+    cleanup_drafts: bool = True,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """0d62f067 (BE4ED581-W2) -- batch staged prose replacements and/or
+    section/table/figure relocations into ONE all-or-nothing writer
+    transaction, then promote to canonical_path exactly once.
+
+    canonical_path is opened READ-ONLY for the first step and is NEVER a
+    write target anywhere in this call except inside the final promotion
+    (merge_draft_into_canonical's own atomic stage/verify/backup-restore).
+    Each subsequent step chains onto the PREVIOUS step's own isolated draft
+    inside draft_dir -- docx_path=draft_(n-1) -> draft_output_path=draft_n
+    -- so canonical_path and every earlier draft stay untouched mid-batch.
+
+    ALL-OR-NOTHING: the first step that fails aborts the whole batch. Every
+    draft this call created so far is deleted, canonical_path is guaranteed
+    untouched, and the result names exactly which step failed and why.
+    Promotion only ever runs after every step has already succeeded.
+
+    Args:
+      canonical_path:                The real document (read-only until the
+                                     final promotion).
+      steps:                         Non-empty list of ``{"kind": ..., "params":
+                                     {...}}``. ``kind`` is one of
+                                     "prose_edit_packets" (params:
+                                     ``{"packets": [...], "expected_source_
+                                     fingerprint": <optional>}``, packets
+                                     from build_prose_edit_packet),
+                                     "move_section", "copy_section",
+                                     "relocate_table", or "relocate_figure"
+                                     (params: that primitive's own keyword
+                                     arguments minus docx_path/
+                                     draft_output_path/wave_run_id/
+                                     index_db_path, which this tool injects
+                                     itself). Caption normalization is NOT
+                                     yet a supported step kind -- edit_caption
+                                     has no draft-mode support yet; this is a
+                                     documented, deferred follow-up, not an
+                                     oversight.
+      draft_dir:                     Directory to stage every intermediate
+                                     draft in (created if missing).
+      wave_run_id:                  Required, non-empty; threaded into every
+                                     chained step's own wave_run_id and used
+                                     to name intermediate drafts.
+      expected_source_fingerprint:  Optional whole-document staleness guard
+                                     on canonical_path, checked before the
+                                     first step even runs.
+      index_db_path:                Forwarded only to the final promotion
+                                     (each intermediate step already skips
+                                     sidecar invalidation while
+                                     draft_output_path is set).
+      allow_degraded_render /
+      degraded_render_reason:       Forwarded verbatim to the final
+                                     promotion -- see merge_docx_draft's own
+                                     docstring for the shared, audited
+                                     opt-in contract.
+      cleanup_drafts:               Default True. On full success, every
+                                     draft this call created (intermediate
+                                     and final) is deleted. On a step
+                                     failure, every draft created so far is
+                                     ALWAYS deleted regardless of this flag.
+                                     On a merge failure specifically
+                                     (every step succeeded, promotion did
+                                     not), intermediate drafts are deleted
+                                     but the final pre-merge draft is kept
+                                     on disk so it can be inspected or
+                                     retried via merge_docx_draft.
+      session_id:                   273df573 -- identifies the calling
+                                     Meridian session to the tunnel-layer
+                                     DOCX region-claim guard
+                                     (check_docs_write_conflict in
+                                     meridian/routes/tunnel.py; the guarded
+                                     path is canonical_path). Not forwarded
+                                     to docs_intel; has no effect when this
+                                     tool is invoked outside Meridian's
+                                     tunnel (e.g. standalone
+                                     `uvx meridian-docs`).
+
+                                     NOT provided by this tool call itself:
+                                     cross-process single-writer locking.
+                                     meridian.db.locks.
+                                     acquire_docx_document_lease/
+                                     release_docx_document_lease is an
+                                     async, aiosqlite-backed primitive in
+                                     the Meridian CORE package -- this
+                                     stdlib-only, DB-free extension cannot
+                                     call it. A caller that needs exclusive
+                                     access across this whole transaction
+                                     should acquire that lease over its own
+                                     separate Meridian MCP/DB connection
+                                     BEFORE calling this tool, and release
+                                     it after.
+
+    Returns on full success: merge_docx_draft's own result dict plus
+    ``{transaction: True, wave_run_id, steps_applied, cleanup}``. Returns on
+    a step failure: ``{transaction: False, reason: "step_failed",
+    failed_step_index, failed_step_kind, step_result, steps_applied,
+    cleanup}`` (canonical_path untouched). Returns on a merge failure:
+    merge_docx_draft's own error dict plus ``{transaction: False, reason:
+    "merge_failed", steps_applied, final_draft_path, cleanup}``. Returns
+    ``{transaction: False, reason: "invalid_request"|
+    "document_changed_before_apply", error: ...}`` for a malformed request
+    or a canonical_path staleness mismatch -- nothing is touched in either
+    case. See docs_intel.apply_reviewable_edit_transaction for the full
+    contract.
+    """
+    return docs_intel.apply_reviewable_edit_transaction(
+        canonical_path,
+        steps,
+        draft_dir,
+        wave_run_id,
+        expected_source_fingerprint=expected_source_fingerprint,
+        index_db_path=index_db_path,
+        allow_degraded_render=allow_degraded_render,
+        degraded_render_reason=degraded_render_reason,
+        cleanup_drafts=cleanup_drafts,
+    )
+
+
+@mcp.tool()
 def audit_equation_integrity(document_path: str) -> dict[str, Any]:
     """3d0769ab (MDE-B1) -- read-only raw-OOXML equation INTEGRITY audit.
 
