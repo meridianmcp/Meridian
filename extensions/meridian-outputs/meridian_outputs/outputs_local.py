@@ -234,11 +234,28 @@ def _matches_exclude_pattern(
 def _walk_safe_output_files(
     outputs_dir: str, *, exclude_patterns: tuple[str, ...] = (),
     on_error: Callable[[str, OSError], None] | None = None,
+    resume_after: str | None = None,
 ):
     """Generator yielding regular files under ``outputs_dir`` that pass the
     secret-file exclusion filter AND the (optional) user exclude-pattern
     list, in deterministic (sorted-directories, sorted-files) order -- the
     same order :func:`_iter_safe_output_files` has always returned.
+
+    ``resume_after`` (fa600e42 follow-up -- see ``OutputsFtsIndex``'s
+    ``initial_scan_boundary`` constructor param): when given, this is the
+    last path a PRIOR pass's walk yielded (e.g. from a checkpointed
+    ``_scan_boundary`` surviving a process restart) -- every path at or
+    before it in this same deterministic sorted-DFS order is skipped, and
+    any subtree that sorts entirely before it is pruned WITHOUT being
+    scandir()'d at all. This is the exact heuristic :func:`_subtree_scanned_
+    past` already uses for convergence reporting, applied here to actually
+    SKIP re-walked ground instead of merely detecting it after the fact.
+    Without this, a fresh walk (new process, no live generator to resume)
+    always restarts from the top of the tree; if a whole pass never
+    completes within one process's lifetime (e.g. a periodic-restart
+    harness), every restart re-treads exactly the ground the previous one
+    covered and none further, forever -- confirmed live, see
+    docs/meridian-outputs-hardening-fa600e42-manifest.md.
 
     ``on_error`` (item 6af1518d, requirement 1 -- convergence state's "last
     error" field): optional callback invoked as ``on_error(dir_path, exc)``
@@ -277,9 +294,20 @@ def _walk_safe_output_files(
     order -- the same sorted, depth-first, current-dir-files-before-
     subdirs order os.walk()'s own sorted-dirs recursion always produced.
     """
+    resume_norm = (
+        _normalize_output_path(resume_after) or resume_after.replace("\\", "/")
+        if resume_after else None
+    )
     stack: list[str] = [outputs_dir]
     while stack:
         root = stack.pop()
+        if resume_norm is not None:
+            root_norm = _normalize_output_path(root) or root.replace("\\", "/")
+            if _subtree_scanned_past(resume_norm, root_norm):
+                # Entire subtree sorts before resume_norm in this walk's own
+                # deterministic sorted-DFS order -- a prior pass already
+                # covered it in full. Skip without even listing it.
+                continue
         try:
             with os.scandir(root) as it:
                 entries = list(it)
@@ -322,6 +350,13 @@ def _walk_safe_output_files(
         stack.extend(e.path for e in reversed(dir_entries))
         for entry in file_entries:
             p = entry.path
+            if resume_norm is not None:
+                p_norm = _normalize_output_path(p) or p.replace("\\", "/")
+                if p_norm <= resume_norm:
+                    # Already yielded by the prior pass this resumes (or is
+                    # the boundary path itself, whose yield is what set the
+                    # boundary in the first place).
+                    continue
             if is_secret_path(p):
                 _log.debug("outputs_local: skipping secret-pattern file %r", p)
                 continue
@@ -474,9 +509,11 @@ class _ResumableFileWalk:
         self, outputs_dir: str, *, exclude_patterns: tuple[str, ...] = (),
         max_batch: int | None = None,
         on_error: Callable[[str, OSError], None] | None = None,
+        resume_after: str | None = None,
     ) -> None:
         self._iterator = _walk_safe_output_files(
             outputs_dir, exclude_patterns=exclude_patterns, on_error=on_error,
+            resume_after=resume_after,
         )
         self.exhausted = False
         self.max_batch = self._resolve_max_batch(max_batch)
@@ -2467,6 +2504,9 @@ class OutputsFtsIndex:
         max_batch: int | None = None,
         write_chunk: int | None = None,
         session_id: str | None = None,
+        initial_scan_boundary: str | None = None,
+        initial_row_cache: dict[str, "OutputRow"] | None = None,
+        initial_manifest: dict[str, tuple[float | None, int | None]] | None = None,
     ) -> None:
         # Persist one canonical spelling for the tree and its cache.  Without
         # this, a process that first indexes an absolute root and a later
@@ -2542,8 +2582,36 @@ class OutputsFtsIndex:
         # actually in the table -- so the caller gets REAL results (from a
         # partial but non-empty index) instead of empty hits with total_indexed=0.
         self._fts_pending = False
-        self._manifest: dict[str, tuple[float | None, int | None]] = {}
-        self._row_cache: dict[str, OutputRow] = {}
+        # fa600e42 follow-up, round 4 -- initial_row_cache/initial_manifest
+        # let a caller seed these BEFORE any rebuild() call, same pattern as
+        # initial_scan_boundary above (a plain constructor-time dict
+        # assignment -- no _connect() involved, so this introduces no
+        # lock-ordering change to rebuild()/`_connect()` at all).
+        #
+        # Why this exists: Phase 0/1's staleness check (`self._manifest.
+        # get(p) != sig or p not in self._row_cache`) runs BEFORE Phase 2's
+        # write-lock is acquired, and therefore before _connect() -- and
+        # therefore _rehydrate_cache_from_disk() -- has ever run on a fresh
+        # process's first call (by design; see rebuild()'s own comment on
+        # why _connect() is deferred to Phase 2). Confirmed live: this made
+        # EVERY already-indexed file look stale on every restart, forcing a
+        # full re-hash-and-rewrite of the whole index each time a periodic-
+        # restart harness reconnects -- and confirmed live tonight, that
+        # repeated full-index rewrite eventually caused a real MemoryError
+        # crash (index bloated from 6GB to 8.7GB from repeated DELETE+
+        # REINSERT cycles that never reclaim space). A caller that already
+        # knows it's reconnecting to an existing index (e.g. a harness that
+        # ran its own lightweight, out-of-band probe against the same
+        # db_path before constructing this instance) can pass the prior
+        # state in here to make Phase 0/1's very first staleness check
+        # correct immediately, instead of only becoming correct after
+        # Phase 2's lazy connect on THIS SAME call runs too late to help it.
+        self._manifest: dict[str, tuple[float | None, int | None]] = (
+            dict(initial_manifest) if initial_manifest else {}
+        )
+        self._row_cache: dict[str, OutputRow] = (
+            dict(initial_row_cache) if initial_row_cache else {}
+        )
         self.last_rebuild_partial = False
         # 1a799e52 -- set when Phase 2's DB write raises inside rebuild()'s
         # `except Exception: _log.debug(...)` block. Previously that failure
@@ -2560,6 +2628,16 @@ class OutputsFtsIndex:
         # holds every path discovered so far in the CURRENT in-progress pass.
         self._walk_state: "_ResumableFileWalk | None" = None
         self._walk_accumulated: list[str] = []
+        # fa600e42 follow-up -- see the call site in rebuild()'s Phase 0
+        # that sets this per-pass, and the walk_complete branch below that
+        # consults it.
+        self._walk_pass_resumed_from_boundary: bool = False
+        # fa600e42 follow-up (write_seconds diagnostics) -- set True the
+        # first time Phase 2's bulk-insert pyarrow import fails at runtime
+        # this process, so the one-time WARNING log (see that call site)
+        # doesn't repeat on every subsequent call while the fallback path
+        # keeps silently costing ~150x per the e8a2f710 benchmark.
+        self._pyarrow_missing_warned: bool = False
         # 6ba77ada -- backlog of paths confirmed stale (by the staleness
         # check below) but not yet successfully analysed + written. Persists
         # across calls so a straggler is retried, not lost or re-detected
@@ -2607,7 +2685,28 @@ class OutputsFtsIndex:
         # pass). Used both as a raw progress signal and, via
         # _subtree_scanned_past(), to answer subtree-scoped convergence
         # queries without a second walk.
-        self._scan_boundary: str | None = None
+        #
+        # fa600e42 follow-up -- ALSO now the resume-ahead hint rebuild()'s
+        # Phase 0 passes to a freshly-constructed _ResumableFileWalk (see
+        # that call site). Normal in-process operation never needs
+        # initial_scan_boundary (the live walk generator just keeps
+        # resuming itself); it exists for a caller that reconstructs
+        # OutputsFtsIndex against the SAME db_path/outputs_dir in a NEW
+        # process mid-pass (e.g. a periodic-restart harness, or a genuine
+        # server restart during a huge-tree convergence) and wants the
+        # fresh instance's walk to pick up past where the last one got to,
+        # instead of re-walking from the top of the tree every single
+        # restart -- confirmed live to otherwise cap total achievable
+        # progress at whatever ONE process's lifetime can cover, forever,
+        # regardless of how many restarts follow (see
+        # docs/meridian-outputs-hardening-fa600e42-manifest.md). The
+        # caller is responsible for sourcing this (e.g. from the previous
+        # process's last checkpoint) -- reading it back off THIS instance's
+        # own on-disk state isn't done here because that requires a live
+        # DB connection, and _connect() (by design) doesn't run until
+        # Phase 2 of the first rebuild() call, well after Phase 0 would
+        # already need this value.
+        self._scan_boundary: str | None = initial_scan_boundary
         # Most recent directory the walk could not list (permission denied,
         # removed mid-walk, etc.), if any -- see _walk_safe_output_files's
         # on_error hook. Distinct from last_db_write_error (a PERSISTENCE
@@ -2798,6 +2897,15 @@ class OutputsFtsIndex:
                     "OutputsFtsIndex._connect: walk-state rehydration failed",
                     exc_info=True,
                 )
+            # fa600e42 follow-up -- same durability treatment as walk state
+            # immediately above, for the legacy-migration-scan throttle.
+            try:
+                self._rehydrate_legacy_migration_state_from_disk()
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._connect: legacy-migration-state "
+                    "rehydration failed", exc_info=True,
+                )
         return self._con
 
     def _rehydrate_cache_from_disk(self) -> None:
@@ -2817,6 +2925,21 @@ class OutputsFtsIndex:
         process restart -- the same class of unbounded growth this item
         fixes for the walk/write path, just at connect() time instead of
         during rebuild().
+
+        fa600e42 follow-up -- the actual read is chunked via
+        ``cursor.fetchmany(self._adaptive_batch)`` instead of one unchunked
+        ``fetchall()``, mirroring the identical lesson already applied to
+        :meth:`_migrate_legacy_storage_paths_locked` (see that method's own
+        docstring) but never ported here. Each chunk is inserted into
+        ``_row_cache``/``_manifest`` immediately rather than accumulated
+        into one big intermediate list first (this method has no
+        cross-row grouping to do, unlike the migration scan, so there is
+        no reason to hold the whole result set in Python at once at all).
+        Confirmed live: reconnecting to a real ~98,304-row/2.85GB index
+        took multiple minutes of mostly I/O-bound time before this fix,
+        with a single large ~2.3GB one-step memory jump once the unchunked
+        fetch completed -- a cost that only grows as the index does, on
+        every process restart.
         """
         con = self._con
         if con is None:
@@ -2831,47 +2954,67 @@ class OutputsFtsIndex:
         if exists is None:
             return
         try:
-            relation = con.execute(
+            cursor = con.execute(
                 "SELECT path, mtime, sha256, size, "
                 "generating_script, kind, is_archival, canonical_path, "
                 "csv_columns, json_keys FROM outputs_index"
             )
-            columns = [c[0] for c in relation.description]
-            fetched = relation.fetchall()
+            columns = [c[0] for c in cursor.description]
         except Exception:  # noqa: BLE001
             _log.debug(
                 "OutputsFtsIndex._rehydrate_cache_from_disk: read failed",
                 exc_info=True,
             )
             return
-        for raw in fetched:
-            rec = dict(zip(columns, raw))
-            path = rec.get("path")
-            if not path:
-                continue
-            row = OutputRow(
-                path=path,
-                content=None,  # edc84500 -- never resident; re-read on demand.
-                mtime=rec.get("mtime"),
-                sha256=rec.get("sha256"),
-                size=rec.get("size"),
-                generating_script=rec.get("generating_script"),
-                kind=rec.get("kind"),
-                is_archival=bool(rec.get("is_archival")),
-                canonical_path=rec.get("canonical_path"),
-                csv_columns=(
-                    json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
-                ),
-                json_keys=(
-                    json.loads(rec["json_keys"]) if rec.get("json_keys") else None
-                ),
-            )
-            self._row_cache[path] = row
-            self._manifest[path] = (rec.get("mtime"), rec.get("size"))
-        if fetched:
+        batch_limit = self._adaptive_batch
+        total_resumed = 0
+        while True:
+            try:
+                chunk = cursor.fetchmany(batch_limit)
+            except Exception:  # noqa: BLE001
+                # A failure mid-stream (e.g. the connection dying partway
+                # through a huge rehydration) must not lose chunks already
+                # merged into _row_cache/_manifest above -- degrade to
+                # "rehydrated as far as we got" rather than discarding
+                # everything, same partial-progress philosophy as every
+                # other best-effort read in this class.
+                _log.debug(
+                    "OutputsFtsIndex._rehydrate_cache_from_disk: chunked "
+                    "read failed partway through (%d rows already "
+                    "resumed)", total_resumed, exc_info=True,
+                )
+                break
+            if not chunk:
+                break
+            for raw in chunk:
+                rec = dict(zip(columns, raw))
+                path = rec.get("path")
+                if not path:
+                    continue
+                row = OutputRow(
+                    path=path,
+                    content=None,  # edc84500 -- never resident; re-read on demand.
+                    mtime=rec.get("mtime"),
+                    sha256=rec.get("sha256"),
+                    size=rec.get("size"),
+                    generating_script=rec.get("generating_script"),
+                    kind=rec.get("kind"),
+                    is_archival=bool(rec.get("is_archival")),
+                    canonical_path=rec.get("canonical_path"),
+                    csv_columns=(
+                        json.loads(rec["csv_columns"]) if rec.get("csv_columns") else None
+                    ),
+                    json_keys=(
+                        json.loads(rec["json_keys"]) if rec.get("json_keys") else None
+                    ),
+                )
+                self._row_cache[path] = row
+                self._manifest[path] = (rec.get("mtime"), rec.get("size"))
+                total_resumed += 1
+        if total_resumed:
             _log.debug(
                 "OutputsFtsIndex._rehydrate_cache_from_disk: resumed %d "
-                "cached rows from disk", len(fetched),
+                "cached rows from disk", total_resumed,
             )
 
     # Keys this instance owns inside the shared, generic ``outputs_index_meta``
@@ -2886,6 +3029,20 @@ class OutputsFtsIndex:
         "walk_expected_count",
         "walk_last_error",
         "walk_pending_stale_json",
+    )
+
+    # fa600e42 follow-up -- same generic outputs_index_meta table, a
+    # separate key namespace for the legacy-migration-scan throttle (see
+    # _persist_legacy_migration_state_locked / _rehydrate_legacy_migration_
+    # state_from_disk below). Kept distinct from _WALK_STATE_META_KEYS
+    # rather than folded in: unlike walk state, these three fields need no
+    # per-field merge logic (see _rehydrate_legacy_migration_state_from_
+    # disk's docstring for why), so conflating the two would only make the
+    # already-intricate walk-state merge docstring harder to follow.
+    _LEGACY_MIGRATION_META_KEYS = (
+        "legacy_migration_ever_scanned",
+        "legacy_migration_found_last_time",
+        "legacy_migration_calls_since_scan",
     )
 
     def _persist_walk_state_locked(self, con: Any) -> None:
@@ -3154,6 +3311,139 @@ class OutputsFtsIndex:
             "state (epoch=%d, pass_complete=%s, pending=%d) from disk",
             self._walk_epoch, self._walk_pass_confirmed_complete,
             len(self._pending_stale),
+        )
+
+    def _persist_legacy_migration_state_locked(self, con: Any) -> None:
+        """Durably record the legacy-migration-scan throttle state into
+        ``outputs_index_meta`` so a process restart knows a full-table scan
+        already ran and doesn't have to redo it as if this were the very
+        first process ever to open this index.
+
+        Must be called with ``self._write_lock`` already held (mirrors
+        :meth:`_persist_walk_state_locked`'s naming and locking contract).
+        Best-effort: a persistence failure here must never break rebuild()'s
+        own contract, so callers wrap this in their own try/except.
+
+        fa600e42 follow-up -- without this, ``_legacy_migration_ever_
+        scanned`` (a plain in-memory flag, constructor default ``False``)
+        looks "never scanned" to EVERY freshly-constructed instance,
+        including one from a periodic-restart harness reconnecting to an
+        index a prior process already fully migration-scanned seconds
+        earlier. The scan itself is a full ``SELECT`` over the entire
+        ``outputs_index`` table (see
+        :meth:`_migrate_legacy_storage_paths_locked`'s own throttle
+        comment) -- confirmed live: with the throttle unable to survive a
+        restart, this forced a full O(total indexed rows) table scan on
+        literally every fresh process's first call, growing more expensive
+        every restart as the index grows, never reaching the intended
+        once-per-25-calls steady state -- the exact same "should be rare
+        but the 'have I done this' state is in-memory-only" shape as the
+        walk-resume bug this same follow-up already fixed.
+        """
+        self._ensure_schema(con)
+        values: dict[str, str | None] = {
+            "legacy_migration_ever_scanned": (
+                "1" if self._legacy_migration_ever_scanned else "0"
+            ),
+            "legacy_migration_found_last_time": (
+                "1" if self._legacy_migration_found_last_time else "0"
+            ),
+            "legacy_migration_calls_since_scan": str(
+                self._legacy_migration_calls_since_scan
+            ),
+        }
+        placeholders = ",".join("?" for _ in self._LEGACY_MIGRATION_META_KEYS)
+        con.execute("BEGIN TRANSACTION")
+        try:
+            con.execute(
+                f"DELETE FROM outputs_index_meta WHERE key IN ({placeholders})",
+                list(self._LEGACY_MIGRATION_META_KEYS),
+            )
+            for key, value in values.items():
+                con.execute(
+                    "INSERT INTO outputs_index_meta (key, value) VALUES (?, ?)",
+                    [key, value],
+                )
+        except BaseException:
+            try:
+                con.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex._persist_legacy_migration_state_locked:"
+                    " rollback after a failed write also failed -- "
+                    "connection may be left in an unusable transaction "
+                    "state", exc_info=True,
+                )
+            raise
+        else:
+            con.execute("COMMIT")
+
+    def _rehydrate_legacy_migration_state_from_disk(self) -> None:
+        """Restore the legacy-migration-scan throttle state from a prior
+        process's persisted state (see
+        :meth:`_persist_legacy_migration_state_locked`).
+
+        Unlike walk state, this needs no per-field merge logic: it is
+        called from ``_connect()``, and :meth:`rebuild` makes an explicit
+        early ``self._connect()`` call right after
+        ``self._write_lock.acquire()`` (fa600e42 follow-up) specifically so
+        this always runs BEFORE anything else in this same process/call has
+        had a chance to read or mutate these three fields. "Adopt the
+        persisted value outright" is therefore correct and sufficient --
+        there is no "this call's own fresher in-flight answer" to protect,
+        unlike ``_scan_boundary``/``_walk_pass_confirmed_complete`` etc.
+
+        No-op (fields keep their constructor defaults -- i.e. behave
+        exactly like a brand-new index, always re-scanning once) when
+        ``outputs_index_meta`` doesn't hold these keys yet (a brand-new DB,
+        or one written before this feature shipped) or can't be read --
+        same degrade-gracefully contract as
+        :meth:`_rehydrate_walk_state_from_disk`.
+        """
+        con = self._con
+        if con is None:
+            return
+        try:
+            placeholders = ",".join(
+                "?" for _ in self._LEGACY_MIGRATION_META_KEYS
+            )
+            rows = con.execute(
+                "SELECT key, value FROM outputs_index_meta "
+                f"WHERE key IN ({placeholders})",
+                list(self._LEGACY_MIGRATION_META_KEYS),
+            ).fetchall()
+        except Exception:  # noqa: BLE001
+            _log.debug(
+                "OutputsFtsIndex._rehydrate_legacy_migration_state_from_"
+                "disk: read failed", exc_info=True,
+            )
+            return
+        if not rows:
+            return
+        values = {key: value for key, value in rows}
+        ever_scanned_raw = values.get("legacy_migration_ever_scanned")
+        if ever_scanned_raw is not None:
+            self._legacy_migration_ever_scanned = ever_scanned_raw == "1"
+        found_raw = values.get("legacy_migration_found_last_time")
+        if found_raw is not None:
+            self._legacy_migration_found_last_time = found_raw == "1"
+        calls_raw = values.get("legacy_migration_calls_since_scan")
+        if calls_raw is not None:
+            try:
+                self._legacy_migration_calls_since_scan = int(calls_raw)
+            except (TypeError, ValueError):
+                _log.debug(
+                    "OutputsFtsIndex._rehydrate_legacy_migration_state_"
+                    "from_disk: invalid legacy_migration_calls_since_scan "
+                    "%r", calls_raw,
+                )
+        _log.debug(
+            "OutputsFtsIndex._rehydrate_legacy_migration_state_from_disk: "
+            "restored legacy-migration state (ever_scanned=%s, "
+            "found_last_time=%s, calls_since_scan=%d) from disk",
+            self._legacy_migration_ever_scanned,
+            self._legacy_migration_found_last_time,
+            self._legacy_migration_calls_since_scan,
         )
 
     def _read_hash_algo_version(self, con: Any) -> int:
@@ -3962,11 +4252,39 @@ class OutputsFtsIndex:
                 # override it with whatever was on disk before."
                 self._last_walk_error = None
                 self._walk_error_confirmed_fresh = True
+                # fa600e42 follow-up -- self._scan_boundary is already
+                # available here even on a freshly-restarted process's very
+                # first rebuild() call: either seeded at construction time
+                # via initial_scan_boundary (the periodic-restart harness's
+                # fix -- see OutputsFtsIndex.__init__), or None for a
+                # genuinely first-ever pass / one that already completed
+                # (both correctly reset it to None -- see the walk_complete
+                # branch below). NOT sourced from _rehydrate_walk_state_from_
+                # disk here, deliberately: that only runs inside _connect(),
+                # which (by design -- see rebuild()'s write-lock ordering)
+                # doesn't happen until Phase 2 of this SAME call, well after
+                # this walk object would already be constructed.
                 self._walk_state = _ResumableFileWalk(
                     self.outputs_dir, exclude_patterns=self._exclude_patterns,
                     max_batch=walk_batch, on_error=self._record_walk_error,
+                    resume_after=self._scan_boundary,
                 )
                 self._walk_accumulated = []
+                # fa600e42 follow-up, code-review fix -- whether THIS pass
+                # started from a boundary (skipping ground a DIFFERENT,
+                # possibly now-gone process's walk already covered) rather
+                # than the true top of the tree. Recorded once at pass-start
+                # and consulted below when the pass completes: a boundary-
+                # resumed pass's own self._walk_accumulated only ever holds
+                # paths discovered AFTER the boundary, so treating it alone
+                # as "the full picture" at completion would make every
+                # pre-boundary path look removed and DELETE it -- confirmed
+                # live (TestWalkStateDurability::
+                # test_restart_resumes_interrupted_walk_without_rehashing):
+                # a second instance resumed from the first's boundary lost
+                # the first instance's already-durably-indexed rows the
+                # moment its own (now much shorter) remaining walk exhausted.
+                self._walk_pass_resumed_from_boundary = self._scan_boundary is not None
             else:
                 # The walk persists across calls; discovery capacity is
                 # static (own knob), so this only re-applies it in case a
@@ -4002,9 +4320,31 @@ class OutputsFtsIndex:
             # detection is safe. Reset resumable state so the NEXT rebuild()
             # call starts a fresh pass and keeps catching future on-disk
             # changes.
-            all_paths: list[str] = sorted(self._walk_accumulated)
+            #
+            # fa600e42 follow-up, code-review fix -- EXCEPT when this pass
+            # was resumed from a boundary (self._walk_pass_resumed_from_
+            # boundary): self._walk_accumulated then only holds paths
+            # discovered AFTER that boundary, not the ones a prior (possibly
+            # now-gone) process's walk already confirmed pre-boundary.
+            # Treating self._walk_accumulated alone as "the full picture" in
+            # that case would make every still-present pre-boundary path
+            # look removed below. Union with self._manifest's current keys
+            # instead -- exactly the same optimistic "assume still present"
+            # rule the walk-still-in-progress branch already uses, applied
+            # here because a boundary-resumed pass never actually
+            # reconfirmed that portion of the tree ITSELF. Safe even before
+            # self._manifest has been rehydrated from disk this instance
+            # (empty on both sides of the removed_paths set-difference
+            # below, so nothing is falsely flagged as removed either way).
+            if self._walk_pass_resumed_from_boundary:
+                all_paths: list[str] = sorted(
+                    set(self._manifest) | set(self._walk_accumulated)
+                )
+            else:
+                all_paths = sorted(self._walk_accumulated)
             self._walk_state = None
             self._walk_accumulated = []
+            self._walk_pass_resumed_from_boundary = False
             removed_paths: set[str] = set(self._manifest) - set(all_paths)
             # A path that vanished from disk can never become un-stale --
             # drop it from the backlog so it isn't retried forever.
@@ -4374,6 +4714,25 @@ class OutputsFtsIndex:
             })
             return len(self._row_cache)
         try:
+            # fa600e42 follow-up -- force _connect() (and therefore
+            # rehydration, including _rehydrate_legacy_migration_state_from_
+            # disk() just below) to happen HERE, before the legacy-migration
+            # throttle decision reads self._legacy_migration_ever_scanned.
+            # Safe to move earlier than its previous implicit call sites
+            # (inside _migrate_legacy_storage_paths_locked(self._connect())
+            # below, or the `if changed or legacy_paths_migrated:` write
+            # block further down): self._write_lock is ALREADY held at this
+            # point (acquired just above), so this introduces no new
+            # lock-ordering exposure -- _connect() was always going to run
+            # somewhere inside this same locked section on this same call;
+            # this only moves WHERE, not WHETHER or under what lock state.
+            # _connect() is idempotent (no-ops on every later call once
+            # self._con is set), so this costs nothing on calls 2+ within
+            # one process. Without this, self._legacy_migration_ever_
+            # scanned/_found_last_time/_calls_since_scan are still at their
+            # constructor defaults when the throttle decision below reads
+            # them, making the persisted state just written pointless.
+            self._connect()
             # Repair caches written by pre-canonicalization versions before
             # the normal staleness pass. This runs under the write lease so a
             # repair cannot race another process's row update.
@@ -4404,6 +4763,11 @@ class OutputsFtsIndex:
                 or self._legacy_migration_calls_since_scan
                 >= self._LEGACY_MIGRATION_RECHECK_INTERVAL
             )
+            # fa600e42 follow-up (write_seconds diagnostics) -- timed even
+            # on the (common, throttled) skip branch, so this metric is
+            # always present and directly comparable call-to-call rather
+            # than only appearing on scan calls.
+            _legacy_migration_started = time.monotonic()
             if run_legacy_migration:
                 migration_failed = False
                 try:
@@ -4437,12 +4801,19 @@ class OutputsFtsIndex:
             else:
                 legacy_paths_migrated = False
                 self._legacy_migration_calls_since_scan += 1
+            self.last_rebuild_metrics["legacy_migration_seconds"] = round(
+                time.monotonic() - _legacy_migration_started, 6,
+            )
             self._ingest_meridian_notes(all_paths)
+            _apply_precomputed_started = time.monotonic()
             rows, changed, paths_to_delete, new_rows = (
                 self._apply_precomputed(
                     all_paths, path_set, removed_paths, stale, stale_sigs,
                     precomputed, classifications, deadline,
                 )
+            )
+            self.last_rebuild_metrics["apply_precomputed_seconds"] = round(
+                time.monotonic() - _apply_precomputed_started, 6,
             )
             if not walk_complete:
                 # 6ba77ada -- the walk itself hasn't finished a full pass yet
@@ -4500,6 +4871,19 @@ class OutputsFtsIndex:
                     # that self._max_batch's new effectively-unbounded
                     # default (time-primary walk convergence) can never
                     # silently turn this into one giant, unchunked write.
+                    #
+                    # fa600e42 follow-up (write_seconds diagnostics) --
+                    # isolates just the DELETE+INSERT DB work below from the
+                    # surrounding write_seconds umbrella (which also
+                    # includes legacy-migration-scan, apply_precomputed,
+                    # Tantivy delta-staging/commit, and walk-state persist --
+                    # each now separately timed too). Live evidence showed
+                    # write_seconds running 13-50x slower per row than the
+                    # isolated pyarrow bulk-insert benchmark this comment
+                    # block documents just above; this metric answers
+                    # whether that gap is really in the insert itself or in
+                    # the other work sharing its timed window.
+                    _db_insert_started = time.monotonic()
                     _WRITE_CHUNK = self._write_chunk
                     replacement_paths = {r.path for r in new_rows}
                     db_delete_paths = [
@@ -4519,25 +4903,85 @@ class OutputsFtsIndex:
                             import pyarrow as _pa  # noqa: PLC0415 -- optional, lazy
                         except ImportError:
                             _pa = None
+                            # fa600e42 follow-up (write_seconds diagnostics)
+                            # -- this fallback used to be entirely silent:
+                            # the ~150x-slower combined-VALUES path below
+                            # would just run, forever, with no signal
+                            # anywhere that the fast path never engaged.
+                            # Confirmed live: exactly this (pyarrow declared
+                            # in the extension's own pyproject.toml but
+                            # missing from the shared pixi.toml
+                            # [pypi-dependencies]) already caused a real
+                            # qualification run to spend the bulk of its
+                            # rebuild() time in Phase 2 for this reason
+                            # before being diagnosed by hand. One WARNING
+                            # per process, not per call.
+                            if not self._pyarrow_missing_warned:
+                                self._pyarrow_missing_warned = True
+                                _log.warning(
+                                    "OutputsFtsIndex.rebuild: pyarrow is "
+                                    "not importable -- falling back to the "
+                                    "combined-VALUES bulk-insert path, "
+                                    "measured ~150x slower per row than "
+                                    "the pyarrow fast path (see e8a2f710). "
+                                    "Install pyarrow>=14.0 to restore the "
+                                    "fast path.",
+                                )
+                        self.last_rebuild_metrics["bulk_insert_path"] = (
+                            "pyarrow" if _pa is not None else "values_fallback"
+                        )
                         if _pa is not None:
-                            _arrow_table = _pa.table({
-                                "path": [r.path for r in new_rows],
-                                "content": [r.content for r in new_rows],
-                                "mtime": [r.mtime for r in new_rows],
-                                "sha256": [r.sha256 for r in new_rows],
-                                "size": [r.size for r in new_rows],
-                                "generating_script": [r.generating_script for r in new_rows],
-                                "kind": [r.kind for r in new_rows],
-                                "is_archival": [r.is_archival for r in new_rows],
-                                "canonical_path": [r.canonical_path for r in new_rows],
-                                "csv_columns": [
+                            # task_ecb96ac9 follow-on (perf) -- the previous
+                            # version built each of these 11 columns with its
+                            # OWN separate `for r in new_rows` comprehension:
+                            # 11 full Python-level passes over the batch
+                            # instead of 1. Confirmed live at real scale
+                            # (SUT_Compressed, 82 calls / 303,104 files): even
+                            # with the pyarrow fast path active, write_seconds
+                            # was still 79.1% of total rebuild() time --
+                            # collapsing to a single pass removes 10 of those
+                            # 11 redundant iterations (and the equivalent
+                            # redundancy in json.dumps() calls, unchanged
+                            # either way) for any batch this large.
+                            _paths: list[str] = []
+                            _contents: list[str | None] = []
+                            _mtimes: list[float | None] = []
+                            _sha256s: list[str | None] = []
+                            _sizes: list[int | None] = []
+                            _generating_scripts: list[str | None] = []
+                            _kinds: list[str] = []
+                            _is_archivals: list[bool] = []
+                            _canonical_paths: list[str | None] = []
+                            _csv_columns_json: list[str | None] = []
+                            _json_keys_json: list[str | None] = []
+                            for r in new_rows:
+                                _paths.append(r.path)
+                                _contents.append(r.content)
+                                _mtimes.append(r.mtime)
+                                _sha256s.append(r.sha256)
+                                _sizes.append(r.size)
+                                _generating_scripts.append(r.generating_script)
+                                _kinds.append(r.kind)
+                                _is_archivals.append(r.is_archival)
+                                _canonical_paths.append(r.canonical_path)
+                                _csv_columns_json.append(
                                     json.dumps(r.csv_columns) if r.csv_columns else None
-                                    for r in new_rows
-                                ],
-                                "json_keys": [
+                                )
+                                _json_keys_json.append(
                                     json.dumps(r.json_keys) if r.json_keys else None
-                                    for r in new_rows
-                                ],
+                                )
+                            _arrow_table = _pa.table({
+                                "path": _paths,
+                                "content": _contents,
+                                "mtime": _mtimes,
+                                "sha256": _sha256s,
+                                "size": _sizes,
+                                "generating_script": _generating_scripts,
+                                "kind": _kinds,
+                                "is_archival": _is_archivals,
+                                "canonical_path": _canonical_paths,
+                                "csv_columns": _csv_columns_json,
+                                "json_keys": _json_keys_json,
                             })
                             con.register("_outputs_index_bulk_insert", _arrow_table)
                             try:
@@ -4572,16 +5016,23 @@ class OutputsFtsIndex:
                                     f"INSERT OR REPLACE INTO outputs_index VALUES {row_placeholders}",
                                     flat_params,
                                 )
+                    self.last_rebuild_metrics["db_insert_seconds"] = round(
+                        time.monotonic() - _db_insert_started, 6,
+                    )
                     # 77443d83 -- stage this call's own delta for the next
                     # Tantivy commit. Accumulates (rather than overwrites)
                     # across deferred calls, so whenever _rebuild_fts() next
                     # actually runs -- here or lazily from search() -- it
                     # commits the full outstanding delta as one small Tantivy
                     # transaction, never a full re-index.
-                    replacement_paths = {r.path for r in new_rows}
+                    #
+                    # task_ecb96ac9 follow-on (perf) -- was a set comprehension
+                    # over new_rows followed by a separate for-loop over the
+                    # same new_rows: 2 passes for what a single loop already
+                    # does in one, on top of the pyarrow-path loop above.
                     self._pending_tantivy_deletes.update(paths_to_delete)
-                    self._pending_tantivy_deletes.update(replacement_paths)
                     for r in new_rows:
+                        self._pending_tantivy_deletes.add(r.path)
                         self._pending_tantivy_upserts[r.path] = r
                     # b1789c0d / d9c76caa -- _rebuild_fts() has no deadline
                     # check of its own. On a huge cold tree, calling it
@@ -4727,6 +5178,7 @@ class OutputsFtsIndex:
             # call (e.g. a full pass over an already-converged tree).
             # Best-effort: a persistence failure here must never break
             # rebuild()'s own return contract.
+            _walk_state_persist_started = time.monotonic()
             try:
                 walk_state_con = self._connect()
                 self._persist_walk_state_locked(walk_state_con)
@@ -4735,6 +5187,20 @@ class OutputsFtsIndex:
                     "OutputsFtsIndex.rebuild: failed to persist walk state",
                     exc_info=True,
                 )
+            # fa600e42 follow-up -- same durability treatment as walk state
+            # immediately above, for the legacy-migration-scan throttle.
+            try:
+                self._persist_legacy_migration_state_locked(
+                    self._connect()
+                )
+            except Exception:  # noqa: BLE001
+                _log.debug(
+                    "OutputsFtsIndex.rebuild: failed to persist "
+                    "legacy-migration state", exc_info=True,
+                )
+            self.last_rebuild_metrics["walk_state_persist_seconds"] = round(
+                time.monotonic() - _walk_state_persist_started, 6,
+            )
             self.last_rebuild_metrics["write_seconds"] = round(
                 time.monotonic() - write_started, 6,
             )

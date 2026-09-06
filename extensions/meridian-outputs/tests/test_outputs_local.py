@@ -1758,6 +1758,58 @@ class TestRowCacheContentEviction:
         finally:
             idx2.close()
 
+    @duckdb_required
+    def test_rehydrate_from_disk_is_chunked_across_multiple_batches(
+        self, tmp_path: Path,
+    ) -> None:
+        """fa600e42 follow-up: _rehydrate_cache_from_disk() must fetch via
+        cursor.fetchmany() in bounded chunks (mirroring
+        _migrate_legacy_storage_paths_locked's own established pattern),
+        not one unchunked fetchall() -- a real live reconnect to a
+        ~98,304-row/2.85GB index spent multiple I/O-bound minutes and one
+        large ~2.3GB one-step memory jump on this before the fix. Forces a
+        tiny adaptive-batch size so a small, fast-to-build dataset still
+        spans several fetchmany() chunks, and asserts every row survives
+        the chunk boundaries with no loss or duplication."""
+        n = 47  # deliberately not a clean multiple of the forced batch size
+        for i in range(n):
+            (tmp_path / f"r{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        # An external db_path (outside outputs_dir) avoids the indexer's own
+        # ensure_gitignored() writing a .gitignore INTO outputs_dir, which
+        # would otherwise get walked and counted as an unexpected extra file.
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-chunked.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        idx1.rebuild(max_seconds=None)
+        assert len(idx1._row_cache) == n
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            idx2._adaptive_batch = 5  # forces >1 fetchmany() chunk for n=47
+            idx2._connect()  # first connect already calls _rehydrate_cache_from_disk once
+            idx2._row_cache.clear()
+            idx2._manifest.clear()
+            # Re-run directly (connection already open) so the chunk size
+            # override above is what governs this call -- verifies the
+            # OUTCOME (no loss/duplication across fetchmany() boundaries),
+            # which is the property that would actually regress if
+            # chunking were implemented incorrectly.
+            idx2._rehydrate_cache_from_disk()
+            assert len(idx2._row_cache) == n, (
+                "chunked rehydration lost or duplicated rows across "
+                "fetchmany() batch boundaries"
+            )
+            assert len(idx2._manifest) == n
+            for i in range(n):
+                key = next(
+                    p for p in idx2._row_cache if p.endswith(f"r{i:03d}.csv")
+                )
+                assert idx2._row_cache[key].content is None
+                assert idx2._row_cache[key].sha256 is not None
+        finally:
+            idx2.close()
+
 
 # ---------------------------------------------------------------------------
 # Module-level API: search_outputs, annotate_outputs, classify_outputs,
@@ -2904,6 +2956,19 @@ class TestParallelRebuildCorrectness:
 
         repaired = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
         try:
+            # fa600e42 follow-up -- the legacy-migration-scan throttle state
+            # now persists across process restarts (see
+            # TestLegacyMigrationScanSurvivesRestart), so `first`'s own
+            # clean scan already persisted "scanned, found nothing" before
+            # this out-of-band duplicate was inserted directly via duckdb
+            # above. A real fresh-DB-or-past-its-recheck-interval instance
+            # would still scan; force that same condition explicitly here
+            # rather than relying on `repaired` merely being a new object.
+            # connect() FIRST (so rehydration -- which would otherwise
+            # immediately reload and overwrite this override -- has already
+            # happened), THEN override.
+            repaired._connect()
+            repaired._legacy_migration_ever_scanned = False
             assert repaired.rebuild() == 1
             rows = repaired._con.execute(
                 "SELECT path FROM outputs_index"
@@ -3318,6 +3383,201 @@ class TestLegacyMigrationThrottle:
             idx.close()
 
 
+class TestLegacyMigrationScanSurvivesRestart:
+    """fa600e42 follow-up: the legacy-migration-scan throttle state must
+    persist across process restarts, the same shape of fix already applied
+    to the resumable file walk.
+
+    Confirmed live (2026-09-03): _legacy_migration_ever_scanned was a plain
+    in-memory flag with constructor default False and no persistence, so
+    EVERY freshly-constructed OutputsFtsIndex -- including one from a
+    periodic-restart harness reconnecting to an index a prior process had
+    already fully migration-scanned seconds earlier -- unconditionally ran
+    a full O(total indexed rows) table scan on its first rebuild() call.
+    This forced that scan onto literally every restart, growing more
+    expensive as the index grows, never reaching the intended
+    once-per-25-calls steady state.
+    """
+
+    @duckdb_required
+    def test_second_instance_does_not_rescan_after_clean_first_scan(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "f.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-persist.duckdb")
+
+        first = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            first.rebuild()
+            assert first._legacy_migration_ever_scanned is True
+            assert first._legacy_migration_found_last_time is False
+        finally:
+            first.close()
+
+        second = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            # The core regression: without the fix, a brand-new instance's
+            # _legacy_migration_ever_scanned starts at the constructor
+            # default (False), forcing run_legacy_migration True on this
+            # call regardless of what `first` already confirmed. With the
+            # fix, rehydration restores the persisted "already scanned,
+            # found nothing" state before the throttle decision runs, so
+            # this call does NOT re-trigger the full-table scan.
+            scan_called = False
+            real_migrate = second._migrate_legacy_storage_paths_locked
+
+            def _tracking_migrate(con):
+                nonlocal scan_called
+                scan_called = True
+                return real_migrate(con)
+
+            second._migrate_legacy_storage_paths_locked = _tracking_migrate
+            second.rebuild()
+            assert scan_called is False, (
+                "second instance re-ran the legacy-migration scan despite "
+                "the first instance already persisting a clean scan"
+            )
+            assert second._legacy_migration_ever_scanned is True
+        finally:
+            second.close()
+
+    @duckdb_required
+    def test_persisted_calls_since_scan_continues_counting_across_restart(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "f.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-counter.duckdb")
+        interval = OL.OutputsFtsIndex._LEGACY_MIGRATION_RECHECK_INTERVAL
+
+        first = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            first.rebuild()
+            # Advance most, but not all, of the way through the recheck
+            # interval in the FIRST process.
+            for _ in range(interval - 2):
+                first.rebuild()
+            assert first._legacy_migration_calls_since_scan == interval - 2
+        finally:
+            first.close()
+
+        second = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            # Restart resumes the counter from where it left off (interval
+            # - 2), not from zero -- confirmed via _connect() (which
+            # triggers rehydration) before rebuild() would otherwise
+            # advance it.
+            second._connect()
+            assert second._legacy_migration_calls_since_scan == interval - 2
+            # One call short of the threshold: no scan yet.
+            second.rebuild()
+            assert second._legacy_migration_calls_since_scan == interval - 1
+            # Force the pre-check value to the threshold directly (matching
+            # TestLegacyMigrationThrottle's own precise-count style) and
+            # confirm crossing it still re-triggers a scan and resets the
+            # counter -- i.e. persistence didn't just freeze the old
+            # in-memory throttle behavior, it correctly continues it.
+            second._legacy_migration_calls_since_scan = interval
+            second.rebuild()
+            assert second._legacy_migration_calls_since_scan == 0
+        finally:
+            second.close()
+
+    @duckdb_required
+    def test_brand_new_db_still_scans_on_first_call(
+        self, tmp_path: Path,
+    ) -> None:
+        """No persisted state yet (a genuinely fresh DB) must behave
+        exactly as before this fix -- degrade gracefully, not silently skip
+        the one-time first-scan concern this whole mechanism exists for."""
+        (tmp_path / "f.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path.parent / f"{tmp_path.name}-fresh.duckdb")
+
+        idx = OL.OutputsFtsIndex(str(tmp_path), db_path=db_path)
+        try:
+            scan_called = False
+            real_migrate = idx._migrate_legacy_storage_paths_locked
+
+            def _tracking_migrate(con):
+                nonlocal scan_called
+                scan_called = True
+                return real_migrate(con)
+
+            idx._migrate_legacy_storage_paths_locked = _tracking_migrate
+            idx.rebuild()
+            assert scan_called is True
+        finally:
+            idx.close()
+
+
+class TestWriteSecondsSubMetrics:
+    """fa600e42 follow-up (write_seconds diagnostics): write_seconds is a
+    wall-clock umbrella over legacy-migration-scan, apply_precomputed, the
+    DB insert itself, and walk-state persist -- previously indistinguishable
+    from each other, which made a real live discrepancy (write_seconds
+    running 13-50x slower per row than an isolated pyarrow bulk-insert
+    benchmark) impossible to attribute without guessing. These sub-metrics
+    make each piece separately visible."""
+
+    @duckdb_required
+    def test_sub_metrics_present_and_sum_close_to_write_seconds(
+        self, tmp_path: Path,
+    ) -> None:
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "b.csv").write_text("col\n2", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            m = idx.last_rebuild_metrics
+            for key in (
+                "legacy_migration_seconds", "apply_precomputed_seconds",
+                "db_insert_seconds", "walk_state_persist_seconds",
+                "write_seconds",
+            ):
+                assert key in m, f"{key} missing from last_rebuild_metrics"
+                assert m[key] >= 0
+            # These four are all sub-windows of write_seconds's own timed
+            # span (not necessarily exhaustive -- Tantivy staging/commit and
+            # other small steps fill the remainder) -- they must never sum
+            # to MORE than the umbrella itself.
+            sub_total = (
+                m["legacy_migration_seconds"] + m["apply_precomputed_seconds"]
+                + m["db_insert_seconds"] + m["walk_state_persist_seconds"]
+            )
+            assert sub_total <= m["write_seconds"] + 1e-3
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_bulk_insert_path_recorded_as_pyarrow_when_available(
+        self, tmp_path: Path,
+    ) -> None:
+        pytest.importorskip("pyarrow")
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert idx.last_rebuild_metrics["bulk_insert_path"] == "pyarrow"
+        finally:
+            idx.close()
+
+    @duckdb_required
+    def test_bulk_insert_path_recorded_as_fallback_when_pyarrow_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "pyarrow", None)
+        (tmp_path / "a.csv").write_text("col\n1", encoding="utf-8")
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        try:
+            idx.rebuild()
+            assert (
+                idx.last_rebuild_metrics["bulk_insert_path"]
+                == "values_fallback"
+            )
+            assert idx._pyarrow_missing_warned is True
+        finally:
+            idx.close()
+
+
 # ---------------------------------------------------------------------------
 # rebuild() Phase 1 deadline enforcement (sprint item d9c76caa)
 # ---------------------------------------------------------------------------
@@ -3540,6 +3800,291 @@ class TestResumableFileWalkDeadlineAwareness:
         assert walk.drain(None) == []
 
 
+class TestResumeAfterCrossProcess:
+    """fa600e42 follow-up: a fresh _ResumableFileWalk/OutputsFtsIndex must be
+    able to pick up where a PRIOR process's walk left off (via a persisted
+    scan boundary), instead of always re-walking the tree from the top.
+
+    Confirmed live (2026-09-03): a periodic-restart harness that reconstructs
+    OutputsFtsIndex against the same db_path/outputs_dir every N calls made
+    literally zero net forward progress past whatever a single process's own
+    call budget could reach -- 8+ consecutive segments each rediscovered the
+    exact same already-indexed files (rows_changed=0) and never advanced,
+    because _scan_boundary was tracked for convergence REPORTING only and
+    never fed back into a freshly-constructed walk to skip already-covered
+    ground.
+    """
+
+    def test_walk_safe_output_files_resume_after_skips_covered_ground(
+        self, tmp_path: Path,
+    ) -> None:
+        names = [f"f{i:03d}.csv" for i in range(20)]
+        for name in names:
+            (tmp_path / name).write_text("col\n1", encoding="utf-8")
+        full = sorted(OL._iter_safe_output_files(str(tmp_path)))
+        boundary = full[9]  # simulate a prior pass that got exactly halfway
+        resumed = list(
+            OL._walk_safe_output_files(str(tmp_path), resume_after=boundary)
+        )
+        assert sorted(resumed) == full[10:]
+
+    def test_walk_safe_output_files_resume_after_prunes_earlier_subdirs(
+        self, tmp_path: Path,
+    ) -> None:
+        # Subdirectories sorting entirely before the boundary must be
+        # skipped WITHOUT being scandir()'d at all -- not merely filtered
+        # out of their yielded results.
+        (tmp_path / "aaa_early").mkdir()
+        (tmp_path / "aaa_early" / "x.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "mid.csv").write_text("col\n1", encoding="utf-8")
+        (tmp_path / "zzz_late").mkdir()
+        (tmp_path / "zzz_late" / "y.csv").write_text("col\n1", encoding="utf-8")
+
+        scanned_dirs: list[str] = []
+        real_scandir = os.scandir
+
+        def _tracking_scandir(path):  # noqa: ANN001
+            scanned_dirs.append(os.fspath(path))
+            return real_scandir(path)
+
+        boundary = str(tmp_path / "mid.csv")
+        with patch("os.scandir", side_effect=_tracking_scandir):
+            resumed = list(
+                OL._walk_safe_output_files(str(tmp_path), resume_after=boundary)
+            )
+        assert resumed == [str(tmp_path / "zzz_late" / "y.csv")]
+        assert not any(
+            "aaa_early" in d for d in scanned_dirs
+        ), f"pruned subtree was scandir()'d anyway: {scanned_dirs!r}"
+
+    def test_resumable_file_walk_resume_after_matches_direct_walk(
+        self, tmp_path: Path,
+    ) -> None:
+        for i in range(15):
+            (tmp_path / f"h{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+        full = sorted(OL._iter_safe_output_files(str(tmp_path)))
+        boundary = full[6]
+        walk = OL._ResumableFileWalk(str(tmp_path), resume_after=boundary)
+        chunk = walk.drain(None)
+        assert sorted(chunk) == full[7:]
+
+    def test_outputsftsindex_second_instance_resumes_past_first_boundary(
+        self, tmp_path: Path,
+    ) -> None:
+        """End-to-end simulation of the actual periodic-restart bug: two
+        SEPARATE OutputsFtsIndex instances against the same db_path/
+        outputs_dir (simulating a process restart), the second seeded with
+        the first's _scan_boundary via initial_scan_boundary. The second
+        instance's walk must reach genuinely new ground, not rediscover
+        what the first already covered."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(40):
+            (outputs_dir / f"r{i:03d}.csv").write_text("col\n1", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        # Force a partial pass: cap the walk so it stops partway through
+        # the tree, mirroring one periodic-restart segment's own budget.
+        idx1._max_batch = 10
+        idx1.rebuild(max_seconds=30.0)
+        boundary = idx1._scan_boundary
+        assert boundary is not None, "first instance's pass should still be in progress"
+        first_total = len(idx1._row_cache)
+        assert 0 < first_total < 40, "first instance should have made partial, not full, progress"
+        idx1.close()
+
+        # Simulate the restart: a genuinely NEW instance against the same
+        # db_path, seeded with the boundary the (now-gone) prior process's
+        # walk had reached.
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path, initial_scan_boundary=boundary,
+        )
+        idx2._max_batch = 10
+        idx2.rebuild(max_seconds=30.0)
+        second_call_metrics = dict(idx2.last_rebuild_metrics)
+        # The core regression: without the fix, this call's walk restarts
+        # from the top and rediscovers exactly the same `first_total` files
+        # idx1 already found, so files_new/rows_changed come back 0 and
+        # idx2's row count never exceeds first_total. With the fix, it
+        # picks up past idx1's boundary and reaches genuinely new ground.
+        assert second_call_metrics.get("files_new", 0) > 0, (
+            "second instance rediscovered only already-indexed files -- "
+            "cross-process walk resume is not working"
+        )
+        assert second_call_metrics.get("rows_changed", 0) > 0
+        # Checked post-rebuild (not via last_rebuild_metrics, which is
+        # computed in Phase 0 before this call's own _connect() rehydrates
+        # idx1's rows into _row_cache) -- the real, ground-truth outcome:
+        # idx2 now knows about idx1's original rows PLUS genuinely new ones.
+        assert len(idx2._row_cache) > first_total
+
+    def test_boundary_resumed_pass_does_not_delete_pre_boundary_rows_on_completion(
+        self, tmp_path: Path,
+    ) -> None:
+        """Code-review-caught regression: a boundary-resumed pass that
+        reaches full exhaustion within the resuming instance must NOT treat
+        pre-boundary files as removed just because ITS OWN walk never
+        revisited them. Forces get_convergence_state() to connect (and
+        rehydrate _manifest) BEFORE the first rebuild() call, matching the
+        exact sequence that reproduced this live."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(6):
+            (outputs_dir / f"f{i}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path, max_batch=3)
+        idx1.rebuild(max_seconds=30.0)
+        boundary = idx1._scan_boundary
+        assert boundary is not None
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path, max_batch=3,
+            initial_scan_boundary=boundary,
+        )
+        # Connects (and rehydrates _manifest) BEFORE any rebuild() call --
+        # this is what made self._manifest non-empty while self._walk_
+        # accumulated only held post-boundary paths, the exact ordering
+        # that triggered the false "removed" detection.
+        pre_state = idx2.get_convergence_state()
+        assert pre_state.converged is False
+        idx2.rebuild(max_seconds=30.0)
+        # max_batch=3 with exactly 3 remaining files drains them all but
+        # can't yet distinguish "drained exactly max_batch" from "more
+        # remain" (see _ResumableFileWalk.drain()) -- one more call
+        # confirms exhaustion and triggers the walk_complete branch under
+        # test.
+        idx2.rebuild(max_seconds=30.0)
+        assert idx2.get_convergence_state().converged is True
+        assert len(idx2._row_cache) == 6, (
+            "boundary-resumed pass wrongly deleted pre-boundary rows on completion"
+        )
+        idx2.close()
+
+
+class TestInitialRowCacheAndManifest:
+    """fa600e42 follow-up, round 4: initial_row_cache/initial_manifest let a
+    caller seed OutputsFtsIndex's staleness-detection state BEFORE any
+    rebuild() call -- closing the gap where Phase 0/1's staleness check
+    (self._manifest.get(p) != sig or p not in self._row_cache) runs before
+    Phase 2's lazy _connect() has ever rehydrated a fresh process's cache.
+
+    Confirmed live: without this, EVERY already-indexed file looked stale
+    on every restart, forcing a full re-hash-and-rewrite of the whole
+    index each time -- which eventually caused a real MemoryError crash
+    after the repeated cycle bloated the DB file from 6GB to 8.7GB.
+    """
+
+    @duckdb_required
+    def test_seeded_cache_prevents_false_staleness_on_first_call(
+        self, tmp_path: Path,
+    ) -> None:
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(10):
+            (outputs_dir / f"f{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx1.rebuild(max_seconds=30.0)
+        assert idx1.get_convergence_state().converged is True
+        row_cache = dict(idx1._row_cache)
+        manifest = dict(idx1._manifest)
+        idx1.close()
+
+        # Simulate a restart, seeded with the prior instance's cache (as a
+        # harness-level probe would source it) instead of the constructor
+        # defaults (empty dicts).
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path,
+            initial_row_cache=row_cache, initial_manifest=manifest,
+        )
+        assert len(idx2._row_cache) == 10
+        assert len(idx2._manifest) == 10
+        idx2.rebuild(max_seconds=30.0)
+        m = idx2.last_rebuild_metrics
+        # The core regression: without seeding, every one of the 10 files
+        # looks stale on this call (files_new==10, rows_changed==10) since
+        # Phase 0/1 run before _connect() has rehydrated anything. With
+        # seeding, the staleness check already knows all 10 are current.
+        assert m.get("files_new", 0) == 0, (
+            "seeded cache did not prevent false staleness on the first call"
+        )
+        assert m.get("rows_changed", 0) == 0
+        idx2.close()
+
+    @duckdb_required
+    def test_no_seed_reproduces_the_original_false_staleness_on_first_call(
+        self, tmp_path: Path,
+    ) -> None:
+        """Control case: confirms the regression test above is actually
+        exercising the bug, not passing vacuously. Same setup, but a
+        SECOND instance constructed WITHOUT seeding (today's default)
+        must still show the original false-staleness behavior."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(10):
+            (outputs_dir / f"f{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx1.rebuild(max_seconds=30.0)
+        idx1.close()
+
+        idx2 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx2.rebuild(max_seconds=30.0)
+        m = idx2.last_rebuild_metrics
+        assert m.get("files_new", 0) == 10, (
+            "expected the original false-staleness behavior without seeding"
+        )
+        idx2.close()
+
+    @duckdb_required
+    def test_seeded_cache_produces_correct_final_row_count(
+        self, tmp_path: Path,
+    ) -> None:
+        """A seeded restart must still correctly pick up genuinely NEW
+        files discovered alongside the seeded (already-current) ones."""
+        outputs_dir = tmp_path / "outputs"
+        outputs_dir.mkdir()
+        for i in range(5):
+            (outputs_dir / f"f{i:03d}.csv").write_text(f"col\n{i}", encoding="utf-8")
+        db_path = str(tmp_path / "index.duckdb")
+
+        idx1 = OL.OutputsFtsIndex(str(outputs_dir), db_path=db_path)
+        idx1.rebuild(max_seconds=30.0)
+        row_cache = dict(idx1._row_cache)
+        manifest = dict(idx1._manifest)
+        idx1.close()
+
+        # A genuinely new file appears between "process 1 exits" and
+        # "process 2 starts" -- exactly the ongoing-writer scenario the
+        # staleness check must still catch even when seeded.
+        (outputs_dir / "new_file.csv").write_text("col\nnew", encoding="utf-8")
+
+        idx2 = OL.OutputsFtsIndex(
+            str(outputs_dir), db_path=db_path,
+            initial_row_cache=row_cache, initial_manifest=manifest,
+        )
+        idx2.rebuild(max_seconds=30.0)
+        assert idx2.get_convergence_state().converged is True
+        assert len(idx2._row_cache) == 6
+        idx2.close()
+
+    @duckdb_required
+    def test_none_defaults_preserve_existing_empty_cache_behavior(
+        self, tmp_path: Path,
+    ) -> None:
+        """Omitting initial_row_cache/initial_manifest (every existing
+        caller) must behave exactly as before -- empty dicts, not None
+        leaking through into code that assumes a dict."""
+        idx = OL.OutputsFtsIndex(str(tmp_path))
+        assert idx._row_cache == {}
+        assert idx._manifest == {}
+
+
 class TestRebuildWalkDeadlineAwareness:
     """rebuild()-level regression coverage for 6ba77ada: a walk that alone
     exceeds max_seconds must not prevent rebuild() from returning promptly
@@ -3553,9 +4098,10 @@ class TestRebuildWalkDeadlineAwareness:
         real_walk = OL._walk_safe_output_files
 
         def slow_walk(outputs_dir: str, *, exclude_patterns: tuple = (),
-                       on_error=None):
+                       on_error=None, resume_after=None):
             for p in real_walk(
                 outputs_dir, exclude_patterns=exclude_patterns, on_error=on_error,
+                resume_after=resume_after,
             ):
                 time.sleep(delay)
                 yield p
