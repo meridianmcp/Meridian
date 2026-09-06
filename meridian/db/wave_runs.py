@@ -1978,8 +1978,7 @@ async def record_wave_run_child_outcome(
     subprocess — "preserve real subprocess exit codes" from the sprint-item
     spec, verbatim.
 
-    A thin, guarded wrapper over :func:`record_wave_run_child`: ``status``
-    must be one of :data:`_WAVE_RUN_CHILD_TERMINAL_STATUSES`
+    ``status`` must be one of :data:`_WAVE_RUN_CHILD_TERMINAL_STATUSES`
     (succeeded/failed/skipped) — raises ``ValueError`` for ``'running'``
     (use :func:`claim_wave_run_child` for the in-flight state instead; this
     function exists specifically for the "this child is DONE" half of the
@@ -1987,6 +1986,35 @@ async def record_wave_run_child_outcome(
     an ``int`` or ``None`` — never a string/bool, so "did the subprocess
     actually succeed" is never ambiguous between "no exit code captured"
     and "exit code was falsy".
+
+    dcf78192 round 2: this used to delegate the status/failure_mode write to
+    :func:`record_wave_run_child` (its own ``UPDATE``/``INSERT`` plus its own
+    ``await db.commit()``) and then issue a SEPARATE ``exit_code``/
+    ``agent_id`` ``UPDATE`` with a second, independent commit. The one
+    caller reachable under an external ``asyncio.wait_for``
+    (``meridian.db.sprint_items._record_wave_run_completion``, bounded by
+    ``_ADVISORY_PHASE_TIMEOUT_S``) could have that outer timeout cancel this
+    coroutine in the gap between those two commits, leaving the row durably
+    showing the new ``status`` with ``exit_code`` unset or stale — a real
+    corruption of this function's own "verbatim" contract, and a permanent
+    one: ``complete_sprint_item``'s idempotent already-committed
+    short-circuit means the advisory block that would have re-run this call
+    never fires again on retry.
+
+    Both writes are now issued as ONE ``INSERT``/``UPDATE`` statement
+    followed by ONE ``await db.commit()`` — deliberately NOT delegating to
+    :func:`record_wave_run_child` any more (that shared helper keeps its own
+    two-call, two-commit shape for its OTHER callers, which this function
+    does not touch, so this fix cannot change their behavior). A single
+    statement is atomic on both backends this module runs against: on
+    SQLite (aiosqlite, a real pending transaction) a cancellation before the
+    one ``commit()`` call rolls back cleanly — every field this call touches
+    is uncommitted together, so a retry sees the prior state, never a
+    half-written one. On Postgres (psycopg3, ``autocommit=True`` per this
+    repo's rules — every statement is already its own transaction) there is
+    only one statement to begin with, so there is no gap between two
+    transactions for a cancellation to land in. Either way, a cancellation
+    now loses BOTH fields or NEITHER — never one without the other.
     """
     if status not in _WAVE_RUN_CHILD_TERMINAL_STATUSES:
         raise ValueError(
@@ -2009,18 +2037,88 @@ async def record_wave_run_child_outcome(
     existing = _row_to_dict(row)
     existing_failure_mode = (existing or {}).get("failure_mode") or "continue"
 
-    await record_wave_run_child(
-        db, wave_run_id, sprint_item_id,
-        failure_mode=existing_failure_mode, status=status,
-        evidence=evidence, actor=actor,
-    )
-    await db.execute(
-        "UPDATE wave_run_children SET exit_code = ?, "
-        "agent_id = COALESCE(?, agent_id), updated_at = datetime('now') "
-        "WHERE wave_run_id = ? AND sprint_item_id = ?",
-        (exit_code, agent_id, wave_run_id, sprint_item_id),
-    )
-    await db.commit()
+    if existing is None:
+        # No prior child row for this (wave_run_id, sprint_item_id) — a
+        # single INSERT carries status, failure_mode, exit_code AND
+        # agent_id together, so there is no second statement left to lose.
+        await db.execute(
+            "INSERT INTO wave_run_children "
+            "(id, wave_run_id, sprint_item_id, failure_mode, status, "
+            "evidence, actor, exit_code, agent_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _new_id(),
+                wave_run_id,
+                sprint_item_id,
+                existing_failure_mode,
+                status,
+                _json_or_none(evidence),
+                actor,
+                exit_code,
+                agent_id,
+            ),
+        )
+        await db.commit()
+        status_changed = True
+        prior_status = None
+    else:
+        # Existing row: one UPDATE carries the status transition AND the
+        # exit_code/agent_id bookkeeping together. failure_mode is
+        # re-written to its OWN current value here (this function never
+        # changes it) purely so this stays a single statement — a no-op
+        # write to the same value, not a behavior change.
+        await db.execute(
+            "UPDATE wave_run_children SET failure_mode = ?, status = ?, "
+            "evidence = COALESCE(?, evidence), actor = COALESCE(?, actor), "
+            "exit_code = ?, agent_id = COALESCE(?, agent_id), "
+            "updated_at = datetime('now') "
+            "WHERE wave_run_id = ? AND sprint_item_id = ?",
+            (
+                existing_failure_mode,
+                status,
+                _json_or_none(evidence),
+                actor,
+                exit_code,
+                agent_id,
+                wave_run_id,
+                sprint_item_id,
+            ),
+        )
+        await db.commit()
+        prior_status = existing.get("status")
+        status_changed = prior_status != status
+
+    # History event, appended AFTER the commit above — exactly the ordering
+    # record_wave_run_child itself uses. An event lost to a cancellation
+    # here is a missed audit-trail entry for an already-durable write, not a
+    # corrupted field: the same best-effort gap this module already accepts
+    # elsewhere (e.g. record_degraded_tool's event append).
+    if existing is None:
+        await append_wave_run_event(
+            db, wave_run_id, "child_recorded",
+            detail=f"{sprint_item_id} -> {status} (failure_mode={existing_failure_mode})",
+            payload={
+                "sprint_item_id": sprint_item_id,
+                "status": status,
+                "failure_mode": existing_failure_mode,
+            },
+            actor=actor,
+        )
+    elif status_changed:
+        await append_wave_run_event(
+            db, wave_run_id, "child_status_changed",
+            detail=(
+                f"{sprint_item_id}: {prior_status} -> {status} "
+                f"(failure_mode={existing_failure_mode})"
+            ),
+            payload={
+                "sprint_item_id": sprint_item_id,
+                "from": prior_status,
+                "to": status,
+                "failure_mode": existing_failure_mode,
+            },
+            actor=actor,
+        )
 
     async with db.execute(
         "SELECT * FROM wave_run_children WHERE wave_run_id = ? AND sprint_item_id = ?",
