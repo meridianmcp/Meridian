@@ -270,6 +270,101 @@ class TestClassifyEditPacketBoundary:
         assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_OMML
         assert any(f["type"] == "missing_trailing_punctuation" for f in result["style_findings"])
 
+    # -- round 2 (e03b41ef verifier fix): audit-error fail-closed --------
+
+    def test_omml_target_with_bad_document_path_is_rejected_not_accepted(self):
+        """Verifier repro (round 2, e03b41ef): a nonexistent document_path
+        makes audit_equation_integrity itself return {"error": ...} --
+        that must reject with a dedicated "audit unavailable" reason, NOT
+        silently fall through to a clean "omml" acceptance. Before the
+        fix this returned {"boundary": "omml", "reason": None,
+        "style_findings": []}, which is exactly the "editing known-corrupt
+        (or entirely unverifiable) state blind" outcome this classifier is
+        documented to refuse."""
+        bad_path = "Z:/this/path/does/not/exist/nowhere.docx"
+        packet = {"omml_payload": _VALID_OMML_PAYLOAD, "target_para_id": "EQDUP0001"}
+
+        integrity = docs_intel.audit_equation_integrity(bad_path)
+        assert "error" in integrity, "fixture invariant: bad path must make the underlying audit itself fail"
+
+        result = docs_intel.classify_edit_packet(packet, document_path=bad_path)
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert result["reason"] == docs_intel.CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE
+        assert result["reason"] != docs_intel.CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING
+        assert "detail" in result and bad_path in result["detail"]
+        assert result["audit_error"] == integrity["error"]
+        # No "omml" acceptance leaks through -- style_findings must never be
+        # attached to a rejected result.
+        assert "style_findings" not in result
+
+    def test_omml_target_with_bad_document_path_via_anchor_query_is_also_rejected(self):
+        """Same fail-closed behavior when the target anchor is named via
+        anchor_query (the prose-shared vocabulary) instead of
+        target_para_id directly -- the audit-unavailable check must not be
+        specific to one anchor-naming path."""
+        bad_path = "Z:/another/missing/document.docx"
+        packet = {
+            "omml_payload": _VALID_OMML_PAYLOAD,
+            "anchor_query": {"para_id": "EQCLEAN0001"},
+        }
+        result = docs_intel.classify_edit_packet(packet, document_path=bad_path)
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert result["reason"] == docs_intel.CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE
+
+    def test_omml_style_audit_error_also_rejects_after_integrity_passes(self, tmp_path, monkeypatch):
+        """The integrity audit can succeed while the STYLE audit itself
+        errors (e.g. a transient failure specific to that pass) -- that
+        must also reject via the same audit-unavailable reason rather than
+        falling through to acceptance once the first audit clears."""
+        doc = _write_classifier_docx(tmp_path)
+        integrity = docs_intel.audit_equation_integrity(doc)
+        assert integrity["finding_count"] >= 1
+        # EQCLEAN0001 carries no integrity finding -- confirm the real
+        # audit_equation_integrity run for this doc/anchor pair would clear,
+        # so the rejection below is attributable to the (monkeypatched)
+        # style-audit failure alone, not a real integrity finding.
+        assert not any(
+            f.get("anchor") == "EQCLEAN0001" or "EQCLEAN0001" in (f.get("anchors") or [])
+            for f in integrity["findings"]
+        )
+
+        monkeypatch.setattr(
+            docs_intel, "audit_equation_style", lambda _path: {"error": "simulated style-audit failure"},
+        )
+        packet = {"omml_payload": _VALID_OMML_PAYLOAD, "target_para_id": "EQCLEAN0001"}
+        result = docs_intel.classify_edit_packet(packet, document_path=doc)
+        assert result["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+        assert result["reason"] == docs_intel.CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE
+        assert result["audit_error"] == "simulated style-audit failure"
+
+    def test_batch_audit_unavailable_does_not_mask_or_get_masked_by_other_results(self, tmp_path):
+        """Fail-closed audit-unavailable rejection composes correctly inside
+        classify_edit_packet_batch too -- one packet's audit failure must
+        report independently, same invariant as the existing mixed-batch
+        tests below for the other rejection reasons."""
+        doc = _write_classifier_docx(tmp_path)
+        clean_omml_packet = {
+            "omml_payload": _VALID_OMML_PAYLOAD,
+            "target_para_id": "EQCLEAN0001",
+        }
+        bad_path_packet = {
+            "omml_payload": _VALID_OMML_PAYLOAD,
+            "target_para_id": "EQCLEAN0001",
+        }
+
+        # classify_edit_packet_batch takes one document_path for the whole
+        # call, so both otherwise-identical packets are classified against
+        # the SAME bad path here -- confirming the audit-unavailable
+        # rejection applies independently and consistently per packet, with
+        # neither one slipping through to a clean "omml" acceptance.
+        results = docs_intel.classify_edit_packet_batch(
+            [clean_omml_packet, bad_path_packet], document_path="Z:/nope/nope.docx",
+        )
+        assert len(results) == 2
+        for entry in results:
+            assert entry["boundary"] == docs_intel.CLASSIFIER_BOUNDARY_REJECTED
+            assert entry["reason"] == docs_intel.CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE
+
     # -- fail-closed mixed batch ------------------------------------------
 
     def test_batch_never_lets_prose_success_mask_omml_rejection(self, tmp_path):

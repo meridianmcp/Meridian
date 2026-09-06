@@ -20907,6 +20907,21 @@ def apply_reviewable_edit_transaction(
 # Rejecting on style findings would make it impossible to ever classify a
 # legitimate style-correction operation as "omml" -- so they are reported,
 # never used to reject.
+#
+# Round 2 (e03b41ef, BE4ED581-W2 verifier fix): an audit ERRORING OUT
+# (audit_equation_integrity/audit_equation_style returning {"error": ...} --
+# a bad/missing/unreadable document_path, or any other I/O/parse failure) is
+# NOT the same thing as "the audit ran and found nothing." The former means
+# verification never actually happened; treating it as equivalent to a clean
+# audit would silently accept an OMML operation this function could never
+# actually check -- exactly the "can't verify, so must refuse" case this
+# module's fail-closed design is supposed to cover. Both audits erroring
+# reject with CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE, a REASON
+# DISTINCT from CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING on
+# purpose: a caller needs to be able to tell "verification never ran" (retry
+# with a valid document_path, or escalate an infra problem) apart from
+# "verification ran and the anchor is genuinely suspect" (a real content
+# problem, not an availability one).
 # ---------------------------------------------------------------------------
 
 CLASSIFIER_BOUNDARY_PROSE = "prose"
@@ -20924,6 +20939,7 @@ CLASSIFIER_REASON_MIXED_SIGNALS = "mixed_prose_and_omml_signals"
 CLASSIFIER_REASON_OMML_PAYLOAD_MISSING = "omml_payload_missing"
 CLASSIFIER_REASON_OMML_STRUCTURE_INVALID = "omml_structure_invalid"
 CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING = "omml_target_has_integrity_finding"
+CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE = "omml_integrity_audit_unavailable"
 CLASSIFIER_REASON_AMBIGUOUS_PACKET_KIND = "ambiguous_or_unrecognized_packet_kind"
 
 # Recognized field names for a candidate OMML-touching operation's raw
@@ -20990,11 +21006,16 @@ def classify_edit_packet(
         structurally valid ``<m:oMath>`` per :func:`_validate_omml_structure`,
         and -- when both ``document_path`` and a resolvable target anchor
         (``target_para_id`` or ``anchor_query["para_id"]``) are given --
-        that anchor carries no existing finding in a fresh
-        :func:`audit_equation_integrity` run against ``document_path``.
-        ``reason`` is ``None``. When ``document_path`` and a target anchor
-        are both available, an additional informational ``style_findings``
-        list is attached (see module note above: never used to reject).
+        a fresh :func:`audit_equation_integrity` run against
+        ``document_path`` both SUCCEEDS (no ``"error"`` key) and finds no
+        existing finding for that anchor, AND a fresh
+        :func:`audit_equation_style` run against ``document_path`` also
+        succeeds. ``reason`` is ``None``. When ``document_path`` and a
+        target anchor are both available, an additional informational
+        ``style_findings`` list is attached (see module note above: never
+        used to reject). If either audit itself errors, this function
+        rejects with :data:`CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE`
+        instead of falling through to acceptance.
         This classification is scoped to VALIDATION ONLY -- no typed,
         build/apply OMML packet contract exists yet; a caller must still
         route an ``"omml"``-classified operation through
@@ -21028,6 +21049,17 @@ def classify_edit_packet(
           route a new OMML operation at an anchor whose current state is
           already known to be structurally suspect (``findings`` carries
           the matched finding dicts).
+        - :data:`CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE` --
+          :func:`audit_equation_integrity` or :func:`audit_equation_style`
+          itself returned ``{"error": ...}`` for ``document_path`` (bad,
+          missing, or unreadable path; any I/O/parse failure) while
+          checking the target anchor -- verification could not run at all,
+          so this is refused rather than silently treated as "audit found
+          nothing." Distinct from
+          ``CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING`` above: this
+          reason means the check never ran; that one means it ran and found
+          a real problem. ``detail`` carries the underlying audit's own
+          error message; ``audit_error`` carries it unwrapped.
         - :data:`CLASSIFIER_REASON_AMBIGUOUS_PACKET_KIND` -- ``packet`` is
           neither a recognizable prose packet nor carries an OMML payload
           field; this function never guesses, so an unrecognized shape is
@@ -21100,34 +21132,59 @@ def classify_edit_packet(
 
     if document_path and target_para_id:
         integrity = audit_equation_integrity(document_path)
-        if "error" not in integrity:
-            matching = [
-                finding
-                for finding in integrity.get("findings", [])
-                if finding.get("anchor") == target_para_id
-                or target_para_id in (finding.get("anchors") or [])
-            ]
-            if matching:
-                return {
-                    "boundary": CLASSIFIER_BOUNDARY_REJECTED,
-                    "reason": CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING,
-                    "detail": (
-                        f"target anchor {target_para_id!r} already carries "
-                        f"{len(matching)} unresolved equation-integrity "
-                        "finding(s) -- refusing to route a new OMML "
-                        "operation at an anchor whose current state is "
-                        "already known to be structurally suspect"
-                    ),
-                    "findings": matching,
-                }
+        if "error" in integrity:
+            return {
+                "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+                "reason": CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE,
+                "detail": (
+                    f"audit_equation_integrity(document_path) could not run "
+                    f"against {document_path!r} to check target anchor "
+                    f"{target_para_id!r} before allowing this OMML operation "
+                    f"({integrity['error']!r}) -- refusing rather than "
+                    "treating an unauditable document as clean"
+                ),
+                "audit_error": integrity["error"],
+            }
+
+        matching = [
+            finding
+            for finding in integrity.get("findings", [])
+            if finding.get("anchor") == target_para_id
+            or target_para_id in (finding.get("anchors") or [])
+        ]
+        if matching:
+            return {
+                "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+                "reason": CLASSIFIER_REASON_OMML_TARGET_HAS_INTEGRITY_FINDING,
+                "detail": (
+                    f"target anchor {target_para_id!r} already carries "
+                    f"{len(matching)} unresolved equation-integrity "
+                    "finding(s) -- refusing to route a new OMML "
+                    "operation at an anchor whose current state is "
+                    "already known to be structurally suspect"
+                ),
+                "findings": matching,
+            }
 
         style_audit = audit_equation_style(document_path)
-        if "error" not in style_audit:
-            style_findings = [
-                finding
-                for finding in style_audit.get("findings", [])
-                if finding.get("para_id") == target_para_id
-            ]
+        if "error" in style_audit:
+            return {
+                "boundary": CLASSIFIER_BOUNDARY_REJECTED,
+                "reason": CLASSIFIER_REASON_OMML_INTEGRITY_AUDIT_UNAVAILABLE,
+                "detail": (
+                    f"audit_equation_style(document_path) could not run "
+                    f"against {document_path!r} to check target anchor "
+                    f"{target_para_id!r} before allowing this OMML operation "
+                    f"({style_audit['error']!r}) -- refusing rather than "
+                    "treating an unauditable document as clean"
+                ),
+                "audit_error": style_audit["error"],
+            }
+        style_findings = [
+            finding
+            for finding in style_audit.get("findings", [])
+            if finding.get("para_id") == target_para_id
+        ]
 
     result: "dict[str, Any]" = {"boundary": CLASSIFIER_BOUNDARY_OMML, "reason": None}
     if document_path and target_para_id:
