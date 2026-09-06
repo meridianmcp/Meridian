@@ -1827,7 +1827,7 @@ def classify_canonical_archival(
     return out
 
 
-@dataclass
+@dataclass(slots=True)
 class OutputRow:
     """One row of the persistent outputs_index table.
 
@@ -1843,6 +1843,18 @@ class OutputRow:
     persistent ``outputs_index`` table by path if you actually need it"
     (see :meth:`OutputsFtsIndex.get_content`) -- it does NOT mean the row is
     stale, incomplete, or unindexed.
+
+    fa600e42 follow-up (architecture review) -- ``slots=True``: this class
+    lives one instance per EVER-discovered path in ``_row_cache`` for the
+    life of the process (O(total corpus), never evicted -- see the memory
+    lens's own finding), so removing the per-instance ``__dict__`` is a
+    real, low-risk win at that scale. Confirmed compatible before adding:
+    ``dataclasses.asdict()``/``dataclasses.replace()`` (used by
+    :meth:`to_dict` and the archival-metadata-refresh path respectively)
+    and ``copy.copy()`` + attribute mutation (used by :func:`_light_row`)
+    all work identically on a slotted dataclass; no code anywhere in this
+    module or its tests reads ``.__dict__``/``vars()`` off an ``OutputRow``,
+    subclasses it, or sets an attribute outside the declared field list.
     """
 
     path: str
