@@ -48,6 +48,19 @@
       ],
       "status": "landed",
       "note": "Split from parent item eb64596f (W31, A/B/C/D). Pure comparator (compare_figure_invariants) over already-extracted FigureSlotPayload dicts -- never reads a .docx or output file itself. Bound-source identity (rid/resolved_path/generating_script) reuses extensions/meridian-docs/meridian_docs/docs_intel.py's _verify_image_ownership rId-based 'never loose labels' precedent (cross-checked in extensions/meridian-docs/tests/test_docx_write_integrity.py); provenance_type vocabulary is kept string-identical to extensions/meridian-outputs/meridian_outputs/provenance_status.py's EXACT/RELOCATED/AMBIGUOUS/DIRECTORY_FALLBACK/UNREGISTERED/UNKNOWN/STALE_BY_SCRIPT (cross-checked in extensions/meridian-outputs/tests/test_provenance_status.py) without importing that module. Five explicit fail-closed verdicts: INVARIANT_HOLDS, INVARIANT_VIOLATION, SOURCE_MISMATCH, AMBIGUOUS, NO_GENERATOR."
+    },
+    "5cc3d745-e494-4602-9ede-027e9ee3b156": {
+      "title": "W31-C: enforce complete promoted/held/skipped/ambiguous slot manifests before asset promotion",
+      "delivers": [
+        "figure_slot_manifest.py",
+        "tools/meridian_fallbacks/tests/test_figure_slot_manifest.py",
+        "transactional_merge.py (new promote() function)",
+        "tools/meridian_fallbacks/tests/test_transactional_merge.py (promote()-specific spy/forwarding coverage)",
+        "capability_manifest.json (this file, module entries + transactional_merge byte/hash refresh)",
+        "tools/meridian_fallbacks/tests/test_capability_parity.py (forbidden-import parametrization)"
+      ],
+      "status": "landed",
+      "note": "Split from parent item eb64596f (W31, A/B/C/D), sibling to db63385b (W31-B, figure_invariant_gate.py) -- deliberately kept separate so the exact resolver, the typography comparator, and this manifest gate can be built and tested in parallel, integrating only through the narrow reconcile_slot_manifest()-returned dict schema. figure_slot_manifest.reconcile_slot_manifest() reconciles an expected set of figure-slot ids against caller-supplied promoted/held/skipped/ambiguous SlotClassification buckets and fails closed (MANIFEST_INCOMPLETE/MANIFEST_CONTRADICTORY) on a missing slot, a duplicate assignment (including twice within the same bucket), an unknown slot, or a malformed entry (blank slot_id/reason/owner, or a bucket field disagreeing with the list it was supplied in). transactional_merge.promote() is the literal enforcement point: it wraps apply_patch_manifest() and refuses to call it at all unless a caller-supplied reconciliation's 'verdict' field equals MANIFEST_COMPLETE. Covered end-to-end in tests/test_figure_slot_manifest.py (module standalone plus promote()'s complete/incomplete/contradictory/non-mapping behavior) and, for the specific non-invocation and verbatim-kwarg-forwarding guarantees, via a monkeypatched spy on apply_patch_manifest in tests/test_transactional_merge.py (proves apply_patch_manifest is never even called on a failing verdict, rather than only inferring it from side effects)."
     }
   },
   "purpose": "Local, dependency-light fallback tools for safe OOXML (.docx) editing when the meridian-docs MCP extension or a Word MCP tunnel slot is unavailable. Exists to satisfy Meridian's capability-manifest fallback_chain contract (AGENTS.md, 649e095f) as a documented, already-wired alternative -- never ad-hoc improvisation. Zero dependency on the Meridian server, its DB, any MCP tool, or Serena memories; source-of-truth is this tracked package plus durable PatchManifest pointers, per the originating proposal.",
@@ -129,17 +142,19 @@
     },
     "transactional_merge": {
       "file": "transactional_merge.py",
-      "sha256": "06307158ffb3bd1b3e62d4fb019c5cb522d2b196de4605aeeb52435cf17f744f",
-      "byte_size": 12298,
+      "sha256": "8def8f413ecb8e665fe81d795a483dd823485e28bdaaa10fae144cac6414ab60",
+      "byte_size": 15814,
       "supported_operations": [
         "apply_patch_manifest(manifest, payloads=..., allow_stale_base=False, dry_run=False, appliers=...) -> MergeResult -- all-or-nothing apply of every operation in a manifest",
+        "promote(manifest, reconciliation, payloads=..., writer=..., appliers=..., allow_stale_base=False, dry_run=False, required_parts=...) -> MergeResult -- the literal 'no asset promotion without a complete slot manifest' enforcement point (sprint item 5cc3d745, W31-C): refuses to call apply_patch_manifest at all unless reconciliation['verdict'] == figure_slot_manifest.MANIFEST_COMPLETE (raising TypeError only when reconciliation is not a mapping at all), forwarding every other keyword argument verbatim to apply_patch_manifest once that check passes",
         "rollback(manifest, merge_result) -> WriteResult -- restore the target to its pre-apply state using the backup a successful apply created",
         "DEFAULT_APPLIERS: {'replace_part': ..., 'insert_image': ...} -- extensible via the appliers= kwarg for custom operation kinds"
       ],
       "limitations": [
         "dry_run=True is a pure preview: it never mutates manifest.status (success or failure), so a failed preview can be fixed and re-previewed without rebuilding the manifest. Only a real (non-dry-run) apply transitions a manifest out of 'draft'.",
         "A stale base_sha256 raises MergeConflictError rather than auto-merging -- there is no 3-way merge; the caller must explicitly opt in via allow_stale_base=True or re-create the manifest against the current file.",
-        "Operations are applied strictly in the order they appear in manifest.operations -- no dependency graph or reordering."
+        "Operations are applied strictly in the order they appear in manifest.operations -- no dependency graph or reordering.",
+        "promote()'s refusal on an incomplete/contradictory reconciliation never mutates manifest.status (mirrors apply_patch_manifest's own dry-run/precondition-failure discipline) -- a caller can fix the reconciliation and retry promote() against the same still-draft manifest without rebuilding it. It never re-derives or second-guesses figure_slot_manifest's own slot-by-slot logic, and never builds the reconciliation itself -- a caller must construct it (typically via figure_slot_manifest.reconcile_slot_manifest) before calling promote()."
       ]
     },
     "output_provenance_gate": {
@@ -198,6 +213,23 @@
         "Identity comparison is exact-match on (kind, value) only -- a RELOCATED (content-hash-confirmed-at-a-different-path) candidate is deliberately treated as SOURCE_MISMATCH rather than an equivalent match; this is a conservative fail-closed choice, not an oversight.",
         "numeric_values/text_content equality is order-sensitive on the exact sequence a caller supplies -- reordering with no value change is reported under 'reordered' but still counts as INVARIANT_VIOLATION, since element order is part of the extracted-content contract the caller declares, not typography.",
         "Hash-based identity ambiguity (two unrelated sources sharing an AMBIGUOUS/RELOCATED-with-multiple-candidates signal) is the caller's (provenance_status.py's) own known limitation, inherited here unmodified -- this gate only decides what to DO once that signal is present (fail closed), it does not resolve the ambiguity itself."
+      ]
+    },
+    "figure_slot_manifest": {
+      "file": "figure_slot_manifest.py",
+      "sha256": "fe69ff5aed5f6db0495bc1ab1986743e76e0177d8243d739e9e88c9d9fad96d4",
+      "byte_size": 18516,
+      "supported_operations": [
+        "reconcile_slot_manifest(expected_slot_ids, promoted=(), held=(), skipped=(), ambiguous=()) -> dict -- fail-closed manifest-level verdict reconciling an expected set of figure-slot ids against four caller-supplied disposition buckets",
+        "SlotClassification -- dataclass (slot_id, bucket, reason, owner); to_dict()/from_dict() for lossless JSON round-tripping. A blank/missing reason or owner is reported as a structural_errors entry, never silently accepted as a valid classification.",
+        "Three explicit manifest-level verdicts (never a bare bool): MANIFEST_COMPLETE='manifest_complete' (every expected slot classified exactly once across promoted/held/skipped/ambiguous, every entry well-formed, no unknown slot in any bucket -- the ONE verdict transactional_merge.promote() requires before it will call apply_patch_manifest at all), MANIFEST_INCOMPLETE='manifest_incomplete' (one or more expected slots have no classification anywhere), MANIFEST_CONTRADICTORY='manifest_contradictory' (a slot classified more than once -- including twice within the SAME bucket -- a bucket entry naming a slot outside expected_slot_ids, a malformed entry, or a last-resort unexplained bucket-entry-count mismatch)",
+        "main(argv) -- CLI entry point: `python figure_slot_manifest.py <manifest.json>`, exit 0 (MANIFEST_COMPLETE) or 1 (any other verdict)"
+      ],
+      "limitations": [
+        "Operates ONLY on already-decided classification data -- never reads a .docx or an outputs directory, never calls the meridian-docs/meridian-outputs MCP extensions, and never imports figure_invariant_gate, docs_intel.py, or provenance_status.py internals; a caller resolves each slot's disposition first (e.g. via figure_invariant_gate.compare_figure_invariants, one slot at a time) and hands this module the resulting bucket assignments.",
+        "Never raises for a malformed dict-shaped bucket entry -- becomes a structural_errors string instead (folded into MANIFEST_CONTRADICTORY). Raises TypeError only when an entry is neither a SlotClassification nor a mapping at all -- a caller programming error, not a manifest-content problem.",
+        "Duplicate-assignment and unknown-slot detection is keyed on exact slot_id string equality only -- it has no notion of slot aliases or renames across a promotion batch; a renamed slot id must be reconciled by the caller before this module ever sees it.",
+        "The defensive raw-entry-count-mismatch fallback check (MANIFEST_CONTRADICTORY) is mathematically unreachable given an otherwise-clean manifest -- it exists purely as a fail-closed backstop against a future logic gap this module's own checks did not anticipate, not a documented real-world trigger."
       ]
     }
   },
