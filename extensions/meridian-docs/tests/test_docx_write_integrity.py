@@ -383,6 +383,109 @@ def test_copy_section_rejects_rid28_reuse_in_figure_a4_and_rolls_back(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# db63385b (W31-B) -- tools/meridian_fallbacks/figure_invariant_gate.py's
+# "bound_source" identity notion must be defined CONSISTENTLY with this
+# module's own rId-based identity (_verify_image_ownership /
+# _image_paragraph_relationship_ids), never a second, drifting notion of
+# figure identity keyed on caption text. Reuses the module's own rId50
+# (Figure 5.21) and rId28 (Figure A.4) fixtures above.
+# ---------------------------------------------------------------------------
+
+def test_figure_invariant_gate_identity_agrees_with_verify_image_ownership_rid(tmp_path):
+    from tools.meridian_fallbacks import figure_invariant_gate as fig_gate
+
+    path = _write_docx(tmp_path, _FIGURE_5_21_XML, name="thesis_fixture.docx")
+    _raw, root = docs_intel._load_docx_xml_stdlib(path)
+    body = root.find(docs_intel._q(_W, "body"))
+    w14_para_id = docs_intel._q(_W14, "paraId")
+
+    original_para = next(el for el in body if el.get(w14_para_id) == "IMG050021")
+    # The SAME extraction helper _verify_image_ownership itself uses --
+    # proves this is one shared identity primitive, not a re-derivation.
+    original_rid = docs_intel._image_paragraph_relationship_ids(original_para)[0]
+    assert original_rid == "rId50"
+
+    canonical = fig_gate.FigureSlotPayload(
+        bound_source={"kind": "rid", "value": original_rid},
+        numeric_values=(21.0,),
+        text_content=("Convergence plot for the primary model.",),
+        typography={"font": "Calibri", "size": 11},
+        caption_text="Figure 21. Convergence plot for the primary model.",
+        provenance_type=fig_gate.PROVENANCE_EXACT,
+    )
+
+    # A typography-only revision of the SAME figure (same rId): different
+    # font/layout, identical numeric/text content -> INVARIANT_HOLDS.
+    typography_revision = fig_gate.FigureSlotPayload(
+        bound_source={"kind": "rid", "value": original_rid},
+        numeric_values=(21.0,),
+        text_content=("Convergence plot for the primary model.",),
+        typography={"font": "Times New Roman", "size": 10},
+        caption_text="Figure 21. Convergence plot for the primary model.",
+        provenance_type=fig_gate.PROVENANCE_EXACT,
+    )
+    result = fig_gate.compare_figure_invariants(canonical, typography_revision)
+    assert result["verdict"] == fig_gate.INVARIANT_HOLDS
+
+    # copy_section's allow_relationship_reuse=True fixture: the COPY's image
+    # paragraph shares the SAME rId50 -- exactly the duplication
+    # _verify_image_ownership's OWN duplicate-relationship check flags as a
+    # hard violation for THAT check's own purpose (two independent figure
+    # blocks must not silently share one relationship). Independently
+    # confirm the gate's identity extraction *agrees* on the primitive: the
+    # copy's bound-source key is identical to the original's.
+    copy_result = docs_intel.copy_section(
+        path, "H0000005", "H0000006", destination_position="after",
+        allow_relationship_reuse=True,
+    )
+    assert copy_result["status"] == "copied"
+    _raw2, root2 = docs_intel._load_docx_xml_stdlib(path)
+    body2 = root2.find(docs_intel._q(_W, "body"))
+    image_paras2 = docs_intel._direct_body_image_paragraphs(body2)
+    copied_rids = [
+        rid
+        for _idx, para in image_paras2
+        for rid in docs_intel._image_paragraph_relationship_ids(para)
+    ]
+    assert copied_rids == ["rId50", "rId50"]
+    copied_candidate = fig_gate.FigureSlotPayload(
+        bound_source={"kind": "rid", "value": copied_rids[1]},
+        numeric_values=(21.0,),
+        text_content=("Convergence plot for the primary model.",),
+        provenance_type=fig_gate.PROVENANCE_EXACT,
+    )
+    copy_verdict = fig_gate.compare_figure_invariants(canonical, copied_candidate)["verdict"]
+    assert copy_verdict == fig_gate.INVARIANT_HOLDS
+
+    # A DIFFERENT real figure (Appendix Figure A.4, rId28, the sibling
+    # fixture) must NEVER be accepted just because a caller mislabels its
+    # caption to look like Figure 5.21 -- bound source (rId), not caption
+    # text, is the identity this gate compares. This is the same "never
+    # loose labels" precedent _verify_image_ownership already established
+    # (two figures sharing an rId are flagged as duplicates even when their
+    # captions differ) applied in the opposite direction: two DIFFERENT
+    # rIds must never be accepted as the same figure even when their
+    # captions are made to match.
+    other_path = _write_docx(tmp_path, _FIGURE_A4_XML, name="thesis_appendix_fixture.docx")
+    _raw3, root3 = docs_intel._load_docx_xml_stdlib(other_path)
+    body3 = root3.find(docs_intel._q(_W, "body"))
+    other_para = next(el for el in body3 if el.get(w14_para_id) == "IMG0A0004")
+    other_rid = docs_intel._image_paragraph_relationship_ids(other_para)[0]
+    assert other_rid == "rId28"
+
+    mislabeled_decoy = fig_gate.FigureSlotPayload(
+        bound_source={"kind": "rid", "value": other_rid},
+        numeric_values=(21.0,),
+        text_content=("Convergence plot for the primary model.",),
+        caption_text="Figure 21. Convergence plot for the primary model.",  # matches canonical's caption verbatim
+        provenance_type=fig_gate.PROVENANCE_EXACT,
+    )
+    mismatch_result = fig_gate.compare_figure_invariants(canonical, mislabeled_decoy)
+    assert mismatch_result["verdict"] == fig_gate.SOURCE_MISMATCH
+    assert mismatch_result["verdict"] != fig_gate.INVARIANT_HOLDS
+
+
+# ---------------------------------------------------------------------------
 # a2cd9f54 -- the new table structural-edit primitives (insert_column /
 # split_cell / transpose_table) must route through the SAME disposable-copy,
 # byte/zip/XML-integrity write pipeline every other writer in this module
